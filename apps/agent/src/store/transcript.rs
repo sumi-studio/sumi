@@ -178,14 +178,12 @@ mod tests {
 
     fn scope() -> AgentScope {
         AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         }
     }
 
     async fn store() -> crate::store::Store {
-        crate::store::Store::session_test_store("conversation-1")
+        crate::store::Store::session_test_store("0198f0f4-9b72-7000-8000-000000000001")
             .await
             .expect("open test store")
     }
@@ -224,7 +222,7 @@ mod tests {
     async fn transcript_record_rejects_non_transcript_key() {
         let store = store().await;
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
         let redactor = Redactor::v1();
@@ -248,7 +246,7 @@ mod tests {
     async fn transcript_round_trip_stores_encrypted_record_and_projection() {
         let store = store().await;
         let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let redactor = Redactor::v1();
@@ -303,7 +301,7 @@ mod tests {
         }
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint key");
         let redactor = Redactor::v1();
@@ -327,7 +325,7 @@ mod tests {
     async fn fts_trigger_maintains_external_content_index() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint key");
         let redactor = Redactor::v1();
@@ -426,7 +424,7 @@ mod tests {
     async fn transcript_record_derives_interrupted_from_public_message() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint key");
         let redactor = Redactor::v1();

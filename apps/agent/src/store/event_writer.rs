@@ -41,7 +41,10 @@ use crate::{
             StopReason, ToolResultMessage,
         },
     },
-    runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
+    runtime::contracts::{
+        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
+        ProcessGenerationLease,
+    },
 };
 
 use super::{
@@ -110,6 +113,8 @@ pub(crate) struct DurableEvent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) direct_chat_provenance: Option<DirectChatProvenanceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,12 +675,8 @@ pub(crate) struct InjectedCommand {
     seq: u64,
     command_id: CommandId,
     message_id: String,
+    provenance: DirectChatProvenanceV1,
 }
-
-/// T18 freezes this same value into the generated cross-language contracts.
-pub(crate) const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x78, 0xf6, 0x2d, 0x15, 0xb9, 0x45, 0x4a, 0x4f, 0x9d, 0x84, 0xd7, 0x3c, 0x7f, 0x93, 0x2b, 0x51,
-]);
 
 /// Temporary local namespace for Error-context disposition identities.
 ///
@@ -731,9 +732,12 @@ impl IntoCanonicalCommandId for String {
     }
 }
 
-pub(crate) fn user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+pub(crate) fn user_message_id(
+    personality_agent_id: &PersonalityAgentId,
+    command_id: &(impl CanonicalCommandIdentity + ?Sized),
+) -> String {
     Uuid::new_v5(
-        &USER_MESSAGE_ID_NAMESPACE,
+        personality_agent_id.as_uuid(),
         command_id.canonical_command_uuid().as_bytes(),
     )
     .to_string()
@@ -744,13 +748,18 @@ impl InjectedCommand {
         dead_code,
         reason = "the T15 run loop consumes the T12-frozen private injection builder"
     )]
-    pub(crate) fn new(seq: u64, command_id: impl IntoCanonicalCommandId) -> Self {
+    pub(crate) fn new(
+        seq: u64,
+        command_id: impl IntoCanonicalCommandId,
+        provenance: DirectChatProvenanceV1,
+    ) -> Self {
         let command_id = command_id.into_canonical_command_id();
-        let message_id = user_message_id(&command_id);
+        let message_id = user_message_id(provenance.personality_agent_id(), &command_id);
         Self {
             seq,
             command_id,
             message_id,
+            provenance,
         }
     }
 
@@ -769,16 +778,22 @@ impl InjectedCommand {
         &self.message_id
     }
 
+    pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
+        &self.provenance
+    }
+
     #[cfg(test)]
     fn with_caller_message_id(
         seq: u64,
         command_id: CommandId,
         message_id: impl Into<String>,
+        provenance: DirectChatProvenanceV1,
     ) -> Self {
         Self {
             seq,
             command_id,
             message_id: message_id.into(),
+            provenance,
         }
     }
 }
@@ -1796,7 +1811,7 @@ impl EventWriter {
 
         let local_agent_namespace = Uuid::new_v5(
             &ERROR_CONTEXT_DISPOSITION_NAMESPACE,
-            self.store.scope().conversation_id.as_bytes(),
+            self.store.scope().personality_agent_id.as_str().as_bytes(),
         );
         let mutation_id = Uuid::new_v5(
             &local_agent_namespace,
@@ -1805,7 +1820,7 @@ impl EventWriter {
         .to_string();
         let mutation_key = self
             .store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .context("failed to load Error-context disposition mutation key")?;
         let prepared = ProviderContextMutationBuilder::new(
@@ -2642,6 +2657,14 @@ impl EventWriter {
         state: &mut WriterState,
     ) -> Result<ApplyBatchOutcome> {
         self.ensure_checkpoint(state).await?;
+        for command in &batch.injected_commands {
+            command
+                .provenance
+                .validate(self.store.scope().personality_agent_id())
+                .map_err(|error| {
+                    anyhow!("injected command targets the wrong private store: {error}")
+                })?;
+        }
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let expected_injections = validate_batch_shape_with_recovery(
             self.store.redactor(),
@@ -2684,7 +2707,7 @@ impl EventWriter {
             });
 
         if let Some(key_ref) = destroy_after_prepare {
-            self.store.destroy_conversation_key_ref(key_ref).await?;
+            self.store.destroy_private_key_ref(key_ref).await?;
         }
 
         let mut transaction = self.store.pool().begin().await?;
@@ -2960,8 +2983,13 @@ impl EventWriter {
             command_plaintext_bytes: 0,
         };
         EventBatchSizer::validate(bounds, 0)?;
+        let injected_provenance: HashMap<String, DirectChatProvenanceV1> = batch
+            .injected_commands
+            .iter()
+            .map(|command| (command.message_id.clone(), command.provenance.clone()))
+            .collect();
         let event_key = if batch.writes.iter().any(|write| write.event.is_some()) {
-            Some(self.store.conversation_key(DataKeyPurpose::Event).await?)
+            Some(self.store.private_key(DataKeyPurpose::Event).await?)
         } else {
             None
         };
@@ -2971,11 +2999,7 @@ impl EventWriter {
                 .iter()
                 .any(|projection| matches!(projection, Projection::MessageEnd { .. }))
         }) {
-            Some(
-                self.store
-                    .conversation_key(DataKeyPurpose::Transcript)
-                    .await?,
-            )
+            Some(self.store.private_key(DataKeyPurpose::Transcript).await?)
         } else {
             None
         };
@@ -2987,7 +3011,7 @@ impl EventWriter {
                 )
             })
         }) {
-            Some(self.store.conversation_key(DataKeyPurpose::Command).await?)
+            Some(self.store.private_key(DataKeyPurpose::Command).await?)
         } else {
             None
         };
@@ -3002,7 +3026,7 @@ impl EventWriter {
         let mut memory_summary_key = if needs_memory_summary_key {
             Some(
                 self.store
-                    .conversation_key(DataKeyPurpose::MemorySummary)
+                    .private_key(DataKeyPurpose::MemorySummary)
                     .await?,
             )
         } else {
@@ -3044,7 +3068,29 @@ impl EventWriter {
                 None
             };
             let event = match (write.event, assigned_seq) {
-                (Some(event), Some(seq)) => {
+                (Some(mut event), Some(seq)) => {
+                    let user_message_id = match &event.value {
+                        AgentEvent::MessageStart {
+                            message_id,
+                            message,
+                        }
+                        | AgentEvent::MessageEnd {
+                            message_id,
+                            message,
+                        } if matches!(message.as_ref(), PublicMessage::User(_)) => Some(message_id),
+                        _ => None,
+                    };
+                    if event.metadata.direct_chat_provenance.is_some() {
+                        bail!("callers cannot supply direct-chat provenance event metadata");
+                    }
+                    if let Some(message_id) = user_message_id {
+                        event.metadata.direct_chat_provenance =
+                            Some(injected_provenance.get(message_id).cloned().ok_or_else(|| {
+                                anyhow!(
+                                    "user event {message_id} has no authenticated injected command provenance"
+                                )
+                            })?);
+                    }
                     let key = event_key.as_ref().expect("event key was loaded");
                     let aad = self.store.scope().row_aad(
                         "agent_events",
@@ -3574,7 +3620,7 @@ impl EventWriter {
         let key = self
             .store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: self.store.scope().conversation_id.clone(),
+                personality_agent_id: self.store.scope().personality_agent_id.clone(),
                 anchor_id,
             })
             .await?;
@@ -4132,7 +4178,7 @@ impl EventWriter {
                 if memory_summary_key.is_none() {
                     *memory_summary_key = Some(
                         self.store
-                            .conversation_key(DataKeyPurpose::MemorySummary)
+                            .private_key(DataKeyPurpose::MemorySummary)
                             .await?,
                     );
                 }
@@ -4268,7 +4314,7 @@ impl EventWriter {
                 if memory_summary_key.is_none() {
                     *memory_summary_key = Some(
                         self.store
-                            .conversation_key(DataKeyPurpose::MemorySummary)
+                            .private_key(DataKeyPurpose::MemorySummary)
                             .await?,
                     );
                 }
@@ -4869,9 +4915,9 @@ async fn load_verified_event_head_in_transaction(
 ) -> Result<Option<EventLogHead>> {
     let row = sqlx::query(
         "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE conversation_id = ?",
+         FROM event_log_heads WHERE personality_agent_id = ?",
     )
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .context("failed to load event-log head in EventBatch")?;
@@ -4953,7 +4999,7 @@ async fn persist_event_head(
         sqlx::query(
             "UPDATE event_log_heads
              SET last_seq=?, event_count=?, chain_digest=?, key_ref=?, head_hmac=?, updated_at=?
-             WHERE conversation_id=? AND last_seq=? AND event_count=?
+             WHERE personality_agent_id=? AND last_seq=? AND event_count=?
                AND chain_digest=? AND key_ref=? AND head_hmac=?",
         )
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
@@ -4962,7 +5008,7 @@ async fn persist_event_head(
         .bind(&next.key_ref)
         .bind(&next.head_hmac)
         .bind(Utc::now().to_rfc3339())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             previous.last_seq,
             "previous event-log head last sequence",
@@ -4979,10 +5025,10 @@ async fn persist_event_head(
     } else {
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
              ) VALUES(?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
         .bind(sqlite_i64(next.event_count, "event-log event count")?)
         .bind(next.chain_digest.as_slice())
@@ -5002,11 +5048,9 @@ async fn revalidate_prepared_key_refs(
 ) -> Result<()> {
     let scope_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_scope
-         WHERE singleton=1 AND tenant_id=? AND agent_id=? AND conversation_id=?",
+         WHERE singleton=1 AND personality_agent_id=?",
     )
-    .bind(&store.scope().tenant_id)
-    .bind(&store.scope().agent_id)
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_one(&mut **transaction)
     .await?;
     if scope_count != 1 {
@@ -5115,13 +5159,13 @@ async fn revalidate_prepared_key_refs(
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM data_keys
              WHERE key_ref=? AND scope='conversation' AND purpose=?
-               AND conversation_id=? AND state='active' AND algorithm=?
+               AND personality_agent_id=? AND state='active' AND algorithm=?
                AND wrap_key_id <> '' AND wrap_nonce IS NOT NULL AND wrapped_key IS NOT NULL
                AND destroyed_at IS NULL",
         )
         .bind(key_ref)
         .bind(purpose.as_str())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(super::crypto::WRAP_ALGORITHM)
         .fetch_one(&mut **transaction)
         .await?;
@@ -5605,7 +5649,14 @@ fn validate_batch_shape_with_recovery(
     let mut message_ids = HashSet::new();
     let mut previous_seq = None;
     for command in &batch.injected_commands {
-        let canonical_message_id = user_message_id(&command.command_id);
+        command
+            .provenance
+            .validate(command.provenance.personality_agent_id())
+            .map_err(|error| anyhow!("invalid injected command provenance: {error}"))?;
+        let canonical_message_id = user_message_id(
+            command.provenance.personality_agent_id(),
+            &command.command_id,
+        );
         if command.message_id != canonical_message_id {
             bail!(
                 "injected command {} message_id is not the canonical UUIDv5 derivation",
@@ -10244,8 +10295,8 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         }
     }
 
-    let command_key = store.conversation_key(DataKeyPurpose::Command).await?;
-    let event_key = store.conversation_key(DataKeyPurpose::Event).await?;
+    let command_key = store.private_key(DataKeyPurpose::Command).await?;
+    let event_key = store.private_key(DataKeyPurpose::Event).await?;
     let mut transaction = store.pool().begin().await?;
     let command_seq_base: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM inbound_commands")
@@ -10363,7 +10414,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
             "UPDATE event_log_heads
              SET last_seq = ?, event_count = ?, chain_digest = ?, key_ref = ?,
                  head_hmac = ?, updated_at = ?
-             WHERE conversation_id = ? AND last_seq = ? AND event_count = ?
+             WHERE personality_agent_id = ? AND last_seq = ? AND event_count = ?
                AND chain_digest = ?",
         )
         .bind(sqlite_i64(
@@ -10378,7 +10429,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         .bind(&event_key.key_ref)
         .bind(head_hmac)
         .bind(Utc::now().to_rfc3339())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             previous.last_seq,
             "provider-context fixture previous event-log sequence",
@@ -10397,10 +10448,10 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
     } else {
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
              ) VALUES(?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             last_seq,
             "provider-context fixture event-log last sequence",
@@ -13124,10 +13175,21 @@ mod tests {
 
     fn scope() -> AgentScope {
         AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         }
+    }
+
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+            .expect("valid direct-chat provenance")
+    }
+
+    fn test_user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+        user_message_id(scope().personality_agent_id(), command_id)
+    }
+
+    fn test_injected_command(seq: u64, command_id: impl IntoCanonicalCommandId) -> InjectedCommand {
+        InjectedCommand::new(seq, command_id, test_provenance())
     }
 
     #[test]
@@ -13554,7 +13616,7 @@ mod tests {
         text: &str,
         timestamp: DateTime<Utc>,
     ) -> Vec<EventWrite> {
-        let message_id = user_message_id(command_id);
+        let message_id = test_user_message_id(command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -13661,7 +13723,7 @@ mod tests {
             })
             .await
             .expect("classify injected command");
-        InjectedCommand::new(
+        test_injected_command(
             seq,
             CommandId::parse(command_id).expect("canonical test command UUID"),
         )
@@ -13986,7 +14048,7 @@ mod tests {
         })
         .expect("canonical payload");
         let timestamp = durable_test_timestamp();
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = format!("run-{}", command_id.as_str());
         let turn_id = format!("turn-{}", command_id.as_str());
         let commands = [InjectionCommandSizeInput {
@@ -14030,7 +14092,7 @@ mod tests {
             CommandId::parse("00000000-0000-4000-8000-000000000033").expect("canonical UUID");
         let previous_owner =
             CommandId::parse("00000000-0000-4000-8000-000000000034").expect("canonical UUID");
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = "run-application-sizer";
         let turn_id = "turn-application-sizer";
         let text = "application-specific write-set";
@@ -14132,7 +14194,7 @@ mod tests {
                     ],
                 },
             ]);
-            let injected = InjectedCommand::new(2, command_id.clone());
+            let injected = test_injected_command(2, command_id.clone());
             let batch = EventBatch {
                 writes,
                 injected_commands: vec![injected.clone()],
@@ -14340,7 +14402,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE id=?")
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("committed message count"),
@@ -14392,7 +14454,8 @@ mod tests {
             })
             .await
             .expect("classify");
-        let message_id_before_restart = user_message_id("00000000-0000-4000-8000-000000000001");
+        let message_id_before_restart =
+            test_user_message_id("00000000-0000-4000-8000-000000000001");
         drop(writer);
         store.pool().close().await;
         drop(store);
@@ -14404,7 +14467,7 @@ mod tests {
         let reopened_writer = EventWriter::new(reopened.clone());
         assert_eq!(
             message_id_before_restart,
-            user_message_id("00000000-0000-4000-8000-000000000001"),
+            test_user_message_id("00000000-0000-4000-8000-000000000001"),
             "restart must not change the UUIDv5 projection anchor"
         );
         let invented = durable_timestamp + chrono::TimeDelta::seconds(1);
@@ -14416,7 +14479,7 @@ mod tests {
                     "timestamped",
                     invented,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -14442,7 +14505,7 @@ mod tests {
                     "timestamped",
                     durable_timestamp,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -14450,7 +14513,7 @@ mod tests {
             .await
             .expect("inject using durable timestamp");
         let payload: String = sqlx::query_scalar("SELECT payload FROM messages WHERE id=?")
-            .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+            .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
             .fetch_one(reopened.pool())
             .await
             .expect("stored user message");
@@ -16346,8 +16409,8 @@ mod tests {
                     },
                 ],
                 injected_commands: vec![
-                    InjectedCommand::new(1, command_a.clone()),
-                    InjectedCommand::new(2, command_b),
+                    test_injected_command(1, command_a.clone()),
+                    test_injected_command(2, command_b),
                 ],
             },
         )
@@ -16360,7 +16423,7 @@ mod tests {
         );
 
         let command_id = command_a.to_string();
-        let message_id = user_message_id(command_id.as_str());
+        let message_id = test_user_message_id(command_id.as_str());
         let user = user_message("injected");
         let assistant = assistant_message(StopReason::Stop);
         let early_assistant = validate_batch_shape(
@@ -16404,7 +16467,7 @@ mod tests {
                         ],
                     },
                 ],
-                injected_commands: vec![InjectedCommand::new(1, command_a)],
+                injected_commands: vec![test_injected_command(1, command_a)],
             },
         )
         .err()
@@ -17448,7 +17511,7 @@ mod tests {
         let wrong_seq = scope().row_aad("inbound_commands", "2", DataKeyPurpose::Command);
         assert!(decrypt_content(&key, &ciphertext, &wrong_seq).is_err());
         let wrong_conversation = AgentScope {
-            conversation_id: "conversation-2".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
             ..scope()
         }
         .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
@@ -17461,7 +17524,7 @@ mod tests {
         let writer = EventWriter::new(store.clone());
         let bytes = vec![b'x'; 1024 * 1024 + 1];
         let key = store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("command key");
         let inbound = InboundCommand::Invalid {
@@ -18689,7 +18752,7 @@ mod tests {
                     "message-1",
                     "hello",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -18947,7 +19010,7 @@ mod tests {
             .await
             .expect("seed next owner");
             let message = user_message("next");
-            let message_id = user_message_id(next_id.as_str());
+            let message_id = test_user_message_id(next_id.as_str());
             let handoff_error = writer
                 .apply(EventBatch {
                     writes: vec![
@@ -19017,7 +19080,7 @@ mod tests {
                             ],
                         },
                     ],
-                    injected_commands: vec![InjectedCommand::new(2, next_id)],
+                    injected_commands: vec![test_injected_command(2, next_id)],
                 })
                 .await
                 .expect_err("pre-assistant owner handoff must fail");
@@ -19357,7 +19420,7 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_start",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageStart"),
@@ -19380,14 +19443,16 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_end",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageEnd"),
                     ),
                     projections: vec![
                         Projection::MessageEnd {
-                            message_id: user_message_id("00000000-0000-4000-8000-000000000018"),
+                            message_id: test_user_message_id(
+                                "00000000-0000-4000-8000-000000000018",
+                            ),
                             role: "user",
                             message,
                             append_to_l0: true,
@@ -19403,7 +19468,7 @@ mod tests {
                     ],
                 },
             ],
-            injected_commands: vec![InjectedCommand::new(
+            injected_commands: vec![test_injected_command(
                 2,
                 "00000000-0000-4000-8000-000000000018",
             )],
@@ -19835,7 +19900,7 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("event key");
         let batch = EventBatch {
@@ -19871,7 +19936,7 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("event key");
         let batch = EventBatch {
@@ -19898,9 +19963,9 @@ mod tests {
                 .expect("replacement data key");
         let aad = KeyWrapAad {
             key_ref: event_key.key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::Event,
-            conversation_id: Some(scope().conversation_id),
+            personality_agent_id: scope().personality_agent_id.to_string(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -19992,9 +20057,9 @@ mod tests {
         .expect("replacement provider-context data key");
         let aad = KeyWrapAad {
             key_ref: provider_context_key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::ProviderContext,
-            conversation_id: Some(scope().conversation_id),
+            personality_agent_id: scope().personality_agent_id.to_string(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -20029,7 +20094,7 @@ mod tests {
                 }],
                 injected_commands: (0_u64..17)
                     .map(|index| {
-                        InjectedCommand::new(
+                        test_injected_command(
                             index + 1,
                             format!("00000000-0000-4000-8000-{index:012}"),
                         )
@@ -20154,8 +20219,8 @@ mod tests {
     #[tokio::test]
     async fn injected_user_message_uuid_v5_is_canonical_and_replay_stable() {
         let command_id = "018f0000-0000-7000-8000-000000000001";
-        let canonical = user_message_id(command_id);
-        assert_eq!(canonical, user_message_id(command_id));
+        let canonical = test_user_message_id(command_id);
+        assert_eq!(canonical, test_user_message_id(command_id));
         assert_eq!(
             Uuid::parse_str(&canonical)
                 .expect("derived message UUID")
@@ -20164,7 +20229,7 @@ mod tests {
         );
         assert_ne!(
             canonical,
-            user_message_id("018f0000-0000-7000-8000-000000000002")
+            test_user_message_id("018f0000-0000-7000-8000-000000000002")
         );
         assert_ne!(
             canonical,
@@ -20184,6 +20249,7 @@ mod tests {
             1,
             CommandId::parse(command_id).expect("canonical test command UUID"),
             "caller-choice",
+            test_provenance(),
         );
         let rejected = writer
             .apply(EventBatch {
@@ -20204,7 +20270,7 @@ mod tests {
         writer
             .apply(EventBatch {
                 writes: injection_writes(command_id, "ignored", "stable"),
-                injected_commands: vec![InjectedCommand::new(1, command_id)],
+                injected_commands: vec![test_injected_command(1, command_id)],
             })
             .await
             .expect("canonical UUIDv5 injection");
@@ -20217,8 +20283,8 @@ mod tests {
             canonical
         );
         assert_eq!(
-            user_message_id(command_id),
-            InjectedCommand::new(1, command_id).message_id(),
+            test_user_message_id(command_id),
+            test_injected_command(1, command_id).message_id(),
             "reclassification/replay must derive the same ID"
         );
     }
@@ -23798,7 +23864,7 @@ mod tests {
     async fn migration_rejects_invalid_command_and_tool_state_fixtures() {
         let store = test_store().await;
         store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("create command key");
         let key_ref: String = sqlx::query_scalar(
@@ -24189,7 +24255,7 @@ mod tests {
                     "message-1",
                     "inject",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -24418,7 +24484,7 @@ mod tests {
                         (SELECT COUNT(*) FROM inbound_commands
                          WHERE command_id='00000000-0000-4000-8000-000000000001' AND run_phase='user_committed')",
                 )
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("injection state");
@@ -27542,7 +27608,7 @@ mod tests {
             .await
             .expect("commit user message");
 
-        let message_id = user_message_id(command_id);
+        let message_id = test_user_message_id(command_id);
         sqlx::query("UPDATE messages SET role = 'assistant' WHERE id = ?")
             .bind(&message_id)
             .execute(store.pool())
@@ -27579,7 +27645,7 @@ mod tests {
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Native compaction coverage must identify an actual persisted message.
-        let user_message_id = user_message_id(command_id);
+        let user_message_id = test_user_message_id(command_id);
         let user_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
             .bind(&user_message_id)
             .fetch_one(writer.store.pool())
@@ -27838,7 +27904,7 @@ mod tests {
                 }
                 "extra" => {
                     let key = store
-                        .conversation_key(DataKeyPurpose::Transcript)
+                        .private_key(DataKeyPurpose::Transcript)
                         .await
                         .expect("mint transcript key");
                     let message = user_message("uncommitted extra member");
@@ -28342,7 +28408,7 @@ mod tests {
     async fn message_end_eviction_footprint_overflow_fails_closed() {
         let store = test_store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
 
@@ -28577,7 +28643,7 @@ mod tests {
     async fn message_end_creates_l0_membership_and_attributes_footprint() {
         let store = test_store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
 

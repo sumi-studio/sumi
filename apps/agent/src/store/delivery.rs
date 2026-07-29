@@ -511,7 +511,7 @@ pub(crate) async fn insert_test_durable_event(
     seq: u64,
     event: &AgentEvent,
 ) -> Result<String> {
-    let key = store.conversation_key(DataKeyPurpose::Event).await?;
+    let key = store.private_key(DataKeyPurpose::Event).await?;
     let raw = serde_json::to_vec(event).context("failed to serialize test event")?;
     let aad = store
         .scope()
@@ -1239,7 +1239,7 @@ mod tests {
         insert_test_durable_event(&store, 1, &event).await.unwrap();
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("active event key");
         let aad = store

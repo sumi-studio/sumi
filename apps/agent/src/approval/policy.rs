@@ -18,6 +18,7 @@ use super::action::{
     BASH_TOOL_NAME, CanonicalAction, Permission, SecretAwareActionProjector, shell,
     text_contains_secret_material,
 };
+use crate::runtime::contracts::PersonalityAgentId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,15 +39,15 @@ pub struct ApprovalRule {
     pub allowed_network_domains: Vec<String>,
 }
 
-pub const APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION: u32 = 1;
-const APPROVAL_POLICY_SIGNATURE_DOMAIN: &[u8] = b"sumi-approval-policy-bundle/v1\0";
+pub const APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION: u32 = 2;
+const APPROVAL_POLICY_SIGNATURE_DOMAIN: &[u8] = b"sumi-approval-policy-bundle/v2\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalPolicyBundle {
     pub schema_version: u32,
     pub tenant_id: String,
-    pub agent_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub version: u64,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -79,8 +80,8 @@ impl ApprovalPolicyBundle {
                 self.schema_version
             );
         }
-        if self.tenant_id.is_empty() || self.agent_id.is_empty() {
-            bail!("approval policy bundle scope identifiers must not be empty");
+        if self.tenant_id.is_empty() {
+            bail!("approval policy authority tenant must not be empty");
         }
         if self.expires_at <= self.issued_at {
             bail!("approval policy bundle expiry must follow issuance");
@@ -143,12 +144,14 @@ impl ApprovalPolicyTrustStore {
         &self,
         signed: &SignedApprovalPolicyBundle,
         tenant_id: &str,
-        agent_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         minimum_version: u64,
         now: DateTime<Utc>,
     ) -> AnyResult<()> {
         signed.payload.validate_shape()?;
-        if signed.payload.tenant_id != tenant_id || signed.payload.agent_id != agent_id {
+        if signed.payload.tenant_id != tenant_id
+            || &signed.payload.personality_agent_id != personality_agent_id
+        {
             bail!("approval policy bundle scope does not match the active agent");
         }
         if signed.payload.version < minimum_version {
@@ -311,7 +314,7 @@ pub struct Policy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedAuthorityIdentity {
     tenant_id: String,
-    agent_id: String,
+    personality_agent_id: PersonalityAgentId,
     bundle_version: u64,
     bundle_digest: String,
 }
@@ -393,7 +396,7 @@ impl Policy {
             "verified_bundle_expires_at": self.verified_bundle_expires_at,
             "verified_authority": self.verified_authority.as_ref().map(|identity| json!({
                 "tenant_id": identity.tenant_id,
-                "agent_id": identity.agent_id,
+                "personality_agent_id": identity.personality_agent_id,
                 "bundle_version": identity.bundle_version,
                 "bundle_digest": identity.bundle_digest,
             })),
@@ -485,7 +488,6 @@ impl Policy {
         bundle: &ApprovalPolicyBundle,
     ) -> Result<Self, RuleValidationError> {
         if bundle.tenant_id.is_empty()
-            || bundle.agent_id.is_empty()
             || bundle.expires_at <= bundle.issued_at
             || bundle.schema_version != APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION
         {
@@ -500,7 +502,7 @@ impl Policy {
             .map_err(|_| RuleValidationError::InvalidAuthorityIdentity)?;
         policy.verified_authority = Some(VerifiedAuthorityIdentity {
             tenant_id: bundle.tenant_id.clone(),
-            agent_id: bundle.agent_id.clone(),
+            personality_agent_id: bundle.personality_agent_id.clone(),
             bundle_version: bundle.version,
             bundle_digest,
         });
@@ -511,7 +513,7 @@ impl Policy {
         self.verified_authority.as_ref().map(|identity| {
             (
                 identity.tenant_id.as_str(),
-                identity.agent_id.as_str(),
+                identity.personality_agent_id.as_str(),
                 identity.bundle_version,
                 identity.bundle_digest.as_str(),
             )
@@ -3463,17 +3465,17 @@ mod tests {
     }
 
     #[test]
-    fn approval_policy_signing_bytes_have_one_canonical_v1_representation() {
+    fn approval_policy_signing_bytes_have_one_canonical_v2_representation() {
         let bundle = ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             version: 7,
             issued_at: "2026-07-27T00:00:00Z".parse().unwrap(),
             expires_at: "2026-07-28T00:00:00Z".parse().unwrap(),
             rules: Vec::new(),
         };
-        let canonical_payload = br#"{"schema_version":1,"tenant_id":"tenant-1","agent_id":"agent-1","version":7,"issued_at":"2026-07-27T00:00:00Z","expires_at":"2026-07-28T00:00:00Z","rules":[]}"#;
+        let canonical_payload = br#"{"schema_version":2,"tenant_id":"tenant-1","personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","version":7,"issued_at":"2026-07-27T00:00:00Z","expires_at":"2026-07-28T00:00:00Z","rules":[]}"#;
         let mut expected = APPROVAL_POLICY_SIGNATURE_DOMAIN.to_vec();
         expected.extend_from_slice(&(canonical_payload.len() as u64).to_be_bytes());
         expected.extend_from_slice(canonical_payload);
@@ -3486,9 +3488,9 @@ mod tests {
                 "expires_at": "2026-07-28T00:00:00+00:00",
                 "issued_at": "2026-07-27T00:00:00+00:00",
                 "version": 7,
-                "agent_id": "agent-1",
+                "personality_agent_id": "0198f0f4-9b72-7000-8000-000000000001",
                 "tenant_id": "tenant-1",
-                "schema_version": 1
+                "schema_version": 2
             }"#,
         )
         .unwrap();
@@ -6120,7 +6122,7 @@ mod tests {
         let bundle = ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             version: 9,
             issued_at: now - chrono::Duration::hours(1),
             expires_at: now + chrono::Duration::hours(1),

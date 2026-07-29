@@ -13,23 +13,19 @@ use zeroize::Zeroize;
 
 use crate::gateway::{CommandDigestFactory, IncrementalCommandDigest, KeyedCommandDigest};
 
-pub const CONTENT_ENVELOPE_VERSION: u8 = 1;
+pub const CONTENT_ENVELOPE_VERSION: u8 = 2;
 pub const CONTENT_NONCE_BYTES: usize = 24;
 pub const DATA_KEY_BYTES: usize = 32;
-pub const WRAP_ALGORITHM: &str = "xchacha20-poly1305/v1";
+pub const WRAP_ALGORITHM: &str = "xchacha20-poly1305/v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataKeyScope {
-    Conversation,
-    Agent,
+    PersonalityAgent,
 }
 
 impl DataKeyScope {
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Conversation => "conversation",
-            Self::Agent => "agent",
-        }
+        "personality_agent"
     }
 }
 
@@ -210,12 +206,12 @@ impl Drop for DataKeyMaterial {
     }
 }
 
-pub(crate) struct ConversationCommandDigestFactory {
+pub(crate) struct PersonalityAgentCommandDigestFactory {
     key_ref: String,
     key: [u8; DATA_KEY_BYTES],
 }
 
-impl ConversationCommandDigestFactory {
+impl PersonalityAgentCommandDigestFactory {
     pub(crate) fn new(data_key: &DataKeyMaterial) -> Result<Self> {
         if data_key.purpose != DataKeyPurpose::Command {
             bail!("command digest factory requires a command data key");
@@ -227,13 +223,13 @@ impl ConversationCommandDigestFactory {
     }
 }
 
-impl Drop for ConversationCommandDigestFactory {
+impl Drop for PersonalityAgentCommandDigestFactory {
     fn drop(&mut self) {
         self.key.zeroize();
     }
 }
 
-impl CommandDigestFactory for ConversationCommandDigestFactory {
+impl CommandDigestFactory for PersonalityAgentCommandDigestFactory {
     fn start(&self) -> Box<dyn IncrementalCommandDigest> {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key)
             .expect("HMAC accepts keys of every length");
@@ -246,7 +242,7 @@ impl CommandDigestFactory for ConversationCommandDigestFactory {
     }
 }
 
-const COMMAND_PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sumi-command-payload/v1";
+const COMMAND_PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sumi-command-payload/v2";
 
 struct CommandDigestAccumulator {
     key_ref: String,
@@ -273,9 +269,7 @@ impl IncrementalCommandDigest for CommandDigestAccumulator {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowAad {
-    pub tenant_id: String,
-    pub agent_id: String,
-    pub conversation_id: String,
+    pub personality_agent_id: String,
     pub table: String,
     pub row_id: String,
     pub purpose: String,
@@ -285,11 +279,9 @@ pub struct RowAad {
 impl RowAad {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         canonical_fields(
-            b"sumi-row-aad/v1",
+            b"sumi-row-aad/v2",
             [
-                self.tenant_id.as_bytes(),
-                self.agent_id.as_bytes(),
-                self.conversation_id.as_bytes(),
+                self.personality_agent_id.as_str().as_bytes(),
                 self.table.as_bytes(),
                 self.row_id.as_bytes(),
                 self.purpose.as_bytes(),
@@ -304,19 +296,19 @@ pub(crate) struct KeyWrapAad {
     pub key_ref: String,
     pub scope: DataKeyScope,
     pub purpose: DataKeyPurpose,
-    pub conversation_id: Option<String>,
+    pub personality_agent_id: String,
     pub wrap_key_id: String,
 }
 
 impl KeyWrapAad {
     fn canonical_bytes(&self) -> Vec<u8> {
         canonical_fields(
-            b"sumi-key-wrap-aad/v1",
+            b"sumi-key-wrap-aad/v2",
             [
                 self.key_ref.as_bytes(),
                 self.scope.as_str().as_bytes(),
                 self.purpose.as_str().as_bytes(),
-                self.conversation_id.as_deref().unwrap_or("").as_bytes(),
+                self.personality_agent_id.as_str().as_bytes(),
                 self.wrap_key_id.as_bytes(),
             ],
         )
@@ -563,13 +555,11 @@ mod tests {
         let data_key =
             DataKeyMaterial::from_bytes("key-1", DataKeyPurpose::Transcript, [7; DATA_KEY_BYTES]);
         let aad = RowAad {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".to_owned(),
             table: "messages".to_owned(),
             row_id: "message-1".to_owned(),
             purpose: "transcript".to_owned(),
-            schema_version: 1,
+            schema_version: 2,
         };
         let encrypted = encrypt_content(&data_key, b"private text", &aad).expect("encrypt");
         assert_eq!(encrypted[0], CONTENT_ENVELOPE_VERSION);
@@ -580,15 +570,7 @@ mod tests {
 
         let mutations = [
             RowAad {
-                tenant_id: "tenant-2".to_owned(),
-                ..aad.clone()
-            },
-            RowAad {
-                agent_id: "agent-2".to_owned(),
-                ..aad.clone()
-            },
-            RowAad {
-                conversation_id: "conversation-2".to_owned(),
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".to_owned(),
                 ..aad.clone()
             },
             RowAad {
@@ -600,7 +582,7 @@ mod tests {
                 ..aad.clone()
             },
             RowAad {
-                schema_version: 2,
+                schema_version: 3,
                 ..aad.clone()
             },
         ];
@@ -614,13 +596,11 @@ mod tests {
         let data_key =
             DataKeyMaterial::from_bytes("key-1", DataKeyPurpose::Transcript, [3; DATA_KEY_BYTES]);
         let first = RowAad {
-            tenant_id: "tenant".to_owned(),
-            agent_id: "agent".to_owned(),
-            conversation_id: "conversation".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".to_owned(),
             table: "messages".to_owned(),
             row_id: "message-1".to_owned(),
             purpose: "transcript".to_owned(),
-            schema_version: 1,
+            schema_version: 2,
         };
         let second = RowAad {
             row_id: "message-2".to_owned(),
@@ -694,7 +674,7 @@ mod tests {
 
         let key = [0x4b; DATA_KEY_BYTES];
         let data_key = DataKeyMaterial::from_bytes("command-key", DataKeyPurpose::Command, key);
-        let factory = ConversationCommandDigestFactory::new(&data_key).expect("digest factory");
+        let factory = PersonalityAgentCommandDigestFactory::new(&data_key).expect("digest factory");
         let payload: Vec<u8> = (0_u16..=511).map(|value| value as u8).collect();
         let expected = command_payload_digest(&data_key, &payload);
         for chunk_size in [1, 31, 63, 64, 65, 127, 128, 129, 511, 512] {

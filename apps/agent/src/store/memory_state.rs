@@ -46,9 +46,7 @@ fn digest_option_marker(hash: &mut Sha256, present: bool) {
 }
 
 fn digest_scope(hash: &mut Sha256, scope: &AgentScope) {
-    digest_text(hash, &scope.tenant_id);
-    digest_text(hash, &scope.agent_id);
-    digest_text(hash, &scope.conversation_id);
+    digest_text(hash, scope.personality_agent_id.as_str());
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1137,7 +1135,7 @@ mod tests {
     use uuid::Uuid;
 
     async fn store() -> Store {
-        Store::session_test_store("conversation-1")
+        Store::session_test_store("0198f0f4-9b72-7000-8000-000000000001")
             .await
             .expect("open test store")
     }
@@ -1271,7 +1269,7 @@ mod tests {
             seed_batch(&store, MemoryLayer::L0, MemoryBatchState::Open).await;
         let event_seq = i64::try_from(event_seq).expect("test event sequence fits i64");
         let summary_key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .private_key(DataKeyPurpose::MemorySummary)
             .await
             .expect("mint summary key");
 
@@ -1371,7 +1369,7 @@ mod tests {
         let store = store().await;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         sqlx::query(
@@ -1569,7 +1567,7 @@ mod tests {
         let (batch_id, _, _, _) =
             seed_batch(&store, MemoryLayer::L1, MemoryBatchState::Compacting).await;
         let summary_key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .private_key(DataKeyPurpose::MemorySummary)
             .await
             .expect("mint memory summary key");
 

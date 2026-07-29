@@ -1,16 +1,16 @@
 CREATE TABLE agent_scope (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  tenant_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL UNIQUE,
+  personality_agent_id TEXT NOT NULL UNIQUE
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   created_at TEXT NOT NULL
 );
 
 CREATE TABLE data_keys (
   key_ref TEXT NOT NULL PRIMARY KEY,
-  scope TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope = 'personality_agent'),
   purpose TEXT NOT NULL,
-  conversation_id TEXT,
+  personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   algorithm TEXT NOT NULL,
   wrap_key_id TEXT NOT NULL,
   wrap_nonce BLOB,
@@ -18,23 +18,10 @@ CREATE TABLE data_keys (
   state TEXT NOT NULL,
   created_at TEXT NOT NULL,
   destroyed_at TEXT,
-  CHECK (scope IN ('conversation', 'agent')),
   CHECK (purpose IN (
     'transcript', 'event', 'memory_summary', 'provider_context',
     'command', 'mutation', 'artifact', 'workspace'
   )),
-  CHECK (
-    (scope = 'conversation'
-      AND conversation_id IS NOT NULL
-      AND purpose IN (
-        'transcript', 'event', 'memory_summary', 'provider_context',
-        'command', 'mutation', 'artifact'
-      ))
-    OR
-    (scope = 'agent'
-      AND conversation_id IS NULL
-      AND purpose = 'workspace')
-  ),
   CHECK (
     (state = 'active'
       AND wrapped_key IS NOT NULL
@@ -49,7 +36,7 @@ CREATE TABLE data_keys (
 );
 
 CREATE UNIQUE INDEX one_active_shared_data_key
-ON data_keys(scope, purpose, COALESCE(conversation_id, ''))
+ON data_keys(personality_agent_id, purpose)
 WHERE state = 'active' AND purpose <> 'provider_context';
 
 CREATE TABLE messages (
@@ -95,7 +82,8 @@ ON agent_events(json_extract(envelope, '$.message_id'))
 WHERE event_type = 'message_start';
 
 CREATE TABLE event_log_heads (
-  conversation_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_scope(conversation_id),
+  personality_agent_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   last_seq INTEGER NOT NULL CHECK (last_seq >= 1),
   event_count INTEGER NOT NULL CHECK (event_count >= 1),
   chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32),

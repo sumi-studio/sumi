@@ -843,9 +843,7 @@ mod tests {
     async fn test_store() -> Arc<Store> {
         Store::in_memory(
             AgentScope {
-                tenant_id: "tenant-1".to_owned(),
-                agent_id: "agent-1".to_owned(),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             },
             Arc::new(TestKeyProvider {
                 key: WrappingKey::new("test-wrap-v1", [0x53; DATA_KEY_BYTES]),
@@ -863,7 +861,7 @@ mod tests {
         let terminal_seq = 12u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
@@ -1103,7 +1101,7 @@ mod tests {
         let terminal_seq = 13u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
@@ -1196,7 +1194,7 @@ mod tests {
         let terminal_seq = 12u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 

@@ -43,32 +43,35 @@ fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} exceeds SQLite INTEGER range"))
 }
 
-const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v1";
-const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v1";
-const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v1";
-const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v1";
-const PROJECTION_HMAC_INFO: &[u8] = b"provider-context-projection-head/v1";
-const PROJECTION_STATE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-context-durable-state/v1";
-const PROJECTION_HEAD_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-projection-head/v1";
-const PROJECTION_SCHEMA_VERSION: i64 = 1;
+const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v2";
+const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v2";
+const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v2";
+const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v2";
+const PROJECTION_HMAC_INFO: &[u8] = b"provider-context-projection-head/v2";
+const PROJECTION_STATE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-context-durable-state/v2";
+const PROJECTION_HEAD_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-projection-head/v2";
+const PROJECTION_SCHEMA_VERSION: i64 = 2;
 const PROJECTION_PAGE_SIZE: i64 = 256;
-const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v1";
+const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v2";
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
 
 /// HKDF-Extract/Expand with HMAC-SHA256, keyed by the durable mutation data key
 /// and conversation-scoped salt.  This key is used for both the plaintext HMAC
 /// and the canonical semantic-intent HMAC.
-pub(crate) fn hkdf_intent_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
-    hkdf_hmac_key(data_key, conversation_id, INTENT_HMAC_INFO)
+pub(crate) fn hkdf_intent_hmac_key(
+    data_key: &DataKeyMaterial,
+    personality_agent_id: &str,
+) -> [u8; 32] {
+    hkdf_hmac_key(data_key, personality_agent_id, INTENT_HMAC_INFO)
 }
 
-fn hkdf_projection_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
-    hkdf_hmac_key(data_key, conversation_id, PROJECTION_HMAC_INFO)
+fn hkdf_projection_hmac_key(data_key: &DataKeyMaterial, personality_agent_id: &str) -> [u8; 32] {
+    hkdf_hmac_key(data_key, personality_agent_id, PROJECTION_HMAC_INFO)
 }
 
-fn hkdf_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str, info: &[u8]) -> [u8; 32] {
-    let mut prk_mac = <Hmac<Sha256> as Mac>::new_from_slice(conversation_id.as_bytes())
+fn hkdf_hmac_key(data_key: &DataKeyMaterial, personality_agent_id: &str, info: &[u8]) -> [u8; 32] {
+    let mut prk_mac = <Hmac<Sha256> as Mac>::new_from_slice(personality_agent_id.as_bytes())
         .expect("HMAC accepts any salt length");
     prk_mac.update(data_key.bytes());
     let prk = prk_mac.finalize().into_bytes();
@@ -108,9 +111,7 @@ fn projection_head_hmac(
 ) -> Vec<u8> {
     let mut writer = CanonicalWriter::with_domain(PROJECTION_HEAD_HMAC_DOMAIN);
     writer.field(PROJECTION_SCHEMA_VERSION.to_string().as_bytes());
-    writer.field(store.scope().tenant_id.as_bytes());
-    writer.field(store.scope().agent_id.as_bytes());
-    writer.field(store.scope().conversation_id.as_bytes());
+    writer.field(store.scope().personality_agent_id.as_str().as_bytes());
     writer.field(revision.to_string().as_bytes());
     writer.field(record_count.to_string().as_bytes());
     writer.field(set_digest);
@@ -252,9 +253,10 @@ async fn provider_context_set_digest(
         &mut hasher,
         PROJECTION_SCHEMA_VERSION.to_string().as_bytes(),
     );
-    digest_field(&mut hasher, store.scope().tenant_id.as_bytes());
-    digest_field(&mut hasher, store.scope().agent_id.as_bytes());
-    digest_field(&mut hasher, store.scope().conversation_id.as_bytes());
+    digest_field(
+        &mut hasher,
+        store.scope().personality_agent_id.as_str().as_bytes(),
+    );
 
     digest_field(&mut hasher, b"provider_context");
     let mut after_id: Option<String> = None;
@@ -456,7 +458,8 @@ async fn load_authenticated_projection_head(
     if key.purpose != DataKeyPurpose::Mutation {
         bail!("provider-context projection head references a non-mutation key");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let expected = projection_head_hmac(
         store,
         &projection_key,
@@ -523,7 +526,8 @@ pub(super) async fn commit_provider_context_projection_set(
     if key.purpose != DataKeyPurpose::Mutation {
         bail!("provider-context projection head references a non-mutation key");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let head_hmac = projection_head_hmac(
         store,
         &projection_key,
@@ -591,7 +595,7 @@ pub(super) async fn initialize_provider_context_projection_head(store: &Store) -
     }
 
     let key = store
-        .conversation_key(DataKeyPurpose::Mutation)
+        .private_key(DataKeyPurpose::Mutation)
         .await
         .context("failed to initialize provider-context projection key")?;
     let mut transaction = store.pool().begin().await?;
@@ -626,7 +630,8 @@ pub(super) async fn initialize_provider_context_projection_head(store: &Store) -
     if record_count != 0 {
         bail!("provider-context projection genesis is not empty");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let head_hmac = projection_head_hmac(
         store,
         &projection_key,
@@ -1440,7 +1445,8 @@ impl ProviderContextMutationBuilder {
             serde_json::to_vec(plaintext)
                 .context("failed to serialize provider-context plaintext for intent")?,
         );
-        let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
+        let intent_key =
+            hkdf_intent_hmac_key(&self.mutation_key, self.scope.personality_agent_id.as_str());
         let plaintext_hmac = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext_bytes);
 
         self.build_full(
@@ -1504,7 +1510,8 @@ impl ProviderContextMutationBuilder {
             created_at: insert.map(|r| r.created_at.clone()).unwrap_or_default(),
         };
 
-        let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
+        let intent_key =
+            hkdf_intent_hmac_key(&self.mutation_key, self.scope.personality_agent_id.as_str());
         let semantic = semantic_intent_bytes(&full);
         let intent_hmac = hmac_sha256(&intent_key, INTENT_HMAC_DOMAIN, &semantic);
 
@@ -1761,8 +1768,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &mutation_id,
                 DataKeyPurpose::Mutation,
             );
-            let intent_key =
-                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let intent_key = hkdf_intent_hmac_key(
+                &mutation_key,
+                self.store.scope().personality_agent_id.as_str(),
+            );
             let full = self.decrypt_full_intent(
                 &mutation_key,
                 &intent_ciphertext,
@@ -1989,7 +1998,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &prepared.mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
 
         if let Some((state, key_ref, hmac, hmac_key_id, ciphertext, _prepared_at)) = existing {
             if state != "prepared" {
@@ -2127,7 +2139,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &prepared.mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let full = self.decrypt_full_intent(
             &mutation_key,
             &prepared.intent_ciphertext,
@@ -2526,7 +2541,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .context("failed to deserialize full mutation intent")?;
 
         let semantic = semantic_intent_bytes(&full);
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let recomputed = hmac_sha256(&intent_key, INTENT_HMAC_DOMAIN, &semantic);
         if recomputed.as_slice().ct_eq(&stored_hmac).unwrap_u8() != 1 {
             bail!("provider-context mutation intent HMAC mismatch");
@@ -2551,7 +2569,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &full.protocol,
                 &full.model,
                 &full.kind,
-                &self.store.scope().conversation_id,
+                self.store.scope().personality_agent_id.as_str(),
                 intent_key,
             );
 
@@ -2853,7 +2871,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let full = self.decrypt_full_intent(
             &mutation_key,
             &intent_ciphertext,
@@ -2872,7 +2893,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &full.protocol,
             &full.model,
             &full.kind,
-            &self.store.scope().conversation_id,
+            self.store.scope().personality_agent_id.as_str(),
             intent_key,
         )
     }
@@ -3131,8 +3152,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &mutation_id,
                 DataKeyPurpose::Mutation,
             );
-            let intent_key =
-                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let intent_key = hkdf_intent_hmac_key(
+                &mutation_key,
+                self.store.scope().personality_agent_id.as_str(),
+            );
             let full = self.decrypt_full_intent(
                 &mutation_key,
                 &original_ciphertext,
@@ -3259,7 +3282,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     .await?;
             if count == 0 {
                 self.store
-                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref.0)
+                    .destroy_private_key_ref_in_transaction(transaction, &key_ref.0)
                     .await
                     .with_context(|| {
                         format!(
@@ -3394,18 +3417,18 @@ fn replace_scope_key(
     protocol: &str,
     model: &str,
     kind: &str,
-    conversation_id: &str,
+    personality_agent_id: &str,
     intent_key: &[u8],
 ) -> String {
     let mut writer = CanonicalWriter::with_domain(SCOPE_KEY_DOMAIN);
-    writer.field(conversation_id.as_bytes());
+    writer.field(personality_agent_id.as_bytes());
     writer.field(provider_instance_id.as_bytes());
     writer.field(protocol.as_bytes());
     writer.field(model.as_bytes());
     writer.field(kind.as_bytes());
     let digest = hmac_sha256(
         intent_key,
-        b"sumi-provider-context-scope-digest/v1",
+        b"sumi-provider-context-scope-digest/v2",
         &writer.finish(),
     );
     encode_hex(&digest)
@@ -3452,7 +3475,7 @@ mod tests {
     }
 
     async fn store() -> Store {
-        Store::session_test_store("conversation-1")
+        Store::session_test_store("0198f0f4-9b72-7000-8000-000000000001")
             .await
             .expect("open test store")
     }
@@ -3461,7 +3484,7 @@ mod tests {
     async fn projection_verifier_preflights_mutation_and_replace_head_bytes_before_paging() {
         let store = store().await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         sqlx::query(
@@ -3534,7 +3557,7 @@ mod tests {
             .initialize_recovery_checkpoint()
             .await?;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let message = PublicMessage::Assistant(PublicAssistantMessage {
@@ -3666,7 +3689,7 @@ mod tests {
             .initialize_recovery_checkpoint()
             .await?;
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
         sqlx::query(
@@ -3749,7 +3772,7 @@ mod tests {
         let item = reasoning_item("message-1", 7);
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -3848,7 +3871,7 @@ mod tests {
         content: &str,
     ) -> EncryptedProviderContextRecord {
         let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
+            personality_agent_id: store.scope().personality_agent_id.clone(),
             anchor_id: format!("{message_id}:{message_seq}"),
         };
         let key = store
@@ -3878,7 +3901,7 @@ mod tests {
         ordinal: u32,
     ) -> EncryptedProviderContextRecord {
         let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
+            personality_agent_id: store.scope().personality_agent_id.clone(),
             anchor_id: format!("{message_id}:{message_seq}"),
         };
         let key = store
@@ -3925,8 +3948,10 @@ mod tests {
         let plaintext_bytes = Zeroizing::new(
             serde_json::to_vec(plaintext).expect("serialize unchecked Replace plaintext"),
         );
-        let intent_key =
-            hkdf_intent_hmac_key(&builder.mutation_key, &builder.scope.conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &builder.mutation_key,
+            builder.scope.personality_agent_id.as_str(),
+        );
         let plaintext_hmac = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext_bytes);
         builder
             .build_full(
@@ -3980,7 +4005,7 @@ mod tests {
                     .expect("seed a different authenticated owner in the same conversation");
                 let wrong_owner_key = store
                     .provider_context_key(&ProviderContextKeyAnchor {
-                        conversation_id: store.scope().conversation_id.clone(),
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
                         anchor_id: "different-owner:8".to_owned(),
                     })
                     .await
@@ -3994,7 +4019,7 @@ mod tests {
         // prepared by an older or compromised caller. Apply must independently
         // re-authenticate it inside EventWriter's transaction.
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let prepared = build_unchecked_replace_for_test(
@@ -4081,7 +4106,7 @@ mod tests {
         let origin = reasoning_origin();
         let wrong_owner_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "different-owner:8".to_owned(),
             })
             .await
@@ -4110,7 +4135,7 @@ mod tests {
         bad_id.id = "noncanonical-provider-context-id".to_owned();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -4124,7 +4149,7 @@ mod tests {
         bad_idempotency.idempotency_key = "noncanonical-idempotency-key".to_owned();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("reuse mutation key"),
             store.scope().clone(),
@@ -4138,7 +4163,7 @@ mod tests {
         bad_key.key_ref = wrong_owner_key.key_ref.clone();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("reuse mutation key"),
             store.scope().clone(),
@@ -4243,7 +4268,7 @@ mod tests {
             data_keys: snapshot_rows(
                 store,
                 "SELECT json_array(
-                    key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                    key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
                     hex(wrap_nonce), hex(wrapped_key), state, created_at, destroyed_at
                  ) FROM data_keys ORDER BY key_ref",
             )
@@ -4283,9 +4308,9 @@ mod tests {
             event_heads: snapshot_rows(
                 store,
                 "SELECT json_array(
-                    conversation_id, last_seq, event_count, hex(chain_digest),
+                    personality_agent_id, last_seq, event_count, hex(chain_digest),
                     key_ref, hex(head_hmac), updated_at
-                 ) FROM event_log_heads ORDER BY conversation_id",
+                 ) FROM event_log_heads ORDER BY personality_agent_id",
             )
             .await,
             memory_batches: snapshot_rows(
@@ -4402,7 +4427,7 @@ mod tests {
     async fn durable_state_commitment_detects_deletion_of_lone_prepared_mutation() {
         let store = store().await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4439,7 +4464,7 @@ mod tests {
             .unwrap();
         let record = reasoning_record(&store, "message-1", 7).await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4513,7 +4538,7 @@ mod tests {
         let record = reasoning_record(&store, "message-1", 7).await;
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4552,7 +4577,7 @@ mod tests {
             reasoning_footprint(&different_item),
             &store
                 .provider_context_key(&ProviderContextKeyAnchor {
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     anchor_id: "message-1:7".to_owned(),
                 })
                 .await
@@ -4562,7 +4587,7 @@ mod tests {
         .expect("encrypt different reasoning");
 
         let mutation_key2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let conflicting = ProviderContextMutationBuilder::new(
@@ -4592,7 +4617,7 @@ mod tests {
             .unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4619,7 +4644,7 @@ mod tests {
         let b_item = reasoning_item_with("message-1", 7, 0, 1);
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_b = ProviderContextMutationBuilder::new(
@@ -4637,7 +4662,7 @@ mod tests {
 
         // Equal (gen, ord) with the same insert id is already satisfied.
         let mutation_key_a2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_a2 = ProviderContextMutationBuilder::new(
@@ -4655,7 +4680,7 @@ mod tests {
 
         // Equal (gen, ord) with a different insert id is superseded.
         let mutation_key_c = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_c = ProviderContextMutationBuilder::new(
@@ -4676,7 +4701,7 @@ mod tests {
         let e = reasoning_record_with(&store, "message-1", 7, 0, 2).await;
         let e_id = e.id().to_owned();
         let mutation_key_e = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_e =
@@ -4723,7 +4748,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4771,7 +4796,7 @@ mod tests {
             .unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4798,7 +4823,7 @@ mod tests {
         let b_item = reasoning_item_with("message-1", 7, 0, 1);
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let stale = ProviderContextMutationBuilder::new(
@@ -4822,7 +4847,7 @@ mod tests {
 
         // CAS update: re-prepare a pending intent after correcting only expected_latest_id.
         let mutation_key_d = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let pending = ProviderContextMutationBuilder::new(
@@ -4864,7 +4889,7 @@ mod tests {
 
         // The same newer Replace with the correct expected head succeeds.
         let mutation_key_c = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let correct =
@@ -4888,7 +4913,7 @@ mod tests {
         let record = reasoning_record(&store, "message-1", 7).await;
         let record_id = record.id().to_owned();
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5009,7 +5034,7 @@ mod tests {
     ) -> EncryptedProviderContextRecord {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!(
                     "{}:{}",
                     item.retention_owner.message_id, item.retention_owner.message_seq
@@ -5117,10 +5142,7 @@ mod tests {
             let insert_key_ref = record.key_ref.clone();
             let mutation_id = format!("retention-{initial_state}");
             let intent = ProviderContextMutationBuilder::new(
-                store
-                    .conversation_key(DataKeyPurpose::Mutation)
-                    .await
-                    .unwrap(),
+                store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
                 store.scope().clone(),
                 mutation_id.clone(),
             )
@@ -5236,10 +5258,7 @@ mod tests {
         let dropped_id = dropped_record.id().to_owned();
         let dropped_key_ref = dropped_record.key_ref.clone();
         let dropped_intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "drop-native",
         )
@@ -5251,10 +5270,7 @@ mod tests {
         let kept_id = kept_record.id().to_owned();
         let kept_key_ref = kept_record.key_ref.clone();
         let kept_intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "keep-reasoning",
         )
@@ -5474,10 +5490,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "overlapping-invalidate",
         )
@@ -5516,7 +5529,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -5628,7 +5641,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5673,7 +5686,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -5695,7 +5708,7 @@ mod tests {
         let new_id = new_record.id().to_owned();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let prepared = ProviderContextMutationBuilder::new(
@@ -5782,10 +5795,7 @@ mod tests {
         assert_eq!(replacement.key_ref, shared_key_ref);
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared_replace = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "prepared-shared-insert",
         )
@@ -5794,10 +5804,7 @@ mod tests {
         applier.prepare(&prepared_replace).await.unwrap();
 
         let invalidate = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "invalidate-shared-live",
         )
@@ -5851,11 +5858,11 @@ mod tests {
         b.insert_committed(&store).await.unwrap();
 
         let mutation_key_a = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key a");
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key b");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5907,7 +5914,7 @@ mod tests {
         // Tamper with the data_keys row so it appears to belong to another conversation,
         // simulating a cross-conversation row referenced by this conversation's store.
         sqlx::query(
-            "UPDATE data_keys SET conversation_id = 'other-conversation' WHERE key_ref = ?",
+            "UPDATE data_keys SET personality_agent_id = 'other-conversation' WHERE key_ref = ?",
         )
         .bind(&cross_key_ref)
         .execute(store.pool())
@@ -5917,7 +5924,7 @@ mod tests {
         let replacement = reasoning_record(&store, "message-2", 9).await;
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5992,7 +5999,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -6057,14 +6064,14 @@ mod tests {
             target.insert_committed(&store).await.unwrap();
 
             let mutation_key = store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key");
             let wrong_key_ref = if purpose == DataKeyPurpose::Mutation {
                 mutation_key.key_ref.clone()
             } else {
                 store
-                    .conversation_key(purpose)
+                    .private_key(purpose)
                     .await
                     .expect("load hostile wrong-purpose key")
                     .key_ref
@@ -6147,7 +6154,7 @@ mod tests {
             let applier = ProviderContextMutationApplier::new(&store);
             let prepared = ProviderContextMutationBuilder::new(
                 store
-                    .conversation_key(DataKeyPurpose::Mutation)
+                    .private_key(DataKeyPurpose::Mutation)
                     .await
                     .expect("mint mutation key"),
                 store.scope().clone(),
@@ -6242,7 +6249,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -6345,7 +6352,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-2:8".to_owned(),
             })
             .await
@@ -6428,7 +6435,7 @@ mod tests {
 
         let wrong_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "different-message:9".to_owned(),
             })
             .await
@@ -6456,7 +6463,7 @@ mod tests {
         };
         let correct_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -6507,7 +6514,7 @@ mod tests {
         let record_id = provider_context_record_id(&item);
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -6647,7 +6654,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:1".to_owned(),
             })
             .await
@@ -6707,7 +6714,7 @@ mod tests {
         };
         let second_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-2:2".to_owned(),
             })
             .await
@@ -6769,7 +6776,7 @@ mod tests {
         // Native compaction covering seq 1; suffix begins at seq 2.
         let compaction_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-2:2".to_owned(),
             })
             .await
@@ -6867,7 +6874,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -6952,7 +6959,7 @@ mod tests {
         record2.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -7041,7 +7048,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let intent = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -7116,7 +7123,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -7188,7 +7195,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -7260,7 +7267,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -7311,7 +7318,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
@@ -7448,7 +7455,7 @@ mod tests {
         assert_eq!(footprint.eviction_tokens(), 24);
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-legacy:7".to_owned(),
             })
             .await
@@ -7597,7 +7604,7 @@ mod tests {
 
         let record = reasoning_record(&store, "message-1", 7).await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let plaintext = reasoning_item("message-1", 7);
@@ -7622,7 +7629,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-1:1".to_owned(),
             })
             .await
@@ -7724,7 +7731,7 @@ mod tests {
         let a_id = a.id().to_owned();
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7738,7 +7745,7 @@ mod tests {
         let b_id = b.id().to_owned();
         let intent_b = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7754,7 +7761,7 @@ mod tests {
 
         let invalidate = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope,
@@ -7810,7 +7817,7 @@ mod tests {
         let a_id = a.id().to_owned();
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7828,7 +7835,7 @@ mod tests {
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let intent_b = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope,
@@ -7976,7 +7983,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: "message-3:3".to_owned(),
             })
             .await
@@ -8137,7 +8144,7 @@ mod tests {
         let c = reasoning_record_with(&store, "message-1", 7, 0, 2).await;
         let c_id = c.id().to_owned();
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -8325,7 +8332,7 @@ mod tests {
         let new_id = new_record.id().to_owned();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -8361,7 +8368,7 @@ mod tests {
         // A duplicate replace intent with the same (gen, ord, id) is already
         // satisfied and must not re-add the footprint.
         let mutation_key_2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint second mutation key");
         let prepared_2 = ProviderContextMutationBuilder::new(
@@ -8402,7 +8409,7 @@ mod tests {
             .as_ref()
             .expect("reasoning item must have an anchor");
         let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
+            personality_agent_id: store.scope().personality_agent_id.clone(),
             anchor_id: format!(
                 "{}:{}",
                 origin_message.message_id, origin_message.message_seq

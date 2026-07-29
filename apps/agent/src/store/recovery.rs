@@ -985,9 +985,9 @@ async fn durable_event_evidence(
     let mut transaction = store.pool().begin().await?;
     let head_row = sqlx::query(
         "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE conversation_id=?",
+         FROM event_log_heads WHERE personality_agent_id=?",
     )
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_optional(&mut *transaction)
     .await
     .context("failed to read authenticated event-log head")?;
@@ -1183,9 +1183,7 @@ mod tests {
     async fn setup() -> (Arc<Store>, EventWriter) {
         let store: Arc<Store> = Store::in_memory(
             AgentScope {
-                tenant_id: "tenant".to_owned(),
-                agent_id: "agent".to_owned(),
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             },
             Arc::new(TestKeyProvider(WrappingKey::new(
                 "test",
@@ -2000,7 +1998,7 @@ mod tests {
             .await
             .expect("restore second ciphertext");
         let transcript = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint wrong-purpose key");
         sqlx::query("UPDATE agent_events SET raw_key_ref=? WHERE seq=?")
@@ -2043,9 +2041,7 @@ mod tests {
             std::env::temp_dir().join(format!("sumi-recovery-reopen-{}", uuid::Uuid::now_v7()));
         let path = root.join("agent.db");
         let scope = AgentScope {
-            tenant_id: "tenant".to_owned(),
-            agent_id: "agent".to_owned(),
-            conversation_id: "conversation".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         };
         let provider: Arc<dyn super::super::KeyProvider> = Arc::new(TestKeyProvider(
             WrappingKey::new("test", [0x61; DATA_KEY_BYTES]),
