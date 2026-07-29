@@ -144,11 +144,24 @@ pub(crate) enum ResumeDirective {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HydrationOutcome {
+    #[allow(
+        dead_code,
+        reason = "T26 bootstrap composition will pass these immutable physical attestations to T27; T17 must keep this variant fail-closed until then"
+    )]
     PhysicalRecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
     LogicalRecoveryRequired {
-        receipt: super::HydrationReceiptIdentity,
+        // T26 owns applying this suffix. Until then this variant deliberately
+        // exposes no receipt or ready signal; only `Complete` does.
+        #[allow(
+            dead_code,
+            reason = "T26 bootstrap composition will consume the ordered logical suffix; T17 must keep it typed and fail-closed until then"
+        )]
         steps: Vec<RecoveryStep>,
     },
+    #[allow(
+        dead_code,
+        reason = "T26 bootstrap composition is the first production consumer of the complete hydrated state and its ready receipt"
+    )]
     Complete(HydratedRunState),
 }
 

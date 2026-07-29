@@ -466,7 +466,6 @@ impl Store {
 
         if !recovery_steps.is_empty() {
             return Ok(HydrationOutcome::LogicalRecoveryRequired {
-                receipt,
                 steps: recovery_steps,
             });
         }
@@ -481,30 +480,6 @@ impl Store {
             memory,
             resume: ResumeDirective::AdmitCommands,
         }))
-    }
-
-    /// Hydrate only the T17 physical-recovery boundary.  T17 validates the
-    /// injected lease/fence and returns immutable running-tool attestations;
-    /// T27 owns the physical kill/reap and proof persistence.  A clean state
-    /// returns a stable receipt identity, while any running execution keeps
-    /// hydration not-ready until a matching receipt is applied through
-    /// EventWriter.
-    #[allow(dead_code, reason = "T26 injects the production hydration lease/fence")]
-    pub(crate) async fn hydrate_recovery_intents(
-        &self,
-        lease: &ProcessGenerationLease,
-        fence: &GenerationRecoveryFence,
-    ) -> Result<(
-        Vec<PhysicalRecoveryIntentRequest>,
-        Option<HydrationReceiptIdentity>,
-    )> {
-        match self.hydrate(lease, fence).await? {
-            HydrationOutcome::PhysicalRecoveryRequired(intents) => Ok((intents, None)),
-            HydrationOutcome::LogicalRecoveryRequired { receipt, .. } => {
-                Ok((Vec::new(), Some(receipt)))
-            }
-            HydrationOutcome::Complete(state) => Ok((Vec::new(), Some(state.receipt))),
-        }
     }
 
     async fn hydrate_running_intents(
@@ -4925,6 +4900,46 @@ mod tests {
         assert!(!state.memory.is_empty());
         assert!(state.provider_context.is_empty());
         assert_eq!(state.resume, ResumeDirective::AdmitCommands);
+    }
+
+    #[tokio::test]
+    async fn hydrate_with_pending_logical_suffix_exposes_no_ready_receipt() {
+        let store = store().await;
+        let command_id = CommandId::parse(&Uuid::now_v7().hyphenated().to_string())
+            .expect("canonical command UUID");
+        EventWriter::new(Arc::new(store.clone()))
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: command_id.clone(),
+                command: Command::UserMessage {
+                    text: "pending logical suffix".to_owned(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .await
+            .expect("persist real pending command");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate pending logical suffix")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps } => {
+                assert!(matches!(
+                    steps.as_slice(),
+                    [RecoveryStep::Reclassify { command_id: recovered_id }]
+                        if recovered_id == command_id.as_str()
+                ));
+            }
+            HydrationOutcome::Complete(_) => {
+                panic!("a pending logical suffix must not expose a ready receipt")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("fixture has no running execution: {intents:?}")
+            }
+        }
     }
 
     #[tokio::test]

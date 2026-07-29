@@ -804,7 +804,7 @@ mod tests {
         GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
-        AgentScope, DataKeyPurpose, KeyProvider, Store,
+        AgentScope, DataKeyPurpose, HydrationOutcome, KeyProvider, Store,
         crypto::{DATA_KEY_BYTES, WrappingKey},
     };
 
@@ -1073,16 +1073,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_hydration_returns_only_fenced_receipt_identity() {
+    async fn empty_hydration_returns_only_complete_fenced_receipt_identity() {
         let store = test_store().await;
         let lease = test_lease(1);
         let fence = test_fence(&lease);
-        let (intents, receipt) = store
-            .hydrate_recovery_intents(&lease, &fence)
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&lease, &fence)
             .await
-            .expect("hydrate clean store");
-        assert!(intents.is_empty());
-        assert_eq!(receipt.expect("clean hydration receipt").intent_count, 0);
+            .expect("hydrate clean store")
+        else {
+            panic!("clean hydration must be complete");
+        };
+        assert_eq!(
+            state.receipt,
+            HydrationReceiptIdentity {
+                lease_id: lease.lease_id().to_owned(),
+                generation: lease.generation(),
+                fence_id: fence.fence_id().to_owned(),
+                intent_count: 0,
+            }
+        );
     }
 
     #[tokio::test]
