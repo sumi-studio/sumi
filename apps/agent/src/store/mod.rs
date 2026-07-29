@@ -239,11 +239,17 @@ mod sqlite_uuid {
     use crate::runtime::contracts::PersonalityAgentId;
 
     #[repr(C)]
-    struct RawSqlite;
+    struct RawSqlite {
+        _opaque: [u8; 0],
+    }
     #[repr(C)]
-    struct RawSqliteContext;
+    struct RawSqliteContext {
+        _opaque: [u8; 0],
+    }
     #[repr(C)]
-    struct RawSqliteValue;
+    struct RawSqliteValue {
+        _opaque: [u8; 0],
+    }
 
     type ScalarFunction =
         unsafe extern "C" fn(*mut RawSqliteContext, c_int, *mut *mut RawSqliteValue);
