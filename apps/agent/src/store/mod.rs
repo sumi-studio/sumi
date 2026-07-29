@@ -282,11 +282,11 @@ pub(crate) struct Store {
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
 
-struct AuthenticatedProviderContextRow {
-    id: String,
-    item: ProviderContextItem,
-    key_ref: String,
-    footprint: EvictionFootprint,
+pub(in crate::store) struct AuthenticatedProviderContextRow {
+    pub(in crate::store) id: String,
+    pub(in crate::store) item: ProviderContextItem,
+    pub(in crate::store) key_ref: String,
+    pub(in crate::store) footprint: EvictionFootprint,
 }
 
 impl Store {
@@ -844,7 +844,7 @@ impl Store {
             .collect())
     }
 
-    async fn hydrate_authenticated_provider_context(
+    pub(in crate::store) async fn hydrate_authenticated_provider_context(
         &self,
         messages: &[ContextMessage],
         transaction: &mut Transaction<'_, Sqlite>,

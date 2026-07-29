@@ -1623,40 +1623,126 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Ok(full)
     }
 
-    /// Remove durable replay copies for provider-context rows erased by a
-    /// memory transition. Prepared replacements for an erased row are first
-    /// terminalized so recovery cannot recreate the deleted plaintext.
+    /// Crypto-erase provider context whose authenticated plaintext names one of
+    /// the exact dropped retention owners.
     ///
-    /// Returns provider-context key refs still required by other prepared
-    /// replacement intents. Callers must preserve those keys even when no
-    /// active provider-context row currently references them.
-    pub(in crate::store) async fn scrub_erased_provider_context_intents(
+    /// This is the only memory-retention erasure boundary. It authenticates
+    /// every live row and every durable mutation envelope before making any
+    /// write, prevents a prepared mutation from racing the retention decision,
+    /// and only ever destroys key refs that crossed the typed
+    /// `ProviderContext` purpose check.
+    pub(in crate::store) async fn erase_for_retention_owners(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        erased_ids: &BTreeSet<String>,
-    ) -> Result<BTreeSet<String>> {
-        if erased_ids.is_empty() {
-            return Ok(BTreeSet::new());
+        dropped_owners: &BTreeSet<(String, u64)>,
+    ) -> Result<()> {
+        if dropped_owners.is_empty() {
+            return Ok(());
         }
 
-        let rows = sqlx::query(
-            "SELECT mutation_id, state, intent_key_ref, intent_ciphertext, intent_hmac
+        struct IntentScrub {
+            mutation_id: String,
+            was_prepared: bool,
+            original_ciphertext: Vec<u8>,
+            mutation_key: DataKeyMaterial,
+            aad: RowAad,
+            full: FullIntent,
+        }
+
+        let projection_checkpoint =
+            verify_provider_context_projection_set(self.store, transaction).await?;
+        let has_erasable_state: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM provider_context
+                 UNION ALL
+                 SELECT 1 FROM provider_context_mutations
+             )",
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .context("failed to inspect provider-context erasure state")?;
+        if !has_erasable_state {
+            // Replacement heads carry no owner plaintext or independently
+            // erasable key material. The authenticated empty row/envelope set
+            // therefore makes this retention transition a provider-context
+            // no-op, without requiring unrelated transcript history.
+            return Ok(());
+        }
+        let messages = self
+            .store
+            .hydrate_messages(transaction)
+            .await
+            .context("failed to authenticate transcript before provider-context erasure")?;
+
+        // Authenticate the membership-derived owner set against exact
+        // MessageEnd receipts. A matching message id with a different sequence
+        // is not the same retention owner.
+        let mut owner_evidence = Vec::new();
+        for (owner_id, owner_seq) in dropped_owners {
+            let message = messages.iter().find_map(|message| match message {
+                ContextMessage::Persisted { id, seq, message }
+                    if id == owner_id && seq == owner_seq =>
+                {
+                    Some(message.clone())
+                }
+                ContextMessage::Persisted { .. } | ContextMessage::Synthetic { .. } => None,
+            });
+            let message = message.ok_or_else(|| {
+                anyhow!(
+                    "dropped memory owner {owner_id}:{owner_seq} is absent from the authenticated transcript"
+                )
+            })?;
+            owner_evidence.push(ProviderContextOwnerEventEvidence {
+                anchor: ProviderContextAnchor {
+                    message_id: owner_id.clone(),
+                    message_seq: *owner_seq,
+                },
+                message,
+            });
+        }
+
+        let live_rows = self
+            .store
+            .hydrate_authenticated_provider_context(&messages, transaction)
+            .await
+            .context("failed to authenticate provider-context rows before erasure")?;
+        let mut live_targets = Vec::new();
+        let mut target_ids = BTreeSet::new();
+        let mut candidate_key_refs = BTreeSet::new();
+        for row in live_rows {
+            let owner = (
+                row.item.retention_owner.message_id.clone(),
+                row.item.retention_owner.message_seq,
+            );
+            if dropped_owners.contains(&owner) {
+                target_ids.insert(row.id.clone());
+                let key_ref = AuthenticatedProviderContextKeyRef(row.key_ref);
+                candidate_key_refs.insert(key_ref.clone());
+                live_targets.push((row.id, key_ref));
+            }
+        }
+
+        let mutation_rows = sqlx::query(
+            "SELECT mutation_id, state, intent_key_ref, intent_ciphertext,
+                    hmac_key_id, intent_hmac
              FROM provider_context_mutations
-             WHERE intent_key_ref IN (
-                 SELECT key_ref FROM data_keys
-                 WHERE scope = 'conversation' AND conversation_id = ? AND state = 'active'
-             )
              ORDER BY mutation_id",
         )
-        .bind(&self.store.scope().conversation_id)
         .fetch_all(&mut **transaction)
         .await
-        .context("failed to load provider-context intents for crypto-erasure")?;
+        .context("failed to load provider-context mutation envelopes for erasure")?;
 
-        let mut protected_key_refs = BTreeSet::new();
-        for row in rows {
+        let mut intent_scrubs = Vec::new();
+        for row in mutation_rows {
             let mutation_id: String = row.try_get("mutation_id")?;
             let state: String = row.try_get("state")?;
+            if !matches!(state.as_str(), "prepared" | "applied" | "superseded") {
+                bail!("provider-context mutation {mutation_id} has invalid state {state}");
+            }
+            let hmac_key_id: String = row.try_get("hmac_key_id")?;
+            if hmac_key_id != INTENT_HMAC_KEY_ID {
+                bail!("provider-context mutation {mutation_id} has unsupported HMAC key id");
+            }
             let intent_key_ref: String = row.try_get("intent_key_ref")?;
             let intent_ciphertext: Vec<u8> = row.try_get("intent_ciphertext")?;
             let stored_hmac: Vec<u8> = row.try_get("intent_hmac")?;
@@ -1665,8 +1751,11 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .data_key_by_ref_in_transaction(transaction, &intent_key_ref)
                 .await
                 .with_context(|| {
-                    format!("failed to load mutation key while scrubbing {mutation_id}")
+                    format!("failed to load mutation key while preflighting {mutation_id}")
                 })?;
+            if mutation_key.purpose != DataKeyPurpose::Mutation {
+                bail!("provider-context mutation {mutation_id} key has wrong purpose");
+            }
             let aad = self.store.scope().row_aad(
                 "provider_context_mutations",
                 &mutation_id,
@@ -1674,7 +1763,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             );
             let intent_key =
                 hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
-            let mut full = self.decrypt_full_intent(
+            let full = self.decrypt_full_intent(
                 &mutation_key,
                 &intent_ciphertext,
                 &aad,
@@ -1682,70 +1771,171 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &stored_hmac,
                 "stored",
             )?;
+            full.validate_identity_and_variant(&mutation_id)?;
 
             if !full.is_replace() {
-                continue;
-            }
-            if !erased_ids.contains(&full.provider_context_id) {
-                if state == "prepared" && !full.key_ref.is_empty() {
-                    protected_key_refs.insert(full.key_ref);
+                if state == "prepared"
+                    && full.invalidate_ids.iter().any(|id| target_ids.contains(id))
+                {
+                    bail!(
+                        "prepared provider-context invalidation overlaps a memory erasure target"
+                    );
                 }
                 continue;
             }
 
-            if state == "prepared" {
-                let result = sqlx::query(
-                    "UPDATE provider_context_mutations
-                     SET state = 'applied', finished_at = ?, terminal_reason = 'already_satisfied'
-                     WHERE mutation_id = ? AND state = 'prepared'",
-                )
-                .bind(Utc::now().to_rfc3339())
-                .bind(&mutation_id)
+            let scrubbed_envelope = full.key_ref.is_empty() && full.ciphertext.is_empty();
+            if scrubbed_envelope {
+                if state == "prepared" {
+                    bail!(
+                        "prepared provider-context mutation {mutation_id} has an empty Replace envelope"
+                    );
+                }
+                // The schema authenticates valid state/reason combinations.
+                // Any terminal Replace may already have had its non-semantic
+                // envelope erased by an earlier retention transition.
+                continue;
+            }
+            if full.key_ref.is_empty() || full.ciphertext.is_empty() {
+                bail!("provider-context mutation {mutation_id} has an incomplete Replace envelope");
+            }
+
+            let (item, insert_key_ref, evidence) = self
+                .authenticate_replace_envelope(transaction, &full, &intent_key, &messages)
+                .await
+                .with_context(|| {
+                    format!("failed to authenticate Replace envelope for mutation {mutation_id}")
+                })?;
+            owner_evidence.push(evidence);
+            let insert_owner = (
+                item.retention_owner.message_id,
+                item.retention_owner.message_seq,
+            );
+            if dropped_owners.contains(&insert_owner) {
+                candidate_key_refs.insert(insert_key_ref);
+                intent_scrubs.push(IntentScrub {
+                    mutation_id,
+                    was_prepared: state == "prepared",
+                    original_ciphertext: intent_ciphertext,
+                    mutation_key,
+                    aad,
+                    full,
+                });
+            } else if state == "prepared"
+                && full.invalidate_ids.iter().any(|id| target_ids.contains(id))
+            {
+                bail!("prepared provider-context replacement overlaps a memory erasure target");
+            }
+        }
+
+        authenticate_provider_context_owner_events(self.store, transaction, &owner_evidence)
+            .await
+            .context("failed to authenticate retention-owner MessageEnd evidence before erasure")?;
+
+        // Every check above is preflight. No durable write occurs before this
+        // point.
+        for (id, key_ref) in &live_targets {
+            let zeroed = sqlx::query(
+                "UPDATE provider_context
+                 SET ciphertext = zeroblob(length(ciphertext))
+                 WHERE id = ? AND key_ref = ?",
+            )
+            .bind(id)
+            .bind(&key_ref.0)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to zero authenticated provider-context erasure target")?;
+            require_single_cas(
+                zeroed.rows_affected(),
+                "authenticated memory provider-context ciphertext erase",
+            )?;
+            #[cfg(test)]
+            self.assert_zeroed_before_delete(transaction, id).await?;
+
+            let deleted = sqlx::query("DELETE FROM provider_context WHERE id = ? AND key_ref = ?")
+                .bind(id)
+                .bind(&key_ref.0)
                 .execute(&mut **transaction)
                 .await
-                .context("failed to terminalize erased provider-context intent")?;
+                .context("failed to delete authenticated provider-context erasure target")?;
+            require_single_cas(
+                deleted.rows_affected(),
+                "authenticated memory provider-context row delete",
+            )?;
+        }
+
+        for mut scrub in intent_scrubs {
+            if scrub.was_prepared {
+                let terminalized = sqlx::query(
+                    "UPDATE provider_context_mutations
+                     SET state = 'applied', finished_at = ?,
+                         terminal_reason = 'already_satisfied'
+                     WHERE mutation_id = ? AND state = 'prepared'
+                       AND intent_ciphertext = ?",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(&scrub.mutation_id)
+                .bind(&scrub.original_ciphertext)
+                .execute(&mut **transaction)
+                .await
+                .context("failed to terminalize erased prepared Replace")?;
                 require_single_cas(
-                    result.rows_affected(),
-                    "ProviderContextMutationEraseTerminalize",
+                    terminalized.rows_affected(),
+                    "ProviderContextMutationRetentionEraseTerminalize",
                 )?;
             }
 
-            // The encrypted insert is non-semantic and may be removed without
-            // changing intent_hmac. Overwrite the old envelope first so SQLite
-            // does not retain a replayable ciphertext in the live page.
-            sqlx::query(
+            let original_len = scrub.original_ciphertext.len();
+            let zeroed = sqlx::query(
                 "UPDATE provider_context_mutations
                  SET intent_ciphertext = zeroblob(length(intent_ciphertext))
-                 WHERE mutation_id = ?",
+                 WHERE mutation_id = ? AND intent_ciphertext = ?",
             )
-            .bind(&mutation_id)
+            .bind(&scrub.mutation_id)
+            .bind(&scrub.original_ciphertext)
             .execute(&mut **transaction)
             .await
-            .context("failed to zero erased provider-context mutation intent")?;
+            .context("failed to zero erased Replace envelope")?;
+            require_single_cas(
+                zeroed.rows_affected(),
+                "ProviderContextMutationRetentionEraseZero",
+            )?;
 
-            full.key_ref.clear();
-            full.ciphertext.zeroize();
-            full.ciphertext.clear();
+            scrub.full.key_ref.clear();
+            scrub.full.ciphertext.zeroize();
+            scrub.full.ciphertext.clear();
             let mut full_json = Zeroizing::new(
-                serde_json::to_vec(&full)
-                    .context("failed to serialize scrubbed provider-context mutation intent")?,
+                serde_json::to_vec(&scrub.full)
+                    .context("failed to serialize scrubbed Replace envelope")?,
             );
-            let scrubbed_ciphertext = encrypt_content(&mutation_key, &full_json, &aad)?;
+            let scrubbed_ciphertext = encrypt_content(&scrub.mutation_key, &full_json, &scrub.aad)?;
             full_json.zeroize();
-            let result = sqlx::query(
+            let persisted = sqlx::query(
                 "UPDATE provider_context_mutations
                  SET intent_ciphertext = ?
-                 WHERE mutation_id = ?",
+                 WHERE mutation_id = ? AND intent_ciphertext = zeroblob(?)",
             )
             .bind(scrubbed_ciphertext)
-            .bind(&mutation_id)
+            .bind(&scrub.mutation_id)
+            .bind(i64::try_from(original_len).context("mutation envelope length overflow")?)
             .execute(&mut **transaction)
             .await
-            .context("failed to persist scrubbed provider-context mutation intent")?;
-            require_single_cas(result.rows_affected(), "ProviderContextMutationEraseScrub")?;
+            .context("failed to persist scrubbed Replace envelope")?;
+            require_single_cas(
+                persisted.rows_affected(),
+                "ProviderContextMutationRetentionEraseScrub",
+            )?;
         }
 
-        Ok(protected_key_refs)
+        if !live_targets.is_empty() || !candidate_key_refs.is_empty() {
+            commit_provider_context_projection_set(self.store, transaction, &projection_checkpoint)
+                .await?;
+        }
+
+        self.close_and_destroy_provider_context_keys(transaction, candidate_key_refs)
+            .await?;
+
+        Ok(())
     }
 
     pub(crate) async fn prepare(&self, prepared: &PreparedProviderContextMutation) -> Result<()> {
@@ -1758,9 +1948,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
 
     /// Persist one prepared intent inside an existing EventWriter transaction.
     ///
-    /// Destructive provider-context application remains a separate, common
-    /// eventless projection. This entry point exists so an attempt disposition
-    /// and the durable prepare record cannot be split by a crash.
+    /// This entry point keeps the durable prepare record in the same
+    /// EventWriter transaction as its `MemoryMaintenance` evidence, so the
+    /// authenticated event and projection transition cannot be split by a
+    /// crash.
     pub(in crate::store) async fn prepare_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -2139,6 +2330,89 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Ok(())
     }
 
+    async fn authenticate_replace_envelope(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        full: &FullIntent,
+        intent_key: &[u8],
+        messages: &[ContextMessage],
+    ) -> Result<(
+        ProviderContextItem,
+        AuthenticatedProviderContextKeyRef,
+        ProviderContextOwnerEventEvidence,
+    )> {
+        if !full.is_replace() || full.key_ref.is_empty() || full.ciphertext.is_empty() {
+            bail!("Replace provider-context mutation is missing encrypted insert");
+        }
+        let provider_context_key = self
+            .store
+            .data_key_by_ref_in_transaction(transaction, &full.key_ref)
+            .await
+            .context("failed to load Replace provider-context key")?;
+        if provider_context_key.purpose != DataKeyPurpose::ProviderContext {
+            bail!("provider-context insert key has wrong purpose");
+        }
+        let aad = self.store.scope().row_aad(
+            "provider_context",
+            &full.provider_context_id,
+            DataKeyPurpose::ProviderContext,
+        );
+        let plaintext = Zeroizing::new(
+            decrypt_content(&provider_context_key, &full.ciphertext, &aad)
+                .context("failed to decrypt provider-context insert for plaintext HMAC check")?,
+        );
+        let expected = hmac_sha256(intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext);
+        if expected.as_slice().ct_eq(&full.plaintext_hmac).unwrap_u8() != 1 {
+            bail!("Replace provider-context mutation plaintext HMAC mismatch");
+        }
+        let item: ProviderContextItem = serde_json::from_slice(&plaintext)
+            .context("Replace provider-context plaintext is not a ProviderContextItem")?;
+        full.validate_replace_insert(self.store.scope(), &item)
+            .context("Replace provider-context insert metadata is not canonical")?;
+
+        let owner_message = messages.iter().find_map(|message| match message {
+            ContextMessage::Persisted {
+                id,
+                seq,
+                message: Message::Assistant(assistant),
+            } if id == &item.retention_owner.message_id
+                && *seq == item.retention_owner.message_seq =>
+            {
+                Some((
+                    Message::Assistant(assistant.clone()),
+                    assistant.origin.clone(),
+                ))
+            }
+            ContextMessage::Persisted { .. } | ContextMessage::Synthetic { .. } => None,
+        });
+        let Some((owner_message, owner_origin)) = owner_message else {
+            bail!(
+                "Replace provider-context retention owner {}:{} is not an authenticated persisted assistant",
+                item.retention_owner.message_id,
+                item.retention_owner.message_seq
+            );
+        };
+        if owner_origin != item.provider_origin {
+            bail!(
+                "Replace provider-context provider origin does not match its authenticated retention owner"
+            );
+        }
+        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+        | ProviderContextPayload::AnthropicCompaction { coverage, .. } = &item.payload
+        {
+            validate_native_suffix_for_hydration(messages, coverage.through_message_seq).map_err(
+                |message| anyhow!("Replace provider-context native coverage is invalid: {message}"),
+            )?;
+        }
+
+        let key_ref = AuthenticatedProviderContextKeyRef(full.key_ref.clone());
+        let evidence = ProviderContextOwnerEventEvidence {
+            anchor: item.retention_owner.clone(),
+            message: owner_message,
+        };
+        Ok((item, key_ref, evidence))
+    }
+
     /// Apply one prepared provider-context mutation inside an EventWriter
     /// transaction.  The intent and, for Replace, the encrypted plaintext HMAC
     /// are revalidated before any durable writes.
@@ -2447,7 +2721,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .await?;
             commit_provider_context_projection_set(self.store, transaction, projection_checkpoint)
                 .await?;
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
+            self.close_and_destroy_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
             Ok(ApplyOutcome::Applied)
         } else {
@@ -2461,7 +2735,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .await?;
             commit_provider_context_projection_set(self.store, transaction, projection_checkpoint)
                 .await?;
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
+            self.close_and_destroy_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
             Ok(ApplyOutcome::Applied)
         }
@@ -2797,12 +3071,171 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Ok(())
     }
 
-    async fn destroy_unreferenced_provider_context_keys(
+    async fn close_and_destroy_provider_context_keys(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         key_refs: BTreeSet<AuthenticatedProviderContextKeyRef>,
     ) -> Result<()> {
+        if key_refs.is_empty() {
+            return Ok(());
+        }
+
+        struct TerminalEnvelopeScrub {
+            mutation_id: String,
+            original_ciphertext: Vec<u8>,
+            mutation_key: DataKeyMaterial,
+            aad: RowAad,
+            full: FullIntent,
+        }
+
+        // Provider-context data keys are also referenced by encrypted Replace
+        // envelopes. Close that complete authenticated reference set before
+        // destroying any candidate key.
+        let projection_checkpoint =
+            verify_provider_context_projection_set(self.store, transaction).await?;
+        let messages = self.store.hydrate_messages(transaction).await?;
+        let rows = sqlx::query(
+            "SELECT mutation_id, state, intent_key_ref, intent_ciphertext,
+                    hmac_key_id, intent_hmac
+             FROM provider_context_mutations
+             ORDER BY mutation_id",
+        )
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to load mutation envelopes before provider-context key destruction")?;
+        let mut protected = BTreeSet::new();
+        let mut scrubs = Vec::new();
+        let mut owner_evidence = Vec::new();
+        for row in rows {
+            let mutation_id: String = row.try_get("mutation_id")?;
+            let state: String = row.try_get("state")?;
+            if !matches!(state.as_str(), "prepared" | "applied" | "superseded") {
+                bail!("provider-context mutation {mutation_id} has invalid state {state}");
+            }
+            let hmac_key_id: String = row.try_get("hmac_key_id")?;
+            if hmac_key_id != INTENT_HMAC_KEY_ID {
+                bail!("provider-context mutation {mutation_id} has unsupported HMAC key id");
+            }
+            let mutation_key_ref: String = row.try_get("intent_key_ref")?;
+            let original_ciphertext: Vec<u8> = row.try_get("intent_ciphertext")?;
+            let stored_hmac: Vec<u8> = row.try_get("intent_hmac")?;
+            let mutation_key = self
+                .store
+                .data_key_by_ref_in_transaction(transaction, &mutation_key_ref)
+                .await?;
+            if mutation_key.purpose != DataKeyPurpose::Mutation {
+                bail!("provider-context mutation {mutation_id} key has wrong purpose");
+            }
+            let aad = self.store.scope().row_aad(
+                "provider_context_mutations",
+                &mutation_id,
+                DataKeyPurpose::Mutation,
+            );
+            let intent_key =
+                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let full = self.decrypt_full_intent(
+                &mutation_key,
+                &original_ciphertext,
+                &aad,
+                &intent_key,
+                &stored_hmac,
+                "stored",
+            )?;
+            full.validate_identity_and_variant(&mutation_id)?;
+            if !full.is_replace() {
+                continue;
+            }
+            if full.key_ref.is_empty() && full.ciphertext.is_empty() {
+                if state == "prepared" {
+                    bail!("prepared mutation {mutation_id} has an empty Replace envelope");
+                }
+                continue;
+            }
+            if full.key_ref.is_empty() || full.ciphertext.is_empty() {
+                bail!("mutation {mutation_id} has an incomplete Replace envelope");
+            }
+            let (_, insert_key_ref, evidence) = self
+                .authenticate_replace_envelope(transaction, &full, &intent_key, &messages)
+                .await?;
+            owner_evidence.push(evidence);
+            if state == "prepared" {
+                protected.insert(insert_key_ref);
+            } else if key_refs.contains(&insert_key_ref) {
+                scrubs.push(TerminalEnvelopeScrub {
+                    mutation_id,
+                    original_ciphertext,
+                    mutation_key,
+                    aad,
+                    full,
+                });
+            }
+        }
+        authenticate_provider_context_owner_events(self.store, transaction, &owner_evidence)
+            .await
+            .context("failed to authenticate Replace owners before key-reference closure")?;
+        for mut scrub in scrubs {
+            let original_len = scrub.original_ciphertext.len();
+            let zeroed = sqlx::query(
+                "UPDATE provider_context_mutations
+                 SET intent_ciphertext = zeroblob(length(intent_ciphertext))
+                 WHERE mutation_id = ? AND intent_ciphertext = ?",
+            )
+            .bind(&scrub.mutation_id)
+            .bind(&scrub.original_ciphertext)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(
+                zeroed.rows_affected(),
+                "ProviderContextMutationKeyClosureZero",
+            )?;
+            scrub.full.key_ref.clear();
+            scrub.full.ciphertext.zeroize();
+            scrub.full.ciphertext.clear();
+            let mut plaintext = Zeroizing::new(serde_json::to_vec(&scrub.full)?);
+            let ciphertext = encrypt_content(&scrub.mutation_key, &plaintext, &scrub.aad)?;
+            plaintext.zeroize();
+            let persisted = sqlx::query(
+                "UPDATE provider_context_mutations
+                 SET intent_ciphertext = ?
+                 WHERE mutation_id = ? AND intent_ciphertext = zeroblob(?)",
+            )
+            .bind(ciphertext)
+            .bind(&scrub.mutation_id)
+            .bind(i64::try_from(original_len).context("mutation envelope length overflow")?)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(
+                persisted.rows_affected(),
+                "ProviderContextMutationKeyClosureScrub",
+            )?;
+        }
+        if !key_refs.is_empty()
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provider_context_mutations
+                 WHERE intent_ciphertext = zeroblob(length(intent_ciphertext))",
+            )
+            .fetch_one(&mut **transaction)
+            .await?
+                != 0
+        {
+            bail!("provider-context key closure left a zeroed mutation envelope");
+        }
+        // This commit is required only when one or more terminal envelopes
+        // were actually scrubbed.
+        let changed = provider_context_set_digest(self.store, transaction).await?
+            != (
+                projection_checkpoint.record_count,
+                projection_checkpoint.set_digest,
+            );
+        if changed {
+            commit_provider_context_projection_set(self.store, transaction, &projection_checkpoint)
+                .await?;
+        }
+
         for key_ref in key_refs {
+            if protected.contains(&key_ref) {
+                continue;
+            }
             let key = self
                 .store
                 .data_key_by_ref_in_transaction(transaction, &key_ref.0)
@@ -3083,6 +3516,15 @@ mod tests {
     }
 
     async fn seed_message(store: &Store, id: &str, seq: u64) -> anyhow::Result<()> {
+        seed_message_with_origin(store, id, seq, reasoning_origin()).await
+    }
+
+    async fn seed_message_with_origin(
+        store: &Store,
+        id: &str,
+        seq: u64,
+        origin: ProviderOrigin,
+    ) -> anyhow::Result<()> {
         // These provider-context unit fixtures exercise row-local provider
         // semantics rather than the transcript/event projection contract.
         // Freeze the empty EventWriter checkpoint before the deliberate direct
@@ -3095,7 +3537,6 @@ mod tests {
             .conversation_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
-        let origin = reasoning_origin();
         let message = PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![PublicAssistantContent::Text {
                 text: "assistant".to_owned(),
@@ -3133,6 +3574,22 @@ mod tests {
         .bind(i64::from(store.redactor().version()))
         .execute(store.pool())
         .await?;
+        Ok(())
+    }
+
+    async fn erase_owners<'a>(
+        store: &Store,
+        owners: impl IntoIterator<Item = (&'a str, u64)>,
+    ) -> anyhow::Result<()> {
+        let owners = owners
+            .into_iter()
+            .map(|(id, seq)| (id.to_owned(), seq))
+            .collect();
+        let mut transaction = store.pool().begin().await?;
+        ProviderContextMutationApplier::new(store)
+            .erase_for_retention_owners(&mut transaction, &owners)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -4546,7 +5003,10 @@ mod tests {
         }
     }
 
-    async fn insert_native_compaction(store: &Store, item: &ProviderContextItem) -> String {
+    async fn native_compaction_record(
+        store: &Store,
+        item: &ProviderContextItem,
+    ) -> EncryptedProviderContextRecord {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
@@ -4557,7 +5017,6 @@ mod tests {
             })
             .await
             .expect("mint native provider-context key");
-        let id = provider_context_record_id(item);
         EncryptedProviderContextRecord::encrypt(
             item,
             &item.provider_origin.provider_instance_id,
@@ -4568,10 +5027,486 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt native compaction")
-        .insert_committed(store)
-        .await
-        .expect("insert native compaction");
+    }
+
+    async fn insert_native_compaction(store: &Store, item: &ProviderContextItem) -> String {
+        let id = provider_context_record_id(item);
+        native_compaction_record(store, item)
+            .await
+            .insert_committed(store)
+            .await
+            .expect("insert native compaction");
         id
+    }
+
+    #[tokio::test]
+    async fn retention_erasure_selects_exact_native_owner_not_coverage_for_both_protocols() {
+        for anthropic in [false, true] {
+            let store = store().await;
+            let origin = ProviderOrigin {
+                provider_instance_id: "provider-instance-1".to_owned(),
+                protocol: if anthropic {
+                    ApiProtocol::AnthropicMessages
+                } else {
+                    ApiProtocol::OpenAiResponses
+                },
+                model: "model-1".to_owned(),
+            };
+            seed_message_with_origin(&store, "coverage-owner", 4, origin.clone())
+                .await
+                .unwrap();
+            seed_message_with_origin(&store, "retention-owner", 6, origin)
+                .await
+                .unwrap();
+            seed_owner_event_evidence(&store, &[("coverage-owner", 4), ("retention-owner", 6)])
+                .await
+                .unwrap();
+
+            let item = native_compaction_item(anthropic, "retention-owner", 6, 4);
+            let id = insert_native_compaction(&store, &item).await;
+            let key_ref = provider_context_owner_key_ref(store.scope(), &item.retention_owner);
+
+            erase_owners(&store, [("coverage-owner", 4)])
+                .await
+                .expect("coverage endpoint is not the retention owner");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                1,
+                "dropping native coverage must not erase its distinct owner"
+            );
+            assert_eq!(
+                data_key_state(&store, &key_ref).await.as_deref(),
+                Some("active")
+            );
+
+            erase_owners(&store, [("retention-owner", 6)])
+                .await
+                .expect("exact native retention owner erases the row");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                data_key_state(&store, &key_ref).await.as_deref(),
+                Some("destroyed")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_erasure_scrubs_dropped_replace_without_recovery_resurrection() {
+        for initial_state in ["prepared", "superseded"] {
+            let store = store().await;
+            seed_message(&store, "coverage", 4).await.unwrap();
+            seed_message_in_open_l0_batch(&store, "owner", 7, 1_000_000)
+                .await
+                .unwrap();
+            seed_owner_event_evidence(&store, &[("coverage", 4), ("owner", 7)])
+                .await
+                .unwrap();
+            let item = native_compaction_item(false, "owner", 7, 4);
+            let record = native_compaction_record(&store, &item).await;
+            let insert_key_ref = record.key_ref.clone();
+            let mutation_id = format!("retention-{initial_state}");
+            let intent = ProviderContextMutationBuilder::new(
+                store
+                    .conversation_key(DataKeyPurpose::Mutation)
+                    .await
+                    .unwrap(),
+                store.scope().clone(),
+                mutation_id.clone(),
+            )
+            .build_replace(None, vec![], &record, &item, 1, 1)
+            .unwrap();
+            let applier = ProviderContextMutationApplier::new(&store);
+            applier.prepare(&intent).await.unwrap();
+
+            if initial_state == "superseded" {
+                let mut transaction = store.pool().begin().await.unwrap();
+                let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE provider_context_mutations
+                     SET state = 'superseded', finished_at = ?,
+                         terminal_reason = 'newer_replace'
+                     WHERE mutation_id = ? AND state = 'prepared'",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(&mutation_id)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+                commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+            }
+
+            erase_owners(&store, [("owner", 7)]).await.unwrap();
+            let (state, reason, scrubbed_ciphertext): (String, Option<String>, Vec<u8>) =
+                sqlx::query_as(
+                    "SELECT state, terminal_reason, intent_ciphertext
+                     FROM provider_context_mutations WHERE mutation_id = ?",
+                )
+                .bind(&mutation_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            if initial_state == "prepared" {
+                assert_eq!(state, "applied");
+                assert_eq!(reason.as_deref(), Some("already_satisfied"));
+            } else {
+                assert_eq!(state, "superseded");
+                assert_eq!(reason.as_deref(), Some("newer_replace"));
+            }
+
+            let mutation_key = store
+                .data_key_by_ref(&intent.intent_key_ref)
+                .await
+                .expect("mutation key remains available for audit");
+            let aad = store.scope().row_aad(
+                "provider_context_mutations",
+                &mutation_id,
+                DataKeyPurpose::Mutation,
+            );
+            let plaintext =
+                Zeroizing::new(decrypt_content(&mutation_key, &scrubbed_ciphertext, &aad).unwrap());
+            let scrubbed: FullIntent = serde_json::from_slice(&plaintext).unwrap();
+            assert!(scrubbed.key_ref.is_empty());
+            assert!(scrubbed.ciphertext.is_empty());
+            assert_eq!(
+                data_key_state(&store, &insert_key_ref).await.as_deref(),
+                Some("destroyed")
+            );
+
+            applier
+                .recover()
+                .await
+                .expect("terminal scrubbed Replace cannot resurrect");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                    .bind(record.id())
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                0
+            );
+            erase_owners(&store, [("owner", 7)])
+                .await
+                .expect("repeated erasure accepts authenticated terminal scrub");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_drop_scrubs_prepared_native_and_preserves_unrelated_prepared_replace() {
+        let store = store().await;
+        seed_message(&store, "coverage", 4).await.unwrap();
+        let dropped_batch = seed_message_in_open_l0_batch(&store, "dropped-owner", 7, 0)
+            .await
+            .unwrap();
+        seed_message_in_open_l0_batch(&store, "kept-owner", 9, 1_000_000)
+            .await
+            .unwrap();
+        seed_owner_event_evidence(
+            &store,
+            &[("coverage", 4), ("dropped-owner", 7), ("kept-owner", 9)],
+        )
+        .await
+        .unwrap();
+
+        let dropped_item = native_compaction_item(false, "dropped-owner", 7, 4);
+        let dropped_record = native_compaction_record(&store, &dropped_item).await;
+        assert!(
+            dropped_record.message_id.is_none(),
+            "native fixture must exercise the unanchored row shape"
+        );
+        assert_ne!(
+            dropped_item.retention_owner.message_seq, 4,
+            "coverage and retention owner must remain distinct"
+        );
+        let dropped_id = dropped_record.id().to_owned();
+        let dropped_key_ref = dropped_record.key_ref.clone();
+        let dropped_intent = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .unwrap(),
+            store.scope().clone(),
+            "drop-native",
+        )
+        .build_replace(None, vec![], &dropped_record, &dropped_item, 1, 1)
+        .unwrap();
+
+        let kept_item = reasoning_item("kept-owner", 9);
+        let kept_record = reasoning_record(&store, "kept-owner", 9).await;
+        let kept_id = kept_record.id().to_owned();
+        let kept_key_ref = kept_record.key_ref.clone();
+        let kept_intent = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .unwrap(),
+            store.scope().clone(),
+            "keep-reasoning",
+        )
+        .build_replace(None, vec![], &kept_record, &kept_item, 1, 1)
+        .unwrap();
+        let applier = ProviderContextMutationApplier::new(&store);
+        applier.prepare(&dropped_intent).await.unwrap();
+        applier.prepare(&kept_intent).await.unwrap();
+
+        let batch_uuid = uuid::Uuid::parse_str(&dropped_batch).unwrap();
+        let version = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(&dropped_batch)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("fixture_drop_native_owner").unwrap(),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        expected_source_versions: BTreeMap::from([(batch_uuid, version)]),
+                        batch_mutations: vec![super::super::event_writer::MemoryBatchMutation {
+                            batch_id: batch_uuid,
+                            expected_version: version,
+                            new_state: MemoryBatchState::Dropped,
+                            summary: None,
+                            est_tokens: 0,
+                            footprint_delta: 0,
+                            delete_membership: true,
+                        }],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("actual memory transition erases exact owner");
+
+        let dropped_state: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, terminal_reason FROM provider_context_mutations
+             WHERE mutation_id = 'drop-native'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            dropped_state,
+            ("applied".to_owned(), Some("already_satisfied".to_owned()))
+        );
+        let kept_state: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, terminal_reason FROM provider_context_mutations
+             WHERE mutation_id = 'keep-reasoning'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(kept_state, ("prepared".to_owned(), None));
+        assert_eq!(
+            data_key_state(&store, &dropped_key_ref).await.as_deref(),
+            Some("destroyed")
+        );
+        assert_eq!(
+            data_key_state(&store, &kept_key_ref).await.as_deref(),
+            Some("active")
+        );
+
+        applier.recover().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind(&dropped_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            0,
+            "dropped prepared native context must never resurrect"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind(&kept_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            1,
+            "unrelated prepared reasoning context remains recoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_drop_rejects_coherently_recommitted_membership_tamper_before_writes() {
+        let store = store().await;
+        seed_message(&store, "extra-member", 4).await.unwrap();
+        let dropped_batch = seed_message_in_open_l0_batch(&store, "dropped-owner", 7, 0)
+            .await
+            .unwrap();
+        seed_owner_event_evidence(&store, &[("extra-member", 4), ("dropped-owner", 7)])
+            .await
+            .unwrap();
+        let writer = EventWriter::new(std::sync::Arc::new(store.clone()));
+        writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("freeze the legitimate event-backed memory checkpoint");
+
+        // Forge a self-consistent SQLite projection (membership digest and
+        // stored projection digest) without the durable event metadata that is
+        // the authority for the projection reference.
+        let mut transaction = store.pool().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO memory_batch_messages(batch_id, message_id, ord)
+             VALUES(?, 'extra-member', 2)",
+        )
+        .bind(&dropped_batch)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        let (membership_count, membership_digest) =
+            super::super::memory_state::recompute_memory_membership_digest(
+                store.scope(),
+                &mut transaction,
+                &dropped_batch,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE memory_batches
+             SET membership_count = ?, membership_digest = ?
+             WHERE id = ?",
+        )
+        .bind(i64::try_from(membership_count).unwrap())
+        .bind(membership_digest.as_slice())
+        .bind(&dropped_batch)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        let projection_key = super::super::memory_state::MemoryProjectionKey {
+            entity: super::super::memory_state::MemoryProjectionEntity::Batch,
+            id: dropped_batch.clone(),
+        };
+        let forged_digest = super::super::memory_state::compute_memory_projection_digest(
+            store.scope(),
+            &mut transaction,
+            &projection_key,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE memory_batches SET projection_digest = ? WHERE id = ?")
+            .bind(forged_digest.as_slice())
+            .bind(&dropped_batch)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let before = destructive_state_snapshot(&store).await;
+        let batch_uuid = uuid::Uuid::parse_str(&dropped_batch).unwrap();
+        let version = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(&dropped_batch)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("forged_membership_drop").unwrap(),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        expected_source_versions: BTreeMap::from([(batch_uuid, version)]),
+                        batch_mutations: vec![super::super::event_writer::MemoryBatchMutation {
+                            batch_id: batch_uuid,
+                            expected_version: version,
+                            new_state: MemoryBatchState::Dropped,
+                            summary: None,
+                            est_tokens: 0,
+                            footprint_delta: 0,
+                            delete_membership: true,
+                        }],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("eventless coherent memory projection rewrite must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the authenticated event-chain checkpoint"),
+            "{error:#}"
+        );
+        assert_eq!(
+            destructive_state_snapshot(&store).await,
+            before,
+            "checkpoint mismatch must reject before provider erasure, membership deletion, batch mutation, key destruction, or event append"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_erasure_rejects_prepared_invalidation_overlap_before_writes() {
+        let store = store().await;
+        seed_message_in_open_l0_batch(&store, "owner", 7, 1_000_000)
+            .await
+            .unwrap();
+        seed_owner_event_evidence(&store, &[("owner", 7)])
+            .await
+            .unwrap();
+        let record = reasoning_record(&store, "owner", 7).await;
+        let record_id = record.id().to_owned();
+        record.insert_committed(&store).await.unwrap();
+
+        let intent = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .unwrap(),
+            store.scope().clone(),
+            "overlapping-invalidate",
+        )
+        .build_invalidate(None, vec![record_id])
+        .unwrap();
+        ProviderContextMutationApplier::new(&store)
+            .prepare(&intent)
+            .await
+            .unwrap();
+        let before = destructive_state_snapshot(&store).await;
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = ProviderContextMutationApplier::new(&store)
+            .erase_for_retention_owners(
+                &mut transaction,
+                &BTreeSet::from([("owner".to_owned(), 7)]),
+            )
+            .await
+            .expect_err("prepared invalidation overlap must defer retention erasure");
+        assert!(
+            error.to_string().contains("invalidation overlaps"),
+            "{error:#}"
+        );
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            destructive_state_snapshot(&store).await,
+            before,
+            "overlap rejection must happen before any durable write"
+        );
     }
 
     #[tokio::test]
@@ -4735,7 +5670,26 @@ mod tests {
         let old_record = reasoning_record(&store, "message-1", 7).await;
         let old_id = old_record.id().to_owned();
         let key_ref = old_record.key_ref.clone();
-        old_record.insert_committed(&store).await.unwrap();
+        let applier = ProviderContextMutationApplier::new(&store);
+        let intent_a = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            store.scope().clone(),
+            "mutation-a",
+        )
+        .build_replace(
+            None,
+            vec![],
+            &old_record,
+            &reasoning_item("message-1", 7),
+            1,
+            1,
+        )
+        .expect("build initial replace");
+        applier.prepare(&intent_a).await.unwrap();
+        applier.apply("mutation-a").await.unwrap();
 
         let new_record = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let new_id = new_record.id().to_owned();
@@ -4744,24 +5698,23 @@ mod tests {
             .conversation_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
-        let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
             mutation_key,
             store.scope().clone(),
-            "mutation-1".to_owned(),
+            "mutation-b".to_owned(),
         )
         .build_replace(
-            None,
+            Some(old_id.clone()),
             vec![old_id.clone()],
             &new_record,
             &reasoning_item_with("message-1", 7, 0, 1),
             1,
-            1,
+            2,
         )
         .expect("build replace");
 
         applier.prepare(&prepared).await.unwrap();
-        applier.apply("mutation-1").await.unwrap();
+        applier.apply("mutation-b").await.unwrap();
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
             .bind(old_id)
@@ -4781,6 +5734,102 @@ mod tests {
         assert_eq!(
             state, "active",
             "shared anchor key must stay active while replacement row references it"
+        );
+
+        let old_envelope: Vec<u8> = sqlx::query_scalar(
+            "SELECT intent_ciphertext FROM provider_context_mutations
+             WHERE mutation_id = 'mutation-a'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let mutation_key = store
+            .data_key_by_ref(&intent_a.intent_key_ref)
+            .await
+            .unwrap();
+        let aad = store.scope().row_aad(
+            "provider_context_mutations",
+            "mutation-a",
+            DataKeyPurpose::Mutation,
+        );
+        let plaintext =
+            Zeroizing::new(decrypt_content(&mutation_key, &old_envelope, &aad).unwrap());
+        let closed: FullIntent = serde_json::from_slice(&plaintext).unwrap();
+        assert!(
+            closed.key_ref.is_empty() && closed.ciphertext.is_empty(),
+            "deleted insert envelope must be scrubbed even while its shared key remains active"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_protects_prepared_insert_that_shares_candidate_key() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
+            .await
+            .unwrap();
+        let old = reasoning_record(&store, "message-1", 7).await;
+        let old_id = old.id().to_owned();
+        let shared_key_ref = old.key_ref.clone();
+        old.insert_committed(&store).await.unwrap();
+
+        let replacement_item = reasoning_item_with("message-1", 7, 0, 1);
+        let replacement = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
+        let replacement_id = replacement.id().to_owned();
+        assert_eq!(replacement.key_ref, shared_key_ref);
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared_replace = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .unwrap(),
+            store.scope().clone(),
+            "prepared-shared-insert",
+        )
+        .build_replace(None, vec![], &replacement, &replacement_item, 1, 1)
+        .unwrap();
+        applier.prepare(&prepared_replace).await.unwrap();
+
+        let invalidate = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .unwrap(),
+            store.scope().clone(),
+            "invalidate-shared-live",
+        )
+        .build_invalidate(None, vec![old_id])
+        .unwrap();
+        applier.prepare(&invalidate).await.unwrap();
+        applier.apply("invalidate-shared-live").await.unwrap();
+        assert_eq!(
+            data_key_state(&store, &shared_key_ref).await.as_deref(),
+            Some("active"),
+            "authenticated prepared insert keeps its candidate key alive"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM provider_context_mutations
+                 WHERE mutation_id = 'prepared-shared-insert'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            "prepared"
+        );
+
+        applier.recover().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind(replacement_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            1,
+            "protected prepared insert remains recoverable"
         );
     }
 
@@ -6652,9 +7701,13 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_message(&store, "message-2", 8).await.unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7), ("message-2", 8)])
-            .await
-            .unwrap();
+        seed_message(&store, "unrelated-owner", 10).await.unwrap();
+        seed_owner_event_evidence(
+            &store,
+            &[("message-1", 7), ("message-2", 8), ("unrelated-owner", 10)],
+        )
+        .await
+        .unwrap();
         seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
@@ -6714,6 +7767,11 @@ mod tests {
             applier.apply("invalidate-b").await.unwrap(),
             ApplyOutcome::Applied
         );
+        erase_owners(&store, [("unrelated-owner", 10)])
+            .await
+            .expect(
+                "a later unrelated retention erasure must not depend on B's destroyed insert key",
+            );
 
         let head: i64 =
             sqlx::query_scalar("SELECT max_window_ordinal FROM provider_context_replace_heads")

@@ -2789,10 +2789,18 @@ impl EventWriter {
 
             let mut captured = Vec::with_capacity(memory_keys.len());
             for key in memory_keys {
-                captured.push(
+                let captured_ref =
                     capture_memory_projection_ref(self.store.scope(), &mut transaction, key)
-                        .await?,
-                );
+                        .await?;
+                let expected = updated_memory_projections.get(&captured_ref.0);
+                if expected != captured_ref.1.as_ref() {
+                    bail!(
+                        "current {:?} {} projection does not match the authenticated event-chain checkpoint",
+                        captured_ref.0.entity,
+                        captured_ref.0.id
+                    );
+                }
+                captured.push(captured_ref);
             }
 
             if !memory_bearing
@@ -10062,7 +10070,7 @@ pub(super) async fn authenticate_running_tool_intent(
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
     let checkpoint =
-        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
+        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction, true).await?;
     transaction.commit().await?;
     Ok(checkpoint)
 }
@@ -10071,7 +10079,7 @@ pub(super) async fn authenticate_event_log_snapshot(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<()> {
-    reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, true)
         .await
         .map(|_| ())
 }
@@ -10106,7 +10114,12 @@ pub(super) async fn authenticate_provider_context_owner_events(
         return Ok(());
     }
 
-    authenticate_event_log_snapshot(store, transaction)
+    // Provider mutations may call this after staging an authenticated memory
+    // footprint delta but before the enclosing EventWriter commits its new
+    // memory-projection event metadata. Authenticate the complete event chain
+    // and exact MessageEnd rows without requiring the transient projection
+    // rows to equal the previous event-backed checkpoint.
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, false)
         .await
         .context("failed to authenticate event history for provider-context invalidation")?;
     for (seq, (expected_message_id, expected_message)) in expected {
@@ -10413,6 +10426,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
 async fn reconstruct_authenticated_checkpoint_in_transaction(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
+    verify_current_memory_projection_rows: bool,
 ) -> Result<LifecycleCheckpoint> {
     let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
@@ -10526,10 +10540,12 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 && head.chain_digest == chain_digest => {}
         Some(_) => bail!("durable event history does not match authenticated head"),
     }
-    let stored_memory_projections =
-        load_verified_memory_projection_set(store.scope(), transaction).await?;
-    if stored_memory_projections != memory_projections {
-        bail!("memory projection rows do not exactly match authenticated event commitments");
+    if verify_current_memory_projection_rows {
+        let stored_memory_projections =
+            load_verified_memory_projection_set(store.scope(), transaction).await?;
+        if stored_memory_projections != memory_projections {
+            bail!("memory projection rows do not exactly match authenticated event commitments");
+        }
     }
     let stored_message_count = u64::try_from(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
@@ -12440,132 +12456,31 @@ async fn apply_memory_batch_mutation(
     store: &Store,
 ) -> Result<()> {
     if batch.delete_membership {
-        let provider_projection_checkpoint =
-            verify_provider_context_projection_set(store, transaction).await?;
-        // Capture the data keys that are about to become unreferenced before
-        // we overwrite/delete provider-context rows. We will destroy each key
-        // only after confirming that no remaining provider-context row still
-        // references it, so shared anchor keys (e.g. native compaction windows)
-        // are only erased once the last referencing row is gone.
-        let mut candidate_keys: HashSet<String> = HashSet::new();
-        let mut erased_provider_context_ids: BTreeSet<String> = BTreeSet::new();
-        erased_provider_context_ids.extend(
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM provider_context
-                 WHERE message_id IN (
-                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                 )",
-            )
-            .bind(&batch.batch_id)
-            .fetch_all(&mut **transaction)
-            .await
-            .context("failed to collect provider-context ids for dropped source batch")?,
-        );
-        erased_provider_context_ids.extend(
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM provider_context
-                 WHERE message_id IS NULL
-                   AND coverage_through_seq IN (
-                       SELECT seq FROM messages
-                       WHERE id IN (
-                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                       )
-                   )",
-            )
-            .bind(&batch.batch_id)
-            .fetch_all(&mut **transaction)
-            .await
-            .context("failed to collect native provider-context ids for dropped source batch")?,
-        );
-        candidate_keys.extend(
-            sqlx::query_scalar::<_, String>(
-                "SELECT DISTINCT key_ref FROM provider_context
-                 WHERE message_id IN (
-                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                 )",
-            )
-            .bind(&batch.batch_id)
-            .fetch_all(&mut **transaction)
-            .await
-            .context("failed to collect provider-context key refs for dropped source batch")?,
-        );
-        candidate_keys.extend(
-            sqlx::query_scalar::<_, String>(
-                "SELECT DISTINCT key_ref FROM provider_context
-                 WHERE message_id IS NULL
-                   AND coverage_through_seq IN (
-                       SELECT seq FROM messages
-                       WHERE id IN (
-                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                       )
-                   )",
-            )
-            .bind(&batch.batch_id)
-            .fetch_all(&mut **transaction)
-            .await
-            .context(
-                "failed to collect native provider-context key refs for dropped source batch",
-            )?,
-        );
+        let owner_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT m.id, m.seq
+             FROM memory_batch_messages mbm
+             JOIN messages m ON m.id = mbm.message_id
+             WHERE mbm.batch_id = ?
+             ORDER BY mbm.ord, m.id",
+        )
+        .bind(&batch.batch_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to load exact retention owners for dropped memory batch")?;
+        let mut dropped_owners = BTreeSet::new();
+        for (message_id, message_seq) in owner_rows {
+            let message_seq = u64::try_from(message_seq)
+                .context("dropped memory retention-owner sequence out of range")?;
+            if !dropped_owners.insert((message_id, message_seq)) {
+                bail!("dropped memory batch contains duplicate retention-owner membership");
+            }
+        }
+        Box::pin(
+            ProviderContextMutationApplier::new(store)
+                .erase_for_retention_owners(transaction, &dropped_owners),
+        )
+        .await?;
 
-        // Crypto-erase provider context for every message whose membership is
-        // about to be dropped. We overwrite the ciphertext BLOB with zeros
-        // before deleting the row so that the SQLite free-page bytes are not
-        // left containing the encrypted secret.
-        sqlx::query(
-            "UPDATE provider_context
-             SET ciphertext = zeroblob(length(ciphertext))
-             WHERE message_id IN (
-                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-             )",
-        )
-        .bind(&batch.batch_id)
-        .execute(&mut **transaction)
-        .await
-        .context("failed to crypto-erase provider context for dropped source batch")?;
-        // Native/dedicated compaction windows are not anchored to a single
-        // message, so `message_id` is NULL. Erase those whose coverage endpoint
-        // is a message seq belonging to this batch, without touching unrelated
-        // windows whose coverage ends elsewhere.
-        sqlx::query(
-            "UPDATE provider_context
-             SET ciphertext = zeroblob(length(ciphertext))
-             WHERE message_id IS NULL
-               AND coverage_through_seq IN (
-                   SELECT seq FROM messages
-                   WHERE id IN (
-                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                   )
-               )",
-        )
-        .bind(&batch.batch_id)
-        .execute(&mut **transaction)
-        .await
-        .context("failed to crypto-erase native provider context for dropped source batch")?;
-        sqlx::query(
-            "DELETE FROM provider_context
-             WHERE message_id IN (
-                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-             )",
-        )
-        .bind(&batch.batch_id)
-        .execute(&mut **transaction)
-        .await
-        .context("failed to delete provider context for dropped source batch")?;
-        sqlx::query(
-            "DELETE FROM provider_context
-             WHERE message_id IS NULL
-               AND coverage_through_seq IN (
-                   SELECT seq FROM messages
-                   WHERE id IN (
-                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
-                   )
-               )",
-        )
-        .bind(&batch.batch_id)
-        .execute(&mut **transaction)
-        .await
-        .context("failed to delete native provider context for dropped source batch")?;
         sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
             .bind(&batch.batch_id)
             .execute(&mut **transaction)
@@ -12582,39 +12497,6 @@ async fn apply_memory_batch_mutation(
         .execute(&mut **transaction)
         .await
         .context("failed to reset memory batch membership commitment")?;
-
-        let protected_key_refs = ProviderContextMutationApplier::new(store)
-            .scrub_erased_provider_context_intents(transaction, &erased_provider_context_ids)
-            .await?;
-        if !erased_provider_context_ids.is_empty() {
-            commit_provider_context_projection_set(
-                store,
-                transaction,
-                &provider_projection_checkpoint,
-            )
-            .await?;
-        }
-
-        // Destroy each candidate data key whose wrapped material is no longer
-        // referenced by any provider-context row. This is done inside the same
-        // transaction as the row deletion so the key and its ciphertext are
-        // erased atomically.
-        for key_ref in candidate_keys {
-            let remaining: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE key_ref = ?")
-                    .bind(&key_ref)
-                    .fetch_one(&mut **transaction)
-                    .await
-                    .context("failed to check remaining provider-context references for key ref")?;
-            if remaining == 0 && !protected_key_refs.contains(&key_ref) {
-                store
-                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref)
-                    .await
-                    .with_context(|| {
-                        format!("failed to destroy unreferenced provider-context key {key_ref}")
-                    })?;
-            }
-        }
     }
 
     let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
