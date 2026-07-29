@@ -200,6 +200,11 @@ fn validate_replay_context(
             ))
         }
         None => {
+            if !context.provider_context.is_empty() {
+                return Err(ChatAdapterError::InvalidContext(
+                    "unbound Chat Completions prompt cannot contain provider_context".into(),
+                ));
+            }
             crate::provider::types::validate_native_suffix(&context.messages, None)
                 .map_err(ChatAdapterError::InvalidContext)?;
             Ok(())
@@ -1880,10 +1885,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::memory::context_assembler::bind_sumi_replay_for_origin_test;
+    use crate::memory::context_assembler::{
+        bind_native_replay_for_test, bind_sumi_replay_for_origin_test,
+    };
     use crate::provider::types::{
-        AssistantMessage, ContextMessage, MemoryBlock, ProviderContextItem, ProviderContextPayload,
-        ToolArgumentError, ToolCall, ToolResultMessage, UserMessage, ValidatedToolArguments,
+        AssistantMessage, ContextMessage, MemoryBlock, NativeCompactionCoverage,
+        ProviderContextItem, ProviderContextPayload, ToolArgumentError, ToolCall,
+        ToolResultMessage, UserMessage, ValidatedToolArguments,
     };
 
     fn context() -> PromptContext {
@@ -2095,6 +2103,91 @@ mod tests {
             Err(ChatAdapterError::InvalidContext(message))
                 if message.contains("destination does not match")
         ));
+    }
+
+    #[test]
+    fn unbound_provider_context_is_rejected_without_breaking_manual_contexts() {
+        let chat_spec = ModelSpec::preset("kimi-k3").expect("Chat preset");
+        let responses_spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let context_fingerprint =
+            crate::provider::context_fingerprint::compute_context_fingerprint(
+                &responses_spec,
+                "System.",
+                &[],
+            )
+            .expect("Responses context fingerprint");
+        let mut native = PromptContext {
+            system_prompt: "System.".to_owned(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(2, "strict native suffix")],
+            provider_context: vec![ProviderContextItem {
+                origin_message: None,
+                wire_item_index: None,
+                ordinal: 0,
+                provider_origin: responses_spec.origin(),
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "id":"cmp-chat-cross-protocol",
+                        "type":"compaction",
+                        "encrypted_content":"opaque"
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 1,
+                        context_fingerprint,
+                    },
+                },
+            }],
+            tools: vec![],
+            replay_provenance: None,
+        };
+        bind_native_replay_for_test(&mut native, responses_spec.origin(), 1, Some(2))
+            .expect("bind exact Responses native replay");
+        crate::provider::adapters::responses::build_request(
+            &responses_spec,
+            &native,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("valid Responses native replay");
+        assert!(matches!(
+            build_request(&chat_spec, &native, &RequestOptions::default()),
+            Err(ChatAdapterError::InvalidContext(_))
+        ));
+
+        let encoded = serde_json::to_value(&native).expect("serialize native prompt");
+        let decoded: PromptContext =
+            serde_json::from_value(encoded).expect("deserialize native prompt");
+        assert_eq!(
+            decoded
+                .verified_replay_provenance()
+                .expect("serde-stripped prompt"),
+            None
+        );
+        assert_eq!(decoded.messages.len(), 1);
+        assert_eq!(decoded.provider_context.len(), 1);
+        assert!(matches!(
+            build_request(&chat_spec, &decoded, &RequestOptions::default()),
+            Err(ChatAdapterError::InvalidContext(message))
+                if message.contains("cannot contain provider_context")
+        ));
+
+        let mut normalized_fallback = decoded.clone();
+        bind_sumi_replay_for_origin_test(&mut normalized_fallback, chat_spec.origin(), Some(2))
+            .expect("bind normalized Chat fallback");
+        build_request(&chat_spec, &normalized_fallback, &RequestOptions::default())
+            .expect("sealed normalized replay may discard provider context");
+
+        let synthetic_only = simple_context(vec![user_message("manual synthetic")], vec![]);
+        build_request(&chat_spec, &synthetic_only, &RequestOptions::default())
+            .expect("manual synthetic-only context");
+        let strict_persisted = PromptContext {
+            messages: vec![persisted_user(1, "manual persisted")],
+            ..simple_context(vec![], vec![])
+        };
+        build_request(&chat_spec, &strict_persisted, &RequestOptions::default())
+            .expect("manual strict persisted context");
     }
 
     fn send_snapshot_matrix() -> serde_json::Value {
