@@ -31,10 +31,11 @@ use crate::provider::{
     types::{ApiProtocol, PublicAssistantContent, PublicMessage, UserContent},
 };
 use crate::store::{
-    DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
-    MemoryApplyCursorAdvance, MemoryApplyCursorRecord, MemoryBatchMutation, MemoryBatchRecord,
+    BootstrapRecoveryGuard, DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
+    EventWriter, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryBatchRecord,
     MemoryBatchState, MemoryJobKind, MemoryJobMutation, MemoryJobRecord, MemoryJobStatus,
-    MemoryJobUpdate, MemoryLayer, MemoryTransition, Projection, Store, decrypt_content,
+    MemoryJobUpdate, MemoryLayer, MemoryTransition, Projection, RecoveryBatchWriter, Store,
+    decrypt_content,
 };
 
 use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
@@ -186,13 +187,13 @@ impl CompactError {
 /// use sumi_agent_doctest::memory::compactor::CompactionInput;
 /// use sumi_agent_doctest::provider::types::PromptContext;
 ///
-/// let ctx = PromptContext {
-///     system_prompt: "sys".into(),
-///     memory_blocks: Vec::new(),
-///     messages: Vec::new(),
-///     provider_context: Vec::new(),
-///     tools: Vec::new(),
-/// };
+/// let ctx = PromptContext::new(
+///     "sys".into(),
+///     Vec::new(),
+///     Vec::new(),
+///     Vec::new(),
+///     Vec::new(),
+/// );
 /// let _ = CompactionInput::from_public_batch(&[ctx], None);
 /// ```
 ///
@@ -878,6 +879,7 @@ fn parse_job_status(value: &str) -> Result<MemoryJobStatus> {
         "running" => Ok(MemoryJobStatus::Running),
         "completed" => Ok(MemoryJobStatus::Completed),
         "applied" => Ok(MemoryJobStatus::Applied),
+        "discarded" => Ok(MemoryJobStatus::Discarded),
         "failed" => Ok(MemoryJobStatus::Failed),
         _ => bail!("unknown memory job status: {value}"),
     }
@@ -1136,7 +1138,7 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
     };
     let batch = EventBatch {
         writes: vec![EventWrite {
-            event: None,
+            event: Some(DurableEvent::memory_maintenance("compact_claimed")?),
             projections: vec![Projection::MemoryJobUpdate(update)],
         }],
         injected_commands: Vec::new(),
@@ -1172,7 +1174,7 @@ async fn release_or_reset_job(store: &Store, job: &Job) -> Result<()> {
     EventWriter::new(Arc::new(store.clone()))
         .apply(EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(DurableEvent::memory_maintenance("compact_released")?),
                 projections: vec![Projection::MemoryJobUpdate(update)],
             }],
             injected_commands: Vec::new(),
@@ -1212,7 +1214,7 @@ async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
     EventWriter::new(Arc::new(store.clone()))
         .apply(EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(DurableEvent::memory_maintenance("compact_started")?),
                 projections: vec![Projection::MemoryJobUpdate(update)],
             }],
             injected_commands: Vec::new(),
@@ -1264,13 +1266,15 @@ async fn supersede_stale_job(
             .ok_or_else(|| anyhow!("source batch {source_id} missing for supersede"))?;
         let version: i64 = row.try_get("version")?;
         let state: String = row.try_get("state")?;
+        let batch_uuid = BatchId::parse_str(source_id)
+            .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
+        let version = u64::try_from(version)
+            .with_context(|| format!("source batch {source_id} version out of range"))?;
+        expected_source_versions.insert(batch_uuid, version);
         if state == MemoryBatchState::Compacting.as_str() {
-            let batch_uuid = BatchId::parse_str(source_id)
-                .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
-            expected_source_versions.insert(batch_uuid, version as u64);
             batch_mutations.push(MemoryBatchMutation {
                 batch_id: batch_uuid,
-                expected_version: version as u64,
+                expected_version: version,
                 new_state: MemoryBatchState::CompactFailed,
                 summary: None,
                 est_tokens: 0,
@@ -1474,22 +1478,56 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
     Ok(())
 }
 
-async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
+async fn recover_expired_running_jobs_with<W: RecoveryBatchWriter>(writer: &mut W) -> Result<()> {
+    let store = writer.recovery_store().clone();
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'pending', lease_until = NULL, updated_at = ?
-         WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)",
+    let rows = sqlx::query(
+        "SELECT id, attempts, lease_until
+         FROM memory_jobs
+         WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)
+         ORDER BY batch_seq, id",
     )
     .bind(&now)
-    .bind(&now)
-    .execute(store.pool())
+    .fetch_all(store.pool())
     .await
-    .context("recover expired running jobs")?;
+    .context("list expired running memory jobs")?;
+    for row in rows {
+        let job_id: String = row.try_get("id")?;
+        let attempts: i64 = row.try_get("attempts")?;
+        if attempts < 0 {
+            bail!("expired memory job {job_id} attempts out of range");
+        }
+        let lease_witness: Option<String> = row.try_get("lease_until")?;
+        writer
+            .apply_recovery_batch(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance(
+                        "compact_expired_lease_recovered",
+                    )?),
+                    projections: vec![Projection::MemoryJobUpdate(MemoryJobUpdate {
+                        expected_source_versions: BTreeMap::new(),
+                        job_mutations: vec![MemoryJobMutation::Release {
+                            job_id: job_id.clone(),
+                            expected_attempt: attempts,
+                            lease_witness,
+                        }],
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .with_context(|| format!("recover expired running memory job {job_id}"))?;
+    }
     Ok(())
 }
 
-async fn recover_compacting_batches(store: &Store) -> Result<()> {
+async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_expired_running_jobs_with(&mut writer).await
+}
+
+async fn recover_compacting_batches_with<W: RecoveryBatchWriter>(writer: &mut W) -> Result<()> {
+    let store = writer.recovery_store().clone();
     let rows = sqlx::query(
         "SELECT id, layer, batch_seq, version, summary_key_ref
          FROM memory_batches
@@ -1549,7 +1587,9 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
                 .await
                 .context("check existing memory job for orphan target batch")?;
                 if !target_referenced && source_referenced.is_none() {
-                    repair_orphan_compacting_target(store, &source_id, version).await?;
+                    bail!(
+                        "summaryless compacting target {source_id} has no authenticated owning job; refusing recovery mutation"
+                    );
                 }
                 continue;
             }
@@ -1609,11 +1649,12 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
             job_mutations: Vec::new(),
             batch_inserts: vec![target_record],
             job_inserts: vec![job_record],
+            membership_inserts: Vec::new(),
             cursor_advance: None,
         };
 
-        EventWriter::new(Arc::new(store.clone()))
-            .apply(EventBatch {
+        writer
+            .apply_recovery_batch(EventBatch {
                 writes: vec![EventWrite {
                     event: Some(DurableEvent::memory_maintenance("compact_recovered")?),
                     projections: vec![Projection::MemoryTransition(transition)],
@@ -1629,49 +1670,23 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
     Ok(())
 }
 
-async fn repair_orphan_compacting_target(
-    store: &Store,
-    target_id: &str,
-    version: i64,
-) -> Result<()> {
-    let batch_uuid = BatchId::parse_str(target_id)
-        .with_context(|| format!("orphan target batch id {target_id} is not a UUID"))?;
-    let expected_source_versions = BTreeMap::from([(batch_uuid, version as u64)]);
-
-    let transition = MemoryTransition {
-        expected_source_versions,
-        batch_mutations: vec![MemoryBatchMutation {
-            batch_id: batch_uuid,
-            expected_version: version as u64,
-            new_state: MemoryBatchState::CompactFailed,
-            summary: None,
-            est_tokens: 0,
-            footprint_delta: 0,
-            delete_membership: false,
-        }],
-        job_mutations: Vec::new(),
-        cursor_advance: None,
-        ..Default::default()
-    };
-
-    EventWriter::new(Arc::new(store.clone()))
-        .apply(EventBatch {
-            writes: vec![EventWrite {
-                event: Some(DurableEvent::memory_maintenance("compact_orphan_repair")?),
-                projections: vec![Projection::MemoryTransition(transition)],
-            }],
-            injected_commands: Vec::new(),
-        })
-        .await
-        .context("repair orphan compacting target")?;
-    tracing::debug!("repaired orphan compacting target {target_id}");
-    Ok(())
+async fn recover_compacting_batches(store: &Store) -> Result<()> {
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_compacting_batches_with(&mut writer).await
 }
 
 async fn recover_jobs(store: &Store) -> Result<()> {
-    recover_expired_running_jobs(store).await?;
-    recover_compacting_batches(store).await?;
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_expired_running_jobs_with(&mut writer).await?;
+    recover_compacting_batches_with(&mut writer).await?;
     Ok(())
+}
+
+pub(crate) async fn recover_boot_memory_jobs(
+    writer: &mut BootstrapRecoveryGuard<'_>,
+) -> Result<()> {
+    recover_expired_running_jobs_with(writer).await?;
+    recover_compacting_batches_with(writer).await
 }
 
 /// Apply completed shelves in durable sequence order. All cursor motion is
@@ -1712,22 +1727,36 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             let Some(first) = first else {
                 return Ok(ApplyProgress::None);
             };
-            MemoryApplyCursorRecord {
-                kind: kind_name.to_owned(),
-                next_batch_seq: first,
-            }
-            .insert(store.pool())
-            .await
-            .context("initialize memory apply cursor")?;
+            EventWriter::new(store.clone())
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::memory_maintenance(
+                            "compact_cursor_initialized",
+                        )?),
+                        projections: vec![Projection::MemoryTransition(MemoryTransition {
+                            cursor_advance: Some(MemoryApplyCursorAdvance {
+                                kind: kind_name.to_owned(),
+                                expected: u64::try_from(first)
+                                    .context("initial memory cursor out of range")?,
+                                next: u64::try_from(first)
+                                    .context("initial memory cursor out of range")?,
+                                initialize: true,
+                            }),
+                            ..Default::default()
+                        })],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .context("initialize memory apply cursor")?;
             first
         }
     };
 
     // Scan forward from the cursor to find the first completed job, passing
-    // over applied rows. If we hit a failed job, the FIFO boundary must hold;
-    // any applied holes before it are advanced and we stop. If we hit a
-    // pending/running row after advancing over applied holes, commit a pure
-    // cursor-advance transition for those applied holes and stop.
+    // only applied or explicitly discarded rows. If we hit a failed job, the
+    // FIFO boundary must hold; any terminal holes before it are advanced and
+    // we stop. Pending/running rows likewise block later application.
     let rows = sqlx::query(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
@@ -1748,9 +1777,12 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             continue;
         }
 
-        if job.status == MemoryJobStatus::Applied {
-            // Applied holes are skipped here and swept up by the cursor
-            // advance bundled with the next completed job's transition.
+        if matches!(
+            job.status,
+            MemoryJobStatus::Applied | MemoryJobStatus::Discarded
+        ) {
+            // Applied/discarded holes are swept up by the cursor advance
+            // bundled with the next completed job's transition.
             cursor = batch_seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
@@ -1760,7 +1792,7 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         if job.status == MemoryJobStatus::Failed {
             // A failed job holds the FIFO boundary: later jobs cannot be
             // applied until the failed job is reclaimed or explicitly
-            // discarded. Advance any leading applied holes now.
+            // discarded. Advance any leading applied/discarded holes now.
             if cursor != initial_cursor {
                 advance_apply_cursor(
                     store.clone(),
@@ -1779,7 +1811,7 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         }
 
         if job.status != MemoryJobStatus::Completed {
-            // Pending or running job blocks further application. Any applied
+            // Pending or running job blocks further application. Any terminal
             // holes swept so far must advance the cursor in their own
             // transition so the stream does not drift.
             if cursor != initial_cursor {
@@ -1802,8 +1834,8 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         return apply_completed_job(store.clone(), &job, initial_cursor).await;
     }
 
-    // Reached the end of the durable job list. Advance the cursor over any
-    // trailing terminal holes so they are not revisited.
+    // Reached the end of the durable job list. Advance over any trailing
+    // applied/discarded holes so they are not revisited.
     if cursor != initial_cursor {
         advance_apply_cursor(
             store.clone(),
@@ -1821,6 +1853,36 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
     })
 }
 
+/// Apply every contiguous completed memory shelf through the authoritative
+/// EventWriter transaction boundary.
+///
+/// This operation deliberately depends only on Store. The background
+/// compactor owns speculative provider work; an idle Session owns promotion
+/// and can therefore apply completed shelves without constructing another
+/// compaction provider.
+pub(crate) async fn apply_ready_memory(store: Arc<Store>) -> Result<usize> {
+    let mut applied = 0;
+    loop {
+        let mut progress = false;
+        for kind in [
+            MemoryJobKind::CompactL0,
+            MemoryJobKind::CompactL1,
+            MemoryJobKind::ConsolidateL2,
+        ] {
+            let outcome = apply_next_completed_job(store.clone(), kind).await?;
+            if outcome == ApplyProgress::Applied {
+                applied += 1;
+            }
+            if outcome.made_progress() {
+                progress = true;
+            }
+        }
+        if !progress {
+            return Ok(applied);
+        }
+    }
+}
+
 async fn advance_apply_cursor(
     store: Arc<Store>,
     kind: MemoryJobKind,
@@ -1836,6 +1898,7 @@ async fn advance_apply_cursor(
             kind: kind.as_str().to_owned(),
             expected: expected as u64,
             next: next as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -1900,6 +1963,7 @@ async fn discard_stale_completed_job(
             kind: job.kind.as_str().to_owned(),
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -1934,11 +1998,15 @@ async fn apply_completed_job(
     .await
     .context("load apply target batch")?;
     let Some(target_row) = target_row else {
-        return discard_stale_completed_job(store, job, None, initial_cursor).await;
+        bail!(
+            "completed memory job {} target is missing; no authenticated GC/tombstone permits discard",
+            job.id
+        );
     };
     let target_id: String = target_row.try_get("id")?;
     let target_version: i64 = target_row.try_get("version")?;
     let target_state: String = target_row.try_get("state")?;
+    let target_est_tokens: i64 = target_row.try_get("est_tokens")?;
     let target_expected = job
         .source_versions
         .get(&target_id)
@@ -1968,13 +2036,10 @@ async fn apply_completed_job(
         .await
         .with_context(|| format!("load apply source batch {source_id}"))?;
         let Some(row) = row else {
-            return discard_stale_completed_job(
-                store,
-                job,
-                Some((&target_id, target_version, &target_state)),
-                initial_cursor,
-            )
-            .await;
+            bail!(
+                "completed memory job {} source batch {source_id} is missing; no authenticated GC/tombstone permits discard",
+                job.id
+            );
         };
         let layer: i64 = row.try_get("layer")?;
         let version: i64 = row.try_get("version")?;
@@ -2018,7 +2083,8 @@ async fn apply_completed_job(
         expected_version: target_version as u64,
         new_state: MemoryBatchState::Promoted,
         summary: None,
-        est_tokens: 0,
+        est_tokens: u64::try_from(target_est_tokens)
+            .with_context(|| format!("target batch {target_id} est_tokens out of range"))?,
         footprint_delta: 0,
         delete_membership: false,
     });
@@ -2040,6 +2106,7 @@ async fn apply_completed_job(
             kind: job.kind.as_str().to_owned(),
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -2245,26 +2312,7 @@ impl CompactWorker {
     /// intentionally an explicit maintenance operation; compaction workers
     /// only produce encrypted shelves and never block the conversation path.
     pub(crate) async fn apply_ready(&self) -> Result<usize> {
-        let mut applied = 0;
-        loop {
-            let mut progress = false;
-            for kind in [
-                MemoryJobKind::CompactL0,
-                MemoryJobKind::CompactL1,
-                MemoryJobKind::ConsolidateL2,
-            ] {
-                let outcome = apply_next_completed_job(self.store.clone(), kind).await?;
-                if outcome == ApplyProgress::Applied {
-                    applied += 1;
-                }
-                if outcome.made_progress() {
-                    progress = true;
-                }
-            }
-            if !progress {
-                return Ok(applied);
-            }
-        }
+        apply_ready_memory(self.store.clone()).await
     }
 
     async fn maintenance_cycle(&self) -> Result<()> {
@@ -2372,19 +2420,30 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::memory::estimate::{EvictionFootprint, legacy_serialized_bytes_eviction_footprint};
+    use crate::agent::{InjectedRunDriver, RunCore, RunDriver, StreamStarter};
+    use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
+    use crate::memory::estimate::{
+        EvictionFootprint, eviction_footprint_for_payload,
+        legacy_serialized_bytes_eviction_footprint,
+    };
+    use crate::provider::RequestOptions;
     use crate::provider::types::{
-        ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
-        ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
-        ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+        ApiProtocol, NativeCompactionCoverage, PromptContext, ProviderContextAnchor,
+        ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEventStream,
+        ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall, ToolResultMessage, Usage,
+        UserMessage, ValidatedToolArguments,
+    };
+    use crate::runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
-        DataKeyPurpose, EncryptedProviderContextRecord, MemoryBatchMessageRecord,
-        MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
-        MemoryLayer, ProviderContextKeyAnchor, ProviderContextMutationApplier,
-        ProviderContextMutationBuilder, Store, TranscriptRecord, encrypt_content,
-        provider_context_record_id,
+        ApplicationKind, DataKeyPurpose, EncryptedProviderContextRecord, HydrationOutcome,
+        InjectedCommand, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+        MemoryJobKind, MemoryJobRecord, MemoryLayer, ProviderContextKeyAnchor,
+        ProviderContextMutationApplier, ProviderContextMutationBuilder, RunPhase, Store,
+        TranscriptRecord, provider_context_record_id,
     };
+    use crate::tools::{ToolRegistryBuilder, WorkspacePaths};
     use tokio_util::sync::CancellationToken;
 
     fn timestamp() -> DateTime<Utc> {
@@ -3118,6 +3177,327 @@ mod tests {
         )
     }
 
+    async fn seed_completed_authenticated_turn(
+        store: &Arc<Store>,
+        spec: &ModelSpec,
+        user_text: &str,
+        assistant_message_id: &str,
+        assistant: PublicMessage,
+        provider_context: Vec<ProviderContextFragment>,
+    ) {
+        let eviction_footprint_tokens = provider_context
+            .iter()
+            .try_fold(0_u64, |total, fragment| {
+                let footprint = eviction_footprint_for_payload(spec, &fragment.payload)?;
+                total
+                    .checked_add(footprint.eviction_tokens())
+                    .ok_or(crate::memory::estimate::EstimateError::ArithmeticOverflow)
+            })
+            .expect("fixture provider-context footprint");
+        let command_id = "20000000-0000-4000-8000-000000000001";
+        let command_seq = 1_u64;
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let envelope = CommandEnvelope {
+            seq: command_seq,
+            command_id: CommandId::parse(command_id).expect("fixture command id"),
+            command: Command::UserMessage {
+                text: user_text.to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let writer = EventWriter::new(store.clone());
+        writer
+            .persist_inbound(&InboundCommand::Valid(envelope))
+            .await
+            .expect("persist fixture command");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: command_id.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify fixture command");
+
+        let user_id = crate::store::user_message_id(command_id);
+        let received_at: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind(command_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fixture command received_at");
+        let user = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: user_text.to_owned(),
+            }],
+            timestamp: DateTime::parse_from_rfc3339(&received_at)
+                .expect("fixture received_at")
+                .with_timezone(&Utc),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "agent_start",
+                                "run_id": run_id.clone(),
+                            }))
+                            .expect("fixture AgentStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "turn_start",
+                                "run_id": run_id.clone(),
+                                "turn_id": turn_id.clone(),
+                            }))
+                            .expect("fixture TurnStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &user_id, &user)
+                                .expect("fixture user MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &user_id, &user)
+                                .expect("fixture user MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: user_id,
+                                role: "user",
+                                message: user,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(
+                    command_seq,
+                    CommandId::parse(command_id).expect("fixture command id"),
+                )],
+            })
+            .await
+            .expect("commit fixture user injection");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_message_id,
+                            &assistant,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("fixture assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open fixture assistant");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                assistant_message_id,
+                                &assistant,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("fixture assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: assistant_message_id.to_owned(),
+                            role: "assistant",
+                            message: assistant.clone(),
+                            append_to_l0: true,
+                            provider_context,
+                            eviction_footprint_tokens,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(run_id.clone(), turn_id, assistant, Vec::new())
+                                .expect("fixture TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end(run_id.clone()).expect("fixture AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit fixture assistant terminal");
+    }
+
+    async fn insert_memory_fixture(store: &Store, kind: &str, transition: MemoryTransition) {
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind)
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("insert authenticated memory fixture");
+    }
+
+    async fn apply_job_fixture_mutation(store: &Store, kind: &str, mutation: MemoryJobMutation) {
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind).expect("fixture job-mutation event"),
+                    ),
+                    projections: vec![Projection::MemoryJobUpdate(MemoryJobUpdate {
+                        expected_source_versions: BTreeMap::new(),
+                        job_mutations: vec![mutation],
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply authenticated job fixture mutation");
+    }
+
+    async fn fixture_running_job(store: &Store, job_id: &str, attempts: i64, lease_until: &str) {
+        apply_job_fixture_mutation(
+            store,
+            "fixture_job_claim",
+            MemoryJobMutation::Claim {
+                job_id: job_id.to_owned(),
+                lease_until: lease_until.to_owned(),
+            },
+        )
+        .await;
+        let mut witness = lease_until.to_owned();
+        for expected_attempt in 0..attempts {
+            let next_lease = if expected_attempt + 1 == attempts {
+                lease_until.to_owned()
+            } else {
+                format!("2099-01-01T00:00:{expected_attempt:02}Z")
+            };
+            apply_job_fixture_mutation(
+                store,
+                "fixture_job_attempt",
+                MemoryJobMutation::Start {
+                    job_id: job_id.to_owned(),
+                    expected_attempt,
+                    lease_witness: Some(witness),
+                    lease_until: next_lease.clone(),
+                },
+            )
+            .await;
+            witness = next_lease;
+        }
+    }
+
+    async fn fixture_pending_job_with_attempts(store: &Store, job_id: &str, attempts: i64) {
+        let lease = "2000-01-01T00:00:00Z";
+        fixture_running_job(store, job_id, attempts, lease).await;
+        apply_job_fixture_mutation(
+            store,
+            "fixture_job_release",
+            MemoryJobMutation::Release {
+                job_id: job_id.to_owned(),
+                expected_attempt: attempts,
+                lease_witness: Some(lease.to_owned()),
+            },
+        )
+        .await;
+    }
+
+    async fn fixture_mutate_batch_state(
+        store: &Store,
+        batch_id: &str,
+        expected_version: u64,
+        new_state: MemoryBatchState,
+    ) {
+        let batch_id = BatchId::parse_str(batch_id).expect("fixture batch UUID");
+        insert_memory_fixture(
+            store,
+            "fixture_batch_state",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(batch_id, expected_version)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id,
+                    expected_version,
+                    new_state,
+                    summary: None,
+                    est_tokens: 0,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     async fn insert_l0_batch(store: &Store, messages: &[PublicMessage]) -> (String, String) {
         insert_l0_batch_with_seq(store, 1, messages).await
     }
@@ -3127,6 +3507,13 @@ mod tests {
         batch_seq: i64,
         messages: &[PublicMessage],
     ) -> (String, String) {
+        // This compactor fixture deliberately seeds transcript rows at
+        // synthetic sequences. Freeze the empty lifecycle checkpoint first;
+        // exact MessageEnd projection behavior is covered by Store tests.
+        EventWriter::new(Arc::new(store.clone()))
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("initialize fixture EventWriter checkpoint");
         let key = store
             .conversation_key(DataKeyPurpose::Transcript)
             .await
@@ -3144,11 +3531,6 @@ mod tests {
             100,
             0,
         );
-        batch
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
-
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3159,11 +3541,7 @@ mod tests {
             0,
             0,
         );
-        target
-            .insert(store.pool())
-            .await
-            .expect("insert target batch");
-
+        let mut membership_inserts = Vec::with_capacity(messages.len());
         for (seq, message) in messages.iter().enumerate() {
             let message_id = format!("{source_id}-msg-{seq}");
             let record = TranscriptRecord::encrypt(
@@ -3178,21 +3556,35 @@ mod tests {
             )
             .expect("encrypt message");
             record.insert(store.pool()).await.expect("insert message");
-            MemoryBatchMessageRecord {
+            membership_inserts.push(MemoryBatchMessageRecord {
                 batch_id: source_id.clone(),
                 message_id: record.id().to_owned(),
-                ord: seq as i64,
-            }
-            .insert(store.pool())
-            .await
-            .expect("insert batch message");
+                ord: i64::try_from(seq + 1).expect("fixture membership ordinal"),
+            });
         }
+
+        insert_memory_fixture(
+            store,
+            "fixture_l0_batches",
+            MemoryTransition {
+                batch_inserts: vec![batch, target],
+                membership_inserts,
+                ..Default::default()
+            },
+        )
+        .await;
 
         (source_id, target_id)
     }
 
     async fn insert_compact_l0_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
-        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 1 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l0 target");
+        let source_versions = BTreeMap::from([(source_id.to_owned(), 0), (target_id, 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL0,
@@ -3200,51 +3592,70 @@ mod tests {
             vec![source_id.to_owned()],
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_compact_l0_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
-    async fn encrypt_summary(store: &Store, batch_id: &str, summary: &str) -> MemoryBatchSummary {
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("memory summary key");
+    async fn attach_fixture_summary(store: &Store, batch_id: &str, summary: &str, est_tokens: u64) {
         let now = Utc::now();
-        let plaintext = serde_json::to_vec(&super::MemorySummaryPayload {
-            summary: summary.to_owned(),
-            est_tokens: 1,
-            from: now,
-            to: now,
-        })
-        .expect("serialize summary payload");
-        let aad = store
-            .scope()
-            .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary);
-        let ciphertext = encrypt_content(&key, &plaintext, &aad).expect("encrypt summary");
-        MemoryBatchSummary {
-            key_ref: key.key_ref.clone(),
-            ciphertext,
-            projection: summary.to_owned(),
-            redaction_version: 1,
-        }
+        insert_memory_fixture(
+            store,
+            "fixture_attach_summary",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: BatchId::parse_str(batch_id).expect("fixture batch UUID"),
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacted,
+                    summary: Some(CompactResult {
+                        summary: DecryptedMemorySummary::new(summary.to_owned()),
+                        est_tokens,
+                        time_range: (now, now),
+                    }),
+                    est_tokens,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_memory_fixture(
+            store,
+            "fixture_reopen_summary_source",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: BatchId::parse_str(batch_id).expect("fixture batch UUID"),
+                    expected_version: 1,
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn insert_l1_batch(store: &Store, batch_seq: i64, summary: &str) -> (String, String) {
         let source_id = Uuid::now_v7().to_string();
-        let summary = encrypt_summary(store, &source_id, summary).await;
-        let source = MemoryBatchRecord {
-            id: source_id.clone(),
-            layer: MemoryLayer::L1,
-            ord: 0,
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L1,
+            0,
             batch_seq,
-            version: 0,
-            state: MemoryBatchState::Compacting,
-            est_tokens: 50,
-            eviction_footprint_tokens: 0,
-            summary: Some(summary),
-            updated_at: Utc::now().to_rfc3339(),
-        };
-        source.insert(store.pool()).await.expect("insert l1 source");
-
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3255,7 +3666,16 @@ mod tests {
             0,
             0,
         );
-        target.insert(store.pool()).await.expect("insert l2 target");
+        insert_memory_fixture(
+            store,
+            "fixture_l1_batches",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                ..Default::default()
+            },
+        )
+        .await;
+        attach_fixture_summary(store, &source_id, summary, 50).await;
 
         (source_id, target_id)
     }
@@ -3267,21 +3687,15 @@ mod tests {
         summary: &str,
     ) -> (String, String) {
         let source_id = Uuid::now_v7().to_string();
-        let summary = encrypt_summary(store, &source_id, summary).await;
-        let source = MemoryBatchRecord {
-            id: source_id.clone(),
-            layer: MemoryLayer::L2,
-            ord: 0,
-            batch_seq: source_seq,
-            version: 0,
-            state: MemoryBatchState::Compacting,
-            est_tokens: 50,
-            eviction_footprint_tokens: 0,
-            summary: Some(summary),
-            updated_at: Utc::now().to_rfc3339(),
-        };
-        source.insert(store.pool()).await.expect("insert l2 source");
-
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L2,
+            0,
+            source_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3292,13 +3706,35 @@ mod tests {
             0,
             0,
         );
-        target.insert(store.pool()).await.expect("insert l2 target");
+        insert_memory_fixture(
+            store,
+            "fixture_l2_batches",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                ..Default::default()
+            },
+        )
+        .await;
+        attach_fixture_summary(store, &source_id, summary, 50).await;
 
         (source_id, target_id)
     }
 
     async fn insert_compact_l1_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
-        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 2 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l1 target");
+        let source_version: i64 =
+            sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(source_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l1 source version");
+        let source_versions =
+            BTreeMap::from([(source_id.to_owned(), source_version), (target_id, 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL1,
@@ -3306,7 +3742,15 @@ mod tests {
             vec![source_id.to_owned()],
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_compact_l1_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn insert_consolidate_l2_job(
@@ -3315,7 +3759,23 @@ mod tests {
         source_ids: &[String],
         batch_seq: i64,
     ) {
-        let source_versions = BTreeMap::from_iter(source_ids.iter().map(|id| (id.clone(), 0)));
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 2 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load consolidate-l2 target");
+        let mut source_versions = BTreeMap::new();
+        for source_id in source_ids {
+            let source_version: i64 =
+                sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                    .bind(source_id)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("load consolidate-l2 source version");
+            source_versions.insert(source_id.clone(), source_version);
+        }
+        source_versions.insert(target_id, 0);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::ConsolidateL2,
@@ -3323,7 +3783,15 @@ mod tests {
             source_ids.to_owned(),
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_consolidate_l2_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn run_worker(store: Arc<Store>, provider: Arc<dyn CompactProvider>) {
@@ -3505,11 +3973,7 @@ mod tests {
         insert_compact_l0_job(&store, "job-stale", &source_id, 1).await;
 
         // Simulate a concurrent update that advanced the source version.
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&source_id)
-            .execute(store.pool())
-            .await
-            .expect("bump version");
+        fixture_mutate_batch_state(&store, &source_id, 0, MemoryBatchState::Promoted).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("stale summary".into()),
@@ -3531,8 +3995,8 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("fetch source batch");
-        assert_eq!(source.get::<String, _>("state"), "compact_failed");
-        assert_eq!(source.get::<i64, _>("version"), 2);
+        assert_eq!(source.get::<String, _>("state"), "promoted");
+        assert_eq!(source.get::<i64, _>("version"), 1);
 
         let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&target_id)
@@ -3557,10 +4021,15 @@ mod tests {
             100,
             0,
         );
-        source
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
+        insert_memory_fixture(
+            &store,
+            "fixture_orphan_l0_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
+        )
+        .await;
 
         let cancel = CancellationToken::new();
         let worker = CompactWorker {
@@ -3611,10 +4080,15 @@ mod tests {
             100,
             0,
         );
-        source
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
+        insert_memory_fixture(
+            &store,
+            "fixture_concurrent_orphan_l0_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
+        )
+        .await;
 
         // Spawn recovery and a concurrent EventWriter transition that inserts
         // an unrelated L1 batch. Under the old raw-transaction recovery, both
@@ -3681,15 +4155,7 @@ mod tests {
         let store = test_store().await;
         let (source_id, _target_id) = insert_l0_batch(&store, &[user("recover lease")]).await;
         insert_compact_l0_job(&store, "job-expired-lease", &source_id, 1).await;
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 1, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-expired-lease")
-        .execute(store.pool())
-        .await
-        .expect("expire lease");
+        fixture_running_job(&store, "job-expired-lease", 1, "2000-01-01T00:00:00Z").await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -3712,15 +4178,7 @@ mod tests {
         let store = test_store().await;
         let (source_id, target_id) = insert_l0_batch(&store, &[user("live lease recovery")]).await;
         insert_compact_l0_job(&store, "job-live-expired", &source_id, 1).await;
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 0, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-live-expired")
-        .execute(store.pool())
-        .await
-        .expect("expire live lease");
+        fixture_running_job(&store, "job-live-expired", 0, "2000-01-01T00:00:00Z").await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -3790,17 +4248,13 @@ mod tests {
         let (source_1, _target_1) = insert_l0_batch(&store, &[user("first")]).await;
         let (source_2, _target_2) = insert_l0_batch_with_seq(&store, 2, &[user("second")]).await;
         insert_compact_l0_job(&store, "job-apply-1", &source_1, 1).await;
-        let source_versions = BTreeMap::from([(source_2.clone(), 0)]);
-        MemoryJobRecord::new(
-            "job-apply-2",
-            MemoryJobKind::CompactL0,
-            2,
-            vec![source_2.clone()],
-            source_versions,
+        insert_compact_l0_job(&store, "job-apply-2", &source_2, 2).await;
+        let maintenance_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
-        .insert(store.pool())
+        .fetch_one(store.pool())
         .await
-        .expect("insert second job");
+        .expect("count fixture maintenance events");
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("summary".into()),
@@ -3852,15 +4306,15 @@ mod tests {
         .expect("apply cursor");
         assert_eq!(cursor, 3);
 
-        // Each job now produces a MemoryMaintenance event at completion and at
-        // apply, so the durable log records two maintenance events per job.
+        // Claim, start, completion, apply, and first cursor initialization are
+        // all authenticated MemoryMaintenance transitions.
         let maintenance_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
         .fetch_one(store.pool())
         .await
         .expect("count maintenance events");
-        assert_eq!(maintenance_count, 4);
+        assert_eq!(maintenance_count - maintenance_before, 9);
     }
 
     #[tokio::test]
@@ -3908,25 +4362,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_completed_job_preserves_target_est_tokens() {
+        let store = test_store().await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-est-tokens", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("promoted estimate check".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let completed = sqlx::query("SELECT state, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch completed target");
+        assert_eq!(completed.get::<String, _>("state"), "compacted");
+        let expected_est: i64 = completed.get("est_tokens");
+        assert!(
+            expected_est > 0,
+            "completed target must carry a real estimate"
+        );
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert_eq!(worker.apply_ready().await.expect("apply"), 1);
+
+        let promoted = sqlx::query("SELECT state, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch promoted target");
+        assert_eq!(promoted.get::<String, _>("state"), "promoted");
+        assert_eq!(
+            promoted.get::<i64, _>("est_tokens"),
+            expected_est,
+            "promoted target must keep the estimate produced at completion"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_consolidates_l2_and_applies() {
         let store = test_store().await;
         let (source_1, _target_1) = insert_l2_batch(&store, 1, 20, "L2 first summary").await;
         let (source_2, _target_2) = insert_l2_batch(&store, 2, 21, "L2 second summary").await;
         let target_id = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let target = MemoryBatchRecord::new(
             &target_id,
             MemoryLayer::L2,
             0,
-            10,
+            5,
             MemoryBatchState::Compacting,
             0,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_consolidate_target",
+            MemoryTransition {
+                batch_inserts: vec![target],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert consolidate target");
-        insert_consolidate_l2_job(&store, "job-l2", &[source_1.clone(), source_2.clone()], 10)
-            .await;
+        .await;
+        insert_consolidate_l2_job(&store, "job-l2", &[source_1.clone(), source_2.clone()], 5).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("Consolidated L2 summary".into()),
@@ -3969,14 +4473,41 @@ mod tests {
     #[tokio::test]
     async fn recover_compacting_l1_and_l2_batches() {
         let store = test_store().await;
-        let (_l1_source, _l1_target) = insert_l1_batch(&store, 1, "lost l1").await;
-        let (_l2_source, _l2_target) = insert_l2_batch(&store, 2, 3, "lost l2").await;
+        let l1_source = Uuid::now_v7().to_string();
+        let l2_source = Uuid::now_v7().to_string();
+        insert_memory_fixture(
+            &store,
+            "fixture_lost_summary_sources",
+            MemoryTransition {
+                batch_inserts: vec![
+                    MemoryBatchRecord::new(
+                        &l1_source,
+                        MemoryLayer::L1,
+                        0,
+                        1,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        &l2_source,
+                        MemoryLayer::L2,
+                        0,
+                        2,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        attach_fixture_summary(&store, &l1_source, "lost l1", 50).await;
+        attach_fixture_summary(&store, &l2_source, "lost l2", 50).await;
 
-        // Drop the jobs to simulate a crash where only compacting batches remain.
-        sqlx::query("DELETE FROM memory_jobs")
-            .execute(store.pool())
-            .await
-            .expect("delete jobs");
+        // Only authenticated compacting source rows survived the crash. Target
+        // allocation and job insertion must be recovered atomically.
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -4015,24 +4546,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_skips_summary_less_in_flight_targets() {
+    async fn recover_skips_summary_less_in_flight_targets_with_authenticated_owner() {
         let store = test_store().await;
         // A summary-less compacting L1 row is an in-flight CompactL0 target,
-        // not a source, and must not be recovered as a new job.
-        let in_flight_target = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
-            &in_flight_target,
-            MemoryLayer::L1,
-            0,
-            1,
-            MemoryBatchState::Compacting,
-            0,
-            0,
-        )
-        .insert(store.pool())
-        .await
-        .expect("insert in-flight target");
-
+        // not a source, only when an authenticated CompactL0 job owns it.
+        let (source_id, _) = insert_l0_batch(&store, &[user("owned target")]).await;
+        insert_compact_l0_job(&store, "job-owned-target", &source_id, 1).await;
         recover_compacting_batches(&store)
             .await
             .expect("recover compacting batches");
@@ -4042,7 +4561,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("count pending");
-        assert_eq!(pending, 0);
+        assert_eq!(pending, 1, "recovery must not duplicate the owning job");
     }
 
     #[test]
@@ -4071,15 +4590,7 @@ mod tests {
 
         // A newer owner advances the first source after completion. Applying
         // the stale result must not overwrite that source.
-        sqlx::query(
-            "UPDATE memory_batches
-             SET version = version + 1, state = 'promoted'
-             WHERE id = ?",
-        )
-        .bind(&source_id)
-        .execute(store.pool())
-        .await
-        .expect("bump source version");
+        fixture_mutate_batch_state(&store, &source_id, 1, MemoryBatchState::Promoted).await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -4098,7 +4609,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("load stale job");
-        assert_eq!(stale_job, "failed");
+        assert_eq!(stale_job, "discarded");
         let source: (String, i64) =
             sqlx::query_as("SELECT state, version FROM memory_batches WHERE id = ?")
                 .bind(&source_id)
@@ -4178,12 +4689,18 @@ mod tests {
             .expect("claim")
             .expect("pending job");
 
-        // Another process changed the job row after it was claimed.
-        sqlx::query("UPDATE memory_jobs SET status = 'completed' WHERE id = ?")
-            .bind(&job.id)
-            .execute(store.pool())
-            .await
-            .expect("tamper with job");
+        // Another process advanced the authenticated row after it was claimed.
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_competing_job_start",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: 0,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
 
         assert!(
             reset_job_to_pending(&store, &job).await.is_err(),
@@ -4206,12 +4723,25 @@ mod tests {
         // Expire A's durable lease, run the real recovery path, then let B
         // claim and start attempt 2. A retains its original attempt/lease
         // witness and must not be allowed to finish B's row.
-        sqlx::query("UPDATE memory_jobs SET lease_until = ? WHERE id = ?")
-            .bind("2000-01-01T00:00:00Z")
-            .bind(&job.id)
-            .execute(store.pool())
-            .await
-            .expect("expire A lease");
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_release_a",
+            MemoryJobMutation::Release {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+            },
+        )
+        .await;
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_expire_a",
+            MemoryJobMutation::Claim {
+                job_id: job.id.clone(),
+                lease_until: "2000-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
         recover_expired_running_jobs(&store)
             .await
             .expect("recover expired A");
@@ -4270,15 +4800,17 @@ mod tests {
             .expect("pending job");
         start_attempt(&store, &mut job).await.expect("start job");
 
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET attempts = 2, lease_until = '2030-01-01T00:00:00Z'
-             WHERE id = ?",
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_reclaim_fail_lease",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
         )
-        .bind(&job.id)
-        .execute(store.pool())
-        .await
-        .expect("reclaim lease");
+        .await;
 
         let error = fail_job(store.as_ref(), &job)
             .await
@@ -4300,15 +4832,17 @@ mod tests {
             .expect("pending job");
         start_attempt(&store, &mut job).await.expect("start job");
 
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET attempts = 2, lease_until = '2030-01-01T00:00:00Z'
-             WHERE id = ?",
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_reclaim_release_lease",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
         )
-        .bind(&job.id)
-        .execute(store.pool())
-        .await
-        .expect("reclaim lease");
+        .await;
 
         let error = reset_job_to_pending(store.as_ref(), &job)
             .await
@@ -4352,15 +4886,7 @@ mod tests {
         insert_compact_l0_job(&store, "job-crash-before", &source_id, 1).await;
 
         // Simulate a crash immediately after claim, before start_attempt.
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 0, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-crash-before")
-        .execute(store.pool())
-        .await
-        .expect("simulate crash after claim");
+        fixture_running_job(&store, "job-crash-before", 0, "2000-01-01T00:00:00Z").await;
 
         let provider = Arc::new(FakeProvider {
             fail_next: AtomicUsize::new(3),
@@ -4400,15 +4926,7 @@ mod tests {
 
         // Simulate a crash after start_attempt on the final retry consumed the
         // budget, but before fail_job could commit.
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 3, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-crash-after")
-        .execute(store.pool())
-        .await
-        .expect("simulate crash after failed attempt");
+        fixture_running_job(&store, "job-crash-after", 3, "2000-01-01T00:00:00Z").await;
 
         let provider = Arc::new(FakeProvider {
             fail_next: AtomicUsize::new(0),
@@ -4509,7 +5027,7 @@ mod tests {
         )
         .expect("encrypt provider context");
         record
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert provider context");
 
@@ -4549,24 +5067,356 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_provider_native_driver_cold_boot_idle_apply_refreshes_fallback_view() {
+        let store = test_store().await;
+        let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
+        let promoted_marker = "PROMOTED_OLD_ASSISTANT";
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![
+                PublicAssistantContent::Thinking {
+                    thinking: "private old reasoning".to_owned(),
+                    signature_field: "encrypted_content".to_owned(),
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::Text {
+                    text: format!("{promoted_marker} {}", "x".repeat(24_000)),
+                    wire_item_index: 1,
+                },
+            ],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let reasoning = ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "rs-idle-apply",
+                "encrypted_content": "opaque-idle-apply",
+                "summary": [],
+            }),
+        };
+        seed_completed_authenticated_turn(
+            &store,
+            &spec,
+            &format!("LARGE_LIFE_LOG_USER {}", "u".repeat(24_000)),
+            "idle-old-assistant",
+            assistant,
+            vec![ProviderContextFragment {
+                wire_item_index: Some(0),
+                payload: reasoning,
+            }],
+        )
+        .await;
+
+        let source = sqlx::query(
+            "SELECT id, version, batch_seq, est_tokens
+             FROM memory_batches WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("live L0 source");
+        let source_id: String = source.get("id");
+        let source_version: i64 = source.get("version");
+        let source_est_tokens: i64 = source.get("est_tokens");
+        let target_id = Uuid::now_v7().to_string();
+        let batch_seq = 1_i64;
+        let source_uuid = BatchId::parse_str(&source_id).expect("source batch UUID");
+        insert_memory_fixture(
+            &store,
+            "fixture_reserve_idle_compaction",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(
+                    source_uuid,
+                    u64::try_from(source_version).expect("source version"),
+                )]),
+                expected_source_states: BTreeMap::from([(source_uuid, MemoryBatchState::Open)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_uuid,
+                    expected_version: u64::try_from(source_version).expect("source version"),
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: u64::try_from(source_est_tokens).expect("source estimate"),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    &target_id,
+                    MemoryLayer::L1,
+                    1,
+                    batch_seq,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                job_inserts: vec![MemoryJobRecord::new(
+                    "30000000-0000-4000-8000-000000000001",
+                    MemoryJobKind::CompactL0,
+                    batch_seq,
+                    vec![source_id.clone()],
+                    BTreeMap::from([
+                        (source_id.clone(), source_version + 1),
+                        (target_id.clone(), 0),
+                    ]),
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let compact_worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&spec, None, &[]).expect("select compact model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("durable promoted summary".to_owned()),
+                ..FakeProvider::default()
+            }),
+            cancel: CancellationToken::new(),
+        };
+        compact_worker
+            .process_all_pending()
+            .await
+            .expect("complete speculative shelf");
+
+        let generation = ProcessGeneration::from_wire(41).expect("fixture generation");
+        let lease =
+            ProcessGenerationLease::new(generation, "idle-memory-lease").expect("fixture lease");
+        let fence = GenerationRecoveryFence::new(&lease, "idle-memory-fence")
+            .expect("fixture recovery fence");
+        let hydrated = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate completed shelf before idle apply")
+        {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("completed shelf must be ready for T21 composition: {other:?}"),
+        };
+        assert_eq!(hydrated.provider_context.len(), 1);
+
+        let registry = ToolRegistryBuilder::default().build();
+        let prompt = PromptContext {
+            system_prompt: "fixture".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+            replay_provenance: None,
+        };
+        let observed_prompts = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
+        let observed = observed_prompts.clone();
+        let starter: Arc<StreamStarter> = Arc::new(move |spec, prompt, _, cancel, _| {
+            observed.lock().expect("prompt capture lock").push(prompt);
+            let (_tx, rx) = mpsc::channel(1);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        });
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("fixture workspace")),
+            Some(generation),
+            starter,
+        )
+        .expect("construct injected driver")
+        .with_hydrated_memory(store.clone(), &lease, &fence, &hydrated)
+        .expect("install authenticated memory boundary");
+        let mut core = RunCore::new();
+        core.install_hydrated_context(hydrated.messages.clone(), hydrated.provider_context.clone());
+
+        let _cold_boot_attempt = RunDriver::start_provider_for_command(
+            &driver,
+            0,
+            core.runtime_context(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("provider-native cold boot falls back to exact hydrated Sumi view");
+        {
+            let mut prompts = observed_prompts.lock().expect("prompt capture lock");
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].messages.len(), 2);
+            assert!(prompts[0].memory_blocks.is_empty());
+            assert_eq!(prompts[0].provider_context.len(), 1);
+            prompts.clear();
+        }
+
+        assert!(
+            RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
+                .await
+                .expect("Store-backed idle apply and refresh")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("life-log row count"),
+            2,
+            "promotion must not delete canonical transcript history"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM memory_batch_messages WHERE batch_id = ?"
+            )
+            .bind(&source_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("promoted source membership"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?"
+            )
+            .bind(&source_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("promoted source footprint"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provider_context WHERE message_id = 'idle-old-assistant'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("erased promoted provider context"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&target_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("promoted L1 target"),
+            "promoted"
+        );
+        assert_eq!(core.runtime_context().len(), 2);
+        assert!(core.provider_context().is_empty());
+
+        let _attempt = RunDriver::start_provider_for_command(
+            &driver,
+            0,
+            core.runtime_context(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("later provider call uses refreshed assembler");
+        {
+            let prompts = observed_prompts.lock().expect("prompt capture lock");
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].memory_blocks.len(), 1);
+            assert_eq!(prompts[0].memory_blocks[0].text, "durable promoted summary");
+            assert!(prompts[0].provider_context.is_empty());
+            assert!(prompts[0].messages.is_empty());
+            assert!(
+                !serde_json::to_string(&prompts[0])
+                    .expect("serialize prompt")
+                    .contains(promoted_marker)
+            );
+        }
+
+        let l1 = sqlx::query("SELECT version, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("refreshed L1 source");
+        let l1_version: i64 = l1.get("version");
+        let l1_est_tokens: i64 = l1.get("est_tokens");
+        let l2_target_id = Uuid::now_v7().to_string();
+        let l1_uuid = BatchId::parse_str(&target_id).expect("L1 source UUID");
+        insert_memory_fixture(
+            &store,
+            "fixture_reserve_pending_rehydrate",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(
+                    l1_uuid,
+                    u64::try_from(l1_version).expect("L1 source version"),
+                )]),
+                expected_source_states: BTreeMap::from([(l1_uuid, MemoryBatchState::Promoted)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: l1_uuid,
+                    expected_version: u64::try_from(l1_version).expect("L1 source version"),
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: u64::try_from(l1_est_tokens).expect("L1 estimate"),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    &l2_target_id,
+                    MemoryLayer::L2,
+                    1,
+                    1,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                job_inserts: vec![MemoryJobRecord::new(
+                    "30000000-0000-4000-8000-000000000002",
+                    MemoryJobKind::CompactL1,
+                    1,
+                    vec![target_id.clone()],
+                    BTreeMap::from([(target_id.clone(), l1_version + 1), (l2_target_id, 0)]),
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
+        compact_worker
+            .process_all_pending()
+            .await
+            .expect("complete second shelf");
+        let pending_command_id = "20000000-0000-4000-8000-000000000002";
+        EventWriter::new(store.clone())
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse(pending_command_id).expect("pending command id"),
+                command: Command::UserMessage {
+                    text: "pending logical suffix".to_owned(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .await
+            .expect("persist pending logical hydration fixture");
+        let epoch_before_failed_refresh = core.mutation_epoch();
+        let context_before_failed_refresh = core.runtime_context().to_vec();
+        let provider_before_failed_refresh = core.provider_context().to_vec();
+        let error = RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
+            .await
+            .expect_err("pending logical hydration must fail closed after durable apply");
+        assert!(error.to_string().contains("pending logical recovery"));
+        assert_eq!(core.mutation_epoch(), epoch_before_failed_refresh);
+        assert_eq!(core.runtime_context(), context_before_failed_refresh);
+        assert_eq!(
+            core.provider_context(),
+            provider_before_failed_refresh,
+            "a pending rehydration must not partially refresh RunCore"
+        );
+    }
+
+    #[tokio::test]
     async fn exhausted_budget_stale_source_supersedes_without_provider_call() {
         let store = test_store().await;
         let (source_id, target_id) = insert_l0_batch(&store, &[user("hello")]).await;
         insert_compact_l0_job(&store, "job-exhausted-stale", &source_id, 1).await;
 
         // Exhaust the durable retry budget before the worker runs.
-        sqlx::query("UPDATE memory_jobs SET attempts = 3 WHERE id = ?")
-            .bind("job-exhausted-stale")
-            .execute(store.pool())
-            .await
-            .expect("set attempts to max");
+        fixture_pending_job_with_attempts(&store, "job-exhausted-stale", 3).await;
 
         // Simulate a concurrent update that advanced the source version.
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&source_id)
-            .execute(store.pool())
-            .await
-            .expect("bump version");
+        fixture_mutate_batch_state(&store, &source_id, 0, MemoryBatchState::Promoted).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("never called".into()),
@@ -4593,8 +5443,8 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("fetch source batch");
-        assert_eq!(source.get::<String, _>("state"), "compact_failed");
-        assert_eq!(source.get::<i64, _>("version"), 2);
+        assert_eq!(source.get::<String, _>("state"), "promoted");
+        assert_eq!(source.get::<i64, _>("version"), 1);
 
         let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&target_id)
@@ -4609,16 +5459,8 @@ mod tests {
         let store = test_store().await;
         let (stale_source, _stale_target) = insert_l0_batch(&store, &[user("stale first")]).await;
         insert_compact_l0_job(&store, "job-stale-first", &stale_source, 1).await;
-        sqlx::query("UPDATE memory_jobs SET attempts = 3 WHERE id = ?")
-            .bind("job-stale-first")
-            .execute(store.pool())
-            .await
-            .expect("exhaust stale job");
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&stale_source)
-            .execute(store.pool())
-            .await
-            .expect("advance stale source");
+        fixture_pending_job_with_attempts(&store, "job-stale-first", 3).await;
+        fixture_mutate_batch_state(&store, &stale_source, 0, MemoryBatchState::Promoted).await;
 
         let (later_source, _later_target) =
             insert_l0_batch_with_seq(&store, 2, &[user("later")]).await;
@@ -4776,14 +5618,7 @@ mod tests {
 
         // Simulate a crash: job was claimed but start_attempt had not yet refreshed.
         let expired = "2000-01-01T00:00:00Z";
-        sqlx::query(
-            "UPDATE memory_jobs SET status = 'running', attempts = 0, lease_until = ? WHERE id = ?",
-        )
-        .bind(expired)
-        .bind("job-lease")
-        .execute(store.pool())
-        .await
-        .expect("simulate running job with expired lease");
+        fixture_running_job(&store, "job-lease", 0, expired).await;
 
         let row = sqlx::query(
             "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
@@ -4991,7 +5826,7 @@ mod tests {
         )
         .expect("encrypt uncovered");
         uncovered
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert uncovered");
 
@@ -5146,7 +5981,10 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt covered");
-        covered.insert(store.pool()).await.expect("insert covered");
+        covered
+            .insert_committed(&store)
+            .await
+            .expect("insert covered");
 
         // Unrelated: this native window is owned by an assistant outside the
         // source batch. Native payloads keep no semantic origin_message, so
@@ -5208,7 +6046,7 @@ mod tests {
         )
         .expect("encrypt uncovered");
         uncovered
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert uncovered");
 
@@ -5264,48 +6102,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_repairs_orphan_l2_target_with_colliding_compact_l0_batch_seq() {
+    async fn recover_rejects_orphan_l2_target_without_mutating_a_false_fixed_point() {
         let store = test_store().await;
-        let source_id = Uuid::now_v7().to_string();
+        let (source_id, _) = insert_l0_batch(&store, &[user("source")]).await;
         // A CompactL0 job whose target L1 happens to share batch_seq with a
         // stray L2 target must not prevent the L2 orphan from being repaired.
-        insert_compact_l0_job(&store, "job-collide", &source_id, 5).await;
+        insert_compact_l0_job(&store, "job-collide", &source_id, 1).await;
 
         let orphan_l2 = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let orphan = MemoryBatchRecord::new(
             &orphan_l2,
             MemoryLayer::L2,
             0,
-            5,
+            1,
             MemoryBatchState::Compacting,
             0,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_orphan_l2_target",
+            MemoryTransition {
+                batch_inserts: vec![orphan],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert orphan L2 target");
-
-        recover_compacting_batches(&store)
-            .await
-            .expect("recover compacting batches");
-
-        let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
-            .bind(&orphan_l2)
-            .fetch_one(store.pool())
-            .await
-            .expect("fetch orphan state");
-        assert_eq!(state, "compact_failed");
-
-        let maintenance: i64 = sqlx::query_scalar(
+        .await;
+        let maintenance_before: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
         .fetch_one(store.pool())
         .await
-        .expect("count maintenance events");
-        assert_eq!(
-            maintenance, 1,
-            "orphan repair must emit one maintenance event"
-        );
+        .expect("count fixture maintenance events");
+
+        for attempt in 1..=2 {
+            let error = recover_compacting_batches(&store)
+                .await
+                .expect_err("orphan target must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("has no authenticated owning job"),
+                "attempt {attempt}: {error:#}"
+            );
+
+            let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&orphan_l2)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch orphan state");
+            assert_eq!(
+                state, "compacting",
+                "fail-closed recovery must preserve the authenticated orphan for diagnosis"
+            );
+
+            let maintenance: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count maintenance events");
+            assert_eq!(
+                maintenance, maintenance_before,
+                "attempt {attempt} must not invent a durable repair event"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5361,7 +6222,7 @@ mod tests {
         // discard branch for a Compacted source with version mismatch is
         // unreachable under existing CAS invariants.
         let source_id = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let source = MemoryBatchRecord::new(
             &source_id,
             MemoryLayer::L0,
             0,
@@ -5369,10 +6230,16 @@ mod tests {
             MemoryBatchState::Compacted,
             100,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_compacted_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert source batch");
+        .await;
 
         let source_uuid = BatchId::parse_str(&source_id).expect("source id is a valid batch UUID");
         let transition = MemoryTransition {

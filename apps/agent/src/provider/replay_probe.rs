@@ -9,7 +9,11 @@ use super::{
     types::{ApiProtocol, NativeCompactionCoverage, ProviderContextPayload},
 };
 
-pub(crate) const REPLAY_PROBE_VERSION: u32 = 1;
+// Version 2 separates the canonical ReplayProbeV1 formula from the legacy
+// T17 estimator v1. The contract name "ReplayProbeV1" is unchanged; only the
+// estimator version was bumped to avoid sharing version 1 with two different
+// formulas.
+pub(crate) const REPLAY_PROBE_VERSION: u32 = 2;
 
 /// Persisted estimator version for the `ReplayProbeV1` contract. It is kept
 /// distinct from the contract version because the legacy serialized-bytes/4

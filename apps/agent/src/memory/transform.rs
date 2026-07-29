@@ -14,6 +14,10 @@ use crate::provider::types::{
 /// previous response was cut off by the user. This text is injected at replay
 /// time and is never persisted.
 pub const INTERRUPTION_MARKER: &str = "[この応答はユーザーの割り込みにより中断された]";
+pub(crate) const MISSING_TOOL_RESULT_TEXT: &str = "No result provided";
+const ORPHAN_TOOL_RESULT_NOTICE: &str = "対応するツール呼び出しがないツール結果は再送から除外されました。必要ならツール呼び出しを再生成してください。";
+const REJECTED_TOOL_NOTICE_PREFIX: &str = "ツール `";
+const REJECTED_TOOL_NOTICE_SUFFIX: &str = "の引数検証に失敗したため実行されませんでした。ツール呼び出しを正しい引数で再生成してください。";
 
 #[derive(Clone, Copy)]
 enum ToolIdConstraint {
@@ -220,10 +224,13 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
 /// compaction remains semantically unanchored, but its authenticated owner
 /// still prevents context retained by an Error MessageEnd from leaking into a
 /// later provider request.
-pub fn provider_context_for_send_view(
+pub fn provider_context_for_send_view<T>(
     messages: &[ContextMessage],
-    provider_context: &[ProviderContextItem],
-) -> Vec<ProviderContextItem> {
+    provider_context: &[T],
+) -> Vec<T>
+where
+    T: AsRef<ProviderContextItem> + Clone,
+{
     let anchors = messages
         .iter()
         .filter_map(|message| match message {
@@ -235,6 +242,7 @@ pub fn provider_context_for_send_view(
     provider_context
         .iter()
         .filter(|item| {
+            let item = item.as_ref();
             anchors.contains(&(
                 item.retention_owner.message_id.as_str(),
                 item.retention_owner.message_seq,
@@ -242,6 +250,33 @@ pub fn provider_context_for_send_view(
         })
         .cloned()
         .collect()
+}
+
+pub(crate) fn is_generated_replay_artifact(context: &ContextMessage) -> bool {
+    let ContextMessage::Synthetic { message } = context else {
+        return false;
+    };
+    match message {
+        Message::ToolResult(result) => {
+            result
+                .details
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                == Some("missing_tool_result")
+                && matches!(
+                    result.content.as_slice(),
+                    [UserContent::Text { text }] if text == MISSING_TOOL_RESULT_TEXT
+                )
+        }
+        Message::User(user) => matches!(
+            user.content.as_slice(),
+            [UserContent::Text { text }]
+                if text == ORPHAN_TOOL_RESULT_NOTICE
+                    || (text.starts_with(REJECTED_TOOL_NOTICE_PREFIX)
+                        && text.ends_with(REJECTED_TOOL_NOTICE_SUFFIX))
+        ),
+        Message::Assistant(_) => false,
+    }
 }
 
 fn same_origin(context: &ContextMessage, destination: &ProviderOrigin) -> bool {
@@ -355,7 +390,7 @@ fn flush_pending_tools(
                 tool_call_id: pending.call.id,
                 tool_name: pending.call.name,
                 content: vec![UserContent::Text {
-                    text: "No result provided".to_owned(),
+                    text: MISSING_TOOL_RESULT_TEXT.to_owned(),
                 }],
                 details: serde_json::json!({"code": "missing_tool_result"}),
                 is_error: true,
@@ -375,8 +410,7 @@ fn flush_orphan_result(
     result.push(ContextMessage::Synthetic {
         message: Message::User(UserMessage {
             content: vec![UserContent::Text {
-                text: "対応するツール呼び出しがないツール結果は再送から除外されました。必要ならツール呼び出しを再生成してください。"
-                    .to_owned(),
+                text: ORPHAN_TOOL_RESULT_NOTICE.to_owned(),
             }],
             timestamp,
         }),
@@ -389,8 +423,8 @@ fn flush_rejections(result: &mut Vec<ContextMessage>, pending: &mut Vec<PendingR
             message: Message::User(UserMessage {
                 content: vec![UserContent::Text {
                     text: format!(
-                        "ツール `{}` の引数検証に失敗したため実行されませんでした。ツール呼び出しを正しい引数で再生成してください。",
-                        pending.rejected.name
+                        "{REJECTED_TOOL_NOTICE_PREFIX}{}` {REJECTED_TOOL_NOTICE_SUFFIX}",
+                        pending.rejected.name,
                     ),
                 }],
                 timestamp: pending.timestamp,
@@ -561,6 +595,7 @@ mod tests {
             messages,
             provider_context: Vec::new(),
             tools: Vec::new(),
+            replay_provenance: None,
         }
     }
 

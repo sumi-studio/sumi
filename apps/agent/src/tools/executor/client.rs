@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sha2::Digest;
 use tokio::{
     io::{
         AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
@@ -21,8 +22,8 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ArtifactOperation, ArtifactResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcRequest,
-    decode_rpc_frame,
+    ArtifactOperation, ArtifactResponse, MAX_ATTACHMENT_CHUNK_BYTES, MAX_RPC_LINE_BYTES, RpcError,
+    RpcFrame, RpcRequest, decode_rpc_frame,
 };
 use crate::runtime::contracts::RpcIdentity;
 use crate::tools::{ToolError, shell_capture::ArtifactAppender};
@@ -211,6 +212,98 @@ impl ArtifactBrokerClient {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    pub async fn put_attachment(
+        &self,
+        artifact_id: &str,
+        content: &str,
+    ) -> Result<String, ToolError> {
+        let bytes = content.as_bytes();
+        let total_bytes = u64::try_from(bytes.len())
+            .map_err(|_| ToolError::Protocol("attachment length overflow".to_owned()))?;
+        let content_digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let response = self
+            .execute(ArtifactOperation::BeginAttachment {
+                conversation_id: self.conversation_id.clone(),
+                artifact_id: artifact_id.to_owned(),
+                total_bytes,
+                content_digest: content_digest.clone(),
+            })
+            .await?;
+        let mut offset = match response {
+            ArtifactResponse::AttachmentBegun { offset } if offset <= total_bytes => offset,
+            ArtifactResponse::AttachmentBegun { .. } => {
+                return Err(ToolError::RpcIndeterminate(
+                    "attachment begin returned an invalid offset".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(ToolError::Protocol(
+                    "attachment begin returned the wrong response variant".to_owned(),
+                ));
+            }
+        };
+        while offset < total_bytes {
+            let start = usize::try_from(offset)
+                .map_err(|_| ToolError::Protocol("attachment offset overflow".to_owned()))?;
+            let end = start
+                .saturating_add(MAX_ATTACHMENT_CHUNK_BYTES)
+                .min(bytes.len());
+            let next = u64::try_from(end)
+                .map_err(|_| ToolError::Protocol("attachment offset overflow".to_owned()))?;
+            let response = self
+                .execute(ArtifactOperation::AppendAttachment {
+                    conversation_id: self.conversation_id.clone(),
+                    artifact_id: artifact_id.to_owned(),
+                    total_bytes,
+                    content_digest: content_digest.clone(),
+                    offset,
+                    content: bytes[start..end].to_vec(),
+                })
+                .await?;
+            match response {
+                ArtifactResponse::AttachmentAppended {
+                    offset: acknowledged,
+                } if acknowledged == next => offset = acknowledged,
+                ArtifactResponse::AttachmentAppended { .. } => {
+                    return Err(ToolError::RpcIndeterminate(
+                        "attachment append returned an unexpected offset".to_owned(),
+                    ));
+                }
+                _ => {
+                    return Err(ToolError::Protocol(
+                        "attachment append returned the wrong response variant".to_owned(),
+                    ));
+                }
+            }
+        }
+        let response = self
+            .execute(ArtifactOperation::FinishAttachment {
+                conversation_id: self.conversation_id.clone(),
+                artifact_id: artifact_id.to_owned(),
+                total_bytes,
+                content_digest,
+            })
+            .await?;
+        match response {
+            ArtifactResponse::Put { handle } if handle == self.attachment_handle(artifact_id) => {
+                Ok(handle)
+            }
+            ArtifactResponse::Put { .. } => Err(ToolError::RpcIndeterminate(
+                "artifact put returned an unexpected canonical handle".to_owned(),
+            )),
+            _ => Err(ToolError::Protocol(
+                "artifact put returned the wrong response variant".to_owned(),
+            )),
+        }
+    }
+
+    fn attachment_handle(&self, artifact_id: &str) -> String {
+        format!(
+            "artifact://{}/attachments/{artifact_id}",
+            self.conversation_id
+        )
     }
 }
 
@@ -861,6 +954,77 @@ mod tests {
             matches!(error, ToolError::RpcIndeterminate(message) if message.contains("canonical handle"))
         );
         server.await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn put_attachment_chunks_large_content_below_the_rpc_line_limit() {
+        let root = std::env::temp_dir().join(format!("sumi-client-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let content = "x".repeat(MAX_RPC_LINE_BYTES + 123);
+        let expected = content.as_bytes().to_vec();
+        let server = tokio::spawn(async move {
+            let mut received: Vec<u8> = Vec::new();
+            let mut largest_line = 0usize;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                largest_line = largest_line.max(line.len());
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let request_id = request["request_id"].clone();
+                let operation = request["operation"]["type"].as_str().unwrap();
+                let result = match operation {
+                    "begin_attachment" => json!({"Ok":{"type":"attachment_begun","offset":0}}),
+                    "append_attachment" => {
+                        let offset = request["operation"]["offset"].as_u64().unwrap();
+                        let bytes = request["operation"]["content"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|value| value.as_u64().unwrap() as u8)
+                            .collect::<Vec<_>>();
+                        received.extend(bytes.iter());
+                        json!({"Ok":{"type":"attachment_appended","offset":offset + bytes.len() as u64}})
+                    }
+                    "finish_attachment" => {
+                        let response = json!({
+                            "type":"terminal", "generation":1, "nonce":"nonce",
+                            "request_id":request_id,
+                            "result":{"Ok":{"type":"put","handle":"artifact://conversation-1/attachments/input-1"}},
+                        });
+                        let mut encoded = serde_json::to_vec(&response).unwrap();
+                        encoded.push(b'\n');
+                        write.write_all(&encoded).await.unwrap();
+                        return (largest_line, received);
+                    }
+                    other => panic!("unexpected attachment operation: {other}"),
+                };
+                let response = json!({
+                    "type":"terminal", "generation":1, "nonce":"nonce",
+                    "request_id":request_id, "result":result,
+                });
+                let mut encoded = serde_json::to_vec(&response).unwrap();
+                encoded.push(b'\n');
+                write.write_all(&encoded).await.unwrap();
+            }
+        });
+        let client = ArtifactBrokerClient::new(
+            &socket,
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            "conversation-1",
+        );
+        assert_eq!(
+            client.put_attachment("input-1", &content).await.unwrap(),
+            "artifact://conversation-1/attachments/input-1"
+        );
+        let (largest_line, received) = server.await.unwrap();
+        assert!(largest_line <= MAX_RPC_LINE_BYTES);
+        assert_eq!(received, expected);
         let _ = std::fs::remove_dir_all(root);
     }
 }

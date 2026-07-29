@@ -7133,9 +7133,7 @@ mod tests {
         let fence = GenerationRecoveryFence::new(&lease, "fence-t17-t24").unwrap();
         let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
             HydrationOutcome::Complete(state) => state.receipt,
-            HydrationOutcome::RecoveryRequired(_) => {
-                panic!("empty test store must hydrate without physical recovery")
-            }
+            other => panic!("empty test store must hydrate without recovery: {other:?}"),
         };
         for seq in 1..=9 {
             insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)

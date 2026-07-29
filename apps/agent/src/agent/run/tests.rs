@@ -26,15 +26,19 @@ use crate::{
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
+    memory::{
+        context_assembler::ProviderCallTrigger,
+        estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+    },
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObserver, RequestOptions,
         assembler::ResponseBudget,
         types::{
             ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, PromptContext,
-            ProviderContextAnchor, ProviderContextFragment, ProviderContextPayload,
-            ProviderEventStream, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
-            RejectedToolCall, SuccessTerminalCommit, ToolArgumentError, Usage,
-            ValidatedToolArguments,
+            ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+            ProviderContextPayload, ProviderEventStream, ProviderOrigin, ProviderOutput,
+            PublicAssistantMessage, RejectedToolCall, SuccessTerminalCommit, ToolArgumentError,
+            Usage, ValidatedToolArguments,
         },
     },
     runtime::contracts::ProcessGeneration,
@@ -60,6 +64,7 @@ fn output(message: AssistantMessage) -> Script {
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
     started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    started_triggers: Mutex<Vec<ProviderCallTrigger>>,
     started_command_times: Mutex<Vec<Option<std::time::Instant>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
@@ -81,6 +86,7 @@ impl FixtureDriver {
         Self {
             scripts: Mutex::new(scripts.into()),
             started_contexts: Mutex::new(Vec::new()),
+            started_triggers: Mutex::new(Vec::new()),
             started_command_times: Mutex::new(Vec::new()),
             tool_order: Mutex::new(Vec::new()),
             tool_failures: Mutex::new(VecDeque::new()),
@@ -177,6 +183,23 @@ impl RunDriver for FixtureDriver {
         }
     }
 
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_triggers
+            .lock()
+            .expect("provider call triggers")
+            .push(trigger);
+        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+            .await
+    }
+
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
@@ -269,8 +292,8 @@ fn timestamp() -> chrono::DateTime<Utc> {
 fn origin() -> ProviderOrigin {
     ProviderOrigin {
         provider_instance_id: "fixture:https://example.invalid".to_owned(),
-        protocol: ApiProtocol::OpenAiChatCompletions,
-        model: "fixture-model".to_owned(),
+        protocol: ApiProtocol::OpenAiResponses,
+        model: "openai-responses".to_owned(),
     }
 }
 
@@ -504,6 +527,7 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
@@ -517,6 +541,7 @@ fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> P
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
@@ -750,6 +775,7 @@ async fn committed_context_mutation_advances_reviewer_cache_version_within_run()
             MessageCommitReceipt {
                 message_id: "persisted-user-2".to_owned(),
                 message_seq: 22,
+                calibration_ratio_bits: None,
                 new_turn_id: None,
             },
             &message,
@@ -837,6 +863,7 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: *next_seq,
+            calibration_ratio_bits: None,
             new_turn_id: None,
         });
         *next_seq += 1;
@@ -862,7 +889,9 @@ async fn complete_with_receipts(
 }
 
 fn assert_completed(completion: RunCompletion) {
-    assert!(matches!(completion, RunCompletion::Completed(_)));
+    if let RunCompletion::Failed { failure, .. } = completion {
+        panic!("run failed: {failure}");
+    }
 }
 
 #[tokio::test]
@@ -961,6 +990,7 @@ async fn required_tool_choice_resets_after_retry_for_queued_user_turn() {
         messages: Vec::new(),
         provider_context: Vec::new(),
         tools: registry.definitions(),
+        replay_provenance: None,
     };
     let driver = Arc::new(
         InjectedRunDriver::with_stream_starter(
@@ -1027,6 +1057,14 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         command_times[1], None,
         "retry backoff is not internal overhead"
     );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "a retry without a newly injected user is a continuation"
+    );
 }
 
 #[tokio::test]
@@ -1042,7 +1080,12 @@ async fn nonempty_provider_context_flows_to_the_durable_message_barrier() {
                     wire_item_index: Some(0),
                     payload: ProviderContextPayload::EncryptedReasoning {
                         protocol: ApiProtocol::OpenAiResponses,
-                        item: json!({"encrypted_content":"opaque"}),
+                        item: json!({
+                            "id": "rs-test-opaque",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": "opaque",
+                        }),
                     },
                 }],
             },
@@ -1077,10 +1120,24 @@ fn cancellation_provider_context() -> Vec<ProviderContextFragment> {
     vec![ProviderContextFragment {
         wire_item_index: Some(0),
         payload: ProviderContextPayload::EncryptedReasoning {
-            protocol: ApiProtocol::OpenAiChatCompletions,
-            item: json!({"encrypted_content":"cancelled-opaque"}),
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "cancelled-reasoning",
+                "summary": [],
+                "encrypted_content": "cancelled-opaque"
+            }),
         },
     }]
+}
+
+fn cancellation_assistant(reason: StopReason) -> AssistantMessage {
+    let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
+    let mut message = assistant(reason, Vec::new(), None, None);
+    message.model = spec.id.clone();
+    message.provider = spec.provider.clone();
+    message.origin = spec.origin();
+    message
 }
 
 #[tokio::test]
@@ -1093,33 +1150,44 @@ async fn aborted_message_end_keeps_verified_provider_context_on_barrier() {
         control_rx,
         events_tx,
     );
-    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
-    let task = tokio::spawn(async move {
-        runner
-            .close_aborted_attempt(
-                "assistant-aborted",
-                true,
-                partial,
-                cancellation_provider_context(),
-            )
-            .await
-    });
-    let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
-    let barrier = output
-        .message_commit_barrier
-        .take()
-        .expect("MessageEnd barrier");
-    assert_eq!(barrier.provider_context_for_test().len(), 1);
-    barrier.resolve(MessageCommitReceipt {
-        message_id: "assistant-aborted".to_owned(),
-        message_seq: 1,
-        new_turn_id: None,
-    });
-    drop(control_tx);
-    assert!(matches!(
-        task.await.expect("close task").expect("close outcome"),
-        AttemptOutcome::ClosedError { .. }
-    ));
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_aborted_attempt(
+        "assistant-aborted",
+        true,
+        partial,
+        cancellation_provider_context(),
+    );
+    let receive = async {
+        let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-aborted".to_owned(),
+            message_seq: 1,
+            calibration_ratio_bits: None,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
+    let AttemptOutcome::ClosedError {
+        message, receipt, ..
+    } = outcome.expect("close outcome")
+    else {
+        panic!("aborted close must return ClosedError");
+    };
+    let receipt = runner
+        .await_message_receipt(receipt)
+        .await
+        .expect("aborted receipt");
+    runner
+        .retain_committed(receipt, &message)
+        .expect("retain aborted context");
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
 }
 
 #[tokio::test]
@@ -1132,37 +1200,39 @@ async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
         control_rx,
         events_tx,
     );
-    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
-    let task = tokio::spawn(async move {
-        runner
-            .close_hard_steer_attempt(
-                "assistant-steered",
-                true,
-                partial,
-                cancellation_provider_context(),
-                admitted_user(2),
-            )
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_hard_steer_attempt(
+        "assistant-steered",
+        true,
+        partial,
+        cancellation_provider_context(),
+        admitted_user(2),
+    );
+    let receive = async {
+        let mut output = events_rx
+            .recv()
             .await
-    });
-    let mut output = events_rx
-        .recv()
-        .await
-        .expect("hard-steer MessageEnd output");
-    let barrier = output
-        .message_commit_barrier
-        .take()
-        .expect("MessageEnd barrier");
-    assert_eq!(barrier.provider_context_for_test().len(), 1);
-    barrier.resolve(MessageCommitReceipt {
-        message_id: "assistant-steered".to_owned(),
-        message_seq: 1,
-        new_turn_id: None,
-    });
-    drop(control_tx);
+            .expect("hard-steer MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-steered".to_owned(),
+            message_seq: 1,
+            calibration_ratio_bits: None,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
     assert!(matches!(
-        task.await.expect("close task").expect("close outcome"),
+        outcome.expect("close outcome"),
         AttemptOutcome::HardSteer
     ));
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
 }
 
 struct HardSteerProviderContextDriver {
@@ -1210,6 +1280,7 @@ impl HardSteerProviderContextDriver {
         Ok(ProviderAttempt {
             message_id: format!("assistant-{attempt}"),
             initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::with_priority_terminal(
                 normal_rx,
                 priority_terminal_rx,
@@ -1244,14 +1315,20 @@ impl RunDriver for HardSteerProviderContextDriver {
         &self,
         attempt: usize,
         _context: &[ContextMessage],
-        provider_context: &[ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: ProviderCallTrigger,
         _command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.started_provider_contexts
             .lock()
             .expect("provider contexts")
-            .push(provider_context.to_vec());
+            .push(
+                provider_context
+                    .iter()
+                    .map(|context| context.item.clone())
+                    .collect(),
+            );
         self.attempt(attempt, cancel)
     }
 
@@ -1341,6 +1418,7 @@ async fn hard_steer_provider_context_reaches_the_next_live_provider_attempt() {
             barrier.resolve(MessageCommitReceipt {
                 message_id: message_id.clone(),
                 message_seq,
+                calibration_ratio_bits: None,
                 new_turn_id,
             });
             message_seq += 1;
@@ -1456,6 +1534,7 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
                 barrier.resolve(MessageCommitReceipt {
                     message_id,
                     message_seq,
+                    calibration_ratio_bits: None,
                     new_turn_id: Some("turn-after-hard-steer".to_owned()),
                 });
                 assert!(
@@ -1471,6 +1550,7 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
             barrier.resolve(MessageCommitReceipt {
                 message_id,
                 message_seq,
+                calibration_ratio_bits: None,
                 new_turn_id,
             });
             message_seq += 1;
@@ -1498,22 +1578,30 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
         .into_iter()
         .next()
         .expect("provider context fragment");
+    let provider_origin = origin();
+    let provider_spec =
+        ModelSpec::from_origin(&provider_origin).expect("known provider context origin");
+    let expected_footprint =
+        eviction_footprint_for_payload(&provider_spec, &fragment.payload).expect("footprint");
     assert_eq!(
         core.provider_context,
-        vec![ProviderContextItem {
-            retention_owner: ProviderContextAnchor {
-                message_id: "assistant-0".to_owned(),
-                message_seq: hard_steer_seq,
+        vec![ProviderContextItemWithFootprint::new(
+            ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "assistant-0".to_owned(),
+                    message_seq: hard_steer_seq,
+                },
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: "assistant-0".to_owned(),
+                    message_seq: hard_steer_seq,
+                }),
+                wire_item_index: fragment.wire_item_index,
+                ordinal: 0,
+                provider_origin,
+                payload: fragment.payload,
             },
-            origin_message: Some(ProviderContextAnchor {
-                message_id: "assistant-0".to_owned(),
-                message_seq: hard_steer_seq,
-            }),
-            wire_item_index: fragment.wire_item_index,
-            ordinal: 0,
-            provider_origin: origin(),
-            payload: fragment.payload,
-        }],
+            expected_footprint,
+        )],
         "the returned live core must match cold hydration exactly once after Abort wins"
     );
 }
@@ -1580,6 +1668,7 @@ async fn authoritative_error_terminal_preserves_metadata_context_and_retry_class
             barrier.resolve(MessageCommitReceipt {
                 message_id: message_id.clone(),
                 message_seq,
+                calibration_ratio_bits: None,
                 new_turn_id: None,
             });
             break task.await.expect("provider attempt task");
@@ -1632,6 +1721,7 @@ async fn authoritative_error_context_survives_overflow_classification() {
             barrier.resolve(MessageCommitReceipt {
                 message_id: message_id.clone(),
                 message_seq: 1,
+                calibration_ratio_bits: None,
                 new_turn_id: None,
             });
             break task.await.expect("provider attempt task");
@@ -1707,6 +1797,14 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
         contexts[1]
             .iter()
             .all(|message| matches!(context_message(message), Message::User(_)))
+    );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::FirstAfterUser,
+        ],
+        "retry-wait user injection must restore TTFT protection even at attempt ordinal one"
     );
 }
 
@@ -1909,6 +2007,14 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "tool-loop calls without a newly injected user are continuations"
+    );
     let command_times = driver.started_command_times.lock().expect("command times");
     assert_eq!(command_times.len(), 2);
     assert!(command_times[0].is_some());
@@ -3523,6 +3629,7 @@ impl RunDriver for CancellingProbeDriver {
         Ok(ProviderAttempt {
             message_id: format!("assistant-{attempt}"),
             initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            uncalibrated_prompt_estimate: 0,
             events: crate::provider::types::ProviderEventStream::new(
                 rx,
                 cancel,

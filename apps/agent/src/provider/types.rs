@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{Stream, task::AtomicWaker};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -89,6 +90,15 @@ impl From<PublicMessage> for Message {
     }
 }
 
+impl PublicMessage {
+    pub fn usage(&self) -> Usage {
+        match self {
+            PublicMessage::Assistant(assistant) => assistant.usage.clone(),
+            _ => Usage::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
@@ -140,8 +150,16 @@ pub struct ProviderContextItem {
 /// provider replay. Every authenticated anchor/wire group starts at ordinal
 /// zero and has no duplicate or missing ordinal. Native windows form an
 /// unanchored group scoped by their exact provider origin and payload kind.
-pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
-    validate_provider_context_ordinal_refs(items.iter())
+impl AsRef<ProviderContextItem> for ProviderContextItem {
+    fn as_ref(&self) -> &ProviderContextItem {
+        self
+    }
+}
+
+pub fn validate_provider_context_ordinals<T: AsRef<ProviderContextItem>>(
+    items: &[T],
+) -> Result<(), String> {
+    validate_provider_context_ordinal_refs(items.iter().map(AsRef::as_ref))
 }
 
 pub(crate) fn validate_provider_context_ordinal_refs<'a>(
@@ -1054,6 +1072,92 @@ pub struct PromptContext {
     pub messages: Vec<ContextMessage>,
     pub provider_context: Vec<ProviderContextItem>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum VerifiedReplayProvenance {
+    SumiNormalized {
+        provider_origin: ProviderOrigin,
+        canonical_through_seq: Option<u64>,
+    },
+    ProviderNativeExact {
+        provider_origin: ProviderOrigin,
+        native_coverage_through_seq: u64,
+        canonical_suffix_through_seq: Option<u64>,
+    },
+}
+
+impl PromptContext {
+    pub fn new(
+        system_prompt: String,
+        memory_blocks: Vec<MemoryBlock>,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            system_prompt,
+            memory_blocks,
+            messages,
+            provider_context,
+            tools,
+            replay_provenance: None,
+        }
+    }
+
+    pub(crate) fn verified_replay_provenance(
+        &self,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let Some(provenance) = &self.replay_provenance else {
+            return Ok(None);
+        };
+        provenance.verify(self.replay_send_view_digest()?).map(Some)
+    }
+
+    pub(crate) fn verified_replay_provenance_for(
+        &self,
+        destination: &ProviderOrigin,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let provenance = self.verified_replay_provenance()?;
+        if provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.provider_origin() != destination)
+        {
+            return Err(
+                "bound replay destination does not match the selected provider_origin".into(),
+            );
+        }
+        Ok(provenance)
+    }
+
+    pub(crate) fn replay_send_view_digest(&self) -> Result<[u8; 32], String> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("failed to serialize replay send view: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"sumi.prompt-replay-binding.v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| "replay send view length exceeds u64".to_owned())?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
+}
+
+impl VerifiedReplayProvenance {
+    pub(crate) fn provider_origin(&self) -> &ProviderOrigin {
+        match self {
+            Self::SumiNormalized {
+                provider_origin, ..
+            }
+            | Self::ProviderNativeExact {
+                provider_origin, ..
+            } => provider_origin,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1394,6 +1498,7 @@ mod tests {
                     "required": ["path"]
                 }),
             }],
+            replay_provenance: None,
         };
 
         assert_round_trip(&context);
