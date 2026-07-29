@@ -30,12 +30,12 @@ type DurableGateway struct {
 	// PollInterval bounds the polling interval used by WaitFor and Live.
 	// A zero value uses the safe default (50ms).
 	PollInterval time.Duration
-	// MaxConversationTails and MaxAckTail bound process memory without changing
+	// MaxPersonalityAgentTails and MaxAckTail bound process memory without changing
 	// durable replay. Zero values use conservative defaults.
-	MaxConversationTails int
-	MaxAckTail           int
+	MaxPersonalityAgentTails int
+	MaxAckTail               int
 
-	tails map[string]*conversationLogState
+	tails map[string]*personalityAgentLogState
 	// browserSubscribers carry volatile frames only. Durable replay always
 	// reads the event log, so disconnecting a slow browser cannot lose durable
 	// history or grow this process without bound.
@@ -54,7 +54,7 @@ type DurableGateway struct {
 	pendingApprovals map[string]map[string]bool
 }
 
-type conversationLogState struct {
+type personalityAgentLogState struct {
 	eventSeq  uint64
 	eventSize int64
 	eventCRC  uint32
@@ -164,7 +164,7 @@ func (r *durableEventRecord) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// durableFileHandle abstracts the per-conversation log file so tests can
+// durableFileHandle abstracts the per-personality-agent log file so tests can
 // inject deterministic write/sync/truncate failures without changing
 // production call sites.
 type durableFileHandle interface {
@@ -202,16 +202,16 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		return nil, fmt.Errorf("gateway runtime state path %q is not a directory", abs)
 	}
 	return &DurableGateway{
-		dir:                  abs,
-		commands:             commands,
-		PollInterval:         50 * time.Millisecond,
-		MaxConversationTails: 128,
-		MaxAckTail:           256,
-		tails:                make(map[string]*conversationLogState),
-		browserSubscribers:   make(map[string]map[uint64]chan Envelope),
-		stateRebuilt:         make(map[string]bool),
-		runInFlight:          make(map[string]bool),
-		pendingApprovals:     make(map[string]map[string]bool),
+		dir:                      abs,
+		commands:                 commands,
+		PollInterval:             50 * time.Millisecond,
+		MaxPersonalityAgentTails: 128,
+		MaxAckTail:               256,
+		tails:                    make(map[string]*personalityAgentLogState),
+		browserSubscribers:       make(map[string]map[uint64]chan Envelope),
+		stateRebuilt:             make(map[string]bool),
+		runInFlight:              make(map[string]bool),
+		pendingApprovals:         make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
@@ -225,9 +225,9 @@ func (g *DurableGateway) pollInterval() time.Duration {
 	return 50 * time.Millisecond
 }
 
-func (g *DurableGateway) maxConversationTails() int {
-	if g.MaxConversationTails > 0 {
-		return g.MaxConversationTails
+func (g *DurableGateway) maxPersonalityAgentTails() int {
+	if g.MaxPersonalityAgentTails > 0 {
+		return g.MaxPersonalityAgentTails
 	}
 	return 128
 }
@@ -320,7 +320,7 @@ func (g *DurableGateway) NextCommandSeq(ctx context.Context, claims TokenClaims)
 
 	// Take the command view after excluding ACK appenders. Any command appended
 	// after this snapshot cannot acquire an ACK until this scan releases the
-	// per-conversation file lock, so returning snapshot.nextSeq is conservative.
+	// per-personality-agent file lock, so returning snapshot.nextSeq is conservative.
 	snapshot, err := g.commands.commandSnapshot(ctx, claims.PersonalityAgentID)
 	if err != nil {
 		return 0, err
@@ -445,7 +445,7 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	); err != nil {
 		return err
 	}
-	g.updateConversationStateLocked(claims.PersonalityAgentID, envelope.Event)
+	g.updateAgentSessionStateLocked(claims.PersonalityAgentID, envelope.Event)
 	return nil
 }
 
@@ -494,7 +494,7 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID st
 				return nil, fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", record.Seq, record.Event.Seq)
 			}
 			if record.Event.PersonalityAgentID != personalityAgentID {
-				return nil, fmt.Errorf("durable event record conversation mismatch: got %q, want %q", record.Event.PersonalityAgentID, personalityAgentID)
+				return nil, fmt.Errorf("durable event record personality agent mismatch: got %q, want %q", record.Event.PersonalityAgentID, personalityAgentID)
 			}
 			previous = record.Seq
 			if record.Seq > lastConsumedSeq {
@@ -586,21 +586,21 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 	return st.eventSeq, nil
 }
 
-func (g *DurableGateway) stateFor(personalityAgentID string) *conversationLogState {
+func (g *DurableGateway) stateFor(personalityAgentID string) *personalityAgentLogState {
 	g.clock++
 	st, ok := g.tails[personalityAgentID]
 	if ok {
 		st.lastUsed = g.clock
 		return st
 	}
-	st = &conversationLogState{acks: make(map[uint64]CommandAck), lastUsed: g.clock}
+	st = &personalityAgentLogState{acks: make(map[uint64]CommandAck), lastUsed: g.clock}
 	g.tails[personalityAgentID] = st
 	g.evictInactiveTailsLocked(personalityAgentID)
 	return st
 }
 
 func (g *DurableGateway) evictInactiveTailsLocked(activePersonalityAgentID string) {
-	for len(g.tails) > g.maxConversationTails() {
+	for len(g.tails) > g.maxPersonalityAgentTails() {
 		var evictID string
 		var oldest uint64
 		for personalityAgentID, state := range g.tails {
@@ -618,7 +618,7 @@ func (g *DurableGateway) evictInactiveTailsLocked(activePersonalityAgentID strin
 	}
 }
 
-func (g *DurableGateway) rememberAckLocked(st *conversationLogState, ack CommandAck) {
+func (g *DurableGateway) rememberAckLocked(st *personalityAgentLogState, ack CommandAck) {
 	st.acks[ack.Seq] = ack
 	st.ackOrder = append(st.ackOrder, ackCacheEntry{seq: ack.Seq, ack: ack})
 	for len(st.acks) > g.maxAckTail() && len(st.ackOrder) > 0 {
@@ -733,7 +733,7 @@ func (g *DurableGateway) appendDurableEventLocked(personalityAgentID string, rec
 	return nil
 }
 
-func (g *DurableGateway) updateConversationStateLocked(personalityAgentID string, event json.RawMessage) {
+func (g *DurableGateway) updateAgentSessionStateLocked(personalityAgentID string, event json.RawMessage) {
 	g.stateMu.Lock()
 	defer g.stateMu.Unlock()
 	g.applyEventStateLocked(personalityAgentID, event)
@@ -781,13 +781,13 @@ func (g *DurableGateway) applyEventStateLocked(personalityAgentID string, event 
 	}
 }
 
-// EnsureConversationStateRebuilt reconstructs the in-flight and pending-approval
+// EnsureAgentSessionStateRebuilt reconstructs the in-flight and pending-approval
 // command guard state for personalityAgentID from the durable event log. It is called
 // by the browser WebSocket before command admission begins so that guards remain
 // authoritative across API process restarts. If the durable log is corrupt,
 // non-contiguous, or otherwise unreadable, reconstruction returns an error and
 // the caller must fail closed rather than admitting commands.
-func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, personalityAgentID string) error {
+func (g *DurableGateway) EnsureAgentSessionStateRebuilt(ctx context.Context, personalityAgentID string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -797,7 +797,7 @@ func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, per
 
 	events, err := g.EventCatchUp(ctx, personalityAgentID, 0)
 	if err != nil {
-		return fmt.Errorf("rebuild conversation state: %w", err)
+		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
 
 	g.stateMu.Lock()
@@ -823,7 +823,7 @@ func (g *DurableGateway) IsRunInFlight(personalityAgentID string) bool {
 }
 
 // IsApprovalPending reports whether an approval with requestID is still awaiting
-// a decision in the conversation. It is used by the browser WebSocket to reject
+// a decision in the agent session. It is used by the browser WebSocket to reject
 // approval_decision commands for unknown or already-resolved requests.
 func (g *DurableGateway) IsApprovalPending(personalityAgentID, requestID string) bool {
 	if requestID == "" {
@@ -844,7 +844,7 @@ func (g *DurableGateway) appendCommandAck(ctx context.Context, personalityAgentI
 	}
 	defer file.Close()
 	// Lock only this ACK log while waiting for I/O. The process-wide cache lock
-	// is acquired afterwards, so unrelated conversations remain independent.
+	// is acquired afterwards, so unrelated personality agents remain independent.
 	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock durable ack log for append: %w", err)
 	}
@@ -923,7 +923,7 @@ func (g *DurableGateway) appendCommandAck(ctx context.Context, personalityAgentI
 	return nil
 }
 
-func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conversationLogState) error {
+func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *personalityAgentLogState) error {
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("seek durable event log: %w", err)
@@ -1039,7 +1039,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 	return nil
 }
 
-func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conversationLogState) error {
+func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *personalityAgentLogState) error {
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("seek durable ack log: %w", err)
@@ -1249,7 +1249,7 @@ func foldAckCursorRecord(snapshot commandLogSnapshot, states compactAckStates, a
 
 // findAckLocked reloads an evicted ACK entry from its durable log. The cache
 // may only retain a bounded tail, but terminal ACK transitions remain valid
-// regardless of conversation age or process lifetime.
+// regardless of personality-agent age or process lifetime.
 func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return CommandAck{}, false, fmt.Errorf("seek durable ack log for lookup: %w", err)

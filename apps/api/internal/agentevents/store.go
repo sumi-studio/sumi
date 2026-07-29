@@ -37,12 +37,12 @@ import (
 type CommandStore struct {
 	mu              sync.Mutex
 	dir             string
-	states          map[string]*conversationState
+	states          map[string]*personalityAgentState
 	idempotencyLock *os.File
 	closed          bool
 }
 
-// fileHandle abstracts the per-conversation log file so tests can inject
+// fileHandle abstracts the per-personality-agent log file so tests can inject
 // deterministic failures without changing production call sites.
 type fileHandle interface {
 	io.Seeker
@@ -55,7 +55,7 @@ type fileHandle interface {
 	Fd() uintptr
 }
 
-type conversationState struct {
+type personalityAgentState struct {
 	mu          sync.Mutex
 	path        string
 	file        fileHandle
@@ -203,7 +203,7 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 
 	s := &CommandStore{
 		dir:    abs,
-		states: make(map[string]*conversationState),
+		states: make(map[string]*personalityAgentState),
 	}
 	idempotencyLockPath := filepath.Join(abs, ".idempotency.lock")
 	idempotencyLock, err := os.OpenFile(idempotencyLockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
@@ -224,7 +224,7 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("invalid command log file %q: %w", path, err)
 		}
-		st := newConversationState(path)
+		st := newPersonalityAgentState(path)
 		if err := s.loadStateLocked(context.Background(), st, personalityAgentID); err != nil {
 			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("load command log %q: %w", path, err)
@@ -242,7 +242,7 @@ func (s *CommandStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	states := make([]*conversationState, 0, len(s.states))
+	states := make([]*personalityAgentState, 0, len(s.states))
 	for _, st := range s.states {
 		states = append(states, st)
 	}
@@ -268,9 +268,9 @@ func (s *CommandStore) Close() error {
 	return firstErr
 }
 
-// poisonLocked marks a conversation state as unusable and closes its file so
+// poisonLocked marks a personality-agent state as unusable and closes its file so
 // no later append can reuse a seq or continue from uncertain bytes.
-func (s *CommandStore) poisonLocked(st *conversationState, reason error) {
+func (s *CommandStore) poisonLocked(st *personalityAgentState, reason error) {
 	if st.file != nil {
 		_ = st.file.Close()
 		st.file = nil
@@ -280,8 +280,8 @@ func (s *CommandStore) poisonLocked(st *conversationState, reason error) {
 }
 
 // rollbackLocked attempts to truncate the log back to offset and fsync. If the
-// rollback cannot be durably confirmed, it poisons the conversation state.
-func (s *CommandStore) rollbackLocked(st *conversationState, offset int64, origErr error) error {
+// rollback cannot be durably confirmed, it poisons the personality-agent state.
+func (s *CommandStore) rollbackLocked(st *personalityAgentState, offset int64, origErr error) error {
 	var truncErr, syncErr error
 	if st.file != nil {
 		truncErr = st.file.Truncate(offset)
@@ -333,7 +333,7 @@ func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenan
 	}
 	personalityAgentID := provenance.PersonalityAgentID
 
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return CommandEnvelope{}, err
 	}
@@ -468,7 +468,7 @@ func (s *CommandStore) NextCommandSeq(ctx context.Context, personalityAgentID st
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return 0, err
 	}
@@ -492,7 +492,7 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, personalityAgentID s
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return 0, err
 	}
@@ -520,7 +520,7 @@ func (s *CommandStore) HasCommands(ctx context.Context, personalityAgentID strin
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return false, err
 	}
@@ -544,7 +544,7 @@ func (s *CommandStore) GetCommand(ctx context.Context, personalityAgentID string
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, false, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
@@ -571,7 +571,7 @@ func (s *CommandStore) CatchUp(ctx context.Context, personalityAgentID string, f
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +604,7 @@ func (s *CommandStore) commandSnapshot(ctx context.Context, personalityAgentID s
 	if err := ctx.Err(); err != nil {
 		return commandLogSnapshot{}, err
 	}
-	st, err := s.lockConversation(ctx, personalityAgentID)
+	st, err := s.lockPersonalityAgent(ctx, personalityAgentID)
 	if err != nil {
 		return commandLogSnapshot{}, err
 	}
@@ -623,10 +623,10 @@ func (s *CommandStore) commandSnapshot(ctx context.Context, personalityAgentID s
 	return commandLogSnapshot{commands: commands, nextSeq: st.nextSeq}, nil
 }
 
-// lockConversation returns with the per-conversation mutex held. The store
+// lockPersonalityAgent returns with the per-personality-agent mutex held. The store
 // mutex protects only lifecycle and map membership and is released before a
-// flock wait or disk scan, allowing unrelated conversations to progress.
-func (s *CommandStore) lockConversation(ctx context.Context, personalityAgentID string) (*conversationState, error) {
+// flock wait or disk scan, allowing unrelated personality agents to progress.
+func (s *CommandStore) lockPersonalityAgent(ctx context.Context, personalityAgentID string) (*personalityAgentState, error) {
 	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
 		return nil, err
 	}
@@ -639,7 +639,7 @@ func (s *CommandStore) lockConversation(ctx context.Context, personalityAgentID 
 	}
 	st := s.states[personalityAgentID]
 	if st == nil {
-		st = newConversationState(commandLogPath(s.dir, personalityAgentID))
+		st = newPersonalityAgentState(commandLogPath(s.dir, personalityAgentID))
 		s.states[personalityAgentID] = st
 	}
 	s.mu.Unlock()
@@ -678,7 +678,7 @@ func isIncompleteJSONError(err error) bool {
 // scanLogLocked reads the log from the current offset and populates st. It
 // truncates an incomplete final tail and repairs a missing trailing newline.
 // The caller must exclusively own st and hold an exclusive flock on st.file.
-func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
+func (s *CommandStore) scanLogLocked(ctx context.Context, st *personalityAgentState, personalityAgentID string) error {
 	if _, err := st.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", personalityAgentID, err)
 	}
@@ -787,12 +787,12 @@ func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState,
 // disk under the existing exclusive flock. A conservative rescan is used rather
 // than a file-size short-circuit so that a same-size truncate/rewrite by
 // another process cannot leave stale nextSeq or idempotency maps.
-func (s *CommandStore) refreshStateLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
+func (s *CommandStore) refreshStateLocked(ctx context.Context, st *personalityAgentState, personalityAgentID string) error {
 	if _, err := st.file.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", personalityAgentID, err)
 	}
 
-	fresh := newConversationState(st.path)
+	fresh := newPersonalityAgentState(st.path)
 	fresh.file = st.file
 	if err := s.scanLogLocked(ctx, fresh, personalityAgentID); err != nil {
 		return err
@@ -806,15 +806,15 @@ func (s *CommandStore) refreshStateLocked(ctx context.Context, st *conversationS
 	return nil
 }
 
-func newConversationState(path string) *conversationState {
-	return &conversationState{
+func newPersonalityAgentState(path string) *personalityAgentState {
+	return &personalityAgentState{
 		path: path, nextSeq: 1, bySeq: make(map[uint64]int),
 		byCommandID: make(map[string]int), byKey: make(map[string]int),
 	}
 }
 
-// loadStateLocked initializes st while its per-conversation mutex is held.
-func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
+// loadStateLocked initializes st while its per-personality-agent mutex is held.
+func (s *CommandStore) loadStateLocked(ctx context.Context, st *personalityAgentState, personalityAgentID string) error {
 	info, err := os.Lstat(st.path)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -835,7 +835,7 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationStat
 		_ = file.Close()
 		return fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
-	fresh := newConversationState(st.path)
+	fresh := newPersonalityAgentState(st.path)
 	fresh.file = file
 	if err := s.scanLogLocked(ctx, fresh, personalityAgentID); err != nil {
 		_ = unlockFile(file)

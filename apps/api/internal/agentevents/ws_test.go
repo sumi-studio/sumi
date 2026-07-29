@@ -506,7 +506,7 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	cs.mu.Unlock()
 }
 
-func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
+func TestWebSocketRejectsEventForAnotherPersonalityAgent(t *testing.T) {
 	srv, _, _, _, es, hl := newTestServer(t)
 	hl.setReady()
 
@@ -539,7 +539,7 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 		FrameType: "event",
 		Envelope: &Envelope{
 			Seq:                &seq1,
-			PersonalityAgentID: "other-conversation",
+			PersonalityAgentID: "018f47a2-9b3c-7def-9abc-0123456789ac",
 			Event:              []byte(`{"type":"agent_start"}`),
 		},
 	}); err != nil {
@@ -548,13 +548,13 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	if err := conn.ReadJSON(&apiHello); err == nil {
-		t.Fatal("expected conversation mismatch to close the connection")
+		t.Fatal("expected personality agent mismatch to close the connection")
 	}
 
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	if len(es.envelopes) != 0 {
-		t.Fatalf("expected no event delivery on conversation mismatch, got %d", len(es.envelopes))
+		t.Fatalf("expected no event delivery on personality agent mismatch, got %d", len(es.envelopes))
 	}
 }
 

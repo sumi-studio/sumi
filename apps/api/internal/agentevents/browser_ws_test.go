@@ -133,7 +133,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 }
 
-func TestBrowserWebSocketRejectsMissingExpiredAndWrongConversationSessions(t *testing.T) {
+func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessions(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
 	if err != nil {
@@ -153,7 +153,7 @@ func TestBrowserWebSocketRejectsMissingExpiredAndWrongConversationSessions(t *te
 	}{
 		{"missing", ""},
 		{"expired", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(-time.Hour).Unix(), Aud: defaultBrowserAudience})},
-		{"wrong-conversation", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "other", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})},
+		{"malformed-personality-agent", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "other", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			header := http.Header{"Origin": {"https://web.example"}}
@@ -509,5 +509,84 @@ func TestDecodeBrowserCommandRequiresContractValidIdempotencyKey(t *testing.T) {
 				t.Fatalf("accepted invalid idempotency key length %d", len(key))
 			}
 		})
+	}
+}
+
+func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    string
+		target func() any
+	}{
+		{
+			name:   "event missing envelope",
+			raw:    `{"type":"event"}`,
+			target: func() any { return &browserEventFrame{} },
+		},
+		{
+			name:   "browser event leaks internal target",
+			raw:    `{"type":"event","envelope":{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"x"}}}`,
+			target: func() any { return &browserEventFrame{} },
+		},
+		{
+			name:   "browser event has null seq",
+			raw:    `{"type":"event","envelope":{"seq":null,"event":{"type":"error","message":"x"}}}`,
+			target: func() any { return &browserEventFrame{} },
+		},
+		{
+			name:   "accepted missing correlation key",
+			raw:    `{"type":"command_accepted","command_id":"00000000-0000-4000-8000-000000000001","seq":1}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted unknown field",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"extra":true}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "rejected missing correlation key",
+			raw:    `{"type":"command_rejected","reject_reason":"schema_violation"}`,
+			target: func() any { return &browserCommandRejectedFrame{} },
+		},
+		{
+			name:   "rejected unknown reason",
+			raw:    `{"type":"command_rejected","idempotency_key":"key","reject_reason":"other"}`,
+			target: func() any { return &browserCommandRejectedFrame{} },
+		},
+		{
+			name:   "status unknown value",
+			raw:    `{"type":"direct_chat_status","status":"connecting"}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+		{
+			name:   "status unknown field",
+			raw:    `{"type":"direct_chat_status","status":"ready","extra":true}`,
+			target: func() any { return &directChatStatusFrame{} },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(test.raw), test.target()); err == nil {
+				t.Fatalf("accepted malformed browser frame: %s", test.raw)
+			}
+		})
+	}
+
+	var volatile browserEventFrame
+	if err := json.Unmarshal(
+		[]byte(`{"type":"event","envelope":{"event":{"type":"error","message":"x"}}}`),
+		&volatile,
+	); err != nil {
+		t.Fatalf("valid target-free volatile browser event rejected: %v", err)
+	}
+	if volatile.Envelope.Seq != nil {
+		t.Fatalf("volatile browser event gained seq: %+v", volatile)
+	}
+	var unavailable directChatStatusFrame
+	if err := json.Unmarshal(
+		[]byte(`{"type":"direct_chat_status","status":"unavailable"}`),
+		&unavailable,
+	); err != nil {
+		t.Fatalf("valid unavailable status rejected: %v", err)
 	}
 }

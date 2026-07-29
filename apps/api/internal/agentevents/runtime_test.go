@@ -411,7 +411,7 @@ func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T)
 	}
 }
 
-func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing.T) {
+func TestDurableGatewayNextCommandSeqDoesNotBlockOtherPersonalityAgentAck(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	firstClaims := TokenClaims{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-012345678980"}
 	secondClaims := TokenClaims{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-012345678981"}
@@ -453,7 +453,7 @@ func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing
 			t.Fatalf("independent ACK failed: %v", err)
 		}
 	case <-time.After(250 * time.Millisecond):
-		t.Fatal("one conversation's ACK scan blocked ApplyAck for another conversation")
+		t.Fatal("one personality agent's ACK scan blocked ApplyAck for another personality agent")
 	}
 	close(release)
 	if err := <-cursorDone; err != nil {
@@ -611,7 +611,7 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
 	}
 }
 
-func TestDurableGatewayReceiveRejectsConversationClaimMismatch(t *testing.T) {
+func TestDurableGatewayReceiveRejectsPersonalityAgentClaimMismatch(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := TokenClaims{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab"}
 	seq := uint64(1)
@@ -621,7 +621,7 @@ func TestDurableGatewayReceiveRejectsConversationClaimMismatch(t *testing.T) {
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match token claim") {
-		t.Fatalf("expected conversation claim mismatch, got %v", err)
+		t.Fatalf("expected personality agent claim mismatch, got %v", err)
 	}
 	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
 	if err != nil {
@@ -698,7 +698,7 @@ func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
 
 func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	gateway.MaxConversationTails = 2
+	gateway.MaxPersonalityAgentTails = 2
 	gateway.MaxAckTail = 1
 
 	for _, personalityAgentID := range []string{"018f47a2-9b3c-7def-8abc-0123456789ab", "018f47a2-9b3c-7def-9abc-0123456789ac", "018f47a2-9b3c-7def-aabc-0123456789ad"} {
@@ -713,9 +713,9 @@ func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 		}
 	}
 	gateway.mu.Lock()
-	if len(gateway.tails) > gateway.MaxConversationTails {
+	if len(gateway.tails) > gateway.MaxPersonalityAgentTails {
 		gateway.mu.Unlock()
-		t.Fatalf("retained %d conversation tails, limit is %d", len(gateway.tails), gateway.MaxConversationTails)
+		t.Fatalf("retained %d personality agent tails, limit is %d", len(gateway.tails), gateway.MaxPersonalityAgentTails)
 	}
 	gateway.mu.Unlock()
 
@@ -977,7 +977,7 @@ func TestDurableGatewayAckLogRejectsCorruptRecordOnFindAckLookup(t *testing.T) {
 
 	// Evict the tail so findAckLocked must read the durable log.
 	gateway.mu.Lock()
-	gateway.tails = make(map[string]*conversationLogState)
+	gateway.tails = make(map[string]*personalityAgentLogState)
 	gateway.mu.Unlock()
 
 	corrupt := fmt.Sprintf(`{"seq":%d,"command_id":"%s","status":"received","status":"received"}`+"\n", command.Seq, command.CommandID)
@@ -1210,9 +1210,9 @@ func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
 			wantErr:  "seq mismatch",
 		},
 		{
-			name:     "conversation mismatch",
+			name:     "personality agent mismatch",
 			contents: []byte(`{"seq":1,"event":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-9abc-0123456789ac","event":{"type":"agent_start"}}}` + "\n"),
-			wantErr:  "conversation mismatch",
+			wantErr:  "personality agent mismatch",
 		},
 		{
 			name:     "volatile event with seq",
@@ -1265,7 +1265,7 @@ func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
 		t.Fatalf("expected 1 event, got %d", len(caught))
 	}
 	if caught[0].PersonalityAgentID != personalityAgentID {
-		t.Fatalf("expected conversation %q, got %q", personalityAgentID, caught[0].PersonalityAgentID)
+		t.Fatalf("expected personality agent %q, got %q", personalityAgentID, caught[0].PersonalityAgentID)
 	}
 	if caught[0].Seq == nil || *caught[0].Seq != 1 {
 		t.Fatalf("expected seq 1, got %v", caught[0].Seq)
@@ -1433,7 +1433,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	defer store.Close()
 
 	// Before reconstruction the guard state must appear empty. This is safe
-	// only because EnsureConversationStateRebuilt is invoked before command
+	// only because EnsureAgentSessionStateRebuilt is invoked before command
 	// admission in the browser WebSocket path.
 	if gateway.IsRunInFlight(personalityAgentID) {
 		t.Fatal("expected no in-flight run before state rebuild")
@@ -1442,8 +1442,8 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 		t.Fatal("expected no pending approvals before state rebuild")
 	}
 
-	if err := gateway.EnsureConversationStateRebuilt(context.Background(), personalityAgentID); err != nil {
-		t.Fatalf("rebuild conversation state: %v", err)
+	if err := gateway.EnsureAgentSessionStateRebuilt(context.Background(), personalityAgentID); err != nil {
+		t.Fatalf("rebuild agent session state: %v", err)
 	}
 
 	if !gateway.IsRunInFlight(personalityAgentID) {
@@ -1491,7 +1491,7 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := gateway.EnsureConversationStateRebuilt(context.Background(), personalityAgentID); err == nil {
+	if err := gateway.EnsureAgentSessionStateRebuilt(context.Background(), personalityAgentID); err == nil {
 		t.Fatal("expected corrupt durable state to fail reconstruction")
 	} else if !strings.Contains(err.Error(), "non-contiguous") {
 		t.Fatalf("expected non-contiguous error, got %v", err)

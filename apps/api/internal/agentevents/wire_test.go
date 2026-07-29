@@ -82,15 +82,18 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 			}
 			roundTripGeneric(t, name, wireRaw)
 		case "browser_hello":
-			var hello browserHello
-			if err := json.Unmarshal(wireRaw, &hello); err != nil {
+			hello, err := decodeBrowserHello(wireRaw)
+			if err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserHello: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &hello)
 		case "browser_command_frame":
-			var frame browserCommandFrame
-			if err := json.Unmarshal(wireRaw, &frame); err != nil {
+			frame, err := decodeBrowserCommand(wireRaw)
+			if err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserCommandFrame: %v", name, err)
+			}
+			if _, err := validateBrowserCommand(frame.Command); err != nil {
+				t.Fatalf("fixture %q: validate BrowserCommandFrame: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &frame)
 		case "browser_event_frame":
@@ -109,6 +112,12 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 			var frame browserCommandRejectedFrame
 			if err := json.Unmarshal(wireRaw, &frame); err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserCommandRejectedFrame: %v", name, err)
+			}
+			roundTripJSON(t, name, wireRaw, &frame)
+		case "browser_direct_chat_status":
+			var frame directChatStatusFrame
+			if err := json.Unmarshal(wireRaw, &frame); err != nil {
+				t.Fatalf("fixture %q: unmarshal DirectChatStatusFrame: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &frame)
 		default:

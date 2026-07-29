@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,141 @@ type browserEventEnvelope struct {
 type directChatStatusFrame struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
+}
+
+func (f *browserEventFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event frame: %w", err)
+	}
+	type wire struct {
+		Type     string                `json:"type"`
+		Envelope *browserEventEnvelope `json:"envelope"`
+	}
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Type != "event" || decoded.Envelope == nil {
+		return errors.New("browser event frame type must be event")
+	}
+	*f = browserEventFrame{Type: decoded.Type, Envelope: *decoded.Envelope}
+	return nil
+}
+
+func (e *browserEventEnvelope) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event envelope: %w", err)
+	}
+	type rawEnvelope struct {
+		Seq   json.RawMessage `json:"seq"`
+		Event json.RawMessage `json:"event"`
+	}
+	var raw rawEnvelope
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
+		return errors.New("browser event envelope requires a valid event")
+	}
+	if err := validateEvent(raw.Event); err != nil {
+		return err
+	}
+	volatile := volatileEventTypes[eventType(raw.Event)]
+	var parsedSeq *uint64
+	switch {
+	case raw.Seq == nil:
+		if !volatile {
+			return errors.New("durable browser event requires seq")
+		}
+	case bytes.Equal(bytes.TrimSpace(raw.Seq), []byte("null")):
+		return errors.New("browser event seq must not be null")
+	default:
+		var seq uint64
+		if err := json.Unmarshal(raw.Seq, &seq); err != nil {
+			return fmt.Errorf("browser event seq: %w", err)
+		}
+		if seq > maxJSONSafeInteger {
+			return errors.New("browser event seq exceeds JSON-safe integer range")
+		}
+		if volatile {
+			return errors.New("volatile browser event must not have seq")
+		}
+		parsedSeq = &seq
+	}
+	*e = browserEventEnvelope{Seq: parsedSeq, Event: raw.Event}
+	return nil
+}
+
+func (f *browserCommandAcceptedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command accepted frame: %w", err)
+	}
+	type wire browserCommandAcceptedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandAcceptedFrame(decoded)
+	if value.Type != "command_accepted" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!canonicalUUIDRegexp.MatchString(value.CommandID) ||
+		value.Seq > maxJSONSafeInteger {
+		return errors.New("invalid browser command accepted frame")
+	}
+	*f = value
+	return nil
+}
+
+func (f *browserCommandRejectedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command rejected frame: %w", err)
+	}
+	type wire browserCommandRejectedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandRejectedFrame(decoded)
+	if value.Type != "command_rejected" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!validBrowserRejectReason(value.RejectReason) {
+		return errors.New("invalid browser command rejected frame")
+	}
+	*f = value
+	return nil
+}
+
+func (f *directChatStatusFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("direct chat status frame: %w", err)
+	}
+	type wire directChatStatusFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := directChatStatusFrame(decoded)
+	if value.Type != "direct_chat_status" || (value.Status != "ready" && value.Status != "unavailable") {
+		return errors.New("invalid direct chat status frame")
+	}
+	*f = value
+	return nil
+}
+
+func validBrowserRejectReason(reason RejectReason) bool {
+	switch reason {
+	case RejectUnknownCommand,
+		RejectSchemaViolation,
+		RejectAttachmentsNotEmpty,
+		RejectOversized,
+		RejectNotAllowed,
+		RejectIdempotencyConflict:
+		return true
+	default:
+		return false
+	}
 }
 
 type browserCommandHead struct {
@@ -221,8 +357,8 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		return err
 	}
 
-	if err := s.Events.EnsureConversationStateRebuilt(ctx, claims.PersonalityAgentID); err != nil {
-		return fmt.Errorf("rebuild conversation state: %w", err)
+	if err := s.Events.EnsureAgentSessionStateRebuilt(ctx, claims.PersonalityAgentID); err != nil {
+		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
 
 	// Install pong handler before first read and schedule the initial

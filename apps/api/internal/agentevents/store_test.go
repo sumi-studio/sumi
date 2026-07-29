@@ -206,7 +206,7 @@ func TestCommandStore_IdempotencyKey(t *testing.T) {
 	}
 }
 
-func TestCommandStore_PerConversationSeq(t *testing.T) {
+func TestCommandStore_PerPersonalityAgentSeq(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenCommandStore(dir)
 	if err != nil {
@@ -224,7 +224,7 @@ func TestCommandStore_PerConversationSeq(t *testing.T) {
 		t.Fatal(err)
 	}
 	if a.Seq != 1 || b.Seq != 1 {
-		t.Fatalf("expected first seq 1 for each conversation, got %d and %d", a.Seq, b.Seq)
+		t.Fatalf("expected first seq 1 for each personality agent, got %d and %d", a.Seq, b.Seq)
 	}
 }
 
@@ -277,7 +277,7 @@ func TestCommandStore_ContextCancellation(t *testing.T) {
 	}
 }
 
-func TestCommandStoreBlockedConversationDoesNotBlockOtherConversation(t *testing.T) {
+func TestCommandStoreBlockedPersonalityAgentDoesNotBlockOtherPersonalityAgent(t *testing.T) {
 	skipIfNoFlock(t)
 	dir := t.TempDir()
 	store, err := OpenCommandStore(dir)
@@ -308,20 +308,20 @@ func TestCommandStoreBlockedConversationDoesNotBlockOtherConversation(t *testing
 	for st.mu.TryLock() {
 		st.mu.Unlock()
 		if time.Now().After(deadline) {
-			t.Fatal("blocked conversation never reached its flock wait")
+			t.Fatal("blocked personality agent never reached its flock wait")
 		}
 		runtime.Gosched()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	if _, err := store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-012345678993"), "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {
-		t.Fatalf("blocked conversation serialized unrelated append: %v", err)
+		t.Fatalf("blocked personality agent serialized unrelated append: %v", err)
 	}
 	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-blockedDone; err != nil {
-		t.Fatalf("blocked conversation did not recover: %v", err)
+		t.Fatalf("blocked personality agent did not recover: %v", err)
 	}
 }
 
@@ -764,7 +764,7 @@ func injectFailingFile(t *testing.T, store *CommandStore, personalityAgentID str
 	t.Helper()
 	st := store.states[personalityAgentID]
 	if st == nil {
-		t.Fatalf("no state for conversation %q", personalityAgentID)
+		t.Fatalf("no state for personality agent %q", personalityAgentID)
 	}
 	ff := &failingFile{File: st.file.(*os.File)}
 	st.file = ff
@@ -1134,7 +1134,7 @@ func TestCommandStore_MultiProcessWorker(t *testing.T) {
 	case "rollback":
 		st := store.states[conv]
 		if st == nil {
-			t.Fatalf("no state for conversation %q", conv)
+			t.Fatalf("no state for personality agent %q", conv)
 		}
 		ff := &failingFile{File: st.file.(*os.File), failSyncOn: 1}
 		st.file = ff

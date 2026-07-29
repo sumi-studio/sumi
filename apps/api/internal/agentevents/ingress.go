@@ -40,7 +40,7 @@ const (
 // accepted the payload.
 type CommandAppender interface {
 	// Append validates (if needed) and atomically allocates the next durable
-	// command_id and seq for the conversation, then returns the persisted
+	// command_id and seq for the personality agent, then returns the persisted
 	// CommandEnvelope. Append is only called for payloads that have already
 	// passed the pre-sequence size/attachment/shape checks.
 	//
