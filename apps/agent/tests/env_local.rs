@@ -55,6 +55,10 @@ fn startup_does_not_implicitly_trust_dot_env_local_in_the_working_directory() {
         .current_dir(&directory)
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
+        .env(
+            "SUMI_PERSONALITY_AGENT_ID",
+            "0198f0f4-9b72-7000-8000-000000000001",
+        )
         .env("SUMI_WORKSPACE", directory.join("workspace"))
         .env("SUMI_STATE_DIR", directory.join("state"))
         .env(
