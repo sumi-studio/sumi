@@ -90,6 +90,117 @@ func TestProjectBrowserEventRewritesNestedOwnedArtifactHandles(t *testing.T) {
 	}
 }
 
+func TestProjectBrowserEventRewritesOwnedArtifactHandleKeys(t *testing.T) {
+	seq := uint64(1)
+	envelope := Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: artifactOwner,
+		Event: json.RawMessage(`{
+			"type":"tool_execution_end",
+			"tool_call_id":"call-keys",
+			"result":{
+				"artifact://018f47a2-9b3c-7def-8abc-0123456789ab/tool-output/run-key":{
+					"artifact://018f47a2-9b3c-7def-8abc-0123456789ab/attachments/input-key":"value"
+				}
+			},
+			"is_error":false
+		}`),
+	}
+	projected, err := projectBrowserEvent(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(projected.Event)
+	if !strings.Contains(text, `"artifact://tool-output/run-key"`) ||
+		!strings.Contains(text, `"artifact://attachments/input-key"`) {
+		t.Fatalf("owned artifact-handle keys were not projected: %s", text)
+	}
+	if strings.Contains(text, "artifact://"+artifactOwner+"/") {
+		t.Fatalf("owned artifact-handle key leaked its target: %s", text)
+	}
+}
+
+func TestArtifactHandleKeysRejectCrossOwnerAndTargetlessInternalRefs(t *testing.T) {
+	seq := uint64(1)
+	for name, key := range map[string]string{
+		"cross owner": "artifact://" + artifactOther + "/tool-output/run-key",
+		"targetless":  "artifact://tool-output/run-key",
+	} {
+		t.Run(name, func(t *testing.T) {
+			event, err := json.Marshal(map[string]any{
+				"type":         "tool_execution_end",
+				"tool_call_id": "call-keys",
+				"result":       map[string]any{key: "value"},
+				"is_error":     false,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope := Envelope{
+				Seq:                &seq,
+				PersonalityAgentID: artifactOwner,
+				Event:              event,
+			}
+			if err := validateEnvelope(envelope); err == nil {
+				t.Fatalf("%s artifact key passed internal validation", name)
+			}
+			if _, err := projectBrowserEvent(envelope); err == nil {
+				t.Fatalf("%s artifact key passed browser projection", name)
+			}
+		})
+	}
+}
+
+func TestArtifactProjectionRejectsKeyCollisionDeterministically(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		owner string
+		kind  string
+	}{
+		{"owned key sorts first", artifactOwner, "tool-output"},
+		{"targetless key sorts first", "f18f47a2-9b3c-7def-8abc-0123456789ab", "attachments"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			seq := uint64(1)
+			owned := "artifact://" + test.owner + "/" + test.kind + "/run-key"
+			targetless := "artifact://" + test.kind + "/run-key"
+			event, err := json.Marshal(map[string]any{
+				"type":         "tool_execution_end",
+				"tool_call_id": "call-keys",
+				"result": map[string]any{
+					owned:      "owned",
+					targetless: "targetless",
+				},
+				"is_error": false,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope := Envelope{
+				Seq:                &seq,
+				PersonalityAgentID: test.owner,
+				Event:              event,
+			}
+
+			var first string
+			for attempt := 0; attempt < 25; attempt++ {
+				if _, err := projectBrowserEvent(envelope); err == nil {
+					t.Fatal("artifact key collision was silently overwritten")
+				} else {
+					if !strings.Contains(err.Error(), "artifact projection key collision") {
+						t.Fatalf("collision returned the wrong failure: %v", err)
+					}
+					if attempt == 0 {
+						first = err.Error()
+					} else if err.Error() != first {
+						t.Fatalf("collision failure was nondeterministic:\nfirst: %s\nlater: %s", first, err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestProjectBrowserEventRewritesToolResultMessageButPreservesUserMessage(t *testing.T) {
 	toolResult := Envelope{
 		PersonalityAgentID: artifactOwner,

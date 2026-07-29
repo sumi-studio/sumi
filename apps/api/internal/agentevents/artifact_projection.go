@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -108,14 +109,48 @@ func transformPublicMessageArtifactReferences(value any, owner string, project b
 func transformArtifactReferenceValue(value any, owner string, project bool) (any, error) {
 	switch typed := value.(type) {
 	case map[string]any:
-		for key, nested := range typed {
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		rebuilt := make(map[string]any, len(typed))
+		keyOrigins := make(map[string]string, len(typed))
+		if project {
+			projectedOrigins := make(map[string]string, len(typed))
+			for _, key := range keys {
+				projectedKey, _ := transformArtifactReferenceStringWithPolicy(key, owner, true, false)
+				if previous, exists := projectedOrigins[projectedKey]; exists {
+					return nil, fmt.Errorf(
+						"artifact projection key collision between %q and %q",
+						previous,
+						key,
+					)
+				}
+				projectedOrigins[projectedKey] = key
+			}
+		}
+		for _, key := range keys {
+			transformedKey, err := transformArtifactReferenceString(key, owner, project)
+			if err != nil {
+				return nil, fmt.Errorf("artifact reference in object key %q: %w", key, err)
+			}
+			if previous, exists := keyOrigins[transformedKey]; exists {
+				return nil, fmt.Errorf(
+					"artifact projection key collision between %q and %q",
+					previous,
+					key,
+				)
+			}
+			nested := typed[key]
 			transformed, err := transformArtifactReferenceValue(nested, owner, project)
 			if err != nil {
 				return nil, err
 			}
-			typed[key] = transformed
+			rebuilt[transformedKey] = transformed
+			keyOrigins[transformedKey] = key
 		}
-		return typed, nil
+		return rebuilt, nil
 	case []any:
 		for index, nested := range typed {
 			transformed, err := transformArtifactReferenceValue(nested, owner, project)
@@ -133,6 +168,10 @@ func transformArtifactReferenceValue(value any, owner string, project bool) (any
 }
 
 func transformArtifactReferenceString(value, owner string, project bool) (string, error) {
+	return transformArtifactReferenceStringWithPolicy(value, owner, project, true)
+}
+
+func transformArtifactReferenceStringWithPolicy(value, owner string, project, enforceBoundary bool) (string, error) {
 	var builder strings.Builder
 	searchFrom := 0
 	copyFrom := 0
@@ -149,10 +188,18 @@ func transformArtifactReferenceString(value, owner string, project bool) (string
 			continue
 		}
 		if reference.isBrowser {
-			return "", errors.New("targetless browser artifact reference is not valid on the internal event boundary")
+			if enforceBoundary {
+				return "", errors.New("targetless browser artifact reference is not valid on the internal event boundary")
+			}
+			searchFrom = reference.end
+			continue
 		}
 		if reference.owner != owner {
-			return "", fmt.Errorf("artifact reference owner %q does not match authenticated personality agent", reference.owner)
+			if enforceBoundary {
+				return "", fmt.Errorf("artifact reference owner %q does not match authenticated personality agent", reference.owner)
+			}
+			searchFrom = reference.end
+			continue
 		}
 		if project {
 			if !changed {
