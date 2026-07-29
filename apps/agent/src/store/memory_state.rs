@@ -1269,7 +1269,7 @@ mod tests {
             seed_batch(&store, MemoryLayer::L0, MemoryBatchState::Open).await;
         let event_seq = i64::try_from(event_seq).expect("test event sequence fits i64");
         let summary_key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "migration-constraint-fixture")
             .await
             .expect("mint summary key");
 
@@ -1567,7 +1567,7 @@ mod tests {
         let (batch_id, _, _, _) =
             seed_batch(&store, MemoryLayer::L1, MemoryBatchState::Compacting).await;
         let summary_key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", &batch_id)
             .await
             .expect("mint memory summary key");
 

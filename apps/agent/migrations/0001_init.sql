@@ -11,6 +11,7 @@ CREATE TABLE data_keys (
   purpose TEXT NOT NULL,
   personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
     CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
+  retention_unit TEXT NOT NULL CHECK (length(retention_unit) BETWEEN 1 AND 96),
   algorithm TEXT NOT NULL,
   wrap_key_id TEXT NOT NULL,
   wrap_nonce BLOB,
@@ -22,6 +23,26 @@ CREATE TABLE data_keys (
     'transcript', 'event', 'memory_summary', 'provider_context',
     'command', 'mutation', 'artifact', 'workspace'
   )),
+  CHECK (
+    (purpose IN (
+      'transcript', 'event', 'command', 'mutation', 'workspace'
+    ) AND retention_unit = 'agent')
+    OR
+    (purpose = 'provider_context'
+      AND length(retention_unit) = 81
+      AND substr(retention_unit, 1, 17) = 'provider_context:'
+      AND substr(retention_unit, 18) NOT GLOB '*[^0-9a-f]*')
+    OR
+    (purpose = 'memory_summary'
+      AND length(retention_unit) = 79
+      AND substr(retention_unit, 1, 15) = 'memory_summary:'
+      AND substr(retention_unit, 16) NOT GLOB '*[^0-9a-f]*')
+    OR
+    (purpose = 'artifact'
+      AND length(retention_unit) = 73
+      AND substr(retention_unit, 1, 9) = 'artifact:'
+      AND substr(retention_unit, 10) NOT GLOB '*[^0-9a-f]*')
+  ),
   CHECK (
     (state = 'active'
       AND wrapped_key IS NOT NULL
@@ -35,9 +56,9 @@ CREATE TABLE data_keys (
   )
 );
 
-CREATE UNIQUE INDEX one_active_shared_data_key
-ON data_keys(personality_agent_id, purpose)
-WHERE state = 'active' AND purpose <> 'provider_context';
+CREATE UNIQUE INDEX one_active_retention_data_key
+ON data_keys(personality_agent_id, purpose, retention_unit)
+WHERE state = 'active';
 
 CREATE TABLE messages (
   id TEXT NOT NULL PRIMARY KEY,

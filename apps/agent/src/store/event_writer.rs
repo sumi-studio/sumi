@@ -1378,8 +1378,7 @@ enum PreparedProjection {
     MemoryJobUpdate {
         expected_source_versions: BTreeMap<String, i64>,
         job_mutations: Vec<PreparedMemoryJobMutation>,
-        memory_summary_key_ref: Option<String>,
-        memory_summary_key_proof: Option<Vec<u8>>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
     },
     MemoryTransition {
         expected_source_versions: BTreeMap<String, i64>,
@@ -1390,8 +1389,7 @@ enum PreparedProjection {
         job_inserts: Vec<MemoryJobRecord>,
         membership_inserts: Vec<MemoryBatchMessageRecord>,
         cursor_advance: Option<MemoryApplyCursorAdvance>,
-        memory_summary_key_ref: Option<String>,
-        memory_summary_key_proof: Option<Vec<u8>>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
     },
     MemoryCalibrationObservation {
         observed_prompt_tokens: u64,
@@ -3063,24 +3061,6 @@ impl EventWriter {
         } else {
             None
         };
-        let needs_memory_summary_key = batch.writes.iter().any(|write| {
-            write.projections.iter().any(|projection| {
-                matches!(
-                    projection,
-                    Projection::MemoryJobUpdate { .. } | Projection::MemoryTransition { .. }
-                )
-            })
-        });
-        let mut memory_summary_key = if needs_memory_summary_key {
-            Some(
-                self.store
-                    .private_key(DataKeyPurpose::MemorySummary)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
         let mut next_seq = first_seq;
         let mut pending_l0_batch: Option<PendingL0Batch> = None;
         let mut l0_allocator: Option<L0BatchAllocator> = None;
@@ -3442,9 +3422,7 @@ impl EventWriter {
                         });
                     }
                     Projection::MemoryJobUpdate(update) => {
-                        let prepared = self
-                            .prepare_memory_job_update(&mut memory_summary_key, update)
-                            .await?;
+                        let prepared = self.prepare_memory_job_update(update).await?;
                         let materialization =
                             prepared_memory_projection_materialization(&prepared)?;
                         charge_materialization_components(
@@ -3455,9 +3433,7 @@ impl EventWriter {
                         projections.push(prepared);
                     }
                     Projection::MemoryTransition(transition) => {
-                        let prepared = self
-                            .prepare_memory_transition(&mut memory_summary_key, transition)
-                            .await?;
+                        let prepared = self.prepare_memory_transition(transition).await?;
                         let materialization =
                             prepared_memory_projection_materialization(&prepared)?;
                         charge_materialization_components(
@@ -4152,9 +4128,9 @@ impl EventWriter {
 
     async fn prepare_memory_job_update(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         update: MemoryJobUpdate,
     ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
         let expected_source_versions = convert_batch_versions(update.expected_source_versions)?;
         let source_versions_json = serde_json::to_string(&expected_source_versions)
             .context("failed to serialize memory job source versions")?;
@@ -4172,36 +4148,26 @@ impl EventWriter {
                 Some(source_versions_json.clone())
             };
             job_mutations.push(
-                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
-                    .await?,
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
             );
         }
-        let (key_ref, key_proof) = memory_summary_key
-            .as_ref()
-            .map(|key| {
-                (
-                    Some(key.key_ref.clone()),
-                    Some(super::crypto::keyed_proof(
-                        key,
-                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-                        PREPARED_KEY_MATERIAL_PROOF,
-                    )),
-                )
-            })
-            .unwrap_or((None, None));
         Ok(PreparedProjection::MemoryJobUpdate {
             expected_source_versions,
             job_mutations,
-            memory_summary_key_ref: key_ref,
-            memory_summary_key_proof: key_proof,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
         })
     }
 
     async fn prepare_memory_transition(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         transition: MemoryTransition,
     ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
         let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
@@ -4257,18 +4223,18 @@ impl EventWriter {
             };
 
             let summary = if let Some(result) = batch.summary {
-                if memory_summary_key.is_none() {
-                    *memory_summary_key = Some(
-                        self.store
-                            .private_key(DataKeyPurpose::MemorySummary)
-                            .await?,
-                    );
-                }
-                let key = memory_summary_key
-                    .as_ref()
-                    .expect("memory summary key loaded");
+                let batch_id = batch.batch_id.to_string();
+                let key = self.store.memory_summary_key("batch", &batch_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
                 Some(
-                    self.encrypt_memory_batch_summary(result, &batch.batch_id.to_string(), key)
+                    self.encrypt_memory_batch_summary(result, &batch_id, &key)
                         .await?,
                 )
             } else {
@@ -4303,24 +4269,14 @@ impl EventWriter {
                 Some(source_versions_json.clone())
             };
             job_mutations.push(
-                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
-                    .await?,
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
             );
         }
-
-        let (key_ref, key_proof) = memory_summary_key
-            .as_ref()
-            .map(|key| {
-                (
-                    Some(key.key_ref.clone()),
-                    Some(super::crypto::keyed_proof(
-                        key,
-                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-                        PREPARED_KEY_MATERIAL_PROOF,
-                    )),
-                )
-            })
-            .unwrap_or((None, None));
 
         let expected_source_states: BTreeMap<String, MemoryBatchState> = transition
             .expected_source_states
@@ -4338,14 +4294,13 @@ impl EventWriter {
             job_inserts: transition.job_inserts,
             membership_inserts: transition.membership_inserts,
             cursor_advance: transition.cursor_advance,
-            memory_summary_key_ref: key_ref,
-            memory_summary_key_proof: key_proof,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
         })
     }
 
     async fn prepare_memory_job_mutation(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
+        memory_summary_key_proofs: &mut BTreeMap<String, Vec<u8>>,
         mutation: MemoryJobMutation,
         source_versions_json: Option<String>,
     ) -> Result<PreparedMemoryJobMutation> {
@@ -4393,17 +4348,18 @@ impl EventWriter {
                 lease_witness,
                 result,
             } => {
-                if memory_summary_key.is_none() {
-                    *memory_summary_key = Some(
-                        self.store
-                            .private_key(DataKeyPurpose::MemorySummary)
-                            .await?,
-                    );
-                }
-                let key = memory_summary_key
-                    .as_ref()
-                    .expect("memory summary key loaded");
-                let encrypted = self.encrypt_memory_job_result(result, &job_id, key).await?;
+                let key = self.store.memory_summary_key("job", &job_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
+                let encrypted = self
+                    .encrypt_memory_job_result(result, &job_id, &key)
+                    .await?;
                 (
                     job_id,
                     "running",
@@ -5314,20 +5270,22 @@ async fn revalidate_prepared_key_refs(
                     intent_key_proof,
                 )?,
                 PreparedProjection::MemoryJobUpdate {
-                    memory_summary_key_ref: Some(key_ref),
-                    memory_summary_key_proof: Some(proof),
+                    memory_summary_key_proofs,
                     ..
                 }
                 | PreparedProjection::MemoryTransition {
-                    memory_summary_key_ref: Some(key_ref),
-                    memory_summary_key_proof: Some(proof),
+                    memory_summary_key_proofs,
                     ..
-                } => insert_prepared_key_expectation(
-                    &mut refs,
-                    key_ref,
-                    DataKeyPurpose::MemorySummary,
-                    proof,
-                )?,
+                } => {
+                    for (key_ref, proof) in memory_summary_key_proofs {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::MemorySummary,
+                            proof,
+                        )?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -5336,7 +5294,7 @@ async fn revalidate_prepared_key_refs(
     for (key_ref, (purpose, expected_proof)) in refs {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM data_keys
-             WHERE key_ref=? AND scope='conversation' AND purpose=?
+             WHERE key_ref=? AND scope='personality_agent' AND purpose=?
                AND personality_agent_id=? AND state='active' AND algorithm=?
                AND wrap_key_id <> '' AND wrap_nonce IS NOT NULL AND wrapped_key IS NOT NULL
                AND destroyed_at IS NULL",
@@ -19954,8 +19912,7 @@ mod tests {
             job_inserts: Vec::new(),
             membership_inserts: vec![membership.clone()],
             cursor_advance: None,
-            memory_summary_key_ref: None,
-            memory_summary_key_proof: None,
+            memory_summary_key_proofs: Vec::new(),
         };
         let prepared_size = prepared_memory_projection_materialization(&prepared)
             .expect("size exact-boundary prepared transition");
@@ -20289,6 +20246,7 @@ mod tests {
             scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::Event,
             personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit: "agent".to_owned(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -20378,11 +20336,18 @@ mod tests {
             DataKeyPurpose::ProviderContext,
         )
         .expect("replacement provider-context data key");
+        let retention_unit: String =
+            sqlx::query_scalar("SELECT retention_unit FROM data_keys WHERE key_ref=?")
+                .bind(&provider_context_key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("load provider-context retention unit");
         let aad = KeyWrapAad {
             key_ref: provider_context_key_ref.clone(),
             scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::ProviderContext,
             personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit,
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =

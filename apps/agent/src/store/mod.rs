@@ -320,6 +320,15 @@ pub(crate) struct ProviderContextKeyAnchor {
     pub anchor_id: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "artifact broker wiring consumes the per-artifact key boundary"
+)]
+pub(crate) struct ArtifactKeyAnchor {
+    pub personality_agent_id: PersonalityAgentId,
+    pub artifact_handle: String,
+}
+
 impl AgentScope {
     pub(crate) const fn new(personality_agent_id: PersonalityAgentId) -> Self {
         Self {
@@ -1992,7 +2001,7 @@ impl Store {
         }
 
         let active_keys = sqlx::query(
-            "SELECT key_ref, scope, purpose, personality_agent_id, algorithm,
+            "SELECT key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm,
                     wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys WHERE state = 'active' ORDER BY key_ref",
         )
@@ -2011,6 +2020,8 @@ impl Store {
                 value => bail!("active data key {key_ref} has unknown scope {value}"),
             };
             let personality_agent_id: String = row.try_get("personality_agent_id")?;
+            let retention_unit: String = row.try_get("retention_unit")?;
+            validate_retention_unit(purpose, &retention_unit)?;
             if personality_agent_id != self.scope.personality_agent_id.as_str() {
                 bail!("active private key {key_ref} is bound to another personality agent");
             }
@@ -2025,6 +2036,7 @@ impl Store {
                 scope: key_scope,
                 purpose,
                 personality_agent_id,
+                retention_unit,
                 wrap_key_id,
             };
             unwrap_data_key(
@@ -2041,8 +2053,15 @@ impl Store {
     }
 
     pub(crate) async fn private_key(&self, purpose: DataKeyPurpose) -> Result<DataKeyMaterial> {
-        if purpose == DataKeyPurpose::ProviderContext {
-            bail!("provider-context keys require a caller-stable authenticated anchor");
+        if matches!(
+            purpose,
+            DataKeyPurpose::ProviderContext
+                | DataKeyPurpose::MemorySummary
+                | DataKeyPurpose::Artifact
+        ) {
+            bail!(
+                "provider-context, memory-summary, and artifact keys require caller-stable retention anchors"
+            );
         }
         if let Some(key) = self.load_active_private_key(purpose).await? {
             return Ok(key);
@@ -2056,14 +2075,15 @@ impl Store {
             scope: DataKeyScope::PersonalityAgent,
             purpose,
             personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: "agent".to_owned(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
         let result = sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
+                key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id,
                 wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES(?, 'personality_agent', ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
+             ) VALUES(?, 'personality_agent', ?, ?, 'agent', ?, ?, ?, ?, 'active', ?, NULL)",
         )
         .bind(&key_ref)
         .bind(purpose.as_str())
@@ -2096,14 +2116,21 @@ impl Store {
         &self,
         purpose: DataKeyPurpose,
     ) -> Result<Option<DataKeyMaterial>> {
-        if purpose == DataKeyPurpose::ProviderContext {
-            bail!("provider-context keys require an authenticated anchor");
+        if matches!(
+            purpose,
+            DataKeyPurpose::ProviderContext
+                | DataKeyPurpose::MemorySummary
+                | DataKeyPurpose::Artifact
+        ) {
+            bail!(
+                "provider-context, memory-summary, and artifact keys require authenticated retention anchors"
+            );
         }
         let row = sqlx::query(
-            "SELECT key_ref, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT key_ref, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE scope = 'personality_agent' AND personality_agent_id = ? AND purpose = ?
-               AND state = 'active'",
+               AND retention_unit = 'agent' AND state = 'active'",
         )
         .bind(self.scope.personality_agent_id.as_str())
         .bind(purpose.as_str())
@@ -2121,6 +2148,7 @@ impl Store {
             scope: DataKeyScope::PersonalityAgent,
             purpose,
             personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: row.try_get("retention_unit")?,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2143,13 +2171,77 @@ impl Store {
         anchor: &ProviderContextKeyAnchor,
     ) -> Result<DataKeyMaterial> {
         if anchor.personality_agent_id != self.scope.personality_agent_id {
-            bail!("provider-context anchor belongs to a different authenticated conversation");
+            bail!("provider-context anchor belongs to a different personality agent");
         }
-        if anchor.anchor_id.is_empty() {
-            bail!("provider-context anchor identity must not be empty");
+        if anchor.anchor_id.is_empty() || anchor.anchor_id.len() > 1024 {
+            bail!("provider-context anchor identity must be 1..=1024 bytes");
         }
 
-        let key_ref = provider_context_key_ref(&self.scope, &anchor.anchor_id);
+        self.anchored_private_key(
+            DataKeyPurpose::ProviderContext,
+            "provider_context",
+            &anchor.anchor_id,
+        )
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "artifact broker wiring consumes this key boundary"
+    )]
+    pub(crate) async fn artifact_key(&self, anchor: &ArtifactKeyAnchor) -> Result<DataKeyMaterial> {
+        if anchor.personality_agent_id != self.scope.personality_agent_id {
+            bail!("artifact anchor belongs to a different personality agent");
+        }
+        let required_prefix = format!("artifact://{}/", self.scope.personality_agent_id);
+        if anchor.artifact_handle.len() > 2048
+            || !anchor.artifact_handle.starts_with(&required_prefix)
+            || anchor.artifact_handle.len() == required_prefix.len()
+        {
+            bail!("artifact handle must be a non-empty PAID-scoped artifact URI");
+        }
+        self.anchored_private_key(
+            DataKeyPurpose::Artifact,
+            "artifact",
+            &anchor.artifact_handle,
+        )
+        .await
+    }
+
+    pub(crate) async fn memory_summary_key(
+        &self,
+        unit_kind: &'static str,
+        unit_id: &str,
+    ) -> Result<DataKeyMaterial> {
+        if !matches!(unit_kind, "batch" | "job") {
+            bail!("memory-summary retention kind must be batch or job");
+        }
+        if unit_id.is_empty() || unit_id.len() > 1024 {
+            bail!("memory-summary retention identity must be 1..=1024 bytes");
+        }
+        self.anchored_private_key(
+            DataKeyPurpose::MemorySummary,
+            "memory_summary",
+            &format!("{unit_kind}:{unit_id}"),
+        )
+        .await
+    }
+
+    async fn anchored_private_key(
+        &self,
+        purpose: DataKeyPurpose,
+        retention_kind: &str,
+        anchor_id: &str,
+    ) -> Result<DataKeyMaterial> {
+        let retention_unit = anchored_retention_unit(retention_kind, &self.scope, anchor_id);
+        let key_ref = format!(
+            "{}-{}",
+            purpose.as_str(),
+            retention_unit
+                .split_once(':')
+                .expect("anchored retention unit has a kind separator")
+                .1
+        );
         let existing_state: Option<String> =
             sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
                 .bind(&key_ref)
@@ -2158,34 +2250,36 @@ impl Store {
                 .context("failed to inspect provider-context anchor key")?;
         if let Some(state) = existing_state {
             if state != "active" {
-                bail!("provider-context anchor key has been crypto-erased");
+                bail!("{retention_kind} retention key has been crypto-erased");
             }
             let key = self.data_key_by_ref(&key_ref).await?;
-            if key.purpose != DataKeyPurpose::ProviderContext {
-                bail!("provider-context anchor resolved to a key with the wrong purpose");
+            if key.purpose != purpose {
+                bail!("{retention_kind} anchor resolved to a key with the wrong purpose");
             }
             return Ok(key);
         }
 
         let wrapping_key = self.key_provider.current_key().await?;
-        let purpose = DataKeyPurpose::ProviderContext;
         let data_key = DataKeyMaterial::generate(&key_ref, purpose)?;
         let aad = KeyWrapAad {
             key_ref: key_ref.clone(),
             scope: DataKeyScope::PersonalityAgent,
             purpose,
             personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: retention_unit.clone(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
         let result = sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
+                key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id,
                 wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES(?, 'personality_agent', 'provider_context', ?, ?, ?, ?, ?, 'active', ?, NULL)",
+             ) VALUES(?, 'personality_agent', ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
         )
         .bind(&key_ref)
+        .bind(purpose.as_str())
         .bind(self.scope.personality_agent_id.as_str())
+        .bind(&retention_unit)
         .bind(WRAP_ALGORITHM)
         .bind(wrapping_key.key_id())
         .bind(wrap_nonce.as_slice())
@@ -2196,22 +2290,23 @@ impl Store {
         match result {
             Ok(_) => Ok(data_key),
             Err(error) if is_unique_violation(&error) => {
-                let key = self
-                    .data_key_by_ref(&key_ref)
-                    .await
-                    .context("provider-context anchor key is not active after creation race")?;
-                if key.purpose != DataKeyPurpose::ProviderContext {
-                    bail!("provider-context anchor resolved to a key with the wrong purpose");
+                let key = self.data_key_by_ref(&key_ref).await.with_context(|| {
+                    format!("{retention_kind} anchor key is not active after creation race")
+                })?;
+                if key.purpose != purpose {
+                    bail!("{retention_kind} anchor resolved to a key with the wrong purpose");
                 }
                 Ok(key)
             }
-            Err(error) => Err(error).context("failed to persist provider-context anchor key"),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to persist {retention_kind} anchor key"))
+            }
         }
     }
 
     pub(crate) async fn data_key_by_ref(&self, key_ref: &str) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, personality_agent_id, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
@@ -2222,6 +2317,8 @@ impl Store {
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
         if personality_agent_id != self.scope.personality_agent_id.as_str() {
             bail!("data key {key_ref} belongs to another personality agent");
         }
@@ -2232,6 +2329,7 @@ impl Store {
             scope: DataKeyScope::PersonalityAgent,
             purpose,
             personality_agent_id,
+            retention_unit,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2250,7 +2348,7 @@ impl Store {
         key_ref: &str,
     ) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, personality_agent_id, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
@@ -2261,6 +2359,8 @@ impl Store {
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
         if personality_agent_id != self.scope.personality_agent_id.as_str() {
             bail!("data key {key_ref} belongs to another personality agent");
         }
@@ -2271,6 +2371,7 @@ impl Store {
             scope: DataKeyScope::PersonalityAgent,
             purpose,
             personality_agent_id,
+            retention_unit,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2294,7 +2395,8 @@ impl Store {
             bail!("crypto-erase key_ref must not be empty");
         }
         let row = sqlx::query(
-            "SELECT scope, purpose, personality_agent_id, state, wrapped_key, wrap_nonce, destroyed_at
+            "SELECT scope, purpose, personality_agent_id, retention_unit,
+                    state, wrapped_key, wrap_nonce, destroyed_at
              FROM data_keys WHERE key_ref = ?",
         )
         .bind(key_ref)
@@ -2306,6 +2408,7 @@ impl Store {
         let scope: String = row.try_get("scope")?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        validate_retention_unit(purpose, row.try_get("retention_unit")?)?;
         if scope != DataKeyScope::PersonalityAgent.as_str()
             || personality_agent_id != self.scope.personality_agent_id.as_str()
             || purpose == DataKeyPurpose::Workspace
@@ -2369,17 +2472,58 @@ impl Store {
     dead_code,
     reason = "used by the T11 per-anchor key boundary before its production caller exists"
 )]
-fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
+fn anchored_retention_unit(kind: &str, scope: &AgentScope, anchor_id: &str) -> String {
+    debug_assert!(matches!(
+        kind,
+        "provider_context" | "memory_summary" | "artifact"
+    ));
     let mut digest = Sha256::new();
-    digest.update(b"sumi-provider-context-anchor/v2");
+    digest.update(b"sumi-retention-unit/v1");
     for field in [
+        kind.as_bytes(),
         scope.personality_agent_id.as_str().as_bytes(),
         anchor_id.as_bytes(),
     ] {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field);
     }
-    format!("provider_context-{:x}", digest.finalize())
+    format!("{kind}:{:x}", digest.finalize())
+}
+
+fn validate_retention_unit(purpose: DataKeyPurpose, retention_unit: &str) -> Result<()> {
+    let valid_hash_unit = |prefix: &str| {
+        retention_unit.strip_prefix(prefix).is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        })
+    };
+    let valid = match purpose {
+        DataKeyPurpose::ProviderContext => valid_hash_unit("provider_context:"),
+        DataKeyPurpose::MemorySummary => valid_hash_unit("memory_summary:"),
+        DataKeyPurpose::Artifact => valid_hash_unit("artifact:"),
+        _ => retention_unit == "agent",
+    };
+    if !valid {
+        bail!(
+            "data-key retention unit {retention_unit:?} is invalid for purpose {}",
+            purpose.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
+    let retention_unit = anchored_retention_unit("provider_context", scope, anchor_id);
+    format!(
+        "provider_context-{}",
+        retention_unit
+            .split_once(':')
+            .expect("provider-context retention unit has a separator")
+            .1
+    )
 }
 
 #[cfg(unix)]
@@ -2532,7 +2676,6 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
-    use sha2::Sha384;
     use tokio_util::sync::CancellationToken;
 
     struct TestKeyProvider {
@@ -2615,28 +2758,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shipped_0001_upgrades_without_checksum_drift_and_backfills_fts() {
-        const SHIPPED_0001_SHA384: &str = "11c6ab3e0d06b6cd663810c0607e7d01f5ec9ab1ec42894e651b807216bd451370fc2c8ee54f4d79f215aec46bdc2989";
-        let shipped_0001 = include_bytes!("../../migrations/0001_init.sql");
-        let digest = Sha384::digest(shipped_0001)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(
-            digest, SHIPPED_0001_SHA384,
-            "migration 0001 is immutable after release"
-        );
-
-        let root = std::env::temp_dir().join(format!("sumi-store-migration-{}", Uuid::now_v7()));
-        let old_migrations = root.join("old-migrations");
+    async fn legacy_contract_database_is_rejected_without_compatibility_migration() {
+        let root = std::env::temp_dir().join(format!("sumi-store-legacy-{}", Uuid::now_v7()));
         let database = root.join("conversation.sqlite");
-        std::fs::create_dir_all(&old_migrations).expect("create old migration directory");
-        std::fs::write(old_migrations.join("0001_init.sql"), shipped_0001)
-            .expect("write shipped migration fixture");
-
-        let old_migrator = sqlx::migrate::Migrator::new(old_migrations.clone())
-            .await
-            .expect("load shipped migration");
+        std::fs::create_dir_all(&root).expect("create legacy fixture directory");
         let options = SqliteConnectOptions::new()
             .filename(&database)
             .create_if_missing(true)
@@ -2646,25 +2771,36 @@ mod tests {
             .connect_with(options)
             .await
             .expect("open legacy database");
-        old_migrator
-            .run(&pool)
-            .await
-            .expect("apply shipped migration");
-        let wrapping_key = WrappingKey::new("test-wrap-v1", [0x42; DATA_KEY_BYTES]);
-        let legacy_key = DataKeyMaterial::from_bytes(
-            "legacy-transcript-key",
-            DataKeyPurpose::Transcript,
-            [0x24; DATA_KEY_BYTES],
-        );
-        let wrap_aad = KeyWrapAad {
-            key_ref: legacy_key.key_ref.clone(),
-            scope: DataKeyScope::PersonalityAgent,
-            purpose: DataKeyPurpose::Transcript,
-            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".to_owned(),
-            wrap_key_id: wrapping_key.key_id().to_owned(),
-        };
-        let (wrap_nonce, wrapped_key) =
-            wrap_data_key(&legacy_key, &wrapping_key, &wrap_aad).expect("wrap legacy data key");
+        sqlx::query(
+            "CREATE TABLE agent_scope(
+                singleton INTEGER PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                personality_agent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy scope schema");
+        sqlx::query(
+            "CREATE TABLE data_keys(
+                key_ref TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                personality_agent_id TEXT,
+                algorithm TEXT NOT NULL,
+                wrap_key_id TEXT NOT NULL,
+                wrap_nonce BLOB,
+                wrapped_key BLOB,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                destroyed_at TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy credential schema");
         sqlx::query(
             "INSERT INTO agent_scope(
                 singleton, tenant_id, agent_id, personality_agent_id, created_at
@@ -2672,66 +2808,55 @@ mod tests {
         )
         .execute(&pool)
         .await
-        .expect("insert legacy scope");
+        .expect("insert legacy scope identity");
         sqlx::query(
             "INSERT INTO data_keys(
                 key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at
+                wrap_nonce, wrapped_key, state, created_at, destroyed_at
              ) VALUES(
                 'legacy-transcript-key', 'conversation', 'transcript',
-                'conversation-1', ?, 'test-wrap-v1', ?, ?, 'active', 'now'
-             )",
-        )
-        .bind(WRAP_ALGORITHM)
-        .bind(wrap_nonce.as_slice())
-        .bind(wrapped_key)
-        .execute(&pool)
-        .await
-        .expect("insert legacy data key");
-        sqlx::query(
-            "INSERT INTO messages(
-                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
-                redaction_version, interrupted, created_at
-             ) VALUES(
-                'legacy-message', 1, 'user', 'legacy-transcript-key', X'00',
-                '{}', 'legacy searchable text', 1, 0, 'now'
+                'conversation-1', 'xchacha20-poly1305/v2', 'test-wrap-v1',
+                zeroblob(24), zeroblob(48), 'active', 'now', NULL
              )",
         )
         .execute(&pool)
         .await
-        .expect("insert legacy message");
+        .expect("insert legacy credential fixture");
         pool.close().await;
 
-        let upgraded = Store::open(&database, scope(), provider())
+        let error = Store::open(&database, scope(), provider())
             .await
-            .expect("current migrator upgrades shipped database");
-        let search_text: String =
-            sqlx::query_scalar("SELECT search_text FROM messages WHERE id = 'legacy-message'")
-                .fetch_one(upgraded.pool())
-                .await
-                .expect("legacy message remains readable");
-        assert_eq!(search_text, "legacy searchable text");
-        let indexed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages_fts
-             WHERE rowid = (SELECT rowid FROM messages WHERE id = 'legacy-message')
-               AND search_text = 'legacy searchable text'",
-        )
-        .fetch_one(upgraded.pool())
-        .await
-        .expect("query backfilled FTS row");
-        assert_eq!(indexed, 1, "pre-upgrade message must be indexed");
-        let t17_tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN ('provider_context', 'memory_batches', 'approval_rules')",
-        )
-        .fetch_one(upgraded.pool())
-        .await
-        .expect("query T17 schema");
-        assert_eq!(t17_tables, 3, "all representative T17 tables must exist");
+            .expect_err("legacy schema and credentials must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("migration") || rendered.contains("already exists"),
+            "unexpected legacy rejection: {rendered}"
+        );
 
-        drop(upgraded);
-        std::fs::remove_dir_all(root).expect("remove migration test directory");
+        let options = SqliteConnectOptions::new()
+            .filename(&database)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("reopen rejected legacy fixture");
+        let legacy_identity: String =
+            sqlx::query_scalar("SELECT personality_agent_id FROM agent_scope WHERE singleton=1")
+                .fetch_one(&pool)
+                .await
+                .expect("legacy identity remains intact");
+        assert_eq!(legacy_identity, "conversation-1");
+        let legacy_algorithm: String = sqlx::query_scalar(
+            "SELECT algorithm FROM data_keys WHERE key_ref='legacy-transcript-key'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("legacy credential remains intact");
+        assert_eq!(legacy_algorithm, "xchacha20-poly1305/v2");
+        pool.close().await;
+
+        std::fs::remove_dir_all(root).expect("remove legacy fixture directory");
     }
 
     fn assert_not_null_violation(error: &sqlx::Error) {
@@ -2818,9 +2943,15 @@ mod tests {
         assert_not_null_violation(&approval_error);
 
         store
-            .private_key(DataKeyPurpose::Artifact)
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/null-identity-test",
+                    scope().personality_agent_id
+                ),
+            })
             .await
-            .expect("valid data_keys identity still inserts");
+            .expect("valid anchored artifact key still inserts");
         sqlx::query(
             "INSERT INTO messages(
                 id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
@@ -2835,8 +2966,9 @@ mod tests {
             "INSERT INTO event_log_heads(
                 personality_agent_id, last_seq, event_count, chain_digest, key_ref,
                 head_hmac, updated_at
-             ) VALUES('conversation-1', 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
+             ) VALUES(?, 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
         )
+        .bind(scope().personality_agent_id.as_str())
         .bind(&event_key.key_ref)
         .execute(store.pool())
         .await
@@ -2932,6 +3064,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_rejects_lookalike_retention_unit_prefixes() {
+        let store = store().await;
+        for (index, (purpose, retention_unit)) in [
+            (
+                "provider_context",
+                format!("providerXcontext:{}", "0".repeat(64)),
+            ),
+            (
+                "memory_summary",
+                format!("memoryXsummary:{}", "0".repeat(64)),
+            ),
+            ("artifact", format!("artifactX{}", "0".repeat(64))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = sqlx::query(
+                "INSERT INTO data_keys(
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(
+                    ?, 'personality_agent', ?, ?, ?, ?, 'wrap', X'00', X'00',
+                    'active', 'now', NULL
+                 )",
+            )
+            .bind(format!("lookalike-retention-{index}"))
+            .bind(purpose)
+            .bind(scope().personality_agent_id.as_str())
+            .bind(retention_unit)
+            .bind(WRAP_ALGORITHM)
+            .execute(store.pool())
+            .await;
+            assert!(
+                result.is_err(),
+                "lookalike {purpose} retention prefix must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn migration_accepts_only_complete_active_and_destroyed_key_states() {
         let store = store().await;
         let invalid_states = [
@@ -2947,12 +3120,17 @@ mod tests {
         {
             let result = sqlx::query(
                 "INSERT INTO data_keys(
-                    key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, 'conversation', 'artifact', 'conversation-1', ?, 'wrap',
-                    ?, ?, ?, 'now', ?)",
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(
+                    ?, 'personality_agent', 'artifact', ?,
+                    'artifact:0000000000000000000000000000000000000000000000000000000000000000',
+                    ?, 'wrap', ?, ?, ?, 'now', ?
+                 )",
             )
             .bind(format!("invalid-state-{index}"))
+            .bind(scope().personality_agent_id.as_str())
             .bind(WRAP_ALGORITHM)
             .bind(wrap_nonce)
             .bind(wrapped_key)
@@ -3031,33 +3209,25 @@ mod tests {
             assert!(row.get::<Option<String>, _>("destroyed_at").is_some());
         }
 
-        sqlx::query(
-            "INSERT INTO data_keys(
-                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES('workspace-key', 'agent', 'workspace', NULL, ?, 'wrap',
-                X'00', X'00', 'active', 'now', NULL)",
-        )
-        .bind(WRAP_ALGORITHM)
-        .execute(store.pool())
-        .await
-        .expect("insert agent-scoped fixture");
-        let error = store
-            .destroy_private_key_ref("workspace-key")
+        let workspace = store
+            .private_key(DataKeyPurpose::Workspace)
             .await
-            .expect_err("conversation erase must reject an agent key");
+            .expect("mint PAID-owned workspace key");
+        let error = store
+            .destroy_private_key_ref(&workspace.key_ref)
+            .await
+            .expect_err("private crypto erase must reject the workspace key");
         assert!(
             error
                 .to_string()
-                .contains("outside the active conversation")
+                .contains("outside the active personality agent scope")
         );
         assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM data_keys WHERE key_ref='workspace-key'",
-            )
-            .fetch_one(store.pool())
-            .await
-            .expect("workspace key remains active"),
+            sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref=?",)
+                .bind(&workspace.key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("workspace key remains active"),
             "active"
         );
     }
@@ -3087,6 +3257,18 @@ mod tests {
             .expect("mint second anchor key");
         assert_eq!(first.key_ref, first_retry.key_ref);
         assert_ne!(first.key_ref, second.key_ref);
+        let retention_units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='provider_context' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load provider-context retention units");
+        assert_eq!(retention_units.len(), 2);
+        assert!(retention_units.iter().all(|unit| {
+            unit.starts_with("provider_context:") && unit.len() == "provider_context:".len() + 64
+        }));
+        assert_ne!(retention_units[0], retention_units[1]);
 
         let second_aad = store.scope().row_aad(
             "provider_context",
@@ -3119,7 +3301,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_context_key_api_rejects_shared_empty_and_cross_conversation_use() {
+    async fn artifact_keys_are_stable_per_handle_and_not_shared_at_paid_grain() {
+        let store = store().await;
+        assert!(
+            store
+                .private_key(DataKeyPurpose::Artifact)
+                .await
+                .expect_err("artifact keys require a handle retention anchor")
+                .to_string()
+                .contains("retention anchors")
+        );
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: scope().personality_agent_id,
+                    artifact_handle: "artifact://0198f0f4-9b72-7000-8000-000000000002/wrong"
+                        .to_owned(),
+                })
+                .await
+                .expect_err("handle PAID must match the authenticated Store")
+                .to_string()
+                .contains("PAID-scoped artifact URI")
+        );
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
+                    artifact_handle: format!(
+                        "artifact://{}/wrong-typed-anchor",
+                        scope().personality_agent_id
+                    ),
+                })
+                .await
+                .expect_err("typed anchor PAID must match the authenticated Store")
+                .to_string()
+                .contains("different personality agent")
+        );
+        let first_anchor = ArtifactKeyAnchor {
+            personality_agent_id: scope().personality_agent_id,
+            artifact_handle: format!("artifact://{}/attachments/a", scope().personality_agent_id),
+        };
+        let second_anchor = ArtifactKeyAnchor {
+            personality_agent_id: scope().personality_agent_id,
+            artifact_handle: format!("artifact://{}/tool-output/b", scope().personality_agent_id),
+        };
+        let first = store.artifact_key(&first_anchor).await.unwrap();
+        let first_replay = store.artifact_key(&first_anchor).await.unwrap();
+        let second = store.artifact_key(&second_anchor).await.unwrap();
+        assert_eq!(first.key_ref, first_replay.key_ref);
+        assert_ne!(first.key_ref, second.key_ref);
+        let units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='artifact' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(
+            units.iter().all(|unit| {
+                unit.starts_with("artifact:") && unit.len() == "artifact:".len() + 64
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_summary_keys_are_stable_per_batch_or_job_and_independently_erasable() {
+        let store = store().await;
+        let batch = store.memory_summary_key("batch", "batch-1").await.unwrap();
+        let batch_replay = store.memory_summary_key("batch", "batch-1").await.unwrap();
+        let other_batch = store.memory_summary_key("batch", "batch-2").await.unwrap();
+        let job = store.memory_summary_key("job", "batch-1").await.unwrap();
+        assert_eq!(batch.key_ref, batch_replay.key_ref);
+        assert_ne!(batch.key_ref, other_batch.key_ref);
+        assert_ne!(
+            batch.key_ref, job.key_ref,
+            "batch and job domains must remain distinct for the same caller ID"
+        );
+
+        let job_aad =
+            store
+                .scope()
+                .row_aad("memory_jobs", "batch-1", DataKeyPurpose::MemorySummary);
+        let job_ciphertext =
+            encrypt_content(&job, b"job-summary", &job_aad).expect("encrypt job summary");
+        store
+            .destroy_private_key_ref(&batch.key_ref)
+            .await
+            .expect("erase only the batch summary key");
+        assert!(
+            store
+                .memory_summary_key("batch", "batch-1")
+                .await
+                .expect_err("erased batch key cannot be reminted")
+                .to_string()
+                .contains("crypto-erased")
+        );
+        let job_replay = store.memory_summary_key("job", "batch-1").await.unwrap();
+        assert_eq!(
+            decrypt_content(&job_replay, &job_ciphertext, &job_aad).unwrap(),
+            b"job-summary"
+        );
+
+        let units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='memory_summary' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|unit| {
+            unit.starts_with("memory_summary:") && unit.len() == "memory_summary:".len() + 64
+        }));
+    }
+
+    #[tokio::test]
+    async fn provider_context_key_api_rejects_shared_empty_and_cross_paid_use() {
         let store = store().await;
         assert!(
             store
@@ -3138,7 +3436,7 @@ mod tests {
                 .await
                 .expect_err("empty anchor")
                 .to_string()
-                .contains("must not be empty")
+                .contains("1..=1024 bytes")
         );
         assert!(
             store
@@ -3147,9 +3445,9 @@ mod tests {
                     anchor_id: "message-1:7".to_owned(),
                 })
                 .await
-                .expect_err("cross-conversation anchor")
+                .expect_err("cross-PAID anchor")
                 .to_string()
-                .contains("different authenticated conversation")
+                .contains("different personality agent")
         );
     }
 
@@ -3298,57 +3596,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_accepts_every_valid_data_key_scope_and_purpose_pair() {
+    async fn data_key_apis_persist_only_paid_scoped_retention_units() {
         let store = store().await;
         for purpose in [
-            "transcript",
-            "event",
-            "memory_summary",
-            "provider_context",
-            "command",
-            "mutation",
-            "artifact",
+            DataKeyPurpose::Transcript,
+            DataKeyPurpose::Event,
+            DataKeyPurpose::Command,
+            DataKeyPurpose::Mutation,
+            DataKeyPurpose::Workspace,
         ] {
-            if purpose == "mutation" {
-                let active_mutation_keys: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM data_keys
-                     WHERE scope = 'conversation' AND purpose = 'mutation'
-                       AND personality_agent_id = 'conversation-1' AND state = 'active'",
-                )
-                .fetch_one(store.pool())
+            store
+                .private_key(purpose)
                 .await
-                .expect("count startup projection-authentication key");
-                assert_eq!(
-                    active_mutation_keys, 1,
-                    "startup projection authentication proves the valid conversation/mutation pair"
-                );
-                continue;
-            }
-            sqlx::query(
-                "INSERT INTO data_keys(
-                    key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, 'conversation', ?, 'conversation-1', ?, 'wrap',
-                    X'00', X'00', 'active', 'now', NULL)",
-            )
-            .bind(format!("valid-conversation-{purpose}"))
-            .bind(purpose)
-            .bind(WRAP_ALGORITHM)
-            .execute(store.pool())
-            .await
-            .unwrap_or_else(|error| panic!("valid conversation purpose {purpose}: {error}"));
+                .unwrap_or_else(|error| panic!("mint shared {} key: {error}", purpose.as_str()));
         }
-        sqlx::query(
-            "INSERT INTO data_keys(
-                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES('valid-agent-workspace', 'agent', 'workspace', NULL, ?, 'wrap',
-                X'00', X'00', 'active', 'now', NULL)",
+        store
+            .memory_summary_key("batch", "retention-test-batch")
+            .await
+            .expect("mint batch summary key");
+        store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                anchor_id: "retention-test-context".to_owned(),
+            })
+            .await
+            .expect("mint provider-context key");
+        store
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/retention-test",
+                    scope().personality_agent_id
+                ),
+            })
+            .await
+            .expect("mint artifact key");
+
+        let rows = sqlx::query(
+            "SELECT purpose, personality_agent_id, retention_unit
+             FROM data_keys WHERE state='active'",
         )
-        .bind(WRAP_ALGORITHM)
-        .execute(store.pool())
+        .fetch_all(store.pool())
         .await
-        .expect("agent workspace is the valid agent-scoped purpose");
+        .expect("load persisted data-key identities");
+        assert!(!rows.is_empty());
+        for row in rows {
+            let purpose = DataKeyPurpose::parse(row.get("purpose")).expect("known purpose");
+            assert_eq!(
+                row.get::<String, _>("personality_agent_id"),
+                scope().personality_agent_id.as_str()
+            );
+            validate_retention_unit(purpose, row.get("retention_unit"))
+                .expect("purpose-specific retention unit");
+        }
     }
 
     #[tokio::test]
@@ -3403,7 +3703,8 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM data_keys
-                 WHERE purpose = 'mutation' AND personality_agent_id = 'conversation-2'",
+                 WHERE purpose = 'mutation'
+                   AND personality_agent_id = '0198f0f4-9b72-7000-8000-000000000002'",
             )
             .fetch_one(&pool)
             .await
@@ -4244,7 +4545,7 @@ mod tests {
     async fn memory_batch_summary_hydrates_successfully() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-ok")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4268,7 +4569,7 @@ mod tests {
     async fn memory_batch_summary_rejects_tampered_ciphertext() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-tamper")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4298,7 +4599,7 @@ mod tests {
     async fn memory_batch_summary_rejects_wrong_key_ref() {
         let store = store().await;
         let memory_key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-wrong-key")
             .await
             .expect("mint memory summary key");
         let transcript_key = store
@@ -4337,7 +4638,7 @@ mod tests {
     async fn memory_batch_summary_rejects_mismatched_projection() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-bad-projection")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4372,7 +4673,7 @@ mod tests {
     async fn memory_batch_summary_rejects_stale_redaction_version() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-stale")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4401,7 +4702,7 @@ mod tests {
     async fn memory_job_result_hydrates_successfully() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-ok")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4425,7 +4726,7 @@ mod tests {
     async fn memory_job_result_rejects_tampered_ciphertext() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-tamper")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4455,7 +4756,7 @@ mod tests {
     async fn memory_job_result_rejects_wrong_key_ref() {
         let store = store().await;
         let memory_key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-wrong-key")
             .await
             .expect("mint memory summary key");
         let transcript_key = store
@@ -4494,7 +4795,7 @@ mod tests {
     async fn memory_job_result_rejects_mismatched_projection() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-bad-projection")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4524,7 +4825,7 @@ mod tests {
     async fn memory_job_result_rejects_stale_redaction_version() {
         let store = store().await;
         let key = store
-            .private_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-stale")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();

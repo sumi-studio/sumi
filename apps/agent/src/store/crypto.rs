@@ -16,7 +16,7 @@ use crate::gateway::{CommandDigestFactory, IncrementalCommandDigest, KeyedComman
 pub const CONTENT_ENVELOPE_VERSION: u8 = 2;
 pub const CONTENT_NONCE_BYTES: usize = 24;
 pub const DATA_KEY_BYTES: usize = 32;
-pub const WRAP_ALGORITHM: &str = "xchacha20-poly1305/v2";
+pub const WRAP_ALGORITHM: &str = "xchacha20-poly1305/v3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataKeyScope {
@@ -297,18 +297,20 @@ pub(crate) struct KeyWrapAad {
     pub scope: DataKeyScope,
     pub purpose: DataKeyPurpose,
     pub personality_agent_id: String,
+    pub retention_unit: String,
     pub wrap_key_id: String,
 }
 
 impl KeyWrapAad {
     fn canonical_bytes(&self) -> Vec<u8> {
         canonical_fields(
-            b"sumi-key-wrap-aad/v2",
+            b"sumi-key-wrap-aad/v3",
             [
                 self.key_ref.as_bytes(),
                 self.scope.as_str().as_bytes(),
                 self.purpose.as_str().as_bytes(),
                 self.personality_agent_id.as_str().as_bytes(),
+                self.retention_unit.as_bytes(),
                 self.wrap_key_id.as_bytes(),
             ],
         )
@@ -549,6 +551,39 @@ mod tests {
     use sha2::Sha256;
 
     use super::*;
+
+    #[test]
+    fn wrapped_key_authenticates_retention_unit() {
+        let data_key =
+            DataKeyMaterial::from_bytes("key-1", DataKeyPurpose::Transcript, [9; DATA_KEY_BYTES]);
+        let wrapping_key = WrappingKey::new("wrap-1", [7; DATA_KEY_BYTES]);
+        let aad = KeyWrapAad {
+            key_ref: data_key.key_ref.clone(),
+            scope: DataKeyScope::PersonalityAgent,
+            purpose: DataKeyPurpose::Transcript,
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".to_owned(),
+            retention_unit: "agent".to_owned(),
+            wrap_key_id: wrapping_key.key_id().to_owned(),
+        };
+        let (nonce, wrapped) = wrap_data_key(&data_key, &wrapping_key, &aad).unwrap();
+        let wrong_retention = KeyWrapAad {
+            retention_unit:
+                "artifact:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            ..aad
+        };
+        assert!(
+            unwrap_data_key(
+                data_key.key_ref,
+                DataKeyPurpose::Transcript,
+                &wrapped,
+                &nonce,
+                &wrapping_key,
+                &wrong_retention,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn content_envelope_binds_every_row_aad_field() {
