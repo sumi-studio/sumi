@@ -9902,6 +9902,7 @@ async fn ask_only_policy(store: &Store) -> crate::approval::Policy {
         .load_approval_policy(
             "/workspace",
             &ApprovalPolicyTrustStore::default(),
+            "tenant-test",
             0,
             chrono::Utc::now(),
         )
@@ -9996,7 +9997,7 @@ async fn expired_policy_grant_reenters_approval_before_stalled_tool_start() {
         &ApprovalPolicyBundle {
             schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             version: 7,
             issued_at: now - chrono::Duration::seconds(10),
             expires_at,

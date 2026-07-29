@@ -364,10 +364,10 @@ mod tests {
 
     use super::super::stdio::MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES;
     use super::super::{
-        AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope,
-        DeliveryAuthorization, Envelope, Gateway, GatewayConnector, GatewayCredential,
-        GatewayReader, GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest,
-        MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
+        AgentHello, ApiHello, Command, CommandDigestFactory, DeliveryAuthorization, Envelope,
+        Gateway, GatewayConnector, GatewayCredential, GatewayReader, GatewayWriter, HelloError,
+        InboundCommand, IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
+        OversizedFrameError,
     };
     use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;

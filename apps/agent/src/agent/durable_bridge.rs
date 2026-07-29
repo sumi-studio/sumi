@@ -2976,6 +2976,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
+                    crate::gateway::test_direct_chat_provenance(),
                 )],
             })
             .await

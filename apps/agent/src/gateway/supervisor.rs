@@ -5341,6 +5341,7 @@ mod tests {
                         ack: CommandAck {
                             seq: terminal_seq,
                             command_id,
+                            personality_agent_id: crate::gateway::test_personality_agent_id(),
                             status: terminal_status,
                             reject_reason,
                         },
@@ -8877,7 +8878,10 @@ mod tests {
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });
-                    let message_id = user_message_id(&initial.envelope().command_id);
+                    let message_id = user_message_id(
+                        &initial.envelope().personality_agent_id,
+                        &initial.envelope().command_id,
+                    );
                     for event in [
                         AgentEvent::AgentStart,
                         AgentEvent::TurnStart,
@@ -9050,7 +9054,10 @@ mod tests {
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });
-                    let message_id = user_message_id(&initial.envelope().command_id);
+                    let message_id = user_message_id(
+                        &initial.envelope().personality_agent_id,
+                        &initial.envelope().command_id,
+                    );
                     for event in [
                         AgentEvent::AgentStart,
                         AgentEvent::TurnStart,

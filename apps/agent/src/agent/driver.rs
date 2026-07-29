@@ -2210,7 +2210,10 @@ mod tests {
         );
         assert_eq!(
             start_ids[0],
-            user_message_id("018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a")
+            user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            )
         );
         assert_eq!(
             message_ends[2].pointer("/envelope/event/message/content"),

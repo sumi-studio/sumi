@@ -1404,12 +1404,16 @@ mod tests {
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command,
             payload_digest,
+            personality_agent_id,
+            provenance,
         } = inbound
         else {
             panic!("oversized command must be a typed rejection");
         };
         assert_eq!(seq, 7);
         assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000008");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
         assert_eq!(actual_bytes, command.len() as u64);
         assert!(matches!(
             raw_command,
@@ -1691,12 +1695,16 @@ mod tests {
             reason,
             raw_command,
             payload_digest,
+            personality_agent_id,
+            provenance,
         } = inbound
         else {
             panic!("oversized command line must produce a typed rejection");
         };
         assert_eq!(seq, 1);
         assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000001");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
         let CommandRejectReason::Oversized { actual_bytes } = reason else {
             panic!("expected Oversized rejection, got {reason:?}");
         };
