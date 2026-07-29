@@ -29,11 +29,12 @@ use zeroize::Zeroize;
 use crate::runtime::contracts::ProcessGeneration;
 
 use super::{
-    Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
+    CommandAck, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
     OutboundFrame, OversizedFrameError,
 };
 
 pub mod seams;
+pub mod session;
 
 // T24-local identity: one `DeliveryEpoch` is minted for each `ConnectionEpoch`
 // and invalidated exactly once when the epoch ends.
@@ -302,6 +303,15 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         Ok(self.clone())
     }
 
+    /// Optional T17 capability consumed by `SessionGateway`.
+    ///
+    /// Sources without an EventWriter/DeliveryPump leave this absent. A
+    /// production Session event is fatal if it reaches an adapter without this
+    /// capability; ACK-only supervisor users do not require it.
+    fn session_event_sink(&self) -> Option<session::SessionEventSink> {
+        None
+    }
+
     async fn event_cursor(&self) -> Result<EventCursors>;
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>>;
     async fn command_cursors(&self) -> Result<CommandCursors>;
@@ -336,13 +346,19 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
 }
 
 pub struct DeliveryEpochRuntime {
-    failure_rx: mpsc::UnboundedReceiver<String>,
+    failure_rx: mpsc::UnboundedReceiver<DeliveryEpochFailure>,
     task: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DeliveryEpochFailure {
+    Reconnect(String),
+    Fatal(String),
 }
 
 enum DeliveryEpochCompletion {
     /// The delivery pump itself reported a recoverable channel failure.
-    Reported(String),
+    Reported(DeliveryEpochFailure),
     /// The failure channel disappeared without reporting why.
     FailureChannelClosed,
     /// The delivery forwarder terminated before reporting a channel failure.
@@ -354,10 +370,15 @@ enum DeliveryEpochCompletion {
 impl DeliveryEpochCompletion {
     fn into_supervisor_error(self) -> Option<SupervisorError> {
         match self {
-            Self::Reported(reason) => Some(SupervisorError::EstablishedReconnect {
-                reason: format!("delivery epoch failed: {reason}"),
-                healthy: false,
-            }),
+            Self::Reported(DeliveryEpochFailure::Reconnect(reason)) => {
+                Some(SupervisorError::EstablishedReconnect {
+                    reason: format!("delivery epoch failed: {reason}"),
+                    healthy: false,
+                })
+            }
+            Self::Reported(DeliveryEpochFailure::Fatal(reason)) => Some(SupervisorError::Fatal(
+                anyhow!("delivery epoch failed permanently: {reason}"),
+            )),
             Self::FailureChannelClosed => Some(SupervisorError::Fatal(anyhow!(
                 "delivery epoch failure channel closed without a terminal signal"
             ))),
@@ -379,7 +400,10 @@ impl DeliveryEpochCompletion {
 }
 
 impl DeliveryEpochRuntime {
-    pub(crate) fn new(failure_rx: mpsc::UnboundedReceiver<String>, task: JoinHandle<()>) -> Self {
+    pub(crate) fn new(
+        failure_rx: mpsc::UnboundedReceiver<DeliveryEpochFailure>,
+        task: JoinHandle<()>,
+    ) -> Self {
         Self {
             failure_rx,
             task: Some(task),
@@ -487,6 +511,30 @@ impl EventSender {
         self.send_with_admission(epoch, frame, None).await
     }
 
+    /// Reliably admit one command ACK into the stable supervisor lane.
+    ///
+    /// Session owns retry across epoch replacement. This boundary therefore
+    /// applies bounded backpressure and reports closure instead of silently
+    /// losing an ACK when the lane is full or unavailable.
+    pub(super) async fn send_command_ack_if_current(
+        &self,
+        epoch: DeliveryEpoch,
+        ack: CommandAck,
+        current_epoch: &watch::Receiver<Option<DeliveryEpoch>>,
+    ) -> Result<bool, mpsc::error::SendError<(DeliveryEpoch, OutboundFrame)>> {
+        let online_at_enqueue = *self.online.borrow();
+        let frame = OutboundFrame::CommandAck { ack };
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => return Err(mpsc::error::SendError((epoch, frame))),
+        };
+        if *current_epoch.borrow() != Some(epoch) {
+            return Ok(false);
+        }
+        permit.send((epoch, online_at_enqueue, frame));
+        Ok(true)
+    }
+
     /// Enqueue a frame emitted by the current DeliveryPump.
     ///
     /// A volatile frame can only leave the pump after `mark_online` has
@@ -529,17 +577,23 @@ pub struct SupervisorHandle {
     pub epochs: watch::Receiver<Option<DeliveryEpoch>>,
     /// True once the current epoch has caught up to the durable event cursor.
     pub online: watch::Receiver<bool>,
+    session_events: Option<session::SessionEventSink>,
+    lifecycle: SupervisorLifecycle,
+}
+
+struct SupervisorLifecycle {
     cancel: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
 }
 
 impl SupervisorHandle {
     pub fn abort(&self) {
-        self.cancel.cancel();
+        self.lifecycle.cancel.cancel();
     }
 
     pub async fn join(mut self) -> Result<()> {
         let task = self
+            .lifecycle
             .task
             .take()
             .context("supervisor task was already consumed")?;
@@ -547,7 +601,7 @@ impl SupervisorHandle {
     }
 }
 
-impl Drop for SupervisorHandle {
+impl Drop for SupervisorLifecycle {
     fn drop(&mut self) {
         self.cancel.cancel();
         // Dropping a JoinHandle detaches the task. Keep the cancelled
@@ -630,6 +684,7 @@ where
         let (events_tx, events_rx) = mpsc::channel(self.config.event_buffer_size.get());
         let epochs_rx = self.current_epoch.subscribe();
         let online_rx = self.online.subscribe();
+        let session_events = self.source.session_event_sink();
         let cancel = self.cancel.clone();
         let events = EventSender {
             tx: events_tx,
@@ -641,8 +696,11 @@ where
             events,
             epochs: epochs_rx,
             online: online_rx,
-            cancel,
-            task: Some(task),
+            session_events,
+            lifecycle: SupervisorLifecycle {
+                cancel,
+                task: Some(task),
+            },
         }
     }
 
@@ -818,7 +876,6 @@ where
         let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size.get());
 
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
-        self.current_epoch.send_replace(Some(delivery_epoch));
 
         let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
         let writer_source = source.clone();
@@ -859,8 +916,8 @@ where
                 epoch_token.cancel();
                 let _ = writer_handle.await;
                 *self.current_writer.lock().unwrap() = None;
-                self.current_epoch.send_replace(None);
                 let _ = self.online.send(false);
+                self.current_epoch.send_replace(None);
 
                 // `install_delivery_epoch` may have installed the opaque epoch
                 // before discovering a later setup error. Always run the
@@ -879,6 +936,8 @@ where
                 });
             }
         };
+        debug_assert!(!*self.online.subscribe().borrow());
+        self.current_epoch.send_replace(Some(delivery_epoch));
         let _ = delivery_ready_tx.send(Ok(()));
 
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
@@ -896,22 +955,22 @@ where
             biased;
             _ = cancel.cancelled() => {
                 epoch_token.cancel();
+                let _ = self.online.send(false);
                 let reader_result = reader_handle.await;
                 let writer_result = writer_handle.await;
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
-                let _ = self.online.send(false);
                 Self::inspect_epoch_results(reader_result, writer_result, || Ok(()))
             }
             reader_result = &mut reader_handle => {
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
-                self.current_epoch.send_replace(None);
                 let was_online = {
                     let rx = self.online.subscribe();
                     *rx.borrow()
                 };
                 let _ = self.online.send(false);
+                self.current_epoch.send_replace(None);
                 let writer_result = writer_handle.await;
                 let healthy = was_online
                     && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
@@ -926,12 +985,12 @@ where
             writer_result = &mut writer_handle => {
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
-                self.current_epoch.send_replace(None);
                 let was_online = {
                     let rx = self.online.subscribe();
                     *rx.borrow()
                 };
                 let _ = self.online.send(false);
+                self.current_epoch.send_replace(None);
                 let reader_result = reader_handle.await;
                 let healthy = was_online
                     && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
@@ -947,8 +1006,8 @@ where
                 delivery_completion = Some(completion);
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
-                self.current_epoch.send_replace(None);
                 let _ = self.online.send(false);
+                self.current_epoch.send_replace(None);
                 let reader_result = reader_handle.await;
                 let writer_result = writer_handle.await;
                 Self::inspect_epoch_results(reader_result, writer_result, || Ok(()))
@@ -1036,6 +1095,15 @@ where
         }
         if let Some(e) = first_durable_replay_invariant_error(&writer_result) {
             return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
+        }
+        if writer_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<seams::DeliveryProjectionError>())
+        {
+            return Err(SupervisorError::Fatal(
+                writer_result.expect_err("projection error checked above"),
+            ));
         }
 
         match (reader_result, writer_result) {
@@ -1465,7 +1533,19 @@ where
             }
         }
 
-        if let Some((_, frame)) = outbox.pop_front() {
+        // During catch-up, an ACK that arrived after a live durable notice
+        // must remain fenced behind that notice. Catch-up will either send the
+        // same sequence or advance `last_received` past it, after which
+        // `prune_pending_events` removes the marker and the ACK may proceed.
+        // ACKs that arrived before every pending durable notice remain
+        // sendable, preserving early receipt feedback without allowing a
+        // terminal ACK to overtake its committed event batch.
+        let ack_is_fenced = !online
+            && matches!(
+                (outbox.front(), pending_events.values().map(|(id, _)| *id).min()),
+                (Some((out_id, _)), Some(event_id)) if event_id < *out_id
+            );
+        if !ack_is_fenced && let Some((_, frame)) = outbox.pop_front() {
             send_with_interleave(
                 writer,
                 frame,
@@ -2095,7 +2175,10 @@ mod tests {
     use tokio::sync::{Notify, mpsc, watch};
 
     use super::*;
-    use crate::agent::{AgentEvent, PublicStreamEvent};
+    use crate::agent::{
+        AdmittedCommand, AgentEvent, PublicStreamEvent, RunCompletion, RunControl, RunCore,
+        RunWorker, Session,
+    };
     use crate::gateway::stdio::{InjectedStdioGateway, SingleConnectionConnector};
     use crate::gateway::wire::to_wire_frame;
     use crate::gateway::{
@@ -2103,10 +2186,15 @@ mod tests {
         Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand,
         OutboundFrame,
     };
+    use crate::provider::types::{
+        ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+        StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        ValidatedToolArguments,
+    };
     use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationOutcome, Store,
-        insert_test_durable_event,
+        insert_test_durable_event, user_message_id,
     };
 
     struct TestDigestFactory;
@@ -2291,6 +2379,38 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SequencedAuthorizationProvider {
+        authorizations: Arc<Mutex<VecDeque<DeliveryAuthorization>>>,
+        counter: Arc<AtomicU64>,
+    }
+
+    impl SequencedAuthorizationProvider {
+        fn new(authorizations: impl IntoIterator<Item = DeliveryAuthorization>) -> Self {
+            Self {
+                authorizations: Arc::new(Mutex::new(authorizations.into_iter().collect())),
+                counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CredentialProvider for SequencedAuthorizationProvider {
+        async fn fresh_credential(&mut self) -> Result<GatewayCredential> {
+            let authorization = self
+                .authorizations
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("test authorization sequence exhausted")?;
+            let attempt = self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(GatewayCredential::new(
+                format!("sequenced-token-{attempt}"),
+                authorization,
+            ))
+        }
+    }
+
     struct MockGatewayReader {
         commands: VecDeque<Result<InboundCommand>>,
         panic: bool,
@@ -2311,6 +2431,9 @@ mod tests {
 
     struct MockGatewayWriter {
         fail_after: Option<usize>,
+        /// Record the Nth frame as a completed wire write, then fail the
+        /// connection before the peer's durable handler can be assumed.
+        fail_after_record: Option<usize>,
         sent: Arc<std::sync::Mutex<Vec<OutboundFrame>>>,
         delay: Option<Duration>,
         /// Number of successfully sent frames after which the writer blocks.
@@ -2363,6 +2486,9 @@ mod tests {
                     bail!("writer failure");
                 }
                 sent.push(frame);
+                if self.fail_after_record == Some(sent.len()) {
+                    bail!("writer failed after wire send before peer persistence");
+                }
                 let blocked = self.block_after.is_some_and(|n| sent.len() == n);
                 (blocked, self.block_notify.clone(), self.release.clone())
             };
@@ -2385,6 +2511,7 @@ mod tests {
         writer: MockGatewayWriter,
         sent_hellos: Arc<std::sync::Mutex<Vec<AgentHello>>>,
         hello_generation: Option<ProcessGeneration>,
+        next_command_seq: Option<u64>,
         last_received_event_seq: u64,
         hello_delay: Option<Duration>,
         hello_error: Option<HelloError>,
@@ -2400,6 +2527,7 @@ mod tests {
                 },
                 writer: MockGatewayWriter {
                     fail_after: None,
+                    fail_after_record: None,
                     sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                     delay: None,
                     block_after: None,
@@ -2408,6 +2536,7 @@ mod tests {
                 },
                 sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 hello_generation: None,
+                next_command_seq: None,
                 last_received_event_seq: 0,
                 hello_delay: None,
                 hello_error: None,
@@ -2416,6 +2545,11 @@ mod tests {
 
         fn with_hello_generation(mut self, generation: u64) -> Self {
             self.hello_generation = Some(ProcessGeneration::from_wire(generation).unwrap());
+            self
+        }
+
+        fn with_next_command_seq(mut self, next_command_seq: u64) -> Self {
+            self.next_command_seq = Some(next_command_seq);
             self
         }
 
@@ -2464,7 +2598,9 @@ mod tests {
             Ok(ApiHello {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
-                next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+                next_command_seq: self
+                    .next_command_seq
+                    .unwrap_or_else(|| hello.last_applied_command_seq.saturating_add(1)),
             })
         }
 
@@ -2515,6 +2651,7 @@ mod tests {
         responses: VecDeque<Result<MockGateway, ConnectorError>>,
         sent_hellos: Arc<std::sync::Mutex<Vec<AgentHello>>>,
         connect_delay: Option<Duration>,
+        connect_gate: Option<Arc<Notify>>,
     }
 
     impl MockConnector {
@@ -2526,11 +2663,17 @@ mod tests {
                 responses,
                 sent_hellos,
                 connect_delay: None,
+                connect_gate: None,
             }
         }
 
         fn with_connect_delay(mut self, delay: Duration) -> Self {
             self.connect_delay = Some(delay);
+            self
+        }
+
+        fn with_connect_gate(mut self, gate: Arc<Notify>) -> Self {
+            self.connect_gate = Some(gate);
             self
         }
     }
@@ -2549,6 +2692,9 @@ mod tests {
                 .expect("mock connector has a queued response")?;
             if let Some(delay) = self.connect_delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(gate) = self.connect_gate.as_ref() {
+                gate.notified().await;
             }
             // Share the hello tracker so the test can observe all attempts.
             gateway.sent_hellos = self.sent_hellos.clone();
@@ -2571,6 +2717,16 @@ mod tests {
             hello_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_millis(50),
         }
+    }
+
+    async fn wait_for_t17_idle(adapter: &seams::T17StoreAdapter) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.active_delivery_epoch().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("T17 delivery epoch cleanup must finish");
     }
 
     fn event_frame(seq: u64) -> OutboundFrame {
@@ -2788,7 +2944,7 @@ mod tests {
         struct PanickingDeliverySource {
             installs: Arc<AtomicU64>,
             invalidations: Arc<AtomicU64>,
-            failure_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+            failure_tx: Arc<Mutex<Option<mpsc::UnboundedSender<DeliveryEpochFailure>>>>,
         }
 
         #[async_trait]
@@ -3036,6 +3192,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3044,6 +3201,7 @@ mod tests {
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3056,6 +3214,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3064,6 +3223,7 @@ mod tests {
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3116,6 +3276,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_epoch_is_never_published_with_stale_online_true() {
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let source = DelayedCatchUpSource {
+            events: Arc::new(Mutex::new(VecDeque::from([event_frame(1)]))),
+            notify: Arc::new(Notify::new()),
+            command_cursor: CommandCursors::default(),
+        };
+
+        let mut first_gateway = MockGateway::new(VecDeque::new());
+        first_gateway.sent_hellos = sent_hellos.clone();
+        first_gateway.last_received_event_seq = 1;
+        first_gateway.writer.fail_after = Some(0);
+        let mut second_gateway = MockGateway::new(VecDeque::new());
+        second_gateway.sent_hellos = sent_hellos;
+        second_gateway.last_received_event_seq = 0;
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(first_gateway), Ok(second_gateway)]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "epoch-online-order".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
+        let mut epochs = handle.epochs.clone();
+        let mut online = handle.online.clone();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while epochs.borrow().is_none() {
+                epochs.changed().await.unwrap();
+            }
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first epoch must become Online");
+        let first_epoch = epochs.borrow_and_update().expect("first epoch");
+
+        handle
+            .events
+            .send((first_epoch, event_frame(2)))
+            .await
+            .expect("live event triggers the first writer failure");
+        let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                epochs.changed().await.unwrap();
+                let observed = *epochs.borrow_and_update();
+                if observed != Some(first_epoch) {
+                    assert!(
+                        !*online.borrow(),
+                        "epoch transition {first_epoch:?} -> {observed:?} observed stale Online=true"
+                    );
+                }
+                if let Some(epoch) = observed
+                    && epoch != first_epoch
+                {
+                    break epoch;
+                }
+            }
+        })
+        .await
+        .expect("replacement epoch must be published while catch-up is blocked");
+        assert_ne!(replacement, first_epoch);
+        assert!(
+            !*online.borrow(),
+            "replacement catch-up remains blocked and cannot already be Online"
+        );
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+    }
+
+    #[tokio::test]
     async fn catch_up_sends_durable_events_before_online() {
         let source = MockDurableSource::new(CommandCursors::default());
         source.push_event(event_frame(1));
@@ -3130,6 +3370,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3138,6 +3379,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3182,6 +3424,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3190,6 +3433,7 @@ mod tests {
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3202,6 +3446,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3210,6 +3455,7 @@ mod tests {
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3282,6 +3528,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3290,6 +3537,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -3345,6 +3593,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -3353,6 +3602,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -4095,6 +4345,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 delay: None,
                 block_after: None,
@@ -4103,6 +4354,7 @@ mod tests {
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -4135,6 +4387,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -4143,6 +4396,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -4784,6 +5038,7 @@ mod tests {
                 },
                 writer: MockGatewayWriter {
                     fail_after: None,
+                    fail_after_record: None,
                     sent: sent.clone(),
                     delay: None,
                     block_after: None,
@@ -5129,6 +5384,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -5137,6 +5393,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -5323,9 +5580,9 @@ mod tests {
                             let event = match serde_json::to_value(event) {
                                 Ok(event) => event,
                                 Err(error) => {
-                                    let _ = failure_tx.send(format!(
+                                    let _ = failure_tx.send(DeliveryEpochFailure::Fatal(format!(
                                         "failed to serialize volatile event: {error}"
-                                    ));
+                                    )));
                                     break;
                                 }
                             };
@@ -5394,6 +5651,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -5402,6 +5660,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -5565,6 +5824,7 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer = MockGatewayWriter {
             fail_after: None,
+            fail_after_record: None,
             sent: sent.clone(),
             delay: None,
             block_after: None,
@@ -5635,10 +5895,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_durable_arrival_fences_later_terminal_ack_until_catch_up() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = MockGatewayWriter {
+            fail_after: None,
+            fail_after_record: None,
+            sent: sent.clone(),
+            delay: None,
+            block_after: None,
+            block_notify: None,
+            release: None,
+        };
+        let (_writer_tx, mut writer_rx) = mpsc::channel(2);
+        let token = CancellationToken::new();
+        let mut next_arrival_id = 0;
+        let mut outbox = VecDeque::new();
+        let mut pending_events = BTreeMap::new();
+        let mut last_received = 0;
+
+        classify_frame(
+            event_frame(2),
+            false,
+            last_received,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+        );
+        classify_frame(
+            OutboundFrame::CommandAck {
+                ack: CommandAck {
+                    seq: 1,
+                    command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    status: CommandAckStatus::Applied,
+                    reject_reason: None,
+                },
+            },
+            false,
+            last_received,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+        );
+
+        drain_next(
+            &mut writer,
+            Duration::from_secs(1),
+            &token,
+            &mut writer_rx,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+            &mut last_received,
+            false,
+        )
+        .await
+        .expect("offline drain");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "terminal ACK must remain behind its earlier durable arrival"
+        );
+
+        // Production catch-up has now durably sent through seq 2. Pruning the
+        // matching live marker releases the later terminal ACK.
+        last_received = 2;
+        drain_next(
+            &mut writer,
+            Duration::from_secs(1),
+            &token,
+            &mut writer_rx,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+            &mut last_received,
+            false,
+        )
+        .await
+        .expect("post-catch-up drain");
+        assert!(matches!(
+            sent.lock().unwrap().as_slice(),
+            [OutboundFrame::CommandAck { ack }] if ack.status == CommandAckStatus::Applied
+        ));
+    }
+
+    #[tokio::test]
     async fn live_durable_gap_fails_without_sending_or_advancing() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer = MockGatewayWriter {
             fail_after: None,
+            fail_after_record: None,
             sent: sent.clone(),
             delay: None,
             block_after: None,
@@ -5706,6 +6050,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: Some(Duration::from_millis(2)),
                 block_after: None,
@@ -5714,6 +6059,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -5891,6 +6237,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: None,
                 block_after: None,
@@ -5899,6 +6246,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -6401,6 +6749,7 @@ mod tests {
             },
             writer: MockGatewayWriter {
                 fail_after: None,
+                fail_after_record: None,
                 sent: sent.clone(),
                 delay: Some(Duration::from_millis(2)),
                 block_after: None,
@@ -6409,6 +6758,7 @@ mod tests {
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
+            next_command_seq: None,
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
@@ -6676,6 +7026,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer = MockGatewayWriter {
             fail_after: None,
+            fail_after_record: None,
             sent: sent.clone(),
             delay: None,
             block_after: None,
@@ -6769,6 +7120,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer = MockGatewayWriter {
             fail_after: None,
+            fail_after_record: None,
             sent: sent.clone(),
             delay: None,
             block_after: None,
@@ -7298,13 +7650,7 @@ mod tests {
             }
             drop(handle);
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while adapter.active_delivery_epoch().await.is_some() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("detached supervisor cleanup must invalidate the dropped handle's epoch");
+            wait_for_t17_idle(&adapter).await;
             assert_eq!(
                 adapter.delivery_epoch_lifecycle_counts(),
                 (1, 1),
@@ -7355,6 +7701,8 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
+        let session_gateway = session::SessionGateway::from(handle);
+        let (_session_reader, mut session_writer) = session_gateway.split();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !*online.borrow() {
                 online.changed().await.unwrap();
@@ -7372,11 +7720,33 @@ mod tests {
         )
         .await
         .unwrap();
-        adapter.on_durable_committed(2).await.unwrap();
-        adapter
-            .on_volatile(crate::agent::AgentEvent::ToolExecutionUpdate {
-                tool_call_id: "tool-1".to_owned(),
-                partial: serde_json::json!({"stdout": raw_secret}),
+        session_writer
+            .send(OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: Some(2),
+                    conversation_id: store.scope().conversation_id.clone(),
+                    // This Session-carried payload is intentionally raw and
+                    // different from the committed row. The adapter must
+                    // discard it and make T17 re-read seq=2.
+                    event: serde_json::json!({
+                        "type": "error",
+                        "message": format!("must-not-bypass-T17 {raw_secret}")
+                    }),
+                },
+            })
+            .await
+            .unwrap();
+        session_writer
+            .send(OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: None,
+                    conversation_id: store.scope().conversation_id.clone(),
+                    event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: "tool-1".to_owned(),
+                        partial: serde_json::json!({"stdout": raw_secret}),
+                    })
+                    .unwrap(),
+                },
             })
             .await
             .unwrap();
@@ -7399,8 +7769,8 @@ mod tests {
         .await
         .expect("projection-only durable frames must be forwarded");
 
-        handle.abort();
-        handle.join().await.unwrap();
+        drop(session_writer);
+        wait_for_t17_idle(&adapter).await;
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -7430,7 +7800,409 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_forwarder_failure_cancels_epoch_and_reconnects() {
+    async fn raw_epoch_backlog_cannot_flush_into_redaction_only_reconnect() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-raw-to-redaction")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let raw_secret = "sk-raw-epoch-secret-value";
+        let raw_sent = Arc::new(Mutex::new(Vec::new()));
+        let redacted_sent = Arc::new(Mutex::new(Vec::new()));
+        let raw_writer_blocked = Arc::new(Notify::new());
+
+        let mut raw_gateway = MockGateway::new(VecDeque::new());
+        raw_gateway.writer.sent = raw_sent.clone();
+        raw_gateway.writer = raw_gateway
+            .writer
+            .with_block_after(1, raw_writer_blocked.clone());
+        let mut redacted_gateway = MockGateway::new(VecDeque::new());
+        redacted_gateway.writer.sent = redacted_sent.clone();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let connector = MockConnector::new(
+            sent_hellos,
+            VecDeque::from([Ok(raw_gateway), Ok(redacted_gateway)]),
+        );
+        let mut config = make_config();
+        config.initial_backoff = Duration::ZERO;
+        config.max_backoff = Duration::ZERO;
+        config.send_timeout = Duration::from_millis(25);
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            SequencedAuthorizationProvider::new([
+                DeliveryAuthorization::Raw,
+                DeliveryAuthorization::RedactionOnly,
+            ]),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "raw-to-redaction-ready".to_owned(),
+            }),
+            config,
+        );
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        let mut epochs = handle.epochs.clone();
+        let session_gateway = session::SessionGateway::from(handle);
+        let (_session_reader, mut session_writer) = session_gateway.split();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("raw epoch must become Online");
+        let raw_epoch = (*epochs.borrow()).expect("raw delivery epoch installed");
+
+        let projection = insert_test_durable_event(
+            &store,
+            1,
+            &crate::agent::AgentEvent::Error {
+                message: format!("durable {raw_secret}"),
+            },
+        )
+        .await
+        .unwrap();
+        session_writer
+            .send(OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: Some(1),
+                    conversation_id: store.scope().conversation_id.clone(),
+                    event: serde_json::json!({
+                        "type": "error",
+                        "message": format!("untrusted Session copy {raw_secret}")
+                    }),
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), raw_writer_blocked.notified())
+            .await
+            .expect("raw writer must block with the durable frame in flight");
+
+        session_writer
+            .send(OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: None,
+                    conversation_id: store.scope().conversation_id.clone(),
+                    event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: "raw-backlog-tool".to_owned(),
+                        partial: serde_json::json!({"stdout": raw_secret}),
+                    })
+                    .unwrap(),
+                },
+            })
+            .await
+            .expect("raw volatile may enter only the old T17 epoch");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let replacement = *epochs.borrow();
+                if replacement.is_some_and(|epoch| epoch != raw_epoch) && *online.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = epochs.changed() => {},
+                    _ = online.changed() => {},
+                }
+            }
+        })
+        .await
+        .expect("writer timeout must reconnect under RedactionOnly authorization");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while redacted_sent.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("redaction-only reconnect must catch up the durable event");
+
+        drop(session_writer);
+        wait_for_t17_idle(&adapter).await;
+
+        assert!(
+            serde_json::to_string(&*raw_sent.lock().unwrap())
+                .unwrap()
+                .contains(raw_secret),
+            "the Raw epoch may receive authorized raw material"
+        );
+        let expected_projection = serde_json::from_str::<serde_json::Value>(&projection).unwrap();
+        let replacement_frames = redacted_sent.lock().unwrap();
+        assert_eq!(
+            replacement_frames
+                .iter()
+                .filter_map(|frame| match frame {
+                    OutboundFrame::Event { envelope } if envelope.seq == Some(1) => {
+                        Some(envelope.event.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![expected_projection],
+            "replacement epoch must re-read the projected durable row exactly once"
+        );
+        assert!(
+            !serde_json::to_string(&*replacement_frames)
+                .unwrap()
+                .contains(raw_secret),
+            "old Raw payloads must not cross into RedactionOnly"
+        );
+        assert!(
+            !replacement_frames.iter().any(
+                |frame| matches!(frame, OutboundFrame::Event { envelope } if envelope.seq.is_none())
+            ),
+            "old raw volatile backlog must not flush into RedactionOnly"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_commit_burst_over_session_capacity_replays_once_after_connect() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-offline-commit-burst")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::new());
+        gateway.writer.sent = sent.clone();
+        let connect_gate = Arc::new(Notify::new());
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        )
+        .with_connect_gate(connect_gate.clone());
+        let mut config = make_config();
+        config.connect_timeout = Duration::from_secs(5);
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "offline-burst-ready".to_owned(),
+            }),
+            config,
+        );
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        let session_gateway = session::SessionGateway::from(handle);
+        let (mut session_reader, mut session_writer) = session_gateway.split();
+
+        for seq in 1..=80 {
+            insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)
+                .await
+                .unwrap();
+            session_writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(seq),
+                        conversation_id: store.scope().conversation_id.clone(),
+                        event: serde_json::json!({
+                            "type": "error",
+                            "message": "untrusted Session payload must be ignored"
+                        }),
+                    },
+                })
+                .await
+                .expect("offline committed notification must remain nonfatal");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), session_reader.next_command())
+                .await
+                .is_err(),
+            "the stable Session command reader must remain open during offline burst"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no event may bypass T17 while connect is gated"
+        );
+
+        connect_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("supervisor must catch up the offline burst and become Online");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let durable_count = sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|frame| outbound_frame_event_seq(frame).is_ok())
+                    .count();
+                if durable_count == 80 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all offline committed rows must replay");
+
+        drop(session_writer);
+        drop(session_reader);
+        wait_for_t17_idle(&adapter).await;
+
+        let delivered: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| outbound_frame_event_seq(frame).ok())
+            .collect();
+        assert_eq!(
+            delivered,
+            (1..=80).collect::<Vec<_>>(),
+            "supervisor catch-up must replay each durable seq exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_fence_registration_is_atomic_with_epoch_invalidation() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-atomic-durable-admission")
+                .await
+                .unwrap(),
+        );
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+        let adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook::default();
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+
+        let epoch = DeliveryEpoch::for_test("atomic-admission-old");
+        let replacement = DeliveryEpoch::for_test("atomic-admission-replacement");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (online_tx, online) = watch::channel(true);
+        let (epochs_tx, epochs) = watch::channel(Some(epoch));
+        let events = EventSender {
+            tx: event_tx,
+            online: online.clone(),
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = adapter
+            .install_delivery_epoch(epoch, 1, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("T17 adapter installs a forwarder runtime");
+        let (_command_tx, commands) = mpsc::channel(1);
+        let gateway = session::SessionGateway::from(SupervisorHandle {
+            commands,
+            events,
+            epochs,
+            online,
+            session_events: adapter.session_event_sink(),
+            lifecycle: SupervisorLifecycle {
+                cancel: pump_cancel.clone(),
+                task: None,
+            },
+        });
+        let (_reader, mut writer) = gateway.split();
+        let conversation_id = store.scope().conversation_id.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(1),
+                        conversation_id,
+                        event: serde_json::json!({"type": "agent_start"}),
+                    },
+                })
+                .await?;
+            writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: 1,
+                        command_id: COMMAND_ID.to_owned(),
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("durable callback must reserve the old epoch");
+        let invalidating_adapter = adapter.clone();
+        let invalidation =
+            tokio::spawn(
+                async move { invalidating_adapter.invalidate_delivery_epoch(epoch).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "invalidation must not pass between epoch reservation and fence registration"
+        );
+
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("durable fence must register before the pump slot is released");
+        tokio::time::timeout(Duration::from_secs(1), invalidation)
+            .await
+            .expect("invalidation must finish once the atomic admission section exits")
+            .expect("invalidation task")
+            .expect("old epoch invalidates");
+        assert_eq!(
+            adapter.durable_fence_count(),
+            0,
+            "invalidation must resolve and remove the registered fence"
+        );
+
+        online_tx.send_replace(false);
+        epochs_tx.send_replace(None);
+        hook.allow_delivery.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "EpochLost must become Deferred and fence the later ACK"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the invalidated pump must not emit the stale durable row or ACK"
+        );
+
+        epochs_tx.send_replace(Some(replacement));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err(),
+            "replacement catch-up must complete before the ACK progresses"
+        );
+        online_tx.send_replace(true);
+        let (ack_epoch, _, frame) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("replacement Online releases the ACK")
+            .expect("stable supervisor event lane remains open");
+        assert_eq!(ack_epoch, replacement);
+        assert!(matches!(frame, OutboundFrame::CommandAck { .. }));
+        tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("Session writer must not wedge on an orphaned fence")
+            .expect("Session writer task")
+            .expect("durable callback and ACK complete");
+
+        adapter.set_durable_admission_hook(None);
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("invalidated forwarder must terminate")
+            .expect("forwarder task joins");
+    }
+
+    #[tokio::test]
+    async fn store_projection_corruption_is_typed_fatal_without_reconnect() {
         let store = Arc::new(
             Store::session_test_store("t17-t24-forwarder-failure")
                 .await
@@ -7473,21 +8245,84 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        adapter.on_durable_committed(1).await.unwrap();
+        let error = adapter
+            .on_durable_committed(1)
+            .await
+            .expect_err("invalid durable projection must fail synchronously");
+        assert!(
+            error
+                .downcast_ref::<seams::DeliveryProjectionError>()
+                .is_some(),
+            "projection corruption must preserve its typed permanent boundary: {error:#}"
+        );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while sent_hellos.lock().unwrap().len() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("forwarder projection failure must force a fresh authenticated epoch");
-        handle.abort();
-        handle.join().await.unwrap();
+        let supervisor_error = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("permanent delivery failure must terminate promptly")
+            .expect_err("projection corruption must be fatal");
+        assert!(
+            format!("{supervisor_error:#}").contains("failed permanently"),
+            "unexpected supervisor error: {supervisor_error:#}"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "permanent projection corruption must not reconnect against the same row"
+        );
         assert_eq!(
             adapter.active_delivery_epoch().await,
             None,
             "failed epoch must be invalidated idempotently after pump/forwarder teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_redaction_backlog_is_fatal_before_online_without_reconnect() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-corrupt-redaction-backlog")
+                .await
+                .unwrap(),
+        );
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_events SET envelope = 'not-json' WHERE seq = 1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let adapter = seams::T17StoreAdapter::new(store);
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let responses = (0..5)
+            .map(|_| Ok(MockGateway::new(VecDeque::new())))
+            .collect();
+        let mut config = make_config();
+        config.initial_backoff = Duration::ZERO;
+        config.max_backoff = Duration::ZERO;
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(sent_hellos.clone(), responses),
+            CountingCredentialProvider::new("token")
+                .with_delivery_authorization(DeliveryAuthorization::RedactionOnly),
+            adapter,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "corrupt-backlog-ready".to_owned(),
+            }),
+            config,
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("permanent backlog projection failure must terminate promptly")
+            .expect_err("corrupt retained projection cannot be repaired by reconnect");
+        assert!(
+            format!("{error:#}").contains("redaction-only projection"),
+            "typed projection failure must remain visible: {error:#}"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "the same corrupt retained row must not be retried on a new connection"
         );
     }
 
@@ -7597,6 +8432,528 @@ mod tests {
             !event_seqs.contains(&99),
             "stale DeliveryEpoch frame 99 must be dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn disconnected_terminal_ack_is_recovered_by_command_replay() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+        let store = Store::session_test_store("terminal-ack-gap-replay")
+            .await
+            .unwrap();
+        let pool = store.pool().clone();
+        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let first_sent = Arc::new(Mutex::new(Vec::new()));
+        let second_sent = Arc::new(Mutex::new(Vec::new()));
+
+        let mut gateway1 = MockGateway::new(VecDeque::from([Ok(valid_command(1, COMMAND_ID))]));
+        gateway1.writer.sent = first_sent.clone();
+        gateway1.writer.fail_after_record = Some(2);
+
+        // Production API semantics use its durable ACK log. The first epoch's
+        // terminal frame reached the wire but failed before ApplyAck, so the
+        // API returns seq 1 despite the agent's second hello reporting local
+        // applied=1.
+        let mut gateway2 = MockGateway::new(VecDeque::from([Ok(valid_command(1, COMMAND_ID))]))
+            .with_next_command_seq(1);
+        gateway2.writer.sent = second_sent.clone();
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([Ok(gateway1), Ok(gateway2)]),
+        );
+        let config = make_config();
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "ack-replay".to_owned(),
+            }),
+            config,
+        );
+        let handle = supervisor.start();
+        let worker_starts = Arc::new(AtomicU64::new(0));
+        let worker: Arc<dyn RunWorker> = Arc::new({
+            let worker_starts = worker_starts.clone();
+            move |core: RunCore,
+                  _initial: AdmittedCommand,
+                  _controls: mpsc::Receiver<RunControl>,
+                  _events: mpsc::Sender<AgentEvent>| {
+                worker_starts.fetch_add(1, Ordering::SeqCst);
+                async move { RunCompletion::Completed(core) }
+            }
+        });
+        let session = Session::start(
+            store,
+            session::SessionGateway::from(handle),
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            ProcessGeneration::from_wire(7).unwrap(),
+        )
+        .await
+        .unwrap();
+        let session_task = tokio::spawn(session.run());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if second_sent.lock().unwrap().iter().any(|frame| {
+                    matches!(
+                        frame,
+                        OutboundFrame::CommandAck { ack }
+                            if ack.seq == 1 && ack.status == CommandAckStatus::Applied
+                    )
+                }) {
+                    break;
+                }
+                assert!(
+                    !session_task.is_finished(),
+                    "the continuing Session must survive ACK-gap recovery"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stored terminal ACK must be resent on duplicate replay");
+
+        {
+            let hellos = sent_hellos.lock().unwrap();
+            assert!(hellos.len() >= 2);
+            assert_eq!(
+                hellos[1].last_applied_command_seq, 1,
+                "the API replay decision must override, not falsify, the local applied cursor"
+            );
+        }
+        assert!(matches!(
+            first_sent.lock().unwrap().as_slice(),
+            [
+                OutboundFrame::CommandAck { ack: received },
+                OutboundFrame::CommandAck { ack: applied },
+            ] if received.status == CommandAckStatus::Received
+                && applied.status == CommandAckStatus::Applied
+        ));
+        assert_eq!(
+            worker_starts.load(Ordering::SeqCst),
+            0,
+            "duplicate recovery must not start provider or tool work"
+        );
+        let command_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_commands")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            command_rows, 1,
+            "duplicate replay must not duplicate durable work"
+        );
+
+        session_task.abort();
+        assert!(session_task.await.unwrap_err().is_cancelled());
+        wait_for_t17_idle(&adapter).await;
+    }
+
+    #[tokio::test]
+    async fn active_session_run_survives_supervisor_reconnect() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+        let store = Store::session_test_store("active-session-reconnect")
+            .await
+            .unwrap();
+        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let first_sent = Arc::new(Mutex::new(Vec::new()));
+        let second_sent = Arc::new(Mutex::new(Vec::new()));
+
+        let user_command = InboundCommand::Valid(CommandEnvelope {
+            seq: 1,
+            command_id: CommandId::parse(COMMAND_ID).unwrap(),
+            command: Command::UserMessage {
+                text: "continue through reconnect".to_owned(),
+                attachments: Vec::new(),
+            },
+        });
+        let mut gateway1 = MockGateway::new(VecDeque::from([Ok(user_command)]));
+        gateway1.writer.sent = first_sent.clone();
+        gateway1.writer.fail_after = Some(1);
+
+        let mut gateway2 = MockGateway::new(VecDeque::new());
+        gateway2.writer.sent = second_sent.clone();
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([Ok(gateway1), Ok(gateway2)]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "active-run-reconnect".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        let mut epochs = handle.epochs.clone();
+        let gateway = session::SessionGateway::from(handle);
+
+        let starts = Arc::new(AtomicU64::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let worker: Arc<dyn RunWorker> = Arc::new({
+            let starts = starts.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move |core: RunCore,
+                  initial: AdmittedCommand,
+                  controls: mpsc::Receiver<RunControl>,
+                  events: mpsc::Sender<AgentEvent>| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                let release = release.clone();
+                async move {
+                    release.notified().await;
+                    let Command::UserMessage { text, .. } = &initial.envelope().command else {
+                        panic!("active reconnect fixture requires a user message");
+                    };
+                    let user = PublicMessage::User(UserMessage {
+                        content: vec![UserContent::Text { text: text.clone() }],
+                        timestamp: initial.received_at(),
+                    });
+                    let message_id = user_message_id(&initial.envelope().command_id);
+                    for event in [
+                        AgentEvent::AgentStart,
+                        AgentEvent::TurnStart,
+                        AgentEvent::MessageStart {
+                            message_id: message_id.clone(),
+                            message: Box::new(user.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id,
+                            message: Box::new(user),
+                        },
+                    ] {
+                        events
+                            .send(event)
+                            .await
+                            .expect("continuing Session event lane");
+                    }
+                    let _ownership = (core, controls);
+                    std::future::pending::<RunCompletion>().await
+                }
+            }
+        });
+        let session = Session::start(
+            store,
+            gateway,
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            ProcessGeneration::from_wire(7).unwrap(),
+        )
+        .await
+        .unwrap();
+        let session_task = tokio::spawn(session.run());
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("Session must start the run on the first epoch");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first epoch must be Online before the active run triggers failure");
+        let first_epoch = (*epochs.borrow()).expect("first delivery epoch installed");
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sent_hellos.lock().unwrap().len() >= 2
+                    && epochs.borrow().is_some_and(|epoch| epoch != first_epoch)
+                    && *online.borrow()
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = epochs.changed() => {},
+                    _ = online.changed() => {},
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
+        })
+        .await
+        .expect("the active run's first durable event must replace the failed T24 epoch");
+        assert!(
+            !session_task.is_finished(),
+            "the stable Session channels must keep the active worker alive across reconnect"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a reconnect must not restart the active worker"
+        );
+        assert!(
+            matches!(
+                first_sent.lock().unwrap().as_slice(),
+                [OutboundFrame::CommandAck { ack }]
+                    if ack.status == CommandAckStatus::Received
+            ),
+            "the first writer must send Received ACK, then fail on the active run's event"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if second_sent.lock().unwrap().iter().any(|frame| {
+                    matches!(
+                        frame,
+                        OutboundFrame::Event { envelope }
+                            if envelope.event.get("type").and_then(serde_json::Value::as_str)
+                                == Some("agent_start")
+                    )
+                }) {
+                    break;
+                }
+                assert!(
+                    !session_task.is_finished(),
+                    "the continuing run must not fail while committing through T17"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement epoch must replay the active worker's committed startup");
+
+        session_task.abort();
+        let error = session_task
+            .await
+            .expect_err("test cleanup aborts the otherwise idle Session");
+        assert!(error.is_cancelled());
+        wait_for_t17_idle(&adapter).await;
+    }
+
+    #[tokio::test]
+    async fn active_session_survives_over_64_commits_with_blocked_installed_pump() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+        const TOOL_COUNT: usize = 40;
+
+        let store = Store::session_test_store("active-session-blocked-pump")
+            .await
+            .unwrap();
+        let pool = store.pool().clone();
+        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let writer_blocked = Arc::new(Notify::new());
+        let writer_release = Arc::new(Notify::new());
+        let command = InboundCommand::Valid(CommandEnvelope {
+            seq: 1,
+            command_id: CommandId::parse(COMMAND_ID).unwrap(),
+            command: Command::UserMessage {
+                text: "keep the run alive under bounded delivery backpressure".to_owned(),
+                attachments: Vec::new(),
+            },
+        });
+        let mut gateway = MockGateway::new(VecDeque::from([Ok(command)]));
+        gateway.writer.sent = sent.clone();
+        gateway.writer = gateway.writer.with_block_after(2, writer_blocked.clone());
+        gateway.writer.release = Some(writer_release.clone());
+
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let mut config = make_config();
+        config.send_timeout = Duration::from_secs(60);
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "blocked-pump-ready".to_owned(),
+            }),
+            config,
+        );
+        let handle = supervisor.start();
+        let worker_started = Arc::new(Notify::new());
+        let worker: Arc<dyn RunWorker> = Arc::new({
+            let worker_started = worker_started.clone();
+            move |_core: RunCore,
+                  initial: AdmittedCommand,
+                  _controls: mpsc::Receiver<RunControl>,
+                  events: mpsc::Sender<AgentEvent>| {
+                worker_started.notify_one();
+                async move {
+                    let Command::UserMessage { text, .. } = &initial.envelope().command else {
+                        panic!("fixture requires user message");
+                    };
+                    let user = PublicMessage::User(UserMessage {
+                        content: vec![UserContent::Text { text: text.clone() }],
+                        timestamp: initial.received_at(),
+                    });
+                    let message_id = user_message_id(&initial.envelope().command_id);
+                    for event in [
+                        AgentEvent::AgentStart,
+                        AgentEvent::TurnStart,
+                        AgentEvent::MessageStart {
+                            message_id: message_id.clone(),
+                            message: Box::new(user.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id,
+                            message: Box::new(user),
+                        },
+                    ] {
+                        events.send(event).await.expect("initial durable event");
+                    }
+                    let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+                        content: (0..TOOL_COUNT)
+                            .map(|index| PublicAssistantContent::ToolCall {
+                                tool_call: ToolCall {
+                                    id: format!("blocked-pump-tool-{index}"),
+                                    name: "blocked-pump-tool".to_owned(),
+                                    arguments: serde_json::from_value::<ValidatedToolArguments>(
+                                        serde_json::json!({"index": index}),
+                                    )
+                                    .expect("object-shaped tool arguments"),
+                                },
+                                wire_item_index: u32::try_from(index).unwrap(),
+                            })
+                            .collect(),
+                        model: "blocked-pump-model".to_owned(),
+                        provider: "blocked-pump-provider".to_owned(),
+                        origin: ProviderOrigin {
+                            provider_instance_id: "blocked-pump-instance".to_owned(),
+                            protocol: ApiProtocol::OpenAiResponses,
+                            model: "blocked-pump-model".to_owned(),
+                        },
+                        usage: Usage::default(),
+                        stop_reason: StopReason::ToolUse,
+                        error_message: None,
+                        provider_code: None,
+                        interrupted: false,
+                        timestamp: chrono::Utc::now(),
+                    });
+                    for event in [
+                        AgentEvent::MessageStart {
+                            message_id: "blocked-pump-assistant".to_owned(),
+                            message: Box::new(assistant.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id: "blocked-pump-assistant".to_owned(),
+                            message: Box::new(assistant),
+                        },
+                    ] {
+                        events
+                            .send(event)
+                            .await
+                            .expect("assistant tool prerequisite");
+                    }
+                    for index in 0..TOOL_COUNT {
+                        let tool_call_id = format!("blocked-pump-tool-{index}");
+                        let result = ToolResultMessage {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: "blocked-pump-tool".to_owned(),
+                            content: vec![UserContent::Text {
+                                text: format!("tool result {index}"),
+                            }],
+                            details: serde_json::json!({"index": index, "ok": true}),
+                            is_error: false,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        for event in [
+                            AgentEvent::ToolExecutionStart {
+                                tool_call_id: tool_call_id.clone(),
+                                tool_name: "blocked-pump-tool".to_owned(),
+                                args: serde_json::json!({"index": index}),
+                            },
+                            AgentEvent::ToolExecutionEnd {
+                                tool_call_id: tool_call_id.clone(),
+                                result: serde_json::to_value(&result).unwrap(),
+                                is_error: false,
+                            },
+                            AgentEvent::MessageStart {
+                                message_id: format!("blocked-pump-result-{index}"),
+                                message: Box::new(PublicMessage::ToolResult(result.clone())),
+                            },
+                            AgentEvent::MessageEnd {
+                                message_id: format!("blocked-pump-result-{index}"),
+                                message: Box::new(PublicMessage::ToolResult(result)),
+                            },
+                        ] {
+                            events.send(event).await.expect("bounded worker event lane");
+                        }
+                    }
+                    std::future::pending::<RunCompletion>().await
+                }
+            }
+        });
+        let session = Session::start(
+            store,
+            session::SessionGateway::from(handle),
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            ProcessGeneration::from_wire(7).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut session_task = tokio::spawn(session.run());
+
+        tokio::time::timeout(Duration::from_secs(10), worker_started.notified())
+            .await
+            .expect("worker must start");
+        let blocked =
+            tokio::time::timeout(Duration::from_secs(10), writer_blocked.notified()).await;
+        if session_task.is_finished() {
+            let result = (&mut session_task).await.expect("session join");
+            panic!("Session failed before blocked delivery: {result:?}");
+        }
+        assert!(
+            blocked.is_ok(),
+            "installed pump must reach the blocked transport; frames={:?}, session_finished={}",
+            *sent.lock().unwrap(),
+            session_task.is_finished()
+        );
+        assert!(
+            adapter.active_delivery_epoch().await.is_some(),
+            "the test must exercise an installed T17 DeliveryPump"
+        );
+
+        let expected = i64::try_from(6 + (4 * TOOL_COUNT)).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let committed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if committed >= expected {
+                    break;
+                }
+                if session_task.is_finished() {
+                    let result = (&mut session_task).await.expect("session join");
+                    panic!("bounded downstream pressure terminated the active Session: {result:?}");
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("more than 64 durable commits must remain live under blocked delivery");
+        assert!(
+            !session_task.is_finished(),
+            "the one active run must survive while delivery remains backpressured"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "the blocked transport must not be bypassed by Session"
+        );
+
+        writer_release.notify_one();
+        session_task.abort();
+        assert!(session_task.await.unwrap_err().is_cancelled());
+        wait_for_t17_idle(&adapter).await;
     }
 
     #[derive(Clone)]

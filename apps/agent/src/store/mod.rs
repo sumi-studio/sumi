@@ -58,8 +58,8 @@ use self::crypto::{
 #[cfg(test)]
 pub(crate) use self::delivery::insert_test_durable_event;
 pub(crate) use self::delivery::{
-    DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, current_event_head_seq,
-    raw_events_after,
+    DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
+    DurableDeliveryOutcome, current_event_head_seq, raw_events_after,
 };
 #[cfg(test)]
 pub(crate) use self::event_writer::seed_provider_context_owner_event_evidence;
