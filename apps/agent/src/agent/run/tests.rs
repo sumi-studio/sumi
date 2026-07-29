@@ -1360,6 +1360,10 @@ async fn hard_steer_provider_context_reaches_the_next_live_provider_attempt() {
         .next()
         .expect("provider context fragment");
     let expected = ProviderContextItem {
+        retention_owner: ProviderContextAnchor {
+            message_id: "assistant-0".to_owned(),
+            message_seq: hard_steer_seq,
+        },
         origin_message: Some(ProviderContextAnchor {
             message_id: "assistant-0".to_owned(),
             message_seq: hard_steer_seq,
@@ -1497,6 +1501,10 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
     assert_eq!(
         core.provider_context,
         vec![ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant-0".to_owned(),
+                message_seq: hard_steer_seq,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant-0".to_owned(),
                 message_seq: hard_steer_seq,
@@ -1511,15 +1519,36 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
 }
 
 #[tokio::test]
-async fn error_terminal_with_context_fails_closed_without_context_on_barrier() {
-    let message = assistant(StopReason::Error, Vec::new(), Some("provider error"), None);
+async fn authoritative_error_terminal_preserves_metadata_context_and_retry_classification() {
+    let message = assistant_with_usage(
+        StopReason::Error,
+        vec![AssistantContent::Text {
+            text: "verified partial".to_owned(),
+            wire_item_index: 0,
+        }],
+        Some("provider display error"),
+        Some("network_error"),
+        17,
+        3,
+    );
+    let expected_public = public_message(&message);
+    let provider_context = cancellation_provider_context();
     let driver = Arc::new(FixtureDriver::new(vec![Script::Events(vec![
         ProviderEvent::Start,
+        ProviderEvent::TextStart { content_index: 0 },
+        ProviderEvent::TextDelta {
+            content_index: 0,
+            delta: "verified partial".to_owned(),
+        },
+        ProviderEvent::TextEnd {
+            content_index: 0,
+            content: "verified partial".to_owned(),
+        },
         ProviderEvent::Error {
             reason: StopReason::Error,
             output: ProviderOutput {
                 message,
-                provider_context: cancellation_provider_context(),
+                provider_context: provider_context.clone(),
             },
         },
     ])]));
@@ -1532,13 +1561,22 @@ async fn error_terminal_with_context_fails_closed_without_context_on_barrier() {
         let mut output = events_rx.recv().await.expect("provider output");
         if let Some(barrier) = output.message_commit_barrier.take() {
             assert_eq!(
-                barrier.provider_context_for_test().len(),
-                0,
-                "genuine error terminals must not retain provider context"
+                barrier.provider_context_for_test(),
+                provider_context,
+                "the durable MessageEnd must retain the verified provider context"
             );
-            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+            let AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } = &output.event
+            else {
                 panic!("receipt barrier without MessageEnd");
             };
+            assert_eq!(
+                message.as_ref(),
+                &expected_public,
+                "Agent must commit the provider's authoritative code, display error, usage, and partial content"
+            );
             barrier.resolve(MessageCommitReceipt {
                 message_id: message_id.clone(),
                 message_seq,
@@ -1547,9 +1585,64 @@ async fn error_terminal_with_context_fails_closed_without_context_on_barrier() {
             break task.await.expect("provider attempt task");
         }
     };
+    let AttemptOutcome::Retry { message, .. } = outcome.expect("provider attempt outcome") else {
+        panic!("provider machine code must retain its retry classification");
+    };
+    assert_eq!(message, expected_public);
+}
+
+#[tokio::test]
+async fn authoritative_error_context_survives_overflow_classification() {
+    let message = assistant(
+        StopReason::Error,
+        Vec::new(),
+        Some("maximum context length exceeded"),
+        Some("context_length_exceeded"),
+    );
+    let provider_context = cancellation_provider_context();
+    let driver = Arc::new(
+        FixtureDriver::new(vec![Script::Events(vec![
+            ProviderEvent::Start,
+            ProviderEvent::Error {
+                reason: StopReason::Error,
+                output: ProviderOutput {
+                    message,
+                    provider_context: provider_context.clone(),
+                },
+            },
+        ])])
+        .with_context_window(100),
+    );
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+
+    let outcome = loop {
+        let mut output = events_rx.recv().await.expect("provider output");
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            assert_eq!(
+                barrier.provider_context_for_test(),
+                provider_context,
+                "overflow recovery must not erase an authoritative Error terminal's context"
+            );
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq: 1,
+                new_turn_id: None,
+            });
+            break task.await.expect("provider attempt task");
+        }
+    };
     assert!(matches!(
         outcome.expect("provider attempt outcome"),
-        AttemptOutcome::ClosedError { .. }
+        AttemptOutcome::ImmediateOverflow {
+            source: OverflowSource::ProviderCode,
+            ..
+        }
     ));
 }
 

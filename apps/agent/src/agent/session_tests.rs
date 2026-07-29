@@ -2432,6 +2432,7 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
             command_id: binding.command_id,
             run_id: binding.run_id,
             turn_id: binding.turn_id,
+            pending_error_context: None,
         }]
     );
 

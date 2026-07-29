@@ -776,22 +776,6 @@ impl Runner {
                         }
                         ProjectedProviderEvent::Terminal(terminal) => {
                             let provider_context = terminal.provider_context().to_vec();
-                            if terminal.kind() == ProviderTerminalKind::Error
-                                && terminal_message
-                                    .as_ref()
-                                    .is_some_and(|message| message.stop_reason == StopReason::Error)
-                                && !provider_context.is_empty()
-                            {
-                                rejected_results.clear();
-                                return self
-                                    .close_broken_attempt(
-                                        &attempt.message_id,
-                                        message_started,
-                                        "error provider terminal cannot retain opaque provider context"
-                                            .to_owned(),
-                                    )
-                                    .await;
-                            }
                             let kind = terminal.kind();
                             let internal =
                                 terminal_message.expect("terminal projection has provider output");
@@ -879,20 +863,27 @@ impl Runner {
                                 }
                                 _ => unreachable!("provider terminal is always MessageEnd"),
                             };
-                            let durable_provider_context = if matches!(
-                                overflow,
-                                Some(OverflowClassification::ImmediateRecovery(_))
-                            ) || length_guarded
+                            let durable_provider_context = if kind != ProviderTerminalKind::Error
+                                && (matches!(
+                                    overflow,
+                                    Some(OverflowClassification::ImmediateRecovery(_))
+                                ) || length_guarded)
                             {
                                 Vec::new()
                             } else {
                                 provider_context
                             };
-                            self.stage_provider_context(
-                                &terminal_message_id,
-                                &terminal_message,
-                                &durable_provider_context,
-                            )?;
+                            // Error assistants and their provider context remain
+                            // outside live L0/replay, but the authoritative
+                            // terminal still carries the verified fragments to
+                            // the durable MessageEnd transaction below.
+                            if kind != ProviderTerminalKind::Error {
+                                self.stage_provider_context(
+                                    &terminal_message_id,
+                                    &terminal_message,
+                                    &durable_provider_context,
+                                )?;
+                            }
                             let receipt = self
                                 .emit_provider_message_end(
                                     terminal_message_id,

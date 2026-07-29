@@ -196,6 +196,7 @@ fn build_replay_probe_request_with_usage(
     };
     let origin = spec.origin();
     let mut provider_context = vec![ProviderContextItem {
+        retention_owner: anchor.clone(),
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
@@ -212,6 +213,7 @@ fn build_replay_probe_request_with_usage(
     }];
     if let Some(fragment) = fragment {
         provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
@@ -4333,6 +4335,7 @@ mod tests {
                 message: Message::Assistant(assistant),
             }],
             provider_context: vec![ProviderContextItem {
+                retention_owner: anchor.clone(),
                 origin_message: Some(anchor),
                 wire_item_index: Some(0),
                 ordinal: 0,
@@ -4649,6 +4652,10 @@ mod tests {
         };
         let fingerprint = context_fingerprint(&spec, &context).unwrap();
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -4709,6 +4716,10 @@ mod tests {
         };
         let fingerprint = context_fingerprint(&spec, &context).unwrap();
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-5".into(),
+                message_seq: 5,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -4752,6 +4763,10 @@ mod tests {
             tools: vec![],
         };
         let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -4859,6 +4874,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -4897,6 +4916,10 @@ mod tests {
             tools: vec![],
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -4935,6 +4958,10 @@ mod tests {
         let mut foreign_origin = spec.origin();
         foreign_origin.provider_instance_id.push_str("-foreign");
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -5167,6 +5194,10 @@ mod tests {
             }]),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant".into(),
                 message_seq: 1,
@@ -5185,6 +5216,10 @@ mod tests {
             },
         });
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant".into(),
                 message_seq: 1,
@@ -5497,6 +5532,7 @@ mod tests {
                 }),
             }],
             provider_context: vec![ProviderContextItem {
+                retention_owner: anchor.clone(),
                 origin_message: Some(anchor.clone()),
                 wire_item_index: Some(0),
                 ordinal: 0,
@@ -5546,6 +5582,10 @@ mod tests {
             tools: vec![],
         };
         let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,

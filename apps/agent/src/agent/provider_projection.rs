@@ -77,11 +77,10 @@ impl ProviderTerminal {
 
     /// Builds the T12-representable half of terminal durability. Opaque
     /// provider context is forwarded to the MessageEnd projection for T17
-    /// encryption and persistence, so it is never silently dropped for a
-    /// message that is admitted to L0. Error-terminal messages are excluded
-    /// from L0; their provider context cannot be anchored to a message that
-    /// will not be replayed, so `append_to_l0=false` with non-empty context
-    /// is rejected at this boundary before it reaches EventWriter.
+    /// encryption and persistence, so it is never silently dropped. Error
+    /// terminals remain durable even though they are excluded from L0; the
+    /// provider send-view later omits their anchored context when transform
+    /// removes the Error assistant.
     #[allow(dead_code, reason = "consumed by the later T15 Session run loop")]
     pub(crate) fn into_t12_write(
         self,
@@ -93,12 +92,6 @@ impl ProviderTerminal {
             AgentEvent::MessageEnd { message_id, .. } => message_id.clone(),
             _ => unreachable!("ProviderTerminal always contains MessageEnd"),
         };
-        if !append_to_l0 && !self.provider_context.is_empty() {
-            bail!(
-                "provider context cannot accompany an L0-excluded MessageEnd; \
-                 the caller must decide drop-vs-persist before T12"
-            );
-        }
         let run_id = run_id.into();
         let turn_id = turn_id.into();
 
@@ -720,16 +713,23 @@ mod tests {
     }
 
     #[test]
-    fn t12_write_rejects_error_terminal_with_provider_context() {
+    fn t12_write_carries_error_terminal_provider_context_without_l0_membership() {
         let mut projector = started();
         let mut terminal_output = output(StopReason::Error);
+        terminal_output.message.origin.protocol = ApiProtocol::OpenAiResponses;
+        terminal_output.message.origin.model = "openai-responses".to_owned();
         terminal_output
             .provider_context
             .push(ProviderContextFragment {
                 wire_item_index: Some(0),
                 payload: ProviderContextPayload::EncryptedReasoning {
-                    protocol: ApiProtocol::OpenAiChatCompletions,
-                    item: json!({"text": "opaque reasoning"}),
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-error",
+                        "encrypted_content": "opaque",
+                        "summary": [],
+                    }),
                 },
             });
         let ProjectedProviderEvent::Terminal(terminal) = projector
@@ -741,14 +741,21 @@ mod tests {
         else {
             panic!("expected terminal");
         };
-        match terminal.into_t12_write("run-1", "turn-1", false) {
-            Err(error) => {
-                assert!(
-                    error.to_string().contains("L0-excluded MessageEnd"),
-                    "unexpected error: {error}"
-                );
+        let write = terminal
+            .into_t12_write("run-1", "turn-1", false)
+            .expect("durable Error terminal context");
+        match write.projections.as_slice() {
+            [
+                Projection::MessageEnd {
+                    append_to_l0,
+                    provider_context,
+                    ..
+                },
+            ] => {
+                assert!(!append_to_l0);
+                assert_eq!(provider_context.len(), 1);
             }
-            Ok(_) => panic!("error terminal with provider context must be rejected"),
+            _ => panic!("expected one MessageEnd projection"),
         }
     }
 

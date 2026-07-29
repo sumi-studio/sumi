@@ -278,6 +278,9 @@ pub struct MemoryBlock {
 /// reasoning は必ず origin_message を持ち、native compaction は coverage を持つ。
 #[derive(Clone, Debug)]
 pub struct ProviderContextItem {
+    /// 暗号化された retention/recovery owner。native も正確な MessageEnd を持つ。
+    pub retention_owner: ProviderContextAnchor,
+    /// provider 意味論上の origin。native compaction は None のまま。
     pub origin_message: Option<ProviderContextAnchor>,
     /// reasoning は公開 Text/ToolCall と共通の flatten 済み wire 順を持つ。
     /// native prefix replacement は None。

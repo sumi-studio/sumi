@@ -39,7 +39,7 @@ use crate::memory::estimate::{
 use crate::provider::model::ModelSpec;
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
-    PublicMessage, validate_native_suffix_for_hydration,
+    PublicMessage, StopReason, validate_native_suffix_for_hydration,
 };
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
@@ -61,7 +61,9 @@ pub(crate) use self::physical_recovery::{
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
 #[cfg(test)]
-pub(crate) use self::provider_context::EncryptedProviderContextRecord;
+pub(crate) use self::provider_context::{
+    EncryptedProviderContextRecord, provider_context_record_id,
+};
 pub(crate) use self::provider_context::{ProviderContextKind, provider_context_idempotency_key};
 #[cfg(test)]
 pub(crate) use self::provider_context::{
@@ -80,11 +82,11 @@ pub(crate) use crypto::{
     reason = "T12 freezes projection types consumed by T15 without duplicating EventWriter"
 )]
 pub(crate) use event_writer::{
-    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch, EventWrite,
-    EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
-    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
-    MemoryTransition, Projection, RecoveryRequired, RunPhase, ToolExecutionMutation,
-    USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, ErrorContextDisposition,
+    EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -100,7 +102,8 @@ pub(crate) use memory_state::{
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
 pub(crate) use recovery::{
-    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, RecoveryStep, SuffixRecovery,
+    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, PendingErrorContextRecovery,
+    RecoveryStep, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -118,6 +121,51 @@ pub(crate) use transcript::TranscriptRecord;
 /// processed and dropped before the next page is requested, so decrypted
 /// plaintext and `SqliteRow` buffers are not retained for the whole history.
 const HYDRATION_PAGE_SIZE: i64 = 64;
+
+fn pending_error_context_recovery(
+    messages: &[ContextMessage],
+    provider_context: &[ProviderContextItem],
+) -> Result<Option<PendingErrorContextRecovery>> {
+    let error_messages: BTreeMap<(&str, u64), bool> = messages
+        .iter()
+        .filter_map(|message| match message {
+            ContextMessage::Persisted { id, seq, message } => Some((
+                (id.as_str(), *seq),
+                matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Error
+                ),
+            )),
+            ContextMessage::Synthetic { .. } => None,
+        })
+        .collect();
+    let mut pending = BTreeMap::<(String, u64), usize>::new();
+    for item in provider_context {
+        let anchor = &item.retention_owner;
+        if error_messages
+            .get(&(anchor.message_id.as_str(), anchor.message_seq))
+            .copied()
+            == Some(true)
+        {
+            *pending
+                .entry((anchor.message_id.clone(), anchor.message_seq))
+                .or_default() += 1;
+        }
+    }
+    if pending.len() > 1 {
+        bail!("cold hydration found multiple undisposed Error provider-context retention units");
+    }
+    let Some(((message_id, message_seq), item_count)) = pending.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(PendingErrorContextRecovery {
+        message_id,
+        message_seq,
+        item_count: u32::try_from(item_count)
+            .context("Error provider-context item count exceeds u32")?,
+    }))
+}
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -174,6 +222,13 @@ pub(crate) struct Store {
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
+}
+
+struct AuthenticatedProviderContextRow {
+    id: String,
+    item: ProviderContextItem,
+    key_ref: String,
+    eviction_tokens: u64,
 }
 
 impl Store {
@@ -351,6 +406,7 @@ impl Store {
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
             .await?;
+        let pending_error_context = pending_error_context_recovery(&messages, &provider_context)?;
         let (memory_batches, memory_batch_messages, memory_jobs, memory_apply_cursors) =
             self.hydrate_memory_state(&mut transaction).await?;
 
@@ -362,7 +418,28 @@ impl Store {
             .commit()
             .await
             .context("failed to commit hydration snapshot transaction")?;
-        let recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+        let mut recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+        if let Some(pending_error_context) = pending_error_context {
+            let mut matching_steps = recovery_steps.iter_mut().filter(|step| {
+                matches!(step, RecoveryStep::ResumeAssistantFromDurableEvents { .. })
+            });
+            let step = matching_steps.next().ok_or_else(|| {
+                anyhow!("undisposed Error provider context has no assistant logical-recovery owner")
+            })?;
+            if matching_steps.next().is_some() {
+                bail!(
+                    "undisposed Error provider context has multiple assistant logical-recovery owners"
+                );
+            }
+            let RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: slot,
+                ..
+            } = step
+            else {
+                unreachable!("matching recovery step variant was checked")
+            };
+            *slot = Some(pending_error_context);
+        }
 
         let receipt = HydrationReceiptIdentity {
             lease_id: lease.lease_id().to_owned(),
@@ -557,6 +634,19 @@ impl Store {
         messages: &[ContextMessage],
         transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<Vec<ProviderContextItem>> {
+        Ok(self
+            .hydrate_authenticated_provider_context(messages, transaction)
+            .await?
+            .into_iter()
+            .map(|row| row.item)
+            .collect())
+    }
+
+    async fn hydrate_authenticated_provider_context(
+        &self,
+        messages: &[ContextMessage],
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<Vec<AuthenticatedProviderContextRow>> {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let mut provider_context = Vec::new();
@@ -576,7 +666,7 @@ impl Store {
                 "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
                     idempotency_key, kind, coverage_through_seq, context_fingerprint,
                     provider_instance_id, protocol, model, key_ref, ciphertext,
-                    eviction_tokens, eviction_estimator_version
+                    eviction_tokens, eviction_estimator_version, created_at
              FROM provider_context
              ORDER BY COALESCE(message_seq, coverage_through_seq),
                       wire_item_index,
@@ -610,6 +700,11 @@ impl Store {
                 let stored_eviction_tokens: i64 = row.try_get("eviction_tokens")?;
                 let stored_eviction_estimator_version: i64 =
                     row.try_get("eviction_estimator_version")?;
+                let stored_created_at: String = row.try_get("created_at")?;
+                self::provider_context::validate_canonical_created_at(&stored_created_at)
+                    .with_context(|| {
+                        format!("provider-context record {id} has invalid created_at metadata")
+                    })?;
 
                 let key = self
                     .load_hydration_key(
@@ -631,6 +726,59 @@ impl Store {
                     serde_json::from_slice(&plaintext).with_context(|| {
                         format!("provider-context record {id} is not a valid ProviderContextItem")
                     })?;
+                if item.retention_owner.message_id.is_empty() {
+                    bail!("provider-context record {id} has an empty retention owner");
+                }
+                let expected_record_id = self::provider_context::provider_context_record_id(&item);
+                if id != expected_record_id {
+                    bail!(
+                        "provider-context record {id} row id does not match authenticated retention owner"
+                    );
+                }
+                let expected_key_ref = self::provider_context::provider_context_owner_key_ref(
+                    &self.scope,
+                    &item.retention_owner,
+                );
+                if key_ref != expected_key_ref {
+                    bail!(
+                        "provider-context record {id} key_ref does not match authenticated retention owner"
+                    );
+                }
+                let owner_message = seq_to_message
+                    .get(&item.retention_owner.message_seq)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} retention owner {}:{} does not resolve to a persisted message",
+                            item.retention_owner.message_id,
+                            item.retention_owner.message_seq
+                        )
+                    })?;
+                let (owner_id, owner_assistant) = match owner_message {
+                    ContextMessage::Persisted {
+                        id,
+                        message: Message::Assistant(assistant),
+                        ..
+                    } => (id, assistant),
+                    _ => {
+                        bail!(
+                            "provider-context record {id} retention owner {}:{} does not resolve to a persisted assistant MessageEnd",
+                            item.retention_owner.message_id,
+                            item.retention_owner.message_seq
+                        );
+                    }
+                };
+                if owner_id != &item.retention_owner.message_id {
+                    bail!(
+                        "provider-context record {id} retention owner {}:{} resolves to a different message id",
+                        item.retention_owner.message_id,
+                        item.retention_owner.message_seq
+                    );
+                }
+                if owner_assistant.origin != item.provider_origin {
+                    bail!(
+                        "provider-context record {id} provider_origin does not match its retention-owner assistant origin"
+                    );
+                }
 
                 if item.origin_message.as_ref().map(|a| a.message_id.as_str())
                     != stored_message_id.as_deref()
@@ -721,62 +869,14 @@ impl Store {
                         }
                     }
                     ProviderContextPayload::EncryptedReasoning { .. } => {
-                        if item.origin_message.is_none() {
+                        if item.origin_message.as_ref() != Some(&item.retention_owner) {
                             bail!(
-                                "provider-context record {id} encrypted reasoning must have an origin message"
+                                "provider-context record {id} encrypted reasoning origin message must match its retention owner"
                             );
                         }
                         if item.wire_item_index.is_none() {
                             bail!(
                                 "provider-context record {id} encrypted reasoning must have a wire_item_index"
-                            );
-                        }
-                    }
-                }
-
-                match &item.payload {
-                    ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    | ProviderContextPayload::AnthropicCompaction { .. } => {
-                        // Native compaction is unanchored; the authenticated plaintext origin is the
-                        // source of truth for provider identity. Do not infer from prior messages.
-                    }
-                    ProviderContextPayload::EncryptedReasoning { .. } => {
-                        let anchor = item.origin_message.as_ref().ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} encrypted reasoning is missing an anchor"
-                        )
-                    })?;
-                        let anchor_message = seq_to_message.get(&anchor.message_seq).ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} anchor {}:{} does not resolve to a persisted message",
-                            anchor.message_id,
-                            anchor.message_seq
-                        )
-                    })?;
-                        let (anchor_id, assistant) = match anchor_message {
-                            ContextMessage::Persisted {
-                                id,
-                                message: Message::Assistant(assistant),
-                                ..
-                            } => (id, assistant),
-                            _ => {
-                                bail!(
-                                    "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
-                                    anchor.message_id,
-                                    anchor.message_seq
-                                );
-                            }
-                        };
-                        if anchor_id != &anchor.message_id {
-                            bail!(
-                                "provider-context record {id} anchor {}:{} resolves to a different message id",
-                                anchor.message_id,
-                                anchor.message_seq
-                            );
-                        }
-                        if assistant.origin != item.provider_origin {
-                            bail!(
-                                "provider-context record {id} provider_origin does not match the anchored assistant origin"
                             );
                         }
                     }
@@ -807,15 +907,7 @@ impl Store {
                             );
                         }
 
-                        let request_id =
-                            crate::store::provider_context::native_request_id_from_record_id(&id)
-                                .ok_or_else(|| {
-                                anyhow!(
-                                    "provider-context record {id} has a non-canonical native row id"
-                                )
-                            })?;
-                        let expected_idempotency_key =
-                            provider_context_idempotency_key(&request_id, &item);
+                        let expected_idempotency_key = provider_context_idempotency_key(&item);
                         if stored_idempotency_key != expected_idempotency_key {
                             bail!(
                                 "provider-context record {id} idempotency key does not match authenticated native item"
@@ -833,16 +925,8 @@ impl Store {
                                 "provider-context record {id} reasoning payload must not carry coverage metadata"
                             );
                         }
-                        let anchor = item.origin_message.as_ref().ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} encrypted reasoning is missing an anchor"
-                        )
-                    })?;
                         let expected_idempotency_key =
-                            self::provider_context::provider_context_idempotency_key(
-                                &anchor.message_id,
-                                &item,
-                            );
+                            self::provider_context::provider_context_idempotency_key(&item);
                         if stored_idempotency_key != expected_idempotency_key {
                             bail!(
                                 "provider-context record {id} idempotency key does not match decrypted reasoning item"
@@ -891,13 +975,19 @@ impl Store {
                     );
                 }
 
-                provider_context.push(item);
+                provider_context.push(AuthenticatedProviderContextRow {
+                    id,
+                    item,
+                    key_ref: expected_key_ref,
+                    eviction_tokens: expected_eviction.eviction_tokens(),
+                });
             }
             offset += HYDRATION_PAGE_SIZE;
         }
-        crate::provider::types::validate_provider_context_ordinals(&provider_context).map_err(
-            |message| anyhow!("hydrated provider-context ordering is invalid: {message}"),
-        )?;
+        crate::provider::types::validate_provider_context_ordinal_refs(
+            provider_context.iter().map(|row| &row.item),
+        )
+        .map_err(|message| anyhow!("hydrated provider-context ordering is invalid: {message}"))?;
         Ok(provider_context)
     }
 

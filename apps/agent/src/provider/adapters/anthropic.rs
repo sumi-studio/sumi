@@ -187,6 +187,7 @@ fn build_replay_probe_prompt(
         wire_item_index: 0,
     }];
     let mut provider_context = vec![ProviderContextItem {
+        retention_owner: anchor.clone(),
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
@@ -211,6 +212,7 @@ fn build_replay_probe_prompt(
             wire_item_index: 1,
         });
         provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
@@ -2213,6 +2215,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).expect("fingerprint"),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -2298,6 +2304,10 @@ mod tests {
         let spec = spec();
         let mut context = context(vec![persisted(1)]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -2738,6 +2748,7 @@ mod tests {
             },
         ]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
@@ -2820,6 +2831,7 @@ mod tests {
             },
         ]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
@@ -2908,6 +2920,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "old".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3054,6 +3070,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "old".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3169,6 +3189,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         let native = |block| ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3234,6 +3258,10 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3262,6 +3290,10 @@ mod tests {
         let spec = spec();
         let mut durable = context(vec![persisted(1), persisted(2)]);
         durable.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3287,6 +3319,10 @@ mod tests {
 
         let mut gap = context(vec![persisted(3)]);
         gap.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-3".into(),
+                message_seq: 3,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
