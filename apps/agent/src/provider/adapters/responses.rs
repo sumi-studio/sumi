@@ -13,7 +13,7 @@ use crate::provider::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent, UserMessage,
+        Usage, UserContent, UserMessage, VerifiedReplayProvenance,
     },
 };
 
@@ -251,6 +251,7 @@ fn build_replay_probe_request_with_usage(
         ],
         provider_context,
         tools: Vec::new(),
+        replay_provenance: None,
     };
     build_request(&spec, &context, &RequestOptions::default())
 }
@@ -302,14 +303,26 @@ pub(in crate::provider) fn derive_compaction_coverage(
     if !compat.supports_native_compact {
         return Err(ResponsesAdapterError::UnsupportedProtocol);
     }
-    let through_message_seq =
-        crate::provider::types::validate_native_suffix(&context.messages, None)
-            .map_err(ResponsesAdapterError::InvalidContext)?
-            .ok_or_else(|| {
-                ResponsesAdapterError::InvalidContext(
-                    "native compaction requires at least one persisted message".into(),
-                )
-            })?;
+    let through_message_seq = match context
+        .verified_replay_provenance()
+        .map_err(ResponsesAdapterError::InvalidContext)?
+    {
+        Some(VerifiedReplayProvenance::SumiNormalized {
+            canonical_through_seq,
+        }) => canonical_through_seq,
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            native_coverage_through_seq,
+            canonical_suffix_through_seq,
+            ..
+        }) => Some(canonical_suffix_through_seq.unwrap_or(native_coverage_through_seq)),
+        None => crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(ResponsesAdapterError::InvalidContext)?,
+    }
+    .ok_or_else(|| {
+        ResponsesAdapterError::InvalidContext(
+            "native compaction requires authenticated persisted coverage".into(),
+        )
+    })?;
     let context_fingerprint = context_fingerprint(spec, context)?;
     Ok(NativeCompactionCoverage {
         through_message_seq,
@@ -862,6 +875,13 @@ fn convert_input(
     let compat = ensure_responses_spec(spec)?;
     crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
         .map_err(ResponsesAdapterError::InvalidContext)?;
+    let replay_provenance = context
+        .verified_replay_provenance()
+        .map_err(ResponsesAdapterError::InvalidContext)?;
+    if replay_provenance.is_none() {
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(ResponsesAdapterError::InvalidContext)?;
+    }
     let replay_encrypted_reasoning = spec.reasoning && compat.supports_encrypted_reasoning;
     let mut output = Vec::new();
     let has_foreign_native = context.provider_context.iter().any(|item| {
@@ -880,27 +900,41 @@ fn convert_input(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let bound_native_required = native_context_requires_bound_window(context);
     let native_enabled = native_compaction && compat.supports_native_compact && !has_foreign_native;
-    let native = if native_enabled {
-        match prepare_native_window(spec, context, &compacted) {
-            Ok(native) => native,
-            Err(error) if bound_native_required => {
-                return Err(ResponsesAdapterError::InvalidContext(format!(
-                    "cannot discard native context from a normalized exact suffix: {error}"
-                )));
+    let native = match &replay_provenance {
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            provider_origin,
+            native_coverage_through_seq,
+            ..
+        }) => {
+            if !native_enabled {
+                return Err(ResponsesAdapterError::InvalidContext(
+                    "bound native Responses replay cannot be discarded".into(),
+                ));
             }
-            Err(error) => {
-                tracing::warn!(reason = %error, "discarded stale Responses native context");
-                None
-            }
+            Some(
+                prepare_native_window(
+                    spec,
+                    context,
+                    &compacted,
+                    provider_origin,
+                    *native_coverage_through_seq,
+                )
+                .map_err(ResponsesAdapterError::InvalidContext)?
+                .ok_or_else(|| {
+                    ResponsesAdapterError::InvalidContext(
+                        "bound native Responses replay is missing its compacted window".into(),
+                    )
+                })?,
+            )
         }
-    } else if bound_native_required {
-        return Err(ResponsesAdapterError::InvalidContext(
-            "normalized exact suffix requires its bound native Responses context".into(),
-        ));
-    } else {
-        None
+        Some(VerifiedReplayProvenance::SumiNormalized { .. }) => None,
+        None if compacted.is_empty() && !has_foreign_native => None,
+        None => {
+            return Err(ResponsesAdapterError::InvalidContext(
+                "unbound prompt cannot replay or discard native provider context".into(),
+            ));
+        }
     };
     let (coverage_seq, native_items) = native
         .map(|(coverage, items)| (Some(coverage), Some(items)))
@@ -1180,34 +1214,12 @@ fn convert_input(
     Ok(output)
 }
 
-fn native_context_requires_bound_window(context: &PromptContext) -> bool {
-    context
-        .provider_context
-        .iter()
-        .filter_map(|item| match &item.payload {
-            ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
-            | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
-                Some(coverage.through_message_seq)
-            }
-            ProviderContextPayload::EncryptedReasoning { .. } => None,
-        })
-        .any(|coverage| {
-            let persisted = context.messages.iter().filter_map(|message| match message {
-                ContextMessage::Persisted { seq, .. } => Some(*seq),
-                ContextMessage::Synthetic { .. } => None,
-            });
-            let mut found = false;
-            let all_after_coverage = persisted
-                .inspect(|_| found = true)
-                .all(|seq| seq > coverage);
-            !found || all_after_coverage
-        })
-}
-
 fn prepare_native_window(
     spec: &ModelSpec,
     context: &PromptContext,
     compacted: &[(&Vec<Value>, &NativeCompactionCoverage)],
+    bound_origin: &crate::provider::types::ProviderOrigin,
+    bound_coverage: u64,
 ) -> Result<Option<(u64, Vec<Value>)>, String> {
     let Some((items, coverage)) = compacted.first().copied() else {
         return Ok(None);
@@ -1230,6 +1242,11 @@ fn prepare_native_window(
             "native compacted window provider_origin does not match the selected Responses origin"
                 .into(),
         );
+    }
+    if native_item.provider_origin != *bound_origin
+        || coverage.through_message_seq != bound_coverage
+    {
+        return Err("native compacted window does not match its assembler replay binding".into());
     }
     if native_item.origin_message.is_some() || native_item.wire_item_index.is_some() {
         return Err("native compacted window has reasoning placement metadata".into());
@@ -1254,11 +1271,6 @@ fn prepare_native_window(
             .map_err(|error| format!("invalid native compacted window item: {error}"))?;
         validated.push(item.clone());
     }
-    crate::provider::types::validate_native_window_replay(
-        &context.messages,
-        coverage.through_message_seq,
-    )
-    .map_err(|error| error.to_string())?;
     Ok(Some((coverage.through_message_seq, validated)))
 }
 
@@ -3584,6 +3596,9 @@ fn validate_prompt_cache_breakpoint(value: Option<&Value>, parent: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::context_assembler::{
+        bind_native_replay_for_test, bind_sumi_replay_for_test,
+    };
     use crate::provider::types::{
         AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
@@ -3649,6 +3664,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let body = build_request(&spec(), &context, &RequestOptions::default()).expect("request");
         assert_eq!(body["instructions"], "constitution");
@@ -3677,6 +3693,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         context.tools = vec![
             ToolDefinition {
@@ -3899,6 +3916,7 @@ mod tests {
                     }],
                     provider_context: vec![],
                     tools: vec![],
+                    replay_provenance: None,
                 },
                 &RequestOptions {
                     temperature: Some(temperature),
@@ -3926,6 +3944,7 @@ mod tests {
                 }],
                 provider_context: vec![],
                 tools: vec![],
+                replay_provenance: None,
             },
             &RequestOptions {
                 temperature: Some(0.7),
@@ -4154,6 +4173,7 @@ mod tests {
             messages: vec![persisted_user(5), persisted_user(8), persisted_user(12)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let coverage = derive_compaction_coverage(&spec, &context).expect("coverage");
         assert_eq!(coverage.through_message_seq, 12);
@@ -4227,6 +4247,7 @@ mod tests {
                 messages: vec![persisted_user(1)],
                 provider_context: vec![],
                 tools: vec![],
+                replay_provenance: None,
             },
         )
         .expect("compact request");
@@ -4294,6 +4315,7 @@ mod tests {
                 },
             }],
             tools: vec![],
+            replay_provenance: None,
         };
         let request = build_request(&target, &context, &RequestOptions::default()).unwrap();
         let wire = request.to_string();
@@ -4424,6 +4446,7 @@ mod tests {
                     messages: vec![],
                     provider_context: vec![],
                     tools: vec![],
+                    replay_provenance: None,
                 },
                 &RequestOptions::default()
             ),
@@ -4579,19 +4602,12 @@ mod tests {
                         timestamp: Utc::now(),
                     }),
                 },
-                persisted_user(1),
-                persisted_user(2),
-                persisted_user(3),
-                persisted_user(4),
-                persisted_user(5),
-                persisted_user(6),
-                persisted_user(7),
-                persisted_user(8),
                 persisted_user(9),
                 persisted_user(10),
             ],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let fingerprint = context_fingerprint(&spec, &context).unwrap();
         context.provider_context.push(ProviderContextItem {
@@ -4607,6 +4623,8 @@ mod tests {
                 },
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 8, Some(10))
+            .expect("bind exact assembler replay");
 
         let input = convert_input(&spec, &context, true).expect("valid native replay");
         assert_eq!(&input[..window.len()], window.as_slice());
@@ -4618,10 +4636,11 @@ mod tests {
         assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
         assert_eq!(input[window.len() + 2]["content"][0]["text"], "message-10");
 
-        let default_request = build_request(&spec, &context, &RequestOptions::default())
-            .expect("default three-layer request");
-        assert!(!default_request.to_string().contains("opaque"));
-        assert!(default_request.to_string().contains("message-7"));
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
 
         let request = build_request(
             &spec,
@@ -4646,15 +4665,10 @@ mod tests {
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![
-                persisted_user(1),
-                persisted_user(3),
-                persisted_user(5),
-                persisted_user(7),
-                persisted_user(9),
-            ],
+            messages: vec![persisted_user(7), persisted_user(9)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let fingerprint = context_fingerprint(&spec, &context).unwrap();
         context.provider_context.push(ProviderContextItem {
@@ -4670,6 +4684,8 @@ mod tests {
                 },
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 5, Some(9))
+            .expect("bind exact gapped assembler replay");
 
         let input = convert_input(&spec, &context, true)
             .expect("valid native replay with global event gaps");
@@ -4691,14 +4707,19 @@ mod tests {
     }
 
     #[test]
-    fn stale_native_context_falls_back_to_durable_three_layer_view() {
+    fn sumi_bound_stale_native_context_falls_back_to_durable_three_layer_view() {
         let spec = spec();
         let mut context = PromptContext {
             system_prompt: "system".into(),
-            memory_blocks: vec![],
+            memory_blocks: vec![crate::provider::types::MemoryBlock {
+                layer: MemoryLayer::L1,
+                text: "memory".into(),
+                time_range: None,
+            }],
             messages: vec![persisted_user(8), persisted_user(9)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let native = ProviderContextItem {
             origin_message: None,
@@ -4709,80 +4730,19 @@ mod tests {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"})],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 8,
-                    context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+                    context_fingerprint: "stale".into(),
                 },
             },
         };
-        context.provider_context = vec![native.clone(), native.clone()];
-        assert!(matches!(
-            convert_input(&spec, &context, true),
-            Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("must be unique and contiguous from zero")
-        ));
-
-        context.provider_context = vec![native.clone()];
-        context
-            .memory_blocks
-            .push(crate::provider::types::MemoryBlock {
-                layer: MemoryLayer::L1,
-                text: "memory".into(),
-                time_range: None,
-            });
-        let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
-        assert!(Value::Array(fallback).to_string().contains("memory"));
-        context.memory_blocks.clear();
-
-        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
-            &mut context.provider_context[0].payload
-        {
-            coverage.context_fingerprint = "wrong".into();
-        }
-        let fallback = convert_input(&spec, &context, true).expect("fingerprint fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
-
         context.provider_context = vec![native];
-        context.messages = vec![persisted_user(10)];
-        let exact_suffix = convert_input(&spec, &context, true).expect("exact suffix replay");
-        let exact_suffix = Value::Array(exact_suffix).to_string();
-        assert!(exact_suffix.contains("message-10"));
-        assert!(exact_suffix.contains("opaque"));
-        assert!(matches!(
-            convert_input(&spec, &context, false),
-            Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("requires its bound native Responses context")
-        ));
-        let exact_fingerprint = context_fingerprint(&spec, &context).unwrap();
-        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
-            &mut context.provider_context[0].payload
-        {
-            coverage.context_fingerprint = "wrong".into();
-        }
-        assert!(matches!(
-            convert_input(&spec, &context, true),
-            Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("cannot discard native context")
-        ));
-        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
-            &mut context.provider_context[0].payload
-        {
-            coverage.context_fingerprint = exact_fingerprint;
-        }
-        context.messages = vec![
-            persisted_user(9),
-            ContextMessage::Synthetic {
-                message: Message::User(UserMessage {
-                    content: vec![],
-                    timestamp: Utc::now(),
-                }),
-            },
-        ];
-        let normalized_suffix =
-            convert_input(&spec, &context, true).expect("normalized exact suffix");
-        assert!(
-            Value::Array(normalized_suffix)
-                .to_string()
-                .contains("opaque")
-        );
+        bind_sumi_replay_for_test(&mut context, Some(9))
+            .expect("bind exact normalized assembler replay");
+        let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
+        let fallback = Value::Array(fallback).to_string();
+        assert!(fallback.contains("memory"));
+        assert!(fallback.contains("message-8"));
+        assert!(fallback.contains("message-9"));
+        assert!(!fallback.contains("opaque"));
     }
 
     #[test]
@@ -4825,9 +4785,10 @@ mod tests {
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(1), persisted_user(2)],
+            messages: vec![persisted_user(2)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let coverage = NativeCompactionCoverage {
             through_message_seq: 1,
@@ -4843,22 +4804,23 @@ mod tests {
                 coverage,
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 1, Some(2))
+            .expect("bind exact assembler replay");
         if let ProtocolCompat::Responses(compat) = &mut spec.compat {
             compat.supports_native_compact = false;
         }
-        let request = build_request(
-            &spec,
-            &context,
-            &RequestOptions {
-                native_compaction: true,
-                ..RequestOptions::default()
-            },
-        )
-        .expect("capability loss falls back");
-        let request = request.to_string();
-        assert!(!request.contains("NATIVE"));
-        assert!(request.contains("message-1"));
-        assert!(request.contains("message-2"));
+        assert!(matches!(
+            build_request(
+                &spec,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
     }
 
     #[test]
@@ -4870,6 +4832,7 @@ mod tests {
             messages: vec![persisted_user(1)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         context.provider_context.push(ProviderContextItem {
             origin_message: None,
@@ -4884,6 +4847,8 @@ mod tests {
                 },
             },
         });
+        bind_sumi_replay_for_test(&mut context, Some(1))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &context,
@@ -4903,9 +4868,10 @@ mod tests {
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(1), persisted_user(2)],
+            messages: vec![persisted_user(2)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let mut foreign_origin = spec.origin();
         foreign_origin.provider_instance_id.push_str("-foreign");
@@ -4913,7 +4879,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: foreign_origin,
+            provider_origin: foreign_origin.clone(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id":"cmp",
@@ -4926,20 +4892,21 @@ mod tests {
                 },
             },
         });
+        bind_native_replay_for_test(&mut context, foreign_origin, 1, Some(2))
+            .expect("bind exact foreign replay");
 
-        let request = build_request(
-            &spec,
-            &context,
-            &RequestOptions {
-                native_compaction: true,
-                ..RequestOptions::default()
-            },
-        )
-        .expect("foreign native context falls back to the durable transcript");
-        let wire = request.to_string();
-        assert!(!wire.contains("FOREIGN_NATIVE_MARKER"));
-        assert!(wire.contains("message-1"));
-        assert!(wire.contains("message-2"));
+        assert!(matches!(
+            build_request(
+                &spec,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("provider_origin")
+        ));
     }
 
     #[test]
@@ -5091,6 +5058,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         assert!(build_request(&spec, &context, &RequestOptions::default()).is_err());
 
@@ -5448,6 +5416,7 @@ mod tests {
                 },
             }],
             tools: vec![],
+            replay_provenance: None,
         };
 
         let enabled =
@@ -5480,6 +5449,7 @@ mod tests {
             messages: vec![persisted_user(7), persisted_user(8)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let native = ProviderContextItem {
             origin_message: None,
@@ -5499,6 +5469,8 @@ mod tests {
             },
         };
         context.provider_context.push(native);
+        bind_sumi_replay_for_test(&mut context, Some(8))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &context,

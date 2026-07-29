@@ -1923,6 +1923,7 @@ mod tests {
             ],
             provider_context: Vec::<ProviderContextItem>::new(),
             tools: vec![tool_definition()],
+            replay_provenance: None,
         }
     }
 
@@ -1957,6 +1958,7 @@ mod tests {
             messages: messages.into_iter().map(synthetic).collect(),
             provider_context: vec![],
             tools,
+            replay_provenance: None,
         }
     }
 
@@ -2060,6 +2062,7 @@ mod tests {
                     }))],
                     provider_context: vec![],
                     tools: vec![],
+                    replay_provenance: None,
                 },
                 &RequestOptions {
                     max_tokens: Some(64),
@@ -2088,6 +2091,7 @@ mod tests {
                             "additionalProperties":false
                         }),
                     }],
+                    replay_provenance: None,
                 },
                 &RequestOptions {
                     max_tokens: Some(4_096),
@@ -2383,6 +2387,7 @@ mod tests {
                         messages: vec![],
                         provider_context: vec![],
                         tools: vec![],
+                        replay_provenance: None,
                     },
                     &RequestOptions {
                         max_tokens: Some(requested),

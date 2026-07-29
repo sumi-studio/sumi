@@ -830,6 +830,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: Vec::new(),
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         (
             ModelSpec::preset("kimi-k3").expect("preset"),
@@ -918,6 +919,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let driver = InjectedRunDriver::with_stream_starter(
             spec,
@@ -973,6 +975,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let spec = ModelSpec::preset("kimi-k3").expect("preset");
         let workspace = WorkspacePaths::new("/workspace").expect("workspace");
@@ -1298,6 +1301,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let driver = Arc::new(
             InjectedRunDriver::with_stream_starter(
@@ -1496,6 +1500,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: Vec::new(),
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let driver = InjectedRunDriver::with_stream_starter(
             ModelSpec::preset("kimi-k3").expect("preset"),
@@ -2590,6 +2595,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let (base_url, server, _) = serve_tool_then_text().await;
         let mut spec = ModelSpec::preset("kimi-k3").expect("preset");

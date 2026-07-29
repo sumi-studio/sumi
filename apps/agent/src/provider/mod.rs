@@ -2929,6 +2929,7 @@ fi
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         }
     }
 
@@ -5570,6 +5571,7 @@ fi
             }],
             provider_context: vec![],
             tools: vec![tool.clone()],
+            replay_provenance: None,
         };
         let first = run_live_request(
             spec.clone(),
@@ -5629,6 +5631,7 @@ fi
             ],
             provider_context: vec![],
             tools: vec![tool],
+            replay_provenance: None,
         };
         let second = run_live_request(
             spec,
@@ -5770,6 +5773,7 @@ fi
                     "additionalProperties":false
                 }),
             }],
+            replay_provenance: None,
         };
         let mut stream = stream_with_api_key(
             spec,

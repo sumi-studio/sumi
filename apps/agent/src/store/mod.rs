@@ -3643,6 +3643,7 @@ mod tests {
                 messages: vec![],
                 provider_context: vec![],
                 tools: vec![],
+                replay_provenance: None,
             },
             spec.clone(),
         )

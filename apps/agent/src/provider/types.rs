@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{Stream, task::AtomicWaker};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -988,6 +989,62 @@ pub struct PromptContext {
     pub messages: Vec<ContextMessage>,
     pub provider_context: Vec<ProviderContextItem>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum VerifiedReplayProvenance {
+    SumiNormalized {
+        canonical_through_seq: Option<u64>,
+    },
+    ProviderNativeExact {
+        provider_origin: ProviderOrigin,
+        native_coverage_through_seq: u64,
+        canonical_suffix_through_seq: Option<u64>,
+    },
+}
+
+impl PromptContext {
+    pub fn new(
+        system_prompt: String,
+        memory_blocks: Vec<MemoryBlock>,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            system_prompt,
+            memory_blocks,
+            messages,
+            provider_context,
+            tools,
+            replay_provenance: None,
+        }
+    }
+
+    pub(crate) fn verified_replay_provenance(
+        &self,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let Some(provenance) = &self.replay_provenance else {
+            return Ok(None);
+        };
+        provenance.verify(self.replay_send_view_digest()?).map(Some)
+    }
+
+    pub(crate) fn replay_send_view_digest(&self) -> Result<[u8; 32], String> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("failed to serialize replay send view: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"sumi.prompt-replay-binding.v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| "replay send view length exceeds u64".to_owned())?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1060,60 +1117,6 @@ pub fn validate_native_suffix(
         return Err("native compaction coverage does not identify a persisted message".into());
     }
     Ok(previous)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeReplayShape {
-    CanonicalHistory,
-    NormalizedExactSuffix,
-}
-
-/// Validate either authenticated canonical history containing the covered
-/// boundary or an already-bound normalized exact suffix produced by the
-/// runtime assembler.
-///
-/// Canonical history retains the stricter pre-normalization placement rule:
-/// synthetic rows may only lead persisted history. A normalized exact suffix
-/// has already been transformed, so generated synthetic rows remain valid in
-/// their vector position. Its persisted rows must still be positive, strictly
-/// increasing, and all greater than `coverage`.
-pub(crate) fn validate_native_window_replay(
-    messages: &[ContextMessage],
-    coverage: u64,
-) -> Result<NativeReplayShape, String> {
-    let contains_coverage = messages.iter().any(
-        |message| matches!(message, ContextMessage::Persisted { seq, .. } if *seq == coverage),
-    );
-    if contains_coverage {
-        validate_native_suffix(messages, Some(coverage))?;
-        return Ok(NativeReplayShape::CanonicalHistory);
-    }
-
-    let mut previous = None;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            continue;
-        };
-        if *seq == 0 {
-            return Err("persisted native replay sequence must be greater than zero".into());
-        }
-        if *seq <= coverage {
-            return Err(
-                "native compacted window replay neither contains coverage nor starts after it"
-                    .into(),
-            );
-        }
-        if previous.is_some_and(|value| value >= *seq) {
-            return Err(
-                "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
-            );
-        }
-        previous = Some(*seq);
-    }
-    if previous.is_none() {
-        return Err("native compacted window requires persisted replay history".into());
-    }
-    Ok(NativeReplayShape::NormalizedExactSuffix)
 }
 
 /// Hydration alias for [`validate_native_suffix`].
@@ -1382,6 +1385,7 @@ mod tests {
                     "required": ["path"]
                 }),
             }],
+            replay_provenance: None,
         };
 
         assert_round_trip(&context);
@@ -2052,34 +2056,6 @@ mod tests {
             },
         ];
         assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
-    }
-
-    #[test]
-    fn native_window_replay_distinguishes_canonical_from_normalized_exact_suffix() {
-        let persisted = |seq| ContextMessage::Persisted {
-            id: format!("m-{seq}"),
-            seq,
-            message: Message::Assistant(assistant_message()),
-        };
-        let synthetic = ContextMessage::Synthetic {
-            message: Message::Assistant(assistant_message()),
-        };
-
-        assert_eq!(
-            validate_native_window_replay(&[persisted(2), persisted(4)], 2)
-                .expect("canonical coverage boundary"),
-            NativeReplayShape::CanonicalHistory
-        );
-        assert_eq!(
-            validate_native_window_replay(
-                &[persisted(4), synthetic.clone(), persisted(7), synthetic,],
-                2,
-            )
-            .expect("normalized suffix keeps generated synthetics in vector order"),
-            NativeReplayShape::NormalizedExactSuffix
-        );
-        assert!(validate_native_window_replay(&[persisted(2), persisted(4)], 3).is_err());
-        assert!(validate_native_window_replay(&[persisted(4), persisted(3)], 2).is_err());
     }
 
     #[test]

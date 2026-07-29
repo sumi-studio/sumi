@@ -26,6 +26,7 @@ use crate::provider::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryBlock, MemoryLayer,
         Message, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderOrigin, ToolDefinition, UserContent,
+        VerifiedReplayProvenance,
     },
 };
 use crate::tools::executor::ArtifactBrokerClient;
@@ -59,6 +60,106 @@ struct BoundProviderContext {
 struct BoundNativeWindow {
     item: ProviderContextItemWithFootprint,
     through_message_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReplayProvenance {
+    kind: ReplayProvenanceKind,
+    seal: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ReplayProvenanceKind {
+    SumiNormalized {
+        canonical_through_seq: Option<u64>,
+    },
+    ProviderNativeExact {
+        provider_origin: ProviderOrigin,
+        native_coverage_through_seq: u64,
+        canonical_suffix_through_seq: Option<u64>,
+    },
+}
+
+impl ReplayProvenance {
+    pub(crate) fn verify(
+        &self,
+        send_view_digest: [u8; 32],
+    ) -> Result<VerifiedReplayProvenance, String> {
+        if self.seal != replay_binding_seal(&self.kind, send_view_digest)? {
+            return Err("bound replay send view changed after assembly".into());
+        }
+        Ok(match &self.kind {
+            ReplayProvenanceKind::SumiNormalized {
+                canonical_through_seq,
+            } => VerifiedReplayProvenance::SumiNormalized {
+                canonical_through_seq: *canonical_through_seq,
+            },
+            ReplayProvenanceKind::ProviderNativeExact {
+                provider_origin,
+                native_coverage_through_seq,
+                canonical_suffix_through_seq,
+            } => VerifiedReplayProvenance::ProviderNativeExact {
+                provider_origin: provider_origin.clone(),
+                native_coverage_through_seq: *native_coverage_through_seq,
+                canonical_suffix_through_seq: *canonical_suffix_through_seq,
+            },
+        })
+    }
+}
+
+fn replay_binding_seal(
+    kind: &ReplayProvenanceKind,
+    send_view_digest: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let mut seal = sha2::Sha256::new();
+    seal.update(b"sumi.prompt-replay-provenance-seal.v1\0");
+    match kind {
+        ReplayProvenanceKind::SumiNormalized {
+            canonical_through_seq,
+        } => {
+            seal.update([0]);
+            update_optional_seq(&mut seal, *canonical_through_seq);
+        }
+        ReplayProvenanceKind::ProviderNativeExact {
+            provider_origin,
+            native_coverage_through_seq,
+            canonical_suffix_through_seq,
+        } => {
+            seal.update([1]);
+            update_seal_text(&mut seal, &provider_origin.provider_instance_id)?;
+            seal.update([match provider_origin.protocol {
+                ApiProtocol::OpenAiChatCompletions => 0,
+                ApiProtocol::OpenAiResponses => 1,
+                ApiProtocol::AnthropicMessages => 2,
+            }]);
+            update_seal_text(&mut seal, &provider_origin.model)?;
+            seal.update(native_coverage_through_seq.to_be_bytes());
+            update_optional_seq(&mut seal, *canonical_suffix_through_seq);
+        }
+    }
+    seal.update(send_view_digest);
+    Ok(seal.finalize().into())
+}
+
+fn update_seal_text(seal: &mut sha2::Sha256, value: &str) -> Result<(), String> {
+    let value = value.as_bytes();
+    seal.update(
+        u64::try_from(value.len())
+            .map_err(|_| "replay provenance text length exceeds u64".to_owned())?
+            .to_be_bytes(),
+    );
+    seal.update(value);
+    Ok(())
+}
+
+fn update_optional_seq(seal: &mut sha2::Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            seal.update([1]);
+            seal.update(value.to_be_bytes());
+        }
+        None => seal.update([0]),
+    }
 }
 
 /// The exact estimate used to construct one provider attempt. Keeping it in
@@ -227,6 +328,7 @@ impl ContextAssembler {
             is_first_user_call,
             &provider_context.items,
         )?;
+        let canonical_through_seq = normalized_replay_through(&messages)?;
         messages = transform::transform(&messages, &destination);
 
         self.apply_user_attachment_truncation(&mut messages).await?;
@@ -238,14 +340,25 @@ impl ContextAssembler {
             self.compute_uncalibrated_estimate(&memory_blocks, &messages, &selected_context)?;
         let selected_items: Vec<ProviderContextItem> =
             selected_context.into_iter().map(|it| it.item).collect();
+        let mut prompt = PromptContext::new(
+            self.system_prompt.clone(),
+            memory_blocks,
+            messages,
+            selected_items,
+            self.tools.clone(),
+        );
+        if let Some(native_window) = &provider_context.native_window {
+            bind_provider_native_exact_replay(
+                &mut prompt,
+                destination,
+                native_window.through_message_seq,
+                canonical_through_seq,
+            )?;
+        } else {
+            bind_sumi_normalized_replay(&mut prompt, canonical_through_seq)?;
+        }
         Ok(AssembledPrompt {
-            prompt: PromptContext {
-                system_prompt: self.system_prompt.clone(),
-                memory_blocks,
-                messages,
-                provider_context: selected_items,
-                tools: self.tools.clone(),
-            },
+            prompt,
             uncalibrated_prompt_estimate: estimate,
         })
     }
@@ -646,6 +759,147 @@ fn hydrated_transcript_cutoff(messages: &[ContextMessage]) -> Result<u64> {
     Ok(previous)
 }
 
+fn normalized_replay_through(messages: &[ContextMessage]) -> Result<Option<u64>> {
+    let mut previous = None;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            continue;
+        };
+        if *seq == 0 || previous.is_some_and(|value| value >= *seq) {
+            anyhow::bail!(
+                "normalized replay persistence is not positive and strictly increasing: {seq} after {previous:?}"
+            );
+        }
+        previous = Some(*seq);
+    }
+    Ok(previous)
+}
+
+fn bind_sumi_normalized_replay(
+    prompt: &mut PromptContext,
+    canonical_through_seq: Option<u64>,
+) -> Result<()> {
+    ensure_unbound_replay(prompt)?;
+    let normalized_through = normalized_replay_through(&prompt.messages)?;
+    if normalized_through > canonical_through_seq {
+        anyhow::bail!("normalized Sumi replay exceeds its authenticated canonical watermark");
+    }
+    let send_view_digest = prompt
+        .replay_send_view_digest()
+        .map_err(anyhow::Error::msg)?;
+    let kind = ReplayProvenanceKind::SumiNormalized {
+        canonical_through_seq,
+    };
+    let seal = replay_binding_seal(&kind, send_view_digest).map_err(anyhow::Error::msg)?;
+    prompt.replay_provenance = Some(ReplayProvenance { kind, seal });
+    Ok(())
+}
+
+fn bind_provider_native_exact_replay(
+    prompt: &mut PromptContext,
+    provider_origin: ProviderOrigin,
+    native_coverage_through_seq: u64,
+    canonical_suffix_through_seq: Option<u64>,
+) -> Result<()> {
+    ensure_unbound_replay(prompt)?;
+    if native_coverage_through_seq == 0 {
+        anyhow::bail!("native replay coverage must be greater than zero");
+    }
+    if canonical_suffix_through_seq.is_some_and(|through| through <= native_coverage_through_seq) {
+        anyhow::bail!("native canonical suffix watermark must be greater than native coverage");
+    }
+    let normalized_through = normalized_replay_through(&prompt.messages)?;
+    if normalized_through.is_some_and(|through| through <= native_coverage_through_seq) {
+        anyhow::bail!("normalized native replay contains covered persisted history");
+    }
+    if normalized_through > canonical_suffix_through_seq {
+        anyhow::bail!(
+            "normalized native replay exceeds its authenticated canonical suffix watermark"
+        );
+    }
+
+    let matching_native = prompt
+        .provider_context
+        .iter()
+        .filter(|item| {
+            if item.provider_origin != provider_origin {
+                return false;
+            }
+            match &item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+                    if provider_origin.protocol == ApiProtocol::OpenAiResponses =>
+                {
+                    coverage.through_message_seq == native_coverage_through_seq
+                }
+                ProviderContextPayload::AnthropicCompaction { coverage, .. }
+                    if provider_origin.protocol == ApiProtocol::AnthropicMessages =>
+                {
+                    coverage.through_message_seq == native_coverage_through_seq
+                }
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. }
+                | ProviderContextPayload::EncryptedReasoning { .. } => false,
+            }
+        })
+        .count();
+    let native_count = prompt
+        .provider_context
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.payload,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    | ProviderContextPayload::AnthropicCompaction { .. }
+            )
+        })
+        .count();
+    if matching_native != 1 || native_count != 1 {
+        anyhow::bail!("native replay provenance requires exactly one matching bound native window");
+    }
+
+    let send_view_digest = prompt
+        .replay_send_view_digest()
+        .map_err(anyhow::Error::msg)?;
+    let kind = ReplayProvenanceKind::ProviderNativeExact {
+        provider_origin,
+        native_coverage_through_seq,
+        canonical_suffix_through_seq,
+    };
+    let seal = replay_binding_seal(&kind, send_view_digest).map_err(anyhow::Error::msg)?;
+    prompt.replay_provenance = Some(ReplayProvenance { kind, seal });
+    Ok(())
+}
+
+fn ensure_unbound_replay(prompt: &PromptContext) -> Result<()> {
+    if prompt.replay_provenance.is_some() {
+        anyhow::bail!("prompt replay provenance is already bound");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn bind_sumi_replay_for_test(
+    prompt: &mut PromptContext,
+    canonical_through_seq: Option<u64>,
+) -> Result<()> {
+    bind_sumi_normalized_replay(prompt, canonical_through_seq)
+}
+
+#[cfg(test)]
+pub(crate) fn bind_native_replay_for_test(
+    prompt: &mut PromptContext,
+    provider_origin: ProviderOrigin,
+    native_coverage_through_seq: u64,
+    canonical_suffix_through_seq: Option<u64>,
+) -> Result<()> {
+    bind_provider_native_exact_replay(
+        prompt,
+        provider_origin,
+        native_coverage_through_seq,
+        canonical_suffix_through_seq,
+    )
+}
+
 fn select_native_suffix(
     life_log: &[ContextMessage],
     through_message_seq: u64,
@@ -995,6 +1249,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         }
     }
 
@@ -1037,6 +1292,23 @@ mod tests {
                 error_message: None,
                 provider_code: None,
                 interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        }
+    }
+
+    fn tool_result(seq: u64, call_id: &str) -> ContextMessage {
+        ContextMessage::Persisted {
+            id: format!("tool-result-{seq}"),
+            seq,
+            message: Message::ToolResult(ToolResultMessage {
+                tool_call_id: call_id.to_owned(),
+                tool_name: "fixture".to_owned(),
+                content: vec![UserContent::Text {
+                    text: "fixture result".to_owned(),
+                }],
+                details: serde_json::Value::Null,
+                is_error: false,
                 timestamp: Utc::now(),
             }),
         }
@@ -1248,8 +1520,8 @@ mod tests {
         };
         let reasoning = ProviderContextItem {
             origin_message: Some(ProviderContextAnchor {
-                message_id: "assistant-3".to_owned(),
-                message_seq: 3,
+                message_id: "assistant-4".to_owned(),
+                message_seq: 4,
             }),
             wire_item_index: Some(1),
             ordinal: 0,
@@ -1262,6 +1534,7 @@ mod tests {
             messages: vec![user("first", 1), user("second", 2), user("third", 3)],
             provider_context: vec![native, reasoning],
             tools: vec![],
+            replay_provenance: None,
         };
         let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone())
             .expect("valid prompt")
@@ -1272,7 +1545,7 @@ mod tests {
                     user("first", 1),
                     user("second", 2),
                     user("third", 3),
-                    assistant_with_thinking_for(&spec, 3, "private", 1),
+                    assistant_with_thinking_for(&spec, 4, "private", 1),
                 ],
                 1,
             )
@@ -1292,7 +1565,7 @@ mod tests {
             result
                 .messages
                 .iter()
-                .any(|m| matches!(m, ContextMessage::Persisted { seq: 3, .. }))
+                .any(|m| matches!(m, ContextMessage::Persisted { seq: 4, .. }))
         );
     }
 
@@ -1356,6 +1629,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: vec![native.clone()],
             tools: Vec::new(),
+            replay_provenance: None,
         };
         let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone())
             .expect("native assembler")
@@ -1470,13 +1744,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_native_block_precedes_normalized_rejection_suffix() {
+    async fn anthropic_native_collapse_carries_full_canonical_watermark_to_next_turn() {
         let spec = anthropic_spec();
-        let life_log = vec![
+        let mut life_log = vec![
             user("covered", 1),
             user("before rejected call", 2),
             rejected_assistant(&spec, 3, "rejected-call"),
-            user("after rejected call", 4),
+            tool_result(4, "rejected-call"),
         ];
         let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
             .expect("fingerprint assembler")
@@ -1512,7 +1786,7 @@ mod tests {
             .assemble(&life_log, 1)
             .await
             .expect("assemble normalized rejection suffix");
-        assert_eq!(assembled.provider_context, vec![native]);
+        assert_eq!(assembled.provider_context, vec![native.clone()]);
         assert!(matches!(
             assembled.messages.as_slice(),
             [
@@ -1520,9 +1794,23 @@ mod tests {
                 ContextMessage::Synthetic {
                     message: Message::User(_),
                 },
-                ContextMessage::Persisted { seq: 4, .. },
             ]
         ));
+        assert!(matches!(
+            assembled
+                .verified_replay_provenance()
+                .expect("verify assembler replay binding"),
+            Some(VerifiedReplayProvenance::ProviderNativeExact {
+                native_coverage_through_seq: 1,
+                canonical_suffix_through_seq: Some(4),
+                ..
+            })
+        ));
+        let returned_coverage =
+            crate::provider::adapters::anthropic::request_coverage(&spec, &assembled, true)
+                .expect("derive authenticated compaction coverage")
+                .expect("persisted canonical coverage");
+        assert_eq!(returned_coverage.through_message_seq, 4);
 
         let request = crate::provider::adapters::anthropic::build_request(
             &spec,
@@ -1546,11 +1834,335 @@ mod tests {
             .find("before rejected call")
             .expect("before marker");
         let rejection = serialized.find("引数検証に失敗").expect("rejection marker");
-        let after = serialized
-            .find("after rejected call")
-            .expect("after marker");
-        assert!(before < rejection && rejection < after);
+        assert!(before < rejection);
+        assert!(!serialized.contains("fixture result"));
         assert!(request.get("context_management").is_some());
+
+        life_log.push(user("next turn", 5));
+        let next_native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: serde_json::json!({
+                    "type": "compaction",
+                    "content": "opaque-through-4",
+                }),
+                coverage: returned_coverage,
+            },
+        };
+        let next_assembler = ContextAssembler::from_prompt_with_spec(
+            PromptContext {
+                provider_context: vec![next_native],
+                ..simple_prompt()
+            },
+            spec.clone(),
+        )
+        .expect("next-turn native assembler")
+        .with_mode(AssemblyMode::ProviderNative);
+        let next = next_assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble only the uncovered next turn");
+        assert!(matches!(
+            next.messages.as_slice(),
+            [ContextMessage::Persisted { seq: 5, .. }]
+        ));
+        assert!(
+            next.messages
+                .iter()
+                .all(|message| !transform::is_generated_replay_artifact(message))
+        );
+        let next_request = crate::provider::adapters::anthropic::build_request(
+            &spec,
+            &next,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("serialize next-turn native suffix");
+        let next_serialized = next_request.to_string();
+        assert!(next_serialized.contains("next turn"));
+        assert!(!next_serialized.contains("引数検証に失敗"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_sumi_fallback_authorizes_rejection_and_orphan_diagnostics() {
+        let spec = anthropic_spec();
+        let life_log = vec![
+            user("before rejected call", 1),
+            rejected_assistant(&spec, 2, "rejected-call"),
+            tool_result(3, "rejected-call"),
+            user("before orphan result", 4),
+            tool_result(5, "orphan-call"),
+        ];
+        let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("Sumi fallback assembler")
+            .with_mode(AssemblyMode::ProviderNative);
+        let assembled = assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble normalized Sumi fallback");
+        assert!(assembled.provider_context.is_empty());
+        let diagnostics = assembled
+            .messages
+            .iter()
+            .filter(|message| transform::is_generated_replay_artifact(message))
+            .count();
+        assert_eq!(diagnostics, 2);
+        assert!(matches!(
+            assembled
+                .verified_replay_provenance()
+                .expect("verify assembler replay binding"),
+            Some(VerifiedReplayProvenance::SumiNormalized {
+                canonical_through_seq: Some(5),
+            })
+        ));
+        let coverage =
+            crate::provider::adapters::anthropic::request_coverage(&spec, &assembled, true)
+                .expect("derive authenticated fallback coverage")
+                .expect("canonical persisted coverage");
+        assert_eq!(coverage.through_message_seq, 5);
+
+        let request = crate::provider::adapters::anthropic::build_request(
+            &spec,
+            &assembled,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("serialize normalized fallback without native validation");
+        let serialized = request.to_string();
+        assert!(serialized.contains("引数検証に失敗"));
+        assert!(serialized.contains("対応するツール呼び出しがない"));
+        assert!(request.get("context_management").is_some());
+    }
+
+    #[tokio::test]
+    async fn responses_native_synthetic_only_suffix_is_exact_and_authenticated() {
+        let spec = responses_spec();
+        let life_log = vec![
+            user("covered", 1),
+            rejected_assistant(&spec, 2, "rejected-call"),
+            tool_result(3, "rejected-call"),
+        ];
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": "cmp-synthetic-only",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-synthetic-only",
+                })],
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(
+            PromptContext {
+                provider_context: vec![native],
+                ..simple_prompt()
+            },
+            spec.clone(),
+        )
+        .expect("native assembler")
+        .with_mode(AssemblyMode::ProviderNative);
+        let assembled = assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble synthetic-only native suffix");
+        assert!(matches!(
+            assembled.messages.as_slice(),
+            [ContextMessage::Synthetic {
+                message: Message::User(_),
+            }]
+        ));
+        assert!(transform::is_generated_replay_artifact(
+            &assembled.messages[0]
+        ));
+        assert!(matches!(
+            assembled
+                .verified_replay_provenance()
+                .expect("verify assembler replay binding"),
+            Some(VerifiedReplayProvenance::ProviderNativeExact {
+                native_coverage_through_seq: 1,
+                canonical_suffix_through_seq: Some(3),
+                ..
+            })
+        ));
+
+        let request = crate::provider::adapters::responses::build_request(
+            &spec,
+            &assembled,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("serialize exact synthetic-only suffix");
+        let input = request["input"].as_array().expect("Responses input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["id"], "cmp-synthetic-only");
+        assert!(
+            input[1]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("引数検証に失敗"))
+        );
+    }
+
+    #[test]
+    fn replay_binding_survives_clone_is_stripped_by_serde_and_rejects_mutation() {
+        let mut prompt = simple_prompt();
+        prompt.messages = vec![user("bound", 1)];
+        let unbound_send_view =
+            serde_json::to_vec(&prompt).expect("serialize unbound provider send view");
+        bind_sumi_normalized_replay(&mut prompt, Some(1)).expect("bind Sumi replay");
+        assert_eq!(
+            serde_json::to_vec(&prompt).expect("serialize bound provider send view"),
+            unbound_send_view,
+            "private replay authority must not perturb provider/overflow send-view digests"
+        );
+
+        let cloned = prompt.clone();
+        assert!(matches!(
+            cloned
+                .verified_replay_provenance()
+                .expect("clone retains valid binding"),
+            Some(VerifiedReplayProvenance::SumiNormalized {
+                canonical_through_seq: Some(1),
+            })
+        ));
+
+        let encoded = serde_json::to_value(&prompt).expect("serialize prompt");
+        assert!(encoded.get("replay_provenance").is_none());
+        let decoded: PromptContext = serde_json::from_value(encoded).expect("deserialize prompt");
+        assert_eq!(
+            decoded
+                .verified_replay_provenance()
+                .expect("deserialized prompt is unbound"),
+            None
+        );
+
+        let mut mutated = cloned;
+        mutated.system_prompt.push_str(" changed");
+        assert_eq!(
+            mutated
+                .verified_replay_provenance()
+                .expect_err("mutation must invalidate replay authority"),
+            "bound replay send view changed after assembly"
+        );
+
+        let mut marker_mutated = prompt.clone();
+        marker_mutated
+            .replay_provenance
+            .as_mut()
+            .expect("bound marker")
+            .kind = ReplayProvenanceKind::SumiNormalized {
+            canonical_through_seq: Some(2),
+        };
+        assert_eq!(
+            marker_mutated
+                .verified_replay_provenance()
+                .expect_err("marker mutation must invalidate its seal"),
+            "bound replay send view changed after assembly"
+        );
+
+        let constructed = PromptContext::new(
+            "System.".to_owned(),
+            Vec::new(),
+            vec![user("constructed", 1)],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            constructed
+                .verified_replay_provenance()
+                .expect("public construction remains unbound"),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_binding_validates_empty_and_synthetic_only_watermark_bounds() {
+        let spec = responses_spec();
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = || ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": "cmp-watermark",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-watermark",
+                })],
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint.clone(),
+                },
+            },
+        };
+        let synthetic = ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "authorized diagnostic".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+
+        let mut no_progress = PromptContext {
+            provider_context: vec![native()],
+            messages: vec![synthetic.clone()],
+            ..simple_prompt()
+        };
+        bind_provider_native_exact_replay(&mut no_progress, spec.origin(), 1, None)
+            .expect("synthetic-only suffix may represent no canonical progress");
+
+        let mut invalid = PromptContext {
+            provider_context: vec![native()],
+            messages: vec![synthetic.clone()],
+            ..simple_prompt()
+        };
+        assert!(
+            bind_provider_native_exact_replay(&mut invalid, spec.origin(), 1, Some(1)).is_err()
+        );
+
+        let mut collapsed = PromptContext {
+            provider_context: vec![native()],
+            messages: vec![synthetic],
+            ..simple_prompt()
+        };
+        bind_provider_native_exact_replay(&mut collapsed, spec.origin(), 1, Some(3))
+            .expect("synthetic-only transformed suffix carries canonical progress");
+
+        let mut empty_collapsed = PromptContext {
+            provider_context: vec![native()],
+            messages: Vec::new(),
+            ..simple_prompt()
+        };
+        bind_provider_native_exact_replay(&mut empty_collapsed, spec.origin(), 1, Some(2))
+            .expect("fully collapsed suffix carries canonical progress");
+
+        let mut invalid_sumi = simple_prompt();
+        invalid_sumi.messages = vec![user("persisted", 1)];
+        assert!(bind_sumi_normalized_replay(&mut invalid_sumi, None).is_err());
     }
 
     #[tokio::test]
@@ -2012,6 +2624,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![item.clone()],
             tools: vec![],
+            replay_provenance: None,
         };
         let assembler =
             ContextAssembler::from_prompt_with_spec(prompt, spec.clone()).expect("valid prompt");
@@ -2063,6 +2676,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![item.clone()],
             tools: vec![],
+            replay_provenance: None,
         };
         let assembler =
             ContextAssembler::from_prompt_with_spec(prompt, spec).expect("valid prompt");

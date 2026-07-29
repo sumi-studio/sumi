@@ -12234,6 +12234,7 @@ mod tests {
         },
         memory::{
             L0_BATCH_MIN,
+            context_assembler::bind_sumi_replay_for_test,
             estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
         },
         provider::{
@@ -24427,18 +24428,18 @@ mod tests {
                 timestamp: durable_test_timestamp(),
             }),
         });
-        let second_turn = build_responses_request(
-            &spec,
-            &PromptContext {
-                system_prompt: "continue the durable conversation".to_owned(),
-                memory_blocks: Vec::new(),
-                messages: second_turn_messages,
-                provider_context: expected_context.iter().map(|i| i.item.clone()).collect(),
-                tools: Vec::new(),
-            },
-            &RequestOptions::default(),
-        )
-        .expect("build second-turn Responses request from canonical HydratedRunState");
+        let mut second_turn_prompt = PromptContext::new(
+            "continue the durable conversation".to_owned(),
+            Vec::new(),
+            second_turn_messages,
+            expected_context.iter().map(|i| i.item.clone()).collect(),
+            Vec::new(),
+        );
+        bind_sumi_replay_for_test(&mut second_turn_prompt, Some(message_seq))
+            .expect("bind exact normalized restart view");
+        let second_turn =
+            build_responses_request(&spec, &second_turn_prompt, &RequestOptions::default())
+                .expect("build second-turn Responses request from canonical HydratedRunState");
         let second_turn_wire = second_turn.to_string();
         assert_eq!(second_turn["store"], false);
         assert!(second_turn_wire.contains("opaque-durable-reasoning"));

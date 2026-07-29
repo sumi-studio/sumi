@@ -555,6 +555,7 @@ mod tests {
             messages,
             provider_context: Vec::new(),
             tools: Vec::new(),
+            replay_provenance: None,
         }
     }
 

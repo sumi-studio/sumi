@@ -990,6 +990,7 @@ async fn required_tool_choice_resets_after_retry_for_queued_user_turn() {
         messages: Vec::new(),
         provider_context: Vec::new(),
         tools: registry.definitions(),
+        replay_provenance: None,
     };
     let driver = Arc::new(
         InjectedRunDriver::with_stream_starter(

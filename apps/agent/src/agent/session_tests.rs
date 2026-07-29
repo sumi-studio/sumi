@@ -6745,6 +6745,7 @@ fn live_responses_driver(
         messages: Vec::new(),
         provider_context: Vec::new(),
         tools: vec![tool],
+        replay_provenance: None,
     };
     Arc::new(
         InjectedRunDriver::new(

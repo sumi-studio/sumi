@@ -183,13 +183,13 @@ impl CompactError {
 /// use sumi_agent_doctest::memory::compactor::CompactionInput;
 /// use sumi_agent_doctest::provider::types::PromptContext;
 ///
-/// let ctx = PromptContext {
-///     system_prompt: "sys".into(),
-///     memory_blocks: Vec::new(),
-///     messages: Vec::new(),
-///     provider_context: Vec::new(),
-///     tools: Vec::new(),
-/// };
+/// let ctx = PromptContext::new(
+///     "sys".into(),
+///     Vec::new(),
+///     Vec::new(),
+///     Vec::new(),
+///     Vec::new(),
+/// );
 /// let _ = CompactionInput::from_public_batch(&[ctx], None);
 /// ```
 ///
@@ -5188,6 +5188,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: Vec::new(),
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let observed_prompts = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
         let observed = observed_prompts.clone();
