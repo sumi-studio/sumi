@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use thiserror::Error;
@@ -39,14 +39,20 @@ use crate::{
         overflow::OverflowSource,
         types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
     },
-    runtime::contracts::{PersonalityAgentId, ProcessGeneration},
+    runtime::{
+        authority::RuntimeEpochAuthority,
+        contracts::{PersonalityAgentId, ProcessGeneration},
+    },
     store::{
         ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
-        EventWriter, InboundAdmission, InboundReceiptOrigin, Projection,
-        RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
-        ToolExecutionMutation,
+        EventWriter, HydratedRunState, HydrationReceiptIdentity, InboundAdmission,
+        InboundReceiptOrigin, Projection, RecoveryRequired as AdmissionRecoveryRequired,
+        RecoveryStep, ResumeDirective, Store, ToolExecutionMutation,
     },
 };
+
+#[cfg(test)]
+use crate::store::SuffixRecovery;
 
 mod driver;
 mod durable_bridge;
@@ -54,6 +60,8 @@ pub(crate) mod events;
 mod provider_projection;
 mod queue;
 mod run;
+#[cfg(test)]
+mod start_authority_tests;
 mod steer;
 
 pub(crate) use durable_bridge::DurableRunBinding;
@@ -211,12 +219,41 @@ async fn own_gateway_writer<W: GatewayWriter>(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HydratedSessionBinding {
+    binding_id: Uuid,
+    runtime: RuntimeEpochAuthority,
+    receipt: HydrationReceiptIdentity,
+    core_ownership_id: Uuid,
+    core_mutation_epoch: u64,
+}
+
+impl HydratedSessionBinding {
+    fn validate_receipt(&self) -> Result<()> {
+        if self.receipt.intent_count != 0
+            || self.receipt.personality_agent_id != *self.runtime.personality_agent_id()
+            || self.receipt.generation != self.runtime.generation()
+            || self.receipt.lease_id != self.runtime.lease().lease_id()
+            || self.receipt.fence_id != self.runtime.fence().fence_id()
+        {
+            bail!(
+                "hydration receipt does not prove the authenticated runtime epoch at a clean recovery fixed point"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The sole mutable conversation value transferred into and out of a worker.
 /// It is intentionally neither `Clone` nor wrapped in shared mutability.
 #[derive(Debug)]
 pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
+    /// Private proof that this exact, still-unmutated core was constructed
+    /// from the authenticated T17 snapshot accepted for one runtime epoch.
+    /// Session rechecks the proof before touching Store keys or gateway state.
+    hydrated_session_binding_id: Option<Uuid>,
     pending_controls: MessageQueue<AdmittedCommand>,
     pending_overflow_apply: Option<OverflowSource>,
     /// In-memory persisted send context returned with the unique core. T21
@@ -245,6 +282,7 @@ impl RunCore {
         Self {
             ownership_id: Uuid::now_v7(),
             mutation_epoch: 0,
+            hydrated_session_binding_id: None,
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
@@ -264,6 +302,7 @@ impl RunCore {
         mut self,
         provider_context: Vec<ProviderContextItemWithFootprint>,
     ) -> Self {
+        self.hydrated_session_binding_id = None;
         self.provider_context = provider_context;
         self
     }
@@ -277,6 +316,7 @@ impl RunCore {
     }
 
     pub(crate) fn mark_mutated(&mut self) {
+        self.hydrated_session_binding_id = None;
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
@@ -293,15 +333,21 @@ impl RunCore {
 
     pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {
         self.pending_controls.push(command)?;
+        self.hydrated_session_binding_id = None;
         Ok(())
     }
 
     pub(crate) fn next_followup(&mut self) -> Option<AdmittedCommand> {
-        self.pending_controls.pop_one()
+        let command = self.pending_controls.pop_one();
+        if command.is_some() {
+            self.hydrated_session_binding_id = None;
+        }
+        command
     }
 
     pub(crate) fn requeue_followup_front(&mut self, command: AdmittedCommand) -> Result<()> {
         self.pending_controls.push_front(command)?;
+        self.hydrated_session_binding_id = None;
         Ok(())
     }
 
@@ -311,6 +357,7 @@ impl RunCore {
 
     pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
         self.pending_overflow_apply.get_or_insert(source);
+        self.hydrated_session_binding_id = None;
     }
 
     pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
@@ -319,6 +366,7 @@ impl RunCore {
 
     pub(crate) fn clear_pending_overflow_apply(&mut self) {
         self.pending_overflow_apply = None;
+        self.hydrated_session_binding_id = None;
     }
 
     pub(crate) fn install_hydrated_context(
@@ -339,6 +387,100 @@ impl RunCore {
     #[cfg(test)]
     pub(crate) fn provider_context(&self) -> &[ProviderContextItemWithFootprint] {
         &self.provider_context
+    }
+}
+
+enum SessionStartAuthorityKind {
+    Hydrated(Box<HydratedSessionBinding>),
+    #[cfg(test)]
+    UnhydratedFixture(ProcessGeneration),
+}
+
+/// Authenticated authority required to transfer one hydrated `RunCore` into a
+/// Session. It is deliberately neither `Clone` nor constructible from bare
+/// identity values in production.
+pub(crate) struct SessionStartAuthority {
+    kind: SessionStartAuthorityKind,
+}
+
+impl SessionStartAuthority {
+    /// Bind a completed T17 hydration result to the exact runtime epoch that
+    /// requested it and construct the only RunCore that this authority admits.
+    ///
+    /// T26 may inspect `hydrated` first to compose memory/driver dependencies,
+    /// but Session state itself is always initialized from the authenticated
+    /// messages and provider context here.
+    pub(crate) fn from_hydrated(
+        runtime: RuntimeEpochAuthority,
+        hydrated: &HydratedRunState,
+    ) -> Result<(RunCore, Self)> {
+        if hydrated.scope.personality_agent_id != *runtime.personality_agent_id() {
+            bail!("hydrated Store scope does not match the authenticated runtime PAID");
+        }
+        if hydrated.lease != *runtime.lease() {
+            bail!("hydrated process-generation lease is stale for the authenticated runtime epoch");
+        }
+        if hydrated.fence != *runtime.fence() {
+            bail!("hydrated recovery fence is stale for the authenticated runtime epoch");
+        }
+        if hydrated.resume != ResumeDirective::AdmitCommands {
+            bail!("hydration result does not authorize command admission");
+        }
+
+        let mut core = RunCore::new();
+        core.runtime_context = hydrated.messages.clone();
+        core.provider_context = hydrated.provider_context.clone();
+        let binding = HydratedSessionBinding {
+            binding_id: Uuid::now_v7(),
+            runtime,
+            receipt: hydrated.receipt.clone(),
+            core_ownership_id: core.ownership_id,
+            core_mutation_epoch: core.mutation_epoch,
+        };
+        binding.validate_receipt()?;
+        core.hydrated_session_binding_id = Some(binding.binding_id);
+        Ok((
+            core,
+            Self {
+                kind: SessionStartAuthorityKind::Hydrated(Box::new(binding)),
+            },
+        ))
+    }
+
+    fn validate_for(&self, store: &Store, core: &RunCore) -> Result<ProcessGeneration> {
+        match &self.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                binding.validate_receipt()?;
+                if store.scope().personality_agent_id != *binding.runtime.personality_agent_id() {
+                    bail!("Session Store PAID does not match the authenticated runtime epoch");
+                }
+                if core.hydrated_session_binding_id != Some(binding.binding_id)
+                    || core.ownership_id != binding.core_ownership_id
+                    || core.mutation_epoch != binding.core_mutation_epoch
+                {
+                    bail!(
+                        "RunCore is not the exact unmutated core bound to this hydration authority"
+                    );
+                }
+                Ok(binding.runtime.generation())
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(generation) => Ok(*generation),
+        }
+    }
+
+    fn uses_completed_hydration(&self) -> bool {
+        matches!(&self.kind, SessionStartAuthorityKind::Hydrated(_))
+    }
+
+    #[cfg(test)]
+    fn unhydrated_fixture(generation: ProcessGeneration) -> Self {
+        // Existing T15/T16 actor tests exercise post-start behavior with
+        // synthetic stores and cores. Production has no conversion from a
+        // bare generation; focused authority tests use `start_hydrated`.
+        Self {
+            kind: SessionStartAuthorityKind::UnhydratedFixture(generation),
+        }
     }
 }
 
@@ -656,6 +798,9 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
+    /// Retains the authenticated runtime/hydration proof for the whole
+    /// Session lifetime; `executor_generation` is derived from this proof.
+    start_authority: SessionStartAuthority,
     executor_generation: ProcessGeneration,
     /// T15 already applies the idle/post-run Abort cutoff and supplies the
     /// injected cancellation and phase-observation seams. Commands received
@@ -674,6 +819,30 @@ pub(crate) struct Session<G: Gateway> {
 }
 
 impl<G: Gateway + 'static> Session<G> {
+    /// All-cfg typed entry point exercised directly by the hydration-authority
+    /// tests and used by T26 production composition.
+    pub(crate) async fn start_hydrated(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        Self::start_inner(store, gateway, core, worker, start_authority).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn start(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        Self::start_hydrated(store, gateway, core, worker, start_authority).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn start(
         store: Store,
         gateway: G,
@@ -681,6 +850,37 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
+        Self::start_fixture(store, gateway, core, worker, executor_generation).await
+    }
+
+    #[cfg(test)]
+    async fn start_fixture(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        executor_generation: ProcessGeneration,
+    ) -> Result<Self> {
+        Self::start_inner(
+            store,
+            gateway,
+            core,
+            worker,
+            SessionStartAuthority::unhydrated_fixture(executor_generation),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        // Every authority/core/Store check precedes key creation, recovery,
+        // gateway splitting, task creation, and worker validation.
+        let executor_generation = start_authority.validate_for(&store, &core)?;
         worker.validate_executor_generation(executor_generation)?;
         let personality_agent_id = store.scope().personality_agent_id.clone();
         let store = Arc::new(store);
@@ -693,7 +893,20 @@ impl<G: Gateway + 'static> Session<G> {
         }
         let writer = EventWriter::new(store.clone());
         writer.initialize_recovery_checkpoint().await?;
-        let recovery_steps = SuffixRecovery::recover_t12_prefix(&store, &writer).await?;
+        let recovery_steps = match &start_authority.kind {
+            // `HydratedRunState::resume == AdmitCommands` is T17's unique
+            // fixed-point authority. Re-running T12 recovery here would make a
+            // second bootstrap decision after the authenticated snapshot.
+            SessionStartAuthorityKind::Hydrated(_) => Vec::new(),
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => {
+                SuffixRecovery::recover_t12_prefix(&store, &writer).await?
+            }
+        };
+        debug_assert!(
+            !start_authority.uses_completed_hydration() || recovery_steps.is_empty(),
+            "completed hydration must not produce a second recovery plan"
+        );
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
         let (gateway_reader, gateway_writer) = gateway.split();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
@@ -729,6 +942,7 @@ impl<G: Gateway + 'static> Session<G> {
             core: Some(core),
             active: None,
             worker,
+            start_authority,
             executor_generation,
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             maintenance_ready_pending: false,

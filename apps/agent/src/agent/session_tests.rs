@@ -66,13 +66,19 @@ fn validate_test_generation(generation: ProcessGeneration) -> Result<()> {
 }
 
 #[test]
-fn session_start_composition_boundary_requires_process_generation() {
+fn hydrated_session_start_composition_boundary_requires_typed_authority() {
     fn assert_signature<Future>(
-        _start: fn(Store, MockGateway, RunCore, Arc<dyn RunWorker>, ProcessGeneration) -> Future,
+        _start: fn(
+            Store,
+            MockGateway,
+            RunCore,
+            Arc<dyn RunWorker>,
+            SessionStartAuthority,
+        ) -> Future,
     ) {
     }
 
-    assert_signature(Session::<MockGateway>::start);
+    assert_signature(Session::<MockGateway>::start_hydrated);
 }
 
 fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
