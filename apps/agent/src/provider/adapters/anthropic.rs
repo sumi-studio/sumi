@@ -983,6 +983,7 @@ pub struct AnthropicReceiveState {
     content_bytes: usize,
     event_count: usize,
     preview_work_bytes: usize,
+    tool_count: usize,
     saw_tool: bool,
     seen_tool_ids: HashSet<String>,
     coverage: Option<NativeCompactionCoverage>,
@@ -1012,6 +1013,7 @@ impl AnthropicReceiveState {
             content_bytes: 0,
             event_count: 0,
             preview_work_bytes: 0,
+            tool_count: 0,
             saw_tool: false,
             seen_tool_ids: HashSet::new(),
             coverage,
@@ -1333,10 +1335,17 @@ impl AnthropicReceiveState {
                 )));
             }
         };
+        let tool_count = checked_counter(
+            self.tool_count,
+            usize::from(is_tool),
+            self.budget.max_tool_calls,
+            "tool_calls",
+        )?;
         self.charge(content_charge, events.len(), 0)?;
         if let OpenBlock::Tool { id, .. } = &open {
             self.seen_tool_ids.insert(id.clone());
         }
+        self.tool_count = tool_count;
         self.saw_tool |= is_tool;
         self.open = Some(open);
         Ok(AnthropicPush {
@@ -3808,6 +3817,69 @@ mod tests {
             .push_named(Some("content_block_start"), block)
             .unwrap();
         state
+    }
+
+    #[test]
+    fn tool_call_budget_rejects_zero_and_excess_tool_blocks_before_normalization() {
+        let schemas = FrozenToolSchemaRegistry::compile(&context(Vec::new()).tools).unwrap();
+        let message_start = r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#;
+        let first_tool = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"read_file","input":{}}}"#;
+
+        let mut zero = AnthropicReceiveState::with_budget(
+            schemas.clone(),
+            ResponseBudget {
+                max_tool_calls: 0,
+                ..ResponseBudget::default()
+            },
+            None,
+            "claude",
+        );
+        zero.push_named(Some("message_start"), message_start)
+            .unwrap();
+        assert!(matches!(
+            zero.push_named(Some("content_block_start"), first_tool),
+            Err(AnthropicAdapterError::ResponseLimitExceeded {
+                resource: "tool_calls",
+                limit: 0
+            })
+        ));
+        assert!(zero.open.is_none());
+        assert_eq!(zero.next_index, 0);
+        assert_eq!(zero.tool_count, 0);
+        assert!(zero.seen_tool_ids.is_empty());
+
+        let mut one = AnthropicReceiveState::with_budget(
+            schemas,
+            ResponseBudget {
+                max_tool_calls: 1,
+                ..ResponseBudget::default()
+            },
+            None,
+            "claude",
+        );
+        one.push_named(Some("message_start"), message_start)
+            .unwrap();
+        one.push_named(Some("content_block_start"), first_tool)
+            .expect("exact tool-call boundary");
+        one.push_named(
+            Some("content_block_stop"),
+            r#"{"type":"content_block_stop","index":0}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            one.push_named(
+                Some("content_block_start"),
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"b","name":"read_file","input":{}}}"#,
+            ),
+            Err(AnthropicAdapterError::ResponseLimitExceeded {
+                resource: "tool_calls",
+                limit: 1
+            })
+        ));
+        assert!(one.open.is_none());
+        assert_eq!(one.next_index, 1);
+        assert_eq!(one.tool_count, 1);
+        assert_eq!(one.seen_tool_ids.len(), 1);
     }
 
     #[test]
