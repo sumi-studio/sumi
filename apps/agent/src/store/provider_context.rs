@@ -6111,7 +6111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_rejects_cross_conversation_provider_context() {
+    async fn invalidation_rejects_cross_personality_agent_provider_context() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_message(&store, "message-2", 9).await.unwrap();
@@ -6121,15 +6121,25 @@ mod tests {
         let cross_key_ref = cross_record.key_ref.clone();
         cross_record.insert_committed(&store).await.unwrap();
 
-        // Tamper with the data_keys row so it appears to belong to another conversation,
-        // simulating a cross-conversation row referenced by this conversation's store.
+        // Disable the relationship check only for the deliberate corruption,
+        // while preserving the canonical UUIDv7 column contract.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(store.pool())
+            .await
+            .expect("disable fixture foreign keys");
         sqlx::query(
-            "UPDATE data_keys SET personality_agent_id = 'other-conversation' WHERE key_ref = ?",
+            "UPDATE data_keys SET personality_agent_id =
+                '0198f0f4-9b72-7000-8000-000000000002'
+             WHERE key_ref = ?",
         )
         .bind(&cross_key_ref)
         .execute(store.pool())
         .await
         .expect("tamper fixture");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(store.pool())
+            .await
+            .expect("restore fixture foreign keys");
 
         let replacement = reasoning_record(&store, "message-2", 9).await;
 
@@ -6157,10 +6167,10 @@ mod tests {
         let error = applier
             .apply("mutation-1")
             .await
-            .expect_err("cross-conversation id must fail closed");
+            .expect_err("cross-personality-agent id must fail closed");
         let message = format!("{error:#}");
         assert!(
-            message.contains("belongs to a different conversation"),
+            message.contains("belongs to another personality agent"),
             "{message}"
         );
 
@@ -6169,7 +6179,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(count, 1, "cross-conversation row must not be deleted");
+        assert_eq!(count, 1, "cross-personality-agent row must not be deleted");
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
             .bind(replacement.id())
@@ -7484,7 +7494,7 @@ mod tests {
         .expect_err("hydration must reject encrypted reasoning without a wire_item_index");
         let message = format!("{error:#}");
         assert!(
-            message.contains("encrypted reasoning must have a wire_item_index"),
+            message.contains("reasoning retention anchor requires a wire item index"),
             "{message}"
         );
     }
@@ -8286,7 +8296,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_shared_key() {
+    async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_sibling_keys() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7)])
@@ -8296,7 +8306,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Two reasoning records for the same anchor share a data key.
+        // Two reasoning records for the same owner have distinct retention keys.
         let a = reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         let a_id = a.id().to_owned();
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
@@ -8304,7 +8314,7 @@ mod tests {
         a.insert_committed(&store).await.unwrap();
         b.insert_committed(&store).await.unwrap();
 
-        // Replace invalidates pc-a and inserts pc-c. All three share the anchor key.
+        // Replace invalidates pc-a and inserts pc-c under its own retention key.
         let c = reasoning_record_with(&store, "message-1", 7, 0, 2).await;
         let c_id = c.id().to_owned();
         let mutation_key = store
@@ -8410,11 +8420,21 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 2, "remaining rows must survive");
 
-        // The shared anchor key stays active because pc-b and pc-c still use it.
-        let state = data_key_state(&store, &a.key_ref)
-            .await
-            .expect("key exists");
-        assert_eq!(state, "active", "shared anchor key must stay active");
+        assert_eq!(
+            data_key_state(&store, &a.key_ref).await.as_deref(),
+            Some("destroyed"),
+            "invalidated item key must be destroyed"
+        );
+        assert_eq!(
+            data_key_state(&store, &b.key_ref).await.as_deref(),
+            Some("active"),
+            "surviving sibling key must stay active"
+        );
+        assert_eq!(
+            data_key_state(&store, &c.key_ref).await.as_deref(),
+            Some("active"),
+            "replacement item key must stay active"
+        );
 
         // The internal test seam in `invalidate_ids` asserted the row's
         // ciphertext was overwritten with zeros before the DELETE executed.

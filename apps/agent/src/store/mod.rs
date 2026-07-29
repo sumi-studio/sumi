@@ -3750,7 +3750,7 @@ mod tests {
                 .await
                 .expect_err("purpose-level shared lookup is forbidden")
                 .to_string()
-                .contains("caller-stable authenticated anchor")
+                .contains("caller-stable retention anchors")
         );
         assert!(
             store
@@ -3777,15 +3777,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_key_rejects_workspace_purpose() {
+    async fn private_workspace_key_is_stable_and_agent_scoped() {
         let store = store().await;
-        assert!(
-            store
-                .private_key(DataKeyPurpose::Workspace)
-                .await
-                .expect_err("workspace keys must be agent-scoped")
-                .to_string()
-                .contains("workspace keys are agent-scoped")
+        let first = store
+            .private_key(DataKeyPurpose::Workspace)
+            .await
+            .expect("mint agent-scoped workspace key");
+        let second = store
+            .private_key(DataKeyPurpose::Workspace)
+            .await
+            .expect("reuse agent-scoped workspace key");
+        assert_eq!(first.key_ref, second.key_ref);
+        assert_eq!(first.purpose, DataKeyPurpose::Workspace);
+
+        let row: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT scope, purpose, personality_agent_id, retention_unit, state
+             FROM data_keys WHERE key_ref = ?",
+        )
+        .bind(&first.key_ref)
+        .fetch_one(store.pool())
+        .await
+        .expect("load persisted workspace key");
+        assert_eq!(
+            row,
+            (
+                "personality_agent".to_owned(),
+                "workspace".to_owned(),
+                store.scope().personality_agent_id.to_string(),
+                "agent".to_owned(),
+                "active".to_owned(),
+            )
         );
     }
 
@@ -6863,6 +6884,16 @@ mod tests {
         );
     }
 
+    async fn register_sqlite_migration_fixture_functions(pool: &SqlitePool) {
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire migration fixture connection");
+        sqlite_uuid::register(&mut connection)
+            .await
+            .expect("register canonical UUIDv7 migration fixture function");
+    }
+
     #[tokio::test]
     async fn migration_0006_upgrades_from_0001_and_0002_without_data_loss() {
         let pool = SqlitePoolOptions::new()
@@ -6870,6 +6901,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open upgrade test pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
 
         let one = MIGRATOR
             .migrations
@@ -7015,6 +7047,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open migration fixture pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
         for migration in MIGRATOR
             .migrations
             .iter()
@@ -7156,6 +7189,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open migration 0008 test pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
 
         for migration in MIGRATOR
             .migrations

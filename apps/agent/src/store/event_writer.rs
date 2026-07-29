@@ -10420,31 +10420,85 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         }
     }
 
+    let writer = EventWriter::new(Arc::new(store.clone()));
+    let provenance = DirectChatProvenanceV1::new(
+        "tenant-test",
+        store.scope().personality_agent_id.clone(),
+        "human-test",
+    )?;
     let command_key = store.private_key(DataKeyPurpose::Command).await?;
-    let event_key = store.private_key(DataKeyPurpose::Event).await?;
-    let mut transaction = store.pool().begin().await?;
     let command_seq_base: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM inbound_commands")
-            .fetch_one(&mut *transaction)
+            .fetch_one(store.pool())
             .await?;
+    let event_key = store.private_key(DataKeyPurpose::Event).await?;
+    let mut transaction = store.pool().begin().await?;
     for (index, owner) in by_end_seq.values().enumerate() {
         let command_seq = command_seq_base
             .checked_add(i64::try_from(index + 1).context("fixture command sequence overflow")?)
             .ok_or_else(|| anyhow!("fixture command sequence overflow"))?;
+        let command_id = Uuid::now_v7().to_string();
+        let command_seq = sqlite_u64(command_seq, "provider-context fixture command sequence")?;
+        let payload = Zeroizing::new(serde_json::to_vec(&Command::UserMessage {
+            text: format!("provider-context owner evidence for {}", owner.message_id),
+            attachments: Vec::new(),
+        })?);
+        let PreparedProjection::CommandInsert {
+            seq,
+            command_id,
+            personality_agent_id,
+            provenance_json,
+            command_kind,
+            payload_key_ref,
+            payload_key_proof: _,
+            payload_ciphertext,
+            payload_hmac,
+            status,
+            reject_reason,
+            reject_actual_bytes,
+            admission_record_hmac,
+        } = writer.prepare_command_insert(CommandInsertInput {
+            key: &command_key,
+            seq: command_seq,
+            command_id,
+            personality_agent_id: store.scope().personality_agent_id(),
+            provenance: &provenance,
+            command_kind: "user_message",
+            canonical_payload: &payload,
+            rejection: None,
+            provided_digest: None,
+        })?
+        else {
+            unreachable!("command preparation returns a command insert");
+        };
+        if status != "received" || reject_reason.is_some() || reject_actual_bytes.is_some() {
+            bail!("provider-context fixture command unexpectedly prepared as rejected");
+        }
         sqlx::query(
             "INSERT INTO inbound_commands(
-                seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                seq, command_id, personality_agent_id, provenance_json,
+                command_kind, payload_ciphertext, payload_key_ref,
                 payload_hmac, status, reject_reason, reject_actual_bytes,
+                admission_record_version, admission_record_hmac,
                 application_kind, run_id, turn_id, run_phase, received_at, applied_at
-             ) VALUES(?, ?, 'user_message', X'00', ?, X'00', 'applying',
-                      NULL, NULL, 'idle_run', ?, ?, 'assistant_started', ?, NULL)",
+             ) VALUES(
+                ?, ?, ?, ?, ?, ?, ?, ?, 'applying', NULL, NULL, ?, ?,
+                'idle_run', ?, ?, 'assistant_started', ?, NULL
+             )",
         )
-        .bind(command_seq)
-        .bind(format!(
-            "provider-context-fixture-command-{}",
-            owner.message_id
-        ))
-        .bind(&command_key.key_ref)
+        .bind(sqlite_i64(
+            seq,
+            "provider-context fixture command sequence",
+        )?)
+        .bind(command_id)
+        .bind(personality_agent_id.as_str())
+        .bind(provenance_json)
+        .bind(command_kind)
+        .bind(payload_ciphertext)
+        .bind(payload_key_ref)
+        .bind(payload_hmac)
+        .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+        .bind(admission_record_hmac)
         .bind(&owner.run_id)
         .bind(&owner.turn_id)
         .bind(Utc::now().to_rfc3339())
