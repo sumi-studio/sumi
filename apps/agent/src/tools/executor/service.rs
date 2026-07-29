@@ -4,6 +4,7 @@ use std::{
     env,
     future::{Future, poll_fn},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -28,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use super::{
     ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse, ExecutorOperation,
     ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
-    RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
+    RpcRequest, decode_rpc_line, encode_rpc_frame,
+    manager::{CancelDecision, ExecutionLease, ExecutorManager},
+    resolve_input,
 };
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{
@@ -48,7 +51,83 @@ const EXECUTOR_TERMINAL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 // progress can never leave a partial JSON frame ahead of the terminal.
 const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
+const EXECUTOR_CANCEL_SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
+const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
+const EXECUTOR_OPERATION_CAPACITY: usize = 8;
+const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(135);
+const SOCKET_CONNECT_DEADLINE: Duration = Duration::from_secs(1);
+const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
+const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// Wait until a Unix-domain endpoint accepts a connection. A missing endpoint
+/// may still be starting; every other error fails closed.
+async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
+    for attempt in 0..SOCKET_READINESS_RETRY_LIMIT {
+        match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(Err(error)) => {
+                bail!(
+                    "{label} socket {} is not accepting connections: {error}",
+                    path.display()
+                );
+            }
+            Err(_) => {}
+        }
+        if attempt + 1 < SOCKET_READINESS_RETRY_LIMIT {
+            tokio::time::sleep(SOCKET_READINESS_RETRY_DELAY).await;
+        }
+    }
+    bail!("{label} socket {} did not become accepting", path.display())
+}
+
+/// Bind without stealing a live endpoint. Only a connection-refused path that
+/// is itself a Unix socket is eligible for stale-socket cleanup.
+async fn bind_unix_listener(path: &Path, label: &str) -> Result<UnixListener> {
+    match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
+        Ok(Ok(_)) => {
+            bail!(
+                "{label} socket {} is already owned by a live listener",
+                path.display()
+            );
+        }
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                format!("failed to inspect stale {label} socket {}", path.display())
+            })?;
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "{label} socket path {} is not a stale Unix socket",
+                    path.display()
+                );
+            }
+            tokio::fs::remove_file(path).await.with_context(|| {
+                format!("failed to remove stale {label} socket {}", path.display())
+            })?;
+        }
+        Ok(Err(error)) => {
+            bail!(
+                "{label} socket {} is not safely replaceable: {error}",
+                path.display()
+            );
+        }
+        Err(_) => {
+            bail!(
+                "{label} socket {} connect timed out; refusing to steal a potentially live listener",
+                path.display()
+            );
+        }
+    }
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("failed to bind {label} socket {}", path.display()))?;
+    // Executor/runtime and broker/executor run under separate service UIDs.
+    // A supervisor-owned setgid IPC directory supplies the shared group.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("failed to restrict {label} socket {}", path.display()))?;
+    Ok(listener)
+}
 
 #[cfg(test)]
 pub(super) struct ExecutorTestControls {
@@ -491,6 +570,7 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
+    let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
     run_executor_service_with_writer(
         stdin,
         ExecutorWriter::start_atomic_progress(stdout),
@@ -498,10 +578,70 @@ pub async fn run_tool_executor_mode() -> Result<()> {
         workspace,
         fs,
         broker,
+        manager,
         #[cfg(test)]
         ExecutorTestControls::default(),
     )
     .await
+}
+
+/// Long-lived Unix executor endpoint for one personality-agent VM process.
+///
+/// Transport sessions are independent, while admission, request/execution
+/// uniqueness, cancellation, and terminal-outcome retention are owned by the
+/// one manager created before the accept loop.
+pub async fn run_tool_executor_socket_mode() -> Result<()> {
+    let identity = identity_from_env()?;
+    let workspace = required_path("SUMI_WORKSPACE")?;
+    let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
+    let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
+
+    wait_for_unix_socket(&broker_socket, "artifact broker")
+        .await
+        .context("artifact broker socket is not ready")?;
+    let listener = bind_unix_listener(&executor_socket, "executor").await?;
+    let connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
+    let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept executor connection")?;
+        let Ok(connection_permit) = connections.clone().try_acquire_owned() else {
+            tracing::warn!("executor connection capacity reached");
+            drop(stream);
+            continue;
+        };
+        let identity = identity.clone();
+        let workspace = workspace.clone();
+        let broker_socket = broker_socket.clone();
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
+                let (read, write) = stream.into_split();
+                let fs = WorkspaceFs::open(&workspace)?;
+                let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
+                run_executor_service_with_manager(
+                    read, write, identity, workspace, fs, broker, manager,
+                )
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "executor socket connection closed with error");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "executor socket connection exceeded its bounded lifetime; active work was cancelled"
+                    );
+                }
+            }
+            drop(connection_permit);
+        });
+    }
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
@@ -640,6 +780,31 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    run_executor_service_with_manager(
+        read,
+        write,
+        identity,
+        workspace,
+        fs,
+        broker,
+        ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
+    )
+    .await
+}
+
+async fn run_executor_service_with_manager<R, W>(
+    read: R,
+    write: W,
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+    manager: Arc<ExecutorManager>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     run_executor_service_with_writer(
         read,
         ExecutorWriter::start(write),
@@ -647,6 +812,7 @@ where
         workspace,
         fs,
         broker,
+        manager,
         #[cfg(test)]
         ExecutorTestControls::default(),
     )
@@ -674,6 +840,7 @@ where
         workspace,
         fs,
         broker,
+        ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
         test_controls,
     )
     .await
@@ -686,6 +853,7 @@ async fn run_executor_service_with_writer<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    manager: Arc<ExecutorManager>,
     #[cfg(test)] test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
@@ -698,6 +866,7 @@ where
         workspace,
         fs,
         broker,
+        manager,
         #[cfg(test)]
         test_controls,
     )
@@ -714,13 +883,13 @@ async fn run_executor_loop<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    manager: Arc<ExecutorManager>,
     #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut read = BufReader::new(read);
-    let mut lifecycle = RpcLifecycleTracker::default();
     loop {
         let Some(line) = read_frame(&mut read).await? else {
             return Ok(());
@@ -728,8 +897,7 @@ where
         let request = match decode_executor_request(&line, &identity)? {
             Ok(request) => request,
             Err((request_id, error)) => {
-                lifecycle.begin_request(&request_id)?;
-                lifecycle.accept_terminal(&request_id)?;
+                manager.reject_request(&request_id)?;
                 writer.terminal(&identity, request_id, Err(error)).await?;
                 continue;
             }
@@ -739,14 +907,22 @@ where
                 command,
                 execution_id,
             } => {
-                lifecycle.begin_execution(&request.request_id, &execution_id)?;
+                let cancel = CancellationToken::new();
+                let mut execution = manager
+                    .begin_execution(
+                        request.request_id.clone(),
+                        execution_id.clone(),
+                        Some(cancel),
+                    )
+                    .await?;
                 run_bash_request(
                     &mut read,
                     writer,
                     &identity,
                     &workspace,
                     &broker,
-                    &mut lifecycle,
+                    &manager,
+                    &mut execution,
                     request.request_id,
                     execution_id,
                     command,
@@ -759,15 +935,13 @@ where
                 .await?;
             }
             ExecutorOperation::Cancel { execution_id } => {
-                lifecycle.begin_request(&request.request_id)?;
-                lifecycle.accept_terminal(&request.request_id)?;
-                let result = if lifecycle.execution_is_completed(&execution_id) {
-                    Ok(ExecutorResponse::CancelTooLate {})
-                } else {
-                    Err(RpcError {
+                let result = match manager.cancel_execution(&request.request_id, &execution_id)? {
+                    CancelDecision::Accepted(completed) => settle_manager_cancel(completed).await,
+                    CancelDecision::TooLate => Ok(ExecutorResponse::CancelTooLate {}),
+                    CancelDecision::Unknown => Err(RpcError {
                         code: "protocol".to_owned(),
                         resource_limit: None,
-                    })
+                    }),
                 };
                 writer
                     .terminal(&identity, request.request_id, result)
@@ -775,14 +949,33 @@ where
             }
             operation => {
                 let execution_id = operation_execution_id(&operation).to_owned();
-                lifecycle.begin_execution(&request.request_id, &execution_id)?;
-                let result = execute_non_bash(&fs, &broker, operation).await;
-                lifecycle.accept_terminal(&request.request_id)?;
+                let mut execution = manager
+                    .begin_execution(request.request_id.clone(), execution_id, None)
+                    .await?;
+                let result = execute_non_bash(&fs, &broker, operation)
+                    .await
+                    .map_err(rpc_error);
+                execution.complete(result.clone())?;
                 writer
-                    .terminal(&identity, request.request_id, result.map_err(rpc_error))
+                    .terminal(&identity, request.request_id, result)
                     .await?;
             }
         }
+    }
+}
+
+async fn settle_manager_cancel(
+    completed: oneshot::Receiver<Result<ExecutorResponse, RpcError>>,
+) -> Result<ExecutorResponse, RpcError> {
+    match timeout(EXECUTOR_CANCEL_SETTLEMENT_DEADLINE, completed).await {
+        Ok(Ok(Ok(ExecutorResponse::Bash { result }))) if result.cancelled => {
+            Ok(ExecutorResponse::CancelAccepted {})
+        }
+        Ok(Ok(Ok(ExecutorResponse::Bash { result }))) if !result.cancelled => {
+            Ok(ExecutorResponse::CancelTooLate {})
+        }
+        Ok(Ok(Ok(_))) => Err(bounded_error("protocol")),
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => Err(bounded_error("rpc_indeterminate")),
     }
 }
 
@@ -793,7 +986,8 @@ async fn run_bash_request<R>(
     identity: &RpcIdentity,
     workspace: &Path,
     broker: &ArtifactBrokerClient,
-    lifecycle: &mut RpcLifecycleTracker,
+    manager: &Arc<ExecutorManager>,
+    execution_lease: &mut ExecutionLease,
     request_id: String,
     execution_id: String,
     command: String,
@@ -802,7 +996,9 @@ async fn run_bash_request<R>(
 where
     R: AsyncBufRead + Unpin,
 {
-    let cancel = CancellationToken::new();
+    let cancel = execution_lease.cancellation_token().ok_or_else(|| {
+        ToolError::Protocol("bash execution is missing its manager cancellation token".to_owned())
+    })?;
     let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
     #[cfg(test)]
@@ -828,7 +1024,7 @@ where
         tokio::select! {
             biased;
             next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
-                match classify_active_control(next, identity, &execution_id, lifecycle) {
+                match classify_active_control(next, identity, &execution_id, manager) {
                     ActiveControl::Cancel(cancel_request_id) => {
                         break BashExit::Cancelled {
                             cancel_request_id,
@@ -853,7 +1049,7 @@ where
                         Some(next),
                         identity,
                         &execution_id,
-                        lifecycle,
+                        manager,
                     ) {
                         ActiveControl::Cancel(cancel_request_id) => {
                             break BashExit::Cancelled {
@@ -877,7 +1073,7 @@ where
                     && let Err(error) = forward_bash_update(
                         writer,
                         identity,
-                        lifecycle,
+                        manager,
                         &request_id,
                         value,
                     )
@@ -906,17 +1102,11 @@ where
                     Ok(result) => result,
                     Err(_) => {
                         tracing::warn!("executor cancellation exceeded its service deadline");
-                        lifecycle.accept_terminal(&request_id)?;
-                        writer
-                            .terminal(
-                                identity,
-                                request_id,
-                                Err(rpc_error(ToolError::RpcIndeterminate(
-                                    "executor cancellation exceeded its service deadline"
-                                        .to_owned(),
-                                ))),
-                            )
-                            .await?;
+                        let terminal = Err(rpc_error(ToolError::RpcIndeterminate(
+                            "executor cancellation exceeded its service deadline".to_owned(),
+                        )));
+                        execution_lease.complete(terminal.clone())?;
+                        writer.terminal(identity, request_id, terminal).await?;
                         if let Some((response_id, response_error)) = response {
                             writer
                                 .terminal(identity, response_id, Err(response_error))
@@ -926,23 +1116,12 @@ where
                     }
                 },
             };
-            drain_completed_bash_updates(
-                writer,
-                identity,
-                lifecycle,
-                &request_id,
-                &mut updates_rx,
-            )?;
-            lifecycle.accept_terminal(&request_id)?;
-            writer
-                .terminal(
-                    identity,
-                    request_id,
-                    result
-                        .map(|result| ExecutorResponse::Bash { result })
-                        .map_err(rpc_error),
-                )
-                .await?;
+            drain_completed_bash_updates(writer, identity, manager, &request_id, &mut updates_rx)?;
+            let terminal = result
+                .map(|result| ExecutorResponse::Bash { result })
+                .map_err(rpc_error);
+            execution_lease.complete(terminal.clone())?;
+            writer.terminal(identity, request_id, terminal).await?;
             if let Some((response_id, response_error)) = response {
                 writer
                     .terminal(identity, response_id, Err(response_error))
@@ -951,23 +1130,12 @@ where
             Err(error.into())
         }
         BashExit::Completed(result) => {
-            drain_completed_bash_updates(
-                writer,
-                identity,
-                lifecycle,
-                &request_id,
-                &mut updates_rx,
-            )?;
-            lifecycle.accept_terminal(&request_id)?;
-            writer
-                .terminal(
-                    identity,
-                    request_id,
-                    result
-                        .map(|result| ExecutorResponse::Bash { result })
-                        .map_err(rpc_error),
-                )
-                .await?;
+            drain_completed_bash_updates(writer, identity, manager, &request_id, &mut updates_rx)?;
+            let terminal = result
+                .map(|result| ExecutorResponse::Bash { result })
+                .map_err(rpc_error);
+            execution_lease.complete(terminal.clone())?;
+            writer.terminal(identity, request_id, terminal).await?;
             Ok(())
         }
         BashExit::Cancelled {
@@ -982,7 +1150,8 @@ where
                 None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(_reap_error)) => {
-                        lifecycle.accept_terminal(&request_id)?;
+                        let terminal = Err(bounded_error("rpc_indeterminate"));
+                        execution_lease.complete(terminal.clone())?;
                         writer
                             .terminal(
                                 identity,
@@ -990,20 +1159,17 @@ where
                                 Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
-                        writer
-                            .terminal(
-                                identity,
-                                request_id,
-                                Err(bounded_error("rpc_indeterminate")),
-                            )
-                            .await?;
+                        writer.terminal(identity, request_id, terminal).await?;
                         return Err(anyhow::anyhow!(
                             "executor cancellation failed before cleanup was proven"
                         ));
                     }
                     Err(_) => {
                         tracing::warn!("executor cancellation exceeded its service deadline");
-                        lifecycle.accept_terminal(&request_id)?;
+                        let terminal = Err(rpc_error(ToolError::RpcIndeterminate(
+                            "executor cancellation exceeded its service deadline".to_owned(),
+                        )));
+                        execution_lease.complete(terminal.clone())?;
                         writer
                             .terminal(
                                 identity,
@@ -1011,47 +1177,27 @@ where
                                 Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
-                        writer
-                            .terminal(
-                                identity,
-                                request_id,
-                                Err(rpc_error(ToolError::RpcIndeterminate(
-                                    "executor cancellation exceeded its service deadline"
-                                        .to_owned(),
-                                ))),
-                            )
-                            .await?;
+                        writer.terminal(identity, request_id, terminal).await?;
                         return Err(anyhow::anyhow!(
                             "executor cancellation exceeded its service deadline"
                         ));
                     }
                 },
             };
-            drain_completed_bash_updates(
-                writer,
-                identity,
-                lifecycle,
-                &request_id,
-                &mut updates_rx,
-            )?;
-            lifecycle.accept_terminal(&request_id)?;
+            drain_completed_bash_updates(writer, identity, manager, &request_id, &mut updates_rx)?;
             let cancel_response = match &result {
                 Ok(result) if result.cancelled => Ok(ExecutorResponse::CancelAccepted {}),
                 Ok(_) => Ok(ExecutorResponse::CancelTooLate {}),
                 Err(_) => Err(bounded_error("rpc_indeterminate")),
             };
+            let terminal = result
+                .map(|result| ExecutorResponse::Bash { result })
+                .map_err(rpc_error);
+            execution_lease.complete(terminal.clone())?;
             writer
                 .terminal(identity, cancel_request_id, cancel_response)
                 .await?;
-            writer
-                .terminal(
-                    identity,
-                    request_id,
-                    result
-                        .map(|result| ExecutorResponse::Bash { result })
-                        .map_err(rpc_error),
-                )
-                .await?;
+            writer.terminal(identity, request_id, terminal).await?;
             Ok(())
         }
     }
@@ -1081,7 +1227,7 @@ fn signal_cancel_ingested(cancel_ingested: &mut Option<oneshot::Sender<()>>) {
 fn forward_bash_update(
     writer: &ExecutorWriter,
     identity: &RpcIdentity,
-    lifecycle: &RpcLifecycleTracker,
+    manager: &ExecutorManager,
     request_id: &str,
     value: Value,
 ) -> Result<(), ToolError> {
@@ -1090,7 +1236,7 @@ fn forward_bash_update(
         _ => None,
     };
     let Some(output) = output else {
-        return forward_single_bash_update(writer, identity, lifecycle, request_id, value);
+        return forward_single_bash_update(writer, identity, manager, request_id, value);
     };
 
     // Bash emits at most one bounded reader chunk per callback, but JSON
@@ -1103,7 +1249,7 @@ fn forward_bash_update(
         let frame = bash_update_frame(identity, request_id, value.clone());
         if encode_rpc_frame(&frame).is_ok_and(|bytes| bytes.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
         {
-            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            forward_single_bash_update(writer, identity, manager, request_id, value)?;
             continue;
         }
 
@@ -1114,7 +1260,7 @@ fn forward_bash_update(
         let Some(split) = split else {
             // Metadata alone can make even one scalar unwriteable. Preserve
             // volatile-update semantics and let try_update drop it explicitly.
-            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            forward_single_bash_update(writer, identity, manager, request_id, value)?;
             continue;
         };
         let (left, right) = chunk.split_at(split);
@@ -1141,11 +1287,11 @@ fn bash_update_frame(
 fn forward_single_bash_update(
     writer: &ExecutorWriter,
     identity: &RpcIdentity,
-    lifecycle: &RpcLifecycleTracker,
+    manager: &ExecutorManager,
     request_id: &str,
     value: Value,
 ) -> Result<(), ToolError> {
-    lifecycle.accept_update(request_id)?;
+    manager.accept_update(request_id)?;
     let frame = bash_update_frame(identity, request_id, value);
     writer.try_update(&frame)
 }
@@ -1153,7 +1299,7 @@ fn forward_single_bash_update(
 fn drain_completed_bash_updates(
     writer: &ExecutorWriter,
     identity: &RpcIdentity,
-    lifecycle: &RpcLifecycleTracker,
+    manager: &ExecutorManager,
     request_id: &str,
     updates_rx: &mut mpsc::Receiver<Value>,
 ) -> Result<(), ToolError> {
@@ -1162,7 +1308,7 @@ fn drain_completed_bash_updates(
     // point, so a nonblocking drain is a stable synchronization boundary, not
     // a racy snapshot.
     while let Ok(value) = updates_rx.try_recv() {
-        forward_bash_update(writer, identity, lifecycle, request_id, value)?;
+        forward_bash_update(writer, identity, manager, request_id, value)?;
     }
     Ok(())
 }
@@ -1197,7 +1343,7 @@ fn classify_active_control(
     next: Option<Result<Option<Vec<u8>>, ToolError>>,
     identity: &RpcIdentity,
     execution_id: &str,
-    lifecycle: &mut RpcLifecycleTracker,
+    manager: &ExecutorManager,
 ) -> ActiveControl {
     let Some(next) = next else {
         return ActiveControl::Fatal {
@@ -1233,10 +1379,7 @@ fn classify_active_control(
         }
         Ok(Ok(request)) => request,
         Ok(Err((request_id, response_error))) => {
-            let lifecycle_result = lifecycle
-                .begin_request(&request_id)
-                .and_then(|()| lifecycle.accept_terminal(&request_id));
-            return match lifecycle_result {
+            return match manager.reject_request(&request_id) {
                 Ok(()) => ActiveControl::Fatal {
                     error: ToolError::Protocol(
                         "invalid control request during active bash execution".to_owned(),
@@ -1255,11 +1398,14 @@ fn classify_active_control(
     } = &incoming.operation
         && target == execution_id
     {
-        return match lifecycle
-            .accept_cancel(&incoming.request_id, target)
-            .and_then(|()| lifecycle.accept_terminal(&incoming.request_id))
-        {
-            Ok(()) => ActiveControl::Cancel(incoming.request_id),
+        return match manager.cancel_execution(&incoming.request_id, target) {
+            Ok(CancelDecision::Accepted(_completed)) => ActiveControl::Cancel(incoming.request_id),
+            Ok(CancelDecision::TooLate | CancelDecision::Unknown) => ActiveControl::Fatal {
+                error: ToolError::Protocol(
+                    "matching cancel did not target an active cancellable execution".to_owned(),
+                ),
+                response: None,
+            },
             Err(error) => ActiveControl::Fatal {
                 error,
                 response: None,
@@ -1268,10 +1414,7 @@ fn classify_active_control(
     }
 
     let request_id = incoming.request_id;
-    match lifecycle
-        .begin_request(&request_id)
-        .and_then(|()| lifecycle.accept_terminal(&request_id))
-    {
+    match manager.reject_request(&request_id) {
         Ok(()) => ActiveControl::Fatal {
             error: ToolError::Protocol(
                 "only a matching cancel is valid during active bash execution".to_owned(),
@@ -1830,9 +1973,10 @@ mod tests {
         let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let (read_side, write_side) = tokio::io::duplex(4096);
         let (writer, writer_task) = ExecutorWriter::start(write_side);
-        let mut lifecycle = RpcLifecycleTracker::default();
-        lifecycle
-            .begin_execution("request-1", "execution-1")
+        let manager = ExecutorManager::new(1);
+        let mut execution = manager
+            .begin_execution("request-1".to_owned(), "execution-1".to_owned(), None)
+            .await
             .expect("begin execution");
         let (updates_tx, mut updates_rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
         updates_tx
@@ -1845,10 +1989,10 @@ mod tests {
             .expect("queue second update");
         drop(updates_tx);
 
-        drain_completed_bash_updates(&writer, &identity, &lifecycle, "request-1", &mut updates_rx)
+        drain_completed_bash_updates(&writer, &identity, &manager, "request-1", &mut updates_rx)
             .expect("drain completed updates");
-        lifecycle
-            .accept_terminal("request-1")
+        execution
+            .complete(Ok(ExecutorResponse::Written {}))
             .expect("accept terminal");
         writer
             .terminal(
@@ -1985,16 +2129,17 @@ mod tests {
             allow_write: Arc::new(Mutex::new(true)),
         };
         let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
-        let mut lifecycle = RpcLifecycleTracker::default();
-        lifecycle
-            .begin_execution("request-1", "execution-1")
+        let manager = ExecutorManager::new(1);
+        let _execution = manager
+            .begin_execution("request-1".to_owned(), "execution-1".to_owned(), None)
+            .await
             .expect("begin execution");
         let output = "界\"\\\n".repeat(2_000);
 
         forward_bash_update(
             &writer,
             &identity,
-            &lifecycle,
+            &manager,
             "request-1",
             serde_json::json!({"output": output}),
         )

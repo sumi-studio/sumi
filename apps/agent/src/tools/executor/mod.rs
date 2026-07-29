@@ -5,6 +5,7 @@
 mod artifact_broker;
 mod client;
 mod executor_client;
+mod manager;
 mod protocol;
 mod remote;
 mod service;
@@ -24,4 +25,6 @@ pub use protocol::{
 };
 #[allow(unused_imports)]
 pub use remote::remote_executor_registry;
-pub use service::{run_artifact_broker_mode, run_tool_executor_mode};
+pub use service::{
+    run_artifact_broker_mode, run_tool_executor_mode, run_tool_executor_socket_mode,
+};
