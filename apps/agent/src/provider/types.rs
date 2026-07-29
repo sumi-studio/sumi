@@ -141,6 +141,12 @@ pub struct ProviderContextItem {
 /// zero and has no duplicate or missing ordinal. Native windows form an
 /// unanchored group scoped by their exact provider origin and payload kind.
 pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
+    validate_provider_context_ordinal_refs(items.iter())
+}
+
+pub(crate) fn validate_provider_context_ordinal_refs<'a>(
+    items: impl IntoIterator<Item = &'a ProviderContextItem>,
+) -> Result<(), String> {
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum Group {
         Anchored {

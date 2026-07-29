@@ -4797,10 +4797,11 @@ async fn validate_prepared_error_context_fences(
         });
     if common_mutation_apply_only {
         // The common applier re-authenticates the already-prepared intent,
-        // fixed target ids, and key proofs before deleting rows and erasing
-        // unreferenced keys. It is the only path allowed to bypass discovery:
-        // requiring live-row hydration here would make recovery impossible
-        // after a partial delete or crypto-erasure.
+        // fixed target ids, key proofs, and every present target row before
+        // deleting rows or erasing unreferenced keys. Already-absent targets
+        // are accepted only for prepared-mutation idempotence; SQLite commits
+        // each application atomically, so no partially applied transaction is
+        // observable here.
         return Ok(());
     }
 
@@ -8805,6 +8806,7 @@ async fn validate_non_empty_turn_end_bindings(
 }
 
 struct AuthenticatedDurableEvent {
+    event: AgentEvent,
     kind: String,
     internal_metadata: String,
     metadata: DurableEventMetadata,
@@ -8864,6 +8866,7 @@ async fn load_authenticated_event(
     }
     let internal_metadata: String = row.try_get("internal_metadata")?;
     Ok(AuthenticatedDurableEvent {
+        event,
         kind,
         internal_metadata: internal_metadata.clone(),
         metadata: serde_json::from_str(&internal_metadata)
@@ -8931,6 +8934,269 @@ pub(super) async fn authenticate_event_log_snapshot(
     reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
         .await
         .map(drop)
+}
+
+pub(super) struct ProviderContextOwnerEventEvidence {
+    pub(super) anchor: ProviderContextAnchor,
+    pub(super) message: Message,
+}
+
+pub(super) async fn authenticate_provider_context_owner_events(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    evidence: &[ProviderContextOwnerEventEvidence],
+) -> Result<()> {
+    let mut expected = BTreeMap::<u64, (&str, &Message)>::new();
+    for owner in evidence {
+        match expected.entry(owner.anchor.message_seq) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((&owner.anchor.message_id, &owner.message));
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if *entry.get() == (owner.anchor.message_id.as_str(), &owner.message) => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                bail!(
+                    "provider-context targets claim conflicting MessageEnd evidence at sequence {}",
+                    owner.anchor.message_seq
+                );
+            }
+        }
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    authenticate_event_log_snapshot(store, transaction)
+        .await
+        .context("failed to authenticate event history for provider-context invalidation")?;
+    for (seq, (expected_message_id, expected_message)) in expected {
+        let physical_seq = sqlite_i64(seq, "provider-context retention owner event sequence")?;
+        let event = load_authenticated_event(store, transaction, physical_seq).await?;
+        let AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } = &event.event
+        else {
+            bail!(
+                "provider-context retention owner {expected_message_id}:{seq} does not resolve to an authenticated MessageEnd event"
+            );
+        };
+        if message_id != expected_message_id
+            || Message::from((**message).clone()) != *expected_message
+        {
+            bail!(
+                "provider-context retention owner {expected_message_id}:{seq} disagrees with authenticated MessageEnd evidence"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn seed_provider_context_owner_event_evidence(
+    store: &Store,
+    owners: &[(&str, u64)],
+) -> Result<()> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let existing_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        .fetch_one(store.pool())
+        .await?;
+    let existing_head: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_log_heads")
+        .fetch_one(store.pool())
+        .await?;
+    if existing_events != 0 || existing_head != 0 {
+        bail!("provider-context event-evidence fixture requires an empty event log");
+    }
+
+    struct OwnerFixture {
+        message_id: String,
+        message: PublicMessage,
+        run_id: String,
+        turn_id: String,
+    }
+
+    let mut by_end_seq = BTreeMap::new();
+    for (message_id, seq) in owners {
+        let row = sqlx::query(
+            "SELECT raw_key_ref, raw_ciphertext
+             FROM messages WHERE id = ? AND seq = ?",
+        )
+        .bind(message_id)
+        .bind(sqlite_i64(
+            *seq,
+            "provider-context fixture message sequence",
+        )?)
+        .fetch_optional(store.pool())
+        .await?
+        .ok_or_else(|| {
+            anyhow!("provider-context event fixture message {message_id}:{seq} does not exist")
+        })?;
+        let key_ref: String = row.try_get("raw_key_ref")?;
+        let key = store.data_key_by_ref(&key_ref).await?;
+        if key.purpose != DataKeyPurpose::Transcript {
+            bail!("provider-context event fixture message uses a non-transcript key");
+        }
+        let aad = store
+            .scope()
+            .row_aad("messages", *message_id, DataKeyPurpose::Transcript);
+        let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+        let plaintext = Zeroizing::new(
+            super::crypto::decrypt_content(&key, &ciphertext, &aad)
+                .context("failed to authenticate provider-context fixture transcript message")?,
+        );
+        let message: PublicMessage = serde_json::from_slice(&plaintext)
+            .context("provider-context fixture transcript is not a PublicMessage")?;
+        if !matches!(message, PublicMessage::Assistant(_)) {
+            bail!("provider-context event fixture owner must be an assistant message");
+        }
+        let fixture = OwnerFixture {
+            message_id: (*message_id).to_owned(),
+            message,
+            run_id: format!("provider-context-fixture-run-{message_id}-{seq}"),
+            turn_id: format!("provider-context-fixture-turn-{message_id}-{seq}"),
+        };
+        if by_end_seq.insert(*seq, fixture).is_some() {
+            bail!("provider-context event fixture owner sequences must be unique");
+        }
+    }
+
+    let end_seqs: BTreeSet<_> = by_end_seq.keys().copied().collect();
+    let mut used_seqs = end_seqs.clone();
+    let mut starts = BTreeMap::new();
+    for (&end_seq, owner) in &by_end_seq {
+        let start_seq = (1..end_seq)
+            .rev()
+            .find(|candidate| !used_seqs.contains(candidate))
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider-context event fixture MessageEnd {end_seq} has no earlier sequence for MessageStart"
+                )
+            })?;
+        used_seqs.insert(start_seq);
+        starts.insert(start_seq, end_seq);
+        if owner.message_id.is_empty() {
+            bail!("provider-context event fixture message id must not be empty");
+        }
+    }
+
+    let command_key = store.conversation_key(DataKeyPurpose::Command).await?;
+    let event_key = store.conversation_key(DataKeyPurpose::Event).await?;
+    let mut transaction = store.pool().begin().await?;
+    for (index, owner) in by_end_seq.values().enumerate() {
+        sqlx::query(
+            "INSERT INTO inbound_commands(
+                seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                payload_hmac, status, reject_reason, reject_actual_bytes,
+                application_kind, run_id, turn_id, run_phase, received_at, applied_at
+             ) VALUES(?, ?, 'user_message', X'00', ?, X'00', 'applying',
+                      NULL, NULL, 'idle_run', ?, ?, 'assistant_started', ?, NULL)",
+        )
+        .bind(i64::try_from(index + 1).context("fixture command sequence overflow")?)
+        .bind(format!(
+            "provider-context-fixture-command-{}",
+            owner.message_id
+        ))
+        .bind(&command_key.key_ref)
+        .bind(&owner.run_id)
+        .bind(&owner.turn_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    let last_seq = *by_end_seq
+        .last_key_value()
+        .expect("non-empty owner fixture")
+        .0;
+    let mut chain_digest = [0_u8; EVENT_DIGEST_BYTES];
+    for seq in 1..=last_seq {
+        let event = if let Some(end_seq) = starts.get(&seq) {
+            let owner = by_end_seq
+                .get(end_seq)
+                .expect("start schedule references a known owner");
+            DurableEvent::message_in_turn(
+                "message_start",
+                &owner.message_id,
+                &owner.message,
+                Some(owner.run_id.clone()),
+                Some(owner.turn_id.clone()),
+            )?
+        } else if let Some(owner) = by_end_seq.get(&seq) {
+            DurableEvent::message_in_turn(
+                "message_end",
+                &owner.message_id,
+                &owner.message,
+                Some(owner.run_id.clone()),
+                Some(owner.turn_id.clone()),
+            )?
+        } else {
+            DurableEvent::memory_maintenance("provider-context-fixture-gap")?
+        };
+        let aad = store
+            .scope()
+            .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
+        let protected = PublicProjectionBuilder::new(store.redactor(), &event_key)
+            .build_serialized(&event.raw_json, &aad)?;
+        let kind = event
+            .value
+            .durable_kind()
+            .expect("fixture events are durable");
+        let internal_metadata = serde_json::to_string(&event.metadata)?;
+        chain_digest = extend_event_chain(
+            &chain_digest,
+            EventChainEntry {
+                seq,
+                event_type: kind,
+                internal_metadata: &internal_metadata,
+                key_ref: &event_key.key_ref,
+                ciphertext: &protected.ciphertext,
+                envelope: &protected.projection,
+                redaction_version: protected.redaction_version,
+            },
+        );
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(sqlite_i64(seq, "provider-context fixture event sequence")?)
+        .bind(kind)
+        .bind(internal_metadata)
+        .bind(&event_key.key_ref)
+        .bind(protected.ciphertext)
+        .bind(protected.projection)
+        .bind(i64::from(protected.redaction_version))
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let head_hmac =
+        authenticate_event_head(store.scope(), &event_key, last_seq, last_seq, &chain_digest)?;
+    sqlx::query(
+        "INSERT INTO event_log_heads(
+            conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&store.scope().conversation_id)
+    .bind(sqlite_i64(
+        last_seq,
+        "provider-context fixture event-log last sequence",
+    )?)
+    .bind(sqlite_i64(
+        last_seq,
+        "provider-context fixture event count",
+    )?)
+    .bind(chain_digest.as_slice())
+    .bind(&event_key.key_ref)
+    .bind(head_hmac)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn reconstruct_authenticated_checkpoint_in_transaction(

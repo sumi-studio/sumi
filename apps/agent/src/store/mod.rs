@@ -224,6 +224,13 @@ pub(crate) struct Store {
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
 
+struct AuthenticatedProviderContextRow {
+    id: String,
+    item: ProviderContextItem,
+    key_ref: String,
+    eviction_tokens: u64,
+}
+
 impl Store {
     pub(crate) async fn open(
         path: &Path,
@@ -627,6 +634,19 @@ impl Store {
         messages: &[ContextMessage],
         transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<Vec<ProviderContextItem>> {
+        Ok(self
+            .hydrate_authenticated_provider_context(messages, transaction)
+            .await?
+            .into_iter()
+            .map(|row| row.item)
+            .collect())
+    }
+
+    async fn hydrate_authenticated_provider_context(
+        &self,
+        messages: &[ContextMessage],
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<Vec<AuthenticatedProviderContextRow>> {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let mut provider_context = Vec::new();
@@ -646,7 +666,7 @@ impl Store {
                 "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
                     idempotency_key, kind, coverage_through_seq, context_fingerprint,
                     provider_instance_id, protocol, model, key_ref, ciphertext,
-                    eviction_tokens, eviction_estimator_version
+                    eviction_tokens, eviction_estimator_version, created_at
              FROM provider_context
              ORDER BY COALESCE(message_seq, coverage_through_seq),
                       wire_item_index,
@@ -680,6 +700,11 @@ impl Store {
                 let stored_eviction_tokens: i64 = row.try_get("eviction_tokens")?;
                 let stored_eviction_estimator_version: i64 =
                     row.try_get("eviction_estimator_version")?;
+                let stored_created_at: String = row.try_get("created_at")?;
+                self::provider_context::validate_canonical_created_at(&stored_created_at)
+                    .with_context(|| {
+                        format!("provider-context record {id} has invalid created_at metadata")
+                    })?;
 
                 let key = self
                     .load_hydration_key(
@@ -950,13 +975,19 @@ impl Store {
                     );
                 }
 
-                provider_context.push(item);
+                provider_context.push(AuthenticatedProviderContextRow {
+                    id,
+                    item,
+                    key_ref: expected_key_ref,
+                    eviction_tokens: expected_eviction.eviction_tokens(),
+                });
             }
             offset += HYDRATION_PAGE_SIZE;
         }
-        crate::provider::types::validate_provider_context_ordinals(&provider_context).map_err(
-            |message| anyhow!("hydrated provider-context ordering is invalid: {message}"),
-        )?;
+        crate::provider::types::validate_provider_context_ordinal_refs(
+            provider_context.iter().map(|row| &row.item),
+        )
+        .map_err(|message| anyhow!("hydrated provider-context ordering is invalid: {message}"))?;
         Ok(provider_context)
     }
 
