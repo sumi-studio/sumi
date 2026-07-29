@@ -542,7 +542,7 @@ fn opt_u32_bytes(opt: Option<u32>) -> Vec<u8> {
 }
 
 /// A prepared `Replace`/`Invalidate` intent ready to be persisted and applied.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedProviderContextMutation {
     mutation_id: String,
     intent_key_ref: String,
@@ -554,6 +554,10 @@ pub(crate) struct PreparedProviderContextMutation {
 impl PreparedProviderContextMutation {
     pub(crate) fn intent_hmac(&self) -> &[u8] {
         &self.intent_hmac
+    }
+
+    pub(in crate::store) fn mutation_id(&self) -> &str {
+        &self.mutation_id
     }
 }
 
@@ -908,11 +912,26 @@ impl<'a> ProviderContextMutationApplier<'a> {
     }
 
     pub(crate) async fn prepare(&self, prepared: &PreparedProviderContextMutation) -> Result<()> {
+        let mut transaction = self.store.pool().begin().await?;
+        self.prepare_in_transaction(&mut transaction, prepared)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Persist one prepared intent inside an existing EventWriter transaction.
+    ///
+    /// Destructive provider-context application remains a separate, common
+    /// eventless projection. This entry point exists so an attempt disposition
+    /// and the durable prepare record cannot be split by a crash.
+    pub(in crate::store) async fn prepare_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        prepared: &PreparedProviderContextMutation,
+    ) -> Result<()> {
         if prepared.mutation_id.is_empty() {
             bail!("mutation_id must not be empty");
         }
-
-        let mut transaction = self.store.pool().begin().await?;
 
         #[allow(clippy::type_complexity)]
         let existing: Option<(String, String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
@@ -920,15 +939,21 @@ impl<'a> ProviderContextMutationApplier<'a> {
              FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind(&prepared.mutation_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await
         .context("failed to load existing mutation row")?;
 
         let mutation_key = self
             .store
-            .data_key_by_ref_in_transaction(&mut transaction, &prepared.intent_key_ref)
+            .data_key_by_ref_in_transaction(transaction, &prepared.intent_key_ref)
             .await
             .context("failed to load mutation key for prepare")?;
+        if mutation_key.purpose != DataKeyPurpose::Mutation {
+            bail!("provider-context mutation prepare key has wrong purpose");
+        }
+        if prepared.hmac_key_id != INTENT_HMAC_KEY_ID {
+            bail!("provider-context mutation prepare has unsupported HMAC key id");
+        }
         let aad = self.store.scope().row_aad(
             "provider_context_mutations",
             &prepared.mutation_id,
@@ -947,7 +972,6 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 bail!("conflicting provider-context mutation intent already exists");
             }
             if hmac == prepared.intent_hmac {
-                transaction.commit().await?;
                 return Ok(());
             }
 
@@ -976,7 +1000,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             }
 
             if !self
-                .is_intent_latest_candidate(&mut transaction, &new_full, &intent_key)
+                .is_intent_latest_candidate(transaction, &new_full, &intent_key)
                 .await?
             {
                 bail!(
@@ -993,11 +1017,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .bind(&prepared.intent_hmac)
             .bind(Utc::now().to_rfc3339())
             .bind(&prepared.mutation_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .context("failed to CAS-update provider-context mutation intent")?;
 
-            transaction.commit().await?;
             return Ok(());
         }
 
@@ -1010,7 +1033,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             "new",
         )?;
         let head = self
-            .load_replace_head(&mut transaction, &new_full, &intent_key)
+            .load_replace_head(transaction, &new_full, &intent_key)
             .await?;
         if !expected_latest_matches_head(&new_full, head.as_ref()) {
             bail!(
@@ -1030,12 +1053,81 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .bind(&prepared.hmac_key_id)
         .bind(&prepared.intent_hmac)
         .bind(Utc::now().to_rfc3339())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .context("failed to prepare provider-context mutation")?;
 
-        transaction.commit().await?;
         Ok(())
+    }
+
+    /// Authenticate an in-memory private-builder result before EventWriter
+    /// enters its SQLite transaction. The proof binds the mutation key into
+    /// EventWriter's prepared-key revalidation, while the same ciphertext/HMAC
+    /// is authenticated again by `prepare_in_transaction`.
+    pub(in crate::store) async fn verify_prepared_invalidate_and_size(
+        &self,
+        prepared: &PreparedProviderContextMutation,
+    ) -> Result<ProviderContextProjectionSize> {
+        if prepared.mutation_id.is_empty() {
+            bail!("mutation_id must not be empty");
+        }
+        if prepared.hmac_key_id != INTENT_HMAC_KEY_ID {
+            bail!("provider-context mutation prepare has unsupported HMAC key id");
+        }
+
+        let mut transaction = self.store.pool().begin().await?;
+        let mutation_key = self
+            .store
+            .data_key_by_ref_in_transaction(&mut transaction, &prepared.intent_key_ref)
+            .await
+            .context("failed to load mutation key for prepared projection")?;
+        if mutation_key.purpose != DataKeyPurpose::Mutation {
+            bail!("provider-context mutation prepare key has wrong purpose");
+        }
+        let aad = self.store.scope().row_aad(
+            "provider_context_mutations",
+            &prepared.mutation_id,
+            DataKeyPurpose::Mutation,
+        );
+        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let full = self.decrypt_full_intent(
+            &mutation_key,
+            &prepared.intent_ciphertext,
+            &aad,
+            &intent_key,
+            &prepared.intent_hmac,
+            "prepared",
+        )?;
+        if full.mutation_id != prepared.mutation_id {
+            bail!("prepared provider-context mutation identity mismatch");
+        }
+        if full.variant != "invalidate"
+            || full.invalidate_ids.is_empty()
+            || !full.provider_context_id.is_empty()
+            || !full.key_ref.is_empty()
+            || !full.ciphertext.is_empty()
+        {
+            bail!("attempt disposition requires an Invalidate provider-context intent");
+        }
+
+        let size = full
+            .invalidate_ids
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(512);
+        transaction.commit().await?;
+        Ok(ProviderContextProjectionSize {
+            size,
+            intent_key_ref: mutation_key.key_ref.clone(),
+            intent_key_proof: super::crypto::keyed_proof(
+                &mutation_key,
+                PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                PREPARED_KEY_MATERIAL_PROOF,
+            ),
+            insert_key_ref: None,
+            insert_key_proof: None,
+        })
     }
 
     /// Recompute the projection byte bound and the prepared-key proofs for a

@@ -39,7 +39,7 @@ use crate::memory::estimate::{
 use crate::provider::model::ModelSpec;
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
-    PublicMessage, validate_native_suffix_for_hydration,
+    PublicMessage, StopReason, validate_native_suffix_for_hydration,
 };
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
@@ -80,11 +80,11 @@ pub(crate) use crypto::{
     reason = "T12 freezes projection types consumed by T15 without duplicating EventWriter"
 )]
 pub(crate) use event_writer::{
-    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch, EventWrite,
-    EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
-    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
-    MemoryTransition, Projection, RecoveryRequired, RunPhase, ToolExecutionMutation,
-    USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, ErrorContextDisposition,
+    EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -100,7 +100,8 @@ pub(crate) use memory_state::{
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
 pub(crate) use recovery::{
-    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, RecoveryStep, SuffixRecovery,
+    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, PendingErrorContextRecovery,
+    RecoveryStep, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -118,6 +119,53 @@ pub(crate) use transcript::TranscriptRecord;
 /// processed and dropped before the next page is requested, so decrypted
 /// plaintext and `SqliteRow` buffers are not retained for the whole history.
 const HYDRATION_PAGE_SIZE: i64 = 64;
+
+fn pending_error_context_recovery(
+    messages: &[ContextMessage],
+    provider_context: &[ProviderContextItem],
+) -> Result<Option<PendingErrorContextRecovery>> {
+    let error_messages: BTreeMap<(&str, u64), bool> = messages
+        .iter()
+        .filter_map(|message| match message {
+            ContextMessage::Persisted { id, seq, message } => Some((
+                (id.as_str(), *seq),
+                matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Error
+                ),
+            )),
+            ContextMessage::Synthetic { .. } => None,
+        })
+        .collect();
+    let mut pending = BTreeMap::<(String, u64), usize>::new();
+    for item in provider_context {
+        let Some(anchor) = item.origin_message.as_ref() else {
+            continue;
+        };
+        if error_messages
+            .get(&(anchor.message_id.as_str(), anchor.message_seq))
+            .copied()
+            == Some(true)
+        {
+            *pending
+                .entry((anchor.message_id.clone(), anchor.message_seq))
+                .or_default() += 1;
+        }
+    }
+    if pending.len() > 1 {
+        bail!("cold hydration found multiple undisposed Error provider-context retention units");
+    }
+    let Some(((message_id, message_seq), item_count)) = pending.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(PendingErrorContextRecovery {
+        message_id,
+        message_seq,
+        item_count: u32::try_from(item_count)
+            .context("Error provider-context item count exceeds u32")?,
+    }))
+}
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -351,6 +399,7 @@ impl Store {
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
             .await?;
+        let pending_error_context = pending_error_context_recovery(&messages, &provider_context)?;
         let (memory_batches, memory_batch_messages, memory_jobs, memory_apply_cursors) =
             self.hydrate_memory_state(&mut transaction).await?;
 
@@ -362,7 +411,28 @@ impl Store {
             .commit()
             .await
             .context("failed to commit hydration snapshot transaction")?;
-        let recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+        let mut recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+        if let Some(pending_error_context) = pending_error_context {
+            let mut matching_steps = recovery_steps.iter_mut().filter(|step| {
+                matches!(step, RecoveryStep::ResumeAssistantFromDurableEvents { .. })
+            });
+            let step = matching_steps.next().ok_or_else(|| {
+                anyhow!("undisposed Error provider context has no assistant logical-recovery owner")
+            })?;
+            if matching_steps.next().is_some() {
+                bail!(
+                    "undisposed Error provider context has multiple assistant logical-recovery owners"
+                );
+            }
+            let RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: slot,
+                ..
+            } = step
+            else {
+                unreachable!("matching recovery step variant was checked")
+            };
+            *slot = Some(pending_error_context);
+        }
 
         let receipt = HydrationReceiptIdentity {
             lease_id: lease.lease_id().to_owned(),

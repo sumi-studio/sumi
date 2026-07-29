@@ -36,6 +36,19 @@ pub(crate) struct PendingApprovalRecovery {
     pub tool_call_id: String,
 }
 
+/// Authenticated pre-disposition Error-context evidence carried to the T26
+/// logical-resume consumer. Store hydration has already verified the
+/// transcript row, exact anchor, encrypted provider-context items, and active
+/// item key. T26 must choose the normal retry/overflow/terminal disposition,
+/// build the fixed Invalidate through EventWriter, and fence resume until its
+/// common application reaches `applied`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingErrorContextRecovery {
+    pub message_id: String,
+    pub message_seq: u64,
+    pub item_count: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryStep {
     Reclassify {
@@ -73,6 +86,7 @@ pub(crate) enum RecoveryStep {
         command_id: String,
         run_id: String,
         turn_id: String,
+        pending_error_context: Option<PendingErrorContextRecovery>,
     },
     /// T23/T26 restart seam for an assistant turn that crashed while a real
     /// ApprovalBroker request was durably pending. T26 must consume this before
@@ -285,6 +299,7 @@ impl SuffixRecovery {
                     command_id,
                     run_id,
                     turn_id,
+                    ..
                 } => {
                     if let Some(pending) =
                         pending_approval_for_recovery(store, run_id, turn_id).await?
@@ -498,6 +513,7 @@ async fn plan_one_command(
             command_id: command.command_id.clone(),
             run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
             turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            pending_error_context: None,
         }),
         RunPhase::HardSteerRequested => Ok(RecoveryStep::ResumeHardSteerFromDurableEvents {
             command_id: command.command_id.clone(),

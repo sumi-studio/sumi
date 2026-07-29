@@ -56,7 +56,8 @@ use super::{
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
-        EncryptedProviderContextRecord, ProviderContextMutation, ProviderContextMutationApplier,
+        EncryptedProviderContextRecord, PreparedProviderContextMutation, ProviderContextMutation,
+        ProviderContextMutationApplier, ProviderContextMutationBuilder,
         provider_context_idempotency_key,
     },
     redactor::search_text_from_projection,
@@ -640,6 +641,21 @@ pub(crate) struct EventBatch {
     pub injected_commands: Vec<InjectedCommand>,
 }
 
+/// Private-builder result for one Error attempt's provider-context retention
+/// boundary. The prepared intent is deliberately opaque outside EventWriter:
+/// lifecycle owners may attach it to the exact disposition transaction and
+/// invoke the common applier, but cannot change its target set or identity.
+#[derive(Clone, Debug)]
+pub(crate) struct ErrorContextDisposition {
+    prepared: PreparedProviderContextMutation,
+}
+
+impl ErrorContextDisposition {
+    pub(crate) fn mutation_id(&self) -> &str {
+        self.prepared.mutation_id()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InjectedCommand {
     seq: u64,
@@ -650,6 +666,17 @@ pub(crate) struct InjectedCommand {
 /// T18 freezes this same value into the generated cross-language contracts.
 pub(crate) const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x78, 0xf6, 0x2d, 0x15, 0xb9, 0x45, 0x4a, 0x4f, 0x9d, 0x84, 0xd7, 0x3c, 0x7f, 0x93, 0x2b, 0x51,
+]);
+
+/// Temporary local namespace for Error-context disposition identities.
+///
+/// The outer UUIDv5 namespace is derived from the current agent DB's
+/// conversation identity and the inner name is the canonical disposition
+/// label plus message id. Issue #74 replaces only the outer namespace with the
+/// final `PersonalityAgentId`; callers never construct or persist a tenant /
+/// workspace owner.
+const ERROR_CONTEXT_DISPOSITION_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x4a, 0x8d, 0x64, 0x8e, 0x58, 0xa0, 0x45, 0xaf, 0x98, 0xe1, 0x2b, 0x95, 0x44, 0x97, 0xa2, 0x31,
 ]);
 
 pub(crate) trait CanonicalCommandIdentity {
@@ -1029,6 +1056,11 @@ pub(crate) enum Projection {
     /// decrypts and revalidates the stored intent, HMAC, and Replace plaintext
     /// HMAC inside its SQLite transaction.
     ProviderContextMutation(ProviderContextMutation),
+    /// Durable prepare half of an Error attempt's provider-context
+    /// disposition. This projection must share the RetryScheduled, terminal
+    /// Error TurnEnd, or active Abort cutoff transaction that ends usability.
+    /// Deletion stays on `ProviderContextMutation` and the common recovery path.
+    ProviderContextMutationPrepare(ErrorContextDisposition),
     /// Atomic durable memory job state update with source-version CAS.
     MemoryJobUpdate(MemoryJobUpdate),
     /// Atomic durable memory batch + job transition with source-version CAS.
@@ -1268,6 +1300,11 @@ enum PreparedProjection {
         insert_key_ref: Option<String>,
         insert_key_proof: Option<Vec<u8>>,
     },
+    ProviderContextMutationPrepare {
+        disposition: ErrorContextDisposition,
+        intent_key_ref: String,
+        intent_key_proof: Vec<u8>,
+    },
     MemoryJobUpdate {
         expected_source_versions: BTreeMap<String, i64>,
         job_mutations: Vec<PreparedMemoryJobMutation>,
@@ -1468,6 +1505,153 @@ impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
         let gate = store.event_writer_state();
         Self { store, gate }
+    }
+
+    /// Build the fixed Invalidate target set for an authenticated Error
+    /// MessageEnd. This does not persist the intent: the lifecycle owner must
+    /// attach the returned value to the exact disposition EventWrite.
+    pub(crate) async fn build_error_context_disposition(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+    ) -> Result<ErrorContextDisposition> {
+        if message_id.is_empty() {
+            bail!("Error-context disposition message_id must not be empty");
+        }
+        let message_seq_i64 = sqlite_i64(message_seq, "Error MessageEnd sequence")?;
+        let mut authentication = self.store.pool().begin().await?;
+        authenticate_event_log_snapshot(self.store.as_ref(), &mut authentication)
+            .await
+            .context("failed to authenticate event history for Error-context disposition")?;
+        let durable =
+            load_authenticated_event(self.store.as_ref(), &mut authentication, message_seq_i64)
+                .await
+                .context("failed to authenticate Error MessageEnd event")?;
+        let exact_error_event = durable.kind == "message_end"
+            && durable.envelope.get("message_id").and_then(Value::as_str) == Some(message_id)
+            && durable
+                .envelope
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+            && durable
+                .envelope
+                .get("message")
+                .and_then(|message| message.get("stop_reason"))
+                .and_then(Value::as_str)
+                == Some("error");
+        if !exact_error_event {
+            bail!(
+                "Error-context disposition target {message_id}/{message_seq} is not the exact authenticated Error MessageEnd event"
+            );
+        }
+        let messages = self
+            .store
+            .hydrate_messages(&mut authentication)
+            .await
+            .context("failed to authenticate transcript for Error-context disposition")?;
+        let provider_context = self
+            .store
+            .hydrate_provider_context(&messages, &mut authentication)
+            .await
+            .context("failed to authenticate provider context for Error-context disposition")?;
+        let exact_error = messages.iter().any(|message| {
+            matches!(
+                message,
+                ContextMessage::Persisted {
+                    id,
+                    seq,
+                    message: Message::Assistant(assistant),
+                } if id == message_id
+                    && *seq == message_seq
+                    && assistant.stop_reason == StopReason::Error
+            )
+        });
+        if !exact_error {
+            bail!(
+                "Error-context disposition target {message_id}/{message_seq} is not an authenticated Error assistant MessageEnd"
+            );
+        }
+        let authenticated_item_count = provider_context
+            .iter()
+            .filter(|item| {
+                item.origin_message.as_ref().is_some_and(|anchor| {
+                    anchor.message_id == message_id && anchor.message_seq == message_seq
+                })
+            })
+            .count();
+
+        let invalidate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM provider_context
+             WHERE message_id = ? AND message_seq = ?
+             ORDER BY id",
+        )
+        .bind(message_id)
+        .bind(message_seq_i64)
+        .fetch_all(&mut *authentication)
+        .await
+        .context("failed to fix Error provider-context disposition target set")?;
+        if invalidate_ids.is_empty() {
+            bail!("Error-context disposition requires at least one active target row");
+        }
+        if invalidate_ids.len() != authenticated_item_count {
+            bail!(
+                "Error-context disposition target set does not match authenticated provider context"
+            );
+        }
+        authentication.commit().await?;
+
+        let local_agent_namespace = Uuid::new_v5(
+            &ERROR_CONTEXT_DISPOSITION_NAMESPACE,
+            self.store.scope().conversation_id.as_bytes(),
+        );
+        let mutation_id = Uuid::new_v5(
+            &local_agent_namespace,
+            format!("error-context-disposition:{message_id}").as_bytes(),
+        )
+        .to_string();
+        let mutation_key = self
+            .store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .context("failed to load Error-context disposition mutation key")?;
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            self.store.scope().clone(),
+            mutation_id,
+        )
+        .build_invalidate(None, invalidate_ids)
+        .context("failed to build Error provider-context Invalidate intent")?;
+        Ok(ErrorContextDisposition { prepared })
+    }
+
+    /// Common destructive half of the Error-context disposition. The
+    /// disposition EventWrite prepares first; this eventless application is
+    /// also exactly what cold-boot mutation recovery executes.
+    pub(crate) async fn apply_error_context_disposition(
+        &self,
+        disposition: &ErrorContextDisposition,
+    ) -> Result<()> {
+        self.apply(EventBatch {
+            writes: vec![EventWrite {
+                event: None,
+                projections: vec![Projection::ProviderContextMutation(
+                    ProviderContextMutation {
+                        mutation_id: disposition.mutation_id().to_owned(),
+                    },
+                )],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to apply Error provider-context disposition {}",
+                disposition.mutation_id()
+            )
+        })?;
+        Ok(())
     }
 
     pub(in crate::store) async fn recover_provider_context_mutations(&self) -> Result<()> {
@@ -1889,7 +2073,7 @@ impl EventWriter {
         abort_command_id: &str,
         abort_seq: u64,
     ) -> Result<Vec<CommandAck>> {
-        self.apply_abort_cutoff(abort_command_id, abort_seq, None)
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
             .await
     }
 
@@ -1899,7 +2083,18 @@ impl EventWriter {
         abort_seq: u64,
         run_id: &str,
     ) -> Result<Vec<CommandAck>> {
-        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id))
+        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: &str,
+        disposition: ErrorContextDisposition,
+    ) -> Result<Vec<CommandAck>> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), Some(disposition))
             .await
     }
 
@@ -1908,6 +2103,7 @@ impl EventWriter {
         abort_command_id: &str,
         abort_seq: u64,
         run_id: Option<&str>,
+        error_context_disposition: Option<ErrorContextDisposition>,
     ) -> Result<Vec<CommandAck>> {
         let mut guard = self.gate.lock().await;
         let mut authentication = self.store.pool().begin().await?;
@@ -2155,6 +2351,9 @@ impl EventWriter {
             command_seq: sqlite_u64(abort_seq, "Abort command sequence")?,
             run_id: abort_run_id,
         });
+        if let Some(disposition) = error_context_disposition {
+            projections.push(Projection::ProviderContextMutationPrepare(disposition));
+        }
         terminal_ids.push(abort_command_id.to_owned());
 
         let mut writes = Vec::new();
@@ -2268,6 +2467,7 @@ impl EventWriter {
 
         let mut transaction = self.store.pool().begin().await?;
         revalidate_prepared_key_refs(self.store.as_ref(), &mut transaction, &prepared).await?;
+        validate_prepared_error_context_fences(&mut transaction, &prepared).await?;
         let transaction_event_head =
             load_verified_event_head_in_transaction(self.store.as_ref(), &mut transaction).await?;
         if transaction_event_head != previous_event_head {
@@ -2835,6 +3035,17 @@ impl EventWriter {
                             intent_key_proof: sized.intent_key_proof,
                             insert_key_ref: sized.insert_key_ref,
                             insert_key_proof: sized.insert_key_proof,
+                        });
+                    }
+                    Projection::ProviderContextMutationPrepare(disposition) => {
+                        let sized = ProviderContextMutationApplier::new(&self.store)
+                            .verify_prepared_invalidate_and_size(&disposition.prepared)
+                            .await?;
+                        charge_transaction_bytes(&mut transaction_bytes, sized.size)?;
+                        projections.push(PreparedProjection::ProviderContextMutationPrepare {
+                            disposition,
+                            intent_key_ref: sized.intent_key_ref,
+                            intent_key_proof: sized.intent_key_proof,
                         });
                     }
                     Projection::MemoryJobUpdate(update) => {
@@ -4510,6 +4721,16 @@ async fn revalidate_prepared_key_refs(
                         )?;
                     }
                 }
+                PreparedProjection::ProviderContextMutationPrepare {
+                    intent_key_ref,
+                    intent_key_proof,
+                    ..
+                } => insert_prepared_key_expectation(
+                    &mut refs,
+                    intent_key_ref,
+                    DataKeyPurpose::Mutation,
+                    intent_key_proof,
+                )?,
                 PreparedProjection::MemoryJobUpdate {
                     memory_summary_key_ref: Some(key_ref),
                     memory_summary_key_proof: Some(proof),
@@ -4571,6 +4792,102 @@ async fn revalidate_prepared_key_refs(
                 purpose.as_str()
             )
         })?;
+    }
+    Ok(())
+}
+
+/// Enforce the Error-context usability fence against the transaction's current
+/// durable rows and the ordered prepared write set. A prepare ends semantic
+/// usability but does not make the rows disappear; therefore a later
+/// MessageStart/AgentEnd in the same batch is still forbidden. Only the common
+/// eventless mutation application can make the next transaction eligible.
+async fn validate_prepared_error_context_fences(
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &[PreparedWrite],
+) -> Result<()> {
+    let mut pending_units: usize = usize::try_from(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (
+                 SELECT pc.message_id, pc.message_seq
+                 FROM provider_context pc
+                 JOIN messages m ON m.id = pc.message_id AND m.seq = pc.message_seq
+                 WHERE m.role = 'assistant'
+                   AND json_extract(m.payload, '$.stop_reason') = 'error'
+                 GROUP BY pc.message_id, pc.message_seq
+             )",
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .context("failed to inspect pending Error provider-context retention units")?,
+    )
+    .context("pending Error provider-context count is negative or too large")?;
+    if pending_units > 1 {
+        bail!("multiple pending Error provider-context retention units violate the attempt fence");
+    }
+
+    for write in prepared {
+        let new_error_units = write
+            .projections
+            .iter()
+            .filter(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        l0_disposition: L0Disposition::ExcludeRetryError,
+                        provider_context,
+                        ..
+                    } if !provider_context.is_empty()
+                )
+            })
+            .count();
+        pending_units = pending_units
+            .checked_add(new_error_units)
+            .ok_or_else(|| anyhow!("pending Error provider-context count overflow"))?;
+        if pending_units > 1 {
+            bail!(
+                "EventBatch would create multiple pending Error provider-context retention units"
+            );
+        }
+
+        let has_prepare = write.projections.iter().any(|projection| {
+            matches!(
+                projection,
+                PreparedProjection::ProviderContextMutationPrepare { .. }
+            )
+        });
+        let is_abort_disposition = write.event.is_none()
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        next: RunPhase::CancelRequested,
+                        ..
+                    })
+                )
+            });
+        let is_event_disposition = write
+            .event
+            .as_ref()
+            .is_some_and(|event| matches!(event.kind.as_str(), "retry_scheduled" | "turn_end"));
+        if pending_units != 0 && (is_event_disposition || is_abort_disposition) && !has_prepare {
+            bail!(
+                "Error-context attempt disposition must prepare Invalidate in the same EventWrite"
+            );
+        }
+        if has_prepare && pending_units != 1 {
+            bail!("Error-context Invalidate prepare has no unique pending retention unit");
+        }
+
+        let is_fenced_progress = write.event.as_ref().is_some_and(|event| {
+            event.kind == "agent_end"
+                || (event.kind == "message_start"
+                    && event.message_role.as_deref() == Some("assistant"))
+        });
+        if pending_units != 0 && is_fenced_progress {
+            bail!(
+                "assistant MessageStart/AgentEnd is fenced until Error-context Invalidate is applied"
+            );
+        }
     }
     Ok(())
 }
@@ -4780,6 +5097,34 @@ fn batch_matches_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
                 })
             })
         }
+        "error_context_message_end" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        l0_disposition: L0Disposition::ExcludeRetryError,
+                        provider_context,
+                        ..
+                    } if !provider_context.is_empty()
+                )
+            })
+        }),
+        "error_context_disposition_prepare" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutationPrepare { .. }
+                )
+            })
+        }),
+        "error_context_disposition_apply" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutation { .. }
+                )
+            })
+        }),
         "supersede_cutoff" => {
             let has_empty_or_normal_turn_end = prepared.iter().any(|write| {
                 write
@@ -5772,6 +6117,41 @@ fn validate_batch_shape_with_recovery(
         }
     }
     for write in &batch.writes {
+        let error_context_disposition_event =
+            write
+                .event
+                .as_ref()
+                .is_some_and(|event| match &event.value {
+                    AgentEvent::RetryScheduled { .. } => true,
+                    AgentEvent::TurnEnd {
+                        message: Some(message),
+                        ..
+                    } => matches!(
+                        message.as_ref(),
+                        PublicMessage::Assistant(assistant)
+                            if assistant.stop_reason == StopReason::Error
+                    ),
+                    _ => false,
+                });
+        let active_abort_disposition = write.event.is_none()
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::RunPhase {
+                        next: RunPhase::CancelRequested,
+                        ..
+                    }
+                )
+            })
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::CommandApplied {
+                        run_id: Some(_),
+                        ..
+                    }
+                )
+            });
         let mut has_memory_maintenance = false;
         if let Some(event) = &write.event
             && matches!(event.value, AgentEvent::MemoryMaintenance { .. })
@@ -5788,6 +6168,17 @@ fn validate_batch_shape_with_recovery(
                 Projection::ProviderContextMutation(_) => {
                     if write.event.is_some() {
                         bail!("ProviderContextMutation projection must be eventless");
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    provider_context_seen = true;
+                }
+                Projection::ProviderContextMutationPrepare(_) => {
+                    if !error_context_disposition_event && !active_abort_disposition {
+                        bail!(
+                            "ProviderContextMutationPrepare requires RetryScheduled, terminal Error TurnEnd, or active Abort disposition"
+                        );
                     }
                     if memory_transition_seen || memory_job_update_seen || provider_context_seen {
                         bail!("only one terminal mutation projection is allowed per EventWrite");
@@ -6296,6 +6687,9 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     .sum::<usize>(),
             ),
         Projection::ProviderContextMutation(inner) => inner.mutation_id.len().saturating_add(4096),
+        Projection::ProviderContextMutationPrepare(disposition) => {
+            disposition.mutation_id().len().saturating_add(4096)
+        }
         Projection::MemoryJobUpdate(update) => update
             .job_mutations
             .iter()
@@ -9684,6 +10078,12 @@ async fn apply_projection(
                 .await
                 .context("failed to apply provider-context mutation projection")?;
         }
+        PreparedProjection::ProviderContextMutationPrepare { disposition, .. } => {
+            ProviderContextMutationApplier::new(store)
+                .prepare_in_transaction(transaction, &disposition.prepared)
+                .await
+                .context("failed to prepare provider-context mutation projection")?;
+        }
         PreparedProjection::MemoryJobUpdate {
             expected_source_versions,
             job_mutations,
@@ -9923,6 +10323,7 @@ async fn apply_plain_projection(
             return Ok(Some(outcome));
         }
         Projection::ProviderContextMutation(_)
+        | Projection::ProviderContextMutationPrepare(_)
         | Projection::MemoryJobUpdate(_)
         | Projection::MemoryTransition(_) => {
             bail!("memory and provider-context mutations must be prepared before apply");
@@ -21923,6 +22324,356 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_RUN_ID: &str = "run-00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_TURN_ID: &str = "turn-00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_MESSAGE_ID: &str = "error-context-kill-assistant";
+
+    #[cfg(unix)]
+    fn error_context_kill_message() -> PublicMessage {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified crash-boundary partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("provider crash-boundary error".to_owned()),
+            provider_code: Some("network_error".to_owned()),
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn error_context_kill_message_end() -> EventWrite {
+        let message = error_context_kill_message();
+        let PublicMessage::Assistant(assistant) = &message else {
+            unreachable!("fixture assistant")
+        };
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": "rs-error-kill",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-error-kill",
+                }),
+            },
+        };
+        let eviction_footprint_tokens =
+            eviction_footprint_for_test(&assistant.origin, std::slice::from_ref(&fragment));
+        EventWrite {
+            event: Some(
+                DurableEvent::message_in_turn(
+                    "message_end",
+                    ERROR_CONTEXT_KILL_MESSAGE_ID,
+                    &message,
+                    Some(ERROR_CONTEXT_KILL_RUN_ID.to_owned()),
+                    Some(ERROR_CONTEXT_KILL_TURN_ID.to_owned()),
+                )
+                .expect("Error MessageEnd"),
+            ),
+            projections: vec![Projection::MessageEnd {
+                message_id: ERROR_CONTEXT_KILL_MESSAGE_ID.to_owned(),
+                role: "assistant",
+                message,
+                append_to_l0: false,
+                eviction_footprint_tokens,
+                provider_context: vec![fragment],
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    async fn error_context_kill_target(writer: &EventWriter, scenario: &str) -> EventBatch {
+        let injected = classified_injection(
+            writer,
+            1,
+            ERROR_CONTEXT_KILL_COMMAND_ID,
+            "ignored",
+            "Error kill fixture",
+        )
+        .await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(
+                    ERROR_CONTEXT_KILL_COMMAND_ID,
+                    "ignored",
+                    "Error kill fixture",
+                ),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist Error kill user injection");
+        let message = error_context_kill_message();
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            ERROR_CONTEXT_KILL_MESSAGE_ID,
+                            &message,
+                            Some(ERROR_CONTEXT_KILL_RUN_ID.to_owned()),
+                            Some(ERROR_CONTEXT_KILL_TURN_ID.to_owned()),
+                        )
+                        .expect("Error kill MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: ERROR_CONTEXT_KILL_COMMAND_ID.to_owned(),
+                        run_id: ERROR_CONTEXT_KILL_RUN_ID.to_owned(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist Error kill MessageStart");
+
+        if scenario == "error_context_message_end" {
+            return EventBatch {
+                writes: vec![error_context_kill_message_end()],
+                injected_commands: Vec::new(),
+            };
+        }
+
+        writer
+            .apply(EventBatch {
+                writes: vec![error_context_kill_message_end()],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist Error kill MessageEnd");
+        let message_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(ERROR_CONTEXT_KILL_MESSAGE_ID)
+            .fetch_one(writer.store().pool())
+            .await
+            .expect("load Error kill MessageEnd sequence");
+        let disposition = writer
+            .build_error_context_disposition(
+                ERROR_CONTEXT_KILL_MESSAGE_ID,
+                u64::try_from(message_seq).expect("positive MessageEnd sequence"),
+            )
+            .await
+            .expect("build Error kill disposition");
+        let prepare_batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::turn_end(
+                        ERROR_CONTEXT_KILL_RUN_ID,
+                        ERROR_CONTEXT_KILL_TURN_ID,
+                        message,
+                        Vec::new(),
+                    )
+                    .expect("Error kill TurnEnd"),
+                ),
+                projections: vec![Projection::ProviderContextMutationPrepare(
+                    disposition.clone(),
+                )],
+            }],
+            injected_commands: Vec::new(),
+        };
+        if scenario == "error_context_disposition_prepare" {
+            return prepare_batch;
+        }
+        assert_eq!(scenario, "error_context_disposition_apply");
+        writer
+            .apply(prepare_batch)
+            .await
+            .expect("persist Error kill disposition prepare");
+        EventBatch {
+            writes: vec![EventWrite {
+                event: None,
+                projections: vec![Projection::ProviderContextMutation(
+                    ProviderContextMutation {
+                        mutation_id: disposition.mutation_id().to_owned(),
+                    },
+                )],
+            }],
+            injected_commands: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for Error-context abrupt transaction tests"]
+    async fn error_context_kill_restart_child() {
+        let scenario =
+            std::env::var("SUMI_ERROR_CONTEXT_SCENARIO").expect("Error scenario environment");
+        let boundary =
+            std::env::var("SUMI_ERROR_CONTEXT_BOUNDARY").expect("Error boundary environment");
+        let database_path = std::path::PathBuf::from(
+            std::env::var("SUMI_ERROR_CONTEXT_DATABASE").expect("Error database environment"),
+        );
+        let readiness_path = std::path::PathBuf::from(
+            std::env::var("SUMI_ERROR_CONTEXT_READY").expect("Error readiness environment"),
+        );
+        let store: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+            .await
+            .expect("child opens Error-context store")
+            .into();
+        let writer = EventWriter::new(store);
+        let target = error_context_kill_target(&writer, &scenario).await;
+        writer
+            .apply_with_abrupt_transaction_failpoint(
+                target,
+                &scenario,
+                boundary == "after_commit",
+                &readiness_path,
+                None,
+            )
+            .await
+            .expect("Error-context abrupt failpoint must not return");
+        panic!("Error-context abrupt failpoint returned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn error_context_kill_restart_boundaries_converge_without_duplicate_attempts() {
+        for scenario in [
+            "error_context_message_end",
+            "error_context_disposition_prepare",
+            "error_context_disposition_apply",
+        ] {
+            for boundary in ["before_commit", "after_commit"] {
+                let root = std::env::temp_dir()
+                    .join(format!("sumi-{scenario}-{boundary}-{}", Uuid::now_v7()));
+                std::fs::create_dir_all(&root).expect("create Error kill fixture root");
+                let database_path = root.join("agent.db");
+                let readiness_path = root.join("ready");
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("current unit test executable"),
+                )
+                .arg("--exact")
+                .arg("store::event_writer::tests::error_context_kill_restart_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_ERROR_CONTEXT_SCENARIO", scenario)
+                .env("SUMI_ERROR_CONTEXT_BOUNDARY", boundary)
+                .env("SUMI_ERROR_CONTEXT_DATABASE", &database_path)
+                .env("SUMI_ERROR_CONTEXT_READY", &readiness_path)
+                .output()
+                .expect("run Error-context abrupt child");
+                assert_eq!(
+                    output.status.code(),
+                    Some(86),
+                    "{scenario}.{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+                    format!("{scenario}.{boundary}\n")
+                );
+
+                // Opening is the common post-prepare recovery boundary. Any
+                // committed prepare is authenticated and applied before this
+                // Store can be hydrated.
+                let reopened: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+                    .await
+                    .expect("reopen Error-context kill store")
+                    .into();
+                let (message_ends, turn_ends, agent_ends, context_rows, mutations): (
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ) = sqlx::query_as(
+                    "SELECT
+                        (SELECT COUNT(*) FROM agent_events
+                         WHERE event_type='message_end'
+                           AND json_extract(envelope, '$.message_id')='error-context-kill-assistant'),
+                        (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
+                        (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
+                        (SELECT COUNT(*) FROM provider_context
+                         WHERE message_id='error-context-kill-assistant'),
+                        (SELECT COUNT(*) FROM provider_context_mutations)",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read Error kill convergence state");
+                assert_eq!(
+                    agent_ends, 0,
+                    "AgentEnd must remain fenced at every boundary"
+                );
+                assert!(message_ends <= 1, "Error attempt MessageEnd duplicated");
+                assert!(turn_ends <= 1, "Error attempt disposition duplicated");
+                assert!(mutations <= 1, "Error disposition intent duplicated");
+
+                let prepare_committed = scenario != "error_context_message_end"
+                    && (scenario == "error_context_disposition_apply"
+                        || boundary == "after_commit");
+                if prepare_committed {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (1, 1, 0, 1)
+                    );
+                    let state: String =
+                        sqlx::query_scalar("SELECT state FROM provider_context_mutations LIMIT 1")
+                            .fetch_one(reopened.pool())
+                            .await
+                            .expect("read recovered Error disposition state");
+                    assert_eq!(state, "applied");
+                    let active_item_keys: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM data_keys
+                         WHERE purpose='provider_context' AND state='active'",
+                    )
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("count active Error item keys");
+                    assert_eq!(active_item_keys, 0);
+                } else if scenario == "error_context_message_end" && boundary == "before_commit" {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (0, 0, 0, 0)
+                    );
+                } else {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (1, 0, 1, 0)
+                    );
+                    let lease = test_lease(1);
+                    let fence = test_fence(&lease);
+                    let hydrated = match reopened
+                        .hydrate(&lease, &fence)
+                        .await
+                        .expect("hydrate pre-disposition Error kill state")
+                    {
+                        HydrationOutcome::Complete(state) => state,
+                        HydrationOutcome::RecoveryRequired(_) => {
+                            panic!("Error context needs logical, not physical, recovery")
+                        }
+                    };
+                    assert!(matches!(
+                        hydrated.recovery_steps.as_slice(),
+                        [RecoveryStep::ResumeAssistantFromDurableEvents {
+                            pending_error_context: Some(pending),
+                            ..
+                        }] if pending.message_id == "error-context-kill-assistant"
+                            && pending.item_count == 1
+                    ));
+                }
+                reopened.pool().close().await;
+                tokio::fs::remove_dir_all(root)
+                    .await
+                    .expect("remove Error kill fixture");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn projected_provider_terminal_round_trips_through_event_writer_with_full_metadata() {
         let store = test_store().await;
@@ -22596,33 +23347,11 @@ mod tests {
             .expect("open Error assistant attempt");
         writer
             .apply(EventBatch {
-                writes: vec![
-                    terminal_write,
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::turn_end(
-                                run_id.clone(),
-                                turn_id.clone(),
-                                terminal_message,
-                                Vec::new(),
-                            )
-                            .expect("TurnEnd"),
-                        ),
-                        projections: Vec::new(),
-                    },
-                    EventWrite {
-                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
-                        projections: vec![Projection::CommandApplied {
-                            command_id: command_id.to_owned(),
-                            command_seq: 1,
-                            run_id: Some(run_id),
-                        }],
-                    },
-                ],
+                writes: vec![terminal_write],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("commit Error terminal with provider context");
+            .expect("commit pre-disposition Error terminal with provider context");
 
         drop(writer);
         store.pool().close().await;
@@ -22656,6 +23385,14 @@ mod tests {
                 } if id == assistant_id && assistant.stop_reason == StopReason::Error
             )
         }));
+        assert!(matches!(
+            hydrated.recovery_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: Some(pending),
+                ..
+            }] if pending.message_id == assistant_id
+                && pending.item_count == 1
+        ));
 
         let mut durable_messages = hydrated.messages;
         durable_messages.push(ContextMessage::Synthetic {
@@ -22692,7 +23429,201 @@ mod tests {
         assert!(!wire.contains("ERROR_MESSAGE_MUST_NOT_REPLAY"));
         assert!(!wire.contains("ERROR_CONTEXT_MUST_NOT_REPLAY"));
 
+        let item_key_ref: String = sqlx::query_scalar(
+            "SELECT key_ref FROM provider_context
+             WHERE message_id = ? AND message_seq = ?",
+        )
+        .bind(assistant_id)
+        .bind(
+            i64::try_from(
+                hydrated
+                    .recovery_steps
+                    .iter()
+                    .find_map(|step| match step {
+                        RecoveryStep::ResumeAssistantFromDurableEvents {
+                            pending_error_context: Some(pending),
+                            ..
+                        } => Some(pending.message_seq),
+                        _ => None,
+                    })
+                    .expect("authenticated pending Error recovery packet"),
+            )
+            .expect("message seq fits SQLite"),
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .expect("load Error item key ref");
+        let error_message_seq = hydrated
+            .recovery_steps
+            .iter()
+            .find_map(|step| match step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    pending_error_context: Some(pending),
+                    ..
+                } => Some(pending.message_seq),
+                _ => None,
+            })
+            .expect("authenticated pending Error recovery packet");
+        let reopened_writer = EventWriter::new(reopened.clone());
+        let fenced_next_attempt = reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            "error-restart-next-attempt",
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("candidate next-attempt MessageStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("next attempt must remain fenced before Error disposition");
+        assert!(
+            fenced_next_attempt
+                .to_string()
+                .contains("fenced until Error-context Invalidate is applied"),
+            "{fenced_next_attempt:#}"
+        );
+        let disposition = reopened_writer
+            .build_error_context_disposition(assistant_id, error_message_seq)
+            .await
+            .expect("recovery consumer builds fixed Error Invalidate");
+        reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_end(
+                            run_id.clone(),
+                            turn_id.clone(),
+                            terminal_message.clone(),
+                            Vec::new(),
+                        )
+                        .expect("terminal Error TurnEnd"),
+                    ),
+                    projections: vec![Projection::ProviderContextMutationPrepare(
+                        disposition.clone(),
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("terminal Error disposition and Invalidate prepare commit atomically");
+
+        let prepared_state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(disposition.mutation_id())
+        .fetch_one(reopened.pool())
+        .await
+        .expect("read prepared Error disposition");
+        assert_eq!(prepared_state, "prepared");
+        let retained_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
+                .bind(assistant_id)
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count retained rows after prepare");
+        assert_eq!(
+            retained_rows, 1,
+            "prepare is durable but common application owns deletion"
+        );
+        let fenced_agent_end = reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: command_id.to_owned(),
+                        command_seq: 1,
+                        run_id: Some(run_id.clone()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("AgentEnd must remain fenced after prepare and before apply");
+        assert!(
+            fenced_agent_end
+                .to_string()
+                .contains("fenced until Error-context Invalidate is applied"),
+            "{fenced_agent_end:#}"
+        );
+
+        drop(reopened_writer);
         reopened.pool().close().await;
+        drop(reopened);
+
+        // Store::finish_open owns common mutation recovery before hydration.
+        // Reopening at the post-prepare crash boundary must authenticate and
+        // apply the intent once, erase the target/key, and only then permit
+        // logical recovery to close the run.
+        let recovered = file_test_store(&path).await;
+        let recovered_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
+                .bind(assistant_id)
+                .fetch_one(recovered.pool())
+                .await
+                .expect("count recovered Error rows");
+        assert_eq!(recovered_rows, 0);
+        let (item_key_state, wrapped_key): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT state, wrapped_key FROM data_keys WHERE key_ref = ?")
+                .bind(&item_key_ref)
+                .fetch_one(recovered.pool())
+                .await
+                .expect("read recovered Error item key");
+        assert_eq!(item_key_state, "destroyed");
+        assert!(
+            wrapped_key.is_none(),
+            "destroyed item key keeps no wrapped bytes"
+        );
+        let recovered_mutation_state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(disposition.mutation_id())
+        .fetch_one(recovered.pool())
+        .await
+        .expect("read recovered Error mutation");
+        assert_eq!(recovered_mutation_state, "applied");
+
+        let recovered_hydration = match recovered
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate only after common Error mutation recovery")
+        {
+            HydrationOutcome::Complete(state) => state,
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("Error disposition has no physical process recovery")
+            }
+        };
+        assert!(recovered_hydration.provider_context.is_empty());
+        assert!(matches!(
+            recovered_hydration.recovery_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: None,
+                ..
+            }]
+        ));
+        EventWriter::new(recovered.clone())
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end(run_id).expect("AgentEnd after recovery")),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: command_id.to_owned(),
+                        command_seq: 1,
+                        run_id: Some(format!("run-{command_id}")),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("AgentEnd is eligible only after Error context reaches applied");
+
+        recovered.pool().close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
@@ -24318,6 +25249,24 @@ mod tests {
             }
             HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
         }
+
+        let message_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load non-Error assistant sequence");
+        let error = writer
+            .build_error_context_disposition(
+                &message_id,
+                u64::try_from(message_seq).expect("positive assistant sequence"),
+            )
+            .await
+            .expect_err("a non-Error assistant cannot authorize Error-context disposition");
+        assert!(
+            error
+                .to_string()
+                .contains("not the exact authenticated Error MessageEnd event")
+        );
     }
 
     #[tokio::test]
