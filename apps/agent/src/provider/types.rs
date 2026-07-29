@@ -1677,6 +1677,101 @@ mod tests {
         assert!(stream.recv().await.is_none());
     }
 
+    #[tokio::test]
+    async fn priority_provider_error_drops_observed_unsigned_thinking_without_synthesis() {
+        let expected_origin = ProviderOrigin {
+            provider_instance_id: "anthropic:https://api.anthropic.com".to_owned(),
+            protocol: ApiProtocol::AnthropicMessages,
+            model: "claude-sonnet-4-20250514".to_owned(),
+        };
+        let verified = AssistantContent::Text {
+            text: "verified prior text".to_owned(),
+            wire_item_index: 0,
+        };
+        let expected_output = ProviderOutput {
+            message: AssistantMessage {
+                content: vec![verified],
+                model: expected_origin.model.clone(),
+                provider: "anthropic".to_owned(),
+                origin: expected_origin.clone(),
+                usage: Usage {
+                    input: 21,
+                    output: 8,
+                    cache_read: 5,
+                    cache_write: 3,
+                    reasoning: 4,
+                    total_tokens: 41,
+                },
+                stop_reason: StopReason::Error,
+                error_message: Some("upstream overloaded".to_owned()),
+                provider_code: Some("overloaded_error".to_owned()),
+                interrupted: false,
+                timestamp: timestamp(),
+            },
+            provider_context: vec![ProviderContextFragment {
+                wire_item_index: Some(0),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::AnthropicMessages,
+                    item: json!({"type": "redacted_thinking", "data": "verified-context"}),
+                },
+            }],
+        };
+        let (tx, rx) = mpsc::channel(5);
+        for event in [
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "verified prior text".to_owned(),
+            },
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "verified prior text".to_owned(),
+            },
+            ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "signature".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "unsigned prefix".to_owned(),
+            },
+        ] {
+            tx.send(event).await.expect("normal event");
+        }
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            CancellationToken::new(),
+            "anthropic",
+            expected_origin,
+            ResponseBudget::default(),
+            Arc::new(SuccessTerminalCommit::new()),
+        );
+        let mut consumer = MessageAssembler::new();
+        for _ in 0..=5 {
+            let event = stream.recv().await.expect("observed prefix");
+            consumer.apply(&event).expect("consumer accepts prefix");
+        }
+
+        let expected_terminal = ProviderEvent::Error {
+            reason: StopReason::Error,
+            output: expected_output.clone(),
+        };
+        priority_tx
+            .send(expected_terminal.clone())
+            .await
+            .expect("provider error");
+        let terminal = stream.recv().await.expect("provider terminal");
+        assert_eq!(terminal, expected_terminal);
+        let message = consumer
+            .apply(&terminal)
+            .expect("consumer reconciles provider terminal")
+            .expect("terminal message");
+        assert_eq!(message, expected_output.message);
+        assert!(stream.recv().await.is_none());
+    }
+
     #[test]
     fn terminal_queue_audit_reports_when_more_events_remain() {
         let (tx, mut rx) = mpsc::channel(34);
