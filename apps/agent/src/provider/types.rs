@@ -646,12 +646,17 @@ impl SuccessTerminalCommit {
 pub struct ProviderEventStream {
     rx: Option<mpsc::Receiver<ProviderEvent>>,
     priority_terminal_rx: Option<mpsc::Receiver<ProviderEvent>>,
+    ordered_prefix_drain_rx: Option<mpsc::Receiver<()>>,
     cancel: CancellationToken,
     provider: String,
     origin: ProviderOrigin,
     shadow: MessageAssembler,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
     producer_task: Option<tokio::task::JoinHandle<()>>,
+    // Only an explicitly marked terminal waits for its already-enqueued normal
+    // prefix. Responses partial tool-call rejections carry their synthetic
+    // result only in that prefix; ordinary failure terminals retain priority.
+    pending_priority_terminal: Option<ProviderEvent>,
     start_emitted: bool,
     terminal_emitted: bool,
 }
@@ -666,12 +671,14 @@ impl ProviderEventStream {
         Self {
             rx: Some(rx),
             priority_terminal_rx: None,
+            ordered_prefix_drain_rx: None,
             cancel,
             provider: provider.into(),
             origin,
             shadow: MessageAssembler::new(),
             success_terminal_committed: Arc::new(SuccessTerminalCommit::new()),
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -689,12 +696,14 @@ impl ProviderEventStream {
         Self {
             rx: Some(rx),
             priority_terminal_rx: Some(priority_terminal_rx),
+            ordered_prefix_drain_rx: None,
             cancel,
             provider: provider.into(),
             origin,
             shadow: MessageAssembler::with_budget(budget),
             success_terminal_committed,
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -705,6 +714,13 @@ impl ProviderEventStream {
     /// observe cooperative cancellation.
     pub(crate) fn own_producer(mut self, producer_task: tokio::task::JoinHandle<()>) -> Self {
         self.producer_task = Some(producer_task);
+        self
+    }
+
+    /// Opts in only explicitly marked priority terminals to draining their
+    /// already-queued normal prefix before consumer terminal validation.
+    pub(crate) fn with_ordered_prefix_drain(mut self, rx: mpsc::Receiver<()>) -> Self {
+        self.ordered_prefix_drain_rx = Some(rx);
         self
     }
 
@@ -907,10 +923,53 @@ impl Stream for ProviderEventStream {
             success_committed = self.success_terminal_committed.is_committed();
         }
         if !success_committed {
+            if let Some(terminal) = self.pending_priority_terminal.take() {
+                if self.cancel.is_cancelled() {
+                    return Poll::Ready(Some(self.accept_event(terminal)));
+                }
+                if let Some(rx) = self.rx.as_mut() {
+                    match rx.poll_recv(cx) {
+                        Poll::Ready(Some(ProviderEvent::Start)) => {
+                            tracing::warn!("discarded duplicate producer Start event");
+                            self.pending_priority_terminal = Some(terminal);
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Some(event)) => {
+                            self.pending_priority_terminal = Some(terminal);
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        Poll::Ready(None) | Poll::Pending => {}
+                    }
+                }
+                return Poll::Ready(Some(self.accept_event(terminal)));
+            }
             if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
                 match priority_rx.poll_recv(cx) {
                     Poll::Ready(Some(event)) => {
                         debug_assert!(event.is_terminal());
+                        if self.cancel.is_cancelled() {
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        let drain_prefix = self
+                            .ordered_prefix_drain_rx
+                            .as_mut()
+                            .is_some_and(|rx| matches!(rx.poll_recv(cx), Poll::Ready(Some(()))));
+                        if drain_prefix && let Some(rx) = self.rx.as_mut() {
+                            match rx.poll_recv(cx) {
+                                Poll::Ready(Some(ProviderEvent::Start)) => {
+                                    tracing::warn!("discarded duplicate producer Start event");
+                                    self.pending_priority_terminal = Some(event);
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Some(normal)) => {
+                                    self.pending_priority_terminal = Some(event);
+                                    return Poll::Ready(Some(self.accept_event(normal)));
+                                }
+                                Poll::Ready(None) | Poll::Pending => {}
+                            }
+                        }
                         return Poll::Ready(Some(self.accept_event(event)));
                     }
                     Poll::Ready(None) => self.priority_terminal_rx = None,
