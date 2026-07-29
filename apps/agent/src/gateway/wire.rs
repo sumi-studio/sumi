@@ -3113,7 +3113,8 @@ mod tests {
                 | "browser_command_frame"
                 | "browser_event_frame"
                 | "browser_command_accepted"
-                | "browser_command_rejected" => continue,
+                | "browser_command_rejected"
+                | "browser_direct_chat_status" => continue,
                 other => panic!("unknown fixture kind '{other}' for '{name}'"),
             }
             passed += 1;

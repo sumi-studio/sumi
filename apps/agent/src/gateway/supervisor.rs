@@ -2806,6 +2806,17 @@ mod tests {
         })
     }
 
+    fn valid_command_json(seq: u64, command_id: &str, command: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "seq": seq,
+            "command_id": command_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": command,
+        }))
+        .expect("serialize authenticated command fixture")
+    }
+
     fn valid_command_for(
         seq: u64,
         command_id: &str,
@@ -4229,8 +4240,11 @@ mod tests {
         use std::io::Cursor;
 
         let generation = ProcessGeneration::from_wire(7).unwrap();
-        let input = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#
-            .to_vec();
+        let input = valid_command_json(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+            serde_json::json!({"type": "abort"}),
+        );
         let gateway = InjectedStdioGateway::new(
             tokio::io::BufReader::new(Cursor::new(input)),
             tokio::io::sink(),
@@ -5543,8 +5557,13 @@ mod tests {
         let (latch_tx, latch_rx) = watch::channel(HydrationState::NotReady);
         let (second_tx, second_rx) = oneshot::channel();
 
-        let first =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"#.to_vec();
+        let first = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"#,
+            crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
+                .expect("serialize direct-chat provenance fixture"),
+        )
+        .into_bytes();
         let second = br#""type":"user_message","text":"hi","attachments":[]}}"#.to_vec();
 
         let buf = ChunkedBuf {

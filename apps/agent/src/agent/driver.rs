@@ -764,6 +764,23 @@ mod tests {
         ProcessGeneration::from_wire(raw).expect("valid test generation")
     }
 
+    fn json_lines_user_command(text: &str) -> Vec<u8> {
+        let mut command = serde_json::to_vec(&json!({
+            "seq": 1,
+            "command_id": "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": {
+                "type": "user_message",
+                "text": text,
+                "attachments": [],
+            },
+        }))
+        .expect("serialize authenticated JSON-lines command fixture");
+        command.push(b'\n');
+        command
+    }
+
     fn expected_tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
         let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
         let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
@@ -1895,7 +1912,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"fail\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("fail"))
+            .await
+            .expect("command");
         let mut lines = BufReader::new(event_read).lines();
         let mut frames = Vec::new();
         loop {
@@ -2084,9 +2104,7 @@ mod tests {
         let session_task = tokio::spawn(session.run());
 
         command_write
-            .write_all(
-                b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"run\",\"attachments\":[]}}\n",
-            )
+            .write_all(&json_lines_user_command("run"))
             .await
             .expect("command");
         let mut lines = BufReader::new(event_read).lines();
@@ -2537,7 +2555,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold"))
+            .await
+            .expect("command");
         started_rx.await.expect("provider started");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)
@@ -2657,7 +2678,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold tool\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold tool"))
+            .await
+            .expect("command");
         entered_rx.await.expect("tool entered");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)

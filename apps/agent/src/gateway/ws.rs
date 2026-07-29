@@ -598,7 +598,14 @@ mod tests {
 
     fn test_command_message() -> tokio_tungstenite::tungstenite::Message {
         tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#.to_owned(),
+            serde_json::to_string(&serde_json::json!({
+                "seq": 2,
+                "command_id": "00000000-0000-4000-8000-000000000002",
+                "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+                "provenance": crate::gateway::test_direct_chat_provenance(),
+                "command": {"type": "abort"},
+            }))
+            .expect("serialize authenticated command fixture"),
         )
     }
 
@@ -1036,9 +1043,24 @@ mod tests {
 
             // Send a bounded oversize payload; the reader must remain bounded.
             let _ = ready_tx.send(());
-            let mut oversized = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":"""#.to_vec();
-            oversized.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
-            oversized.extend_from_slice(br#"","attachments":[]}}"#);
+            let mut oversized = format!(
+                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
+                crate::gateway::TEST_PERSONALITY_AGENT_ID,
+                serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
+                    .expect("serialize direct-chat provenance fixture"),
+            )
+            .into_bytes();
+            let suffix = br#"","attachments":[]}}"#;
+            let text_bytes = (MAX_FRAME_BYTES + 1)
+                .checked_sub(oversized.len() + suffix.len())
+                .expect("authenticated command envelope must fit below the transport limit");
+            oversized.extend(std::iter::repeat_n(b'x', text_bytes));
+            oversized.extend_from_slice(suffix);
+            assert_eq!(
+                oversized.len(),
+                MAX_FRAME_BYTES + 1,
+                "fixture must exercise the first byte beyond the transport limit"
+            );
             ws.send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
                 .await
                 .unwrap();
