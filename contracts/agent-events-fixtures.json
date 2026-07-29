@@ -117,6 +117,7 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -134,6 +135,7 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "error",
           "message": "bad"
@@ -391,6 +393,7 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -535,7 +538,31 @@
     "wire": {
       "type": "command",
       "idempotency_key": "00000000-0000-4000-8000-000000000001",
-      "content": "hello"
+      "command": {
+        "type": "user_message",
+        "text": "hello",
+        "attachments": []
+      }
+    }
+  },
+  "browser_command_frame_abort": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000002",
+      "command": { "type": "abort" }
+    }
+  },
+  "browser_command_frame_approval": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000003",
+      "command": {
+        "type": "approval_decision",
+        "request_id": "00000000-0000-4000-8000-000000000004",
+        "decision": { "type": "approve_once" }
+      }
     }
   },
   "browser_event_frame": {

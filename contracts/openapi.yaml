@@ -44,7 +44,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/DirectChatCommand"
+              $ref: "#/components/schemas/DirectChatUserMessageCommand"
       responses:
         "201":
           description: Target-free command receipt
@@ -165,13 +165,20 @@ components:
       $ref: "./agent-events.yaml#/$defs/BrowserClientFrame"
     BrowserServerFrame:
       $ref: "./agent-events.yaml#/$defs/BrowserServerFrame"
-    DirectChatCommand:
+    DirectChatUserMessageCommand:
       type: object
-      required: [content]
+      required: [type, text, attachments]
       additionalProperties: false
       properties:
-        content:
+        type:
+          const: user_message
+        text:
           type: string
+        attachments:
+          type: array
+          maxItems: 0
+          items:
+            $ref: "./agent-events.yaml#/$defs/Attachment"
     DirectChatCommandReceipt:
       type: object
       required: [idempotency_key, command_id, seq]

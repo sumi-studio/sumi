@@ -158,8 +158,11 @@ export interface components {
         };
         BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
         BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
-        DirectChatCommand: {
-            content: string;
+        DirectChatUserMessageCommand: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            attachments: components["schemas"]["Attachment"][];
         };
         DirectChatCommandReceipt: {
             idempotency_key: string;
@@ -172,16 +175,54 @@ export interface components {
             /** @enum {string} */
             reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict";
         };
+        /** @description placeholder for v1; no attachments are accepted yet */
+        Attachment: {
+            [key: string]: unknown;
+        };
         BrowserHello: {
             /** @constant */
             type: "hello";
             last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
+        /** @description any JSON value */
+        AnyJSON: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
+        /** @description object boundary preserved for T22/T23; properties are intentionally open */
+        DeferredApprovalRule: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        };
+        ApprovalDecision: {
+            /** @constant */
+            type: "approve_once";
+        } | {
+            /** @constant */
+            type: "approve_always";
+            rule: components["schemas"]["DeferredApprovalRule"];
+        } | {
+            /** @constant */
+            type: "deny";
+        };
+        Command: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            /** @description reserved for v1; must be an empty array */
+            attachments: components["schemas"]["Attachment"][];
+        } | {
+            /** @constant */
+            type: "abort";
+        } | {
+            /** @constant */
+            type: "approval_decision";
+            request_id: string;
+            decision: components["schemas"]["ApprovalDecision"];
+        };
         BrowserCommandFrame: {
             /** @constant */
             type: "command";
             idempotency_key: string;
-            content: string;
+            command: components["schemas"]["Command"];
         };
         AgentStartEvent: {
             /** @constant */
@@ -212,10 +253,6 @@ export interface components {
             /** Format: date-time */
             timestamp: string;
         };
-        /** @description any JSON value */
-        AnyJSON: {
-            [key: string]: components["schemas"]["AnyJSON"];
-        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
         ToolCall: {
             id: string;
             name: string;
@@ -384,21 +421,6 @@ export interface components {
             type: "approval_requested";
             request: components["schemas"]["ApprovalRequest"];
         };
-        /** @description object boundary preserved for T22/T23; properties are intentionally open */
-        DeferredApprovalRule: {
-            [key: string]: components["schemas"]["AnyJSON"];
-        };
-        ApprovalDecision: {
-            /** @constant */
-            type: "approve_once";
-        } | {
-            /** @constant */
-            type: "approve_always";
-            rule: components["schemas"]["DeferredApprovalRule"];
-        } | {
-            /** @constant */
-            type: "deny";
-        };
         ApprovalResolution: "cancelled" | {
             decision: components["schemas"]["ApprovalDecision"];
         };
@@ -553,33 +575,15 @@ export interface components {
         };
         /** @description opaque ASCII tenant identity */
         TenantId: string;
-        /** @description human-readable ASCII principal identity */
+        /** @description opaque ASCII principal identity */
         PrincipalId: string;
-        /** @description placeholder for v1; no attachments are accepted yet */
-        Attachment: {
-            [key: string]: unknown;
-        };
-        Command: {
-            /** @constant */
-            type: "user_message";
-            text: string;
-            /** @description reserved for v1; must be an empty array */
-            attachments: components["schemas"]["Attachment"][];
-        } | {
-            /** @constant */
-            type: "abort";
-        } | {
-            /** @constant */
-            type: "approval_decision";
-            request_id: string;
-            decision: components["schemas"]["ApprovalDecision"];
-        };
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             event: components["schemas"]["DurableAgentEvent"];
             seq: components["schemas"]["JsonSafeInteger"];
         };
         VolatileEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             event: components["schemas"]["VolatileAgentEvent"];
         };
         Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
@@ -636,7 +640,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["DirectChatCommand"];
+                "application/json": components["schemas"]["DirectChatUserMessageCommand"];
             };
         };
         responses: {

@@ -105,6 +105,18 @@ if (
   failed = true;
 }
 
+const directChatRequest = openApi.components?.schemas?.DirectChatUserMessageCommand;
+if (
+  directChatRequest?.type !== "object" ||
+  directChatRequest?.additionalProperties !== false ||
+  directChatRequest?.properties?.type?.const !== "user_message" ||
+  directChatRequest?.properties?.text?.type !== "string" ||
+  directChatRequest?.properties?.attachments?.maxItems !== 0
+) {
+  console.error("Direct-chat HTTP admission must preserve the strict structured user-message command body.");
+  failed = true;
+}
+
 const boundedDecimalCases = [
   {
     name: "ProcessGeneration",
@@ -203,9 +215,15 @@ const counterexamples = [
     name: "volatile envelope with disallowed seq",
     def: "Envelope",
     value: {
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "error", message: "x" },
       seq: 1,
     },
+  },
+  {
+    name: "volatile envelope requires personality agent ID",
+    def: "Envelope",
+    value: { event: { type: "error", message: "x" } },
   },
   {
     name: "hello rejects noncanonical decimal",
@@ -339,15 +357,15 @@ const counterexamples = [
   {
     name: "browser command rejects an empty idempotency key",
     def: "BrowserCommandFrame",
-    value: { type: "command", idempotency_key: "", content: "hello" },
+    value: { type: "command", idempotency_key: "", command: { type: "abort" } },
   },
   {
-    name: "browser command rejects a legacy command payload",
+    name: "browser command rejects a content-only payload",
     def: "BrowserCommandFrame",
     value: {
       type: "command",
       idempotency_key: "key-1",
-      command: { type: "user_message", text: "hello", attachments: [] },
+      content: "hello",
     },
   },
   {

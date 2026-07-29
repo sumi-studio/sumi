@@ -310,7 +310,7 @@ export type Command =
  */
 export type TenantId = string;
 /**
- * human-readable ASCII principal identity
+ * opaque ASCII principal identity
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PrincipalId".
@@ -643,6 +643,7 @@ export interface RetryScheduledEvent {
  * via the `definition` "VolatileEnvelope".
  */
 export interface VolatileEnvelope {
+  personality_agent_id: PersonalityAgentId;
   event: VolatileAgentEvent;
 }
 /**
@@ -727,7 +728,7 @@ export interface BrowserHello {
 export interface BrowserCommandFrame {
   type: "command";
   idempotency_key: string;
-  content: string;
+  command: Command;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

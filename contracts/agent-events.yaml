@@ -28,9 +28,10 @@ $defs:
 
   VolatileEnvelope:
     type: object
-    required: [event]
+    required: [personality_agent_id, event]
     additionalProperties: false
     properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       event: { $ref: '#/$defs/VolatileAgentEvent' }
 
   Envelope:
@@ -681,7 +682,7 @@ $defs:
     minLength: 1
     maxLength: 256
     pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
-    description: human-readable ASCII principal identity
+    description: opaque ASCII principal identity
 
   DirectChatProvenanceV1:
     type: object
@@ -772,7 +773,7 @@ $defs:
 
   BrowserCommandFrame:
     type: object
-    required: [type, idempotency_key, content]
+    required: [type, idempotency_key, command]
     additionalProperties: false
     properties:
       type: { const: command }
@@ -780,7 +781,7 @@ $defs:
         type: string
         minLength: 1
         maxLength: 1024
-      content: { type: string }
+      command: { $ref: '#/$defs/Command' }
 
   BrowserClientFrame:
     oneOf:
