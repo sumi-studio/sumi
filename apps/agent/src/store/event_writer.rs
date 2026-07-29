@@ -3002,6 +3002,12 @@ impl EventWriter {
         if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
         }
+        // COMMIT is the durability boundary. Publication is an O(1) wake
+        // high-water over the canonical `agent_events` FIFO and never awaits
+        // T17/T24 while this writer gate is held. Keeping the abrupt
+        // after-commit failpoint above this line exercises crash recovery when
+        // the durable row exists but no in-memory wake was emitted.
+        self.store.publish_committed_event_seqs(&event_seqs);
         Ok(ApplyBatchOutcome {
             seqs: event_seqs,
             receipt_outcome,
@@ -25177,6 +25183,118 @@ mod tests {
             }],
             injected_commands: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_memory_recovery_and_provider_mutation_share_one_post_commit_dispatcher() {
+        #[derive(Clone)]
+        struct RecordingTarget(Arc<std::sync::Mutex<Vec<u64>>>);
+
+        #[async_trait::async_trait]
+        impl crate::gateway::supervisor::post_commit::PostCommitAdmissionTarget for RecordingTarget {
+            async fn admit_committed(
+                &self,
+                _personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
+                seq: u64,
+            ) -> Result<crate::gateway::supervisor::session::DurableEventAdmission> {
+                self.0.lock().unwrap().push(seq);
+                Ok(
+                    crate::gateway::supervisor::session::DurableEventAdmission::Deferred {
+                        after_epoch: None,
+                    },
+                )
+            }
+        }
+
+        let store = test_store().await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher =
+            crate::gateway::supervisor::post_commit::OrderedPostCommitDispatcher::start(
+                store.clone(),
+                RecordingTarget(calls.clone()),
+                0,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .expect("one dispatcher claims the Store");
+        let client = dispatcher.client();
+        let writer = EventWriter::new(store.clone());
+
+        // Provider-context mutation uses its real prepared/apply contract.
+        let provider_mutation =
+            error_context_kill_target(&writer, "error_context_disposition_apply").await;
+        let session_event_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM agent_events WHERE event_type='message_end'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            session_event_seq > 0,
+            "the real Session fixture must commit lifecycle output"
+        );
+        let mut committed = writer.apply(provider_mutation).await.unwrap();
+
+        // Idle/background memory maintenance uses the same EventWriter.
+        committed.extend(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("background-memory")
+                                .expect("memory maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+
+        // Cold-boot recovery retains the writer gate but still publishes from
+        // the common post-COMMIT boundary.
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(41),
+            "post-commit-recovery-lease",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "post-commit-recovery-fence").unwrap();
+        let mut recovery = writer
+            .begin_bootstrap_recovery(&lease, &fence)
+            .await
+            .unwrap();
+        committed.extend(
+            recovery
+                .apply_recovery_batch(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("bootstrap-recovery")
+                                .expect("recovery event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+        drop(recovery);
+
+        let final_seq = *committed
+            .last()
+            .expect("producer commits returned receipts");
+        client
+            .admission_for(&store.scope().personality_agent_id, final_seq)
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            (1..=final_seq).collect::<Vec<_>>(),
+            "every producer must enter the one exact durable FIFO"
+        );
+        dispatcher.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]

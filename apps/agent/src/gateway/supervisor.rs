@@ -33,6 +33,7 @@ use super::{
     OutboundFrame, OversizedFrameError,
 };
 
+pub mod post_commit;
 pub mod seams;
 pub mod session;
 
@@ -323,11 +324,12 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         Ok(self.clone())
     }
 
-    /// Optional T17 capability consumed by `SessionGateway`.
+    /// Optional composite T26/T17 capability consumed by `SessionGateway`.
     ///
-    /// Sources without an EventWriter/DeliveryPump leave this absent. A
-    /// production Session event is fatal if it reaches an adapter without this
-    /// capability; ACK-only supervisor users do not require it.
+    /// Sources without an EventWriter/post-commit dispatcher/DeliveryPump leave
+    /// this absent. A production Session event is fatal if it reaches an
+    /// adapter without this capability; ACK-only supervisor users do not
+    /// require it.
     fn session_event_sink(&self) -> Option<session::SessionEventSink> {
         None
     }
@@ -2231,8 +2233,9 @@ mod tests {
         DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease,
     };
     use crate::store::{
-        DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationOutcome, Store,
-        insert_test_durable_event, user_message_id,
+        DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
+        EventBatch, EventWrite, EventWriter, HydrationOutcome, Store, insert_test_durable_event,
+        user_message_id,
     };
 
     struct TestDigestFactory;
@@ -2784,6 +2787,37 @@ mod tests {
         })
         .await
         .expect("T17 delivery epoch cleanup must finish");
+    }
+
+    fn bind_test_post_commit_dispatcher(
+        store: Arc<Store>,
+        adapter: &seams::T17StoreAdapter,
+        start_after_seq: u64,
+    ) -> (
+        seams::T17StoreAdapter,
+        post_commit::OrderedPostCommitDispatcher,
+    ) {
+        let dispatcher = post_commit::OrderedPostCommitDispatcher::start(
+            store,
+            adapter.clone(),
+            start_after_seq,
+            CancellationToken::new(),
+        )
+        .expect("start one test post-commit dispatcher");
+        let bound = adapter
+            .bind_post_commit_dispatcher(dispatcher.client())
+            .expect("bind the dispatcher proof to Session delivery");
+        (bound, dispatcher)
+    }
+
+    fn test_maintenance_batch(kind: &str) -> EventBatch {
+        EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance(kind).unwrap()),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        }
     }
 
     fn event_frame(seq: u64) -> OutboundFrame {
@@ -7826,7 +7860,7 @@ mod tests {
         insert_test_durable_event(&store, 10, &crate::agent::AgentEvent::TurnStart)
             .await
             .unwrap();
-        adapter.on_durable_committed(10).await.unwrap();
+        adapter.admit_ordered_commit(10).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -7937,7 +7971,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        store.publish_test_committed_event_receipt(&[1]);
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 1);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = MockGateway::new(VecDeque::new());
@@ -7978,6 +8015,7 @@ mod tests {
         )
         .await
         .unwrap();
+        store.publish_test_committed_event_receipt(&[2]);
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
@@ -8029,6 +8067,7 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
+        dispatcher.shutdown().await.unwrap();
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -8064,7 +8103,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let raw_secret = "sk-raw-epoch-secret-value";
         let raw_sent = Arc::new(Mutex::new(Vec::new()));
         let redacted_sent = Arc::new(Mutex::new(Vec::new()));
@@ -8123,6 +8164,7 @@ mod tests {
         )
         .await
         .unwrap();
+        store.publish_test_committed_event_receipt(&[1]);
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
@@ -8180,6 +8222,7 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
+        dispatcher.shutdown().await.unwrap();
 
         assert!(
             serde_json::to_string(&*raw_sent.lock().unwrap())
@@ -8223,7 +8266,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = MockGateway::new(VecDeque::new());
         gateway.writer.sent = sent.clone();
@@ -8254,6 +8299,7 @@ mod tests {
             insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)
                 .await
                 .unwrap();
+            store.publish_test_committed_event_receipt(&[seq]);
             session_writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
@@ -8307,6 +8353,7 @@ mod tests {
         drop(session_writer);
         drop(session_reader);
         wait_for_t17_idle(&adapter).await;
+        dispatcher.shutdown().await.unwrap();
 
         let delivered: Vec<_> = sent
             .lock()
@@ -8322,6 +8369,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_post_commit_dispatcher_fences_n_plus_one_and_ack_in_exact_lane_order() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+        let store = Arc::new(
+            Store::session_test_store("t26-exact-post-commit-order")
+                .await
+                .unwrap(),
+        );
+        let base_adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook::default();
+        base_adapter.set_durable_admission_hook(Some(hook.clone()));
+
+        let epoch = DeliveryEpoch::for_test("t26-exact-order");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (_online_tx, online) = watch::channel(true);
+        let (_epochs_tx, epochs) = watch::channel(Some(epoch));
+        let events = EventSender {
+            tx: event_tx,
+            online: online.clone(),
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = base_adapter
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("T17 adapter installs one delivery epoch");
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
+
+        let (_command_tx, commands) = mpsc::channel(1);
+        let gateway = session::SessionGateway::from(SupervisorHandle {
+            commands,
+            events: events.clone(),
+            epochs,
+            online,
+            session_events: adapter.session_event_sink(),
+            lifecycle: SupervisorLifecycle {
+                cancel: pump_cancel.clone(),
+                task: None,
+            },
+        });
+        let (_reader, mut session_writer) = gateway.split();
+        let event_writer = EventWriter::new(store.clone());
+
+        assert_eq!(
+            event_writer
+                .apply(test_maintenance_batch("memory-maintenance"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("N must enter the single dispatcher first");
+
+        assert_eq!(
+            event_writer
+                .apply(test_maintenance_batch("session-output"))
+                .await
+                .unwrap(),
+            vec![2]
+        );
+        let personality_agent_id = store.scope().personality_agent_id.clone();
+        let write = tokio::spawn(async move {
+            session_writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(2),
+                        personality_agent_id: personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "memory_maintenance",
+                            "kind": "untrusted-session-copy"
+                        }),
+                    },
+                })
+                .await?;
+            session_writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: 1,
+                        command_id: COMMAND_ID.to_owned(),
+                        personality_agent_id,
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "Session must await the same N+1 dispatcher proof before its ACK"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "holding N admission must keep N+1 and the ACK out of T24"
+        );
+
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("N registers its completion fence");
+        hook.allow_delivery.notify_one();
+        let first = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("N reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&first.2).unwrap(), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("N+1 starts only after N admission completes");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the terminal ACK cannot overtake held N+1"
+        );
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("N+1 registers its completion fence");
+        hook.allow_delivery.notify_one();
+
+        let second = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("N+1 reaches T24")
+            .expect("T24 lane remains open");
+        let third = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("ACK reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&second.2).unwrap(), 2);
+        assert!(matches!(third.2, OutboundFrame::CommandAck { .. }));
+        assert_eq!(first.0, epoch);
+        assert_eq!(second.0, epoch);
+        assert_eq!(third.0, epoch);
+        tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("Session writer completes after ordered admission")
+            .expect("Session writer task")
+            .expect("durable frame and ACK send");
+
+        base_adapter.set_durable_admission_hook(None);
+        dispatcher.shutdown().await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("delivery forwarder terminates")
+            .expect("delivery forwarder joins");
+    }
+
+    #[tokio::test]
     async fn durable_fence_registration_is_atomic_with_epoch_invalidation() {
         const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
         let store = Arc::new(
@@ -8329,18 +8528,15 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
-            .await
-            .unwrap();
-        let adapter = seams::T17StoreAdapter::new(store.clone())
+        let base_adapter = seams::T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
         let hook = seams::DurableAdmissionHook::default();
-        adapter.set_durable_admission_hook(Some(hook.clone()));
+        base_adapter.set_durable_admission_hook(Some(hook.clone()));
 
         let epoch = DeliveryEpoch::for_test("atomic-admission-old");
         let replacement = DeliveryEpoch::for_test("atomic-admission-replacement");
-        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
         let (online_tx, online) = watch::channel(true);
         let (epochs_tx, epochs) = watch::channel(Some(epoch));
         let events = EventSender {
@@ -8348,15 +8544,25 @@ mod tests {
             online: online.clone(),
         };
         let pump_cancel = CancellationToken::new();
-        let runtime = adapter
-            .install_delivery_epoch(epoch, 1, events.clone(), pump_cancel.child_token())
+        let runtime = base_adapter
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
             .await
             .unwrap()
             .expect("T17 adapter installs a forwarder runtime");
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
+        let dispatcher_client = dispatcher.client();
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("atomic-admission"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
         let (_command_tx, commands) = mpsc::channel(1);
         let gateway = session::SessionGateway::from(SupervisorHandle {
             commands,
-            events,
+            events: events.clone(),
             epochs,
             online,
             session_events: adapter.session_event_sink(),
@@ -8367,28 +8573,6 @@ mod tests {
         });
         let (_reader, mut writer) = gateway.split();
         let personality_agent_id = store.scope().personality_agent_id.clone();
-        let write = tokio::spawn(async move {
-            writer
-                .send(OutboundFrame::Event {
-                    envelope: Envelope {
-                        seq: Some(1),
-                        personality_agent_id,
-                        event: serde_json::json!({"type": "agent_start"}),
-                    },
-                })
-                .await?;
-            writer
-                .send(OutboundFrame::CommandAck {
-                    ack: CommandAck {
-                        seq: 1,
-                        command_id: COMMAND_ID.to_owned(),
-                        personality_agent_id: crate::gateway::test_personality_agent_id(),
-                        status: CommandAckStatus::Applied,
-                        reject_reason: None,
-                    },
-                })
-                .await
-        });
 
         tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
             .await
@@ -8422,23 +8606,102 @@ mod tests {
         online_tx.send_replace(false);
         epochs_tx.send_replace(None);
         hook.allow_delivery.notify_one();
-        tokio::task::yield_now().await;
-        assert!(
-            !write.is_finished(),
-            "EpochLost must become Deferred and fence the later ACK"
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                dispatcher_client.admission_for(&personality_agent_id, 1)
+            )
+            .await
+            .expect("old-epoch admission resolves after invalidation")
+            .expect("old-epoch loss is reconnectable"),
+            session::DurableEventAdmission::Deferred {
+                after_epoch: Some(epoch)
+            }
         );
         assert!(
             event_rx.try_recv().is_err(),
-            "the invalidated pump must not emit the stale durable row or ACK"
+            "the invalidated pump must not emit stale N"
         );
 
-        epochs_tx.send_replace(Some(replacement));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), event_rx.recv())
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("session-after-epoch-loss"))
                 .await
-                .is_err(),
-            "replacement catch-up must complete before the ACK progresses"
+                .unwrap(),
+            vec![2]
         );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                dispatcher_client.admission_for(&personality_agent_id, 2)
+            )
+            .await
+            .expect("offline N+1 admission resolves")
+            .expect("offline admission remains reconnectable"),
+            session::DurableEventAdmission::Deferred {
+                after_epoch: Some(epoch)
+            }
+        );
+        let write = tokio::spawn(async move {
+            writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(2),
+                        personality_agent_id: personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "memory_maintenance",
+                            "kind": "untrusted-session-copy"
+                        }),
+                    },
+                })
+                .await?;
+            writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: 1,
+                        command_id: COMMAND_ID.to_owned(),
+                        personality_agent_id,
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "the deferred N/N+1 barrier must hold the terminal ACK offline"
+        );
+
+        let replacement_runtime = adapter
+            .install_delivery_epoch(replacement, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("replacement T17 epoch installs");
+        epochs_tx.send_replace(Some(replacement));
+        let catch_up = adapter.events_after(0, 16).await.unwrap();
+        assert_eq!(
+            catch_up
+                .iter()
+                .map(outbound_frame_event_seq)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            vec![1, 2]
+        );
+        for frame in catch_up {
+            events.send((replacement, frame)).await.unwrap();
+        }
+        let replay_n = event_rx.recv().await.unwrap();
+        let replay_n_plus_one = event_rx.recv().await.unwrap();
+        assert_eq!(outbound_frame_event_seq(&replay_n.2).unwrap(), 1);
+        assert_eq!(outbound_frame_event_seq(&replay_n_plus_one.2).unwrap(), 2);
+        assert_eq!(replay_n.0, replacement);
+        assert_eq!(replay_n_plus_one.0, replacement);
+        assert!(
+            !write.is_finished() && event_rx.try_recv().is_err(),
+            "replacement catch-up must finish before exactly one ACK is admitted"
+        );
+        adapter.mark_delivery_online(replacement).await.unwrap();
         online_tx.send_replace(true);
         let (ack_epoch, _, frame) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
@@ -8453,11 +8716,95 @@ mod tests {
             .expect("durable callback and ACK complete");
 
         adapter.set_durable_admission_hook(None);
+        dispatcher.shutdown().await.unwrap();
+        adapter
+            .invalidate_delivery_epoch(replacement)
+            .await
+            .unwrap();
         pump_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), runtime.join())
             .await
             .expect("invalidated forwarder must terminate")
             .expect("forwarder task joins");
+        tokio::time::timeout(Duration::from_secs(1), replacement_runtime.join())
+            .await
+            .expect("replacement forwarder must terminate")
+            .expect("replacement forwarder joins");
+    }
+
+    #[tokio::test]
+    async fn emergency_dispatcher_drop_removes_its_inflight_t17_fence() {
+        let store = Arc::new(
+            Store::session_test_store("t26-emergency-fence-cleanup")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook::default();
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+        let epoch = DeliveryEpoch::for_test("emergency-fence-cleanup");
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = adapter
+            .install_delivery_epoch(epoch, 0, events, pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("delivery epoch installs");
+        let dispatcher = post_commit::OrderedPostCommitDispatcher::start(
+            store.clone(),
+            adapter.clone(),
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("emergency-fence"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("dispatcher reserves the delivery epoch");
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("dispatcher owns a completion fence");
+        assert_eq!(adapter.durable_fence_count(), 1);
+
+        drop(dispatcher);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.durable_fence_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("emergency cancellation drops the RAII fence owner");
+        assert_eq!(
+            EventWriter::new(store)
+                .apply(test_maintenance_batch("writer-after-emergency"))
+                .await
+                .unwrap(),
+            vec![2],
+            "dispatcher cancellation cannot strand EventWriter's gate"
+        );
+
+        adapter.set_durable_admission_hook(None);
+        adapter.invalidate_delivery_epoch(epoch).await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("forwarder terminates")
+            .expect("forwarder joins");
     }
 
     #[tokio::test]
@@ -8505,7 +8852,7 @@ mod tests {
             .await
             .unwrap();
         let error = adapter
-            .on_durable_committed(1)
+            .admit_ordered_commit(1)
             .await
             .expect_err("invalid durable projection must fail synchronously");
         assert!(
@@ -8819,7 +9166,9 @@ mod tests {
         let store = Store::session_test_store("active-session-reconnect")
             .await
             .unwrap();
-        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let store_arc = Arc::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
+        let (adapter, dispatcher) = bind_test_post_commit_dispatcher(store_arc, &base_adapter, 0);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let first_sent = Arc::new(Mutex::new(Vec::new()));
         let second_sent = Arc::new(Mutex::new(Vec::new()));
@@ -8996,6 +9345,7 @@ mod tests {
             .expect_err("test cleanup aborts the otherwise idle Session");
         assert!(error.is_cancelled());
         wait_for_t17_idle(&adapter).await;
+        dispatcher.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -9007,7 +9357,9 @@ mod tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let store_arc = Arc::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
+        let (adapter, dispatcher) = bind_test_post_commit_dispatcher(store_arc, &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer_blocked = Arc::new(Notify::new());
         let writer_release = Arc::new(Notify::new());
@@ -9223,6 +9575,7 @@ mod tests {
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
         wait_for_t17_idle(&adapter).await;
+        dispatcher.shutdown().await.unwrap();
     }
 
     #[derive(Clone)]

@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::post_commit::{PostCommitAdmissionTarget, PostCommitDispatcherClient};
 use super::session::{DurableEventAdmission, SessionEventDelivery, SessionEventSink};
 use super::{
     CommandCursors, CredentialProvider, DeliveryAuthorization, DeliveryEpoch, DeliveryEpochFailure,
@@ -37,6 +38,17 @@ enum DurableForwardFailure {
 
 type DurableFenceSender = oneshot::Sender<std::result::Result<(), DurableForwardFailure>>;
 type DurableFences = Arc<Mutex<HashMap<(u64, u64), DurableFenceSender>>>;
+
+struct DurableFenceRegistration {
+    fences: DurableFences,
+    key: (u64, u64),
+}
+
+impl Drop for DurableFenceRegistration {
+    fn drop(&mut self) {
+        self.fences.lock().unwrap().remove(&self.key);
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -134,6 +146,7 @@ pub struct T17StoreAdapter {
     authorization: Option<DeliveryAuthorization>,
     pump: Arc<tokio::sync::Mutex<Option<DeliveryPump>>>,
     durable_fences: DurableFences,
+    post_commit_dispatcher: Option<PostCommitDispatcherClient>,
     #[cfg(test)]
     replay_page_lengths: Arc<Mutex<Vec<usize>>>,
     #[cfg(test)]
@@ -159,6 +172,7 @@ impl T17StoreAdapter {
             authorization: None,
             pump: Arc::new(tokio::sync::Mutex::new(None)),
             durable_fences: Arc::new(Mutex::new(HashMap::new())),
+            post_commit_dispatcher: None,
             #[cfg(test)]
             replay_page_lengths: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -168,6 +182,29 @@ impl T17StoreAdapter {
             #[cfg(test)]
             durable_admission_hook: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Bind the one T26 dispatcher proof client used by Session.
+    ///
+    /// The dispatcher target is an unbound clone of this adapter. Binding only
+    /// adds the wait capability; pump/epoch state remains shared by all clones.
+    pub(crate) fn bind_post_commit_dispatcher(
+        &self,
+        dispatcher: PostCommitDispatcherClient,
+    ) -> Result<Self> {
+        if dispatcher.personality_agent_id() != self.store.scope().personality_agent_id() {
+            bail!(
+                "post-commit dispatcher personality-agent mismatch: expected {}, got {}",
+                self.store.scope().personality_agent_id,
+                dispatcher.personality_agent_id()
+            );
+        }
+        if self.post_commit_dispatcher.is_some() {
+            bail!("T17 Store adapter already has a post-commit dispatcher");
+        }
+        let mut bound = self.clone();
+        bound.post_commit_dispatcher = Some(dispatcher);
+        Ok(bound)
     }
 
     fn start_forwarder(
@@ -311,9 +348,9 @@ impl T17StoreAdapter {
         })
     }
 
-    /// Called by T26's ordered post-commit pump task. EventWriter must not
-    /// await this bounded delivery path inside its database transaction.
-    pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<DurableEventAdmission> {
+    /// Called only by T26's ordered post-commit dispatcher. EventWriter never
+    /// awaits this bounded delivery path inside its database transaction.
+    pub(super) async fn admit_ordered_commit(&self, seq: u64) -> Result<DurableEventAdmission> {
         let (fence_tx, fence_rx) = oneshot::channel();
         let (reservation, epoch, key) = {
             // Reservation and fence registration are one admission operation
@@ -338,19 +375,29 @@ impl T17StoreAdapter {
             }
 
             let key = (epoch.as_u64(), seq);
-            if self
-                .durable_fences
-                .lock()
-                .unwrap()
-                .insert(key, fence_tx)
-                .is_some()
             {
-                bail!(
-                    "duplicate durable delivery fence for epoch {} seq {seq}",
-                    epoch.as_u64()
-                );
+                use std::collections::hash_map::Entry;
+                match self.durable_fences.lock().unwrap().entry(key) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(fence_tx);
+                    }
+                    Entry::Occupied(_) => {
+                        bail!(
+                            "duplicate durable delivery fence for epoch {} seq {seq}",
+                            epoch.as_u64()
+                        );
+                    }
+                }
             }
             (reservation, epoch, key)
+        };
+        // Dropping the dispatcher admission future (for example during T26
+        // shutdown) removes the completion sender. The DeliveryPump
+        // reservation has its own RAII pending-count guard, so cancellation
+        // cannot strand an unowned fence or wedge volatile delivery.
+        let _fence_registration = DurableFenceRegistration {
+            fences: self.durable_fences.clone(),
+            key,
         };
 
         #[cfg(test)]
@@ -364,13 +411,11 @@ impl T17StoreAdapter {
         match reservation.deliver().await {
             Ok(DurableDeliveryOutcome::Enqueued) => {}
             Ok(DurableDeliveryOutcome::EpochLost) => {
-                self.durable_fences.lock().unwrap().remove(&key);
                 return Ok(DurableEventAdmission::Deferred {
                     after_epoch: Some(epoch),
                 });
             }
             Err(error) => {
-                self.durable_fences.lock().unwrap().remove(&key);
                 if error.is::<DeliveryTransportError>() {
                     return Ok(DurableEventAdmission::Deferred {
                         after_epoch: Some(epoch),
@@ -446,7 +491,11 @@ impl SessionEventDelivery for T17StoreAdapter {
                 self.store.scope().personality_agent_id
             );
         }
-        T17StoreAdapter::on_durable_committed(self, seq).await
+        self.post_commit_dispatcher
+            .as_ref()
+            .context("Session durable event reached T17 without T26's ordered dispatcher")?
+            .admission_for(personality_agent_id, seq)
+            .await
     }
 
     async fn on_volatile(
@@ -468,6 +517,23 @@ impl SessionEventDelivery for T17StoreAdapter {
             }
             result => result,
         }
+    }
+}
+
+#[async_trait]
+impl PostCommitAdmissionTarget for T17StoreAdapter {
+    async fn admit_committed(
+        &self,
+        personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
+        seq: u64,
+    ) -> Result<DurableEventAdmission> {
+        if personality_agent_id != &self.store.scope().personality_agent_id {
+            bail!(
+                "post-commit dispatcher targets personality agent {personality_agent_id}, but T17 owns {}",
+                self.store.scope().personality_agent_id,
+            );
+        }
+        self.admit_ordered_commit(seq).await
     }
 }
 
@@ -511,7 +577,9 @@ impl DurableSource for T17StoreAdapter {
     }
 
     fn session_event_sink(&self) -> Option<SessionEventSink> {
-        Some(SessionEventSink::new(self.clone()))
+        self.post_commit_dispatcher
+            .as_ref()
+            .map(|_| SessionEventSink::new(self.clone()))
     }
 
     async fn event_cursor(&self) -> Result<EventCursors> {
