@@ -5049,7 +5049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_driver_idle_apply_refreshes_store_core_and_next_provider_view() {
+    async fn injected_provider_native_driver_cold_boot_idle_apply_refreshes_fallback_view() {
         let store = test_store().await;
         let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
         let promoted_marker = "PROMOTED_OLD_ASSISTANT";
@@ -5198,7 +5198,10 @@ mod tests {
         });
         let driver = InjectedRunDriver::with_stream_starter(
             spec,
-            RequestOptions::default(),
+            RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
             Some(prompt),
             Some(registry),
             Some(WorkspacePaths::new("/workspace").expect("fixture workspace")),
@@ -5206,10 +5209,28 @@ mod tests {
             starter,
         )
         .expect("construct injected driver")
-        .with_hydrated_memory(store.clone(), &hydrated)
+        .with_hydrated_memory(store.clone(), &lease, &fence, &hydrated)
         .expect("install authenticated memory boundary");
         let mut core = RunCore::new();
         core.install_hydrated_context(hydrated.messages.clone(), hydrated.provider_context.clone());
+
+        let _cold_boot_attempt = RunDriver::start_provider_for_command(
+            &driver,
+            0,
+            core.runtime_context(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("provider-native cold boot falls back to exact hydrated Sumi view");
+        {
+            let mut prompts = observed_prompts.lock().expect("prompt capture lock");
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].messages.len(), 2);
+            assert!(prompts[0].memory_blocks.is_empty());
+            assert_eq!(prompts[0].provider_context.len(), 1);
+            prompts.clear();
+        }
 
         assert!(
             RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
@@ -5356,11 +5377,7 @@ mod tests {
         let error = RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
             .await
             .expect_err("pending logical hydration must fail closed after durable apply");
-        assert!(
-            error
-                .to_string()
-                .contains("pending physical or logical recovery")
-        );
+        assert!(error.to_string().contains("pending logical recovery"));
         assert_eq!(core.mutation_epoch(), epoch_before_failed_refresh);
         assert_eq!(core.runtime_context(), context_before_failed_refresh);
         assert_eq!(

@@ -126,21 +126,21 @@ impl ContextAssembler {
         self
     }
 
-    /// Install one authenticated Store snapshot as the Sumi send-view source.
+    /// Install one authenticated Store snapshot as the fallback send-view
+    /// source.
     ///
     /// The caller transcript remains the canonical life log. The snapshot
     /// binds the exact live L0 membership to the greatest transcript sequence
     /// observed during the same hydration transaction; later persisted
-    /// messages are overlaid until the next idle refresh.
+    /// messages are overlaid until the next idle refresh. Provider-native mode
+    /// uses this exact view only when no authenticated native window matches
+    /// the destination.
     pub(crate) fn install_hydrated_memory(
         &self,
         memory: ThreeLayerMemory,
         hydrated_messages: &[ContextMessage],
         provider_context: Vec<ProviderContextItemWithFootprint>,
     ) -> Result<()> {
-        if self.mode != AssemblyMode::SumiThreeLayer {
-            anyhow::bail!("hydrated three-layer memory requires sumi_three_layer assembly mode");
-        }
         let transcript_through_seq = hydrated_transcript_cutoff(hydrated_messages)?;
         for message in memory.l0().iter().flat_map(|batch| &batch.messages) {
             let ContextMessage::Persisted { seq, .. } = message else {
@@ -213,7 +213,7 @@ impl ContextAssembler {
             .lock()
             .expect("provider context lock")
             .clone();
-        let active_view = self.active_send_messages(context)?;
+        let active_view = self.send_source_messages(context, &provider_context)?;
         let mut messages = overflow.recover_context_with_provider_context(
             active_view,
             is_first_user_call,
@@ -268,7 +268,7 @@ impl ContextAssembler {
         // completed shelves while Idle. At this API-preflight fallback we retain
         // only the bounded, replay-safe send-view recovery. It neither changes
         // durable membership nor tries to imitate promotion in process memory.
-        let active_view = self.active_send_messages(active_context)?;
+        let active_view = self.send_source_messages(active_context, &provider_context)?;
         overflow.recover_context_with_provider_context(active_view, false, &provider_context)
     }
 
@@ -368,6 +368,23 @@ impl ContextAssembler {
             }
         }
         Ok(active)
+    }
+
+    fn send_source_messages(
+        &self,
+        life_log: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
+    ) -> Result<Vec<ContextMessage>> {
+        if self.mode == AssemblyMode::ProviderNative {
+            let fingerprint = self.destination_fingerprint()?;
+            if find_native_window(provider_context, &self.spec.origin(), &fingerprint).is_some() {
+                // A matching native window owns its covered prefix. Its suffix
+                // is therefore selected from the canonical transcript rather
+                // than Sumi's independently promoted L0 membership.
+                return Ok(life_log.to_vec());
+            }
+        }
+        self.active_send_messages(life_log)
     }
 
     async fn apply_user_attachment_truncation(
@@ -1146,6 +1163,100 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| matches!(m, ContextMessage::Persisted { seq: 3, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrated_provider_native_uses_canonical_window_suffix_and_exact_sumi_fallback() {
+        let spec = responses_spec();
+        let promoted_prefix = user("covered prefix", 1);
+        let promoted_after_window = user("promoted after native coverage", 2);
+        let exact_l0 = user("exact live L0", 3);
+        let life_log = vec![
+            promoted_prefix,
+            promoted_after_window.clone(),
+            exact_l0.clone(),
+        ];
+        let memory = || {
+            let mut memory = ThreeLayerMemory::new(
+                ConsolidatedMemory {
+                    summary: crate::memory::DecryptedMemorySummary::new(
+                        "sumi fallback summary".to_owned(),
+                    ),
+                    est_tokens: 6,
+                },
+                TokenCalibration::default(),
+            );
+            memory.push_l0(L0Batch::new(vec![exact_l0.clone()], 1, 0, 4));
+            memory
+        };
+
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                })],
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        };
+        let native_footprint =
+            eviction_footprint_for_payload(&spec, &native.payload).expect("native footprint");
+        let native_entry = ProviderContextItemWithFootprint::new(native.clone(), native_footprint);
+
+        let native_assembler =
+            ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+                .expect("native assembler")
+                .with_mode(AssemblyMode::ProviderNative);
+        native_assembler
+            .install_hydrated_memory(memory(), &life_log, vec![native_entry])
+            .expect("install authenticated native-mode memory");
+        let native_prompt = native_assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble native window");
+        assert_eq!(
+            native_prompt
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    ContextMessage::Persisted { seq, .. } => Some(*seq),
+                    ContextMessage::Synthetic { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            [2, 3],
+            "native coverage suffix must come from the canonical life log"
+        );
+        assert!(native_prompt.memory_blocks.is_empty());
+        assert_eq!(native_prompt.provider_context, vec![native]);
+
+        let fallback_assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec)
+            .expect("fallback assembler")
+            .with_mode(AssemblyMode::ProviderNative);
+        fallback_assembler
+            .install_hydrated_memory(memory(), &life_log, Vec::new())
+            .expect("install authenticated fallback memory");
+        let fallback_prompt = fallback_assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble Sumi fallback");
+        assert_eq!(fallback_prompt.messages, vec![exact_l0]);
+        assert_eq!(fallback_prompt.memory_blocks.len(), 1);
+        assert_eq!(
+            fallback_prompt.memory_blocks[0].text,
+            "sumi fallback summary"
         );
     }
 
