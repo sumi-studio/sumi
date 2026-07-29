@@ -24,11 +24,15 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
   if (!fixtureBuild) throw new Error("browser E2E fixture was not built");
 
   let terminalFrames = 0;
+  let directChatSocketSeen = false;
   let markReplaySettled: (() => void) | undefined;
   const replaySettled = new Promise<void>((resolveReplay) => {
     markReplaySettled = resolveReplay;
   });
   page.on("websocket", (socket) => {
+    if (new URL(socket.url()).pathname === "/direct-chat/ws") {
+      directChatSocketSeen = true;
+    }
     socket.on("framereceived", ({ payload }) => {
       if (typeof payload !== "string") return;
       try {
@@ -65,7 +69,9 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       (await page.request.get(`${fixture.url}/__e2e__/session`)).status(),
     ).toBe(204);
     await page.goto(webURL);
-    await expect(page.getByText("open", { exact: true })).toBeVisible();
+    await expect(page.getByText("connected", { exact: true })).toBeVisible();
+    await expect(page.getByText("agent: Ready", { exact: true })).toBeVisible();
+    await expect.poll(() => directChatSocketSeen).toBe(true);
 
     const composer = page.getByLabel("メッセージ");
     await composer.fill("initial user_message");
@@ -112,7 +118,7 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
         return stats.active === 1 && stats.accepted > beforeReconnect.accepted;
       })
       .toBe(true);
-    await expect(page.getByText("open", { exact: true })).toBeVisible();
+    await expect(page.getByText("connected", { exact: true })).toBeVisible();
     await expect(
       page.getByText("Terminal replay", { exact: true }),
     ).toHaveCount(1);
@@ -206,7 +212,6 @@ function startVite(apiURL: string) {
       env: {
         ...process.env,
         VITE_API_BASE_URL: apiURL,
-        VITE_CONVERSATION_ID: "conversation-1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
