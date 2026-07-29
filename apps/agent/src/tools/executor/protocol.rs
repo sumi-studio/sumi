@@ -1127,6 +1127,7 @@ mod tests {
             serde_json::from_slice::<Value>(&encoded).expect("decode wire fixture"),
             json!({
                 "type": "update",
+                "personality_agent_id": PAID,
                 "generation": 7,
                 "nonce": "boot-nonce",
                 "request_id": "request-1",
@@ -1137,13 +1138,15 @@ mod tests {
         assert_eq!(decode_rpc_frame::<Value>(line, &identity()).unwrap(), frame);
 
         for stale in [
+            RpcIdentity::from_wire("0198f0f4-9b72-7000-8000-000000000002", 7, "boot-nonce")
+                .unwrap(),
             RpcIdentity::from_wire(PAID, 8, "boot-nonce").unwrap(),
             RpcIdentity::from_wire(PAID, 7, "stale-nonce").unwrap(),
         ] {
             assert!(matches!(
                 decode_rpc_frame::<Value>(line, &stale),
                 Err(ToolError::Protocol(message))
-                    if message == "RPC generation or boot nonce mismatch"
+                    if message == "RPC personality agent, generation, or boot nonce mismatch"
             ));
         }
     }
@@ -1175,6 +1178,7 @@ mod tests {
             serde_json::from_slice::<Value>(&encoded).expect("decode response"),
             json!({
                 "type": "terminal",
+                "personality_agent_id": PAID,
                 "generation": 7,
                 "nonce": "boot-nonce",
                 "request_id": "request-1",

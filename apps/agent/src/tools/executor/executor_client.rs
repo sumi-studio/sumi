@@ -1071,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_personality_agent_artifact_routes_fail_before_service_contact() {
-        let root = temp_root("cross-personality-agent-preflight");
+        let root = temp_root("xpaid");
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());

@@ -476,7 +476,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub(crate) async fn session_test_store(personality_agent_id: &str) -> Result<Self> {
+    pub(crate) async fn session_test_store(identity_fixture: &str) -> Result<Self> {
         #[derive(Clone)]
         struct SessionTestKeyProvider(WrappingKey);
 
@@ -494,8 +494,14 @@ impl Store {
             }
         }
 
+        // Most historical callers pass a descriptive store-instance label,
+        // not an identity. Keep those fixtures on the one shared test person;
+        // tests that intentionally exercise another person pass a canonical
+        // UUIDv7 explicitly.
+        let personality_agent_id = PersonalityAgentId::parse(identity_fixture)
+            .unwrap_or_else(|_| crate::gateway::test_personality_agent_id());
         Self::in_memory(
-            AgentScope::new(personality_agent_id.parse()?),
+            AgentScope::new(personality_agent_id),
             Arc::new(SessionTestKeyProvider(WrappingKey::new(
                 "session-test-key/v1",
                 [0x5a; 32],
