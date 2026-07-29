@@ -35,7 +35,7 @@ test.after(() => {
   Object.defineProperty(globalThis, "location", { configurable: true, value: originalLocation });
 });
 
-const accepted = (key) => ({ type: "command_accepted", idempotency_key: key, command_id: "command-1", seq: 1 });
+const accepted = (key) => ({ type: "command_accepted", idempotency_key: key, command_id: "00000000-0000-4000-8000-000000000001", seq: 1 });
 const event = (seq, value) => ({ type: "event", envelope: { seq, event: value } });
 
 test("uses the session-resolved direct-chat route and sends no target or provenance", () => {
@@ -52,7 +52,7 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   assert.equal(JSON.stringify(commands).includes("personality_agent_id"), false);
   assert.equal(JSON.stringify(commands).includes("conversation_id"), false);
   assert.equal(isDirectChatCommand({ type: "user_message", text: "x", attachments: [], actor: "forged" }), false);
-  assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { source: "forged" } } }), false);
+  assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { source: "project-policy" } } }), true);
   socket.close();
 });
 
@@ -100,6 +100,10 @@ test("rejects legacy target-bearing and malformed server frames", () => {
   assert.equal(parseDirectChatServerFrame(event(1, { type: "agent_start" }), 0)?.type, "event");
   assert.equal(parseDirectChatServerFrame({ type: "event", envelope: { conversation_id: "legacy", seq: 1, event: { type: "agent_start" } } }, 0), undefined);
   assert.equal(parseDirectChatServerFrame({ type: "command_accepted", idempotency_key: "k" }, 0), undefined);
+  for (const command_id of ["command-1", "00000000-0000-4000-8000-00000000000", "00000000-0000-4000-8000-00000000000G", "00000000-0000-4000-8000-000000000001 ", "0000000a-0000-4000-8000-000000000001".toUpperCase()]) {
+    assert.equal(parseDirectChatServerFrame({ type: "command_accepted", idempotency_key: "k", command_id, seq: 1 }, 0), undefined);
+  }
+  assert.equal(parseDirectChatServerFrame(accepted("k"), 0)?.type, "command_accepted");
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
 });
 

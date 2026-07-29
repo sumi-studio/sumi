@@ -51,15 +51,7 @@ const RejectReasons = new Set([
   "oversized",
   "not_allowed",
 ]);
-const BrowserForbiddenProvenanceFields = new Set([
-  "personality_agent_id",
-  "conversation_id",
-  "tenant_id",
-  "actor",
-  "actor_id",
-  "source",
-  "source_surface",
-]);
+const UUIDPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DurableEventTypes = new Set([
   "agent_start",
   "agent_end",
@@ -95,14 +87,6 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key));
 }
 
-function containsForbiddenProvenance(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsForbiddenProvenance);
-  if (!isRecord(value)) return false;
-  return Object.entries(value).some(
-    ([key, nested]) => BrowserForbiddenProvenanceFields.has(key) || containsForbiddenProvenance(nested),
-  );
-}
-
 function isSafeSequence(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -114,7 +98,6 @@ function isSafeSequence(value: unknown): value is number {
  */
 export function isDirectChatCommand(value: unknown): value is DirectChatCommand {
   if (!isRecord(value) || typeof value.type !== "string") return false;
-  if (containsForbiddenProvenance(value)) return false;
   if (value.type === "abort") return hasOnlyKeys(value, ["type"]);
   if (value.type === "user_message") {
     return (
@@ -204,7 +187,7 @@ export function parseDirectChatServerFrame(
     return value as DirectChatEventFrame;
   }
   if (value.type === "command_accepted" && typeof value.idempotency_key === "string" &&
-    value.idempotency_key.length > 0 && typeof value.command_id === "string" &&
+    value.idempotency_key.length > 0 && typeof value.command_id === "string" && UUIDPattern.test(value.command_id) &&
     isSafeSequence(value.seq) && hasOnlyKeys(value, ["type", "idempotency_key", "command_id", "seq"])) {
     return value as DirectChatAcceptedFrame;
   }
