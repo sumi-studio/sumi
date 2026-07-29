@@ -28,11 +28,12 @@ import (
 // and rollback are serialized by an advisory flock on the log file so multiple
 // API processes sharing SUMI_COMMAND_LOG_DIR cannot allocate duplicate seqs,
 // interleave writes, or roll back another process's committed record. In
-// addition, a process-level mutex protects the in-memory state map. Command
-// bytes are fsynced to the log before success is returned. After any restart,
-// OpenCommandStore re-reads the logs and reconstructs the per-conversation
-// next seq and idempotency maps, so restart preserves the log and allocation
-// continuity.
+// addition, a process-level mutex protects the in-memory state map and a
+// per-conversation mutex protects each cached state without serializing
+// unrelated flock waits or scans. Command bytes are fsynced to the log before
+// success is returned. After any restart, OpenCommandStore re-reads the logs
+// and reconstructs the per-conversation next seq and idempotency maps, so
+// restart preserves the log and allocation continuity.
 type CommandStore struct {
 	mu     sync.Mutex
 	dir    string
@@ -583,7 +584,7 @@ func isIncompleteJSONError(err error) bool {
 
 // scanLogLocked reads the log from the current offset and populates st. It
 // truncates an incomplete final tail and repairs a missing trailing newline.
-// The caller must hold CommandStore.mu and an exclusive flock on st.file.
+// The caller must exclusively own st and hold an exclusive flock on st.file.
 func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState, conversationID string) error {
 	if _, err := st.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", conversationID, err)

@@ -299,9 +299,19 @@ func TestCommandStoreBlockedConversationDoesNotBlockOtherConversation(t *testing
 	}
 	defer syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN)
 
+	store.mu.Lock()
+	st := store.states[blocked]
+	store.mu.Unlock()
 	blockedDone := make(chan error, 1)
 	go func() { _, err := store.NextCommandSeq(context.Background(), blocked); blockedDone <- err }()
-	time.Sleep(10 * time.Millisecond)
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for st.mu.TryLock() {
+		st.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("blocked conversation never reached its flock wait")
+		}
+		runtime.Gosched()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	if _, err := store.Append(ctx, "conv-independent", "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {

@@ -936,6 +936,39 @@ func TestWebSocketPumpFailureUnblocksPeerReadWithoutPongWait(t *testing.T) {
 	}
 }
 
+func TestWebSocketReadFailureClosesIdleWriterWithoutPongWait(t *testing.T) {
+	srv, _, _, _, _, hl := newTestServer(t)
+	hl.setReady()
+	srv.PongWait = 5 * time.Second
+	srv.PingInterval = time.Hour
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+		t.Fatal(err)
+	}
+	var hello ApiHello
+	if err := conn.ReadJSON(&hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"frame_type":"unknown"}`)); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	conn.SetReadDeadline(started.Add(500 * time.Millisecond))
+	var frame OutboundFrame
+	if err := conn.ReadJSON(&frame); err == nil {
+		t.Fatal("expected connection close after read-pump validation failure")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("idle writer survived sibling failure for %v", elapsed)
+	}
+}
+
 func TestServerWriteDeadlineUsesConfiguredTimeout(t *testing.T) {
 	srv, _, _, _, _, _ := newTestServer(t)
 	srv.WriteTimeout = time.Second

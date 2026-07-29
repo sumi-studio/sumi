@@ -9,10 +9,36 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
+
+type countingDurableFile struct {
+	durableFileHandle
+	readBytes *atomic.Int64
+}
+
+func (f *countingDurableFile) Read(p []byte) (int, error) {
+	n, err := f.durableFileHandle.Read(p)
+	f.readBytes.Add(int64(n))
+	return n, err
+}
+
+type blockingDurableFile struct {
+	durableFileHandle
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingDurableFile) Read(p []byte) (int, error) {
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return f.durableFileHandle.Read(p)
+}
 
 func openRuntimeGateway(t *testing.T) *DurableGateway {
 	t.Helper()
@@ -293,6 +319,148 @@ func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t 
 	}
 }
 
+func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-out-of-order-terminal"}
+	commands := make([]CommandEnvelope, 0, 3)
+	for i := 0; i < 3; i++ {
+		command, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	for _, ack := range []CommandAck{
+		{Seq: commands[2].Seq, CommandID: commands[2].CommandID, Status: "applied"},
+		{Seq: commands[0].Seq, CommandID: commands[0].CommandID, Status: "applied"},
+		{Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "received"},
+	} {
+		if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != commands[1].Seq {
+		t.Fatalf("first nonterminal gap = %d, want %d (err=%v)", next, commands[1].Seq, err)
+	}
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != commands[2].Seq+1 {
+		t.Fatalf("completed out-of-order history next = %d, want %d (err=%v)", next, commands[2].Seq+1, err)
+	}
+}
+
+func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T) {
+	const commandCount = 4096
+	const conversationID = "conversation-long-restart"
+	storeDir, runtimeDir := t.TempDir(), t.TempDir()
+	var commandLog, ackLog bytes.Buffer
+	for i := 1; i <= commandCount; i++ {
+		commandID := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		record := LogRecord{CommandEnvelope: CommandEnvelope{Seq: uint64(i), CommandID: commandID, Command: json.RawMessage(`{"type":"user_message","text":"history","attachments":[]}`)}}
+		line, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandLog.Write(line)
+		commandLog.WriteByte('\n')
+		line, err = json.Marshal(CommandAck{Seq: uint64(i), CommandID: commandID, Status: "applied"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ackLog.Write(line)
+		ackLog.WriteByte('\n')
+	}
+	if err := os.WriteFile(commandLogPath(storeDir, conversationID), commandLog.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gateway.ackPath(conversationID), ackLog.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedStore, reopened, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedStore.Close()
+	var readBytes atomic.Int64
+	open := reopened.newFile
+	ackPath := reopened.ackPath(conversationID)
+	reopened.newFile = func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
+		file, err := open(name, flag, perm)
+		if err != nil || name != ackPath {
+			return file, err
+		}
+		return &countingDurableFile{durableFileHandle: file, readBytes: &readBytes}, nil
+	}
+	next, err := reopened.NextCommandSeq(context.Background(), TokenClaims{ConversationID: conversationID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != commandCount+1 {
+		t.Fatalf("next command seq = %d, want %d", next, commandCount+1)
+	}
+	if got, limit := readBytes.Load(), int64(ackLog.Len()+4096); got > limit {
+		t.Fatalf("restart cursor read %d bytes from a %d-byte ACK log; scan must remain linear", got, ackLog.Len())
+	}
+}
+
+func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	firstClaims := TokenClaims{ConversationID: "conversation-slow-cursor"}
+	secondClaims := TokenClaims{ConversationID: "conversation-independent-ack"}
+	first, err := gateway.commands.Append(context.Background(), firstClaims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := gateway.commands.Append(context.Background(), secondClaims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(context.Background(), firstClaims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	open := gateway.newFile
+	blockedPath := gateway.ackPath(firstClaims.ConversationID)
+	entered, release := make(chan struct{}), make(chan struct{})
+	gateway.newFile = func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
+		file, err := open(name, flag, perm)
+		if err != nil || name != blockedPath {
+			return file, err
+		}
+		return &blockingDurableFile{durableFileHandle: file, entered: entered, release: release}, nil
+	}
+	cursorDone := make(chan error, 1)
+	go func() { _, err := gateway.NextCommandSeq(context.Background(), firstClaims); cursorDone <- err }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("slow ACK scan did not start")
+	}
+	ackDone := make(chan error, 1)
+	go func() {
+		ackDone <- gateway.ApplyAck(context.Background(), secondClaims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "received"})
+	}()
+	select {
+	case err := <-ackDone:
+		if err != nil {
+			t.Fatalf("independent ACK failed: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("one conversation's ACK scan blocked ApplyAck for another conversation")
+	}
+	close(release)
+	if err := <-cursorDone; err != nil {
+		t.Fatalf("cursor scan failed after release: %v", err)
+	}
+}
+
 func TestFoldAckCursorRecordRejectsInvalidTransitionWithoutStateChange(t *testing.T) {
 	const commandID = "00000000-0000-4000-8000-000000000001"
 	snapshot := commandLogSnapshot{commands: []CommandEnvelope{{Seq: 1, CommandID: commandID}}, nextSeq: 2}
@@ -331,23 +499,28 @@ func TestDurableGatewayNextCommandSeqFlockHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestDurableGatewayNextCommandSeqRejectsMalformedAndConflictingRestartAckHistory(t *testing.T) {
+func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		lines func(CommandEnvelope) []string
+		lines func(CommandEnvelope) []CommandAck
 	}{
 		{
-			name: "malformed status",
-			lines: func(command CommandEnvelope) []string {
-				return []string{fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"completed"}`, command.Seq, command.CommandID)}
+			name: "multiple terminal transitions",
+			lines: func(command CommandEnvelope) []CommandAck {
+				reason := "schema_violation"
+				return []CommandAck{
+					{Seq: command.Seq, CommandID: command.CommandID, Status: "received"},
+					{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
+					{Seq: command.Seq, CommandID: command.CommandID, Status: "rejected", RejectReason: &reason},
+				}
 			},
 		},
 		{
-			name: "conflicting terminal transitions",
-			lines: func(command CommandEnvelope) []string {
-				return []string{
-					fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"applied"}`, command.Seq, command.CommandID),
-					fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"applied"}`, command.Seq, command.CommandID),
+			name: "identity changes then returns",
+			lines: func(command CommandEnvelope) []CommandAck {
+				return []CommandAck{
+					{Seq: command.Seq, CommandID: "00000000-0000-4000-8000-000000000099", Status: "received"},
+					{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
 				}
 			},
 		},
@@ -358,12 +531,67 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedAndConflictingRestartAckHis
 			if err != nil {
 				t.Fatal(err)
 			}
-			claims := TokenClaims{ConversationID: "conversation-invalid-ack-history"}
+			claims := TokenClaims{ConversationID: "conversation-corrupt-ack-restart"}
 			command, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(strings.Join(tc.lines(command), "\n")+"\n"), 0o600); err != nil {
+			var log bytes.Buffer
+			encoder := json.NewEncoder(&log)
+			for _, ack := range tc.lines(command) {
+				if err := encoder.Encode(ack); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), log.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopenedStore, reopened, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopenedStore.Close()
+			if _, err := reopened.NextCommandSeq(context.Background(), claims); err == nil {
+				t.Fatal("individually valid but contradictory ACK records must fail closed")
+			}
+		})
+	}
+}
+
+func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
+	tests := []struct {
+		name    string
+		ackJSON func(CommandEnvelope) string
+	}{
+		{name: "empty status", ackJSON: func(command CommandEnvelope) string {
+			return fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":""}`, command.Seq, command.CommandID)
+		}},
+		{name: "unknown status", ackJSON: func(command CommandEnvelope) string {
+			return fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"completed"}`, command.Seq, command.CommandID)
+		}},
+		{name: "terminal status with reject reason", ackJSON: func(command CommandEnvelope) string {
+			return fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"applied","reject_reason":"schema_violation"}`, command.Seq, command.CommandID)
+		}},
+		{name: "rejected without reason", ackJSON: func(command CommandEnvelope) string {
+			return fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"rejected"}`, command.Seq, command.CommandID)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			storeDir, runtimeDir := t.TempDir(), t.TempDir()
+			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims := TokenClaims{ConversationID: "conversation-malformed-ack-restart"}
+			command, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), append([]byte(tc.ackJSON(command)), '\n'), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Close(); err != nil {
@@ -375,7 +603,9 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedAndConflictingRestartAckHis
 			}
 			defer reopenedStore.Close()
 			if next, err := reopened.NextCommandSeq(context.Background(), claims); err == nil {
-				t.Fatalf("invalid durable ACK history advanced replay cursor to %d", next)
+				t.Fatalf("malformed durable ACK advanced replay cursor to %d", next)
+			} else if !strings.Contains(err.Error(), "command_ack") {
+				t.Fatalf("malformed durable ACK returned unexpected error: %v", err)
 			}
 		})
 	}
