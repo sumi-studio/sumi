@@ -2632,11 +2632,6 @@ impl EventWriter {
                         eviction_footprint_tokens: expected_eviction_footprint_tokens,
                     } => {
                         let l0_disposition = l0_disposition(&message, append_to_l0)?;
-                        if !append_to_l0 && !provider_context.is_empty() {
-                            bail!(
-                                "MessageEnd with append_to_l0=false must not carry provider_context"
-                            );
-                        }
                         let event_seq = assigned_seq
                             .ok_or_else(|| anyhow!("MessageEnd projection requires an event"))?;
                         let key = transcript_key.as_ref().expect("transcript key was loaded");
@@ -22501,6 +22496,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_context_survives_restart_but_is_excluded_from_next_responses_send_view() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-error-provider-context-restart-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000093";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "restart fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "restart fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let assistant_id = "error-assistant-with-context";
+        let error_message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "ERROR_MESSAGE_MUST_NOT_REPLAY".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("provider failed".to_owned()),
+            provider_code: Some("fixture_error".to_owned()),
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        };
+        let error_context = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": "rs-error-restart",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "ERROR_CONTEXT_MUST_NOT_REPLAY",
+                }),
+            },
+        };
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Error {
+                reason: StopReason::Error,
+                output: ProviderOutput {
+                    message: error_message,
+                    provider_context: vec![error_context],
+                },
+            })
+            .expect("Error terminal projection")
+        else {
+            panic!("expected Error terminal");
+        };
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), false)
+            .expect("durable Error terminal with provider context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open Error assistant attempt");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message,
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit Error terminal with provider context");
+
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+
+        let reopened = file_test_store(&path).await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let hydrated = match reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect("cold hydration after Error provider-context commit")
+        {
+            HydrationOutcome::Complete(state) => state,
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("completed Error turn must not require physical recovery")
+            }
+        };
+        assert_eq!(
+            hydrated.provider_context.len(),
+            1,
+            "authenticated durable Error context must survive hydration"
+        );
+        assert!(hydrated.messages.iter().any(|message| {
+            matches!(
+                message,
+                ContextMessage::Persisted {
+                    id,
+                    message: Message::Assistant(assistant),
+                    ..
+                } if id == assistant_id && assistant.stop_reason == StopReason::Error
+            )
+        }));
+
+        let mut durable_messages = hydrated.messages;
+        durable_messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "continue after error restart".to_owned(),
+                }],
+                timestamp: durable_test_timestamp(),
+            }),
+        });
+        let send_messages = crate::memory::transform::transform(&durable_messages, &spec.origin());
+        let send_provider_context = crate::memory::transform::provider_context_for_send_view(
+            &send_messages,
+            &hydrated.provider_context,
+        );
+        assert!(
+            send_provider_context.is_empty(),
+            "context anchored to a transformed-away Error assistant must not be sent"
+        );
+        let next_request = build_responses_request(
+            &spec,
+            &PromptContext {
+                system_prompt: "continue the durable conversation".to_owned(),
+                memory_blocks: Vec::new(),
+                messages: send_messages,
+                provider_context: send_provider_context,
+                tools: Vec::new(),
+            },
+            &RequestOptions::default(),
+        )
+        .expect("next Responses request after Error restart");
+        let wire = next_request.to_string();
+        assert!(wire.contains("continue after error restart"));
+        assert!(!wire.contains("ERROR_MESSAGE_MUST_NOT_REPLAY"));
+        assert!(!wire.contains("ERROR_CONTEXT_MUST_NOT_REPLAY"));
+
+        reopened.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
     async fn message_end_opaque_provider_context_does_not_leak_to_public_transcript() {
         let path = std::env::current_dir()
             .expect("current package directory")
@@ -23001,7 +23199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_message_end_with_append_to_l0_false_rejects_provider_context() {
+    async fn error_message_end_durably_stores_context_without_l0_membership_or_footprint() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let command_id = "00000000-0000-4000-8000-000000000050";
@@ -23016,15 +23214,29 @@ mod tests {
 
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
-        let error_message = assistant_message(StopReason::Error);
+        let mut error_message = assistant_message(StopReason::Error);
         let message_id = "assistant-error-with-context";
         let fragment = ProviderContextFragment {
             wire_item_index: Some(0),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-error",
+                    "encrypted_content": "opaque-error",
+                    "summary": [],
+                }),
             },
         };
+        let origin = match &mut error_message {
+            PublicMessage::Assistant(assistant) => {
+                assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+                &assistant.origin
+            }
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
+        assert!(footprint > 0);
 
         writer
             .apply(EventBatch {
@@ -23051,7 +23263,7 @@ mod tests {
             .await
             .expect("persist assistant start");
 
-        let error = writer
+        writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
                     event: Some(
@@ -23070,14 +23282,47 @@ mod tests {
                         message: error_message,
                         append_to_l0: false,
                         provider_context: vec![fragment],
-                        eviction_footprint_tokens: 0,
+                        eviction_footprint_tokens: footprint,
                     }],
                 }],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("error MessageEnd must not carry provider_context");
-        assert!(error.to_string().contains("append_to_l0=false"));
+            .expect("persist authoritative Error terminal and provider context");
+
+        let provider_row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT message_id, eviction_tokens
+             FROM provider_context
+             WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("durable Error provider-context row");
+        assert_eq!(provider_row.0, message_id);
+        assert_eq!(
+            provider_row.1,
+            i64::try_from(footprint).expect("footprint fits SQLite")
+        );
+
+        let l0_membership: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count Error L0 membership");
+        assert_eq!(l0_membership, 0, "Error assistant must remain outside L0");
+
+        let l0_footprint: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(eviction_footprint_tokens), 0) FROM memory_batches",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("sum L0 provider-context footprint");
+        assert_eq!(
+            l0_footprint, 0,
+            "durable Error context must not become replay or eviction footprint"
+        );
     }
 
     #[tokio::test]

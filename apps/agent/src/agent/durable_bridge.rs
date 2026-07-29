@@ -1519,9 +1519,6 @@ impl DurableBridge {
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
-        if !append_to_l0 && !provider_context.is_empty() {
-            bail!("L0-excluded assistant MessageEnd cannot carry provider context");
-        }
         if self.pending_hard_steer.is_some()
             && matches!(
                 &message,
@@ -1895,9 +1892,6 @@ impl DurableBridge {
             PublicMessage::Assistant(value) if value.stop_reason == StopReason::Error
         );
         let provider_context = assistant_barrier.provider_context().to_vec();
-        if !append_to_l0 && !provider_context.is_empty() {
-            bail!("L0-excluded rejected assistant cannot carry provider context");
-        }
         let mut writes = vec![EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -3209,6 +3203,131 @@ mod tests {
             )
             .await
             .expect("tool result MessageStart accepted after hard-steer user");
+    }
+
+    #[tokio::test]
+    async fn error_terminal_preserves_context_durably_without_l0_replay_membership() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let origin = spec.origin();
+
+        let owner_id = "00000000-0000-4000-8000-000000000079";
+        let run_id = "run-error-provider-context";
+        let turn_id = "turn-error-provider-context";
+        let (owner_binding, owner_assistant) = owner_in_phase_with_origin(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+            origin.clone(),
+        )
+        .await;
+        let (owner_assistant_id, _) = owner_assistant.expect("owner assistant");
+
+        let mut bridge = DurableBridge::new(owner_binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(owner_assistant_id.clone());
+
+        let usage = crate::provider::types::Usage {
+            input: 17,
+            output: 3,
+            total_tokens: 20,
+            ..crate::provider::types::Usage::default()
+        };
+        let error = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin,
+            usage,
+            stop_reason: StopReason::Error,
+            error_message: Some("provider display error".to_owned()),
+            provider_code: Some("network_error".to_owned()),
+            interrupted: false,
+            timestamp: test_timestamp(),
+        });
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: serde_json::json!({
+                    "id": "rs-error",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-error-reasoning",
+                }),
+            },
+        };
+
+        let (barrier, receipt) =
+            MessageCommitBarrier::channel_with_provider_context(vec![fragment.clone()]);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: owner_assistant_id.clone(),
+                        message: Box::new(error.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit authoritative Error terminal");
+        let (outputs, _, _, _) = committed.resolve_message_receipts();
+        assert!(matches!(
+            outputs.as_slice(),
+            [CommittedOutput {
+                event: AgentEvent::MessageEnd { message, .. },
+                ..
+            }] if message.as_ref() == &error
+        ));
+        let receipt = receipt.await.expect("Error MessageEnd receipt");
+        assert_eq!(receipt.message_id, owner_assistant_id);
+
+        let provider_row: (String, i64) = sqlx::query_as(
+            "SELECT message_id, eviction_tokens
+             FROM provider_context
+             WHERE message_id = ?",
+        )
+        .bind(&owner_assistant_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("durable Error provider-context row");
+        assert_eq!(provider_row.0, owner_assistant_id);
+        assert!(provider_row.1 > 0);
+
+        let membership: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages WHERE message_id = ?")
+                .bind(&owner_assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count Error L0 membership");
+        assert_eq!(membership, 0, "Error assistant must remain outside L0");
+
+        let l0_footprint: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(eviction_footprint_tokens), 0) FROM memory_batches",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("sum L0 provider-context footprint");
+        assert_eq!(
+            l0_footprint, 0,
+            "durable Error context must not be charged to replayable L0"
+        );
     }
 
     #[tokio::test]

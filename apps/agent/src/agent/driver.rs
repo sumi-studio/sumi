@@ -228,6 +228,8 @@ impl InjectedRunDriver {
         // Derive the send view immediately before the provider call. The
         // runner's retained durable anchors must not be mutated.
         prompt.messages = transform::transform(context, &self.spec.origin());
+        prompt.provider_context =
+            transform::provider_context_for_send_view(&prompt.messages, &prompt.provider_context);
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
             bail!("provider prompt tools diverged from the frozen registry");
@@ -489,8 +491,9 @@ mod tests {
         provider::{
             ProviderTimingObservation, stream_with_api_key_observed,
             types::{
-                AssistantContent, AssistantMessage, ContextMessage, Message, ProviderEvent,
-                ProviderOutput, StopReason, ToolDefinition, Usage, UserContent, UserMessage,
+                AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextAnchor,
+                ProviderContextItem, ProviderContextPayload, ProviderEvent, ProviderOutput,
+                StopReason, ToolDefinition, Usage, UserContent, UserMessage,
                 ValidatedToolArguments,
             },
         },
@@ -2164,11 +2167,11 @@ mod tests {
 
     #[tokio::test]
     async fn provider_send_view_is_transformed_without_mutating_active_context() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(None));
         let captured = sent.clone();
         let starter: Arc<StreamStarter> =
             Arc::new(move |spec, prompt, _options, cancel, _observer| {
-                *captured.lock().expect("sent") = prompt.messages;
+                *captured.lock().expect("sent") = Some(prompt);
                 let (tx, rx) = mpsc::channel(1);
                 drop(tx);
                 ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
@@ -2239,30 +2242,71 @@ mod tests {
         };
         let active_context = vec![user, error, cross_model];
         let active_context_clone = active_context.clone();
+        let error_provider_context = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "e1".to_owned(),
+                message_seq: 2,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: spec.protocol,
+                item: json!({"opaque": "must not be sent"}),
+            },
+        };
+        let surviving_provider_context = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "a1".to_owned(),
+                message_seq: 3,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: spec.protocol,
+                item: json!({"opaque": "survives"}),
+            },
+        };
         driver
-            .start_provider_for_command(0, &active_context, None, CancellationToken::new())
+            .start_provider_with_context(
+                0,
+                &active_context,
+                &[error_provider_context, surviving_provider_context.clone()],
+                None,
+                CancellationToken::new(),
+            )
             .await
             .expect("start");
 
-        let captured = sent.lock().expect("captured").clone();
+        let captured = sent
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("provider prompt");
         let expected = crate::memory::transform::transform(&active_context, &spec.origin());
         assert_eq!(
-            captured, expected,
+            captured.messages, expected,
             "provider must receive the transformed send view"
+        );
+        assert_eq!(
+            captured.provider_context,
+            vec![surviving_provider_context],
+            "only provider context whose exact anchor survives transform may be sent"
         );
         assert_eq!(
             active_context, active_context_clone,
             "retained active context must not be mutated"
         );
         assert_eq!(
-            captured.len(),
+            captured.messages.len(),
             2,
             "Error assistant must be excluded while cross-model visible text is retained"
         );
         let ContextMessage::Persisted {
             message: Message::Assistant(assistant),
             ..
-        } = &captured[1]
+        } = &captured.messages[1]
         else {
             panic!("expected transformed cross-model assistant");
         };

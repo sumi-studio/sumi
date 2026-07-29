@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 
 use crate::provider::types::{
-    ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, ProviderOrigin,
-    RejectedToolCall, StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
+    ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextItem,
+    ProviderOrigin, RejectedToolCall, StopReason, ToolCall, ToolResultMessage, UserContent,
+    UserMessage,
 };
 
 /// Marker appended to an interrupted assistant message so the model can tell the
@@ -209,6 +210,36 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
     flush_rejections(&mut result, &mut pending_rejections);
     flush_orphan_result(&mut result, &mut pending_orphan_result);
     result
+}
+
+/// Restrict durable provider context to the final provider send view.
+///
+/// Hydration authenticates and retains provider-context rows independently of
+/// L0 replay. Anchored context is sendable only while its exact persisted
+/// `(message_id, message_seq)` survives transcript normalization. Native
+/// compaction context is intentionally unanchored and remains subject to the
+/// adapter's separate coverage/fingerprint validation.
+pub fn provider_context_for_send_view(
+    messages: &[ContextMessage],
+    provider_context: &[ProviderContextItem],
+) -> Vec<ProviderContextItem> {
+    let anchors = messages
+        .iter()
+        .filter_map(|message| match message {
+            ContextMessage::Persisted { id, seq, .. } => Some((id.as_str(), *seq)),
+            ContextMessage::Synthetic { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+
+    provider_context
+        .iter()
+        .filter(|item| {
+            item.origin_message.as_ref().is_none_or(|anchor| {
+                anchors.contains(&(anchor.message_id.as_str(), anchor.message_seq))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn same_origin(context: &ContextMessage, destination: &ProviderOrigin) -> bool {
@@ -416,7 +447,10 @@ mod tests {
     use crate::provider::{
         ModelSpec, RequestOptions,
         adapters::{anthropic, chat_completions, responses},
-        types::{PromptContext, ToolArgumentError, Usage, UserMessage, ValidatedToolArguments},
+        types::{
+            NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextPayload,
+            ToolArgumentError, Usage, UserMessage, ValidatedToolArguments,
+        },
     };
 
     fn timestamp() -> chrono::DateTime<Utc> {
@@ -535,6 +569,53 @@ mod tests {
             &output[0],
             ContextMessage::Persisted { id, seq: 7, .. } if id == "m1"
         ));
+    }
+
+    #[test]
+    fn provider_send_view_keeps_exact_surviving_anchors_and_native_context() {
+        let send_messages = vec![persisted(
+            "kept",
+            7,
+            assistant(Vec::new(), StopReason::Stop, false),
+        )];
+        let anchored = |message_id: &str, message_seq: u64| ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 0,
+            provider_origin: target(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({"type": "reasoning", "encrypted_content": message_id}),
+            },
+        };
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: target(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type": "compaction", "id": "cmp-1"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fixture".to_owned(),
+                },
+            },
+        };
+
+        let result = provider_context_for_send_view(
+            &send_messages,
+            &[
+                anchored("kept", 7),
+                anchored("kept", 8),
+                anchored("removed", 7),
+                native.clone(),
+            ],
+        );
+
+        assert_eq!(result, vec![anchored("kept", 7), native]);
     }
 
     #[test]
