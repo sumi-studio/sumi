@@ -996,6 +996,7 @@ pub struct PromptContext {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum VerifiedReplayProvenance {
     SumiNormalized {
+        provider_origin: ProviderOrigin,
         canonical_through_seq: Option<u64>,
     },
     ProviderNativeExact {
@@ -1032,6 +1033,22 @@ impl PromptContext {
         provenance.verify(self.replay_send_view_digest()?).map(Some)
     }
 
+    pub(crate) fn verified_replay_provenance_for(
+        &self,
+        destination: &ProviderOrigin,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let provenance = self.verified_replay_provenance()?;
+        if provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.provider_origin() != destination)
+        {
+            return Err(
+                "bound replay destination does not match the selected provider_origin".into(),
+            );
+        }
+        Ok(provenance)
+    }
+
     pub(crate) fn replay_send_view_digest(&self) -> Result<[u8; 32], String> {
         let encoded = serde_json::to_vec(self)
             .map_err(|error| format!("failed to serialize replay send view: {error}"))?;
@@ -1044,6 +1061,19 @@ impl PromptContext {
         );
         digest.update(encoded);
         Ok(digest.finalize().into())
+    }
+}
+
+impl VerifiedReplayProvenance {
+    pub(crate) fn provider_origin(&self) -> &ProviderOrigin {
+        match self {
+            Self::SumiNormalized {
+                provider_origin, ..
+            }
+            | Self::ProviderNativeExact {
+                provider_origin, ..
+            } => provider_origin,
+        }
     }
 }
 

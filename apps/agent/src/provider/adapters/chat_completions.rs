@@ -13,6 +13,7 @@ use crate::provider::{
     types::{
         ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message, PromptContext,
         ProviderEvent, RawUsage, StopReason, ToolDefinition, ToolResultMessage, Usage, UserContent,
+        VerifiedReplayProvenance,
     },
 };
 
@@ -26,6 +27,8 @@ pub enum ChatAdapterError {
     InvalidTemperature(f64),
     #[error("this model requires reasoning to remain enabled")]
     ReasoningRequired,
+    #[error("invalid Chat Completions request context: {0}")]
+    InvalidContext(String),
     #[error("unsupported reasoning_effort {0}; this model requires max")]
     InvalidReasoningEffort(String),
     #[error("tool_choice=\"required\" is unsupported by this provider preset")]
@@ -82,6 +85,7 @@ pub fn build_request(
     let compat = spec
         .chat_compat()
         .ok_or(ChatAdapterError::UnsupportedProtocol)?;
+    validate_replay_context(spec, context)?;
     if let Some(temperature) = options.temperature
         && !temperature.is_finite()
     {
@@ -179,6 +183,28 @@ pub fn build_request(
     }
 
     Ok(Value::Object(request))
+}
+
+fn validate_replay_context(
+    spec: &ModelSpec,
+    context: &PromptContext,
+) -> Result<(), ChatAdapterError> {
+    match context
+        .verified_replay_provenance_for(&spec.origin())
+        .map_err(ChatAdapterError::InvalidContext)?
+    {
+        Some(VerifiedReplayProvenance::SumiNormalized { .. }) => Ok(()),
+        Some(VerifiedReplayProvenance::ProviderNativeExact { .. }) => {
+            Err(ChatAdapterError::InvalidContext(
+                "Chat Completions does not accept provider-native replay".into(),
+            ))
+        }
+        None => {
+            crate::provider::types::validate_native_suffix(&context.messages, None)
+                .map_err(ChatAdapterError::InvalidContext)?;
+            Ok(())
+        }
+    }
 }
 
 pub fn requested_output_tokens(
@@ -1854,9 +1880,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::memory::context_assembler::bind_sumi_replay_for_origin_test;
     use crate::provider::types::{
-        AssistantMessage, ContextMessage, MemoryBlock, ProviderContextItem, ToolArgumentError,
-        ToolCall, ToolResultMessage, UserMessage, ValidatedToolArguments,
+        AssistantMessage, ContextMessage, MemoryBlock, ProviderContextItem, ProviderContextPayload,
+        ToolArgumentError, ToolCall, ToolResultMessage, UserMessage, ValidatedToolArguments,
     };
 
     fn context() -> PromptContext {
@@ -1960,6 +1987,114 @@ mod tests {
             tools,
             replay_provenance: None,
         }
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: text.to_owned(),
+            }],
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn persisted_user(seq: u64, text: &str) -> ContextMessage {
+        ContextMessage::Persisted {
+            id: format!("user-{seq}"),
+            seq,
+            message: user_message(text),
+        }
+    }
+
+    #[test]
+    fn replay_binding_is_mandatory_and_destination_specific() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let mut context = PromptContext {
+            system_prompt: "System.".to_owned(),
+            memory_blocks: vec![],
+            messages: vec![
+                persisted_user(1, "durable"),
+                synthetic(user_message("assembler diagnostic")),
+            ],
+            provider_context: vec![],
+            tools: vec![tool_definition()],
+            replay_provenance: None,
+        };
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind exact normalized replay");
+
+        let sealed_clone = context.clone();
+        build_request(&spec, &sealed_clone, &RequestOptions::default())
+            .expect("matching sealed clone");
+
+        let mut changed_system = context.clone();
+        changed_system.system_prompt.push_str(" changed");
+        let mut changed_messages = context.clone();
+        changed_messages
+            .messages
+            .push(synthetic(user_message("changed")));
+        let mut changed_tools = context.clone();
+        changed_tools.tools[0].description.push_str(" changed");
+        let mut changed_provider_context = context.clone();
+        changed_provider_context
+            .provider_context
+            .push(ProviderContextItem {
+                origin_message: None,
+                wire_item_index: Some(0),
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    item: json!({"opaque":"changed"}),
+                },
+            });
+        for changed in [
+            changed_system,
+            changed_messages,
+            changed_tools,
+            changed_provider_context,
+        ] {
+            assert!(matches!(
+                build_request(&spec, &changed, &RequestOptions::default()),
+                Err(ChatAdapterError::InvalidContext(message))
+                    if message.contains("bound replay send view changed")
+            ));
+        }
+
+        let encoded = serde_json::to_value(&context).expect("serialize sealed prompt");
+        let decoded: PromptContext =
+            serde_json::from_value(encoded).expect("deserialize unbound prompt");
+        assert!(matches!(
+            build_request(&spec, &decoded, &RequestOptions::default()),
+            Err(ChatAdapterError::InvalidContext(message))
+                if message.contains("synthetic content after persisted history")
+        ));
+
+        let mut different_model = spec.clone();
+        different_model.set_model_id("different-model");
+        let mut different_instance = spec.clone();
+        different_instance.account_scope = "different-account".to_owned();
+        for destination in [different_model, different_instance] {
+            assert!(matches!(
+                build_request(&destination, &context, &RequestOptions::default()),
+                Err(ChatAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+        }
+
+        let mut foreign_protocol_origin = spec.origin();
+        foreign_protocol_origin.protocol = ApiProtocol::OpenAiResponses;
+        let mut foreign_protocol = PromptContext {
+            replay_provenance: None,
+            ..decoded
+        };
+        bind_sumi_replay_for_origin_test(&mut foreign_protocol, foreign_protocol_origin, Some(1))
+            .expect("bind replay to a different protocol");
+        assert!(matches!(
+            build_request(&spec, &foreign_protocol, &RequestOptions::default()),
+            Err(ChatAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
     }
 
     fn send_snapshot_matrix() -> serde_json::Value {

@@ -71,6 +71,7 @@ pub(crate) struct ReplayProvenance {
 #[derive(Clone, Debug, PartialEq)]
 enum ReplayProvenanceKind {
     SumiNormalized {
+        provider_origin: ProviderOrigin,
         canonical_through_seq: Option<u64>,
     },
     ProviderNativeExact {
@@ -90,8 +91,10 @@ impl ReplayProvenance {
         }
         Ok(match &self.kind {
             ReplayProvenanceKind::SumiNormalized {
+                provider_origin,
                 canonical_through_seq,
             } => VerifiedReplayProvenance::SumiNormalized {
+                provider_origin: provider_origin.clone(),
                 canonical_through_seq: *canonical_through_seq,
             },
             ReplayProvenanceKind::ProviderNativeExact {
@@ -112,54 +115,63 @@ fn replay_binding_seal(
     send_view_digest: [u8; 32],
 ) -> Result<[u8; 32], String> {
     let mut seal = sha2::Sha256::new();
-    seal.update(b"sumi.prompt-replay-provenance-seal.v1\0");
+    seal.update(b"sumi.prompt-replay-provenance-seal.v2\0");
     match kind {
         ReplayProvenanceKind::SumiNormalized {
+            provider_origin,
             canonical_through_seq,
         } => {
-            seal.update([0]);
-            update_optional_seq(&mut seal, *canonical_through_seq);
+            update_seal_frame(&mut seal, b"sumi_normalized")?;
+            update_seal_origin(&mut seal, provider_origin)?;
+            update_seal_optional_seq(&mut seal, *canonical_through_seq)?;
         }
         ReplayProvenanceKind::ProviderNativeExact {
             provider_origin,
             native_coverage_through_seq,
             canonical_suffix_through_seq,
         } => {
-            seal.update([1]);
-            update_seal_text(&mut seal, &provider_origin.provider_instance_id)?;
-            seal.update([match provider_origin.protocol {
-                ApiProtocol::OpenAiChatCompletions => 0,
-                ApiProtocol::OpenAiResponses => 1,
-                ApiProtocol::AnthropicMessages => 2,
-            }]);
-            update_seal_text(&mut seal, &provider_origin.model)?;
-            seal.update(native_coverage_through_seq.to_be_bytes());
-            update_optional_seq(&mut seal, *canonical_suffix_through_seq);
+            update_seal_frame(&mut seal, b"provider_native_exact")?;
+            update_seal_origin(&mut seal, provider_origin)?;
+            update_seal_frame(&mut seal, &native_coverage_through_seq.to_be_bytes())?;
+            update_seal_optional_seq(&mut seal, *canonical_suffix_through_seq)?;
         }
     }
-    seal.update(send_view_digest);
+    update_seal_frame(&mut seal, &send_view_digest)?;
     Ok(seal.finalize().into())
 }
 
-fn update_seal_text(seal: &mut sha2::Sha256, value: &str) -> Result<(), String> {
-    let value = value.as_bytes();
+fn update_seal_origin(
+    seal: &mut sha2::Sha256,
+    provider_origin: &ProviderOrigin,
+) -> Result<(), String> {
+    update_seal_frame(seal, provider_origin.provider_instance_id.as_bytes())?;
+    let protocol: &[u8] = match provider_origin.protocol {
+        ApiProtocol::OpenAiChatCompletions => b"open_ai_chat_completions",
+        ApiProtocol::OpenAiResponses => b"open_ai_responses",
+        ApiProtocol::AnthropicMessages => b"anthropic_messages",
+    };
+    update_seal_frame(seal, protocol)?;
+    update_seal_frame(seal, provider_origin.model.as_bytes())
+}
+
+fn update_seal_frame(seal: &mut sha2::Sha256, value: &[u8]) -> Result<(), String> {
     seal.update(
         u64::try_from(value.len())
-            .map_err(|_| "replay provenance text length exceeds u64".to_owned())?
+            .map_err(|_| "replay provenance frame length exceeds u64".to_owned())?
             .to_be_bytes(),
     );
     seal.update(value);
     Ok(())
 }
 
-fn update_optional_seq(seal: &mut sha2::Sha256, value: Option<u64>) {
-    match value {
-        Some(value) => {
-            seal.update([1]);
-            seal.update(value.to_be_bytes());
-        }
-        None => seal.update([0]),
-    }
+fn update_seal_optional_seq(seal: &mut sha2::Sha256, value: Option<u64>) -> Result<(), String> {
+    let Some(value) = value else {
+        return update_seal_frame(seal, &[0]);
+    };
+    let mut frame = [0_u8; 9];
+    frame[0] = 1;
+    frame[1..].copy_from_slice(&value.to_be_bytes());
+    update_seal_frame(seal, &frame)
 }
 
 /// The exact estimate used to construct one provider attempt. Keeping it in
@@ -355,7 +367,7 @@ impl ContextAssembler {
                 canonical_through_seq,
             )?;
         } else {
-            bind_sumi_normalized_replay(&mut prompt, canonical_through_seq)?;
+            bind_sumi_normalized_replay(&mut prompt, destination, canonical_through_seq)?;
         }
         Ok(AssembledPrompt {
             prompt,
@@ -777,6 +789,7 @@ fn normalized_replay_through(messages: &[ContextMessage]) -> Result<Option<u64>>
 
 fn bind_sumi_normalized_replay(
     prompt: &mut PromptContext,
+    provider_origin: ProviderOrigin,
     canonical_through_seq: Option<u64>,
 ) -> Result<()> {
     ensure_unbound_replay(prompt)?;
@@ -788,6 +801,7 @@ fn bind_sumi_normalized_replay(
         .replay_send_view_digest()
         .map_err(anyhow::Error::msg)?;
     let kind = ReplayProvenanceKind::SumiNormalized {
+        provider_origin,
         canonical_through_seq,
     };
     let seal = replay_binding_seal(&kind, send_view_digest).map_err(anyhow::Error::msg)?;
@@ -882,7 +896,26 @@ pub(crate) fn bind_sumi_replay_for_test(
     prompt: &mut PromptContext,
     canonical_through_seq: Option<u64>,
 ) -> Result<()> {
-    bind_sumi_normalized_replay(prompt, canonical_through_seq)
+    let mut origins = prompt
+        .provider_context
+        .iter()
+        .map(|item| item.provider_origin.clone());
+    let provider_origin = origins
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("test replay origin is absent"))?;
+    if origins.any(|origin| origin != provider_origin) {
+        anyhow::bail!("test replay origin is ambiguous");
+    }
+    bind_sumi_normalized_replay(prompt, provider_origin, canonical_through_seq)
+}
+
+#[cfg(test)]
+pub(crate) fn bind_sumi_replay_for_origin_test(
+    prompt: &mut PromptContext,
+    provider_origin: ProviderOrigin,
+    canonical_through_seq: Option<u64>,
+) -> Result<()> {
+    bind_sumi_normalized_replay(prompt, provider_origin, canonical_through_seq)
 }
 
 #[cfg(test)]
@@ -1918,6 +1951,7 @@ mod tests {
                 .expect("verify assembler replay binding"),
             Some(VerifiedReplayProvenance::SumiNormalized {
                 canonical_through_seq: Some(5),
+                ..
             })
         ));
         let coverage =
@@ -2024,11 +2058,13 @@ mod tests {
 
     #[test]
     fn replay_binding_survives_clone_is_stripped_by_serde_and_rejects_mutation() {
+        let provider_origin = responses_spec().origin();
         let mut prompt = simple_prompt();
         prompt.messages = vec![user("bound", 1)];
         let unbound_send_view =
             serde_json::to_vec(&prompt).expect("serialize unbound provider send view");
-        bind_sumi_normalized_replay(&mut prompt, Some(1)).expect("bind Sumi replay");
+        bind_sumi_normalized_replay(&mut prompt, provider_origin.clone(), Some(1))
+            .expect("bind Sumi replay");
         assert_eq!(
             serde_json::to_vec(&prompt).expect("serialize bound provider send view"),
             unbound_send_view,
@@ -2041,9 +2077,18 @@ mod tests {
                 .verified_replay_provenance()
                 .expect("clone retains valid binding"),
             Some(VerifiedReplayProvenance::SumiNormalized {
+                ref provider_origin,
                 canonical_through_seq: Some(1),
-            })
+            }) if provider_origin == &responses_spec().origin()
         ));
+        let mut different_destination = provider_origin.clone();
+        different_destination.model.push_str("-different");
+        assert_eq!(
+            cloned
+                .verified_replay_provenance_for(&different_destination)
+                .expect_err("bound destination must remain exact"),
+            "bound replay destination does not match the selected provider_origin"
+        );
 
         let encoded = serde_json::to_value(&prompt).expect("serialize prompt");
         assert!(encoded.get("replay_provenance").is_none());
@@ -2064,12 +2109,33 @@ mod tests {
             "bound replay send view changed after assembly"
         );
 
+        let mut origin_mutated = prompt.clone();
+        let ReplayProvenanceKind::SumiNormalized {
+            provider_origin: mutated_origin,
+            ..
+        } = &mut origin_mutated
+            .replay_provenance
+            .as_mut()
+            .expect("bound marker")
+            .kind
+        else {
+            panic!("Sumi marker");
+        };
+        mutated_origin.model.push_str("-changed");
+        assert_eq!(
+            origin_mutated
+                .verified_replay_provenance()
+                .expect_err("destination mutation must invalidate its seal"),
+            "bound replay send view changed after assembly"
+        );
+
         let mut marker_mutated = prompt.clone();
         marker_mutated
             .replay_provenance
             .as_mut()
             .expect("bound marker")
             .kind = ReplayProvenanceKind::SumiNormalized {
+            provider_origin: provider_origin.clone(),
             canonical_through_seq: Some(2),
         };
         assert_eq!(
@@ -2091,6 +2157,47 @@ mod tests {
                 .verified_replay_provenance()
                 .expect("public construction remains unbound"),
             None
+        );
+    }
+
+    #[test]
+    fn legacy_test_binder_requires_one_distinct_provider_origin() {
+        let item = |provider_origin: ProviderOrigin, ordinal| ProviderContextItem {
+            origin_message: None,
+            wire_item_index: Some(0),
+            ordinal,
+            provider_origin,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: serde_json::json!({"type":"reasoning","ordinal":ordinal}),
+            },
+        };
+        assert_eq!(
+            bind_sumi_replay_for_test(&mut simple_prompt(), None)
+                .expect_err("missing origin must fail")
+                .to_string(),
+            "test replay origin is absent"
+        );
+
+        let origin = responses_spec().origin();
+        let mut unique = PromptContext {
+            provider_context: vec![item(origin.clone(), 0), item(origin.clone(), 1)],
+            ..simple_prompt()
+        };
+        bind_sumi_replay_for_test(&mut unique, None)
+            .expect("repeated identical origin is uniquely derivable");
+
+        let mut other = origin.clone();
+        other.model.push_str("-other");
+        let mut ambiguous = PromptContext {
+            provider_context: vec![item(origin, 0), item(other, 1)],
+            ..simple_prompt()
+        };
+        assert_eq!(
+            bind_sumi_replay_for_test(&mut ambiguous, None)
+                .expect_err("multiple distinct origins must fail")
+                .to_string(),
+            "test replay origin is ambiguous"
         );
     }
 
@@ -2162,7 +2269,7 @@ mod tests {
 
         let mut invalid_sumi = simple_prompt();
         invalid_sumi.messages = vec![user("persisted", 1)];
-        assert!(bind_sumi_normalized_replay(&mut invalid_sumi, None).is_err());
+        assert!(bind_sumi_normalized_replay(&mut invalid_sumi, spec.origin(), None).is_err());
     }
 
     #[tokio::test]

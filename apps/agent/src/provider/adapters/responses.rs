@@ -304,11 +304,12 @@ pub(in crate::provider) fn derive_compaction_coverage(
         return Err(ResponsesAdapterError::UnsupportedProtocol);
     }
     let through_message_seq = match context
-        .verified_replay_provenance()
+        .verified_replay_provenance_for(&spec.origin())
         .map_err(ResponsesAdapterError::InvalidContext)?
     {
         Some(VerifiedReplayProvenance::SumiNormalized {
             canonical_through_seq,
+            ..
         }) => canonical_through_seq,
         Some(VerifiedReplayProvenance::ProviderNativeExact {
             native_coverage_through_seq,
@@ -876,7 +877,7 @@ fn convert_input(
     crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
         .map_err(ResponsesAdapterError::InvalidContext)?;
     let replay_provenance = context
-        .verified_replay_provenance()
+        .verified_replay_provenance_for(&spec.origin())
         .map_err(ResponsesAdapterError::InvalidContext)?;
     if replay_provenance.is_none() {
         crate::provider::types::validate_native_suffix(&context.messages, None)
@@ -3597,7 +3598,7 @@ fn validate_prompt_cache_breakpoint(value: Option<&Value>, parent: &str) -> Resu
 mod tests {
     use super::*;
     use crate::memory::context_assembler::{
-        bind_native_replay_for_test, bind_sumi_replay_for_test,
+        bind_native_replay_for_test, bind_sumi_replay_for_origin_test,
     };
     use crate::provider::types::{
         AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
@@ -4735,7 +4736,7 @@ mod tests {
             },
         };
         context.provider_context = vec![native];
-        bind_sumi_replay_for_test(&mut context, Some(9))
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(9))
             .expect("bind exact normalized assembler replay");
         let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
         let fallback = Value::Array(fallback).to_string();
@@ -4743,6 +4744,64 @@ mod tests {
         assert!(fallback.contains("message-8"));
         assert!(fallback.contains("message-9"));
         assert!(!fallback.contains("opaque"));
+    }
+
+    #[test]
+    fn sumi_replay_destination_is_enforced_for_requests_and_coverage() {
+        let spec = spec();
+        let unbound = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(1)],
+            provider_context: vec![],
+            tools: vec![],
+            replay_provenance: None,
+        };
+        let mut context = unbound.clone();
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind Responses destination");
+
+        build_request(&spec, &context, &RequestOptions::default())
+            .expect("matching request destination");
+        assert_eq!(
+            derive_compaction_coverage(&spec, &context)
+                .expect("matching coverage destination")
+                .through_message_seq,
+            1
+        );
+
+        let mut different_model = spec.clone();
+        different_model.set_model_id("different-model");
+        let mut different_instance = spec.clone();
+        different_instance.account_scope = "different-account".into();
+        for destination in [different_model, different_instance] {
+            assert!(matches!(
+                build_request(&destination, &context, &RequestOptions::default()),
+                Err(ResponsesAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+            assert!(matches!(
+                derive_compaction_coverage(&destination, &context),
+                Err(ResponsesAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+        }
+
+        let mut foreign_origin = spec.origin();
+        foreign_origin.protocol = ApiProtocol::AnthropicMessages;
+        let mut foreign_protocol = unbound;
+        bind_sumi_replay_for_origin_test(&mut foreign_protocol, foreign_origin, Some(1))
+            .expect("bind foreign protocol destination");
+        assert!(matches!(
+            build_request(&spec, &foreign_protocol, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
+        assert!(matches!(
+            derive_compaction_coverage(&spec, &foreign_protocol),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
     }
 
     #[test]
@@ -4847,7 +4906,7 @@ mod tests {
                 },
             },
         });
-        bind_sumi_replay_for_test(&mut context, Some(1))
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
             .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
@@ -5469,7 +5528,7 @@ mod tests {
             },
         };
         context.provider_context.push(native);
-        bind_sumi_replay_for_test(&mut context, Some(8))
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(8))
             .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,

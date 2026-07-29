@@ -2404,6 +2404,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
             "stream_ended_without_finish_reason".to_owned(),
         ),
         ChatAdapterError::UnsupportedProtocol
+        | ChatAdapterError::InvalidContext(_)
         | ChatAdapterError::InvalidMaxTokens { .. }
         | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
@@ -2492,6 +2493,13 @@ mod tests {
         AssistantContent, ContextMessage, Message, RejectedToolCall, ToolArgumentError, ToolCall,
         ToolDefinition, ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
     };
+
+    #[test]
+    fn chat_context_validation_is_classified_as_invalid_provider_request() {
+        let (message, code) = adapter_error(&ChatAdapterError::InvalidContext("fixture".into()));
+        assert!(message.contains("fixture"));
+        assert_eq!(code, "invalid_provider_request");
+    }
 
     struct CaptureCommandFixture {
         root: PathBuf,
