@@ -24,6 +24,8 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
   if (!fixtureBuild) throw new Error("browser E2E fixture was not built");
 
   let terminalFrames = 0;
+  let toolStartFrames = 0;
+  let toolEndFrames = 0;
   let directChatSocketSeen = false;
   let markReplaySettled: (() => void) | undefined;
   const replaySettled = new Promise<void>((resolveReplay) => {
@@ -47,6 +49,12 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
           JSON.stringify(event.message).includes("Terminal replay")
         ) {
           terminalFrames++;
+        }
+        if (event?.type === "tool_execution_start") {
+          toolStartFrames++;
+        }
+        if (event?.type === "tool_execution_end") {
+          toolEndFrames++;
         }
         if (event?.type === "agent_end") {
           markReplaySettled?.();
@@ -80,11 +88,10 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       page.getByText("streamed assistant", { exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByText("Tool started: read_file", { exact: true }),
-    ).toBeVisible();
-    await expect(
       page.getByText("Tool finished: call-1", { exact: true }),
     ).toBeVisible();
+    expect(toolStartFrames).toBe(1);
+    expect(toolEndFrames).toBe(1);
 
     await composer.fill("second message is a steer");
     await page.getByRole("button", { name: "Steer" }).click();
