@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // CommandStore is a durable, append-only per-conversation command log. It
@@ -27,11 +28,12 @@ import (
 // and rollback are serialized by an advisory flock on the log file so multiple
 // API processes sharing SUMI_COMMAND_LOG_DIR cannot allocate duplicate seqs,
 // interleave writes, or roll back another process's committed record. In
-// addition, a process-level mutex protects the in-memory state map. Command
-// bytes are fsynced to the log before success is returned. After any restart,
-// OpenCommandStore re-reads the logs and reconstructs the per-conversation
-// next seq and idempotency maps, so restart preserves the log and allocation
-// continuity.
+// addition, a process-level mutex protects the in-memory state map and a
+// per-conversation mutex protects each cached state without serializing
+// unrelated flock waits or scans. Command bytes are fsynced to the log before
+// success is returned. After any restart, OpenCommandStore re-reads the logs
+// and reconstructs the per-conversation next seq and idempotency maps, so
+// restart preserves the log and allocation continuity.
 type CommandStore struct {
 	mu     sync.Mutex
 	dir    string
@@ -53,6 +55,7 @@ type fileHandle interface {
 }
 
 type conversationState struct {
+	mu          sync.Mutex
 	path        string
 	file        fileHandle
 	nextSeq     uint64
@@ -63,15 +66,45 @@ type conversationState struct {
 	fileSize    int64          // end offset observed at last scan
 	poisoned    bool
 	poisonErr   error
+	closed      bool
 }
 
-// lockFile acquires an exclusive advisory flock on the log file.
-// The caller must hold CommandStore.mu.
-func lockFile(f fileHandle) error {
-	if f == nil {
-		return errors.New("no file to lock")
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	return nil
+}
+
+// flockContext is cancellation-aware and retries EINTR. All durable log
+// operations use it so a blocked cross-process lock cannot hold a global
+// process mutex or outlive the caller's connection.
+func flockContext(ctx context.Context, fd uintptr, mode int) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := syscall.Flock(int(fd), mode|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // unlockFile releases the advisory flock. Errors are ignored because the fd may
@@ -170,9 +203,11 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid command log file %q: %w", path, err)
 		}
-		if _, err := s.loadFileLocked(conversationID, path); err != nil {
+		st := newConversationState(path)
+		if err := s.loadStateLocked(context.Background(), st, conversationID); err != nil {
 			return nil, fmt.Errorf("load command log %q: %w", path, err)
 		}
+		s.states[conversationID] = st
 	}
 	return s, nil
 }
@@ -180,20 +215,29 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 // Close flushes and closes all open log files.
 func (s *CommandStore) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
-	var firstErr error
+	states := make([]*conversationState, 0, len(s.states))
 	for _, st := range s.states {
+		states = append(states, st)
+	}
+	s.mu.Unlock()
+
+	var firstErr error
+	for _, st := range states {
+		st.mu.Lock()
 		if st.file != nil {
 			if err := st.file.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			st.file = nil
 		}
+		st.closed = true
+		st.mu.Unlock()
 	}
-	s.states = nil
 	return firstErr
 }
 
@@ -237,27 +281,21 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 		return CommandEnvelope{}, fmt.Errorf("validate command before append: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return CommandEnvelope{}, errors.New("command store is closed")
-	}
-
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return CommandEnvelope{}, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return CommandEnvelope{}, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
 
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return CommandEnvelope{}, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
 
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return CommandEnvelope{}, err
 	}
 
@@ -340,23 +378,19 @@ func (s *CommandStore) NextCommandSeq(ctx context.Context, conversationID string
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return 0, errors.New("command store is closed")
-	}
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return 0, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return 0, err
 	}
 	return st.nextSeq, nil
@@ -368,23 +402,19 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID strin
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return 0, errors.New("command store is closed")
-	}
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return 0, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return 0, err
 	}
 	if len(st.commands) == 0 {
@@ -400,23 +430,19 @@ func (s *CommandStore) HasCommands(ctx context.Context, conversationID string) (
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false, errors.New("command store is closed")
-	}
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return false, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return false, err
 	}
 	return len(st.commands) != 0, nil
@@ -428,23 +454,19 @@ func (s *CommandStore) GetCommand(ctx context.Context, conversationID string, se
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, false, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return CommandEnvelope{}, false, errors.New("command store is closed")
-	}
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return CommandEnvelope{}, false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return CommandEnvelope{}, false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return CommandEnvelope{}, false, err
 	}
 	idx, ok := st.bySeq[seq]
@@ -459,23 +481,19 @@ func (s *CommandStore) CatchUp(ctx context.Context, conversationID string, fromS
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, errors.New("command store is closed")
-	}
-	st, err := s.ensureStateLocked(conversationID)
+	st, err := s.lockConversation(ctx, conversationID)
 	if err != nil {
 		return nil, err
 	}
+	defer st.mu.Unlock()
 	if st.poisoned {
 		return nil, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
-	if err := lockFile(st.file); err != nil {
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
 		return nil, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
 		return nil, err
 	}
 	i := sort.Search(len(st.commands), func(i int) bool { return st.commands[i].Seq >= fromSeq })
@@ -484,12 +502,69 @@ func (s *CommandStore) CatchUp(ctx context.Context, conversationID string, fromS
 	return out, nil
 }
 
-func (s *CommandStore) ensureStateLocked(conversationID string) (*conversationState, error) {
-	if st, ok := s.states[conversationID]; ok {
-		return st, nil
+type commandLogSnapshot struct {
+	commands []CommandEnvelope
+	nextSeq  uint64
+}
+
+// commandSnapshot returns an immutable view of the committed command prefix.
+// refreshStateLocked always swaps fresh backing arrays, so later rescans and
+// appends cannot mutate a view that is being folded into an ACK cursor.
+func (s *CommandStore) commandSnapshot(ctx context.Context, conversationID string) (commandLogSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return commandLogSnapshot{}, err
 	}
-	path := commandLogPath(s.dir, conversationID)
-	return s.loadFileLocked(conversationID, path)
+	st, err := s.lockConversation(ctx, conversationID)
+	if err != nil {
+		return commandLogSnapshot{}, err
+	}
+	defer st.mu.Unlock()
+	if st.poisoned {
+		return commandLogSnapshot{}, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+	}
+	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
+		return commandLogSnapshot{}, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+		return commandLogSnapshot{}, err
+	}
+	commands := st.commands[:len(st.commands):len(st.commands)]
+	return commandLogSnapshot{commands: commands, nextSeq: st.nextSeq}, nil
+}
+
+// lockConversation returns with the per-conversation mutex held. The store
+// mutex protects only lifecycle and map membership and is released before a
+// flock wait or disk scan, allowing unrelated conversations to progress.
+func (s *CommandStore) lockConversation(ctx context.Context, conversationID string) (*conversationState, error) {
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errors.New("command store is closed")
+	}
+	st := s.states[conversationID]
+	if st == nil {
+		st = newConversationState(commandLogPath(s.dir, conversationID))
+		s.states[conversationID] = st
+	}
+	s.mu.Unlock()
+
+	if err := lockMutexContext(ctx, &st.mu); err != nil {
+		return nil, err
+	}
+	if st.closed {
+		st.mu.Unlock()
+		return nil, errors.New("command store is closed")
+	}
+	if st.file == nil && !st.poisoned {
+		if err := s.loadStateLocked(ctx, st, conversationID); err != nil {
+			st.mu.Unlock()
+			return nil, err
+		}
+	}
+	return st, nil
 }
 
 // isIncompleteJSONError reports whether err indicates the JSON parser ran off
@@ -509,8 +584,8 @@ func isIncompleteJSONError(err error) bool {
 
 // scanLogLocked reads the log from the current offset and populates st. It
 // truncates an incomplete final tail and repairs a missing trailing newline.
-// The caller must hold CommandStore.mu and an exclusive flock on st.file.
-func (s *CommandStore) scanLogLocked(st *conversationState, conversationID string) error {
+// The caller must exclusively own st and hold an exclusive flock on st.file.
+func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState, conversationID string) error {
 	if _, err := st.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
 	}
@@ -518,6 +593,9 @@ func (s *CommandStore) scanLogLocked(st *conversationState, conversationID strin
 	r := bufio.NewReader(st.file)
 	offset := int64(0)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		lineStart := offset
 		line, readErr := r.ReadBytes('\n')
 		if len(line) > 0 {
@@ -616,65 +694,74 @@ func (s *CommandStore) scanLogLocked(st *conversationState, conversationID strin
 // disk under the existing exclusive flock. A conservative rescan is used rather
 // than a file-size short-circuit so that a same-size truncate/rewrite by
 // another process cannot leave stale nextSeq or idempotency maps.
-func (s *CommandStore) refreshStateLocked(st *conversationState, conversationID string) error {
+func (s *CommandStore) refreshStateLocked(ctx context.Context, st *conversationState, conversationID string) error {
 	if _, err := st.file.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
 	}
 
-	st.commands = st.commands[:0]
-	st.nextSeq = 1
-	st.bySeq = make(map[uint64]int)
-	st.byCommandID = make(map[string]int)
-	st.byKey = make(map[string]int)
-	st.fileSize = 0
-	return s.scanLogLocked(st, conversationID)
+	fresh := newConversationState(st.path)
+	fresh.file = st.file
+	if err := s.scanLogLocked(ctx, fresh, conversationID); err != nil {
+		return err
+	}
+	st.nextSeq = fresh.nextSeq
+	st.commands = fresh.commands
+	st.bySeq = fresh.bySeq
+	st.byCommandID = fresh.byCommandID
+	st.byKey = fresh.byKey
+	st.fileSize = fresh.fileSize
+	return nil
 }
 
-func (s *CommandStore) loadFileLocked(conversationID, path string) (*conversationState, error) {
-	info, err := os.Lstat(path)
+func newConversationState(path string) *conversationState {
+	return &conversationState{
+		path: path, nextSeq: 1, bySeq: make(map[uint64]int),
+		byCommandID: make(map[string]int), byKey: make(map[string]int),
+	}
+}
+
+// loadStateLocked initializes st while its per-conversation mutex is held.
+func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationState, conversationID string) error {
+	info, err := os.Lstat(st.path)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("command log for %q is a symlink", conversationID)
+			return fmt.Errorf("command log for %q is a symlink", conversationID)
 		}
 		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("command log for %q is not a regular file", conversationID)
+			return fmt.Errorf("command log for %q is not a regular file", conversationID)
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("stat command log for %q: %w", conversationID, err)
+		return fmt.Errorf("stat command log for %q: %w", conversationID, err)
 	}
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	file, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open command log for %q: %w", conversationID, err)
+		return fmt.Errorf("open command log for %q: %w", conversationID, err)
 	}
-
-	st := &conversationState{
-		path:        path,
-		file:        file,
-		nextSeq:     1,
-		bySeq:       make(map[uint64]int),
-		byCommandID: make(map[string]int),
-		byKey:       make(map[string]int),
-	}
-
-	if err := lockFile(file); err != nil {
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
-
-	if err := s.scanLogLocked(st, conversationID); err != nil {
+	fresh := newConversationState(st.path)
+	fresh.file = file
+	if err := s.scanLogLocked(ctx, fresh, conversationID); err != nil {
 		_ = unlockFile(file)
 		_ = file.Close()
-		return nil, err
+		return err
 	}
 
 	if err := unlockFile(file); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("unlock command log for %q: %w", conversationID, err)
+		return fmt.Errorf("unlock command log for %q: %w", conversationID, err)
 	}
-
-	s.states[conversationID] = st
-	return st, nil
+	st.file = file
+	st.nextSeq = fresh.nextSeq
+	st.commands = fresh.commands
+	st.bySeq = fresh.bySeq
+	st.byCommandID = fresh.byCommandID
+	st.byKey = fresh.byKey
+	st.fileSize = fresh.fileSize
+	return nil
 }
 
 func commandLogPath(dir, conversationID string) string {
