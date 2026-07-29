@@ -45,6 +45,8 @@ pub(crate) fn retryable_machine_code(code: &str) -> bool {
         "network_error"
             | "request_error"
             | "transport_error"
+            | "overloaded_error"
+            | "server_error"
             | "unexpected_sse_eof"
             | "idle_timeout"
             | "response_header_timeout"
@@ -270,6 +272,34 @@ mod tests {
             "insufficient_quota",
             Some("http_429")
         )));
+    }
+
+    #[test]
+    fn native_provider_transient_codes_are_authoritative() {
+        for (code, terse_display) in [("overloaded_error", "busy"), ("server_error", "failed")] {
+            assert!(
+                is_retryable(&error_with_code(terse_display, Some(code))),
+                "{code}/{terse_display}"
+            );
+            assert!(
+                is_retryable(&error_with_code("billing quota exceeded", Some(code))),
+                "{code} must take precedence over display text"
+            );
+
+            let mut non_error = error_with_code(terse_display, Some(code));
+            non_error.stop_reason = StopReason::Stop;
+            assert!(
+                !is_retryable(&non_error),
+                "{code} must not override a non-error terminal"
+            );
+        }
+
+        for (code, terse_display) in [("overloaded", "busy"), ("server_error_detail", "failed")] {
+            assert!(
+                !is_retryable(&error_with_code(terse_display, Some(code))),
+                "near-match code {code} must not become retryable"
+            );
+        }
     }
 
     #[tokio::test]
