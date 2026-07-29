@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const GENERATION: u64 = 19;
 const NONCE: &str = "executor-service-test";
+const PERSONALITY_AGENT_ID: &str = "018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e";
 
 struct Fixture {
     root: PathBuf,
@@ -76,7 +77,7 @@ impl Fixture {
             .env("SUMI_RPC_GENERATION", GENERATION.to_string())
             .env("SUMI_RPC_NONCE", NONCE)
             .env("SUMI_WORKSPACE", &self.workspace)
-            .env("SUMI_CONVERSATION_ID", "conversation-1")
+            .env("SUMI_PERSONALITY_AGENT_ID", PERSONALITY_AGENT_ID)
             .env("SUMI_ARTIFACT_BROKER_SOCKET", &self.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -193,7 +194,7 @@ async fn idle_or_nonreading_broker_clients_do_not_starve_later_clients() {
     let mut bytes = serde_json::to_vec(&request(
         "nonreader",
         json!({
-            "type":"begin_tool_output", "conversation_id":"conversation-1",
+            "type":"begin_tool_output", "personality_agent_id":PERSONALITY_AGENT_ID,
             "execution_id":"nonreader", "content":[120]
         }),
     ))
@@ -209,7 +210,7 @@ async fn idle_or_nonreading_broker_clients_do_not_starve_later_clients() {
             &request(
                 "later",
                 json!({
-                    "type":"begin_tool_output", "conversation_id":"conversation-1",
+                    "type":"begin_tool_output", "personality_agent_id":PERSONALITY_AGENT_ID,
                     "execution_id":"later", "content":[121]
                 }),
             ),
@@ -230,8 +231,8 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
         "stale",
         json!({
             "type": "read_artifact",
-            "conversation_id": "conversation-1",
-            "handle": "artifact://conversation-1/tool-output/execution-1",
+            "personality_agent_id": PERSONALITY_AGENT_ID,
+            "handle": format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/execution-1"),
             "offset": 0,
             "limit": 10,
         }),
@@ -246,7 +247,7 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "begin",
             json!({
                 "type": "begin_tool_output",
-                "conversation_id": "conversation-1",
+                "personality_agent_id": PERSONALITY_AGENT_ID,
                 "execution_id": "execution-1",
                 "content": [104, 101, 108, 108, 111],
             }),
@@ -262,7 +263,7 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "append",
             json!({
                 "type": "append_tool_output",
-                "conversation_id": "conversation-1",
+                "personality_agent_id": PERSONALITY_AGENT_ID,
                 "handle": handle,
                 "offset": 5,
                 "content": [32, 119, 111, 114, 108, 100],
@@ -278,7 +279,7 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "finish",
             json!({
                 "type": "finish_tool_output",
-                "conversation_id": "conversation-1",
+                "personality_agent_id": PERSONALITY_AGENT_ID,
                 "handle": handle,
             }),
         ),
@@ -290,7 +291,7 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
         std::fs::read(
             fixture
                 .artifacts
-                .join("conversation-1/tool-output/execution-1")
+                .join(format!("{PERSONALITY_AGENT_ID}/tool-output/execution-1"))
         )
         .unwrap(),
         b"hello world"
@@ -305,7 +306,7 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
         &request(
             "begin-slow",
             json!({
-                "type":"begin_tool_output", "conversation_id":"conversation-1",
+                "type":"begin_tool_output", "personality_agent_id":PERSONALITY_AGENT_ID,
                 "execution_id":"slow", "content":[97]
             }),
         ),
@@ -313,7 +314,9 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
     .await
     .unwrap();
     let handle = begun["result"]["Ok"]["handle"].as_str().unwrap().to_owned();
-    let artifact_path = fixture.artifacts.join("conversation-1/tool-output/slow");
+    let artifact_path = fixture
+        .artifacts
+        .join(format!("{PERSONALITY_AGENT_ID}/tool-output/slow"));
     let locked = OpenOptions::new()
         .read(true)
         .write(true)
@@ -325,7 +328,7 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
     let append = request(
         "append-slow",
         json!({
-            "type":"append_tool_output", "conversation_id":"conversation-1",
+            "type":"append_tool_output", "personality_agent_id":PERSONALITY_AGENT_ID,
             "handle":handle, "offset":1, "content":[98,99]
         }),
     );
@@ -351,8 +354,8 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
         &request(
             "append-replay",
             json!({
-                "type":"append_tool_output", "conversation_id":"conversation-1",
-                "handle":"artifact://conversation-1/tool-output/slow",
+                "type":"append_tool_output", "personality_agent_id":PERSONALITY_AGENT_ID,
+                "handle":format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/slow"),
                 "offset":1, "content":[98,99]
             }),
         ),
@@ -372,7 +375,7 @@ async fn executor_routes_workspace_and_artifact_reads_and_grep() {
             "begin-route",
             json!({
                 "type": "begin_tool_output",
-                "conversation_id": "conversation-1",
+                "personality_agent_id": PERSONALITY_AGENT_ID,
                 "execution_id": "route-output",
                 "content": [97, 108, 112, 104, 97, 10, 110, 101, 101, 100, 108, 101, 10],
             }),
@@ -968,13 +971,13 @@ async fn bash_archives_large_output_through_the_broker_client() {
     };
     assert_eq!(
         terminal["result"]["Ok"]["result"]["artifact_handle"],
-        "artifact://conversation-1/tool-output/bash-archive-1"
+        format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/bash-archive-1")
     );
     assert_eq!(
         std::fs::metadata(
             fixture
                 .artifacts
-                .join("conversation-1/tool-output/bash-archive-1")
+                .join(format!("{PERSONALITY_AGENT_ID}/tool-output/bash-archive-1"))
         )
         .unwrap()
         .len(),

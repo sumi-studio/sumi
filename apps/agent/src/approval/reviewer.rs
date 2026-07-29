@@ -882,11 +882,17 @@ mod tests {
             ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
             PublicMessage, StopReason, ToolCall, Usage, UserContent, UserMessage,
         },
+        runtime::contracts::PersonalityAgentId,
         store::Redactor,
     };
 
     fn projector() -> SecretAwareActionProjector {
         SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture())
+    }
+
+    fn personality_agent_id(value: &str) -> PersonalityAgentId {
+        PersonalityAgentId::parse(value)
+            .expect("test personality_agent_id must be a canonical UUIDv7")
     }
 
     fn reviewable_projection() -> ReviewProjection {
@@ -1640,27 +1646,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn allow_cache_does_not_cross_verified_authority_scope() {
-        let fake = FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json())]);
+    async fn allow_cache_does_not_cross_verified_authority_provenance_or_owner() {
+        let fake =
+            FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json()), Ok(allow_json())]);
         let reviewer = make_reviewer(fake.clone());
         let now = chrono::Utc::now();
-        let bundle = |tenant_id: &str| ApprovalPolicyBundle {
-            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
-            tenant_id: tenant_id.to_owned(),
-            agent_id: "agent-1".to_owned(),
-            version: 1,
-            issued_at: now - chrono::Duration::minutes(1),
-            expires_at: now + chrono::Duration::hours(1),
-            rules: Vec::new(),
-        };
+        let bundle =
+            |tenant_id: &str, personality_agent_id: PersonalityAgentId| ApprovalPolicyBundle {
+                schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+                tenant_id: tenant_id.to_owned(),
+                personality_agent_id,
+                version: 1,
+                issued_at: now - chrono::Duration::minutes(1),
+                expires_at: now + chrono::Duration::hours(1),
+                rules: Vec::new(),
+            };
+        let paid_a = personality_agent_id("018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e");
+        let paid_b = personality_agent_id("018f8a9e-65c1-7b6c-9e4d-2a3b4c5d6e7f");
         let policy_a =
-            Policy::from_verified_bundle("/workspace", &bundle("tenant-a")).expect("policy a");
-        let policy_b =
-            Policy::from_verified_bundle("/workspace", &bundle("tenant-b")).expect("policy b");
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_a.clone()))
+                .expect("policy a");
+        let policy_b = Policy::from_verified_bundle("/workspace", &bundle("tenant-b", paid_a))
+            .expect("policy with distinct event-time tenant provenance");
+        let policy_c = Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_b))
+            .expect("policy with distinct PAID owner");
         assert_ne!(
             policy_a.hash_at(now),
             policy_b.hash_at(now),
-            "verified authority scope must be part of policy identity"
+            "event-time tenant provenance must be part of policy identity"
+        );
+        assert_ne!(
+            policy_a.hash_at(now),
+            policy_c.hash_at(now),
+            "PAID owner must be part of policy identity"
         );
 
         let mut first = review_request(reviewable_projection());
@@ -1676,10 +1694,16 @@ mod tests {
             reviewer.review(second, CancellationToken::new()).await,
             ReviewOutcome::Allow(_)
         ));
+        let mut third = review_request(reviewable_projection());
+        third.policy_hash = policy_c.hash_at(now);
+        assert!(matches!(
+            reviewer.review(third, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
         assert_eq!(
             fake.called_count(),
-            2,
-            "a shared reviewer must not reuse an allow across authority scopes"
+            3,
+            "a shared reviewer must not reuse an allow across tenant provenance or PAID owners"
         );
     }
 

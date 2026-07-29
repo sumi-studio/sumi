@@ -5020,7 +5020,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!("{message_id}:{message_seq}"),
             })
             .await
@@ -5724,7 +5724,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!("{message_id}:{message_seq}"),
             })
             .await
@@ -5825,7 +5825,7 @@ mod tests {
         let unrelated_message_seq = 200u64;
         let unrelated_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
             })
             .await
@@ -5981,7 +5981,7 @@ mod tests {
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!("{message_id}:{message_seq}"),
             })
             .await
@@ -6046,7 +6046,7 @@ mod tests {
         let unrelated_message_seq = 200u64;
         let unrelated_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
                 anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
             })
             .await
