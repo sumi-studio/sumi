@@ -229,56 +229,15 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 mod sqlite_uuid {
     use std::{
-        ffi::{c_char, c_int, c_void},
+        ffi::c_int,
         panic::{AssertUnwindSafe, catch_unwind},
         slice, str,
     };
 
+    use libsqlite3_sys as ffi;
     use sqlx::{Error, Result, sqlite::SqliteConnection};
 
     use crate::runtime::contracts::PersonalityAgentId;
-
-    #[repr(C)]
-    struct RawSqlite {
-        _opaque: [u8; 0],
-    }
-    #[repr(C)]
-    struct RawSqliteContext {
-        _opaque: [u8; 0],
-    }
-    #[repr(C)]
-    struct RawSqliteValue {
-        _opaque: [u8; 0],
-    }
-
-    type ScalarFunction =
-        unsafe extern "C" fn(*mut RawSqliteContext, c_int, *mut *mut RawSqliteValue);
-
-    unsafe extern "C" {
-        fn sqlite3_create_function_v2(
-            database: *mut RawSqlite,
-            name: *const c_char,
-            argument_count: c_int,
-            flags: c_int,
-            application_data: *mut c_void,
-            scalar: Option<ScalarFunction>,
-            step: Option<unsafe extern "C" fn()>,
-            finalizer: Option<unsafe extern "C" fn()>,
-            destroy: Option<unsafe extern "C" fn(*mut c_void)>,
-        ) -> c_int;
-        fn sqlite3_value_type(value: *mut RawSqliteValue) -> c_int;
-        fn sqlite3_value_text(value: *mut RawSqliteValue) -> *const u8;
-        fn sqlite3_value_bytes(value: *mut RawSqliteValue) -> c_int;
-        fn sqlite3_result_int(context: *mut RawSqliteContext, value: c_int);
-        fn sqlite3_result_error_code(context: *mut RawSqliteContext, code: c_int);
-    }
-
-    const SQLITE_OK: c_int = 0;
-    const SQLITE_TEXT: c_int = 3;
-    const SQLITE_UTF8: c_int = 1;
-    const SQLITE_DETERMINISTIC: c_int = 0x0000_0800;
-    const SQLITE_INNOCUOUS: c_int = 0x0020_0000;
-    const SQLITE_CONSTRAINT_FUNCTION: c_int = 1043;
     const FUNCTION_NAME: &[u8] = b"sumi_is_canonical_uuid_v7\0";
 
     pub(super) async fn register(connection: &mut SqliteConnection) -> Result<()> {
@@ -288,11 +247,11 @@ mod sqlite_uuid {
             // duration of registration. The callback owns no application data
             // and SQLite retains only the static function name and function
             // pointer.
-            sqlite3_create_function_v2(
+            ffi::sqlite3_create_function_v2(
                 handle.as_raw_handle().as_ptr().cast(),
                 FUNCTION_NAME.as_ptr().cast(),
                 1,
-                SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC | ffi::SQLITE_INNOCUOUS,
                 std::ptr::null_mut(),
                 Some(is_canonical_uuid_v7),
                 None,
@@ -300,7 +259,7 @@ mod sqlite_uuid {
                 None,
             )
         };
-        if result != SQLITE_OK {
+        if result != ffi::SQLITE_OK {
             return Err(Error::Protocol(format!(
                 "failed to register canonical UUIDv7 SQLite scalar: code {result}"
             )));
@@ -309,23 +268,23 @@ mod sqlite_uuid {
     }
 
     unsafe extern "C" fn is_canonical_uuid_v7(
-        context: *mut RawSqliteContext,
+        context: *mut ffi::sqlite3_context,
         argument_count: c_int,
-        arguments: *mut *mut RawSqliteValue,
+        arguments: *mut *mut ffi::sqlite3_value,
     ) {
         let valid = catch_unwind(AssertUnwindSafe(|| {
             if argument_count != 1 || arguments.is_null() {
                 return None;
             }
             let value = unsafe { *arguments };
-            if value.is_null() || unsafe { sqlite3_value_type(value) } != SQLITE_TEXT {
+            if value.is_null() || unsafe { ffi::sqlite3_value_type(value) } != ffi::SQLITE_TEXT {
                 return Some(false);
             }
-            let length = unsafe { sqlite3_value_bytes(value) };
+            let length = unsafe { ffi::sqlite3_value_bytes(value) };
             if length < 0 {
                 return None;
             }
-            let text = unsafe { sqlite3_value_text(value) };
+            let text = unsafe { ffi::sqlite3_value_text(value) };
             if text.is_null() {
                 return None;
             }
@@ -338,9 +297,9 @@ mod sqlite_uuid {
             )
         }));
         match valid {
-            Ok(Some(valid)) => unsafe { sqlite3_result_int(context, c_int::from(valid)) },
+            Ok(Some(valid)) => unsafe { ffi::sqlite3_result_int(context, c_int::from(valid)) },
             Ok(None) | Err(_) => unsafe {
-                sqlite3_result_error_code(context, SQLITE_CONSTRAINT_FUNCTION)
+                ffi::sqlite3_result_error_code(context, ffi::SQLITE_CONSTRAINT_FUNCTION)
             },
         }
     }

@@ -2350,6 +2350,7 @@ dependencies = [
  "hmac",
  "jsonschema",
  "libc",
+ "libsqlite3-sys",
  "rand 0.9.5",
  "regex",
  "reqwest",
