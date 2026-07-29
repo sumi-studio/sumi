@@ -91,6 +91,7 @@ pub enum NativeCompactionError {
 struct ProducerChannels {
     normal: mpsc::Sender<ProviderEvent>,
     priority_terminal: mpsc::Sender<ProviderEvent>,
+    ordered_prefix_drain: Option<mpsc::Sender<()>>,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
     timing: Option<ProviderTimingObserver>,
 }
@@ -433,6 +434,7 @@ fn stream_chat_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: None,
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -463,6 +465,7 @@ fn stream_responses_with_api_key(
 ) -> ProviderEventStream {
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+    let (ordered_prefix_drain_tx, ordered_prefix_drain_rx) = mpsc::channel(1);
     let origin = spec.origin();
     let provider = spec.provider.clone();
     let stream_budget = responses_requested_output_tokens(&spec, &options)
@@ -489,6 +492,7 @@ fn stream_responses_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: Some(ordered_prefix_drain_tx),
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -506,6 +510,7 @@ fn stream_responses_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .with_ordered_prefix_drain(ordered_prefix_drain_rx)
     .own_producer(producer_task)
 }
 
@@ -545,6 +550,7 @@ fn stream_anthropic_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: None,
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -576,6 +582,7 @@ async fn run_anthropic_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain: _,
         success_terminal_committed,
         timing,
     } = channels;
@@ -975,6 +982,7 @@ async fn run_responses_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain,
         success_terminal_committed,
         timing,
     } = channels;
@@ -1175,7 +1183,10 @@ async fn run_responses_stream(
         match transport.next_event().await {
             Ok(Some(event)) => {
                 if let Err(error) = validate_event_name(event.event.as_deref(), &event.data) {
-                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+                    mark_responses_partial_rejection_prefix(
+                        &ordered_prefix_drain,
+                        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                    );
                     finish_responses_error(
                         &priority_terminal_tx,
                         &mut assembler,
@@ -1191,7 +1202,11 @@ async fn run_responses_stream(
                 let pushed = match receive.push_json(&event.data) {
                     Ok(pushed) => pushed,
                     Err(error) => {
-                        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+                        mark_responses_partial_rejection_prefix(
+                            &ordered_prefix_drain,
+                            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
+                                .await,
+                        );
                         finish_responses_error(
                             &priority_terminal_tx,
                             &mut assembler,
@@ -1216,8 +1231,11 @@ async fn run_responses_stream(
                         EmitResult::Sent => {}
                         EmitResult::Closed => return,
                         EmitResult::Cancelled => {
-                            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
-                                .await;
+                            mark_responses_partial_rejection_prefix(
+                                &ordered_prefix_drain,
+                                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
+                                    .await,
+                            );
                             finish_failure_with_context(
                                 &priority_terminal_tx,
                                 &mut assembler,
@@ -1265,7 +1283,10 @@ async fn run_responses_stream(
                 let error = receive
                     .finish_eof()
                     .expect_err("loop returns immediately after a terminal response");
-                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+                mark_responses_partial_rejection_prefix(
+                    &ordered_prefix_drain,
+                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                );
                 finish_responses_error(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1279,7 +1300,10 @@ async fn run_responses_stream(
                 return;
             }
             Err(error) => {
-                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+                mark_responses_partial_rejection_prefix(
+                    &ordered_prefix_drain,
+                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                );
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1308,6 +1332,7 @@ async fn run_chat_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain: _,
         success_terminal_committed,
         timing,
     } = channels;
@@ -1720,7 +1745,8 @@ async fn close_responses_partial(
     receive: &mut ResponsesReceiveState,
     assembler: &mut MessageAssembler,
     cancel: &CancellationToken,
-) {
+) -> bool {
+    let mut rejection_sent = false;
     for event in receive.fail() {
         // Reserve the ordered-lane slot before mutating the authoritative
         // producer snapshot. A cancellation must still be able to abandon an
@@ -1728,10 +1754,10 @@ async fn close_responses_partial(
         // cannot be allowed into the abort terminal.
         let permit = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => return false,
             permit = tx.reserve() => match permit {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(_) => return false,
             }
         };
         if let Err(error) = assembler.apply(&event) {
@@ -1739,7 +1765,26 @@ async fn close_responses_partial(
             tracing::error!(%error, "failed to close partial Responses output");
             break;
         }
+        let is_rejection = matches!(event, ProviderEvent::ToolCallRejected { .. });
         permit.send(event);
+        rejection_sent |= is_rejection;
+    }
+    rejection_sent
+}
+
+fn mark_responses_partial_rejection_prefix(
+    ordered_prefix_drain: &Option<mpsc::Sender<()>>,
+    rejection_sent: bool,
+) {
+    if !rejection_sent {
+        return;
+    }
+    let Some(ordered_prefix_drain) = ordered_prefix_drain else {
+        tracing::error!("Responses partial rejection has no ordered-prefix drain channel");
+        return;
+    };
+    if ordered_prefix_drain.try_send(()).is_err() {
+        tracing::error!("failed to mark Responses partial rejection ordered-prefix drain");
     }
 }
 
@@ -5908,6 +5953,7 @@ fi
             .expect("producer Start");
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (priority_tx, priority_rx) = mpsc::channel(1);
+        let (ordered_prefix_drain_tx, ordered_prefix_drain_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let committed = Arc::new(SuccessTerminalCommit::new());
 
@@ -5927,7 +5973,10 @@ fi
             .await,
             EmitResult::Sent
         ));
-        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+        mark_responses_partial_rejection_prefix(
+            &Some(ordered_prefix_drain_tx),
+            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+        );
 
         match failure {
             PartialResponsesFailure::MalformedInput => {
@@ -5984,7 +6033,8 @@ fi
             spec.origin(),
             ResponseBudget::default(),
             committed,
-        );
+        )
+        .with_ordered_prefix_drain(ordered_prefix_drain_rx);
         let mut events = Vec::new();
         while let Some(event) = stream.recv().await {
             events.push(event);
@@ -6006,6 +6056,50 @@ fi
             &partial_responses_failure_events(PartialResponsesFailure::Transport).await,
             "transport_error",
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_priority_error_does_not_drain_normal_backlog() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::ToolCallStart { content_index: 0 })
+            .await
+            .expect("queue ordinary normal event");
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler
+            .apply(&ProviderEvent::Start)
+            .expect("producer Start");
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            "fixture ordinary failure".to_owned(),
+            "ordinary_failure",
+            false,
+        )
+        .await;
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            CancellationToken::new(),
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            Arc::new(SuccessTerminalCommit::new()),
+        );
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        assert_eq!(event_types(&events), ["start", "error"]);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Error { output, .. })
+                if output.message.provider_code.as_deref() == Some("ordinary_failure")
+        ));
     }
 
     #[tokio::test]
