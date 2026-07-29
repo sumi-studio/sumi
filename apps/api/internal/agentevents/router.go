@@ -33,11 +33,11 @@ func NewProductionMux(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("user command ingress: %w", err)
 	}
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	mux.Handle("POST /direct-chat/commands", ingress)
 
 	browser := NewBrowserServer(sv, store, runtime)
 	browser.AllowedOrigins = browserOrigins
-	mux.Handle("GET /conversations/{conversation_id}/ws", browser)
+	mux.Handle("GET /direct-chat/ws", browser)
 
 	return mux, browser, agent, nil
 }

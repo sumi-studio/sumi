@@ -7,20 +7,15 @@ import (
 
 func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
 	claims := tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}
 	srv, cs, token := newTokenVerifiedTestServer(t, claims)
 
-	cmd := CommandEnvelope{
-		Seq:       1,
-		CommandID: "00000000-0000-4000-8000-000000000001",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	}
+	cmd := testCommandEnvelope(1, "00000000-0000-4000-8000-000000000001", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), claims.PersonalityAgentID)
 	cs.pushCommand(cmd)
 
 	server := startTestServer(t, srv)
@@ -34,7 +29,7 @@ func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -62,12 +57,11 @@ func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
 
 func TestWebSocketRealTokenExpiredIsRejected(t *testing.T) {
 	claims := tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(-time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(-time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}
 	srv, _, token := newTokenVerifiedTestServer(t, claims)
 
@@ -86,12 +80,11 @@ func TestWebSocketRealTokenExpiredIsRejected(t *testing.T) {
 
 func TestWebSocketRealTokenHelloGenerationMismatchCloses(t *testing.T) {
 	claims := tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}
 	srv, _, token := newTokenVerifiedTestServer(t, claims)
 
@@ -106,7 +99,7 @@ func TestWebSocketRealTokenHelloGenerationMismatchCloses(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             99,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,

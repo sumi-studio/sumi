@@ -19,7 +19,7 @@ type fakeGenerationVerifier struct {
 	latest uint64
 }
 
-func (f *fakeGenerationVerifier) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
+func (f *fakeGenerationVerifier) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if generation != f.latest {
@@ -261,11 +261,7 @@ func TestWebSocketHelloAndCommandCatchUp(t *testing.T) {
 	srv, _, _, cs, _, hl := newTestServer(t)
 	hl.setReady()
 
-	cmd := CommandEnvelope{
-		Seq:       1,
-		CommandID: "00000000-0000-4000-8000-000000000001",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	}
+	cmd := testCommandEnvelope(1, "00000000-0000-4000-8000-000000000001", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
 	cs.pushCommand(cmd)
 
 	server := startTestServer(t, srv)
@@ -279,7 +275,7 @@ func TestWebSocketHelloAndCommandCatchUp(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -310,9 +306,9 @@ func TestWebSocketHelloUsesDurableEventCursorNotAgentEcho(t *testing.T) {
 	hl.setReady()
 	seq := uint64(3)
 	es.envelopes = []Envelope{{
-		Seq:            &seq,
-		ConversationID: "conversation-1",
-		Event:          []byte(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Event:              []byte(`{"type":"agent_start"}`),
 	}}
 
 	server := startTestServer(t, srv)
@@ -323,7 +319,7 @@ func TestWebSocketHelloUsesDurableEventCursorNotAgentEcho(t *testing.T) {
 	}
 	defer conn.Close()
 	if err := conn.WriteJSON(AgentHello{
-		AgentID: "agent-1", Generation: 7, LastSentEventSeq: 99,
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7, LastSentEventSeq: 99,
 		LastReceivedCommandSeq: 0, LastAppliedCommandSeq: 0,
 	}); err != nil {
 		t.Fatalf("write hello: %v", err)
@@ -353,7 +349,7 @@ func TestWebSocketStaleGenerationIsClosed(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -371,11 +367,7 @@ func TestWebSocketStaleGenerationIsClosed(t *testing.T) {
 
 func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	srv, _, _, cs, _, hl := newTestServer(t)
-	cmd := CommandEnvelope{
-		Seq:       1,
-		CommandID: "00000000-0000-4000-8000-000000000001",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	}
+	cmd := testCommandEnvelope(1, "00000000-0000-4000-8000-000000000001", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
 	cs.pushCommand(cmd)
 
 	server := startTestServer(t, srv)
@@ -390,7 +382,7 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	if err := conn1.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -415,7 +407,7 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	}
 	defer conn2.Close()
 	if err := conn2.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -461,7 +453,7 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -479,9 +471,9 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	eventFrame := OutboundFrame{
 		FrameType: "event",
 		Envelope: &Envelope{
-			Seq:            &seq1,
-			ConversationID: "conversation-1",
-			Event:          []byte(`{"type":"agent_start"}`),
+			Seq:                &seq1,
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+			Event:              []byte(`{"type":"agent_start"}`),
 		},
 	}
 	if err := conn.WriteJSON(eventFrame); err != nil {
@@ -489,7 +481,7 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	}
 	ackFrame := OutboundFrame{
 		FrameType: "command_ack",
-		Ack: &CommandAck{
+		Ack: &CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 			Seq:       1,
 			CommandID: "00000000-0000-4000-8000-000000000001",
 			Status:    "received",
@@ -529,7 +521,7 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -546,9 +538,9 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
 		Envelope: &Envelope{
-			Seq:            &seq1,
-			ConversationID: "other-conversation",
-			Event:          []byte(`{"type":"agent_start"}`),
+			Seq:                &seq1,
+			PersonalityAgentID: "other-conversation",
+			Event:              []byte(`{"type":"agent_start"}`),
 		},
 	}); err != nil {
 		t.Fatalf("write mismatched event: %v", err)
@@ -620,13 +612,14 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 	hl.setReady()
 
 	for i := 1; i <= 2; i++ {
-		cs.pushCommand(CommandEnvelope{
-			Seq:       uint64(i),
-			CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i),
-			Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-		})
+		cs.pushCommand(testCommandEnvelope(
+			uint64(i),
+			fmt.Sprintf("00000000-0000-4000-8000-%012d", i),
+			[]byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+			"018f47a2-9b3c-7def-8abc-0123456789ab",
+		))
 	}
-	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{
+	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Seq:       1,
 		CommandID: "00000000-0000-4000-8000-000000000001",
 		Status:    "applied",
@@ -645,7 +638,7 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 1,
@@ -674,12 +667,8 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 func TestWebSocketDurableAckGapOverridesAgentLastAppliedCursor(t *testing.T) {
 	srv, _, _, cs, _, hl := newTestServer(t)
 	hl.setReady()
-	cs.pushCommand(CommandEnvelope{
-		Seq:       1,
-		CommandID: "00000000-0000-4000-8000-000000000001",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	})
-	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{Seq: 1, CommandID: "00000000-0000-4000-8000-000000000001", Status: "received"}); err != nil {
+	cs.pushCommand(testCommandEnvelope(1, "00000000-0000-4000-8000-000000000001", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab"))
+	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: 1, CommandID: "00000000-0000-4000-8000-000000000001", Status: "received"}); err != nil {
 		t.Fatal(err)
 	}
 	server := startTestServer(t, srv)
@@ -689,7 +678,7 @@ func TestWebSocketDurableAckGapOverridesAgentLastAppliedCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7, LastReceivedCommandSeq: 1, LastAppliedCommandSeq: 1}); err != nil {
+	if err := conn.WriteJSON(AgentHello{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7, LastReceivedCommandSeq: 1, LastAppliedCommandSeq: 1}); err != nil {
 		t.Fatal(err)
 	}
 	var hello ApiHello
@@ -720,7 +709,7 @@ func TestWebSocketRejectsEmptyCommandLogAfterDurableProgress(t *testing.T) {
 	}
 	defer conn.Close()
 	if err := conn.WriteJSON(AgentHello{
-		AgentID: "agent-1", Generation: 7,
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7,
 		LastReceivedCommandSeq: 1, LastAppliedCommandSeq: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -734,11 +723,7 @@ func TestWebSocketRejectsEmptyCommandLogAfterDurableProgress(t *testing.T) {
 func TestWebSocketRejectsInvalidCommandID(t *testing.T) {
 	srv, _, _, cs, _, hl := newTestServer(t)
 	hl.setReady()
-	cs.pushCommand(CommandEnvelope{
-		Seq:       1,
-		CommandID: "not-a-canonical-uuid",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	})
+	cs.pushCommand(testCommandEnvelope(1, "not-a-canonical-uuid", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab"))
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -751,7 +736,7 @@ func TestWebSocketRejectsInvalidCommandID(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -781,11 +766,7 @@ func TestWebSocketCatchUpGapFromLastReceivedCommandSeq(t *testing.T) {
 	hl.setReady()
 
 	// The retained log begins at seq 5, but the agent has only received up to 3.
-	cs.pushCommand(CommandEnvelope{
-		Seq:       5,
-		CommandID: "00000000-0000-4000-8000-000000000005",
-		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
-	})
+	cs.pushCommand(testCommandEnvelope(5, "00000000-0000-4000-8000-000000000005", []byte(`{"type":"user_message","text":"hi","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab"))
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -798,7 +779,7 @@ func TestWebSocketCatchUpGapFromLastReceivedCommandSeq(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 3,
@@ -831,7 +812,7 @@ func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -847,7 +828,7 @@ func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
 
 	// The limit leaves ample room for AgentHello. This structurally valid frame
 	// is deliberately more than twice the post-hello limit.
-	largeEvent := `{"frame_type":"event","envelope":{"seq":1,"conversation_id":"conversation-1","event":{"type":"error","message":"` + strings.Repeat("x", 2*readLimit) + `"}}}`
+	largeEvent := `{"frame_type":"event","envelope":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"` + strings.Repeat("x", 2*readLimit) + `"}}}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(largeEvent)); err != nil {
 		t.Fatalf("write oversized frame: %v", err)
 	}
@@ -875,7 +856,7 @@ func TestWritePumpClosedErrorChannelDoesNotSpinWithoutPing(t *testing.T) {
 	close(liveErr)
 
 	done := make(chan error, 1)
-	go func() { done <- srv.writePump(context.Background(), nil, live, liveErr) }()
+	go func() { done <- srv.writePump(context.Background(), nil, TokenClaims{}, live, liveErr) }()
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "command source closed") {
@@ -894,7 +875,7 @@ func TestWritePumpPreservesSourceErrorAfterCommandsClose(t *testing.T) {
 	close(live)
 	liveErr <- errors.New("durable source failed")
 	close(liveErr)
-	if err := srv.writePump(context.Background(), nil, live, liveErr); err == nil || !strings.Contains(err.Error(), "durable source failed") {
+	if err := srv.writePump(context.Background(), nil, TokenClaims{}, live, liveErr); err == nil || !strings.Contains(err.Error(), "durable source failed") {
 		t.Fatalf("expected source error after commands close, got %v", err)
 	}
 }
@@ -917,7 +898,7 @@ func TestWebSocketPumpFailureUnblocksPeerReadWithoutPongWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+	if err := conn.WriteJSON(AgentHello{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7}); err != nil {
 		t.Fatal(err)
 	}
 	var hello ApiHello
@@ -948,7 +929,7 @@ func TestWebSocketReadFailureClosesIdleWriterWithoutPongWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+	if err := conn.WriteJSON(AgentHello{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7}); err != nil {
 		t.Fatal(err)
 	}
 	var hello ApiHello
@@ -996,7 +977,7 @@ func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
 	defer conn.Close()
 
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -1035,7 +1016,7 @@ func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+	if err := conn.WriteJSON(AgentHello{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7}); err != nil {
 		t.Fatal(err)
 	}
 	var hello ApiHello
@@ -1047,9 +1028,9 @@ func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
 		Envelope: &Envelope{
-			Seq:            &seq,
-			ConversationID: "conversation-1",
-			Event:          []byte(`{"type":"agent_start"}`),
+			Seq:                &seq,
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+			Event:              []byte(`{"type":"agent_start"}`),
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -1085,7 +1066,7 @@ func TestWebSocketHelloRejectsCheckedAddOverflow(t *testing.T) {
 	// next_command_seq = max + 1. The server must fail closed and not marshal
 	// an out-of-range ApiHello.
 	if err := conn.WriteJSON(AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             7,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,

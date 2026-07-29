@@ -239,8 +239,8 @@ func (g *DurableGateway) maxAckTail() int {
 	return 256
 }
 
-func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
-	state, err := g.state(ctx, agentID)
+func (g *DurableGateway) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
+	state, err := g.state(ctx, personalityAgentID)
 	if err != nil {
 		return err
 	}
@@ -253,11 +253,21 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, g
 	return nil
 }
 
+// IsPersonalityAgentReady reports the authoritative Ready latch for the one
+// global runtime identity. Tenant is intentionally absent from this key.
+func (g *DurableGateway) IsPersonalityAgentReady(ctx context.Context, personalityAgentID string) (bool, error) {
+	state, err := g.state(ctx, personalityAgentID)
+	if err != nil {
+		return false, err
+	}
+	return state.present && state.HydrationReceiptIdentity != nil, nil
+}
+
 func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error {
 	ticker := time.NewTicker(g.pollInterval())
 	defer ticker.Stop()
 	for {
-		state, err := g.state(ctx, claims.AgentID)
+		state, err := g.state(ctx, claims.PersonalityAgentID)
 		if err != nil {
 			return err
 		}
@@ -287,18 +297,18 @@ func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, genera
 }
 
 func (g *DurableGateway) FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
-	return g.commands.FirstCommandSeq(ctx, claims.ConversationID)
+	return g.commands.FirstCommandSeq(ctx, claims.PersonalityAgentID)
 }
 
 func (g *DurableGateway) HasCommands(ctx context.Context, claims TokenClaims) (bool, error) {
-	return g.commands.HasCommands(ctx, claims.ConversationID)
+	return g.commands.HasCommands(ctx, claims.PersonalityAgentID)
 }
 
 // NextCommandSeq returns the earliest command without a durable terminal ACK.
 // It is the sole replay cursor authority: agent hello state may bound it, but
 // can never advance it past an ACK the API has not durably recorded.
 func (g *DurableGateway) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
-	file, err := g.newFile(g.ackPath(claims.ConversationID), os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := g.newFile(g.ackPath(claims.PersonalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return 0, err
 	}
@@ -311,7 +321,7 @@ func (g *DurableGateway) NextCommandSeq(ctx context.Context, claims TokenClaims)
 	// Take the command view after excluding ACK appenders. Any command appended
 	// after this snapshot cannot acquire an ACK until this scan releases the
 	// per-conversation file lock, so returning snapshot.nextSeq is conservative.
-	snapshot, err := g.commands.commandSnapshot(ctx, claims.ConversationID)
+	snapshot, err := g.commands.commandSnapshot(ctx, claims.PersonalityAgentID)
 	if err != nil {
 		return 0, err
 	}
@@ -340,7 +350,7 @@ func (g *DurableGateway) NextCommandSeq(ctx context.Context, claims TokenClaims)
 }
 
 func (g *DurableGateway) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
-	return g.commands.CatchUp(ctx, claims.ConversationID, fromSeq)
+	return g.commands.CatchUp(ctx, claims.PersonalityAgentID, fromSeq)
 }
 
 // Live polls the durable command log starting at fromSeq and streams each
@@ -357,7 +367,7 @@ func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq u
 		ticker := time.NewTicker(g.pollInterval())
 		defer ticker.Stop()
 		for {
-			commands, err := g.commands.CatchUp(ctx, claims.ConversationID, next)
+			commands, err := g.commands.CatchUp(ctx, claims.PersonalityAgentID, next)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("command catch-up: %w", err):
@@ -390,18 +400,21 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	if err := validateCommandAck(ack); err != nil {
 		return err
 	}
-	cmd, found, err := g.commands.GetCommand(ctx, claims.ConversationID, ack.Seq)
+	if ack.PersonalityAgentID != claims.PersonalityAgentID {
+		return errors.New("command ACK target does not match token claim")
+	}
+	cmd, found, err := g.commands.GetCommand(ctx, claims.PersonalityAgentID, ack.Seq)
 	if err != nil {
 		return fmt.Errorf("load acknowledged command: %w", err)
 	}
-	if !found || cmd.CommandID != ack.CommandID {
+	if !found || cmd.CommandID != ack.CommandID || cmd.PersonalityAgentID != ack.PersonalityAgentID {
 		return fmt.Errorf(
 			"ack does not match durable command log: seq=%d command_id=%q",
 			ack.Seq,
 			ack.CommandID,
 		)
 	}
-	return g.appendCommandAck(ctx, claims.ConversationID, ack)
+	return g.appendCommandAck(ctx, claims.PersonalityAgentID, ack)
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -411,42 +424,45 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	if err := validateEnvelope(envelope); err != nil {
 		return err
 	}
-	if envelope.ConversationID != claims.ConversationID {
+	if envelope.PersonalityAgentID != claims.PersonalityAgentID {
 		return fmt.Errorf(
-			"event conversation_id %q does not match token claim %q",
-			envelope.ConversationID,
-			claims.ConversationID,
+			"event personality_agent_id %q does not match token claim %q",
+			envelope.PersonalityAgentID,
+			claims.PersonalityAgentID,
 		)
 	}
 	if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
 		g.mu.Lock()
-		g.publishVolatileLocked(claims.ConversationID, envelope)
+		g.publishVolatileLocked(claims.PersonalityAgentID, envelope)
 		g.mu.Unlock()
 		return nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.appendDurableEventLocked(
-		claims.ConversationID,
+		claims.PersonalityAgentID,
 		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
 	); err != nil {
 		return err
 	}
-	g.updateConversationStateLocked(claims.ConversationID, envelope.Event)
+	g.updateConversationStateLocked(claims.PersonalityAgentID, envelope.Event)
 	return nil
 }
 
 // EventCatchUp returns the durable event suffix after lastConsumedSeq. It
 // verifies the complete retained log on every read, so a gap or corrupt record
 // fails closed rather than being silently skipped during browser reconnect.
-func (g *DurableGateway) EventCatchUp(ctx context.Context, conversationID string, lastConsumedSeq uint64) ([]Envelope, error) {
+func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID string, lastConsumedSeq uint64) ([]Envelope, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
 		return nil, err
 	}
 	if lastConsumedSeq > maxJSONSafeInteger {
 		return nil, fmt.Errorf("browser event cursor %d exceeds JSON-safe integer range", lastConsumedSeq)
 	}
-	path := g.eventPath(conversationID)
+	path := g.eventPath(personalityAgentID)
 	file, err := g.newFile(path, os.O_RDONLY, 0o600)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -477,8 +493,8 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, conversationID string
 			if record.Event.Seq == nil || *record.Event.Seq != record.Seq {
 				return nil, fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", record.Seq, record.Event.Seq)
 			}
-			if record.Event.ConversationID != conversationID {
-				return nil, fmt.Errorf("durable event record conversation mismatch: got %q, want %q", record.Event.ConversationID, conversationID)
+			if record.Event.PersonalityAgentID != personalityAgentID {
+				return nil, fmt.Errorf("durable event record conversation mismatch: got %q, want %q", record.Event.PersonalityAgentID, personalityAgentID)
 			}
 			previous = record.Seq
 			if record.Seq > lastConsumedSeq {
@@ -500,47 +516,47 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, conversationID string
 
 // SubscribeBrowserVolatile registers one bounded live-only receiver. A slow
 // consumer is disconnected rather than buffering unbounded volatile deltas.
-func (g *DurableGateway) SubscribeBrowserVolatile(conversationID string) (<-chan Envelope, func()) {
+func (g *DurableGateway) SubscribeBrowserVolatile(personalityAgentID string) (<-chan Envelope, func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.nextBrowserSubscriber++
 	id := g.nextBrowserSubscriber
 	out := make(chan Envelope, 64)
-	if g.browserSubscribers[conversationID] == nil {
-		g.browserSubscribers[conversationID] = make(map[uint64]chan Envelope)
+	if g.browserSubscribers[personalityAgentID] == nil {
+		g.browserSubscribers[personalityAgentID] = make(map[uint64]chan Envelope)
 	}
-	g.browserSubscribers[conversationID][id] = out
+	g.browserSubscribers[personalityAgentID][id] = out
 	var once sync.Once
 	return out, func() {
 		once.Do(func() {
 			g.mu.Lock()
 			defer g.mu.Unlock()
-			g.removeBrowserSubscriberLocked(conversationID, id)
+			g.removeBrowserSubscriberLocked(personalityAgentID, id)
 		})
 	}
 }
 
-func (g *DurableGateway) publishVolatileLocked(conversationID string, envelope Envelope) {
-	for id, subscriber := range g.browserSubscribers[conversationID] {
+func (g *DurableGateway) publishVolatileLocked(personalityAgentID string, envelope Envelope) {
+	for id, subscriber := range g.browserSubscribers[personalityAgentID] {
 		select {
 		case subscriber <- envelope:
 		default:
 			// The receiver is no longer a safe live stream. Removing and closing
 			// it makes its writer fail closed; durable replay remains available on
 			// reconnect.
-			g.removeBrowserSubscriberLocked(conversationID, id)
+			g.removeBrowserSubscriberLocked(personalityAgentID, id)
 		}
 	}
 }
 
-func (g *DurableGateway) removeBrowserSubscriberLocked(conversationID string, id uint64) {
-	subscribers := g.browserSubscribers[conversationID]
+func (g *DurableGateway) removeBrowserSubscriberLocked(personalityAgentID string, id uint64) {
+	subscribers := g.browserSubscribers[personalityAgentID]
 	if subscriber, ok := subscribers[id]; ok {
 		delete(subscribers, id)
 		close(subscriber)
 	}
 	if len(subscribers) == 0 {
-		delete(g.browserSubscribers, conversationID)
+		delete(g.browserSubscribers, personalityAgentID)
 	}
 }
 
@@ -550,8 +566,8 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	st := g.stateFor(claims.ConversationID)
-	path := g.eventPath(claims.ConversationID)
+	st := g.stateFor(claims.PersonalityAgentID)
+	path := g.eventPath(claims.PersonalityAgentID)
 	file, err := g.newFile(path, os.O_RDWR, 0o600)
 	if os.IsNotExist(err) {
 		return 0, nil
@@ -570,29 +586,29 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 	return st.eventSeq, nil
 }
 
-func (g *DurableGateway) stateFor(conversationID string) *conversationLogState {
+func (g *DurableGateway) stateFor(personalityAgentID string) *conversationLogState {
 	g.clock++
-	st, ok := g.tails[conversationID]
+	st, ok := g.tails[personalityAgentID]
 	if ok {
 		st.lastUsed = g.clock
 		return st
 	}
 	st = &conversationLogState{acks: make(map[uint64]CommandAck), lastUsed: g.clock}
-	g.tails[conversationID] = st
-	g.evictInactiveTailsLocked(conversationID)
+	g.tails[personalityAgentID] = st
+	g.evictInactiveTailsLocked(personalityAgentID)
 	return st
 }
 
-func (g *DurableGateway) evictInactiveTailsLocked(activeConversationID string) {
+func (g *DurableGateway) evictInactiveTailsLocked(activePersonalityAgentID string) {
 	for len(g.tails) > g.maxConversationTails() {
 		var evictID string
 		var oldest uint64
-		for conversationID, state := range g.tails {
-			if conversationID == activeConversationID {
+		for personalityAgentID, state := range g.tails {
+			if personalityAgentID == activePersonalityAgentID {
 				continue
 			}
-			if evictID == "" || state.lastUsed < oldest || (state.lastUsed == oldest && conversationID < evictID) {
-				evictID, oldest = conversationID, state.lastUsed
+			if evictID == "" || state.lastUsed < oldest || (state.lastUsed == oldest && personalityAgentID < evictID) {
+				evictID, oldest = personalityAgentID, state.lastUsed
 			}
 		}
 		if evictID == "" {
@@ -615,14 +631,21 @@ func (g *DurableGateway) rememberAckLocked(st *conversationLogState, ack Command
 }
 
 func commandAckEqual(left, right CommandAck) bool {
-	return left.Seq == right.Seq && left.CommandID == right.CommandID && left.Status == right.Status && stringPointerEqual(left.RejectReason, right.RejectReason)
+	return left.Seq == right.Seq &&
+		left.CommandID == right.CommandID &&
+		left.PersonalityAgentID == right.PersonalityAgentID &&
+		left.Status == right.Status &&
+		stringPointerEqual(left.RejectReason, right.RejectReason)
 }
 
-func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeState, error) {
+func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (runtimeState, error) {
 	if err := ctx.Err(); err != nil {
 		return runtimeState{}, err
 	}
-	path := g.statePath(agentID)
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return runtimeState{}, err
+	}
+	path := g.statePath(personalityAgentID)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return runtimeState{}, nil
@@ -651,9 +674,9 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	return state, nil
 }
 
-func (g *DurableGateway) appendDurableEventLocked(conversationID string, record durableEventRecord) error {
-	st := g.stateFor(conversationID)
-	path := g.eventPath(conversationID)
+func (g *DurableGateway) appendDurableEventLocked(personalityAgentID string, record durableEventRecord) error {
+	st := g.stateFor(personalityAgentID)
+	path := g.eventPath(personalityAgentID)
 	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -710,13 +733,13 @@ func (g *DurableGateway) appendDurableEventLocked(conversationID string, record 
 	return nil
 }
 
-func (g *DurableGateway) updateConversationStateLocked(conversationID string, event json.RawMessage) {
+func (g *DurableGateway) updateConversationStateLocked(personalityAgentID string, event json.RawMessage) {
 	g.stateMu.Lock()
 	defer g.stateMu.Unlock()
-	g.applyEventStateLocked(conversationID, event)
+	g.applyEventStateLocked(personalityAgentID, event)
 }
 
-func (g *DurableGateway) applyEventStateLocked(conversationID string, event json.RawMessage) {
+func (g *DurableGateway) applyEventStateLocked(personalityAgentID string, event json.RawMessage) {
 	type eventHead struct {
 		Type      string `json:"type"`
 		RequestID string `json:"request_id"`
@@ -734,54 +757,54 @@ func (g *DurableGateway) applyEventStateLocked(conversationID string, event json
 		// One run spans turn replacement during hard/soft steering as well as
 		// assistant message, tool, and continuation boundaries. Only AgentEnd
 		// closes the abort-admission window.
-		g.runInFlight[conversationID] = true
+		g.runInFlight[personalityAgentID] = true
 	case "agent_end":
-		g.runInFlight[conversationID] = false
+		g.runInFlight[personalityAgentID] = false
 	case "approval_requested":
 		if head.Request.ID == "" {
 			return
 		}
-		if g.pendingApprovals[conversationID] == nil {
-			g.pendingApprovals[conversationID] = make(map[string]bool)
+		if g.pendingApprovals[personalityAgentID] == nil {
+			g.pendingApprovals[personalityAgentID] = make(map[string]bool)
 		}
-		g.pendingApprovals[conversationID][head.Request.ID] = true
+		g.pendingApprovals[personalityAgentID][head.Request.ID] = true
 	case "approval_resolved":
 		if head.RequestID == "" {
 			return
 		}
-		if g.pendingApprovals[conversationID] != nil {
-			delete(g.pendingApprovals[conversationID], head.RequestID)
-			if len(g.pendingApprovals[conversationID]) == 0 {
-				delete(g.pendingApprovals, conversationID)
+		if g.pendingApprovals[personalityAgentID] != nil {
+			delete(g.pendingApprovals[personalityAgentID], head.RequestID)
+			if len(g.pendingApprovals[personalityAgentID]) == 0 {
+				delete(g.pendingApprovals, personalityAgentID)
 			}
 		}
 	}
 }
 
 // EnsureConversationStateRebuilt reconstructs the in-flight and pending-approval
-// command guard state for conversationID from the durable event log. It is called
+// command guard state for personalityAgentID from the durable event log. It is called
 // by the browser WebSocket before command admission begins so that guards remain
 // authoritative across API process restarts. If the durable log is corrupt,
 // non-contiguous, or otherwise unreadable, reconstruction returns an error and
 // the caller must fail closed rather than admitting commands.
-func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, conversationID string) error {
+func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, personalityAgentID string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.stateRebuilt[conversationID] {
+	if g.stateRebuilt[personalityAgentID] {
 		return nil
 	}
 
-	events, err := g.EventCatchUp(ctx, conversationID, 0)
+	events, err := g.EventCatchUp(ctx, personalityAgentID, 0)
 	if err != nil {
 		return fmt.Errorf("rebuild conversation state: %w", err)
 	}
 
 	g.stateMu.Lock()
 	for _, envelope := range events {
-		g.applyEventStateLocked(conversationID, envelope.Event)
+		g.applyEventStateLocked(personalityAgentID, envelope.Event)
 	}
-	g.stateRebuilt[conversationID] = true
+	g.stateRebuilt[personalityAgentID] = true
 	g.stateMu.Unlock()
 
 	return nil
@@ -791,18 +814,18 @@ func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, con
 // by agent_end. It is used by the browser command guard to reject meaningless
 // aborts without closing the window during tool execution, continuation calls,
 // or hard/soft-steer turn replacement.
-func (g *DurableGateway) IsRunInFlight(conversationID string) bool {
+func (g *DurableGateway) IsRunInFlight(personalityAgentID string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.stateMu.RLock()
 	defer g.stateMu.RUnlock()
-	return g.runInFlight[conversationID]
+	return g.runInFlight[personalityAgentID]
 }
 
 // IsApprovalPending reports whether an approval with requestID is still awaiting
 // a decision in the conversation. It is used by the browser WebSocket to reject
 // approval_decision commands for unknown or already-resolved requests.
-func (g *DurableGateway) IsApprovalPending(conversationID, requestID string) bool {
+func (g *DurableGateway) IsApprovalPending(personalityAgentID, requestID string) bool {
 	if requestID == "" {
 		return false
 	}
@@ -810,11 +833,11 @@ func (g *DurableGateway) IsApprovalPending(conversationID, requestID string) boo
 	defer g.mu.Unlock()
 	g.stateMu.RLock()
 	defer g.stateMu.RUnlock()
-	return g.pendingApprovals[conversationID] != nil && g.pendingApprovals[conversationID][requestID]
+	return g.pendingApprovals[personalityAgentID] != nil && g.pendingApprovals[personalityAgentID][requestID]
 }
 
-func (g *DurableGateway) appendCommandAck(ctx context.Context, conversationID string, ack CommandAck) error {
-	path := g.ackPath(conversationID)
+func (g *DurableGateway) appendCommandAck(ctx context.Context, personalityAgentID string, ack CommandAck) error {
+	path := g.ackPath(personalityAgentID)
 	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -830,7 +853,7 @@ func (g *DurableGateway) appendCommandAck(ctx context.Context, conversationID st
 		return err
 	}
 	defer g.mu.Unlock()
-	st := g.stateFor(conversationID)
+	st := g.stateFor(personalityAgentID)
 
 	if err := g.refreshAckTailLocked(file, st); err != nil {
 		return err
@@ -1253,7 +1276,10 @@ func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error)
 	}
 }
 
-func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
+func (g *DurableGateway) publishRuntimeState(personalityAgentID string, state runtimeState) error {
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
 	if state.Generation > maxProcessGeneration {
 		return fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
@@ -1261,7 +1287,22 @@ func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(g.statePath(agentID), raw, 0o600)
+	return writeFileAtomic(g.statePath(personalityAgentID), raw, 0o600)
+}
+
+// PublishRuntimeState atomically publishes the global generation and Ready
+// latch for one personality agent. A nil receipt means NotReady.
+func (g *DurableGateway) PublishRuntimeState(personalityAgentID string, generation uint64, hydrationReceiptIdentity *string) error {
+	if generation > maxProcessGeneration {
+		return fmt.Errorf("runtime generation %d exceeds process generation range", generation)
+	}
+	if hydrationReceiptIdentity != nil && *hydrationReceiptIdentity == "" {
+		return errors.New("hydration receipt identity must not be empty")
+	}
+	return g.publishRuntimeState(personalityAgentID, runtimeState{
+		Generation:               generation,
+		HydrationReceiptIdentity: hydrationReceiptIdentity,
+	})
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
@@ -1333,13 +1374,13 @@ func stringPointerEqual(left, right *string) bool {
 	return *left == *right
 }
 
-func (g *DurableGateway) statePath(agentID string) string {
-	return filepath.Join(g.dir, "runtime-"+safeFileID(agentID)+".json")
+func (g *DurableGateway) statePath(personalityAgentID string) string {
+	return filepath.Join(g.dir, "runtime-"+safeFileID(personalityAgentID)+".json")
 }
-func (g *DurableGateway) eventPath(conversationID string) string {
-	return filepath.Join(g.dir, "events-"+safeFileID(conversationID)+".jsonl")
+func (g *DurableGateway) eventPath(personalityAgentID string) string {
+	return filepath.Join(g.dir, "events-"+safeFileID(personalityAgentID)+".jsonl")
 }
-func (g *DurableGateway) ackPath(conversationID string) string {
-	return filepath.Join(g.dir, "acks-"+safeFileID(conversationID)+".jsonl")
+func (g *DurableGateway) ackPath(personalityAgentID string) string {
+	return filepath.Join(g.dir, "acks-"+safeFileID(personalityAgentID)+".jsonl")
 }
 func safeFileID(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }

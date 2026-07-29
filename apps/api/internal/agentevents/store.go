@@ -19,26 +19,27 @@ import (
 	"time"
 )
 
-// CommandStore is a durable, append-only per-conversation command log. It
+// CommandStore is a durable, append-only per-personality-agent command log. It
 // implements CommandAppender and exposes read-only introspection helpers for
 // verification; it does not wire the WebSocket CommandSource seam (that is
 // intentionally isolated for T17/T26).
 //
-// Each conversation has its own JSON Lines log. Seq allocation, append, sync
+// Each personality agent has one JSON Lines command log. Seq allocation, append, sync
 // and rollback are serialized by an advisory flock on the log file so multiple
 // API processes sharing SUMI_COMMAND_LOG_DIR cannot allocate duplicate seqs,
 // interleave writes, or roll back another process's committed record. In
 // addition, a process-level mutex protects the in-memory state map and a
-// per-conversation mutex protects each cached state without serializing
+// per-personality-agent mutex protects each cached state without serializing
 // unrelated flock waits or scans. Command bytes are fsynced to the log before
 // success is returned. After any restart, OpenCommandStore re-reads the logs
-// and reconstructs the per-conversation next seq and idempotency maps, so
+// and reconstructs the per-personality-agent next seq and idempotency maps, so
 // restart preserves the log and allocation continuity.
 type CommandStore struct {
-	mu     sync.Mutex
-	dir    string
-	states map[string]*conversationState
-	closed bool
+	mu              sync.Mutex
+	dir             string
+	states          map[string]*conversationState
+	idempotencyLock *os.File
+	closed          bool
 }
 
 // fileHandle abstracts the per-conversation log file so tests can inject
@@ -133,17 +134,19 @@ func (r *LogRecord) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("command log record json: %w", err)
 	}
 	type rawRecord struct {
-		Seq            *uint64         `json:"seq"`
-		CommandID      *string         `json:"command_id"`
-		Command        json.RawMessage `json:"command"`
-		IdempotencyKey string          `json:"idempotency_key"`
+		Seq                *uint64               `json:"seq"`
+		CommandID          *string               `json:"command_id"`
+		PersonalityAgentID *string               `json:"personality_agent_id"`
+		Provenance         *DirectChatProvenance `json:"provenance"`
+		Command            json.RawMessage       `json:"command"`
+		IdempotencyKey     string                `json:"idempotency_key"`
 	}
 	var raw rawRecord
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
 	}
-	if raw.Seq == nil || raw.CommandID == nil || len(raw.Command) == 0 {
-		return errors.New("seq, command_id, and command are required")
+	if raw.Seq == nil || raw.CommandID == nil || raw.PersonalityAgentID == nil || raw.Provenance == nil || len(raw.Command) == 0 {
+		return errors.New("seq, command_id, personality_agent_id, provenance, and command are required")
 	}
 	if *raw.Seq > maxJSONSafeInteger {
 		return fmt.Errorf("seq %d exceeds JSON-safe integer range", *raw.Seq)
@@ -151,11 +154,21 @@ func (r *LogRecord) UnmarshalJSON(data []byte) error {
 	if !canonicalUUIDRegexp.MatchString(*raw.CommandID) {
 		return errors.New("command_id must be a canonical UUID")
 	}
+	if err := ValidatePersonalityAgentID(*raw.PersonalityAgentID); err != nil {
+		return err
+	}
+	if *raw.PersonalityAgentID != raw.Provenance.PersonalityAgentID {
+		return errors.New("persisted command target does not match provenance target")
+	}
 	if err := ValidateCommand(raw.Command); err != nil {
 		return fmt.Errorf("invalid persisted command: %w", err)
 	}
 	*r = LogRecord{CommandEnvelope: CommandEnvelope{
-		Seq: *raw.Seq, CommandID: *raw.CommandID, Command: raw.Command,
+		Seq:                *raw.Seq,
+		CommandID:          *raw.CommandID,
+		PersonalityAgentID: *raw.PersonalityAgentID,
+		Provenance:         *raw.Provenance,
+		Command:            raw.Command,
 	}, IdempotencyKey: raw.IdempotencyKey}
 	return nil
 }
@@ -192,22 +205,31 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 		dir:    abs,
 		states: make(map[string]*conversationState),
 	}
+	idempotencyLockPath := filepath.Join(abs, ".idempotency.lock")
+	idempotencyLock, err := os.OpenFile(idempotencyLockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open global idempotency lock: %w", err)
+	}
+	s.idempotencyLock = idempotencyLock
 
 	matches, err := filepath.Glob(filepath.Join(abs, "commands-*.jsonl"))
 	if err != nil {
+		_ = idempotencyLock.Close()
 		return nil, fmt.Errorf("scan command log dir: %w", err)
 	}
 	sort.Strings(matches)
 	for _, path := range matches {
-		conversationID, err := conversationIDFromPath(path)
+		personalityAgentID, err := personalityAgentIDFromPath(path)
 		if err != nil {
+			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("invalid command log file %q: %w", path, err)
 		}
 		st := newConversationState(path)
-		if err := s.loadStateLocked(context.Background(), st, conversationID); err != nil {
+		if err := s.loadStateLocked(context.Background(), st, personalityAgentID); err != nil {
+			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("load command log %q: %w", path, err)
 		}
-		s.states[conversationID] = st
+		s.states[personalityAgentID] = st
 	}
 	return s, nil
 }
@@ -237,6 +259,11 @@ func (s *CommandStore) Close() error {
 		}
 		st.closed = true
 		st.mu.Unlock()
+	}
+	if s.idempotencyLock != nil {
+		if err := s.idempotencyLock.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	return firstErr
 }
@@ -268,12 +295,12 @@ func (s *CommandStore) rollbackLocked(st *conversationState, offset int64, origE
 	return nil
 }
 
-// Append durably appends a validated command to the conversation log.
+// Append durably appends a validated command to the personality agent's log.
 // If idempotencyKey is non-empty and a command was previously accepted with
-// the same key and identical command bytes, the existing CommandEnvelope is
-// returned without allocating a second seq. A different command body for the
-// same key is a conflict and returns an error.
-func (s *CommandStore) Append(ctx context.Context, conversationID string, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
+// the same key and identical authenticated envelope, the existing
+// CommandEnvelope is returned without allocating a second seq. A changed
+// target, tenant, actor, source, or command is a conflict.
+func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, err
 	}
@@ -281,32 +308,47 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 		return CommandEnvelope{}, fmt.Errorf("validate command before append: %w", err)
 	}
 
-	st, err := s.lockConversation(ctx, conversationID)
+	if idempotencyKey != "" {
+		if err := flockContext(ctx, s.idempotencyLock.Fd(), syscall.LOCK_EX); err != nil {
+			return CommandEnvelope{}, fmt.Errorf("lock global idempotency index: %w", err)
+		}
+		defer func() { _ = syscall.Flock(int(s.idempotencyLock.Fd()), syscall.LOCK_UN) }()
+
+		existing, found, err := s.findIdempotencyRecord(ctx, idempotencyKey)
+		if err != nil {
+			return CommandEnvelope{}, err
+		}
+		if found {
+			if existing.PersonalityAgentID == provenance.PersonalityAgentID &&
+				existing.Provenance == provenance &&
+				string(existing.Command) == string(command) {
+				return existing, nil
+			}
+			return CommandEnvelope{}, fmt.Errorf("idempotency key %q reused with different command: %w", idempotencyKey, errIdempotencyConflict)
+		}
+	}
+
+	if err := provenance.Validate(); err != nil {
+		return CommandEnvelope{}, fmt.Errorf("validate provenance before append: %w", err)
+	}
+	personalityAgentID := provenance.PersonalityAgentID
+
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return CommandEnvelope{}, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return CommandEnvelope{}, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return CommandEnvelope{}, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return CommandEnvelope{}, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return CommandEnvelope{}, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
 
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return CommandEnvelope{}, err
-	}
-
-	if idempotencyKey != "" {
-		if idx, ok := st.byKey[idempotencyKey]; ok {
-			existing := st.commands[idx]
-			if string(existing.Command) == string(command) {
-				return existing, nil
-			}
-			return CommandEnvelope{}, fmt.Errorf("idempotency key %q reused with different command: %w", idempotencyKey, errIdempotencyConflict)
-		}
 	}
 
 	if st.nextSeq > maxJSONSafeInteger {
@@ -320,9 +362,11 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 
 	seq := st.nextSeq
 	env := CommandEnvelope{
-		Seq:       seq,
-		CommandID: commandID,
-		Command:   command,
+		Seq:                seq,
+		CommandID:          commandID,
+		PersonalityAgentID: personalityAgentID,
+		Provenance:         provenance,
+		Command:            command,
 	}
 
 	offset := st.fileSize
@@ -373,48 +417,94 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 	return env, nil
 }
 
-// NextCommandSeq returns the next seq that would be allocated for conversationID.
-func (s *CommandStore) NextCommandSeq(ctx context.Context, conversationID string) (uint64, error) {
+// findIdempotencyRecord scans only records that contain storage-authored
+// idempotency metadata. Every keyed writer holds idempotencyLock, so those
+// records are stable even while unrelated unkeyed logs append concurrently.
+func (s *CommandStore) findIdempotencyRecord(ctx context.Context, idempotencyKey string) (CommandEnvelope, bool, error) {
+	matches, err := filepath.Glob(filepath.Join(s.dir, "commands-*.jsonl"))
+	if err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	sort.Strings(matches)
+	for _, path := range matches {
+		if err := ctx.Err(); err != nil {
+			return CommandEnvelope{}, false, err
+		}
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return CommandEnvelope{}, false, fmt.Errorf("open command log for global idempotency scan: %w", err)
+		}
+		reader := bufio.NewReader(file)
+		for {
+			line, readErr := reader.ReadBytes('\n')
+			if bytes.Contains(line, []byte(`"idempotency_key"`)) {
+				var record LogRecord
+				if err := json.Unmarshal(bytes.TrimSpace(line), &record); err != nil {
+					_ = file.Close()
+					return CommandEnvelope{}, false, fmt.Errorf("decode keyed record during global idempotency scan: %w", err)
+				}
+				if record.IdempotencyKey == idempotencyKey {
+					_ = file.Close()
+					return record.CommandEnvelope, true, nil
+				}
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			if readErr != nil {
+				_ = file.Close()
+				return CommandEnvelope{}, false, readErr
+			}
+		}
+		if err := file.Close(); err != nil {
+			return CommandEnvelope{}, false, err
+		}
+	}
+	return CommandEnvelope{}, false, nil
+}
+
+// NextCommandSeq returns the next seq that would be allocated for personalityAgentID.
+func (s *CommandStore) NextCommandSeq(ctx context.Context, personalityAgentID string) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return 0, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return 0, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return 0, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return 0, err
 	}
 	return st.nextSeq, nil
 }
 
-// FirstCommandSeq returns the first durable seq for conversationID. If the log
+// FirstCommandSeq returns the first durable seq for personalityAgentID. If the log
 // is empty, it returns 1 so catch-up can use it as the lower bound.
-func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID string) (uint64, error) {
+func (s *CommandStore) FirstCommandSeq(ctx context.Context, personalityAgentID string) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return 0, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return 0, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return 0, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return 0, err
 	}
 	if len(st.commands) == 0 {
@@ -426,23 +516,23 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID strin
 // HasCommands distinguishes an empty log from a log whose first retained
 // sequence happens to be one. Reconnecting agents with durable progress must
 // never be silently stranded by a lost command log.
-func (s *CommandStore) HasCommands(ctx context.Context, conversationID string) (bool, error) {
+func (s *CommandStore) HasCommands(ctx context.Context, personalityAgentID string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return false, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return false, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return false, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return false, err
 	}
 	return len(st.commands) != 0, nil
@@ -450,23 +540,23 @@ func (s *CommandStore) HasCommands(ctx context.Context, conversationID string) (
 
 // GetCommand returns a single command by exact seq. It is preferred over
 // CatchUp(seq) when the caller needs exactly one command.
-func (s *CommandStore) GetCommand(ctx context.Context, conversationID string, seq uint64) (CommandEnvelope, bool, error) {
+func (s *CommandStore) GetCommand(ctx context.Context, personalityAgentID string, seq uint64) (CommandEnvelope, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, false, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return CommandEnvelope{}, false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return CommandEnvelope{}, false, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return CommandEnvelope{}, false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return CommandEnvelope{}, false, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return CommandEnvelope{}, false, err
 	}
 	idx, ok := st.bySeq[seq]
@@ -476,24 +566,24 @@ func (s *CommandStore) GetCommand(ctx context.Context, conversationID string, se
 	return st.commands[idx], true, nil
 }
 
-// CatchUp returns commands for conversationID with seq >= fromSeq in order.
-func (s *CommandStore) CatchUp(ctx context.Context, conversationID string, fromSeq uint64) ([]CommandEnvelope, error) {
+// CatchUp returns commands for personalityAgentID with seq >= fromSeq in order.
+func (s *CommandStore) CatchUp(ctx context.Context, personalityAgentID string, fromSeq uint64) ([]CommandEnvelope, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return nil, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return nil, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return nil, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return nil, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return nil, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return nil, err
 	}
 	i := sort.Search(len(st.commands), func(i int) bool { return st.commands[i].Seq >= fromSeq })
@@ -510,23 +600,23 @@ type commandLogSnapshot struct {
 // commandSnapshot returns an immutable view of the committed command prefix.
 // refreshStateLocked always swaps fresh backing arrays, so later rescans and
 // appends cannot mutate a view that is being folded into an ACK cursor.
-func (s *CommandStore) commandSnapshot(ctx context.Context, conversationID string) (commandLogSnapshot, error) {
+func (s *CommandStore) commandSnapshot(ctx context.Context, personalityAgentID string) (commandLogSnapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return commandLogSnapshot{}, err
 	}
-	st, err := s.lockConversation(ctx, conversationID)
+	st, err := s.lockConversation(ctx, personalityAgentID)
 	if err != nil {
 		return commandLogSnapshot{}, err
 	}
 	defer st.mu.Unlock()
 	if st.poisoned {
-		return commandLogSnapshot{}, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+		return commandLogSnapshot{}, fmt.Errorf("command log for %q is poisoned: %w", personalityAgentID, st.poisonErr)
 	}
 	if err := flockContext(ctx, st.file.Fd(), syscall.LOCK_EX); err != nil {
-		return commandLogSnapshot{}, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return commandLogSnapshot{}, fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	defer func() { _ = unlockFile(st.file) }()
-	if err := s.refreshStateLocked(ctx, st, conversationID); err != nil {
+	if err := s.refreshStateLocked(ctx, st, personalityAgentID); err != nil {
 		return commandLogSnapshot{}, err
 	}
 	commands := st.commands[:len(st.commands):len(st.commands)]
@@ -536,7 +626,10 @@ func (s *CommandStore) commandSnapshot(ctx context.Context, conversationID strin
 // lockConversation returns with the per-conversation mutex held. The store
 // mutex protects only lifecycle and map membership and is released before a
 // flock wait or disk scan, allowing unrelated conversations to progress.
-func (s *CommandStore) lockConversation(ctx context.Context, conversationID string) (*conversationState, error) {
+func (s *CommandStore) lockConversation(ctx context.Context, personalityAgentID string) (*conversationState, error) {
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return nil, err
+	}
 	if err := lockMutexContext(ctx, &s.mu); err != nil {
 		return nil, err
 	}
@@ -544,10 +637,10 @@ func (s *CommandStore) lockConversation(ctx context.Context, conversationID stri
 		s.mu.Unlock()
 		return nil, errors.New("command store is closed")
 	}
-	st := s.states[conversationID]
+	st := s.states[personalityAgentID]
 	if st == nil {
-		st = newConversationState(commandLogPath(s.dir, conversationID))
-		s.states[conversationID] = st
+		st = newConversationState(commandLogPath(s.dir, personalityAgentID))
+		s.states[personalityAgentID] = st
 	}
 	s.mu.Unlock()
 
@@ -559,7 +652,7 @@ func (s *CommandStore) lockConversation(ctx context.Context, conversationID stri
 		return nil, errors.New("command store is closed")
 	}
 	if st.file == nil && !st.poisoned {
-		if err := s.loadStateLocked(ctx, st, conversationID); err != nil {
+		if err := s.loadStateLocked(ctx, st, personalityAgentID); err != nil {
 			st.mu.Unlock()
 			return nil, err
 		}
@@ -585,9 +678,9 @@ func isIncompleteJSONError(err error) bool {
 // scanLogLocked reads the log from the current offset and populates st. It
 // truncates an incomplete final tail and repairs a missing trailing newline.
 // The caller must exclusively own st and hold an exclusive flock on st.file.
-func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState, conversationID string) error {
+func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
 	if _, err := st.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
+		return fmt.Errorf("seek command log for %q: %w", personalityAgentID, err)
 	}
 
 	r := bufio.NewReader(st.file)
@@ -618,32 +711,32 @@ func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState,
 			// line, is a malformed complete record and must fail closed.
 			if readErr == io.EOF && isIncompleteJSONError(err) {
 				if truncErr := st.file.Truncate(lineStart); truncErr != nil {
-					return fmt.Errorf("truncate partial tail for %q: %w", conversationID, truncErr)
+					return fmt.Errorf("truncate partial tail for %q: %w", personalityAgentID, truncErr)
 				}
 				if syncErr := st.file.Sync(); syncErr != nil {
-					return fmt.Errorf("sync after truncating partial tail for %q: %w", conversationID, syncErr)
+					return fmt.Errorf("sync after truncating partial tail for %q: %w", personalityAgentID, syncErr)
 				}
 				offset = lineStart
 				break
 			}
 			if readErr == io.EOF {
-				return fmt.Errorf("decode command log for %q: final record is malformed but complete: %w", conversationID, err)
+				return fmt.Errorf("decode command log for %q: final record is malformed but complete: %w", personalityAgentID, err)
 			}
-			return fmt.Errorf("decode command log for %q: %w", conversationID, err)
+			return fmt.Errorf("decode command log for %q: %w", personalityAgentID, err)
 		}
 
 		if rec.Seq == 0 && rec.CommandID == "" && len(rec.Command) == 0 {
-			return fmt.Errorf("empty command record in log for %q", conversationID)
+			return fmt.Errorf("empty command record in log for %q", personalityAgentID)
 		}
 		if rec.Seq > maxJSONSafeInteger {
-			return fmt.Errorf("command log for %q contains seq %d exceeding JSON-safe integer range", conversationID, rec.Seq)
+			return fmt.Errorf("command log for %q contains seq %d exceeding JSON-safe integer range", personalityAgentID, rec.Seq)
 		}
 		if existing, ok := st.bySeq[rec.Seq]; ok {
-			return fmt.Errorf("duplicate seq %d in log for %q (existing %d)", rec.Seq, conversationID, existing)
+			return fmt.Errorf("duplicate seq %d in log for %q (existing %d)", rec.Seq, personalityAgentID, existing)
 		}
 		expectedSeq := uint64(len(st.commands) + 1)
 		if rec.Seq != expectedSeq {
-			return fmt.Errorf("command log for %q has non-contiguous seq: got %d, want %d", conversationID, rec.Seq, expectedSeq)
+			return fmt.Errorf("command log for %q has non-contiguous seq: got %d, want %d", personalityAgentID, rec.Seq, expectedSeq)
 		}
 
 		idx := len(st.commands)
@@ -651,12 +744,12 @@ func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState,
 		st.nextSeq = rec.Seq + 1
 		st.bySeq[rec.Seq] = idx
 		if _, ok := st.byCommandID[rec.CommandID]; ok {
-			return fmt.Errorf("duplicate command_id %q in log for %q", rec.CommandID, conversationID)
+			return fmt.Errorf("duplicate command_id %q in log for %q", rec.CommandID, personalityAgentID)
 		}
 		st.byCommandID[rec.CommandID] = idx
 		if rec.IdempotencyKey != "" {
 			if _, ok := st.byKey[rec.IdempotencyKey]; ok {
-				return fmt.Errorf("duplicate idempotency key %q in log for %q", rec.IdempotencyKey, conversationID)
+				return fmt.Errorf("duplicate idempotency key %q in log for %q", rec.IdempotencyKey, personalityAgentID)
 			}
 			st.byKey[rec.IdempotencyKey] = idx
 		}
@@ -668,23 +761,23 @@ func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState,
 			// cannot concatenate records into an unparseable `}{` boundary.
 			if len(line) > 0 && line[len(line)-1] != '\n' {
 				if _, werr := st.file.Write([]byte{'\n'}); werr != nil {
-					return fmt.Errorf("repair missing trailing newline for %q: %w", conversationID, werr)
+					return fmt.Errorf("repair missing trailing newline for %q: %w", personalityAgentID, werr)
 				}
 				if syncErr := st.file.Sync(); syncErr != nil {
-					return fmt.Errorf("sync repaired trailing newline for %q: %w", conversationID, syncErr)
+					return fmt.Errorf("sync repaired trailing newline for %q: %w", personalityAgentID, syncErr)
 				}
 				offset += 1
 			}
 			break
 		}
 		if readErr != nil {
-			return fmt.Errorf("read command log for %q: %w", conversationID, readErr)
+			return fmt.Errorf("read command log for %q: %w", personalityAgentID, readErr)
 		}
 	}
 
 	size, err := st.file.Seek(0, io.SeekEnd)
 	if err != nil {
-		return fmt.Errorf("seek end of command log for %q: %w", conversationID, err)
+		return fmt.Errorf("seek end of command log for %q: %w", personalityAgentID, err)
 	}
 	st.fileSize = size
 	return nil
@@ -694,14 +787,14 @@ func (s *CommandStore) scanLogLocked(ctx context.Context, st *conversationState,
 // disk under the existing exclusive flock. A conservative rescan is used rather
 // than a file-size short-circuit so that a same-size truncate/rewrite by
 // another process cannot leave stale nextSeq or idempotency maps.
-func (s *CommandStore) refreshStateLocked(ctx context.Context, st *conversationState, conversationID string) error {
+func (s *CommandStore) refreshStateLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
 	if _, err := st.file.Seek(0, io.SeekEnd); err != nil {
-		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
+		return fmt.Errorf("seek command log for %q: %w", personalityAgentID, err)
 	}
 
 	fresh := newConversationState(st.path)
 	fresh.file = st.file
-	if err := s.scanLogLocked(ctx, fresh, conversationID); err != nil {
+	if err := s.scanLogLocked(ctx, fresh, personalityAgentID); err != nil {
 		return err
 	}
 	st.nextSeq = fresh.nextSeq
@@ -721,30 +814,30 @@ func newConversationState(path string) *conversationState {
 }
 
 // loadStateLocked initializes st while its per-conversation mutex is held.
-func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationState, conversationID string) error {
+func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationState, personalityAgentID string) error {
 	info, err := os.Lstat(st.path)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("command log for %q is a symlink", conversationID)
+			return fmt.Errorf("command log for %q is a symlink", personalityAgentID)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("command log for %q is not a regular file", conversationID)
+			return fmt.Errorf("command log for %q is not a regular file", personalityAgentID)
 		}
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat command log for %q: %w", conversationID, err)
+		return fmt.Errorf("stat command log for %q: %w", personalityAgentID, err)
 	}
 
 	file, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return fmt.Errorf("open command log for %q: %w", conversationID, err)
+		return fmt.Errorf("open command log for %q: %w", personalityAgentID, err)
 	}
 	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("lock command log for %q: %w", conversationID, err)
+		return fmt.Errorf("lock command log for %q: %w", personalityAgentID, err)
 	}
 	fresh := newConversationState(st.path)
 	fresh.file = file
-	if err := s.scanLogLocked(ctx, fresh, conversationID); err != nil {
+	if err := s.scanLogLocked(ctx, fresh, personalityAgentID); err != nil {
 		_ = unlockFile(file)
 		_ = file.Close()
 		return err
@@ -752,7 +845,7 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationStat
 
 	if err := unlockFile(file); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("unlock command log for %q: %w", conversationID, err)
+		return fmt.Errorf("unlock command log for %q: %w", personalityAgentID, err)
 	}
 	st.file = file
 	st.nextSeq = fresh.nextSeq
@@ -764,12 +857,12 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *conversationStat
 	return nil
 }
 
-func commandLogPath(dir, conversationID string) string {
-	encoded := base64.RawURLEncoding.EncodeToString([]byte(conversationID))
+func commandLogPath(dir, personalityAgentID string) string {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(personalityAgentID))
 	return filepath.Join(dir, "commands-"+encoded+".jsonl")
 }
 
-func conversationIDFromPath(path string) (string, error) {
+func personalityAgentIDFromPath(path string) (string, error) {
 	base := filepath.Base(path)
 	const prefix = "commands-"
 	const suffix = ".jsonl"
@@ -779,9 +872,13 @@ func conversationIDFromPath(path string) (string, error) {
 	encoded := base[len(prefix) : len(base)-len(suffix)]
 	b, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return "", fmt.Errorf("decode conversation id: %w", err)
+		return "", fmt.Errorf("decode personality agent id: %w", err)
 	}
-	return string(b), nil
+	personalityAgentID := string(b)
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return "", err
+	}
+	return personalityAgentID, nil
 }
 
 func newCommandID() (string, error) {

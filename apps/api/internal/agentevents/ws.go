@@ -22,13 +22,12 @@ import (
 )
 
 // TokenClaims are the signed claims from the short-lived agent token.
-// API derives conversation and expected generation from these claims; the
-// agent's hello identifiers are assertions to be verified, not authoritative.
+// API derives the target and expected generation from these claims; the
+// agent's hello identifier is an assertion to be verified, not authoritative.
 type TokenClaims struct {
-	TenantID       string
-	AgentID        string
-	ConversationID string
-	Generation     uint64
+	TenantID           string
+	PersonalityAgentID string
+	Generation         uint64
 }
 
 // TokenVerifier validates the Authorization bearer header. Production wiring
@@ -41,7 +40,7 @@ type TokenVerifier interface {
 // agent's latest lease and fences stale connections. Production wiring belongs
 // to T26.
 type GenerationVerifier interface {
-	VerifyGeneration(ctx context.Context, agentID string, generation uint64) error
+	VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error
 }
 
 // CommandSource is the durable command log. It is authoritative for seq numbers
@@ -192,6 +191,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid authorization", http.StatusUnauthorized)
 		return
 	}
+	if claims.TenantID == "" || ValidatePersonalityAgentID(claims.PersonalityAgentID) != nil {
+		http.Error(w, "invalid authorization", http.StatusUnauthorized)
+		return
+	}
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -233,8 +236,8 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("read hello: %w", err)
 	}
 
-	if hello.AgentID != claims.AgentID {
-		return fmt.Errorf("agent_id claim mismatch")
+	if hello.PersonalityAgentID != claims.PersonalityAgentID {
+		return fmt.Errorf("personality_agent_id claim mismatch")
 	}
 	if hello.Generation != claims.Generation {
 		return fmt.Errorf("generation claim mismatch")
@@ -242,7 +245,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if hello.LastAppliedCommandSeq > hello.LastReceivedCommandSeq {
 		return fmt.Errorf("last applied command seq %d exceeds last received %d", hello.LastAppliedCommandSeq, hello.LastReceivedCommandSeq)
 	}
-	if err := s.Generation.VerifyGeneration(helloCtx, claims.AgentID, hello.Generation); err != nil {
+	if err := s.Generation.VerifyGeneration(helloCtx, claims.PersonalityAgentID, hello.Generation); err != nil {
 		return fmt.Errorf("verify generation: %w", err)
 	}
 
@@ -308,6 +311,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("last_received_event_seq %d exceeds JSON-safe integer range", lastReceivedEventSeq)
 	}
 	apiHello := ApiHello{
+		PersonalityAgentID:   claims.PersonalityAgentID,
 		AcceptedGeneration:   claims.Generation,
 		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextSeq,
@@ -333,7 +337,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("command catch-up: %w", err)
 	}
 	for _, cmd := range commands {
-		if err := s.sendCommandEnvelope(conn, cmd); err != nil {
+		if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
 			return fmt.Errorf("send catch-up command: %w", err)
 		}
 		nextSeq = cmd.Seq + 1
@@ -365,7 +369,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 
 	go func() {
 		defer wg.Done()
-		errCh <- s.writePump(ctx, conn, live, liveErr)
+		errCh <- s.writePump(ctx, conn, claims, live, liveErr)
 		stopPumps()
 	}()
 
@@ -412,8 +416,8 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 
 		switch frame.FrameType {
 		case "event":
-			if frame.Envelope.ConversationID != claims.ConversationID {
-				return errors.New("event conversation_id claim mismatch")
+			if frame.Envelope.PersonalityAgentID != claims.PersonalityAgentID {
+				return errors.New("event personality_agent_id claim mismatch")
 			}
 			if err := s.Events.Receive(ctx, claims, *frame.Envelope); err != nil {
 				return err
@@ -426,7 +430,7 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 	}
 }
 
-func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-chan CommandEnvelope, liveErr <-chan error) error {
+func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, claims TokenClaims, live <-chan CommandEnvelope, liveErr <-chan error) error {
 	if s.PingInterval <= 0 {
 		for {
 			select {
@@ -436,7 +440,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 				if !ok {
 					return sourceCloseError(liveErr)
 				}
-				if err := s.sendCommandEnvelope(conn, cmd); err != nil {
+				if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
 					return err
 				}
 			case err, ok := <-liveErr:
@@ -460,7 +464,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 			if !ok {
 				return sourceCloseError(liveErr)
 			}
-			if err := s.sendCommandEnvelope(conn, cmd); err != nil {
+			if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
 				return err
 			}
 		case err, ok := <-liveErr:
@@ -490,18 +494,12 @@ func sourceCloseError(liveErr <-chan error) error {
 	return errors.New("command source closed")
 }
 
-func (s *Server) sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
-	if cmd.Seq > maxJSONSafeInteger {
-		return fmt.Errorf("command envelope seq exceeds JSON-safe integer range")
+func (s *Server) sendCommandEnvelope(conn *websocket.Conn, claims TokenClaims, cmd CommandEnvelope) error {
+	if err := cmd.Validate(); err != nil {
+		return fmt.Errorf("invalid command envelope: %w", err)
 	}
-	if cmd.CommandID == "" {
-		return fmt.Errorf("command envelope missing command_id")
-	}
-	if !canonicalUUIDRegexp.MatchString(cmd.CommandID) {
-		return fmt.Errorf("command_id %q is not a canonical lowercase UUID", cmd.CommandID)
-	}
-	if err := ValidateCommand(cmd.Command); err != nil {
-		return err
+	if cmd.PersonalityAgentID != claims.PersonalityAgentID {
+		return errors.New("command envelope target does not match token claim")
 	}
 	return s.writeJSON(conn, cmd)
 }

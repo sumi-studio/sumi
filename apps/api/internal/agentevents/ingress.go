@@ -31,6 +31,7 @@ const (
 	RejectAttachmentsNotEmpty RejectReason = "attachments_not_empty"
 	RejectOversized           RejectReason = "oversized"
 	RejectNotAllowed          RejectReason = "not_allowed"
+	RejectIdempotencyConflict RejectReason = "idempotency_conflict"
 )
 
 // CommandAppender is the durable command log entry point owned by the T28 API
@@ -46,12 +47,12 @@ type CommandAppender interface {
 	// If idempotencyKey is non-empty, the appender returns the existing
 	// CommandEnvelope for that key when the same command bytes are resubmitted;
 	// a different body for the same key is a conflict and returns an error.
-	Append(ctx context.Context, conversationID string, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error)
+	Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error)
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
 // It authenticates the caller via the signed HttpOnly browser session cookie,
-// authorizes the conversation, then rejects oversized payloads, non-empty
+// derives the target and provenance exclusively from that session, then rejects oversized payloads, non-empty
 // attachments, and malformed commands before calling CommandAppender.Append.
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
@@ -80,12 +81,6 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conversationID := r.PathValue("conversation_id")
-	if conversationID == "" {
-		http.Error(w, "missing conversation_id", http.StatusBadRequest)
-		return
-	}
-
 	cookie, err := r.Cookie(BrowserSessionCookie)
 	if err != nil || h.Sessions == nil {
 		http.Error(w, "missing session", http.StatusUnauthorized)
@@ -95,11 +90,6 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	claims, err := h.Sessions.VerifySession(r.Context(), cookie.Value)
 	if err != nil {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
-		return
-	}
-
-	if claims.ConversationID != conversationID {
-		http.Error(w, "conversation authorization failed", http.StatusForbidden)
 		return
 	}
 
@@ -119,17 +109,31 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeRejection(w, RejectSchemaViolation)
+		return
+	}
 	if len(idempotencyKey) > MaxIdempotencyKeyBytes {
 		writeRejection(w, RejectOversized)
 		return
 	}
 
-	env, err := h.Appender.Append(r.Context(), conversationID, idempotencyKey, raw)
+	env, err := h.Appender.Append(r.Context(), directChatProvenance(claims), idempotencyKey, raw)
 	if err != nil {
 		// Idempotency conflicts are exposed as 409 so callers cannot
 		// accidentally mint a second command by retrying with a mutated body.
 		if isIdempotencyConflict(err) {
-			http.Error(w, "idempotency key conflict", http.StatusConflict)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error          string       `json:"error"`
+				IdempotencyKey string       `json:"idempotency_key"`
+				RejectReason   RejectReason `json:"reject_reason"`
+			}{
+				Error:          "idempotency_conflict",
+				IdempotencyKey: idempotencyKey,
+				RejectReason:   RejectIdempotencyConflict,
+			})
 			return
 		}
 		http.Error(w, "command append failed", http.StatusInternalServerError)
@@ -140,7 +144,24 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(env)
+	_ = enc.Encode(browserCommandReceipt{
+		IdempotencyKey: idempotencyKey,
+		CommandID:      env.CommandID,
+		Seq:            env.Seq,
+	})
+}
+
+func directChatProvenance(claims UserSessionClaims) DirectChatProvenance {
+	return DirectChatProvenance{
+		Version:            1,
+		TenantID:           claims.TenantID,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Actor: ProvenanceActor{
+			Kind:        "human",
+			PrincipalID: claims.UserID,
+		},
+		Source: ProvenanceSource{Surface: "direct_chat"},
+	}
 }
 
 func readLimitedBody(r io.Reader, limit int64) ([]byte, error) {

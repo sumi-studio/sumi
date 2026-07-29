@@ -28,16 +28,17 @@ type fakeCommandAppender struct {
 }
 
 type appendCall struct {
-	ConversationID string
-	IdempotencyKey string
-	Command        json.RawMessage
+	PersonalityAgentID string
+	Provenance         DirectChatProvenance
+	IdempotencyKey     string
+	Command            json.RawMessage
 }
 
 type fakeTokenVerifier struct {
-	mu             sync.Mutex
-	conversationID string
-	reject         bool
-	err            error
+	mu                 sync.Mutex
+	personalityAgentID string
+	reject             bool
+	err                error
 }
 
 func (f *fakeTokenVerifier) setReject(reject bool) {
@@ -50,7 +51,7 @@ func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	f.mu.Lock()
 	reject := f.reject
 	err := f.err
-	conversationID := f.conversationID
+	personalityAgentID := f.personalityAgentID
 	f.mu.Unlock()
 
 	if reject {
@@ -59,30 +60,29 @@ func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	if err != nil {
 		return TokenClaims{}, err
 	}
-	conv := conversationID
+	conv := personalityAgentID
 	if conv == "" {
-		conv = "conversation-1"
+		conv = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	}
 	return TokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: conv,
-		Generation:     7,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: conv,
+		Generation:         7,
 	}, nil
 }
 
 type fakeSessionVerifier struct {
-	mu             sync.Mutex
-	conversationID string
-	reject         bool
-	err            error
+	mu                 sync.Mutex
+	personalityAgentID string
+	reject             bool
+	err                error
 }
 
 func (f *fakeSessionVerifier) VerifySession(ctx context.Context, cookie string) (UserSessionClaims, error) {
 	f.mu.Lock()
 	reject := f.reject
 	err := f.err
-	conversationID := f.conversationID
+	personalityAgentID := f.personalityAgentID
 	f.mu.Unlock()
 
 	if reject {
@@ -91,14 +91,14 @@ func (f *fakeSessionVerifier) VerifySession(ctx context.Context, cookie string) 
 	if err != nil {
 		return UserSessionClaims{}, err
 	}
-	conv := conversationID
+	conv := personalityAgentID
 	if conv == "" {
-		conv = "conversation-1"
+		conv = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	}
 	return UserSessionClaims{
-		TenantID:       "tenant-1",
-		UserID:         "user-1",
-		ConversationID: conv,
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: conv,
 	}, nil
 }
 
@@ -108,14 +108,14 @@ func (f *fakeSessionVerifier) setReject(reject bool) {
 	f.reject = reject
 }
 
-func signTestIngressSession(conversationID string) string {
+func signTestIngressSession(personalityAgentID string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	claims, _ := json.Marshal(map[string]any{
-		"tenant_id":       "tenant-1",
-		"user_id":         "user-1",
-		"conversation_id": conversationID,
-		"exp":             1893456000,
-		"aud":             defaultBrowserAudience,
+		"tenant_id":            "tenant-1",
+		"user_id":              "user-1",
+		"personality_agent_id": personalityAgentID,
+		"exp":                  1893456000,
+		"aud":                  defaultBrowserAudience,
 	})
 	claimsPart := base64.RawURLEncoding.EncodeToString(claims)
 	signingInput := header + "." + claimsPart
@@ -135,15 +135,22 @@ func (errorReadCloser) Close() error {
 	return nil
 }
 
-func (f *fakeCommandAppender) Append(ctx context.Context, conversationID string, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
+func (f *fakeCommandAppender) Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextSeq++
-	f.calls = append(f.calls, appendCall{ConversationID: conversationID, IdempotencyKey: idempotencyKey, Command: command})
+	f.calls = append(f.calls, appendCall{
+		PersonalityAgentID: provenance.PersonalityAgentID,
+		Provenance:         provenance,
+		IdempotencyKey:     idempotencyKey,
+		Command:            command,
+	})
 	return CommandEnvelope{
-		Seq:       f.nextSeq,
-		CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", f.nextSeq),
-		Command:   command,
+		Seq:                f.nextSeq,
+		CommandID:          fmt.Sprintf("00000000-0000-4000-8000-%012d", f.nextSeq),
+		PersonalityAgentID: provenance.PersonalityAgentID,
+		Provenance:         provenance,
+		Command:            command,
 	}, nil
 }
 
@@ -156,7 +163,7 @@ func (f *fakeCommandAppender) callCount() int {
 func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	t.Helper()
 	appender := &fakeCommandAppender{}
-	verifier := &fakeSessionVerifier{conversationID: "conv-1"}
+	verifier := &fakeSessionVerifier{personalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab"}
 	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatalf("new ingress: %v", err)
@@ -164,14 +171,15 @@ func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	return ingress, appender
 }
 
-func postWithSessionCookie(t *testing.T, url string, body []byte, conversationID string) *http.Response {
+func postWithSessionCookie(t *testing.T, url string, body []byte, personalityAgentID string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession(conversationID)})
+	req.Header.Set("Idempotency-Key", "test-key")
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession(personalityAgentID)})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -196,7 +204,7 @@ func postWithAuthorization(t *testing.T, url string, body []byte) *http.Response
 
 func newCommandMux(ingress *UserCommandIngress) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	mux.Handle("POST /direct-chat/commands", ingress)
 	return mux
 }
 
@@ -206,7 +214,7 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
@@ -215,8 +223,12 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	if appender.callCount() != 1 {
 		t.Fatalf("expected 1 append call, got %d", appender.callCount())
 	}
+	wantProvenance := testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab")
+	if got := appender.calls[0].Provenance; got != wantProvenance {
+		t.Fatalf("server-authored provenance mismatch: got %+v want %+v", got, wantProvenance)
+	}
 
-	var env CommandEnvelope
+	var env browserCommandReceipt
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -241,7 +253,7 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 		t.Fatalf("test fixture not oversized: %d bytes", len(body))
 	}
 
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -254,12 +266,12 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 
 	// A subsequent valid request must receive the first contiguous sequence.
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", valid, "conv-1")
+	resp2 := postWithSessionCookie(t, server.URL+"/direct-chat/commands", valid, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 after reject, got %d", resp2.StatusCode)
 	}
-	var env CommandEnvelope
+	var env browserCommandReceipt
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -277,7 +289,7 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[{"name":"x"}]}`)
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -289,9 +301,9 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	assertRejectReason(t, resp.Body, RejectAttachmentsNotEmpty)
 
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", valid, "conv-1")
+	resp2 := postWithSessionCookie(t, server.URL+"/direct-chat/commands", valid, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp2.Body.Close()
-	var env CommandEnvelope
+	var env browserCommandReceipt
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -321,6 +333,16 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 			reason: RejectSchemaViolation,
 		},
 		{
+			name:   "browser target override",
+			body:   `{"type":"user_message","text":"hi","attachments":[],"personality_agent_id":"018f47a2-9b3c-7def-9abc-0123456789ac"}`,
+			reason: RejectSchemaViolation,
+		},
+		{
+			name:   "browser provenance override",
+			body:   `{"type":"user_message","text":"hi","attachments":[],"provenance":{"version":1}}`,
+			reason: RejectSchemaViolation,
+		},
+		{
 			name:   "text not string",
 			body:   `{"type":"user_message","text":123,"attachments":[]}`,
 			reason: RejectSchemaViolation,
@@ -339,7 +361,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", []byte(tc.body), "conv-1")
+			resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", []byte(tc.body), "018f47a2-9b3c-7def-8abc-0123456789ab")
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -352,6 +374,18 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 	}
 }
 
+func TestUserCommandIngressRequiresNonemptyIdempotencyKey(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands", strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
+	recorder := httptest.NewRecorder()
+	ingress.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest || appender.callCount() != 0 {
+		t.Fatalf("missing idempotency key: status=%d appends=%d", recorder.Code, appender.callCount())
+	}
+	assertRejectReason(t, recorder.Body, RejectSchemaViolation)
+}
+
 func TestUserCommandIngress_InvalidUTF8RejectedWithoutAllocatingSeq(t *testing.T) {
 	ingress, appender := newTestIngress(t)
 	server := httptest.NewServer(newCommandMux(ingress))
@@ -362,7 +396,7 @@ func TestUserCommandIngress_InvalidUTF8RejectedWithoutAllocatingSeq(t *testing.T
 		0xff,
 	)
 	body = append(body, []byte(`","attachments":[]}`)...)
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -378,11 +412,11 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 	ingress, appender := newTestIngress(t)
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/conversations/conv-1/commands",
+		"/direct-chat/commands",
 		nil,
 	)
-	req.SetPathValue("conversation_id", "conv-1")
-	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("conv-1")})
+	req.SetPathValue("personality_agent_id", "018f47a2-9b3c-7def-8abc-0123456789ab")
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	req.Body = errorReadCloser{}
 	recorder := httptest.NewRecorder()
 
@@ -404,11 +438,11 @@ func TestUserCommandIngress_MultipleValidRequestsAreContiguous(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		body := []byte(fmt.Sprintf(`{"type":"user_message","text":"msg %d","attachments":[]}`, i))
-		resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+		resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("expected 201 for request %d, got %d", i, resp.StatusCode)
 		}
-		var env CommandEnvelope
+		var env browserCommandReceipt
 		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 			t.Fatalf("decode %d: %v", i, err)
 		}
@@ -429,12 +463,12 @@ func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postWithAuthorization(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithAuthorization(t, server.URL+"/direct-chat/commands", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for missing session cookie, got %d", resp.StatusCode)
@@ -446,18 +480,18 @@ func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 
 func TestUserCommandIngress_AgentBearerTokenCannotInjectUserCommand(t *testing.T) {
 	appender := &fakeCommandAppender{}
-	verifier := &fakeSessionVerifier{conversationID: "conv-1"}
+	verifier := &fakeSessionVerifier{personalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab"}
 	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postWithAuthorization(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithAuthorization(t, server.URL+"/direct-chat/commands", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for agent bearer token, got %d", resp.StatusCode)
@@ -467,30 +501,30 @@ func TestUserCommandIngress_AgentBearerTokenCannotInjectUserCommand(t *testing.T
 	}
 }
 
-func TestUserCommandIngress_RejectsInvalidAndWrongConversationSession(t *testing.T) {
+func TestUserCommandIngress_TargetComesOnlyFromVerifiedSession(t *testing.T) {
 	appender := &fakeCommandAppender{}
-	verifier := &fakeSessionVerifier{conversationID: "other-conversation"}
+	verifier := &fakeSessionVerifier{personalityAgentID: "018f47a2-9b3c-7def-9abc-0123456789ac"}
 	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403 for wrong conversation, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected targetless route to use the verified session target, got %d", resp.StatusCode)
 	}
-	if appender.callCount() != 0 {
-		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	if appender.callCount() != 1 || appender.calls[0].PersonalityAgentID != "018f47a2-9b3c-7def-9abc-0123456789ac" {
+		t.Fatalf("expected one append to the signed target, got %+v", appender.calls)
 	}
 
 	verifier.setReject(true)
-	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp2 := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for rejected session, got %d", resp2.StatusCode)
@@ -509,14 +543,14 @@ func TestUserCommandIngress_TrailingDataRejectedWithoutAllocatingSeq(t *testing.
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]} trailing`)
-	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands", body, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 	if appender.callCount() != 0 {
-		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+		t.Fatalf("invalid body must not append, got %d calls", appender.callCount())
 	}
 	assertRejectReason(t, resp.Body, RejectSchemaViolation)
 }
@@ -527,12 +561,12 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("conv-1")})
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	req.Header.Set("Idempotency-Key", strings.Repeat("x", MaxIdempotencyKeyBytes+1))
 
 	resp, err := http.DefaultClient.Do(req)
@@ -552,17 +586,11 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 
 func TestUserCommandIngress_RejectsNonContiguousPersistedSeq(t *testing.T) {
 	dir := t.TempDir()
-	conv := "conv-ingress-max"
+	conv := "018f47a2-9b3c-7def-8abc-012345678970"
 
 	// A persisted jump must be rejected at startup: CatchUp assumes a
 	// contiguous durable log rather than a sparse sorted sequence.
-	seed := LogRecord{
-		CommandEnvelope: CommandEnvelope{
-			Seq:       maxJSONSafeInteger,
-			CommandID: "00000000-0000-4000-8000-000000000000",
-			Command:   json.RawMessage(`{"type":"user_message","text":"seed","attachments":[]}`),
-		},
-	}
+	seed := testLogRecord(maxJSONSafeInteger, "00000000-0000-4000-8000-000000000000", json.RawMessage(`{"type":"user_message","text":"seed","attachments":[]}`), conv)
 	seedLine, _ := json.Marshal(seed)
 	path := commandLogPath(dir, conv)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

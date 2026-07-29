@@ -37,6 +37,10 @@ func main() {
 		log.Fatal(err)
 	}
 	gateway.PollInterval = 5 * time.Millisecond
+	receipt := "browser-e2e-ready"
+	if err := gateway.PublishRuntimeState("018f47a2-9b3c-7def-8abc-0123456789ab", 1, &receipt); err != nil {
+		log.Fatal(err)
+	}
 	browserSessions, err := agentevents.NewHMACUserSessionVerifier(secret, "")
 	if err != nil {
 		log.Fatal(err)
@@ -119,7 +123,7 @@ func (f *fixture) run() {
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
-		commands, err := f.store.CatchUp(context.Background(), "conversation-1", f.from)
+		commands, err := f.store.CatchUp(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab", f.from)
 		if err != nil {
 			log.Printf("fixture command catch-up: %v", err)
 			continue
@@ -199,14 +203,14 @@ func (f *fixture) emitTerminalEvent() error {
 func (f *fixture) durable(event string) {
 	f.seq++
 	seq := f.seq
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", AgentID: "fixture-agent", ConversationID: "conversation-1", Generation: 1}, agentevents.Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(event)})
+	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
 	if err != nil {
 		log.Printf("fixture durable event: %v", err)
 	}
 }
 
 func (f *fixture) volatile(event string) {
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", AgentID: "fixture-agent", ConversationID: "conversation-1", Generation: 1}, agentevents.Envelope{ConversationID: "conversation-1", Event: json.RawMessage(event)})
+	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
 	if err != nil {
 		log.Printf("fixture volatile event: %v", err)
 	}
@@ -214,7 +218,7 @@ func (f *fixture) volatile(event string) {
 
 func signSession() string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payload, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "user_id": "user", "conversation_id": "conversation-1", "exp": time.Now().Add(time.Hour).Unix(), "aud": "sumi:web:conversation"})
+	payload, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "user_id": "user", "personality_agent_id": "018f47a2-9b3c-7def-8abc-0123456789ab", "exp": time.Now().Add(time.Hour).Unix(), "aud": agentevents.DefaultBrowserAudience()})
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte(header + "." + encoded))

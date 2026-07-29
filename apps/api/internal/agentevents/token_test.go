@@ -21,19 +21,18 @@ func TestHMACTokenVerifierAcceptsValidToken(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 
 	claims, err := v.Verify(context.Background(), token)
 	if err != nil {
 		t.Fatalf("verify valid token: %v", err)
 	}
-	if claims.TenantID != "tenant-1" || claims.AgentID != "agent-1" || claims.ConversationID != "conversation-1" || claims.Generation != 7 {
+	if claims.TenantID != "tenant-1" || claims.PersonalityAgentID != "018f47a2-9b3c-7def-8abc-0123456789ab" || claims.Generation != 7 {
 		t.Fatalf("unexpected claims: %+v", claims)
 	}
 }
@@ -45,12 +44,11 @@ func TestHMACTokenVerifierRejectsExpiredToken(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(-time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(-time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 
 	if _, err := v.Verify(context.Background(), token); err == nil {
@@ -65,12 +63,11 @@ func TestHMACTokenVerifierRejectsTokenAtExpiryBoundary(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Unix(),
+		Aud:                defaultAgentAudience,
 	})
 
 	if _, err := v.Verify(context.Background(), token); err == nil {
@@ -85,16 +82,33 @@ func TestHMACTokenVerifierRejectsWrongAudience(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            "other-audience",
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                "other-audience",
 	})
 
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Fatal("expected wrong audience to be rejected")
+	}
+}
+
+func TestHMACTokenVerifierRejectsLegacyIdentityClaims(t *testing.T) {
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token := signRawTestToken(t, testSecret, map[string]any{
+		"tenant_id":       "tenant-1",
+		"agent_id":        "018f47a2-9b3c-7def-8abc-0123456789ab",
+		"conversation_id": "018f47a2-9b3c-7def-8abc-0123456789ab",
+		"generation":      7,
+		"exp":             time.Now().Add(time.Hour).Unix(),
+		"aud":             defaultAgentAudience,
+	})
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected legacy identity claims to be rejected")
 	}
 }
 
@@ -105,12 +119,11 @@ func TestHMACTokenVerifierRejectsTamperedSignature(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 
 	token = token + "x"
@@ -127,12 +140,11 @@ func TestHMACTokenVerifierRejectsAlgNone(t *testing.T) {
 
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	claims := base64.RawURLEncoding.EncodeToString(mustJSON(t, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}))
 	token := header + "." + claims + "."
 
@@ -148,24 +160,22 @@ func TestHMACTokenVerifierProcessGenerationBoundary(t *testing.T) {
 	}
 
 	valid := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     maxProcessGeneration,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         maxProcessGeneration,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 	if _, err := v.Verify(context.Background(), valid); err != nil {
 		t.Fatalf("max process generation must be accepted: %v", err)
 	}
 
 	invalid := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     maxProcessGeneration + 1,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         maxProcessGeneration + 1,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 	if _, err := v.Verify(context.Background(), invalid); err == nil {
 		t.Fatal("generation max+1 must be rejected before hello emission")
@@ -179,24 +189,22 @@ func TestHMACTokenVerifierRejectsMissingClaims(t *testing.T) {
 	}
 
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Fatal("expected missing tenant_id to be rejected")
 	}
 
 	token = signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            0,
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                0,
+		Aud:                defaultAgentAudience,
 	})
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Fatal("expected missing exp to be rejected")
@@ -210,6 +218,10 @@ func TestHMACTokenVerifierRejectsShortSecret(t *testing.T) {
 }
 
 func signTestToken(t *testing.T, secret []byte, claims tokenClaims) string {
+	return signRawTestToken(t, secret, claims)
+}
+
+func signRawTestToken(t *testing.T, secret []byte, claims any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload := base64.RawURLEncoding.EncodeToString(mustJSON(t, claims))
@@ -250,12 +262,11 @@ func TestHMACTokenVerifierAcceptsPaddedSignature(t *testing.T) {
 		t.Fatalf("new verifier: %v", err)
 	}
 	token := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Minute).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Minute).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 	parts := strings.Split(token, ".")
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
@@ -276,12 +287,11 @@ func TestHMACTokenVerifierRejectsDuplicateKeys(t *testing.T) {
 
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","alg":"HS256","typ":"JWT"}`))
 	claims := base64.RawURLEncoding.EncodeToString(mustJSON(t, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}))
 	token := signTokenWithParts(t, testSecret, header, claims)
 	if _, err := v.Verify(context.Background(), token); err == nil {
@@ -289,7 +299,7 @@ func TestHMACTokenVerifierRejectsDuplicateKeys(t *testing.T) {
 	}
 
 	header = base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	claims = base64.RawURLEncoding.EncodeToString([]byte(`{"tenant_id":"tenant-1","tenant_id":"tenant-1","agent_id":"agent-1","conversation_id":"conversation-1","generation":7,"exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultAgentAudience + `"}`))
+	claims = base64.RawURLEncoding.EncodeToString([]byte(`{"tenant_id":"tenant-1","tenant_id":"tenant-1","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":7,"exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultAgentAudience + `"}`))
 	token = signTokenWithParts(t, testSecret, header, claims)
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Fatal("expected duplicate keys in claims to be rejected")
@@ -304,12 +314,11 @@ func TestHMACTokenVerifierRejectsUnknownFieldsAndWrongTyp(t *testing.T) {
 
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT","extra":"field"}`))
 	claims := base64.RawURLEncoding.EncodeToString(mustJSON(t, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	}))
 	token := signTokenWithParts(t, testSecret, header, claims)
 	if _, err := v.Verify(context.Background(), token); err == nil {
@@ -341,12 +350,11 @@ func TestHMACTokenVerifierSignatureCheckedBeforeClaims(t *testing.T) {
 	// A valid token with expired claims must reach claim handling and fail
 	// with a token-expired error.
 	expired := signTestToken(t, testSecret, tokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-		Exp:            time.Now().Add(-time.Hour).Unix(),
-		Aud:            defaultAgentAudience,
+		TenantID:           "tenant-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Generation:         7,
+		Exp:                time.Now().Add(-time.Hour).Unix(),
+		Aud:                defaultAgentAudience,
 	})
 	_, verifyErr := v.Verify(context.Background(), expired)
 	if verifyErr == nil {

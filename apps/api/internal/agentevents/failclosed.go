@@ -20,7 +20,7 @@ func (failClosedTokenVerifier) Verify(ctx context.Context, token string) (TokenC
 
 type failClosedGenerationVerifier struct{}
 
-func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
+func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
 	return errNotWired
 }
 

@@ -19,20 +19,25 @@ var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
 var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
 
 type testTokenClaims struct {
-	TenantID       string `json:"tenant_id"`
-	AgentID        string `json:"agent_id"`
-	ConversationID string `json:"conversation_id"`
-	Generation     uint64 `json:"generation"`
-	Exp            int64  `json:"exp"`
-	Aud            string `json:"aud"`
+	TenantID           string `json:"tenant_id"`
+	PersonalityAgentID string `json:"personality_agent_id"`
+	Generation         uint64 `json:"generation"`
+	Exp                int64  `json:"exp"`
+	Aud                string `json:"aud"`
 }
 
 type testSessionClaims struct {
-	TenantID       string `json:"tenant_id"`
-	UserID         string `json:"user_id"`
-	ConversationID string `json:"conversation_id"`
-	Exp            int64  `json:"exp"`
-	Aud            string `json:"aud"`
+	TenantID           string `json:"tenant_id"`
+	UserID             string `json:"user_id"`
+	PersonalityAgentID string `json:"personality_agent_id"`
+	Exp                int64  `json:"exp"`
+	Aud                string `json:"aud"`
+}
+
+type testCommandReceipt struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	CommandID      string `json:"command_id"`
+	Seq            uint64 `json:"seq"`
 }
 
 func signTestToken(t *testing.T, secret []byte, claims testTokenClaims) string {
@@ -78,21 +83,21 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
 }
 
-func postAuthorized(t *testing.T, serverURL, conversationID string, body []byte) *http.Response {
+func postAuthorized(t *testing.T, serverURL, personalityAgentID string, body []byte) *http.Response {
 	t.Helper()
 	token := signTestToken(t, testTokenSecret, testTokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: conversationID,
-		Generation:     7,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            "sumi:agent:events",
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         7,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                "sumi:agent:events",
 	})
-	req, err := http.NewRequest(http.MethodPost, serverURL+"/conversations/"+conversationID+"/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-key")
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -101,20 +106,21 @@ func postAuthorized(t *testing.T, serverURL, conversationID string, body []byte)
 	return resp
 }
 
-func postWithSessionCookie(t *testing.T, serverURL, conversationID string, body []byte) *http.Response {
+func postWithSessionCookie(t *testing.T, serverURL, personalityAgentID string, body []byte) *http.Response {
 	t.Helper()
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
-		TenantID:       "tenant-1",
-		UserID:         "user-1",
-		ConversationID: conversationID,
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            agentevents.DefaultBrowserAudience(),
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                agentevents.DefaultBrowserAudience(),
 	})
-	req, err := http.NewRequest(http.MethodPost, serverURL+"/conversations/"+conversationID+"/commands", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/direct-chat/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-key")
 	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: session})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -187,13 +193,13 @@ func TestNewRouter_RegistersCommandRouteWithBrowserSession(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hello","attachments":[]}`)
-	resp := postWithSessionCookie(t, server.URL, "c-1", body)
+	resp := postWithSessionCookie(t, server.URL, "018f47a2-9b3c-7def-8abc-0123456789ab", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)
 	}
 
-	var env agentevents.CommandEnvelope
+	var env testCommandReceipt
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +224,7 @@ func TestNewRouter_CommandRouteRejectsAgentToken(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hello","attachments":[]}`)
-	resp := postAuthorized(t, server.URL, "c-1", body)
+	resp := postAuthorized(t, server.URL, "018f47a2-9b3c-7def-8abc-0123456789ab", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for agent bearer token, got %d", resp.StatusCode)
@@ -238,7 +244,7 @@ func TestNewRouter_CommandRouteRejectsOversized(t *testing.T) {
 
 	text := strings.Repeat("x", 1024*1024+1)
 	body := []byte(`{"type":"user_message","text":"` + text + `","attachments":[]}`)
-	resp := postWithSessionCookie(t, server.URL, "c-1", body)
+	resp := postWithSessionCookie(t, server.URL, "018f47a2-9b3c-7def-8abc-0123456789ab", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -258,17 +264,17 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 
 	body := []byte(`{"type":"user_message","text":"idem","attachments":[]}`)
 
-	req1, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/c-1/commands", bytes.NewReader(body))
+	req1, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req1.Header.Set("Content-Type", "application/json")
 	req1.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
-		TenantID:       "tenant-1",
-		UserID:         "user-1",
-		ConversationID: "c-1",
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            agentevents.DefaultBrowserAudience(),
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                agentevents.DefaultBrowserAudience(),
 	})})
 	req1.Header.Set("Idempotency-Key", "idem-key-1")
 
@@ -279,7 +285,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	if resp1.StatusCode != http.StatusCreated {
 		t.Fatalf("expected first response 201, got %d", resp1.StatusCode)
 	}
-	var env1 agentevents.CommandEnvelope
+	var env1 testCommandReceipt
 	if err := json.NewDecoder(resp1.Body).Decode(&env1); err != nil {
 		t.Fatal(err)
 	}
@@ -288,17 +294,17 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 		t.Fatalf("expected non-empty first command envelope, got %+v", env1)
 	}
 
-	req2, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/c-1/commands", bytes.NewReader(body))
+	req2, err := http.NewRequest(http.MethodPost, server.URL+"/direct-chat/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req2.Header.Set("Content-Type", "application/json")
 	req2.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
-		TenantID:       "tenant-1",
-		UserID:         "user-1",
-		ConversationID: "c-1",
-		Exp:            time.Now().Add(time.Hour).Unix(),
-		Aud:            agentevents.DefaultBrowserAudience(),
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                agentevents.DefaultBrowserAudience(),
 	})})
 	req2.Header.Set("Idempotency-Key", "idem-key-1")
 
@@ -309,7 +315,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	if resp2.StatusCode != http.StatusCreated {
 		t.Fatalf("expected second response 201, got %d", resp2.StatusCode)
 	}
-	var env2 agentevents.CommandEnvelope
+	var env2 testCommandReceipt
 	if err := json.NewDecoder(resp2.Body).Decode(&env2); err != nil {
 		t.Fatal(err)
 	}
