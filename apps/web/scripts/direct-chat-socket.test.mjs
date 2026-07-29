@@ -37,6 +37,29 @@ test.after(() => {
 
 const accepted = (key) => ({ type: "command_accepted", idempotency_key: key, command_id: "00000000-0000-4000-8000-000000000001", seq: 1 });
 const event = (seq, value) => ({ type: "event", envelope: { seq, event: value } });
+const timestamp = "2026-07-28T00:00:00Z";
+const usage = { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: 0 };
+const assistantMessage = (content = []) => ({
+  role: "assistant",
+  content,
+  model: "fixture",
+  provider: "fixture",
+  origin: { provider_instance_id: "fixture", protocol: "open_ai_responses", model: "fixture" },
+  usage,
+  stop_reason: "stop",
+  error_message: null,
+  provider_code: null,
+  interrupted: false,
+  timestamp,
+});
+const approvalRequest = (overrides = {}) => ({
+  id: "request-1",
+  tool_call_id: "call-1",
+  tool_name: "read_file",
+  action: { reviewable: "read fixture" },
+  args_summary: "read fixture",
+  ...overrides,
+});
 
 test("uses the session-resolved direct-chat route and sends no target or provenance", () => {
   FakeWebSocket.instances = [];
@@ -53,7 +76,7 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   assert.equal(JSON.stringify(commands).includes("conversation_id"), false);
   assert.equal(isDirectChatCommand({ type: "user_message", text: "x", attachments: [], actor: "forged" }), false);
   assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { source: "project-policy" } } }), true);
-  assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { scope: [{ personalityAgentId: "forged" }] } } }), false);
+  assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { scope: [{ personalityAgentId: "literal-data", paid: true }] } } }), true);
   socket.close();
 });
 
@@ -128,80 +151,174 @@ test("rejects legacy target-bearing and malformed server frames", () => {
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
 });
 
-test("rejects nested confidential identity and provenance in durable and volatile events", () => {
-  const durableLeaks = [
+test("rejects identity aliases and provenance only when they are structural fields", () => {
+  const structuralLeaks = [
+    { type: "agent_start", PersonalityAgentId: "internal" },
     {
-      type: "tool_execution_start",
-      tool_call_id: "tool-1",
-      tool_name: "read_file",
-      args: { selection: [{ PersonalityAgentId: "internal" }] },
-    },
-    {
-      type: "approval_requested",
-      request: {
-        id: "request-1",
-        action: { scope: { tenant_id: "internal" } },
-        args_summary: {},
-      },
-    },
-    {
-      type: "tool_execution_end",
-      tool_call_id: "tool-1",
-      result: { metadata: { workspaceId: "internal" } },
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000001",
+      message: { ...assistantMessage(), tenantId: "internal" },
     },
     {
       type: "message_end",
-      message_id: "message-1",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "done", metadata: { PAID: "internal" } }],
-      },
+      message_id: "00000000-0000-4000-8000-000000000001",
+      message: assistantMessage([{ type: "text", text: "done", wire_item_index: 0, provenance: {} }]),
+    },
+    {
+      type: "approval_requested",
+      request: approvalRequest({ PAID: "internal" }),
+    },
+    {
+      type: "approval_requested",
+      request: approvalRequest({ action: { reviewable: "read", workspaceId: "internal" } }),
+    },
+    {
+      type: "approval_requested",
+      request: approvalRequest({
+        audit: {
+          outcome: "allow",
+          risk: "low",
+          authorization: "low",
+          rationale: "ok",
+          org_id: "internal",
+        },
+      }),
     },
   ];
-  for (const leak of durableLeaks) {
+  for (const leak of structuralLeaks) {
     assert.equal(parseDirectChatServerFrame(event(1, leak), 0), undefined);
   }
 
   const volatileLeaks = [
     {
       type: "message_update",
-      message_id: "message-1",
+      message_id: "00000000-0000-4000-8000-000000000001",
       event: {
         type: "text_delta",
+        content_index: 0,
         delta: "draft",
-        context: [{ org_id: "internal" }],
+        organization_id: "internal",
       },
     },
-    {
-      type: "error",
-      message: "failed",
-      details: { provenance: { organization_id: "internal" } },
-    },
+    { type: "error", message: "failed", provenance: {} },
   ];
   for (const leak of volatileLeaks) {
     assert.equal(parseDirectChatServerFrame({ type: "event", envelope: { event: leak } }, 0), undefined);
   }
 });
 
-test("allows legitimate request-specific fields inside explicit AnyJSON payloads", () => {
+test("preserves identity-like keys and paid data inside explicit AnyJSON fields", () => {
+  const opaque = {
+    personality_agent_id: "literal-data",
+    tenant_id: "literal-data",
+    provenance: { source: "literal-data" },
+    paid: true,
+  };
   assert.equal(parseDirectChatServerFrame(event(1, {
     type: "tool_execution_start",
     tool_call_id: "tool-1",
     tool_name: "read_file",
-    args: {
-      source: "document",
-      resource_id: "payload-resource",
-      action: { workspace: "user-selected-folder" },
+    args: opaque,
+  }), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "tool_execution_end",
+    tool_call_id: "tool-1",
+    result: opaque,
+    is_error: false,
+  }), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame({
+    type: "event",
+    envelope: {
+      event: { type: "tool_execution_update", tool_call_id: "tool-1", partial: opaque },
+    },
+  }, 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "approval_requested",
+    request: approvalRequest({ action: { reviewable: opaque }, args_summary: opaque }),
+  }), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "message_end",
+    message_id: "00000000-0000-4000-8000-000000000001",
+    message: {
+      role: "tool_result",
+      tool_call_id: "call-1",
+      tool_name: "read_file",
+      content: [{ type: "text", text: JSON.stringify(opaque) }],
+      details: opaque,
+      is_error: false,
+      timestamp,
     },
   }), 0)?.type, "event");
   assert.equal(parseDirectChatServerFrame(event(1, {
-    type: "approval_requested",
-    request: {
-      id: "request-1",
-      action: { source: "review-projection" },
-      args_summary: { organization: "user-supplied-content" },
+    type: "message_end",
+    message_id: "00000000-0000-4000-8000-000000000001",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: JSON.stringify(opaque) }],
+      timestamp,
     },
   }), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame({
+    type: "event",
+    envelope: {
+      event: {
+        type: "message_update",
+        message_id: "00000000-0000-4000-8000-000000000001",
+        event: {
+          type: "tool_call_end",
+          content_index: 0,
+          tool_call: { id: "call-1", name: "read_file", arguments: opaque },
+        },
+      },
+    },
+  }, 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "approval_resolved",
+    request_id: "request-1",
+    resolution: { decision: { type: "approve_always", rule: opaque } },
+  }), 0)?.type, "event");
+});
+
+test("accepts every exact event shape emitted by the browser E2E fixture", () => {
+  const durable = [
+    { type: "agent_start" },
+    { type: "turn_start" },
+    { type: "tool_execution_start", tool_call_id: "call-1", tool_name: "read_file", args: {} },
+    { type: "tool_execution_end", tool_call_id: "call-1", result: "ok", is_error: false },
+    { type: "steered", mode: "hard" },
+    { type: "approval_requested", request: approvalRequest() },
+    {
+      type: "message_start",
+      message_id: "00000000-0000-4000-8000-000000000002",
+      message: assistantMessage(),
+    },
+    {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000002",
+      message: {
+        ...assistantMessage([{ type: "text", text: "Terminal replay", wire_item_index: 0 }]),
+        stop_reason: "aborted",
+        interrupted: true,
+      },
+    },
+    { type: "turn_end", message: null, tool_results: [] },
+    { type: "agent_end" },
+  ];
+  for (const fixtureEvent of durable) {
+    assert.equal(parseDirectChatServerFrame(event(1, fixtureEvent), 0)?.type, "event");
+  }
+  for (const delta of ["streamed assistant", "abortable stream"]) {
+    assert.equal(parseDirectChatServerFrame({
+      type: "event",
+      envelope: {
+        event: {
+          type: "message_update",
+          message_id: "00000000-0000-4000-8000-000000000001",
+          event: { type: "text_delta", content_index: 0, delta },
+        },
+      },
+    }, 0)?.type, "event");
+  }
 });
 
 test("reconstructs and deduplicates durable messages and tool state after reload/replay", () => {
