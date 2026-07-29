@@ -13475,9 +13475,20 @@ mod tests {
     }
 
     fn user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
+        user_command_with_provenance(seq, command_id, text, test_provenance())
+    }
+
+    fn user_command_with_provenance(
+        seq: u64,
+        command_id: &str,
+        text: &str,
+        provenance: DirectChatProvenanceV1,
+    ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance,
             command: Command::UserMessage {
                 text: text.to_owned(),
                 attachments: Vec::new(),
@@ -13489,6 +13500,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::Abort {},
         })
     }
@@ -13506,6 +13519,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::ApprovalDecision {
                 request_id: request_id.to_owned(),
                 decision,
@@ -15062,6 +15077,8 @@ mod tests {
                 CommandEnvelope {
                     seq: 2,
                     command_id: CommandId::parse(steer_id).expect("canonical test UUID"),
+                    personality_agent_id: scope().personality_agent_id,
+                    provenance: test_provenance(),
                     command: Command::UserMessage {
                         text: "steer now".to_owned(),
                         attachments: Vec::new(),
@@ -17365,6 +17382,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_replay_authenticates_exact_persisted_provenance_and_admission_record() {
+        let command_id = "00000000-0000-4000-8000-000000000031";
+        for tampered_provenance in [
+            DirectChatProvenanceV1::new("tenant-tampered", scope().personality_agent_id, "human-1")
+                .unwrap(),
+            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-tampered")
+                .unwrap(),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered_provenance).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance");
+            let matching_tamper =
+                user_command_with_provenance(1, command_id, "original", tampered_provenance);
+            let error = writer
+                .persist_inbound(&matching_tamper)
+                .await
+                .expect_err("unauthenticated provenance replacement must fail");
+            assert!(
+                error.to_string().contains("admission record HMAC mismatch"),
+                "{error:#}"
+            );
+        }
+
+        for (field, value) in [
+            ("source", serde_json::json!({"surface": "group_chat"})),
+            (
+                "personality_agent_id",
+                serde_json::json!("0198f0f4-9b72-7000-8000-000000000002"),
+            ),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            let mut tampered = serde_json::to_value(test_provenance()).unwrap();
+            tampered[field] = value;
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance field");
+            assert!(
+                writer.persist_inbound(&original).await.is_err(),
+                "tampered provenance field {field} must fail replay"
+            );
+        }
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "original");
+        writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist authenticated command");
+        sqlx::query(
+            "UPDATE inbound_commands SET admission_record_hmac=zeroblob(32)
+             WHERE command_id=?",
+        )
+        .bind(command_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper admission HMAC");
+        let error = writer
+            .persist_inbound(&original)
+            .await
+            .expect_err("tampered admission record must fail replay");
+        assert!(
+            error.to_string().contains("admission record HMAC mismatch"),
+            "{error:#}"
+        );
+
+        let root = std::env::temp_dir().join(format!("sumi-command-provenance-{}", Uuid::now_v7()));
+        let path = root.join("state").join("agent.db");
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "restart");
+        let expected = writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist command before restart");
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let replayed = EventWriter::new(reopened.clone())
+            .persist_inbound(&original)
+            .await
+            .expect("authenticate exact command provenance after restart");
+        assert_eq!(replayed, expected);
+        reopened.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove provenance restart fixture");
+    }
+
+    #[tokio::test]
     async fn live_admission_accepts_user_then_reserved_abort_without_reentering_replay_mode() {
         let store = test_store().await;
         let writer = EventWriter::new(store);
@@ -17718,6 +17845,8 @@ mod tests {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: bytes.len() as u64,
             },
@@ -17763,6 +17892,8 @@ mod tests {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: changed_bytes.len() as u64,
             },
@@ -17803,6 +17934,8 @@ mod tests {
             let original = InboundCommand::Invalid {
                 seq: 1,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: first,
                 payload_digest: None,
@@ -17821,6 +17954,8 @@ mod tests {
             let changed = InboundCommand::Invalid {
                 seq: 1,
                 command_id,
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: replay,
                 payload_digest: None,
@@ -20483,6 +20618,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test command UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::Abort {},
             },
         };
@@ -23785,6 +23922,8 @@ mod tests {
             CommandEnvelope {
                 seq: 2,
                 command_id: CommandId::parse(steer_1_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::UserMessage {
                     text: "a".to_owned(),
                     attachments: Vec::new(),
@@ -23796,6 +23935,8 @@ mod tests {
             CommandEnvelope {
                 seq: 3,
                 command_id: CommandId::parse(steer_2_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::UserMessage {
                     text: "b".to_owned(),
                     attachments: Vec::new(),
@@ -24401,6 +24542,8 @@ mod tests {
                             seq: 1,
                             command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                                 .expect("canonical test command UUID"),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
                             command: Command::Abort {},
                         },
                     }],

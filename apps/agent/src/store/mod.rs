@@ -5133,6 +5133,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: "pending logical suffix".to_owned(),
                     attachments: Vec::new(),
@@ -5250,6 +5252,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: text.to_owned(),
                     attachments: Vec::new(),
