@@ -53,6 +53,7 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   assert.equal(JSON.stringify(commands).includes("conversation_id"), false);
   assert.equal(isDirectChatCommand({ type: "user_message", text: "x", attachments: [], actor: "forged" }), false);
   assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { source: "project-policy" } } }), true);
+  assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { scope: [{ personalityAgentId: "forged" }] } } }), false);
   socket.close();
 });
 
@@ -127,19 +128,78 @@ test("rejects legacy target-bearing and malformed server frames", () => {
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
 });
 
-test("allows identity-like keys inside explicit AnyJSON payloads", () => {
+test("rejects nested confidential identity and provenance in durable and volatile events", () => {
+  const durableLeaks = [
+    {
+      type: "tool_execution_start",
+      tool_call_id: "tool-1",
+      tool_name: "read_file",
+      args: { selection: [{ PersonalityAgentId: "internal" }] },
+    },
+    {
+      type: "approval_requested",
+      request: {
+        id: "request-1",
+        action: { scope: { tenant_id: "internal" } },
+        args_summary: {},
+      },
+    },
+    {
+      type: "tool_execution_end",
+      tool_call_id: "tool-1",
+      result: { metadata: { workspaceId: "internal" } },
+    },
+    {
+      type: "message_end",
+      message_id: "message-1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "done", metadata: { PAID: "internal" } }],
+      },
+    },
+  ];
+  for (const leak of durableLeaks) {
+    assert.equal(parseDirectChatServerFrame(event(1, leak), 0), undefined);
+  }
+
+  const volatileLeaks = [
+    {
+      type: "message_update",
+      message_id: "message-1",
+      event: {
+        type: "text_delta",
+        delta: "draft",
+        context: [{ org_id: "internal" }],
+      },
+    },
+    {
+      type: "error",
+      message: "failed",
+      details: { provenance: { organization_id: "internal" } },
+    },
+  ];
+  for (const leak of volatileLeaks) {
+    assert.equal(parseDirectChatServerFrame({ type: "event", envelope: { event: leak } }, 0), undefined);
+  }
+});
+
+test("allows legitimate request-specific fields inside explicit AnyJSON payloads", () => {
   assert.equal(parseDirectChatServerFrame(event(1, {
     type: "tool_execution_start",
     tool_call_id: "tool-1",
     tool_name: "read_file",
-    args: { source: "document", personality_agent_id: "payload-value" },
+    args: {
+      source: "document",
+      resource_id: "payload-resource",
+      action: { workspace: "user-selected-folder" },
+    },
   }), 0)?.type, "event");
   assert.equal(parseDirectChatServerFrame(event(1, {
     type: "approval_requested",
     request: {
       id: "request-1",
       action: { source: "review-projection" },
-      args_summary: { personality_agent_id: "payload-value" },
+      args_summary: { organization: "user-supplied-content" },
     },
   }), 0)?.type, "event");
 });

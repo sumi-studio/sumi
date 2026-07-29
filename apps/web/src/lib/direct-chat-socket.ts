@@ -69,6 +69,15 @@ const InternalIdentityOrProvenanceFields = new Set([
   "causation_id",
   "provenance",
 ]);
+const ConfidentialFieldNames = new Set([
+  "personalityagentid",
+  "paid",
+  "tenantid",
+  "workspaceid",
+  "orgid",
+  "organizationid",
+  "provenance",
+]);
 const DurableEventTypes = new Set([
   "agent_start",
   "agent_end",
@@ -105,10 +114,33 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
 }
 
 // Public projections must never carry routing identity or authenticated
-// provenance at their structural boundary. This deliberately does not recurse:
-// tool args, review projections, and summaries are legitimate AnyJSON payloads.
+// provenance in the event schema's structural objects.
 function hasInternalIdentityOrProvenance(value: Record<string, unknown>): boolean {
   return Object.keys(value).some((key) => InternalIdentityOrProvenanceFields.has(key));
+}
+
+// AnyJSON fields may contain request-specific data, but they do not create an
+// exception to the browser confidentiality boundary. Match reserved identity
+// aliases independent of casing and separators without rejecting ordinary
+// payload keys such as source, resource_id, or action.
+function containsConfidentialField(value: unknown): boolean {
+  const pending = [value];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== "object" || current === null || seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const nested of current) pending.push(nested);
+      continue;
+    }
+    for (const [key, nested] of Object.entries(current)) {
+      const normalized = key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+      if (ConfidentialFieldNames.has(normalized)) return true;
+      pending.push(nested);
+    }
+  }
+  return false;
 }
 
 function isSafeSequence(value: unknown): value is number {
@@ -121,7 +153,7 @@ function isSafeSequence(value: unknown): value is number {
  * rejects any caller that tries to smuggle those fields through a command.
  */
 export function isDirectChatCommand(value: unknown): value is DirectChatCommand {
-  if (!isRecord(value) || typeof value.type !== "string") return false;
+  if (!isRecord(value) || containsConfidentialField(value) || typeof value.type !== "string") return false;
   if (value.type === "abort") return hasOnlyKeys(value, ["type"]);
   if (value.type === "user_message") {
     return (
@@ -190,7 +222,7 @@ export function parseDirectChatServerFrame(
   value: unknown,
   lastEventSeq: number,
 ): DirectChatServerFrame | undefined {
-  if (!isRecord(value)) return undefined;
+  if (!isRecord(value) || containsConfidentialField(value)) return undefined;
   if (value.type === "direct_chat_status" && (value.status === "ready" || value.status === "unavailable") &&
     hasOnlyKeys(value, ["type", "status"])) {
     return value as DirectChatStatusFrame;
