@@ -4732,6 +4732,7 @@ impl EventWriter {
                 message_id: &command.message_id,
                 text: &expected.text,
                 timestamp: &expected.timestamp,
+                provenance: &command.provenance,
             })
             .collect();
         let size = EventBatchSizer::injection_batch(
@@ -14230,6 +14231,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: injected.provenance(),
         }];
         let predicted = EventBatchSizer::injection_batch(
             store.redactor(),
@@ -14270,6 +14272,7 @@ mod tests {
         let turn_id = "turn-application-sizer";
         let text = "application-specific write-set";
         let timestamp = durable_test_timestamp();
+        let provenance = test_provenance();
         let message = canonical_user_message(text, timestamp);
         let payload = serde_json::to_vec(&Command::UserMessage {
             text: text.to_owned(),
@@ -14282,6 +14285,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: &provenance,
         }];
 
         for application in [
