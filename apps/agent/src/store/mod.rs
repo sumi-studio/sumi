@@ -3987,6 +3987,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_store_initializes_provider_projection_schema_v2() {
+        let store = store().await;
+        let (schema_version, state, revision): (i64, String, i64) = sqlx::query_as(
+            "SELECT schema_version, state, revision
+             FROM provider_context_projection_head
+             WHERE singleton = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load provider-context projection genesis");
+        assert_eq!(schema_version, 2);
+        assert_eq!(state, "active");
+        assert_eq!(revision, 0);
+    }
+
+    #[tokio::test]
     async fn wrong_scope_open_cannot_poison_uninitialized_provider_projection_genesis() {
         let store = store().await;
         sqlx::query(

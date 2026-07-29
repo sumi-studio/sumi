@@ -132,7 +132,7 @@ CREATE TABLE memory_calibration (
 -- or an uninitialized marker beside non-empty state fails closed.
 CREATE TABLE provider_context_projection_head (
   singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
-  schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+  schema_version INTEGER NOT NULL CHECK (schema_version = 2),
   state TEXT NOT NULL CHECK (state IN ('uninitialized', 'active')),
   revision INTEGER NOT NULL CHECK (revision >= 0),
   record_count INTEGER NOT NULL CHECK (record_count >= 0),
@@ -160,7 +160,7 @@ CREATE TABLE provider_context_projection_head (
 INSERT INTO provider_context_projection_head(
   singleton, schema_version, state, revision, record_count,
   set_digest, key_ref, head_hmac
-) VALUES(1, 1, 'uninitialized', 0, 0, NULL, NULL, NULL);
+) VALUES(1, 2, 'uninitialized', 0, 0, NULL, NULL, NULL);
 
 CREATE TRIGGER reject_legacy_calibration_insert
 BEFORE INSERT ON kv
