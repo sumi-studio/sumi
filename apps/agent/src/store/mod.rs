@@ -61,6 +61,8 @@ pub(crate) use self::delivery::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, current_event_head_seq,
     raw_events_after,
 };
+#[cfg(test)]
+pub(crate) use self::event_writer::seed_provider_context_owner_event_evidence;
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,

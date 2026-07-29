@@ -3499,7 +3499,7 @@ mod tests {
     }
 
     async fn insert_l0_batch(store: &Store, messages: &[PublicMessage]) -> (String, String) {
-        insert_l0_batch_with_seq(store, 1, messages).await
+        insert_l0_batch_with_seq_and_event_evidence(store, 1, messages, false).await
     }
 
     async fn insert_l0_batch_with_seq(
@@ -3507,9 +3507,28 @@ mod tests {
         batch_seq: i64,
         messages: &[PublicMessage],
     ) -> (String, String) {
+        insert_l0_batch_with_seq_and_event_evidence(store, batch_seq, messages, false).await
+    }
+
+    async fn insert_authenticated_l0_batch_with_seq(
+        store: &Store,
+        batch_seq: i64,
+        messages: &[PublicMessage],
+    ) -> (String, String) {
+        insert_l0_batch_with_seq_and_event_evidence(store, batch_seq, messages, true).await
+    }
+
+    async fn insert_l0_batch_with_seq_and_event_evidence(
+        store: &Store,
+        batch_seq: i64,
+        messages: &[PublicMessage],
+        authenticate_messages: bool,
+    ) -> (String, String) {
         // This compactor fixture deliberately seeds transcript rows at
-        // synthetic sequences. Freeze the empty lifecycle checkpoint first;
-        // exact MessageEnd projection behavior is covered by Store tests.
+        // synthetic sequences. Provider-context erasure fixtures additionally
+        // seed exact MessageEnd evidence before the first subsequent
+        // EventWriter transaction; ordinary compactor fixtures keep the
+        // lighter raw-transcript setup.
         EventWriter::new(Arc::new(store.clone()))
             .initialize_recovery_checkpoint()
             .await
@@ -3542,25 +3561,37 @@ mod tests {
             0,
         );
         let mut membership_inserts = Vec::with_capacity(messages.len());
+        let mut event_owners = Vec::with_capacity(messages.len());
         for (seq, message) in messages.iter().enumerate() {
             let message_id = format!("{source_id}-msg-{seq}");
-            let record = TranscriptRecord::encrypt(
-                message,
-                &message_id,
-                (batch_seq as u64)
-                    .saturating_mul(100)
-                    .saturating_add(seq as u64),
-                &key,
-                scope,
-                redactor,
-            )
-            .expect("encrypt message");
+            let message_seq = (batch_seq as u64)
+                .saturating_mul(100)
+                .saturating_add(seq as u64);
+            let record =
+                TranscriptRecord::encrypt(message, &message_id, message_seq, &key, scope, redactor)
+                    .expect("encrypt message");
             record.insert(store.pool()).await.expect("insert message");
             membership_inserts.push(MemoryBatchMessageRecord {
                 batch_id: source_id.clone(),
                 message_id: record.id().to_owned(),
                 ord: i64::try_from(seq + 1).expect("fixture membership ordinal"),
             });
+            if authenticate_messages {
+                assert!(
+                    matches!(message, PublicMessage::Assistant(_)),
+                    "authenticated provider-context fixture owners must be assistants"
+                );
+                event_owners.push((message_id, message_seq));
+            }
+        }
+        if authenticate_messages {
+            let owner_refs = event_owners
+                .iter()
+                .map(|(message_id, message_seq)| (message_id.as_str(), *message_seq))
+                .collect::<Vec<_>>();
+            crate::store::seed_provider_context_owner_event_evidence(store, &owner_refs)
+                .await
+                .expect("seed authenticated provider-context owner events");
         }
 
         insert_memory_fixture(
@@ -4982,7 +5013,8 @@ mod tests {
             timestamp: timestamp(),
         });
         let (source_id, _target_id) =
-            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
+            insert_authenticated_l0_batch_with_seq(&store, 1, std::slice::from_ref(&assistant))
+                .await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -5685,7 +5717,8 @@ mod tests {
             timestamp: timestamp(),
         });
         let (source_id, _target_id) =
-            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
+            insert_authenticated_l0_batch_with_seq(&store, 1, std::slice::from_ref(&assistant))
+                .await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -5787,7 +5820,7 @@ mod tests {
             timestamp: timestamp(),
         });
         let (unrelated_source_id, _unrelated_target_id) =
-            insert_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
+            insert_authenticated_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
         let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
         let unrelated_message_seq = 200u64;
         let unrelated_key = store
@@ -5941,7 +5974,8 @@ mod tests {
             timestamp: timestamp(),
         });
         let (source_id, _target_id) =
-            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
+            insert_authenticated_l0_batch_with_seq(&store, 1, std::slice::from_ref(&assistant))
+                .await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -6007,7 +6041,7 @@ mod tests {
             timestamp: timestamp(),
         });
         let (unrelated_source_id, _unrelated_target_id) =
-            insert_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
+            insert_authenticated_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
         let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
         let unrelated_message_seq = 200u64;
         let unrelated_key = store

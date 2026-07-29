@@ -10133,21 +10133,25 @@ pub(super) async fn authenticate_provider_context_owner_events(
 }
 
 #[cfg(test)]
-pub(super) async fn seed_provider_context_owner_event_evidence(
+pub(crate) async fn seed_provider_context_owner_event_evidence(
     store: &Store,
     owners: &[(&str, u64)],
 ) -> Result<()> {
     if owners.is_empty() {
         return Ok(());
     }
+    let mut head_transaction = store.pool().begin().await?;
+    let previous_head =
+        load_verified_event_head_in_transaction(store, &mut head_transaction).await?;
+    head_transaction.rollback().await?;
+    let previous_last_seq = previous_head.as_ref().map_or(0, |head| head.last_seq);
+    let previous_event_count = previous_head.as_ref().map_or(0, |head| head.event_count);
     let existing_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
         .fetch_one(store.pool())
         .await?;
-    let existing_head: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_log_heads")
-        .fetch_one(store.pool())
-        .await?;
-    if existing_events != 0 || existing_head != 0 {
-        bail!("provider-context event-evidence fixture requires an empty event log");
+    if sqlite_u64(existing_events, "provider-context fixture event count")? != previous_event_count
+    {
+        bail!("provider-context event-evidence fixture found an inconsistent event count");
     }
 
     struct OwnerFixture {
@@ -10203,10 +10207,16 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
     }
 
     let end_seqs: BTreeSet<_> = by_end_seq.keys().copied().collect();
+    if end_seqs
+        .first()
+        .is_some_and(|first| *first <= previous_last_seq)
+    {
+        bail!("provider-context event-evidence fixture owner sequence is not after the event head");
+    }
     let mut used_seqs = end_seqs.clone();
     let mut starts = BTreeMap::new();
     for (&end_seq, owner) in &by_end_seq {
-        let start_seq = (1..end_seq)
+        let start_seq = (previous_last_seq.saturating_add(1)..end_seq)
             .rev()
             .find(|candidate| !used_seqs.contains(candidate))
             .ok_or_else(|| {
@@ -10224,7 +10234,14 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
     let command_key = store.conversation_key(DataKeyPurpose::Command).await?;
     let event_key = store.conversation_key(DataKeyPurpose::Event).await?;
     let mut transaction = store.pool().begin().await?;
+    let command_seq_base: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM inbound_commands")
+            .fetch_one(&mut *transaction)
+            .await?;
     for (index, owner) in by_end_seq.values().enumerate() {
+        let command_seq = command_seq_base
+            .checked_add(i64::try_from(index + 1).context("fixture command sequence overflow")?)
+            .ok_or_else(|| anyhow!("fixture command sequence overflow"))?;
         sqlx::query(
             "INSERT INTO inbound_commands(
                 seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
@@ -10233,7 +10250,7 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
              ) VALUES(?, ?, 'user_message', X'00', ?, X'00', 'applying',
                       NULL, NULL, 'idle_run', ?, ?, 'assistant_started', ?, NULL)",
         )
-        .bind(i64::try_from(index + 1).context("fixture command sequence overflow")?)
+        .bind(command_seq)
         .bind(format!(
             "provider-context-fixture-command-{}",
             owner.message_id
@@ -10250,8 +10267,10 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
         .last_key_value()
         .expect("non-empty owner fixture")
         .0;
-    let mut chain_digest = [0_u8; EVENT_DIGEST_BYTES];
-    for seq in 1..=last_seq {
+    let mut chain_digest = previous_head
+        .as_ref()
+        .map_or([0_u8; EVENT_DIGEST_BYTES], |head| head.chain_digest);
+    for seq in previous_last_seq.saturating_add(1)..=last_seq {
         let event = if let Some(end_seq) = starts.get(&seq) {
             let owner = by_end_seq
                 .get(end_seq)
@@ -10313,28 +10332,77 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
         .execute(&mut *transaction)
         .await?;
     }
-    let head_hmac =
-        authenticate_event_head(store.scope(), &event_key, last_seq, last_seq, &chain_digest)?;
-    sqlx::query(
-        "INSERT INTO event_log_heads(
-            conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&store.scope().conversation_id)
-    .bind(sqlite_i64(
+    let added_event_count = last_seq
+        .checked_sub(previous_last_seq)
+        .ok_or_else(|| anyhow!("provider-context fixture event count underflow"))?;
+    let event_count = previous_event_count
+        .checked_add(added_event_count)
+        .ok_or_else(|| anyhow!("provider-context fixture event count overflow"))?;
+    let head_hmac = authenticate_event_head(
+        store.scope(),
+        &event_key,
         last_seq,
-        "provider-context fixture event-log last sequence",
-    )?)
-    .bind(sqlite_i64(
-        last_seq,
-        "provider-context fixture event count",
-    )?)
-    .bind(chain_digest.as_slice())
-    .bind(&event_key.key_ref)
-    .bind(head_hmac)
-    .bind(Utc::now().to_rfc3339())
-    .execute(&mut *transaction)
-    .await?;
+        event_count,
+        &chain_digest,
+    )?;
+    if let Some(previous) = previous_head {
+        let result = sqlx::query(
+            "UPDATE event_log_heads
+             SET last_seq = ?, event_count = ?, chain_digest = ?, key_ref = ?,
+                 head_hmac = ?, updated_at = ?
+             WHERE conversation_id = ? AND last_seq = ? AND event_count = ?
+               AND chain_digest = ?",
+        )
+        .bind(sqlite_i64(
+            last_seq,
+            "provider-context fixture event-log last sequence",
+        )?)
+        .bind(sqlite_i64(
+            event_count,
+            "provider-context fixture event count",
+        )?)
+        .bind(chain_digest.as_slice())
+        .bind(&event_key.key_ref)
+        .bind(head_hmac)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&store.scope().conversation_id)
+        .bind(sqlite_i64(
+            previous.last_seq,
+            "provider-context fixture previous event-log sequence",
+        )?)
+        .bind(sqlite_i64(
+            previous.event_count,
+            "provider-context fixture previous event count",
+        )?)
+        .bind(previous.chain_digest.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        require_single_cas(
+            result.rows_affected(),
+            "provider-context fixture event-log head",
+        )?;
+    } else {
+        sqlx::query(
+            "INSERT INTO event_log_heads(
+                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&store.scope().conversation_id)
+        .bind(sqlite_i64(
+            last_seq,
+            "provider-context fixture event-log last sequence",
+        )?)
+        .bind(sqlite_i64(
+            event_count,
+            "provider-context fixture event count",
+        )?)
+        .bind(chain_digest.as_slice())
+        .bind(&event_key.key_ref)
+        .bind(head_hmac)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
     transaction.commit().await?;
     EventWriter::new(Arc::new(store.clone()))
         .reset_checkpoint_after_direct_fixture_mutation()
