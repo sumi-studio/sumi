@@ -349,6 +349,7 @@ fn encode_request(
     operation: ExecutorOperation,
 ) -> Result<Vec<u8>, ToolError> {
     let request = RpcRequest {
+        personality_agent_id: identity.personality_agent_id().clone(),
         generation: identity.generation().to_wire(),
         nonce: identity.nonce().as_str().to_owned(),
         request_id: request_id.to_owned(),
@@ -635,6 +636,8 @@ fn indeterminate(message: &str) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::tools::{
         executor::{
             ArtifactBrokerClient,
@@ -654,12 +657,13 @@ mod tests {
     };
 
     fn identity() -> RpcIdentity {
-        RpcIdentity::from_wire(7, "boot-nonce").unwrap()
+        RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap()
     }
 
     #[test]
     fn outgoing_request_rejects_out_of_domain_generation_before_encoding() {
         let error = RpcIdentity::from_wire(
+            PAID,
             crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
             "boot-nonce",
         )

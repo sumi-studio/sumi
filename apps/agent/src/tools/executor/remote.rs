@@ -656,6 +656,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -1457,6 +1459,7 @@ mod tests {
             let request: RpcRequest<ExecutorOperation> =
                 serde_json::from_str(line.trim_end()).unwrap();
             let forged = RpcFrame::Terminal {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: request.generation,
                 nonce: "stale-nonce".to_owned(),
                 request_id: request.request_id,
@@ -1470,7 +1473,7 @@ mod tests {
         });
         let client = Arc::new(ExecutorClient::new(
             socket,
-            RpcIdentity::from_wire(7, "current-nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap(),
             "conversation-1",
         ));
         let registry = remote_executor_registry(client).unwrap();

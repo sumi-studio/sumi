@@ -2540,8 +2540,12 @@ async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved
             .await
             .expect("saved steer turn binding");
 
-    let lease = ProcessGenerationLease::new(test_executor_generation(), "approval-recovery-lease")
-        .expect("valid recovery lease");
+    let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "approval-recovery-lease",
+    )
+    .expect("valid recovery lease");
     let fence = GenerationRecoveryFence::new(&lease, "approval-recovery-fence")
         .expect("valid recovery fence");
     let hydrated = store
@@ -2681,8 +2685,12 @@ async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_
     drop(store);
 
     let store = open_kill_restart_store(&database_path).await;
-    let lease = ProcessGenerationLease::new(test_executor_generation(), "abort-approval-lease")
-        .expect("valid recovery lease");
+    let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "abort-approval-lease",
+    )
+    .expect("valid recovery lease");
     let fence =
         GenerationRecoveryFence::new(&lease, "abort-approval-fence").expect("valid recovery fence");
     let hydrated = store
@@ -7148,9 +7156,12 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     first_pool.close().await;
 
     let reopened = open_kill_restart_store(&path).await;
-    let lease =
-        ProcessGenerationLease::new(test_executor_generation(), "live-responses-restart-lease")
-            .expect("live Responses restart lease");
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-responses-restart-lease",
+    )
+    .expect("live Responses restart lease");
     let fence = GenerationRecoveryFence::new(&lease, "live-responses-restart-fence")
         .expect("live Responses restart fence");
     let hydrated = match reopened
@@ -7300,9 +7311,12 @@ async fn successful_provider_context_survives_session_restart_and_reaches_turn_t
 
     pool.close().await;
     let reopened = open_kill_restart_store(&path).await;
-    let lease =
-        ProcessGenerationLease::new(test_executor_generation(), "provider-context-session-lease")
-            .expect("lease");
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "provider-context-session-lease",
+    )
+    .expect("lease");
     let fence =
         GenerationRecoveryFence::new(&lease, "provider-context-session-fence").expect("fence");
     let hydrated = match reopened
@@ -11071,6 +11085,7 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
     pool.close().await;
     let store = open_kill_restart_store(&database_path).await;
     let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
         test_executor_generation(),
         "duplicate-approval-restart-lease",
     )

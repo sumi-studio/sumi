@@ -82,6 +82,7 @@ impl ArtifactBrokerClient {
     ) -> Result<ArtifactResponse, ToolError> {
         let request_id = format!("broker-{}", Uuid::now_v7());
         let request = RpcRequest {
+            personality_agent_id: self.identity.personality_agent_id().clone(),
             generation: self.identity.generation().to_wire(),
             nonce: self.identity.nonce().as_str().to_owned(),
             request_id: request_id.clone(),
@@ -453,6 +454,8 @@ fn indeterminate(error: ToolError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::tools::{shell_capture::ShellCapture, truncate::DEFAULT_MAX_BYTES};
     use serde_json::json;
     use std::{
@@ -539,7 +542,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client
@@ -557,6 +560,7 @@ mod tests {
     #[tokio::test]
     async fn outgoing_request_rejects_out_of_domain_generation_before_connecting() {
         let error = RpcIdentity::from_wire(
+            PAID,
             crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
             "boot-nonce",
         )
@@ -578,7 +582,7 @@ mod tests {
     async fn complete_request_followed_by_shutdown_failure_is_indeterminate() {
         let client = ArtifactBrokerClient::new(
             "/unused",
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         let written = Arc::new(Mutex::new(Vec::new()));
@@ -670,7 +674,7 @@ mod tests {
 
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client
@@ -752,7 +756,7 @@ mod tests {
             });
             let client = ArtifactBrokerClient::new(
                 &socket,
-                RpcIdentity::from_wire(1, "nonce").unwrap(),
+                RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
                 "conversation-1",
             );
             assert!(matches!(
@@ -793,7 +797,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         assert!(matches!(
@@ -901,7 +905,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         let prefix = vec![b'x'; DEFAULT_MAX_BYTES + 1];
@@ -943,7 +947,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client
@@ -1015,7 +1019,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             "conversation-1",
         );
         assert_eq!(

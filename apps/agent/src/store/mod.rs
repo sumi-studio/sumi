@@ -522,6 +522,16 @@ impl Store {
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
     ) -> Result<HydrationOutcome> {
+        lease
+            .validate_exact(
+                &self.scope.personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| anyhow!("hydration lease is not bound to this Store PAID: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid hydration recovery fence: {error}"))?;
         self.validate_startup().await?;
 
         let writer = EventWriter::new(Arc::new(self.clone()));
@@ -623,6 +633,7 @@ impl Store {
         }
 
         let receipt = HydrationReceiptIdentity {
+            personality_agent_id: self.scope.personality_agent_id.clone(),
             lease_id: lease.lease_id().to_owned(),
             generation: lease.generation(),
             fence_id: fence.fence_id().to_owned(),
@@ -3911,6 +3922,7 @@ mod tests {
 
     fn test_lease(raw: u64) -> ProcessGenerationLease {
         ProcessGenerationLease::new(
+            scope().personality_agent_id,
             ProcessGeneration::from_wire(raw).expect("valid generation"),
             "test-lease",
         )

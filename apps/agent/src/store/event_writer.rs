@@ -1904,7 +1904,11 @@ impl EventWriter {
         fence: &GenerationRecoveryFence,
     ) -> Result<BootstrapRecoveryGuard<'a>> {
         lease
-            .validate_exact(fence.generation(), fence.lease_id())
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
             .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
         fence
             .validate_exact(lease, fence.fence_id())
@@ -2259,6 +2263,18 @@ impl EventWriter {
         receipt: PhysicalRecoveryReceipt,
         mut batch: EventBatch,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        lease
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| {
+                anyhow!("physical recovery lease is not bound to this Store: {error}")
+            })?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid physical recovery fence: {error}"))?;
         receipt.validate_for(lease, fence)?;
         let mut has_receipt_projection = false;
         for projection in batch.writes.iter().flat_map(|write| &write.projections) {
@@ -13150,8 +13166,12 @@ mod tests {
     }
 
     fn test_lease(raw: u64) -> ProcessGenerationLease {
-        ProcessGenerationLease::new(test_process_generation(raw), "test-lease")
-            .expect("valid test lease")
+        ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
+            test_process_generation(raw),
+            "test-lease",
+        )
+        .expect("valid test lease")
     }
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
@@ -28327,8 +28347,12 @@ mod tests {
         run_id: &str,
         tool_call_id: &str,
     ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
-        let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
-            .expect("test process generation lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(1),
+            "test-lease",
+        )
+        .expect("test process generation lease");
         let fence = GenerationRecoveryFence::new(&lease, "test-fence")
             .expect("test generation recovery fence");
         let decision_id = "00000000-0000-4000-8000-000000000003";
@@ -28604,8 +28628,12 @@ mod tests {
                 // The before-commit kill rolled back the logical suffix and the
                 // application ledger. Replaying the exact same recovery batch must
                 // converge to a committed state.
-                let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
-                    .expect("test lease");
+                let lease = ProcessGenerationLease::new(
+                    reopened.scope().personality_agent_id.clone(),
+                    test_process_generation(1),
+                    "test-lease",
+                )
+                .expect("test lease");
                 let fence = GenerationRecoveryFence::new(&lease, "test-fence").expect("test fence");
                 let writer = EventWriter::new(reopened.clone());
                 let (batch, receipt) =

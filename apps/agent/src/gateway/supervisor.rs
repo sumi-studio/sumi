@@ -7734,7 +7734,12 @@ mod tests {
                 .unwrap(),
         );
         let generation = ProcessGeneration::from_wire(7).unwrap();
-        let lease = ProcessGenerationLease::new(generation, "lease-t17-t24").unwrap();
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "lease-t17-t24",
+        )
+        .unwrap();
         let fence = GenerationRecoveryFence::new(&lease, "fence-t17-t24").unwrap();
         let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
             HydrationOutcome::Complete(state) => state.receipt,

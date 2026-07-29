@@ -401,6 +401,7 @@ impl ExecutorWriter {
         result: Result<ExecutorResponse, RpcError>,
     ) -> Result<(), ToolError> {
         let frame = RpcFrame::Terminal {
+            personality_agent_id: identity.personality_agent_id().clone(),
             generation: identity.generation().to_wire(),
             nonce: identity.nonce().as_str().to_owned(),
             request_id: request_id.clone(),
@@ -410,6 +411,7 @@ impl ExecutorWriter {
             Ok(encoded) => encoded,
             Err(ToolError::Protocol(_)) => {
                 encode_rpc_frame(&RpcFrame::<ExecutorResponse>::Terminal {
+                    personality_agent_id: identity.personality_agent_id().clone(),
                     generation: identity.generation().to_wire(),
                     nonce: identity.nonce().as_str().to_owned(),
                     request_id,
@@ -483,10 +485,10 @@ impl BlockingWorkRegistry {
 pub async fn run_tool_executor_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
-    let conversation_id = required_text("SUMI_CONVERSATION_ID")?;
+    let personality_agent_id = identity.personality_agent_id().to_string();
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let fs = WorkspaceFs::open(&workspace).context("failed to open executor workspace")?;
-    let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
+    let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), personality_agent_id);
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
     run_executor_service_with_writer(
@@ -567,6 +569,7 @@ async fn serve_broker_connection(
             write_frame(
                 &mut write,
                 &RpcFrame::<ArtifactResponse>::Terminal {
+                    personality_agent_id: identity.personality_agent_id().clone(),
                     generation: identity.generation().to_wire(),
                     nonce: identity.nonce().as_str().to_owned(),
                     request_id,
@@ -608,6 +611,7 @@ async fn serve_broker_connection(
     write_frame(
         &mut write,
         &RpcFrame::Terminal {
+            personality_agent_id: identity.personality_agent_id().clone(),
             generation: identity.generation().to_wire(),
             nonce: identity.nonce().as_str().to_owned(),
             request_id,
@@ -1121,6 +1125,7 @@ fn bash_update_frame(
     value: Value,
 ) -> RpcFrame<ExecutorResponse> {
     RpcFrame::Update {
+        personality_agent_id: identity.personality_agent_id().clone(),
         generation: identity.generation().to_wire(),
         nonce: identity.nonce().as_str().to_owned(),
         request_id: request_id.to_owned(),
@@ -1371,7 +1376,11 @@ fn decode_executor_request(
                 Err(_) => return Err(validation_error),
             };
             if identity
-                .validate_wire(request.generation, &request.nonce)
+                .validate_wire(
+                    request.personality_agent_id.as_str(),
+                    request.generation,
+                    &request.nonce,
+                )
                 .is_err()
                 || request.request_id.is_empty()
                 || request.request_id.len() > 128
@@ -1395,7 +1404,11 @@ fn decode_artifact_request(
                 Err(_) => return Err(validation_error),
             };
             if identity
-                .validate_wire(request.generation, &request.nonce)
+                .validate_wire(
+                    request.personality_agent_id.as_str(),
+                    request.generation,
+                    &request.nonce,
+                )
                 .is_err()
                 || request.request_id.is_empty()
                 || request.request_id.len() > 128
@@ -1515,16 +1528,21 @@ fn nonblocking_stdio_fd(raw_fd: libc::c_int) -> std::io::Result<AsyncFd<OwnedFd>
 
 fn identity_from_env() -> Result<RpcIdentity> {
     identity_from_values(
+        &required_text("SUMI_PERSONALITY_AGENT_ID")?,
         &required_text("SUMI_RPC_GENERATION")?,
         required_text("SUMI_RPC_NONCE")?,
     )
 }
 
-fn identity_from_values(generation: &str, nonce: String) -> Result<RpcIdentity> {
+fn identity_from_values(
+    personality_agent_id: &str,
+    generation: &str,
+    nonce: String,
+) -> Result<RpcIdentity> {
     let generation = generation
         .parse::<u64>()
         .context("SUMI_RPC_GENERATION must be an unsigned integer")?;
-    RpcIdentity::from_wire(generation, nonce)
+    RpcIdentity::from_wire(personality_agent_id, generation, nonce)
         .map_err(anyhow::Error::from)
         .context("invalid executor RPC identity")
 }
@@ -1548,17 +1566,21 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::{runtime::contracts::MAX_PROCESS_GENERATION, tools::executor::decode_rpc_frame};
 
     #[test]
     fn bootstrap_generation_accepts_sqlite_domain_and_rejects_the_next_value() {
         for generation in [0, MAX_PROCESS_GENERATION] {
-            let identity = identity_from_values(&generation.to_string(), "boot-nonce".to_owned())
-                .expect("bootstrap identity");
+            let identity =
+                identity_from_values(PAID, &generation.to_string(), "boot-nonce".to_owned())
+                    .expect("bootstrap identity");
             assert_eq!(identity.generation().to_wire(), generation);
         }
         assert!(
             identity_from_values(
+                PAID,
                 &(MAX_PROCESS_GENERATION + 1).to_string(),
                 "boot-nonce".to_owned(),
             )
@@ -1735,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_bash_updates_are_emitted_before_terminal() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let (read_side, write_side) = tokio::io::duplex(4096);
         let (writer, writer_task) = ExecutorWriter::start(write_side);
         let mut lifecycle = RpcLifecycleTracker::default();
@@ -1793,12 +1815,13 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_fence_drops_old_updates_and_reenables_next_exchange() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let (read_side, write_side) = tokio::io::duplex(4096);
         let (writer, writer_task) = ExecutorWriter::start(write_side);
 
         writer
             .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: identity.generation().to_wire(),
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1833,6 +1856,7 @@ mod tests {
 
         writer
             .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: identity.generation().to_wire(),
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-2".to_owned(),
@@ -1884,7 +1908,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_bash_progress_is_split_into_atomic_utf8_frames() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let transport = AtomicBlockedThenWrite {
             bytes: bytes.clone(),
@@ -1945,7 +1969,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_zero_byte_progress_timeout_preserves_terminal() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (pending_polled, pending_polled_rx) = oneshot::channel();
         let transport = UpdatePendingTerminalWrite {
@@ -1955,6 +1979,7 @@ mod tests {
         let (writer, writer_task) = ExecutorWriter::start(transport);
         writer
             .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: identity.generation().to_wire(),
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1997,7 +2022,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_progress_write_permanently_closes_writer_epoch() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let prefix = 7;
         let transport = PrefixThenStall {
@@ -2008,6 +2033,7 @@ mod tests {
         let (writer, writer_task) = ExecutorWriter::start(transport);
         writer
             .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: identity.generation().to_wire(),
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
@@ -2022,6 +2048,7 @@ mod tests {
         assert!(
             writer
                 .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                    personality_agent_id: PAID.parse().unwrap(),
                     generation: identity.generation().to_wire(),
                     nonce: identity.nonce().as_str().to_owned(),
                     request_id: "request-1".to_owned(),
@@ -2046,7 +2073,7 @@ mod tests {
 
     #[tokio::test]
     async fn atomic_progress_backpressure_drops_update_and_preserves_terminal() {
-        let identity = RpcIdentity::from_wire(7, "boot-nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let allow_write = Arc::new(Mutex::new(false));
         let transport = AtomicBlockedThenWrite {
@@ -2056,6 +2083,7 @@ mod tests {
         let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
         writer
             .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: identity.generation().to_wire(),
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::{ResourceLimit, ToolError};
 use super::ArtifactResponse;
-use crate::runtime::contracts::RpcIdentity;
+use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -23,6 +23,7 @@ type RpcIdDigest = [u8; 32];
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest<T> {
+    pub personality_agent_id: PersonalityAgentId,
     pub generation: u64,
     pub nonce: String,
     pub request_id: String,
@@ -33,12 +34,14 @@ pub struct RpcRequest<T> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RpcFrame<T> {
     Update {
+        personality_agent_id: PersonalityAgentId,
         generation: u64,
         nonce: String,
         request_id: String,
         value: Value,
     },
     Terminal {
+        personality_agent_id: PersonalityAgentId,
         generation: u64,
         nonce: String,
         request_id: String,
@@ -47,14 +50,20 @@ pub enum RpcFrame<T> {
 }
 
 impl<T> RpcFrame<T> {
-    fn identity_fields(&self) -> (u64, &str) {
+    fn identity_fields(&self) -> (&PersonalityAgentId, u64, &str) {
         match self {
             Self::Update {
-                generation, nonce, ..
+                personality_agent_id,
+                generation,
+                nonce,
+                ..
             }
             | Self::Terminal {
-                generation, nonce, ..
-            } => (*generation, nonce),
+                personality_agent_id,
+                generation,
+                nonce,
+                ..
+            } => (personality_agent_id, *generation, nonce),
         }
     }
 }
@@ -369,15 +378,19 @@ pub fn decode_rpc_line<T: DeserializeOwned + RpcOperationValidation>(
     }
     let request = serde_json::from_slice::<RpcRequest<T>>(line)
         .map_err(|error| ToolError::Protocol(format!("invalid RPC JSON: {error}")))?;
-    identity.validate_wire(request.generation, &request.nonce)?;
+    identity.validate_wire(
+        request.personality_agent_id.as_str(),
+        request.generation,
+        &request.nonce,
+    )?;
     validate_rpc_id(&request.request_id, "request_id")?;
     request.operation.validate()?;
     Ok(request)
 }
 
 pub fn encode_rpc_frame<T: Serialize>(frame: &RpcFrame<T>) -> Result<Vec<u8>, ToolError> {
-    let (generation, nonce) = frame.identity_fields();
-    RpcIdentity::from_wire(generation, nonce)?;
+    let (personality_agent_id, generation, nonce) = frame.identity_fields();
+    RpcIdentity::from_wire(personality_agent_id.as_str(), generation, nonce)?;
     match frame {
         RpcFrame::Update { request_id, .. } => validate_rpc_id(request_id, "request_id")?,
         RpcFrame::Terminal {
@@ -413,8 +426,8 @@ pub fn decode_rpc_frame<T: DeserializeOwned>(
     }
     let frame = serde_json::from_slice::<RpcFrame<T>>(line)
         .map_err(|error| ToolError::Protocol(format!("invalid RPC JSON: {error}")))?;
-    let (generation, nonce) = frame.identity_fields();
-    identity.validate_wire(generation, nonce)?;
+    let (personality_agent_id, generation, nonce) = frame.identity_fields();
+    identity.validate_wire(personality_agent_id.as_str(), generation, nonce)?;
     match &frame {
         RpcFrame::Update { request_id, .. } => validate_rpc_id(request_id, "request_id")?,
         RpcFrame::Terminal {
@@ -784,17 +797,20 @@ mod tests {
     use super::*;
     use crate::runtime::contracts::{MAX_OPAQUE_ID_BYTES, MAX_PROCESS_GENERATION};
 
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
     fn identity() -> RpcIdentity {
-        RpcIdentity::from_wire(7, "boot-nonce").unwrap()
+        RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap()
     }
 
     #[test]
     fn process_generation_domain_is_shared_by_identity_and_wire_paths() {
         for generation in [0, MAX_PROCESS_GENERATION] {
-            let identity = RpcIdentity::from_wire(generation, "boot-nonce")
+            let identity = RpcIdentity::from_wire(PAID, generation, "boot-nonce")
                 .expect("valid identity generation");
 
             let request = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: identity.personality_agent_id().clone(),
                 generation,
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
@@ -807,6 +823,7 @@ mod tests {
                 .expect("valid request generation");
 
             encode_rpc_frame(&RpcFrame::<Value>::Update {
+                personality_agent_id: identity.personality_agent_id().clone(),
                 generation,
                 nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
@@ -816,9 +833,10 @@ mod tests {
         }
 
         let out_of_domain = MAX_PROCESS_GENERATION + 1;
-        assert!(RpcIdentity::from_wire(out_of_domain, "boot-nonce").is_err());
+        assert!(RpcIdentity::from_wire(PAID, out_of_domain, "boot-nonce").is_err());
         assert!(
             encode_rpc_frame(&RpcFrame::<Value>::Update {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: out_of_domain,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -827,8 +845,10 @@ mod tests {
             .is_err()
         );
 
-        let valid_identity = RpcIdentity::from_wire(MAX_PROCESS_GENERATION, "boot-nonce").unwrap();
+        let valid_identity =
+            RpcIdentity::from_wire(PAID, MAX_PROCESS_GENERATION, "boot-nonce").unwrap();
         let invalid_request = serde_json::to_vec(&RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: out_of_domain,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -840,6 +860,7 @@ mod tests {
         assert!(decode_rpc_line::<ExecutorOperation>(&invalid_request, &valid_identity).is_err());
 
         let invalid_frame = serde_json::to_vec(&RpcFrame::<Value>::Update {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: out_of_domain,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -851,6 +872,7 @@ mod tests {
 
     fn request_line(request_id: &str, execution_id: &str) -> Vec<u8> {
         serde_json::to_vec(&RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: request_id.to_owned(),
@@ -863,6 +885,7 @@ mod tests {
 
     fn update_frame(request_id: impl Into<String>) -> RpcFrame<Value> {
         RpcFrame::Update {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: request_id.into(),
@@ -872,6 +895,7 @@ mod tests {
 
     fn terminal_frame(result: Result<Value, RpcError>) -> RpcFrame<Value> {
         RpcFrame::Terminal {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -889,8 +913,15 @@ mod tests {
         );
         assert!(decode_rpc_line::<ExecutorOperation>(b"{}\n", &identity()).is_err());
 
-        let wrong = RpcIdentity::from_wire(8, "boot-nonce").unwrap();
+        let wrong = RpcIdentity::from_wire(PAID, 8, "boot-nonce").unwrap();
         assert!(decode_rpc_line::<ExecutorOperation>(&encoded, &wrong).is_err());
+        let wrong_paid =
+            RpcIdentity::from_wire("0198f0f4-9b72-7000-8000-000000000002", 7, "boot-nonce")
+                .unwrap();
+        assert!(
+            decode_rpc_line::<ExecutorOperation>(&encoded, &wrong_paid).is_err(),
+            "same generation and nonce must not cross a PAID boundary"
+        );
         assert!(decode_rpc_line::<ExecutorOperation>(
             br#"{"generation":7,"nonce":"boot-nonce","request_id":"request-1","operation":{"type":"cancel","execution_id":"execution-1"},"extra":true}"#,
             &identity(),
@@ -900,6 +931,7 @@ mod tests {
     #[test]
     fn jsonl_size_limit_includes_the_terminal_newline() {
         let mut request = RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -962,6 +994,7 @@ mod tests {
     fn nonces_are_nonempty_bounded_and_checked_on_both_directions() {
         for nonce in ["".to_owned(), "n".repeat(MAX_OPAQUE_ID_BYTES + 1)] {
             let request = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: nonce.clone(),
                 request_id: "request-1".to_owned(),
@@ -972,7 +1005,7 @@ mod tests {
             .expect("encode malformed request fixture");
             assert!(decode_rpc_line::<ExecutorOperation>(&request, &identity()).is_err());
 
-            assert!(RpcIdentity::from_wire(7, nonce.clone()).is_err());
+            assert!(RpcIdentity::from_wire(PAID, 7, nonce.clone()).is_err());
 
             let mut frame = update_frame("request-1");
             let RpcFrame::Update {
@@ -1060,6 +1093,7 @@ mod tests {
         for execution_id in ["550e8400-e29b-41d4-a716-446655440000", "execution-_.1"] {
             for operation in operations(execution_id) {
                 let encoded = serde_json::to_vec(&RpcRequest {
+                    personality_agent_id: PAID.parse().unwrap(),
                     generation: 7,
                     nonce: "boot-nonce".to_owned(),
                     request_id: "request-1".to_owned(),
@@ -1073,6 +1107,7 @@ mod tests {
         for execution_id in ["with/slash", ".", "..", "会話", "pipe|id", "plus+id"] {
             for operation in operations(execution_id) {
                 let encoded = serde_json::to_vec(&RpcRequest {
+                    personality_agent_id: PAID.parse().unwrap(),
                     generation: 7,
                     nonce: "boot-nonce".to_owned(),
                     request_id: "request-1".to_owned(),
@@ -1135,8 +1170,8 @@ mod tests {
         assert_eq!(decode_rpc_frame::<Value>(line, &identity()).unwrap(), frame);
 
         for stale in [
-            RpcIdentity::from_wire(8, "boot-nonce").unwrap(),
-            RpcIdentity::from_wire(7, "stale-nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 8, "boot-nonce").unwrap(),
+            RpcIdentity::from_wire(PAID, 7, "stale-nonce").unwrap(),
         ] {
             assert!(matches!(
                 decode_rpc_frame::<Value>(line, &stale),
@@ -1249,6 +1284,7 @@ mod tests {
             },
         ] {
             let request = RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1271,6 +1307,7 @@ mod tests {
 
         for (limit, valid) in [(MAX_RPC_READ_BYTES, true), (MAX_RPC_READ_BYTES + 1, false)] {
             let request = RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1322,6 +1359,7 @@ mod tests {
         ];
         for operation in valid {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1387,6 +1425,7 @@ mod tests {
         ];
         for operation in invalid {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1472,6 +1511,7 @@ mod tests {
 
         for (operation, expected_valid) in cases {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1498,6 +1538,7 @@ mod tests {
             ("c".repeat(MAX_RPC_ID_BYTES), "e".repeat(MAX_RPC_ID_BYTES)),
         ] {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1523,6 +1564,7 @@ mod tests {
                 ("conversation-1".to_owned(), invalid_component.clone()),
             ] {
                 let encoded = serde_json::to_vec(&RpcRequest {
+                    personality_agent_id: PAID.parse().unwrap(),
                     generation: 7,
                     nonce: "boot-nonce".to_owned(),
                     request_id: "request-1".to_owned(),
@@ -1572,6 +1614,7 @@ mod tests {
         ];
         for operation in invalid {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1599,6 +1642,7 @@ mod tests {
             },
         ] {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1647,6 +1691,7 @@ mod tests {
         ];
         for operation in valid {
             let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
@@ -1728,6 +1773,7 @@ mod tests {
             InputRoute::Artifact
         );
         let valid_request = serde_json::to_vec(&RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -1765,6 +1811,7 @@ mod tests {
             ));
         }
         let invalid_request = serde_json::to_vec(&RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 7,
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
@@ -2061,8 +2108,9 @@ mod tests {
 
     #[test]
     fn attachment_chunks_are_valid_and_fit_a_single_rpc_line() {
-        let identity = RpcIdentity::from_wire(1, "nonce").unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 1, "nonce").unwrap();
         let request = RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
             generation: 1,
             nonce: "nonce".to_owned(),
             request_id: "attachment-chunk".to_owned(),

@@ -5217,8 +5217,12 @@ mod tests {
             .expect("complete speculative shelf");
 
         let generation = ProcessGeneration::from_wire(41).expect("fixture generation");
-        let lease =
-            ProcessGenerationLease::new(generation, "idle-memory-lease").expect("fixture lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "idle-memory-lease",
+        )
+        .expect("fixture lease");
         let fence = GenerationRecoveryFence::new(&lease, "idle-memory-fence")
             .expect("fixture recovery fence");
         let hydrated = match store

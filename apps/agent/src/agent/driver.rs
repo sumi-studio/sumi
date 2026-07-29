@@ -620,6 +620,7 @@ fn validate_hydrated_authority(
         bail!("hydrated memory fence does not match the independently supplied authority");
     }
     if hydrated.receipt.intent_count != 0
+        || hydrated.receipt.personality_agent_id != *expected_lease.personality_agent_id()
         || hydrated.receipt.generation != expected_lease.generation()
         || hydrated.receipt.lease_id != expected_lease.lease_id()
         || hydrated.receipt.fence_id != expected_fence.fence_id()
@@ -735,6 +736,8 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::{
         agent::{RunCore, SequentialRunWorker, Session, SessionResult},
         gateway::InjectedStdioGateway,
@@ -966,7 +969,7 @@ mod tests {
     fn construction_binds_remote_registry_to_executor_generation() {
         let client = Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
-            RpcIdentity::from_wire(7, "boot-nonce").expect("identity"),
+            RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity"),
             "conversation-1",
         ));
         let registry = remote_executor_registry(client).expect("remote registry");
@@ -1017,8 +1020,12 @@ mod tests {
                 .expect("store"),
         );
         let generation = generation(7);
-        let hydrated_lease =
-            ProcessGenerationLease::new(generation, "hydrated-lease").expect("hydrated lease");
+        let hydrated_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "hydrated-lease",
+        )
+        .expect("hydrated lease");
         let hydrated_fence = GenerationRecoveryFence::new(&hydrated_lease, "hydrated-fence")
             .expect("hydrated fence");
         let hydrated = match store
@@ -1060,8 +1067,12 @@ mod tests {
                 .expect("clean Sumi binding has no ready maintenance")
         );
 
-        let stale_lease = ProcessGenerationLease::new(generation, "same-generation-stale-lease")
-            .expect("stale lease");
+        let stale_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "same-generation-stale-lease",
+        )
+        .expect("stale lease");
         let stale_lease_fence =
             GenerationRecoveryFence::new(&stale_lease, hydrated_fence.fence_id())
                 .expect("stale lease fence");
@@ -1096,8 +1107,12 @@ mod tests {
                 .expect("store"),
         );
         let generation = generation(9);
-        let lease =
-            ProcessGenerationLease::new(generation, "overflow-lease").expect("fixture lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "overflow-lease",
+        )
+        .expect("fixture lease");
         let fence = GenerationRecoveryFence::new(&lease, "overflow-fence").expect("fixture fence");
         let hydrated = match store
             .hydrate(&lease, &fence)

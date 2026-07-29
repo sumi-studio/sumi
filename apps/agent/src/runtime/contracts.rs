@@ -37,11 +37,13 @@ pub enum RuntimeContractError {
     NegativeSqliteProcessGeneration(i64),
     #[error("{kind} must contain 1..={MAX_OPAQUE_ID_BYTES} bytes")]
     InvalidOpaqueIdentity { kind: &'static str },
-    #[error("RPC generation or boot nonce mismatch")]
+    #[error("RPC personality agent, generation, or boot nonce mismatch")]
     RpcIdentityMismatch,
-    #[error("process generation lease generation or opaque identity mismatch")]
+    #[error("process generation lease personality agent, generation, or opaque identity mismatch")]
     ProcessGenerationLeaseMismatch,
-    #[error("generation recovery fence lease/generation or opaque identity mismatch")]
+    #[error(
+        "generation recovery fence personality agent, lease/generation, or opaque identity mismatch"
+    )]
     GenerationRecoveryFenceMismatch,
 }
 
@@ -403,23 +405,38 @@ impl RpcBootNonce {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcIdentity {
+    personality_agent_id: PersonalityAgentId,
     generation: ProcessGeneration,
     nonce: RpcBootNonce,
 }
 
 impl RpcIdentity {
-    pub const fn new(generation: ProcessGeneration, nonce: RpcBootNonce) -> Self {
-        Self { generation, nonce }
+    pub const fn new(
+        personality_agent_id: PersonalityAgentId,
+        generation: ProcessGeneration,
+        nonce: RpcBootNonce,
+    ) -> Self {
+        Self {
+            personality_agent_id,
+            generation,
+            nonce,
+        }
     }
 
     pub fn from_wire(
+        personality_agent_id: impl AsRef<str>,
         generation: u64,
         nonce: impl Into<String>,
     ) -> Result<Self, RuntimeContractError> {
         Ok(Self::new(
+            PersonalityAgentId::parse(personality_agent_id.as_ref())?,
             ProcessGeneration::from_wire(generation)?,
             RpcBootNonce::new(nonce)?,
         ))
+    }
+
+    pub const fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub const fn generation(&self) -> ProcessGeneration {
@@ -430,10 +447,19 @@ impl RpcIdentity {
         &self.nonce
     }
 
-    pub fn validate_wire(&self, generation: u64, nonce: &str) -> Result<(), RuntimeContractError> {
+    pub fn validate_wire(
+        &self,
+        personality_agent_id: &str,
+        generation: u64,
+        nonce: &str,
+    ) -> Result<(), RuntimeContractError> {
+        let personality_agent_id = PersonalityAgentId::parse(personality_agent_id)?;
         let generation = ProcessGeneration::from_wire(generation)?;
         let nonce = RpcBootNonce::new(nonce)?;
-        if generation != self.generation || nonce != self.nonce {
+        if personality_agent_id != self.personality_agent_id
+            || generation != self.generation
+            || nonce != self.nonce
+        {
             return Err(RuntimeContractError::RpcIdentityMismatch);
         }
         Ok(())
@@ -442,19 +468,26 @@ impl RpcIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessGenerationLease {
+    personality_agent_id: PersonalityAgentId,
     generation: ProcessGeneration,
     lease_id: String,
 }
 
 impl ProcessGenerationLease {
     pub fn new(
+        personality_agent_id: PersonalityAgentId,
         generation: ProcessGeneration,
         lease_id: impl Into<String>,
     ) -> Result<Self, RuntimeContractError> {
         Ok(Self {
+            personality_agent_id,
             generation,
             lease_id: validate_opaque(lease_id.into(), "process generation lease identity")?,
         })
+    }
+
+    pub const fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub const fn generation(&self) -> ProcessGeneration {
@@ -467,11 +500,15 @@ impl ProcessGenerationLease {
 
     pub fn validate_exact(
         &self,
+        personality_agent_id: &PersonalityAgentId,
         generation: ProcessGeneration,
         lease_id: &str,
     ) -> Result<(), RuntimeContractError> {
         let lease_id = validate_opaque(lease_id.to_owned(), "process generation lease identity")?;
-        if generation != self.generation || lease_id != self.lease_id {
+        if personality_agent_id != &self.personality_agent_id
+            || generation != self.generation
+            || lease_id != self.lease_id
+        {
             return Err(RuntimeContractError::ProcessGenerationLeaseMismatch);
         }
         Ok(())
@@ -480,6 +517,7 @@ impl ProcessGenerationLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationRecoveryFence {
+    personality_agent_id: PersonalityAgentId,
     generation: ProcessGeneration,
     lease_id: String,
     fence_id: String,
@@ -491,10 +529,15 @@ impl GenerationRecoveryFence {
         fence_id: impl Into<String>,
     ) -> Result<Self, RuntimeContractError> {
         Ok(Self {
+            personality_agent_id: lease.personality_agent_id.clone(),
             generation: lease.generation,
             lease_id: lease.lease_id.clone(),
             fence_id: validate_opaque(fence_id.into(), "generation recovery fence identity")?,
         })
+    }
+
+    pub const fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub const fn generation(&self) -> ProcessGeneration {
@@ -515,7 +558,8 @@ impl GenerationRecoveryFence {
         fence_id: &str,
     ) -> Result<(), RuntimeContractError> {
         let fence_id = validate_opaque(fence_id.to_owned(), "generation recovery fence identity")?;
-        if self.generation != lease.generation
+        if self.personality_agent_id != lease.personality_agent_id
+            || self.generation != lease.generation
             || self.lease_id != lease.lease_id
             || self.fence_id != fence_id
         {
@@ -681,15 +725,21 @@ mod tests {
     #[test]
     fn rpc_identity_requires_exact_typed_wire_identity() {
         let identity = RpcIdentity::new(
+            PersonalityAgentId::parse(PAID).unwrap(),
             ProcessGeneration::from_wire(7).unwrap(),
             RpcBootNonce::new("boot-nonce").unwrap(),
         );
-        assert!(identity.validate_wire(7, "boot-nonce").is_ok());
-        assert!(identity.validate_wire(8, "boot-nonce").is_err());
-        assert!(identity.validate_wire(7, "stale-nonce").is_err());
+        assert!(identity.validate_wire(PAID, 7, "boot-nonce").is_ok());
         assert!(
             identity
-                .validate_wire(MAX_PROCESS_GENERATION + 1, "boot-nonce")
+                .validate_wire("0198f0f4-9b72-7000-8000-000000000002", 7, "boot-nonce")
+                .is_err()
+        );
+        assert!(identity.validate_wire(PAID, 8, "boot-nonce").is_err());
+        assert!(identity.validate_wire(PAID, 7, "stale-nonce").is_err());
+        assert!(
+            identity
+                .validate_wire(PAID, MAX_PROCESS_GENERATION + 1, "boot-nonce")
                 .is_err()
         );
     }
@@ -698,13 +748,27 @@ mod tests {
     fn lease_and_fence_require_exact_generation_and_opaque_identities() {
         let generation = ProcessGeneration::from_wire(7).unwrap();
         let other_generation = ProcessGeneration::from_wire(8).unwrap();
-        let lease = ProcessGenerationLease::new(generation, "lease-1").unwrap();
+        let paid = PersonalityAgentId::parse(PAID).unwrap();
+        let other_paid = PersonalityAgentId::parse("0198f0f4-9b72-7000-8000-000000000002").unwrap();
+        let lease = ProcessGenerationLease::new(paid.clone(), generation, "lease-1").unwrap();
         let other_generation_lease =
-            ProcessGenerationLease::new(other_generation, "lease-1").unwrap();
-        let other_identity_lease = ProcessGenerationLease::new(generation, "lease-2").unwrap();
-        assert!(lease.validate_exact(generation, "lease-1").is_ok());
-        assert!(lease.validate_exact(other_generation, "lease-1").is_err());
-        assert!(lease.validate_exact(generation, "lease-2").is_err());
+            ProcessGenerationLease::new(paid.clone(), other_generation, "lease-1").unwrap();
+        let other_identity_lease =
+            ProcessGenerationLease::new(paid.clone(), generation, "lease-2").unwrap();
+        let other_paid_lease =
+            ProcessGenerationLease::new(other_paid.clone(), generation, "lease-1").unwrap();
+        assert!(lease.validate_exact(&paid, generation, "lease-1").is_ok());
+        assert!(
+            lease
+                .validate_exact(&other_paid, generation, "lease-1")
+                .is_err()
+        );
+        assert!(
+            lease
+                .validate_exact(&paid, other_generation, "lease-1")
+                .is_err()
+        );
+        assert!(lease.validate_exact(&paid, generation, "lease-2").is_err());
 
         let fence = GenerationRecoveryFence::new(&lease, "fence-1").unwrap();
         assert!(fence.validate_exact(&lease, "fence-1").is_ok());
@@ -718,8 +782,9 @@ mod tests {
                 .validate_exact(&other_identity_lease, "fence-1")
                 .is_err()
         );
+        assert!(fence.validate_exact(&other_paid_lease, "fence-1").is_err());
         assert!(fence.validate_exact(&lease, "fence-2").is_err());
-        assert!(ProcessGenerationLease::new(generation, "").is_err());
+        assert!(ProcessGenerationLease::new(paid, generation, "").is_err());
         assert!(GenerationRecoveryFence::new(&lease, "").is_err());
     }
 }
