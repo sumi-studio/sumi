@@ -4,7 +4,10 @@
 //! does not replace the production workload-identity issuer or central runtime
 //! registry from issue #80.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use super::supervisor::DeliveryAuthorization;
 
@@ -21,7 +24,7 @@ pub(crate) struct LocalCredentialIssueRequest {
     pub(crate) audience: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalCredentialIssueResponse {
     pub(crate) request_id: String,
@@ -32,6 +35,28 @@ pub(crate) struct LocalCredentialIssueResponse {
     pub(crate) expires_at_unix: i64,
     pub(crate) delivery_authorization: DeliveryAuthorization,
     pub(crate) token: String,
+}
+
+impl fmt::Debug for LocalCredentialIssueResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalCredentialIssueResponse")
+            .field("request_id", &self.request_id)
+            .field("personality_agent_id", &self.personality_agent_id)
+            .field("generation", &self.generation)
+            .field("rpc_boot_nonce", &self.rpc_boot_nonce)
+            .field("audience", &self.audience)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("delivery_authorization", &self.delivery_authorization)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for LocalCredentialIssueResponse {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -6,6 +6,7 @@ pub mod wire;
 pub(crate) mod duplicate;
 
 pub(crate) mod local_control;
+pub(crate) mod local_runtime;
 pub mod stdio;
 pub mod supervisor;
 pub mod ws;
