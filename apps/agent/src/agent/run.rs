@@ -2144,7 +2144,10 @@ impl Runner {
             content: vec![UserContent::Text { text: text.clone() }],
             timestamp: command.received_at(),
         });
-        let message_id = user_message_id(&command.envelope().command_id);
+        let message_id = user_message_id(
+            &command.envelope().personality_agent_id,
+            &command.envelope().command_id,
+        );
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -2177,7 +2180,10 @@ impl Runner {
         for command in &injectables {
             let message = super::steer::build_user_message(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-            let message_id = crate::store::user_message_id(&command.envelope().command_id);
+            let message_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
             self.emit(AgentEvent::MessageStart {
                 message_id: message_id.clone(),
                 message: Box::new(message.clone()),

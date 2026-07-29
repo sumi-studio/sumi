@@ -548,6 +548,8 @@ fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> P
 
 fn user(seq: u64) -> CommandEnvelope {
     CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
             .expect("command id"),
@@ -556,6 +558,10 @@ fn user(seq: u64) -> CommandEnvelope {
             attachments: Vec::new(),
         },
     }
+}
+
+fn user_message_id(command_id: &CommandId) -> String {
+    crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id)
 }
 
 fn admitted_user(seq: u64) -> AdmittedCommand {
@@ -569,6 +575,8 @@ fn live_admitted_user(seq: u64) -> AdmittedCommand {
 fn admitted_abort(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                 .expect("command id"),
@@ -581,6 +589,8 @@ fn admitted_abort(seq: u64) -> AdmittedCommand {
 fn admitted_approval(seq: u64, request_id: &str) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                 .expect("command id"),
@@ -2124,6 +2134,7 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
 #[test]
 fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_failure_role() {
     let binding = DurableRunBinding {
+        provenance: crate::gateway::test_direct_chat_provenance(),
         command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
         command_seq: 1,
         run_id: "01900000-0000-7000-8000-000000000001".to_owned(),

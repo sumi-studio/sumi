@@ -33,7 +33,7 @@ use crate::{
     runtime::contracts::{
         GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
     },
-    store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey, user_message_id},
+    store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey},
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
         text_output,
@@ -53,6 +53,10 @@ use crate::approval::{
 
 fn test_executor_generation() -> ProcessGeneration {
     ProcessGeneration::from_wire(73).expect("valid test generation")
+}
+
+fn user_message_id(command_id: &CommandId) -> String {
+    crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id)
 }
 
 fn validate_test_generation(generation: ProcessGeneration) -> Result<()> {
@@ -82,6 +86,7 @@ fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage
 
 fn test_api_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
+        personality_agent_id: hello.personality_agent_id.clone(),
         accepted_generation: hello.generation,
         last_received_event_seq: 0,
         next_command_seq: hello.last_applied_command_seq.saturating_add(1),
@@ -496,6 +501,8 @@ fn failed(result: SessionResult) -> (SessionFailure, RunOwnership) {
 fn user(seq: u64) -> InboundCommand {
     let command_id = format!("00000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::UserMessage {
@@ -508,6 +515,8 @@ fn user(seq: u64) -> InboundCommand {
 fn abort(seq: u64) -> InboundCommand {
     let command_id = format!("10000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::Abort {},
@@ -1776,10 +1785,7 @@ async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
         DataKeyPurpose::Event,
         DataKeyPurpose::Transcript,
     ] {
-        store
-            .conversation_key(purpose)
-            .await
-            .expect("conversation key");
+        store.private_key(purpose).await.expect("private key");
     }
     let writer = EventWriter::new(store.clone());
     writer
@@ -4360,6 +4366,7 @@ fn reliable_outbound_admission_fails_explicitly_when_full_or_closed() {
         ack: CommandAck {
             seq: 1,
             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             status: CommandAckStatus::Received,
             reject_reason: None,
         },
@@ -6897,6 +6904,8 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
 fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
     let command_id = format!("25000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical live Responses command id"),
         command: Command::UserMessage {
@@ -7868,7 +7877,12 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .collect();
     let expected_ids: Vec<String> = steer_command_ids
         .iter()
-        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .map(|command_id| {
+            crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                command_id.as_str(),
+            )
+        })
         .collect();
     assert!(
         context_ids.ends_with(&expected_ids),
@@ -8002,7 +8016,12 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         .collect();
     let expected_ids: Vec<String> = steer_command_ids
         .iter()
-        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .map(|command_id| {
+            crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                command_id.as_str(),
+            )
+        })
         .collect();
     assert!(
         context_ids.ends_with(&expected_ids),
@@ -8029,9 +8048,10 @@ impl KeyProvider for KillRestartKeyProvider {
 
 async fn open_kill_restart_store(path: &std::path::Path) -> Store {
     let scope = AgentScope {
-        tenant_id: "kill-restart-tenant".to_owned(),
-        agent_id: "kill-restart-agent".to_owned(),
-        conversation_id: "kill-restart-conversation".to_owned(),
+        personality_agent_id: crate::runtime::contracts::PersonalityAgentId::parse(
+            "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+        )
+        .expect("canonical test UUIDv7"),
     };
     let key = WrappingKey::new("kill-restart-key/v1", [0x5a; DATA_KEY_BYTES]);
     Store::open(path, scope, Arc::new(KillRestartKeyProvider(key)))
@@ -10139,6 +10159,8 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
 
 fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),
@@ -10169,6 +10191,8 @@ fn approval_always_decision_with_rule(seq: u64, request_id: &str, rule: Value) -
     let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(rule)
         .expect("object deferred ApproveAlways rule");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),

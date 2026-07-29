@@ -39,7 +39,7 @@ use crate::{
         overflow::OverflowSource,
         types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{PersonalityAgentId, ProcessGeneration},
     store::{
         ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
         EventWriter, InboundAdmission, InboundReceiptOrigin, Projection,
@@ -649,7 +649,7 @@ pub(crate) struct Session<G: Gateway> {
     writer_done: oneshot::Receiver<Result<()>>,
     writer_join: Option<JoinHandle<()>>,
     gateway_type: PhantomData<G>,
-    conversation_id: String,
+    personality_agent_id: PersonalityAgentId,
     writer: EventWriter,
     admission: InboundAdmission,
     recovery_steps: Vec<RecoveryStep>,
@@ -682,14 +682,14 @@ impl<G: Gateway + 'static> Session<G> {
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
         worker.validate_executor_generation(executor_generation)?;
-        let conversation_id = store.scope().conversation_id.clone();
+        let personality_agent_id = store.scope().personality_agent_id.clone();
         let store = Arc::new(store);
         for purpose in [
             DataKeyPurpose::Command,
             DataKeyPurpose::Event,
             DataKeyPurpose::Transcript,
         ] {
-            store.conversation_key(purpose).await?;
+            store.private_key(purpose).await?;
         }
         let writer = EventWriter::new(store.clone());
         writer.initialize_recovery_checkpoint().await?;
@@ -722,7 +722,7 @@ impl<G: Gateway + 'static> Session<G> {
             writer_done,
             writer_join: Some(writer_join),
             gateway_type: PhantomData,
-            conversation_id,
+            personality_agent_id,
             writer,
             admission,
             recovery_steps,
@@ -879,6 +879,17 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
+        if inbound.personality_agent_id() != &self.personality_agent_id
+            || inbound.provenance().personality_agent_id() != &self.personality_agent_id
+        {
+            return Err(anyhow::anyhow!(
+                "command target mismatch before Store admission: session={}, command={}, provenance={}",
+                self.personality_agent_id,
+                inbound.personality_agent_id(),
+                inbound.provenance().personality_agent_id(),
+            )
+            .into());
+        }
         // Capture live ingress before durable admission. Replay returns before
         // construction below and therefore never fabricates a monotonic span.
         let received_monotonic = Instant::now();
@@ -1479,6 +1490,7 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = CommandAck {
             seq,
             command_id,
+            personality_agent_id: self.personality_agent_id.clone(),
             status: CommandAckStatus::Applied,
             reject_reason: None,
         };
@@ -1864,7 +1876,7 @@ impl<G: Gateway + 'static> Session<G> {
             frames.push(OutboundFrame::Event {
                 envelope: crate::gateway::Envelope {
                     seq: output.seq,
-                    conversation_id: self.conversation_id.clone(),
+                    personality_agent_id: self.personality_agent_id.clone(),
                     event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
                 },
             });
@@ -1912,6 +1924,20 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn enqueue_reliable(&mut self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
+        for frame in &frames {
+            let frame_personality_agent_id = match frame {
+                OutboundFrame::Event { envelope } => &envelope.personality_agent_id,
+                OutboundFrame::CommandAck { ack } => &ack.personality_agent_id,
+            };
+            if frame_personality_agent_id != &self.personality_agent_id {
+                return Err(anyhow::anyhow!(
+                    "outbound frame personality-agent mismatch: session={}, frame={}",
+                    self.personality_agent_id,
+                    frame_personality_agent_id,
+                )
+                .into());
+            }
+        }
         let outbound = self.outbound_handle()?.clone();
         match outbound.enqueue_reliable_wait(frames).await {
             Err(SessionFailure::OutboundClosed) => match self.writer_done.try_recv() {

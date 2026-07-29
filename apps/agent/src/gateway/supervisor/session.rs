@@ -13,15 +13,20 @@ use crate::gateway::{
     AgentHello, ApiHello, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError,
     InboundCommand, OutboundFrame,
 };
+use crate::runtime::contracts::PersonalityAgentId;
 
 #[async_trait]
 pub(crate) trait SessionEventDelivery: Send + Sync + 'static {
     async fn on_durable_committed(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission>;
-    async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()>;
+    async fn on_volatile(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        event: AgentEvent,
+    ) -> Result<()>;
 }
 
 /// Result of passing one committed durable sequence through T17.
@@ -55,16 +60,20 @@ impl SessionEventSink {
 
     async fn on_durable_committed(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission> {
         self.delivery
-            .on_durable_committed(conversation_id, seq)
+            .on_durable_committed(personality_agent_id, seq)
             .await
     }
 
-    async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()> {
-        self.delivery.on_volatile(conversation_id, event).await
+    async fn on_volatile(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        event: AgentEvent,
+    ) -> Result<()> {
+        self.delivery.on_volatile(personality_agent_id, event).await
     }
 }
 
@@ -222,7 +231,7 @@ impl GatewayWriter for SessionGatewayWriter {
                     // later terminal ACK in the same committed batch cannot
                     // overtake this durable sequence.
                     let admission = session_events
-                        .on_durable_committed(&envelope.conversation_id, seq)
+                        .on_durable_committed(&envelope.personality_agent_id, seq)
                         .await
                         .map_err(|source| {
                             anyhow!(SessionGatewayError::DurableEvent { seq, source })
@@ -247,7 +256,7 @@ impl GatewayWriter for SessionGatewayWriter {
                     }));
                 }
                 session_events
-                    .on_volatile(&envelope.conversation_id, event)
+                    .on_volatile(&envelope.personality_agent_id, event)
                     .await
                     .map_err(|source| anyhow!(SessionGatewayError::VolatileEvent { source }))
             }
@@ -336,31 +345,35 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingDelivery {
-        durable: Arc<Mutex<Vec<(String, u64)>>>,
-        volatile: Arc<Mutex<Vec<(String, AgentEvent)>>>,
+        durable: Arc<Mutex<Vec<(PersonalityAgentId, u64)>>>,
+        volatile: Arc<Mutex<Vec<(PersonalityAgentId, AgentEvent)>>>,
     }
 
     #[async_trait]
     impl SessionEventDelivery for RecordingDelivery {
         async fn on_durable_committed(
             &self,
-            conversation_id: &str,
+            personality_agent_id: &PersonalityAgentId,
             seq: u64,
         ) -> Result<DurableEventAdmission> {
             self.durable
                 .lock()
                 .unwrap()
-                .push((conversation_id.to_owned(), seq));
+                .push((personality_agent_id.clone(), seq));
             Ok(DurableEventAdmission::Enqueued {
                 epoch: DeliveryEpoch::for_test("session-gateway-flow"),
             })
         }
 
-        async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            personality_agent_id: &PersonalityAgentId,
+            event: AgentEvent,
+        ) -> Result<()> {
             self.volatile
                 .lock()
                 .unwrap()
-                .push((conversation_id.to_owned(), event));
+                .push((personality_agent_id.clone(), event));
             Ok(())
         }
     }
@@ -372,13 +385,17 @@ mod tests {
     impl SessionEventDelivery for FailingDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             anyhow::bail!("store corruption")
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             anyhow::bail!("authorization corruption")
         }
     }
@@ -390,13 +407,17 @@ mod tests {
     impl SessionEventDelivery for DeferredDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             Ok(DurableEventAdmission::Deferred { after_epoch: None })
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -412,7 +433,7 @@ mod tests {
     impl SessionEventDelivery for BlockingDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             self.entered.notify_one();
@@ -420,13 +441,19 @@ mod tests {
             Ok(DurableEventAdmission::Enqueued { epoch: self.epoch })
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             Ok(())
         }
     }
 
     fn command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical command id"),
             command: Command::Abort {},
@@ -438,6 +465,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: command_id.to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -448,7 +476,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(seq),
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "turn_start"}),
             },
         }
@@ -458,7 +486,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "error", "message": message}),
             },
         }
@@ -549,12 +577,12 @@ mod tests {
         );
         assert_eq!(
             *delivery.durable.lock().unwrap(),
-            vec![("conversation".to_owned(), 19)]
+            vec![(crate::gateway::test_personality_agent_id(), 19)]
         );
         assert_eq!(
             *delivery.volatile.lock().unwrap(),
             vec![(
-                "conversation".to_owned(),
+                crate::gateway::test_personality_agent_id(),
                 AgentEvent::Error {
                     message: "sk-secret-delta".to_owned()
                 }
@@ -708,7 +736,7 @@ mod tests {
         let malformed = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "not_an_agent_event"}),
             },
         };
@@ -725,7 +753,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: "conversation".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "turn_start"}),
                 },
             })
@@ -767,7 +795,7 @@ mod tests {
         assert_ne!(first_seen, second_seen);
         assert_eq!(
             *delivery.durable.lock().unwrap(),
-            vec![("conversation".to_owned(), 23)]
+            vec![(crate::gateway::test_personality_agent_id(), 23)]
         );
     }
 
@@ -911,7 +939,7 @@ mod tests {
         );
         let error = gateway
             .authenticate_hello(AgentHello {
-                agent_id: "agent".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 generation: ProcessGeneration::MIN,
                 last_sent_event_seq: 0,
                 last_received_command_seq: 0,

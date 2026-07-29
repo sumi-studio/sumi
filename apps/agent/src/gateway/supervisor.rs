@@ -26,7 +26,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
-use crate::runtime::contracts::ProcessGeneration;
+use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration};
 
 use super::{
     CommandAck, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
@@ -77,19 +77,36 @@ impl ConnectionEpoch {
 #[derive(Clone)]
 pub struct GatewayCredential {
     token: String,
+    personality_agent_id: PersonalityAgentId,
+    generation: ProcessGeneration,
     delivery_authorization: DeliveryAuthorization,
 }
 
 impl GatewayCredential {
-    pub fn new(token: impl Into<String>, delivery_authorization: DeliveryAuthorization) -> Self {
+    pub fn new(
+        token: impl Into<String>,
+        personality_agent_id: PersonalityAgentId,
+        generation: ProcessGeneration,
+        delivery_authorization: DeliveryAuthorization,
+    ) -> Self {
         Self {
             token: token.into(),
+            personality_agent_id,
+            generation,
             delivery_authorization,
         }
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
+    }
+
+    pub const fn generation(&self) -> ProcessGeneration {
+        self.generation
     }
 
     pub const fn delivery_authorization(&self) -> DeliveryAuthorization {
@@ -101,6 +118,8 @@ impl fmt::Debug for GatewayCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayCredential")
             .field("token", &"[REDACTED]")
+            .field("personality_agent_id", &self.personality_agent_id)
+            .field("generation", &self.generation)
             .field("delivery_authorization", &self.delivery_authorization)
             .finish()
     }
@@ -131,7 +150,7 @@ impl Drop for GatewayCredential {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
-    pub agent_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     #[serde(with = "lossless_generation")]
     pub generation: ProcessGeneration,
     #[serde(with = "lossless_u64")]
@@ -146,6 +165,7 @@ pub struct AgentHello {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiHello {
+    pub personality_agent_id: PersonalityAgentId,
     #[serde(with = "lossless_generation")]
     pub accepted_generation: ProcessGeneration,
     #[serde(with = "lossless_u64")]
@@ -455,7 +475,7 @@ pub trait HydrationLatch: Clone + Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupervisorConfig {
-    pub agent_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub generation: ProcessGeneration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
@@ -467,25 +487,6 @@ pub struct SupervisorConfig {
     pub max_auth_attempts: Option<u32>,
     pub hello_timeout: Duration,
     pub connect_timeout: Duration,
-}
-
-impl Default for SupervisorConfig {
-    fn default() -> Self {
-        Self {
-            agent_id: String::new(),
-            generation: ProcessGeneration::MIN,
-            initial_backoff: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(30),
-            send_timeout: Duration::from_secs(30),
-            event_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            command_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            catch_up_page_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            max_reconnect_attempts: None,
-            max_auth_attempts: Some(3),
-            hello_timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(30),
-        }
-    }
 }
 
 /// Sender returned by `SupervisorHandle::events`.
@@ -825,6 +826,17 @@ where
                 reason: format!("failed to obtain credential: {e}"),
             })?,
         };
+        if credential.personality_agent_id() != &config.personality_agent_id
+            || credential.generation() != config.generation
+        {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "gateway credential scope mismatch: expected ({}, {}), got ({}, {})",
+                config.personality_agent_id,
+                config.generation,
+                credential.personality_agent_id(),
+                credential.generation(),
+            )));
+        }
         let delivery_authorization = credential.delivery_authorization();
 
         let mut gateway = tokio::select! {
@@ -946,6 +958,7 @@ where
             commands_tx,
             self.latch.clone(),
             api_hello,
+            config.personality_agent_id.clone(),
             epoch_token.child_token(),
             command_send_blocked_notify,
         ));
@@ -1190,7 +1203,7 @@ async fn build_agent_hello<S: DurableSource>(
                 reason: format!("command cursor unavailable: {e}"),
             })?;
     Ok(AgentHello {
-        agent_id: config.agent_id.clone(),
+        personality_agent_id: config.personality_agent_id.clone(),
         generation: config.generation,
         last_sent_event_seq: event_cursor.last_sent,
         last_received_command_seq: command_cursor.received,
@@ -1203,6 +1216,13 @@ async fn validate_hello<S: DurableSource>(
     agent: &AgentHello,
     api: &ApiHello,
 ) -> Result<(), SupervisorError> {
+    if api.personality_agent_id != agent.personality_agent_id {
+        return Err(SupervisorError::Fatal(anyhow!(
+            "personality-agent claim mismatch: api={}, agent={}",
+            api.personality_agent_id,
+            agent.personality_agent_id
+        )));
+    }
     if api.accepted_generation != agent.generation {
         return Err(SupervisorError::Fatal(anyhow!(
             "generation claim mismatch: api={}, agent={}",
@@ -1938,6 +1958,7 @@ async fn reader_task<R, L>(
     mut command_tx: mpsc::Sender<InboundCommand>,
     latch: L,
     api_hello: ApiHello,
+    personality_agent_id: PersonalityAgentId,
     token: CancellationToken,
     command_send_blocked_notify: Option<Arc<Notify>>,
 ) -> Result<(), ReaderError>
@@ -1997,7 +2018,7 @@ where
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
-                        next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                        next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
                     }
                     if terminal_after_pending {
                         break 'task Err(ReaderError::Terminal);
@@ -2010,7 +2031,7 @@ where
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
-                                next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                                next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
                             } else if pending.len() >= MAX_PENDING_BEFORE_READY {
                                 break 'task Err(ReaderError::Fatal(anyhow!(
                                     "hydration hold limit exceeded: {} commands received before Ready",
@@ -2051,11 +2072,26 @@ where
 
 async fn send_validated(
     cmd: InboundCommand,
+    expected_personality_agent_id: &PersonalityAgentId,
     next_expected: u64,
     command_tx: &mut mpsc::Sender<InboundCommand>,
     token: &CancellationToken,
     blocked_notify: Option<Arc<Notify>>,
 ) -> Result<u64> {
+    if cmd.personality_agent_id() != expected_personality_agent_id {
+        bail!(
+            "command target mismatch: expected {}, got {}",
+            expected_personality_agent_id,
+            cmd.personality_agent_id()
+        );
+    }
+    if cmd.provenance().personality_agent_id() != expected_personality_agent_id {
+        bail!(
+            "command provenance target mismatch: expected {}, got {}",
+            expected_personality_agent_id,
+            cmd.provenance().personality_agent_id()
+        );
+    }
     let seq = inbound_command_seq(&cmd);
     if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
@@ -2191,7 +2227,9 @@ mod tests {
         StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
         ValidatedToolArguments,
     };
-    use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
+    use crate::runtime::contracts::{
+        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease,
+    };
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationOutcome, Store,
         insert_test_durable_event, user_message_id,
@@ -2375,7 +2413,22 @@ mod tests {
             let n = self.counter.fetch_add(1, Ordering::SeqCst);
             let token = format!("{}-{}", self.prefix, n);
             self.tokens.lock().unwrap().push(token.clone());
-            Ok(GatewayCredential::new(token, self.delivery_authorization))
+            Ok(GatewayCredential::new(
+                token,
+                crate::gateway::test_personality_agent_id(),
+                ProcessGeneration::from_wire(7).unwrap(),
+                self.delivery_authorization,
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedCredentialProvider(GatewayCredential);
+
+    #[async_trait]
+    impl CredentialProvider for FixedCredentialProvider {
+        async fn fresh_credential(&mut self) -> Result<GatewayCredential> {
+            Ok(self.0.clone())
         }
     }
 
@@ -2406,6 +2459,8 @@ mod tests {
             let attempt = self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(GatewayCredential::new(
                 format!("sequenced-token-{attempt}"),
+                crate::gateway::test_personality_agent_id(),
+                ProcessGeneration::from_wire(7).unwrap(),
                 authorization,
             ))
         }
@@ -2596,6 +2651,7 @@ mod tests {
             }
             let accepted_generation = self.hello_generation.unwrap_or(hello.generation);
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
                 next_command_seq: self
@@ -2636,6 +2692,7 @@ mod tests {
             hello: AgentHello,
         ) -> std::result::Result<ApiHello, HelloError> {
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: self.next_command_seq,
@@ -2704,7 +2761,7 @@ mod tests {
 
     fn make_config() -> SupervisorConfig {
         SupervisorConfig {
-            agent_id: "test-agent".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
@@ -2733,7 +2790,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(seq),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "agent_start"}),
             },
         }
@@ -2741,6 +2798,29 @@ mod tests {
 
     fn valid_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
+            seq,
+            command_id: CommandId::parse(command_id).unwrap(),
+            command: Command::Abort {},
+        })
+    }
+
+    fn valid_command_for(
+        seq: u64,
+        command_id: &str,
+        personality_agent_id: PersonalityAgentId,
+        tenant_id: &str,
+        principal_id: &str,
+    ) -> InboundCommand {
+        InboundCommand::Valid(CommandEnvelope {
+            provenance: DirectChatProvenanceV1::new(
+                tenant_id,
+                personality_agent_id.clone(),
+                principal_id,
+            )
+            .expect("valid direct-chat provenance"),
+            personality_agent_id,
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
             command: Command::Abort {},
@@ -2751,6 +2831,8 @@ mod tests {
         InboundCommand::Invalid {
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command: crate::gateway::RejectedCommandPayload::DiscardedOversized,
             payload_digest: Some(crate::gateway::KeyedCommandDigest::new("test-key", [0; 32])),
@@ -2758,6 +2840,38 @@ mod tests {
     }
 
     // Tests
+
+    #[tokio::test]
+    async fn credential_scope_mismatch_is_fatal_before_connect() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = MockConnector::new(sent_hellos, VecDeque::new());
+        let credentials = FixedCredentialProvider(GatewayCredential::new(
+            "wrong-scope-token",
+            PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd").unwrap(),
+            ProcessGeneration::from_wire(7).unwrap(),
+            DeliveryAuthorization::Raw,
+        ));
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let handle = supervisor.start();
+        let error = handle
+            .join()
+            .await
+            .expect_err("credential target mismatch must terminate the supervisor");
+
+        assert!(
+            error
+                .to_string()
+                .contains("gateway credential scope mismatch"),
+            "unexpected supervisor error: {error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn fresh_credential_per_attempt() {
@@ -3640,6 +3754,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Rejected,
                 reject_reason: Some("oversized".to_owned()),
             },
@@ -3668,6 +3783,7 @@ mod tests {
         drop(rx);
         let result = send_validated(
             valid_command(1, "00000000-0000-4000-8000-000000000001"),
+            &crate::gateway::test_personality_agent_id(),
             1,
             &mut tx,
             &CancellationToken::new(),
@@ -3683,6 +3799,7 @@ mod tests {
         let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
         let error = send_validated(
             valid_command(u64::MAX, "00000000-0000-4000-8000-000000000001"),
+            &crate::gateway::test_personality_agent_id(),
             u64::MAX,
             &mut tx,
             &CancellationToken::new(),
@@ -3692,6 +3809,89 @@ mod tests {
         .expect_err("maximum command sequence must exhaust the cursor");
         assert!(error.is::<DurableReplayInvariantError>());
         assert_eq!(inbound_command_seq(&rx.recv().await.unwrap()), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn send_validated_rejects_a_different_personality_before_forwarding() {
+        let expected = crate::gateway::test_personality_agent_id();
+        let different = PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd").unwrap();
+        let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
+
+        let error = send_validated(
+            valid_command_for(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                different,
+                "tenant-a",
+                "human-a",
+            ),
+            &expected,
+            1,
+            &mut tx,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("a different personality must be rejected before admission");
+
+        assert!(error.to_string().contains("command target mismatch"));
+        assert!(
+            rx.try_recv().is_err(),
+            "mismatched command must not reach Store"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_validated_keeps_one_runtime_identity_across_tenant_contexts() {
+        let personality_agent_id = crate::gateway::test_personality_agent_id();
+        let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(2);
+        let cancel = CancellationToken::new();
+
+        let next = send_validated(
+            valid_command_for(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                personality_agent_id.clone(),
+                "tenant-a",
+                "human-a",
+            ),
+            &personality_agent_id,
+            1,
+            &mut tx,
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        let next = send_validated(
+            valid_command_for(
+                2,
+                "00000000-0000-4000-8000-000000000002",
+                personality_agent_id.clone(),
+                "tenant-b",
+                "human-b",
+            ),
+            &personality_agent_id,
+            next,
+            &mut tx,
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next, 3);
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.personality_agent_id(), second.personality_agent_id());
+        assert_ne!(
+            first.provenance().tenant_id(),
+            second.provenance().tenant_id()
+        );
+        assert_ne!(
+            first.provenance().actor().principal_id(),
+            second.provenance().actor().principal_id()
+        );
     }
 
     #[tokio::test]
@@ -3710,6 +3910,7 @@ mod tests {
             ack: CommandAck {
                 seq: 0,
                 command_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -3732,6 +3933,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -3739,7 +3941,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "delta"}),
             },
         };
@@ -4497,6 +4699,7 @@ mod tests {
         assert_eq!(agent.last_received_command_seq, 5);
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4581,6 +4784,7 @@ mod tests {
         // applied+1 command, even though the local applied cursor has since
         // moved to 7.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4592,6 +4796,7 @@ mod tests {
         // The API may start at an already-applied command when its terminal ACK
         // was lost; the durable consumer will re-ACK it without reapplying it.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 5,
@@ -4601,6 +4806,7 @@ mod tests {
             .expect("locally terminal command must remain replayable");
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 0,
@@ -4624,7 +4830,7 @@ mod tests {
         // Generation boundaries: 0, JSON-safe max, JSON-safe max + 1, i64::MAX.
         for gen_value in [0, json_safe, over_json_safe, i64_max] {
             let agent = AgentHello {
-                agent_id: "a".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 generation: ProcessGeneration::from_wire(gen_value).unwrap(),
                 last_sent_event_seq: 0,
                 last_received_command_seq: 0,
@@ -4642,6 +4848,7 @@ mod tests {
         // Seq boundaries: 0, JSON-safe max, JSON-safe max + 1, u64::MAX.
         for seq in [0, json_safe, over_json_safe, u64_max] {
             let api = ApiHello {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 accepted_generation: ProcessGeneration::from_wire(0).unwrap(),
                 last_received_event_seq: seq,
                 next_command_seq: seq,
@@ -4654,7 +4861,7 @@ mod tests {
 
         // i64::MAX and u64::MAX together in one hello.
         let agent_i64_max = AgentHello {
-            agent_id: "a".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(i64_max).unwrap(),
             last_sent_event_seq: u64_max,
             last_received_command_seq: u64_max,
@@ -4667,39 +4874,37 @@ mod tests {
 
         // Generation beyond i64::MAX is rejected on the wire.
         let agent_json = format!(
-            r#"{{"agent_id":"a","generation":"{over_i64}","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"{over_i64}","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
         );
         assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
 
         let api_json = format!(
-            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
 
         // u64 overflow is rejected.
         let agent_overflow = format!(
-            r#"{{"agent_id":"a","generation":"0","last_sent_event_seq":"{over_u64}","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"0","last_sent_event_seq":"{over_u64}","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
         );
         assert!(serde_json::from_str::<AgentHello>(&agent_overflow).is_err());
 
         let api_overflow = format!(
-            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_overflow).is_err());
 
         // Old numeric encodings are no longer accepted; the wire uses strings.
-        let agent_numeric = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
+        let agent_numeric = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_numeric).is_err());
-        let api_numeric =
-            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+        let api_numeric = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_numeric).is_err());
     }
 
     #[test]
     fn hello_dto_rejects_malformed_unknown_and_trailing_data() {
-        let agent_base = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
-        let api_base =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let agent_base = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
+        let api_base = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
 
         assert!(serde_json::from_str::<AgentHello>(agent_base).is_ok());
         assert!(serde_json::from_str::<ApiHello>(api_base).is_ok());
@@ -4747,17 +4952,17 @@ mod tests {
         }
 
         // Unknown fields continue to be rejected.
-        let agent_unknown = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
+        let agent_unknown = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
 
-        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let api_unknown = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
 
         // Trailing data after a valid object must also be rejected.
-        let agent_trailing = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
+        let agent_trailing = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
 
-        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
+        let api_trailing = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
@@ -4802,13 +5007,14 @@ mod tests {
         }
 
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: 0,
             last_applied_command_seq: 0,
         };
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -4844,13 +5050,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_hello_rejects_personality_mismatch_before_cursor_state() {
+        let agent = AgentHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 0,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 0,
+        };
+        let api = ApiHello {
+            personality_agent_id: PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd")
+                .unwrap(),
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+        };
+
+        let result = validate_hello(
+            &MockDurableSource::new(CommandCursors::default()),
+            &agent,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(SupervisorError::Fatal(ref error))
+                    if error.to_string().contains("personality-agent claim mismatch")
+            ),
+            "wrong personality must be fatal before trusting peer cursors: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_hello_command_cursor_cannot_skip_nonterminal_prefix() {
         let cursor = CommandCursors {
             received: 10,
             applied: 5,
         };
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
@@ -4883,6 +5122,7 @@ mod tests {
         // A locally terminal command remains a valid replay point when the API
         // did not durably record its terminal ACK.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
@@ -4893,6 +5133,7 @@ mod tests {
 
         // Exactly applied+1 is the normal catch-up boundary and is allowed.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4903,6 +5144,7 @@ mod tests {
 
         // A cursor after applied+1 skips a locally nonterminal command.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
@@ -4914,6 +5156,7 @@ mod tests {
         );
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
@@ -4926,6 +5169,7 @@ mod tests {
 
         // Ahead of received+1 is also fatal.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 12,
@@ -4938,6 +5182,7 @@ mod tests {
         );
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 0,
@@ -4994,6 +5239,7 @@ mod tests {
                 hello: AgentHello,
             ) -> std::result::Result<ApiHello, HelloError> {
                 Ok(ApiHello {
+                    personality_agent_id: hello.personality_agent_id.clone(),
                     accepted_generation: hello.generation,
                     last_received_event_seq: 0,
                     next_command_seq: self.terminal_seq,
@@ -5136,13 +5382,14 @@ mod tests {
             applied: u64::MAX,
         };
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
             last_applied_command_seq: cursor.applied,
         };
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: u64::MAX,
@@ -5430,7 +5677,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
             },
         };
@@ -5442,6 +5689,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -5563,7 +5811,7 @@ mod tests {
             pump.install_supervised_epoch(epoch, failure_tx.clone());
             *self.pump.lock().unwrap() = Some(pump);
 
-            let conversation_id = "conversation-1".to_owned();
+            let personality_agent_id = crate::gateway::test_personality_agent_id();
             let task = tokio::spawn(async move {
                 loop {
                     let frame = tokio::select! {
@@ -5592,7 +5840,7 @@ mod tests {
                     let outbound = OutboundFrame::Event {
                         envelope: Envelope {
                             seq,
-                            conversation_id: conversation_id.clone(),
+                            personality_agent_id: personality_agent_id.clone(),
                             event,
                         },
                     };
@@ -5850,7 +6098,7 @@ mod tests {
             OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: "conversation-1".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "message_update"}),
                 },
             },
@@ -5926,6 +6174,7 @@ mod tests {
                 ack: CommandAck {
                     seq: 1,
                     command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     status: CommandAckStatus::Applied,
                     reject_reason: None,
                 },
@@ -6092,6 +6341,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -6104,7 +6354,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
             },
         };
@@ -6790,6 +7040,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -6904,7 +7155,7 @@ mod tests {
 
     #[test]
     fn agent_hello_rejects_unknown_fields() {
-        let json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
+        let json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(
             serde_json::from_str::<AgentHello>(json).is_err(),
             "AgentHello must reject unknown fields"
@@ -6913,7 +7164,7 @@ mod tests {
 
     #[test]
     fn api_hello_rejects_unknown_fields() {
-        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(
             serde_json::from_str::<ApiHello>(json).is_err(),
             "ApiHello must reject unknown fields"
@@ -6922,11 +7173,10 @@ mod tests {
 
     #[test]
     fn hello_dto_deserialization_still_accepts_known_fields() {
-        let agent_json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
+        let agent_json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
 
-        let api_json =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let api_json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 
@@ -7037,6 +7287,7 @@ mod tests {
         let (online, mut online_rx) = watch::channel(false);
         let token = CancellationToken::new();
         let api_hello = ApiHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -7131,6 +7382,7 @@ mod tests {
         let (online, online_rx) = watch::channel(false);
         let token = CancellationToken::new();
         let api_hello = ApiHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -7724,7 +7976,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: Some(2),
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     // This Session-carried payload is intentionally raw and
                     // different from the committed row. The adapter must
                     // discard it and make T17 re-read seq=2.
@@ -7740,7 +7992,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
                         tool_call_id: "tool-1".to_owned(),
                         partial: serde_json::json!({"stdout": raw_secret}),
@@ -7869,7 +8121,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: Some(1),
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::json!({
                         "type": "error",
                         "message": format!("untrusted Session copy {raw_secret}")
@@ -7886,7 +8138,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
                         tool_call_id: "raw-backlog-tool".to_owned(),
                         partial: serde_json::json!({"stdout": raw_secret}),
@@ -8000,7 +8252,7 @@ mod tests {
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
                         seq: Some(seq),
-                        conversation_id: store.scope().conversation_id.clone(),
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
                         event: serde_json::json!({
                             "type": "error",
                             "message": "untrusted Session payload must be ignored"
@@ -8108,13 +8360,13 @@ mod tests {
             },
         });
         let (_reader, mut writer) = gateway.split();
-        let conversation_id = store.scope().conversation_id.clone();
+        let personality_agent_id = store.scope().personality_agent_id.clone();
         let write = tokio::spawn(async move {
             writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
                         seq: Some(1),
-                        conversation_id,
+                        personality_agent_id,
                         event: serde_json::json!({"type": "agent_start"}),
                     },
                 })
@@ -8124,6 +8376,7 @@ mod tests {
                     ack: CommandAck {
                         seq: 1,
                         command_id: COMMAND_ID.to_owned(),
+                        personality_agent_id: crate::gateway::test_personality_agent_id(),
                         status: CommandAckStatus::Applied,
                         reject_reason: None,
                     },
@@ -8566,6 +8819,8 @@ mod tests {
         let second_sent = Arc::new(Mutex::new(Vec::new()));
 
         let user_command = InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {
@@ -8748,6 +9003,8 @@ mod tests {
         let writer_blocked = Arc::new(Notify::new());
         let writer_release = Arc::new(Notify::new());
         let command = InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {
@@ -9002,6 +9259,7 @@ mod tests {
         ) -> std::result::Result<ApiHello, HelloError> {
             self.sent_hellos.lock().unwrap().push(hello.clone());
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),

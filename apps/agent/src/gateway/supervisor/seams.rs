@@ -178,7 +178,7 @@ impl T17StoreAdapter {
         cancel: CancellationToken,
         failure_tx: mpsc::UnboundedSender<DeliveryEpochFailure>,
     ) -> tokio::task::JoinHandle<()> {
-        let conversation_id = self.store.scope().conversation_id.clone();
+        let personality_agent_id = self.store.scope().personality_agent_id.clone();
         let durable_fences = self.durable_fences.clone();
         tokio::spawn(async move {
             loop {
@@ -279,7 +279,7 @@ impl T17StoreAdapter {
                 let outbound = OutboundFrame::Event {
                     envelope: Envelope {
                         seq,
-                        conversation_id: conversation_id.clone(),
+                        personality_agent_id: personality_agent_id.clone(),
                         event,
                     },
                 };
@@ -437,13 +437,13 @@ impl T17StoreAdapter {
 impl SessionEventDelivery for T17StoreAdapter {
     async fn on_durable_committed(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission> {
-        if conversation_id != self.store.scope().conversation_id {
+        if personality_agent_id != &self.store.scope().personality_agent_id {
             bail!(
-                "Session durable event conversation mismatch: expected {}, got {conversation_id}",
-                self.store.scope().conversation_id
+                "Session durable event personality-agent mismatch: expected {}, got {personality_agent_id}",
+                self.store.scope().personality_agent_id
             );
         }
         T17StoreAdapter::on_durable_committed(self, seq).await
@@ -451,13 +451,13 @@ impl SessionEventDelivery for T17StoreAdapter {
 
     async fn on_volatile(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
         event: crate::agent::AgentEvent,
     ) -> Result<()> {
-        if conversation_id != self.store.scope().conversation_id {
+        if personality_agent_id != &self.store.scope().personality_agent_id {
             bail!(
-                "Session volatile event conversation mismatch: expected {}, got {conversation_id}",
-                self.store.scope().conversation_id
+                "Session volatile event personality-agent mismatch: expected {}, got {personality_agent_id}",
+                self.store.scope().personality_agent_id
             );
         }
         match T17StoreAdapter::on_volatile(self, event).await {
@@ -532,7 +532,7 @@ impl DurableSource for T17StoreAdapter {
                     Ok(OutboundFrame::Event {
                         envelope: Envelope {
                             seq: Some(seq),
-                            conversation_id: self.store.scope().conversation_id.clone(),
+                            personality_agent_id: self.store.scope().personality_agent_id.clone(),
                             event: serde_json::to_value(event)
                                 .context("serialize durable T17 event for gateway")?,
                         },
@@ -547,7 +547,11 @@ impl DurableSource for T17StoreAdapter {
                         Ok(OutboundFrame::Event {
                             envelope: Envelope {
                                 seq: Some(seq),
-                                conversation_id: self.store.scope().conversation_id.clone(),
+                                personality_agent_id: self
+                                    .store
+                                    .scope()
+                                    .personality_agent_id
+                                    .clone(),
                                 event: parse_projected_event(seq, &projection)?,
                             },
                         })

@@ -11,6 +11,8 @@ pub mod ws;
 
 /// Maximum size in bytes of a single gateway frame/message.
 pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+pub(crate) const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
 
 use std::fmt;
 
@@ -20,6 +22,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize;
+
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+
+#[cfg(test)]
+pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
+    PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical test UUIDv7")
+}
+
+#[cfg(test)]
+pub(crate) fn test_direct_chat_provenance() -> DirectChatProvenanceV1 {
+    DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+        .expect("valid direct-chat provenance")
+}
 
 #[allow(
     unused_imports,
@@ -100,6 +115,8 @@ where
 pub struct CommandEnvelope {
     pub seq: u64,
     pub command_id: CommandId,
+    pub personality_agent_id: PersonalityAgentId,
+    pub provenance: DirectChatProvenanceV1,
     pub command: Command,
 }
 
@@ -164,6 +181,8 @@ pub enum InboundCommand {
     Invalid {
         seq: u64,
         command_id: CommandId,
+        personality_agent_id: PersonalityAgentId,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         /// Transient bytes used only to authenticate the durable receipt. The
         /// EventWriter encrypts valid-size rejects and discards oversized bytes
@@ -173,6 +192,32 @@ pub enum InboundCommand {
         /// command value after incrementally authenticating its exact raw bytes.
         payload_digest: Option<KeyedCommandDigest>,
     },
+}
+
+impl InboundCommand {
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Valid(envelope) => envelope.seq,
+            Self::Invalid { seq, .. } => *seq,
+        }
+    }
+
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        match self {
+            Self::Valid(envelope) => &envelope.personality_agent_id,
+            Self::Invalid {
+                personality_agent_id,
+                ..
+            } => personality_agent_id,
+        }
+    }
+
+    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+        match self {
+            Self::Valid(envelope) => &envelope.provenance,
+            Self::Invalid { provenance, .. } => provenance,
+        }
+    }
 }
 
 pub(crate) const MISSING_COMMAND_PAYLOAD: &[u8] = b"\0sumi/inbound-command/missing-field/v1";
@@ -306,6 +351,7 @@ pub enum CommandAckStatus {
 pub struct CommandAck {
     pub seq: u64,
     pub command_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub status: CommandAckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
@@ -315,7 +361,7 @@ pub struct CommandAck {
 pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    pub conversation_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub event: serde_json::Value,
 }
 
@@ -484,7 +530,9 @@ mod tests {
         let encoded = serde_json::to_value(OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: "018f3f8d-7b2c-7a10-8f9e-123456789abc"
+                    .parse()
+                    .expect("canonical UUIDv7"),
                 event: json!({"type": "text_delta"}),
             },
         })
@@ -500,6 +548,7 @@ mod tests {
             ack: CommandAck {
                 seq: 7,
                 command_id: "00000000-0000-4000-8000-000000000007".to_owned(),
+                personality_agent_id: test_personality_agent_id(),
                 status: CommandAckStatus::Rejected,
                 reject_reason: Some("oversized".to_owned()),
             },
@@ -513,6 +562,7 @@ mod tests {
                 "ack": {
                     "seq": 7,
                     "command_id": "00000000-0000-4000-8000-000000000007",
+                    "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
                     "status": "rejected",
                     "reject_reason": "oversized",
                 }
