@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{Stream, task::AtomicWaker};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -89,6 +90,15 @@ impl From<PublicMessage> for Message {
     }
 }
 
+impl PublicMessage {
+    pub fn usage(&self) -> Usage {
+        match self {
+            PublicMessage::Assistant(assistant) => assistant.usage.clone(),
+            _ => Usage::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
@@ -122,6 +132,11 @@ pub struct ProviderOrigin {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderContextItem {
+    /// Exact durable MessageEnd that owns this retention unit. This is
+    /// deliberately separate from `origin_message`: native compaction has no
+    /// semantic transcript origin, but still has one authenticated lifecycle
+    /// owner for recovery and erasure.
+    pub retention_owner: ProviderContextAnchor,
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
     /// Tie-breaker within the same `wire_item_index`, zero-based and assigned
@@ -135,7 +150,21 @@ pub struct ProviderContextItem {
 /// provider replay. Every authenticated anchor/wire group starts at ordinal
 /// zero and has no duplicate or missing ordinal. Native windows form an
 /// unanchored group scoped by their exact provider origin and payload kind.
-pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
+impl AsRef<ProviderContextItem> for ProviderContextItem {
+    fn as_ref(&self) -> &ProviderContextItem {
+        self
+    }
+}
+
+pub fn validate_provider_context_ordinals<T: AsRef<ProviderContextItem>>(
+    items: &[T],
+) -> Result<(), String> {
+    validate_provider_context_ordinal_refs(items.iter().map(AsRef::as_ref))
+}
+
+pub(crate) fn validate_provider_context_ordinal_refs<'a>(
+    items: impl IntoIterator<Item = &'a ProviderContextItem>,
+) -> Result<(), String> {
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum Group {
         Anchored {
@@ -144,6 +173,8 @@ pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Resu
             wire_item_index: u32,
         },
         Native {
+            retention_owner_message_id: String,
+            retention_owner_message_seq: u64,
             provider_instance_id: String,
             protocol: ApiProtocol,
             model: String,
@@ -153,12 +184,21 @@ pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Resu
 
     let mut groups = BTreeMap::<Group, Vec<u32>>::new();
     for item in items {
+        if item.retention_owner.message_id.is_empty() {
+            return Err("provider context retention owner message_id is empty".to_owned());
+        }
         let group = match &item.payload {
             ProviderContextPayload::EncryptedReasoning { .. } => {
                 let anchor = item
                     .origin_message
                     .as_ref()
                     .ok_or_else(|| "encrypted reasoning is missing an origin message".to_owned())?;
+                if anchor != &item.retention_owner {
+                    return Err(
+                        "encrypted reasoning origin message does not match its retention owner"
+                            .to_owned(),
+                    );
+                }
                 let wire_item_index = item
                     .wire_item_index
                     .ok_or_else(|| "encrypted reasoning is missing a wire_item_index".to_owned())?;
@@ -177,6 +217,8 @@ pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Resu
                     );
                 }
                 Group::Native {
+                    retention_owner_message_id: item.retention_owner.message_id.clone(),
+                    retention_owner_message_seq: item.retention_owner.message_seq,
                     provider_instance_id: item.provider_origin.provider_instance_id.clone(),
                     protocol: item.provider_origin.protocol,
                     model: item.provider_origin.model.clone(),
@@ -219,6 +261,7 @@ pub fn bind_provider_context_fragments(
     for fragment in fragments {
         let ordinal = next_ordinal.entry(fragment.wire_item_index).or_insert(0);
         let item = ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: match &fragment.payload {
                 ProviderContextPayload::EncryptedReasoning { .. } => Some(anchor.clone()),
                 ProviderContextPayload::OpenAiCompactedWindow { .. }
@@ -1029,6 +1072,92 @@ pub struct PromptContext {
     pub messages: Vec<ContextMessage>,
     pub provider_context: Vec<ProviderContextItem>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum VerifiedReplayProvenance {
+    SumiNormalized {
+        provider_origin: ProviderOrigin,
+        canonical_through_seq: Option<u64>,
+    },
+    ProviderNativeExact {
+        provider_origin: ProviderOrigin,
+        native_coverage_through_seq: u64,
+        canonical_suffix_through_seq: Option<u64>,
+    },
+}
+
+impl PromptContext {
+    pub fn new(
+        system_prompt: String,
+        memory_blocks: Vec<MemoryBlock>,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            system_prompt,
+            memory_blocks,
+            messages,
+            provider_context,
+            tools,
+            replay_provenance: None,
+        }
+    }
+
+    pub(crate) fn verified_replay_provenance(
+        &self,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let Some(provenance) = &self.replay_provenance else {
+            return Ok(None);
+        };
+        provenance.verify(self.replay_send_view_digest()?).map(Some)
+    }
+
+    pub(crate) fn verified_replay_provenance_for(
+        &self,
+        destination: &ProviderOrigin,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let provenance = self.verified_replay_provenance()?;
+        if provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.provider_origin() != destination)
+        {
+            return Err(
+                "bound replay destination does not match the selected provider_origin".into(),
+            );
+        }
+        Ok(provenance)
+    }
+
+    pub(crate) fn replay_send_view_digest(&self) -> Result<[u8; 32], String> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("failed to serialize replay send view: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"sumi.prompt-replay-binding.v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| "replay send view length exceeds u64".to_owned())?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
+}
+
+impl VerifiedReplayProvenance {
+    pub(crate) fn provider_origin(&self) -> &ProviderOrigin {
+        match self {
+            Self::SumiNormalized {
+                provider_origin, ..
+            }
+            | Self::ProviderNativeExact {
+                provider_origin, ..
+            } => provider_origin,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1369,6 +1498,7 @@ mod tests {
                     "required": ["path"]
                 }),
             }],
+            replay_provenance: None,
         };
 
         assert_round_trip(&context);
@@ -2143,6 +2273,7 @@ mod tests {
             message_seq: 7,
         };
         let item = |wire_item_index, ordinal| ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor.clone()),
             wire_item_index: Some(wire_item_index),
             ordinal,
@@ -2172,6 +2303,7 @@ mod tests {
         }
 
         let native = ProviderContextItem {
+            retention_owner: anchor,
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
@@ -2185,5 +2317,36 @@ mod tests {
             },
         };
         assert!(validate_provider_context_ordinals(&[native]).is_err());
+    }
+
+    #[test]
+    fn native_binding_keeps_semantic_origin_none_and_authenticates_retention_owner() {
+        let owner = ProviderContextAnchor {
+            message_id: "assistant-error".to_owned(),
+            message_seq: 11,
+        };
+        let items = bind_provider_context_fragments(
+            vec![ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "id": "cmp-error",
+                        "type": "compaction",
+                        "encrypted_content": "opaque",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 9,
+                        context_fingerprint: "fp-error".to_owned(),
+                    },
+                },
+            }],
+            owner.clone(),
+            origin(),
+        )
+        .expect("bind native Error context");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].retention_owner, owner);
+        assert_eq!(items[0].origin_message, None);
     }
 }

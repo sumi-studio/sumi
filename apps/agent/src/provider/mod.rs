@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod assembler;
 pub(crate) mod canonical_request;
+pub(crate) mod context_fingerprint;
 pub mod model;
 pub mod overflow;
 pub mod partial_json;
@@ -2468,6 +2469,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
             "stream_ended_without_finish_reason".to_owned(),
         ),
         ChatAdapterError::UnsupportedProtocol
+        | ChatAdapterError::InvalidContext(_)
         | ChatAdapterError::InvalidMaxTokens { .. }
         | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
@@ -2556,6 +2558,13 @@ mod tests {
         AssistantContent, ContextMessage, Message, RejectedToolCall, ToolArgumentError, ToolCall,
         ToolDefinition, ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
     };
+
+    #[test]
+    fn chat_context_validation_is_classified_as_invalid_provider_request() {
+        let (message, code) = adapter_error(&ChatAdapterError::InvalidContext("fixture".into()));
+        assert!(message.contains("fixture"));
+        assert_eq!(code, "invalid_provider_request");
+    }
 
     struct CaptureCommandFixture {
         root: PathBuf,
@@ -2993,6 +3002,7 @@ fi
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         }
     }
 
@@ -5634,6 +5644,7 @@ fi
             }],
             provider_context: vec![],
             tools: vec![tool.clone()],
+            replay_provenance: None,
         };
         let first = run_live_request(
             spec.clone(),
@@ -5693,6 +5704,7 @@ fi
             ],
             provider_context: vec![],
             tools: vec![tool],
+            replay_provenance: None,
         };
         let second = run_live_request(
             spec,
@@ -5834,6 +5846,7 @@ fi
                     "additionalProperties":false
                 }),
             }],
+            replay_provenance: None,
         };
         let mut stream = stream_with_api_key(
             spec,

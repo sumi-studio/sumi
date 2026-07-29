@@ -278,6 +278,9 @@ pub struct MemoryBlock {
 /// reasoning は必ず origin_message を持ち、native compaction は coverage を持つ。
 #[derive(Clone, Debug)]
 pub struct ProviderContextItem {
+    /// 暗号化された retention/recovery owner。native も正確な MessageEnd を持つ。
+    pub retention_owner: ProviderContextAnchor,
+    /// provider 意味論上の origin。native compaction は None のまま。
     pub origin_message: Option<ProviderContextAnchor>,
     /// reasoning は公開 Text/ToolCall と共通の flatten 済み wire 順を持つ。
     /// native prefix replacement は None。
@@ -510,7 +513,7 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 
 永続contentを作る`ProviderEvent.content_index`はadapterがflatten済みwire slotとして発行し、assemblerが同値を`wire_item_index`へ変換する。`u32`へ表現不能ならtruncateせずErrorとする。`ReasoningSummary*`のindexだけはdisplay専用の別namespaceで、永続content位置へ変換しない。
 
-通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は `event=None + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の置換無効化と新 window の暗号化 INSERT を1 transaction で行う。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
+通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は同じ EventWrite の `MemoryMaintenance + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の置換無効化と新 window の暗号化 INSERT を1 transaction で行う。footprintへ影響する場合は、prepare時とapply transaction内で完全一致を確認した対象batch集合について、同じ`MemoryMaintenance`へ認証済みmemory projection deltaを載せる。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
 
 ストリームの型は `pi:ai/src/utils/event-stream.ts` の `EventStream`(push/AsyncIterator/最終結果Promise)に対応して:
 
@@ -1208,8 +1211,8 @@ user: <conversation>CompactionInput内のPublicMessage列の直列化</conversat
 
   圧縮率の明示指定は Mastra で観測された ~50倍の過剰圧縮を避ける製品既定である。max_tokens でも物理上限を掛ける(pi は reserveTokens×0.8 を maxTokens に指定 **[事実]** :470-473)
 - **framing tag の無害化**: `<conversation>` / `<recent-memory>` は未信頼の会話本文・ツール出力を包む framing であり、そのまま直列化するとユーザーやツール出力が `</conversation>` を含めるだけで区画を閉じて偽装指示を注入できる。serializer は直列化の直前に本文中の全 framing tag 偽装列(`</conversation`・`</recent-memory` を含む列等)を §7.1 の memory tag と同じ規則で escape する。M4 ゲート4の adversarial fixture に「本文へ `</conversation>` + 偽装 system 指示を埋めた入力で Compact 出力が指示に従わず framing が破れない」ことを追加する
-- ワーカーは EventWriter の内部 `MemoryJobUpdate` 投影で `pending` を原子的に `running` へ claim する。予約時に全 source batch の `(id, version)` を `source_versions` へ固定し、完了時は`MemoryProjectionBuilder`がCompact平文結果から暗号化正本+redacted projection+`redaction_version`を生成する。`MemoryTransition` は現在値がすべて一致する場合だけ、それらを `memory_jobs.result_*` と `memory_batches.summary_*` へ保存し、source batch の `Compacting → Compacted`、job の `running → completed` を**同じ transaction**で進める(CAS)。unredacted result/summaryをTEXTへ一時保存する段階は設けない。PublicMessage membership/state/summaryを変える batch mutation は `version = version + 1` とする。provider-contextのfootprint加減算だけはCompact入力を変えないaccounting mutationなのでversionを進めず、単一EventWriterによるchecked `SET eviction_footprint_tokens = eviction_footprint_tokens ± ?`で直列化する。古い入力に対する遅延結果は破棄し、`UNIQUE(kind, batch_seq)` により二重実行されても結果は1件だけ残る。**この時点では L0 から消さない**(先回り原則)
-- 適用は layer/kind ごとの `memory_apply_cursors.next_batch_seq` と一致する `completed` job だけを許す。後続 `batch_seq` が先に完了しても棚で待たせる。L0/L1 membership の削除、summary の昇格、job の `applied` 化、cursor の前進を公開 `MemoryMaintenance` と同じ `MemoryTransition` transaction で行う。重複完了通知は `applied` を見て no-op にする
+- ワーカーは EventWriter の内部 `MemoryJobUpdate` 投影で `pending` を原子的に `running` へ claim する。予約時に全 source batch の `(id, version)` と同一transactionで予約したtarget batchの `(id, version)` を `source_versions` へ固定し、完了時は`MemoryProjectionBuilder`がCompact平文結果から暗号化正本+redacted projection+`redaction_version`を生成する。`MemoryTransition` は現在値がすべて一致する場合だけ、それらを `memory_jobs.result_*` と `memory_batches.summary_*` へ保存し、source batch の `Compacting → Compacted`、job の `running → completed` を**同じ transaction**で進める(CAS)。unredacted result/summaryをTEXTへ一時保存する段階は設けない。PublicMessage membership/state/summaryを変える batch mutation は `version = version + 1` とする。provider-contextのfootprint加減算だけはCompact入力を変えないaccounting mutationなのでversionを進めず、単一EventWriterによるchecked `SET eviction_footprint_tokens = eviction_footprint_tokens ± ?`で直列化する。古い入力に対する遅延完了結果はretry exhaustionの`failed`と混同せず`discarded`へ遷移し、`UNIQUE(kind, batch_seq)` により二重実行されても結果は1件だけ残る。`discarded`以外の全jobはsource+targetのexact version witnessを保持する。**この時点では L0 から消さない**(先回り原則)
+- 適用は layer/kind ごとの `memory_apply_cursors.next_batch_seq` と一致する `completed` job だけを許す。後続 `batch_seq` が先に完了しても棚で待たせる。L0/L1 membership の削除、summary の昇格、job の `applied` 化、cursor の前進を公開 `MemoryMaintenance` と同じ `MemoryTransition` transaction で行う。cursorが通過済みにできるstatusは`applied`と明示的な`discarded`だけであり、retry exhaustionの`failed`はreclaimまたは別transactionでの明示discardまでFIFO境界を保持する。重複完了通知は `applied` を見て no-op にする
 - 失敗時: リトライ2回、それでも駄目なら `MemoryTransition` で job を `failed`、source batch を `CompactFailed` にし、shelf に「未Compact」マークを残す。この mutation で batch version が進むため、同じ transaction で job の `source_versions` も**遷移後のversion**へ更新する。溢れ処理時の同期フォールバックはそのversionをCASして `failed → running` を claim し、成功時は同じ completion transaction で `CompactFailed → Compacted` と `running → completed` へ進める(このときだけ遅延が出る)。Compact 失敗でも会話は止めない
 - 再起動時: `running` のまま残ったジョブを lease timeout 後に `pending` へ戻し、`Compacting` かつ完全な`summary_*`組がないバッチを再投入する。`CompactFailed` は自動再投入せず、ハード上限時の同期 fallback だけが再 claim する。起動時の整合チェックは「状態だけ Compacting でジョブ無し」、正本/projection/versionの一部だけがある不正行、鍵破棄済みで復号不能なcompleted resultを検出する。不正な部分組はtransactionを拒否するため通常生成されない。派生memoryのtyped retention tombstoneで対象keyが破棄済みなら行をcrypto-erasedとして掃除し、active agentで根拠なく鍵だけ欠落した場合はfail-closedで`CompactFailed`へ修復してcanonical PublicMessageから再投入する。外部agent-death tombstoneがある場合はagent DBを復旧せずsupervisor-owned purgeへ進む。L0/L1/L2 のどの段階でもプロセス kill 後に再開できることを M4 の fault-injection テストで確認する
 - ワーカーは Umans の同時4セッション制限を食う点に注意(会話ストリーム+Compact で2本)**[事実]**(調査レポート)
@@ -1698,7 +1701,8 @@ CREATE TABLE provider_context (
   FOREIGN KEY(message_id, message_seq) REFERENCES messages(id, seq) ON DELETE CASCADE
 );
 
--- event=Noneのprovider-context mutationをprepare→applyでexactly-onceにする内部intent/log。
+-- same-write MemoryMaintenanceを伴うprovider-context mutationを
+-- prepare→applyでexactly-onceにする内部intent/log。
 CREATE TABLE provider_context_mutations (
   mutation_id TEXT PRIMARY KEY,
   state TEXT NOT NULL,          -- prepared | applied | superseded
@@ -1784,7 +1788,7 @@ CREATE TABLE memory_jobs (
   batch_seq INTEGER NOT NULL,
   source_ids TEXT NOT NULL,     -- JSON array
   source_versions TEXT NOT NULL,-- JSON object {batch_id: version}
-  status TEXT NOT NULL,         -- pending | running | completed | applied | failed
+  status TEXT NOT NULL,         -- pending | running | completed | applied | discarded | failed
   lease_until TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   result_key_ref TEXT,          -- PersonalityAgentId配下のmemory-summary data key
@@ -2168,7 +2172,7 @@ IDはdedicated compactionではprovider request ID、L0 promotionではmemory jo
 
 Replaceの「現在latest」はactive `provider_context` rowだけで判定せず、`provider_context_replace_heads`の永続high-watermarkを正典とする。scopeはversioned keyed HMACで`provider_instance_id/protocol/model/kind`へ束縛し、比較は`(config_generation, window_ordinal)`の辞書順とする。Replace適用transactionは新row INSERTと同時に、candidate tupleがheadより大きい場合だけheadをCAS前進し、同値なら`latest_insert_id`一致を要求する。candidateがhead未満ならactive rowが空でも`superseded/newer_replace`、同値かつ同一insertなら`applied/already_satisfied`で終端する。Invalidate、promotion、mode切替、crypto-erase、通常のprovider-context retentionによるrow削除はheadを後退・削除しない。agent deathだけがagent DBと共にmutation/head全体を破棄する。したがってB適用後にB rowが正当に削除されても、古いAのordinalはheadとの比較で必ずsupersededになる。
 
-初回適用では両variantの`invalidate_ids`重複と`Invalidate`の空リストを拒否する(`Replace`の初回INSERTだけは空を許す)。減算量は入力値ではなく、上記規則で削除対象と確定した現存rowの保存済み`eviction_tokens`をmessage→`memory_batch_messages`で対応batchへ集約して求め、`UPDATE ... SET eviction_footprint_tokens = eviction_footprint_tokens - ? WHERE id=? AND eviction_footprint_tokens >= ?`の更新件数を検証する。これにより重複減算・underflow・promotionとの競合をfail-closedにする。footprint-only accounting mutationは§7.4どおりbatch versionを進めない。対象data keyのdestroy、row削除、batch減算、Replaceの新row INSERT、mutationのterminal化を1 transactionに置く。L0→L1 promotionも同じ削除プリミティブをcaller-stable mutation IDで使い、競合時はalready-satisfied規則へ収束する。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
+初回適用では両variantの`invalidate_ids`重複と`Invalidate`の空リストを拒否する(`Replace`の初回INSERTだけは空を許す)。減算量は入力値ではなく、上記規則で削除対象と確定した現存rowの保存済み`eviction_tokens`をmessage→`memory_batch_messages`で対応batchへ集約して求め、`UPDATE ... SET eviction_footprint_tokens = eviction_footprint_tokens - ? WHERE id=? AND eviction_footprint_tokens >= ?`の更新件数を検証する。これにより重複減算・underflow・promotionとの競合をfail-closedにする。footprint-only accounting mutationは§7.4どおりbatch versionを進めない。対象data keyのdestroy、row削除、batch減算、Replaceの新row INSERT、mutationのterminal化を1 transactionに置く。L0→L1 promotionも同じ削除プリミティブをcaller-stable mutation IDで使い、競合時はalready-satisfied規則へ収束する。`ProviderContextMutation`はEventBatch唯一のwriteかつ唯一のprojectionとし、prepare時に得たaffected batch集合をapply transaction内で再導出して完全一致をprojection前に要求する。適用にはsame-write `MemoryMaintenance`を必須とし、footprintへ影響する場合はそのeventへ対象batchの認証済みmemory projection deltaを載せる。provider-context projection後にeventをappendする順序は意図的であり、Replaceのretention owner認証はprojection前の認証済みevent headを参照する。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result等の内部投影だけに限定し、`ProviderContextMutation`には許可しない。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
 
 mode/fingerprint切替では、対象rowの無効化・選択mode/fingerprintの更新・`config_generation`のCAS前進・mutationのterminal化も同じtransactionに置く。`provider_context`の後続INSERTは生成開始時のgenerationと現在値の一致、および現在のmode/fingerprintを検証するため、切替成功後に旧generationのrowが再出現することはない。競合したprepared操作は上記generation比較でalready-satisfiedまたはsupersededへ閉じ、一度terminalになったIDの異なるdigestは異なる操作として拒否する。
 
@@ -2214,7 +2218,7 @@ tool callがstrict検証を通ってpolicy/approval段階へ入るときは、�
   - `AgentEnd` 後 → 追記なし
   合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。復旧処理は replay で得た phase と、追記しようとする次イベントの組を検証し、完了済みの MessageEnd / TurnEnd を重複発行しない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保つ
 
-復元時は memory_batches + memory_batch_messages から L0/L1/L2 を正確な membership 順に再構成し、各L0 batchの`est_tokens + eviction_footprint_tokens`も保存値から復元してseal/overflow判定を再開する。L1/L2とshelfは`summary_ciphertext`/completed jobの`result_ciphertext`をmemory-summary鍵で復号して戻し、projectionをcanonical contextの正本として使わない。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/完全な`summary_*`組がない状態を修復する。派生memoryのtyped retentionでkey破棄済みなら対象projectionをcleanupし、active agentで復号に失敗したresultは適用せずcanonical PublicMessageから再Compactする。外部agent-death tombstoneがあれば復号・再投入せずsupervisor-owned purgeへ進む。適用は `memory_apply_cursors.next_batch_seq` と一致する連続 `completed` job だけを `applied` にし、完了通知順には依存しない。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
+復元時は memory_batches + memory_batch_messages から L0/L1/L2 を正確な membership 順に再構成し、各L0 batchの`est_tokens + eviction_footprint_tokens`も認証済みmembershipとprovider-context anchorの再計算値へ完全一致させてseal/overflow判定を再開する。provider-context anchorはlive L0 membershipに属する保存済みmessageだけを許し、EventWriterのatomic seal予約では到達不能なdurable `sealed` batchは全件拒否する。L1/L2とshelfは`summary_ciphertext`/completed jobの`result_ciphertext`をmemory-summary鍵で復号して戻し、projectionを会話contextの正本として使わない。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/完全な`summary_*`組がない状態を修復する。`discarded`以外のjobはsource+targetのexact version witnessを要求する。鍵破棄済みconversationは復号や再投入をせずtombstone cleanupへ進み、live conversationで復号に失敗したresultは適用せずPublicMessage正本から再Compactする。適用は `memory_apply_cursors.next_batch_seq` と一致する連続 `completed` job だけを `applied` にし、cursorは`applied`/`discarded`だけを通過でき、`failed`では停止する。完了通知順には依存しない。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
 
 検証では EventWriter のDB書込みを意図的に遅延させても `MessageStart → MessageUpdate* → MessageEnd` が崩れないこと、各トランザクション境界へ failpoint を入れて kill/restart してもイベントログと投影状態が一致することを確認する。physical recoveryでは上記3つのcanonical failpointを必ず発火し、receiptの同一再送をalready-appliedへ収束させ、logical suffixと`indeterminate` terminalの二重生成がないことを確認する。
 

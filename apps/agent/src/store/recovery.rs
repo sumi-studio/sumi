@@ -7,7 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
-use crate::provider::types::{ContextMessage, ProviderContextItem};
+use crate::memory::{HydratedMemoryRuntime, estimate::ProviderContextItemWithFootprint};
+use crate::provider::types::ContextMessage;
 use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
@@ -16,9 +17,6 @@ use super::{
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
-    memory_state::{
-        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord,
-    },
     verify_command_payload_digest,
 };
 
@@ -34,6 +32,19 @@ const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) struct PendingApprovalRecovery {
     pub request_id: String,
     pub tool_call_id: String,
+}
+
+/// Authenticated pre-disposition Error-context evidence carried to the T26
+/// logical-resume consumer. Store hydration has already verified the
+/// transcript row, exact anchor, encrypted provider-context items, and active
+/// item key. T26 must choose the normal retry/overflow/terminal disposition,
+/// build the fixed Invalidate through EventWriter, and fence resume until its
+/// common application reaches `applied`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingErrorContextRecovery {
+    pub message_id: String,
+    pub message_seq: u64,
+    pub item_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +84,7 @@ pub(crate) enum RecoveryStep {
         command_id: String,
         run_id: String,
         turn_id: String,
+        pending_error_context: Option<PendingErrorContextRecovery>,
     },
     /// T23/T26 restart seam for an assistant turn that crashed while a real
     /// ApprovalBroker request was durably pending. T26 must consume this before
@@ -123,12 +135,19 @@ pub(crate) struct HydratedRunState {
     pub fence: GenerationRecoveryFence,
     pub receipt: super::HydrationReceiptIdentity,
     pub messages: Vec<ContextMessage>,
-    pub provider_context: Vec<ProviderContextItem>,
-    pub memory_batches: Vec<MemoryBatchRecord>,
-    pub memory_batch_messages: Vec<MemoryBatchMessageRecord>,
-    pub memory_jobs: Vec<MemoryJobRecord>,
-    pub memory_apply_cursors: Vec<MemoryApplyCursorRecord>,
-    pub recovery_steps: Vec<RecoveryStep>,
+    pub provider_context: Vec<ProviderContextItemWithFootprint>,
+    /// Authenticated, ciphertext-free Store handoff. A future T26 consumer
+    /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
+    pub memory: HydratedMemoryRuntime,
+    pub resume: ResumeDirective,
+}
+
+/// Runtime instruction carried only by a hydration result that reached a
+/// durable fixed point. Any nonempty logical suffix is returned as the typed
+/// `LogicalRecoveryRequired` outcome instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeDirective {
+    AdmitCommands,
 }
 
 /// Result of a T17 hydration attempt.
@@ -139,7 +158,24 @@ pub(crate) struct HydratedRunState {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HydrationOutcome {
-    RecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    #[allow(
+        dead_code,
+        reason = "T26 bootstrap composition will pass these immutable physical attestations to T27; T17 must keep this variant fail-closed until then"
+    )]
+    PhysicalRecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    LogicalRecoveryRequired {
+        // T26 owns applying this suffix. Until then this variant deliberately
+        // exposes no receipt or ready signal; only `Complete` does.
+        #[allow(
+            dead_code,
+            reason = "T26 bootstrap composition will consume the ordered logical suffix; T17 must keep it typed and fail-closed until then"
+        )]
+        steps: Vec<RecoveryStep>,
+    },
+    #[allow(
+        dead_code,
+        reason = "T26 bootstrap composition is the first production consumer of the complete hydrated state and its ready receipt"
+    )]
     Complete(HydratedRunState),
 }
 
@@ -285,6 +321,7 @@ impl SuffixRecovery {
                     command_id,
                     run_id,
                     turn_id,
+                    ..
                 } => {
                     if let Some(pending) =
                         pending_approval_for_recovery(store, run_id, turn_id).await?
@@ -498,6 +535,7 @@ async fn plan_one_command(
             command_id: command.command_id.clone(),
             run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
             turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            pending_error_context: None,
         }),
         RunPhase::HardSteerRequested => Ok(RecoveryStep::ResumeHardSteerFromDurableEvents {
             command_id: command.command_id.clone(),

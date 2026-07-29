@@ -717,6 +717,10 @@ mod tests {
     #[test]
     fn provider_context_payload_cannot_be_reinterpreted_as_public_message() {
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "msg-1".to_owned(),
+                message_seq: 1,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "msg-1".to_owned(),
                 message_seq: 1,

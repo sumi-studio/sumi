@@ -17,6 +17,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::protocol::MAX_ATTACHMENT_CHUNK_BYTES;
 use super::protocol::{
     ArtifactKind, ArtifactOperation, RpcOperationValidation, parse_artifact_handle,
 };
@@ -55,6 +57,9 @@ pub enum ArtifactResponse {
     Finished,
     Read { content: Vec<u8>, eof: bool },
     Grep { matches: Vec<ArtifactGrepMatch> },
+    Put { handle: String },
+    AttachmentBegun { offset: u64 },
+    AttachmentAppended { offset: u64 },
 }
 
 /// A broker instance pins its root inode for its lifetime. All descendants are
@@ -150,7 +155,197 @@ impl ArtifactBroker {
                 handle,
                 pattern,
             } => self.grep_artifact(&conversation_id, &handle, &pattern),
+            ArtifactOperation::PutAttachment {
+                conversation_id,
+                artifact_id,
+                content,
+            } => self.put_attachment(&conversation_id, &artifact_id, &content),
+            ArtifactOperation::BeginAttachment {
+                conversation_id,
+                artifact_id,
+                total_bytes,
+                content_digest,
+            } => {
+                self.begin_attachment(&conversation_id, &artifact_id, total_bytes, &content_digest)
+            }
+            ArtifactOperation::AppendAttachment {
+                conversation_id,
+                artifact_id,
+                total_bytes,
+                content_digest,
+                offset,
+                content,
+            } => self.append_attachment(
+                &conversation_id,
+                &artifact_id,
+                total_bytes,
+                &content_digest,
+                offset,
+                &content,
+            ),
+            ArtifactOperation::FinishAttachment {
+                conversation_id,
+                artifact_id,
+                total_bytes,
+                content_digest,
+            } => {
+                self.finish_attachment(&conversation_id, &artifact_id, total_bytes, &content_digest)
+            }
         }
+    }
+
+    fn begin_attachment(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_conversation, attachments) =
+            self.ensure_artifact_dirs(conversation_id, ArtifactKind::Attachments)?;
+        let final_name = cstring(artifact_id)?;
+        match openat2_cstr(
+            attachments.as_raw_fd(),
+            &final_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                ensure_regular_file(&file, "artifact")?;
+                if file_matches_attachment(&mut file, total_bytes, content_digest)? {
+                    return Ok(ArtifactResponse::AttachmentBegun {
+                        offset: total_bytes,
+                    });
+                }
+                return Err(ToolError::Protocol(
+                    "duplicate attachment has conflicting content".to_owned(),
+                ));
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let staging = ensure_dir(&attachments, ".staging")?;
+        let name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let name = cstring(&name)?;
+        let fd = openat2_cstr(
+            staging.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT,
+            0o600,
+        )?;
+        let file = File::from(fd);
+        ensure_regular_file(&file, "attachment staging file")?;
+        fchmod(file.as_raw_fd(), 0o600)?;
+        lock_exclusive(&file)?;
+        let offset = file.metadata()?.len();
+        if offset > total_bytes {
+            return Err(ToolError::Protocol(
+                "attachment staging file exceeds declared length".to_owned(),
+            ));
+        }
+        Ok(ArtifactResponse::AttachmentBegun { offset })
+    }
+
+    fn append_attachment(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+        offset: u64,
+        content: &[u8],
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_conversation, attachments) =
+            self.open_artifact_dirs(conversation_id, ArtifactKind::Attachments)?;
+        let staging = open_dir(&attachments, ".staging")?;
+        let name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let fd = open_regular_file(&staging, &name, libc::O_RDWR)?;
+        let mut file = File::from(fd);
+        lock_exclusive(&file)?;
+        let next = offset
+            .checked_add(
+                u64::try_from(content.len()).map_err(|_| {
+                    ToolError::Protocol("attachment chunk length overflow".to_owned())
+                })?,
+            )
+            .ok_or_else(|| ToolError::Protocol("attachment chunk offset overflow".to_owned()))?;
+        if next > total_bytes {
+            return Err(ToolError::Protocol(
+                "attachment chunk exceeds declared length".to_owned(),
+            ));
+        }
+        let actual = file.metadata()?.len();
+        if actual == offset {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            fsync_fd(staging.as_raw_fd())?;
+            return Ok(ArtifactResponse::AttachmentAppended { offset: next });
+        }
+        if actual >= next && file_range_equals(&mut file, offset, content)? {
+            return Ok(ArtifactResponse::AttachmentAppended { offset: next });
+        }
+        Err(ToolError::Protocol(
+            "attachment append offset or replay content conflicts".to_owned(),
+        ))
+    }
+
+    fn finish_attachment(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_conversation, attachments) =
+            self.open_artifact_dirs(conversation_id, ArtifactKind::Attachments)?;
+        let final_name = cstring(artifact_id)?;
+        match openat2_cstr(
+            attachments.as_raw_fd(),
+            &final_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                ensure_regular_file(&file, "artifact")?;
+                if file_matches_attachment(&mut file, total_bytes, content_digest)? {
+                    return Ok(ArtifactResponse::Put {
+                        handle: format!("artifact://{conversation_id}/attachments/{artifact_id}"),
+                    });
+                }
+                return Err(ToolError::Protocol(
+                    "duplicate attachment has conflicting content".to_owned(),
+                ));
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let staging = open_dir(&attachments, ".staging")?;
+        let staging_name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let fd = open_regular_file(&staging, &staging_name, libc::O_RDWR)?;
+        let mut file = File::from(fd);
+        lock_exclusive(&file)?;
+        if !file_matches_attachment(&mut file, total_bytes, content_digest)? {
+            return Err(ToolError::Protocol(
+                "attachment finish does not match declared content".to_owned(),
+            ));
+        }
+        file.sync_all()?;
+        renameat(
+            staging.as_raw_fd(),
+            &cstring(&staging_name)?,
+            attachments.as_raw_fd(),
+            &final_name,
+        )?;
+        fsync_fd(attachments.as_raw_fd())?;
+        Ok(ArtifactResponse::Put {
+            handle: format!("artifact://{conversation_id}/attachments/{artifact_id}"),
+        })
     }
 
     fn begin_tool_output(
@@ -231,6 +426,83 @@ impl ArtifactBroker {
             handle,
             offset: initial_len,
         })
+    }
+
+    fn put_attachment(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        content: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let handle = format!("artifact://{conversation_id}/attachments/{artifact_id}");
+        let content_bytes = content.as_bytes();
+        let content_len = u64::try_from(content_bytes.len()).map_err(|_| {
+            ToolError::Protocol("artifact attachment content length overflow".to_owned())
+        })?;
+        let content_digest: [u8; 32] = Sha256::digest(content_bytes).into();
+
+        let mut state = self.lock_state()?;
+        if let Some(record) = state.artifacts.get(&handle) {
+            if record.initial_len != content_len || record.initial_digest != content_digest {
+                return Err(ToolError::Protocol(
+                    "duplicate PutAttachment has conflicting content".to_owned(),
+                ));
+            }
+            return Ok(ArtifactResponse::Put { handle });
+        }
+        if state.artifacts.len() >= MAX_TRACKED_ARTIFACTS {
+            return Err(ToolError::Protocol(format!(
+                "artifact process state capacity of {MAX_TRACKED_ARTIFACTS} was reached"
+            )));
+        }
+
+        let (conversation, kind) =
+            self.ensure_artifact_dirs(conversation_id, ArtifactKind::Attachments)?;
+        let name = cstring(artifact_id)?;
+        let created = match openat2_cstr(
+            kind.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(fd) => (fd, true),
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => (
+                openat2_cstr(
+                    kind.as_raw_fd(),
+                    &name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )?,
+                false,
+            ),
+            Err(error) => return Err(error),
+        };
+        ensure_regular(&created.0, "artifact")?;
+        fchmod(created.0.as_raw_fd(), 0o600)?;
+        let mut file = File::from(created.0);
+        lock_exclusive(&file)?;
+        if created.1 {
+            file.write_all(content_bytes)?;
+            file.sync_all()?;
+            fsync_fd(kind.as_raw_fd())?;
+            fsync_fd(conversation.as_raw_fd())?;
+            fsync_fd(self.root.as_raw_fd())?;
+        } else if !file_equals(&mut file, content_bytes)? {
+            return Err(ToolError::Protocol(
+                "duplicate PutAttachment has conflicting content".to_owned(),
+            ));
+        }
+        state.artifacts.insert(
+            handle.clone(),
+            ArtifactRecord {
+                initial_len: content_len,
+                initial_digest: content_digest,
+                committed_offset: content_len,
+                last_append: None,
+                finished: true,
+            },
+        );
+        Ok(ArtifactResponse::Put { handle })
     }
 
     fn append_tool_output(
@@ -538,6 +810,75 @@ fn ensure_regular(fd: &OwnedFd, operation: &str) -> Result<(), ToolError> {
         Err(ToolError::InvalidPath(format!(
             "{operation} is not a regular file"
         )))
+    }
+}
+
+fn ensure_regular_file(file: &File, operation: &str) -> Result<(), ToolError> {
+    if file.metadata()?.is_file() {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidPath(format!(
+            "{operation} is not a regular file"
+        )))
+    }
+}
+
+fn attachment_staging_name(artifact_id: &str, total_bytes: u64, content_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(artifact_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(total_bytes.to_be_bytes());
+    hasher.update(content_digest.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn file_matches_attachment(
+    file: &mut File,
+    total_bytes: u64,
+    content_digest: &str,
+) -> Result<bool, ToolError> {
+    if file.metadata()?.len() != total_bytes {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == content_digest)
+}
+
+fn file_range_equals(file: &mut File, offset: u64, expected: &[u8]) -> Result<bool, ToolError> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut compared = 0usize;
+    let mut buffer = [0u8; 8192];
+    while compared < expected.len() {
+        let read = file.read(&mut buffer)?;
+        if read == 0 || buffer[..read] != expected[compared..compared + read] {
+            return Ok(false);
+        }
+        compared = compared
+            .checked_add(read)
+            .ok_or_else(|| ToolError::Protocol("attachment comparison overflow".to_owned()))?;
+    }
+    Ok(true)
+}
+
+fn renameat(
+    old_dir: RawFd,
+    old_name: &CStr,
+    new_dir: RawFd,
+    new_name: &CStr,
+) -> Result<(), ToolError> {
+    if unsafe { libc::renameat(old_dir, old_name.as_ptr(), new_dir, new_name.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
     }
 }
 
@@ -853,6 +1194,108 @@ mod tests {
             broker.execute(append(13, b"late".to_vec())),
             Err(ToolError::Protocol(message)) if message.contains("finished artifact")
         ));
+    }
+
+    #[test]
+    fn put_attachment_is_idempotent_and_rejects_conflicts() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let put = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            content: "large user text".to_owned(),
+        };
+        let expected = ArtifactResponse::Put {
+            handle: "artifact://conversation-1/attachments/artifact-1".to_owned(),
+        };
+        assert_eq!(broker.execute(put.clone()).unwrap(), expected);
+        assert_eq!(broker.execute(put.clone()).unwrap(), expected);
+
+        let conflict = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            content: "different".to_owned(),
+        };
+        assert!(matches!(
+            broker.execute(conflict),
+            Err(ToolError::Protocol(message))
+                if message == "duplicate PutAttachment has conflicting content"
+        ));
+    }
+
+    #[test]
+    fn chunked_attachment_restarts_from_a_durable_prefix_and_publishes_atomically() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let content = vec![b'x'; 1_200 * 1024];
+        let digest = format!("{:x}", Sha256::digest(&content));
+        let total = content.len() as u64;
+        let begin = || ArtifactOperation::BeginAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "large-input".to_owned(),
+            total_bytes: total,
+            content_digest: digest.clone(),
+        };
+        assert_eq!(
+            broker.execute(begin()).unwrap(),
+            ArtifactResponse::AttachmentBegun { offset: 0 }
+        );
+        let first = MAX_ATTACHMENT_CHUNK_BYTES;
+        assert_eq!(
+            broker
+                .execute(ArtifactOperation::AppendAttachment {
+                    conversation_id: "conversation-1".to_owned(),
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest.clone(),
+                    offset: 0,
+                    content: content[..first].to_vec(),
+                })
+                .unwrap(),
+            ArtifactResponse::AttachmentAppended {
+                offset: first as u64
+            }
+        );
+        // A restarted broker reconstructs the durable staging offset rather
+        // than requiring process-local state.
+        drop(broker);
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        assert_eq!(
+            broker.execute(begin()).unwrap(),
+            ArtifactResponse::AttachmentBegun {
+                offset: first as u64
+            }
+        );
+        for offset in (first..content.len()).step_by(MAX_ATTACHMENT_CHUNK_BYTES) {
+            let end = (offset + MAX_ATTACHMENT_CHUNK_BYTES).min(content.len());
+            broker
+                .execute(ArtifactOperation::AppendAttachment {
+                    conversation_id: "conversation-1".to_owned(),
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest.clone(),
+                    offset: offset as u64,
+                    content: content[offset..end].to_vec(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            broker
+                .execute(ArtifactOperation::FinishAttachment {
+                    conversation_id: "conversation-1".to_owned(),
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest,
+                })
+                .unwrap(),
+            ArtifactResponse::Put {
+                handle: "artifact://conversation-1/attachments/large-input".to_owned(),
+            }
+        );
+        assert_eq!(
+            fs::read(root.0.join("conversation-1/attachments/large-input")).unwrap(),
+            content
+        );
     }
 
     #[test]

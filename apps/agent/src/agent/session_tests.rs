@@ -21,13 +21,13 @@ use crate::store::KeyProvider;
 use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
     gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
+    memory::estimate::ProviderContextItemWithFootprint,
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
-        ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEvent,
-        ProviderEventStream, ProviderOrigin, ProviderOutput, PublicAssistantContent,
-        PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
-        ToolCall, ToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
-        ValidatedToolArguments,
+        ProviderContextFragment, ProviderContextPayload, ProviderEvent, ProviderEventStream,
+        ProviderOrigin, ProviderOutput, PublicAssistantContent, PublicAssistantMessage,
+        PublicMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolDefinition,
+        ToolResultMessage, Usage, UserContent, UserMessage, ValidatedToolArguments,
     },
     provider::{ModelSpec, RequestOptions},
     runtime::contracts::{
@@ -2432,6 +2432,7 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
             command_id: binding.command_id,
             run_id: binding.run_id,
             turn_id: binding.turn_id,
+            pending_error_context: None,
         }]
     );
 
@@ -2541,10 +2542,9 @@ async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved
         .hydrate(&lease, &fence)
         .await
         .expect("authenticated hydration");
-    let HydrationOutcome::Complete(hydrated) = hydrated else {
+    let HydrationOutcome::LogicalRecoveryRequired { steps, .. } = hydrated else {
         panic!("prepared approval requires logical-only recovery")
     };
-    let steps = hydrated.recovery_steps;
     assert_eq!(
         steps,
         vec![
@@ -2683,11 +2683,11 @@ async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_
         .hydrate(&lease, &fence)
         .await
         .expect("authenticated restart hydration");
-    let HydrationOutcome::Complete(hydrated) = hydrated else {
+    let HydrationOutcome::LogicalRecoveryRequired { steps, .. } = hydrated else {
         panic!("prepared approval requires logical-only recovery")
     };
     assert_eq!(
-        hydrated.recovery_steps,
+        steps,
         vec![RecoveryStep::ResumeCancellationFromDurableEvents {
             command_id: binding.command_id,
             run_id: binding.run_id,
@@ -3399,6 +3399,7 @@ impl RunDriver for MultiRejectedReceiptDriver {
         Ok(ProviderAttempt {
             message_id: format!("multi-rejected-assistant-{attempt}"),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -3523,6 +3524,7 @@ impl RunDriver for DurableToolBarrierDriver {
         Ok(ProviderAttempt {
             message_id: format!("barrier-assistant-{attempt}"),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -3675,6 +3677,7 @@ impl RunDriver for IndeterminateToolDriver {
         Ok(ProviderAttempt {
             message_id: format!("indeterminate-assistant-{attempt}"),
             initial_message: bridge_assistant(reason),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -4491,6 +4494,7 @@ impl RunDriver for OpaqueContextDriver {
                 interrupted: false,
                 timestamp: Utc::now(),
             }),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(
                 rx,
                 CancellationToken::new(),
@@ -4504,7 +4508,8 @@ impl RunDriver for OpaqueContextDriver {
         &self,
         attempt: usize,
         context: &[ContextMessage],
-        provider_context: &[crate::provider::types::ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: crate::memory::context_assembler::ProviderCallTrigger,
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
@@ -5422,6 +5427,7 @@ impl RunDriver for SessionRetrySteerDriver {
         Ok(ProviderAttempt {
             message_id: format!("session-retry-steer-assistant-{attempt}"),
             initial_message,
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -5523,6 +5529,7 @@ impl RunDriver for SessionImmediateOverflowDriver {
         Ok(ProviderAttempt {
             message_id: format!("session-immediate-overflow-{attempt}"),
             initial_message: PublicMessage::Assistant(initial),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(
                 rx,
                 cancel,
@@ -5636,6 +5643,347 @@ async fn session_immediate_overflow_commits_zero_delay_before_installing_replace
     .await
     .expect("durable immediate-overflow retry schedule");
     assert_eq!(delay, 0);
+}
+
+#[derive(Clone, Copy)]
+enum IdleMaintenanceResult {
+    Refreshed,
+    NotCommitted,
+    Failed,
+}
+
+struct IdleMaintenanceDriver {
+    provider_calls: AtomicUsize,
+    maintenance_calls: AtomicUsize,
+    result: IdleMaintenanceResult,
+}
+
+impl IdleMaintenanceDriver {
+    fn new(result: IdleMaintenanceResult) -> Self {
+        Self {
+            provider_calls: AtomicUsize::new(0),
+            maintenance_calls: AtomicUsize::new(0),
+            result,
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "idle-maintenance".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for IdleMaintenanceDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn apply_idle_memory_maintenance(&self, core: &mut RunCore) -> Result<bool> {
+        self.maintenance_calls.fetch_add(1, Ordering::SeqCst);
+        match self.result {
+            IdleMaintenanceResult::Refreshed => {
+                // The production contract requires the durable apply and the
+                // replacement runtime snapshot to finish before returning
+                // true. This fixture makes that refresh observable through
+                // RunCore's mutation epoch without creating another memory
+                // authority.
+                core.install_hydrated_context(
+                    core.runtime_context.clone(),
+                    core.provider_context.clone(),
+                );
+                Ok(true)
+            }
+            IdleMaintenanceResult::NotCommitted => Ok(false),
+            IdleMaintenanceResult::Failed => Err(anyhow!("fixture maintenance apply failed")),
+        }
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let attempt = self.provider_calls.fetch_add(1, Ordering::SeqCst);
+        // This normal no-tool Stop is deliberately just over the fixture
+        // context window, yielding a deferred (not immediate) maintenance
+        // marker after TurnEnd.
+        let usage = Usage {
+            input: 101,
+            ..Usage::default()
+        };
+        let message = AssistantMessage {
+            content: Vec::new(),
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        let (tx, rx) = mpsc::channel(2);
+        tx.try_send(ProviderEvent::Start)?;
+        tx.try_send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message,
+                provider_context: Vec::new(),
+            },
+        })?;
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("idle-maintenance-provider-{attempt}"),
+            initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "idle-maintenance fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        Some(100)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!(
+            "idle-maintenance fixture only exercises deferred apply"
+        ))
+    }
+}
+
+struct MaintenanceLatchWorker {
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+    maintenance_calls: AtomicUsize,
+}
+
+impl RunWorker for MaintenanceLatchWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    fn apply_idle_memory_maintenance<'a>(
+        &'a self,
+        core: &'a mut RunCore,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            self.maintenance_calls.fetch_add(1, Ordering::SeqCst);
+            core.mark_mutated();
+            Ok(true)
+        })
+    }
+
+    fn run(
+        &self,
+        core: RunCore,
+        _initial: AdmittedCommand,
+        _controls: mpsc::Receiver<RunControl>,
+        _events: mpsc::Sender<RunOutput>,
+    ) -> WorkerFuture {
+        let release = self
+            .release
+            .lock()
+            .expect("maintenance latch release")
+            .take()
+            .expect("one active fixture worker");
+        Box::pin(async move {
+            release.await.expect("release active worker");
+            RunCompletion::Completed(core)
+        })
+    }
+}
+
+#[tokio::test]
+async fn no_tool_turn_end_applies_deferred_maintenance_before_the_next_user_run() {
+    let (gateway, _commands, _frames) = gateway();
+    let driver = Arc::new(IdleMaintenanceDriver::new(IdleMaintenanceResult::Refreshed));
+    let mut session = session(gateway, Arc::new(SequentialRunWorker::new(driver.clone()))).await;
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("first no-tool command");
+    drive_active_to_completion(&mut session)
+        .await
+        .expect("first no-tool turn completes");
+
+    assert!(
+        session.active.is_none(),
+        "TurnEnd must return the Session to Idle"
+    );
+    assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        session
+            .core
+            .as_ref()
+            .expect("idle core")
+            .pending_overflow_apply()
+            .is_none()
+    );
+
+    session
+        .admit_and_route(user(2))
+        .await
+        .expect("second user command after maintenance");
+    drive_active_to_completion(&mut session)
+        .await
+        .expect("second no-tool turn completes");
+    assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn maintenance_ready_while_idle_applies_an_independent_completed_shelf_immediately() {
+    let (gateway, _commands, _frames) = gateway();
+    let driver = Arc::new(IdleMaintenanceDriver::new(IdleMaintenanceResult::Refreshed));
+    let mut session = session(gateway, Arc::new(SequentialRunWorker::new(driver.clone()))).await;
+
+    session
+        .maintenance_ready()
+        .await
+        .expect("idle MaintenanceReady applies immediately");
+
+    assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 0);
+    assert!(!session.maintenance_ready_pending);
+}
+
+#[tokio::test]
+async fn failed_or_uncommitted_maintenance_preserves_pending_and_blocks_stale_provider_calls() {
+    for result in [
+        IdleMaintenanceResult::NotCommitted,
+        IdleMaintenanceResult::Failed,
+    ] {
+        let (gateway, _commands, _frames) = gateway();
+        let driver = Arc::new(IdleMaintenanceDriver::new(result));
+        let mut session =
+            session(gateway, Arc::new(SequentialRunWorker::new(driver.clone()))).await;
+
+        session
+            .admit_and_route(user(1))
+            .await
+            .expect("first no-tool command");
+        let failure = drive_active_to_completion(&mut session)
+            .await
+            .expect_err("uncommitted maintenance must fail closed at Idle");
+        assert!(matches!(
+            failure,
+            SessionFailure::Worker(WorkerFailure::Error(_))
+        ));
+        assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            session
+                .core
+                .as_ref()
+                .expect("failed idle core remains owned")
+                .pending_overflow_apply()
+                .is_some()
+        );
+
+        let stale_attempt = session.admit_and_route(user(2)).await;
+        assert!(matches!(
+            stale_attempt,
+            Err(SessionFailure::Worker(WorkerFailure::Error(_)))
+        ));
+        assert_eq!(
+            driver.provider_calls.load(Ordering::SeqCst),
+            1,
+            "a pending unrefreshed transition must block the next provider call"
+        );
+        assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn idle_maintenance_with_a_deferred_marker_never_calls_the_provider() {
+    let (gateway, _commands, _frames) = gateway();
+    let driver = Arc::new(IdleMaintenanceDriver::new(IdleMaintenanceResult::Refreshed));
+    let mut core = RunCore::fixture_with_unapproved_tools();
+    core.defer_overflow_apply(crate::provider::overflow::OverflowSource::StopUsage);
+    let mut session = session_with_core(
+        gateway,
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        core,
+    )
+    .await;
+
+    session
+        .maintenance_ready()
+        .await
+        .expect("idle deferred maintenance");
+
+    assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        session
+            .core
+            .as_ref()
+            .expect("idle core")
+            .pending_overflow_apply()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn maintenance_ready_received_while_active_is_latched_until_idle() {
+    let (gateway, _commands, _frames) = gateway();
+    let (release_tx, release_rx) = oneshot::channel();
+    let worker = Arc::new(MaintenanceLatchWorker {
+        release: Mutex::new(Some(release_rx)),
+        maintenance_calls: AtomicUsize::new(0),
+    });
+    let mut session = session(gateway, worker.clone()).await;
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    session
+        .maintenance_ready()
+        .await
+        .expect("active MaintenanceReady is latched");
+    assert!(session.maintenance_ready_pending);
+    assert_eq!(worker.maintenance_calls.load(Ordering::SeqCst), 0);
+
+    release_tx.send(()).expect("release worker");
+    finish_active(&mut session).await;
+
+    assert_eq!(worker.maintenance_calls.load(Ordering::SeqCst), 1);
+    assert!(!session.maintenance_ready_pending);
 }
 
 #[tokio::test]
@@ -6398,6 +6746,7 @@ fn live_responses_driver(
         messages: Vec::new(),
         provider_context: Vec::new(),
         tools: vec![tool],
+        replay_provenance: None,
     };
     Arc::new(
         InjectedRunDriver::new(
@@ -6646,10 +6995,10 @@ fn collect_encrypted_content(value: &Value, markers: &mut Vec<String>) {
     }
 }
 
-fn live_opaque_markers(items: &[ProviderContextItem]) -> Vec<String> {
+fn live_opaque_markers(items: &[ProviderContextItemWithFootprint]) -> Vec<String> {
     let mut markers = Vec::new();
     for item in items {
-        match &item.payload {
+        match &item.item.payload {
             ProviderContextPayload::EncryptedReasoning { item, .. } => {
                 collect_encrypted_content(item, &mut markers);
             }
@@ -6801,9 +7150,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
         .expect("authenticate and hydrate live Responses restart state")
     {
         HydrationOutcome::Complete(state) => state,
-        HydrationOutcome::RecoveryRequired(intents) => {
-            panic!("completed live Responses turn unexpectedly requires recovery: {intents:?}")
-        }
+        other => panic!("completed live Responses turn unexpectedly requires recovery: {other:?}"),
     };
     assert!(
         !hydrated.provider_context.is_empty(),
@@ -6955,7 +7302,7 @@ async fn successful_provider_context_survives_session_restart_and_reaches_turn_t
         .expect("canonical restart hydration")
     {
         HydrationOutcome::Complete(state) => state,
-        HydrationOutcome::RecoveryRequired(_) => panic!("completed turn requires no recovery"),
+        other => panic!("completed turn requires no recovery: {other:?}"),
     };
     assert_eq!(hydrated.provider_context.len(), 1);
     let mut restarted_core = RunCore::new();
@@ -7358,6 +7705,7 @@ impl RunDriver for RetryGroupDriver {
         Ok(ProviderAttempt {
             message_id: format!("retry-group-assistant-{attempt}"),
             initial_message: Self::assistant_with(reason),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7741,6 +8089,7 @@ impl RunDriver for HardSteerKillDriver {
         Ok(ProviderAttempt {
             message_id: "kill-restart-assistant".to_owned(),
             initial_message: PublicMessage::Assistant(initial),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7835,6 +8184,7 @@ impl RunDriver for TurnEndKillDriver {
         Ok(ProviderAttempt {
             message_id: "turn-end-assistant".to_owned(),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7908,6 +8258,7 @@ impl RunDriver for AbortProviderKillDriver {
         Ok(ProviderAttempt {
             message_id: "abort-provider-assistant".to_owned(),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -8666,6 +9017,7 @@ impl RunDriver for SaturatedTerminalTailDriver {
         Ok(ProviderAttempt {
             message_id: format!("saturated-terminal-tail-assistant-{start}"),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -9261,6 +9613,7 @@ fn provider_attempt_from_tool_call(attempt: usize, tool_call: ToolCall) -> Provi
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_initial_message(),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
     }
 }
@@ -9281,6 +9634,7 @@ fn provider_attempt_stop(attempt: usize) -> ProviderAttempt {
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_initial_message(),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
     }
 }
@@ -10705,10 +11059,10 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
     let HydrationOutcome::Complete(hydrated) = hydrated else {
         panic!("fully terminal duplicate approval state must hydrate without physical recovery")
     };
-    assert!(
-        hydrated.recovery_steps.is_empty(),
-        "restart must not replay either approval decision or the tool: {:?}",
-        hydrated.recovery_steps
+    assert_eq!(
+        hydrated.resume,
+        crate::store::ResumeDirective::AdmitCommands,
+        "restart must not replay either approval decision or the tool"
     );
     assert_eq!(
         sqlx::query_as::<_, (String, String, String, String, i64, i64)>(

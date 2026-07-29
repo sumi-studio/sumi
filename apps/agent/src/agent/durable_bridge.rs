@@ -18,8 +18,9 @@ use crate::{
     },
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch,
-        EventWrite, EventWriter, InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
+        ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent,
+        ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
+        RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -27,6 +28,12 @@ struct PendingSteerMessage {
     message_id: String,
     message: PublicMessage,
     barrier: MessageCommitBarrier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingErrorProviderContext {
+    message_id: String,
+    message_seq: u64,
 }
 
 use super::steer::{
@@ -113,6 +120,9 @@ impl RunOutput {
 pub(crate) struct MessageCommitReceipt {
     pub message_id: String,
     pub message_seq: u64,
+    /// Exact big-endian IEEE-754 bits committed by EventWriter for the
+    /// prompt-token calibration observation carried by this MessageEnd.
+    pub calibration_ratio_bits: Option<[u8; 8]>,
     /// When a hard-steer close batch creates a new turn, the worker needs the
     /// durable turn identity to bind subsequent MessageStart/End events.
     pub new_turn_id: Option<String>,
@@ -121,6 +131,7 @@ pub(crate) struct MessageCommitReceipt {
 pub(crate) struct MessageCommitBarrier {
     sender: oneshot::Sender<MessageCommitReceipt>,
     provider_context: Vec<ProviderContextFragment>,
+    calibration_estimate: Option<u64>,
 }
 
 impl MessageCommitBarrier {
@@ -136,6 +147,22 @@ impl MessageCommitBarrier {
             Self {
                 sender,
                 provider_context,
+                calibration_estimate: None,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn channel_with_provider_context_and_calibration(
+        provider_context: Vec<ProviderContextFragment>,
+        uncalibrated_prompt_estimate: u64,
+    ) -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender,
+                provider_context,
+                calibration_estimate: Some(uncalibrated_prompt_estimate),
             },
             receiver,
         )
@@ -143,6 +170,10 @@ impl MessageCommitBarrier {
 
     fn provider_context(&self) -> &[ProviderContextFragment] {
         &self.provider_context
+    }
+
+    fn calibration_estimate(&self) -> Option<u64> {
+        self.calibration_estimate
     }
 
     #[cfg(test)]
@@ -278,6 +309,11 @@ pub(super) struct DurableBridge {
     length_not_started: HashSet<String>,
     pending_rejected_end: Option<(String, PublicMessage, HashSet<String>, MessageCommitBarrier)>,
     pending_rejected_results: Vec<(String, PublicMessage, MessageCommitBarrier)>,
+    /// Authoritative Error context remains durable only until the first
+    /// attempt disposition. That disposition prepares its fixed Invalidate
+    /// intent; the bridge then fences progress while the common applier
+    /// destroys the rows and per-item key.
+    pending_error_provider_context: Option<PendingErrorProviderContext>,
     startup_agent_pending: bool,
     startup_turn_pending: bool,
     retry_wait_ready: bool,
@@ -375,6 +411,7 @@ impl DurableBridge {
             length_not_started: HashSet::new(),
             pending_rejected_end: None,
             pending_rejected_results: Vec::new(),
+            pending_error_provider_context: None,
             startup_agent_pending: false,
             startup_turn_pending: false,
             retry_wait_ready: false,
@@ -425,6 +462,41 @@ impl DurableBridge {
                 .ok_or_else(|| anyhow!("eviction footprint overflow"))?;
         }
         Ok(total)
+    }
+
+    async fn build_pending_error_context_disposition(
+        &self,
+        writer: &EventWriter,
+    ) -> Result<Option<ErrorContextDisposition>> {
+        let Some(pending) = self.pending_error_provider_context.as_ref() else {
+            return Ok(None);
+        };
+        writer
+            .build_error_context_disposition(&pending.message_id, pending.message_seq)
+            .await
+            .map(Some)
+    }
+
+    async fn apply_pending_error_context_disposition(
+        &mut self,
+        writer: &EventWriter,
+        disposition: Option<&ErrorContextDisposition>,
+    ) -> Result<()> {
+        let Some(disposition) = disposition else {
+            return Ok(());
+        };
+        writer.apply_error_context_disposition(disposition).await?;
+        let pending = self
+            .pending_error_provider_context
+            .take()
+            .ok_or_else(|| anyhow!("applied Error-context disposition had no pending attempt"))?;
+        if disposition.mutation_id().is_empty() {
+            bail!(
+                "Error-context disposition for {} produced an empty mutation identity",
+                pending.message_id
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn steer_stage(&self) -> SteerStage {
@@ -507,12 +579,27 @@ impl DurableBridge {
             bail!("abort binding requires an Abort command");
         }
 
-        let mut acks = writer
-            .apply_active_abort_cutoff(
-                command.envelope().command_id.as_str(),
-                command.envelope().seq,
-                &self.binding.run_id,
-            )
+        let error_context_disposition =
+            self.build_pending_error_context_disposition(writer).await?;
+        let mut acks = if let Some(disposition) = error_context_disposition.as_ref() {
+            writer
+                .apply_active_abort_cutoff_with_error_context_disposition(
+                    command.envelope().command_id.as_str(),
+                    command.envelope().seq,
+                    &self.binding.run_id,
+                    disposition.clone(),
+                )
+                .await?
+        } else {
+            writer
+                .apply_active_abort_cutoff(
+                    command.envelope().command_id.as_str(),
+                    command.envelope().seq,
+                    &self.binding.run_id,
+                )
+                .await?
+        };
+        self.apply_pending_error_context_disposition(writer, error_context_disposition.as_ref())
             .await?;
 
         // Abort supersedes a hard steer after step zero but before the new
@@ -940,6 +1027,12 @@ impl DurableBridge {
                 message_id,
                 message,
             } => {
+                if let Some(pending) = self.pending_error_provider_context.as_ref() {
+                    bail!(
+                        "assistant MessageStart is fenced until Error context {} is invalidated",
+                        pending.message_id
+                    );
+                }
                 if !self.turn_open || self.assistant_open.is_some() {
                     bail!(
                         "assistant MessageStart requires one exact open turn and no open attempt"
@@ -1190,6 +1283,13 @@ impl DurableBridge {
                 retry_at,
                 error_message,
             } => {
+                let error_context_disposition =
+                    self.build_pending_error_context_disposition(writer).await?;
+                let projections = error_context_disposition
+                    .iter()
+                    .cloned()
+                    .map(Projection::ProviderContextMutationPrepare)
+                    .collect();
                 let committed = self
                     .commit_single(
                         writer,
@@ -1201,7 +1301,7 @@ impl DurableBridge {
                             retry_at,
                             error_message.clone(),
                         )?,
-                        Vec::new(),
+                        projections,
                         AgentEvent::RetryScheduled {
                             attempt,
                             delay_ms,
@@ -1210,6 +1310,11 @@ impl DurableBridge {
                         },
                     )
                     .await?;
+                self.apply_pending_error_context_disposition(
+                    writer,
+                    error_context_disposition.as_ref(),
+                )
+                .await?;
                 self.retry_wait_ready = delay_ms > 0;
                 Ok(committed)
             }
@@ -1223,28 +1328,53 @@ impl DurableBridge {
                     && group.application_kind() == ApplicationKind::SoftSteer
                     && self.pending_steer_turn_end.is_none()
                 {
+                    if self.pending_error_provider_context.is_some() {
+                        bail!(
+                            "terminal Error TurnEnd cannot be buffered past its context disposition"
+                        );
+                    }
                     self.pending_steer_turn_end = Some(((*message).clone(), tool_results.clone()));
                     Ok((Vec::new(), Vec::new()))
                 } else {
+                    let error_context_disposition =
+                        self.build_pending_error_context_disposition(writer).await?;
+                    let projections = error_context_disposition
+                        .iter()
+                        .cloned()
+                        .map(Projection::ProviderContextMutationPrepare)
+                        .collect();
                     self.turn_open = false;
-                    self.commit_single(
+                    let committed = self
+                        .commit_single(
+                            writer,
+                            DurableEvent::turn_end(
+                                &self.binding.run_id,
+                                &self.binding.turn_id,
+                                (*message).clone(),
+                                tool_results.clone(),
+                            )?,
+                            projections,
+                            AgentEvent::TurnEnd {
+                                message: Some(message),
+                                tool_results,
+                            },
+                        )
+                        .await?;
+                    self.apply_pending_error_context_disposition(
                         writer,
-                        DurableEvent::turn_end(
-                            &self.binding.run_id,
-                            &self.binding.turn_id,
-                            (*message).clone(),
-                            tool_results.clone(),
-                        )?,
-                        Vec::new(),
-                        AgentEvent::TurnEnd {
-                            message: Some(message),
-                            tool_results,
-                        },
+                        error_context_disposition.as_ref(),
                     )
-                    .await
+                    .await?;
+                    Ok(committed)
                 }
             }
             AgentEvent::AgentEnd => {
+                if let Some(pending) = self.pending_error_provider_context.as_ref() {
+                    bail!(
+                        "AgentEnd is fenced until Error context {} is invalidated",
+                        pending.message_id
+                    );
+                }
                 if self.turn_open {
                     bail!("AgentEnd requires the current TurnEnd to be durable first");
                 }
@@ -1519,9 +1649,6 @@ impl DurableBridge {
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
-        if !append_to_l0 && !provider_context.is_empty() {
-            bail!("L0-excluded assistant MessageEnd cannot carry provider context");
-        }
         if self.pending_hard_steer.is_some()
             && matches!(
                 &message,
@@ -1540,6 +1667,22 @@ impl DurableBridge {
             self.pending_rejected_end = Some((message_id, message, rejected, barrier));
             return Ok((Vec::new(), Vec::new()));
         }
+        let mut projections = vec![Projection::MessageEnd {
+            message_id: message_id.clone(),
+            role: "assistant",
+            message: message.clone(),
+            append_to_l0,
+            eviction_footprint_tokens: Self::provider_context_footprint(
+                &message,
+                &provider_context,
+            )?,
+            provider_context,
+        }];
+        if let Some(uncalibrated_prompt_estimate) = barrier.calibration_estimate() {
+            projections.push(Projection::MemoryCalibrationObservation {
+                uncalibrated_prompt_estimate,
+            });
+        }
         self.commit_message_batch(
             writer,
             EventBatch {
@@ -1551,17 +1694,7 @@ impl DurableBridge {
                         Some(self.binding.run_id.clone()),
                         Some(self.binding.turn_id.clone()),
                     )?),
-                    projections: vec![Projection::MessageEnd {
-                        message_id: message_id.clone(),
-                        role: "assistant",
-                        message: message.clone(),
-                        append_to_l0,
-                        eviction_footprint_tokens: Self::provider_context_footprint(
-                            &message,
-                            &provider_context,
-                        )?,
-                        provider_context,
-                    }],
+                    projections,
                 }],
                 injected_commands: Vec::new(),
             },
@@ -1895,8 +2028,21 @@ impl DurableBridge {
             PublicMessage::Assistant(value) if value.stop_reason == StopReason::Error
         );
         let provider_context = assistant_barrier.provider_context().to_vec();
-        if !append_to_l0 && !provider_context.is_empty() {
-            bail!("L0-excluded rejected assistant cannot carry provider context");
+        let mut assistant_projections = vec![Projection::MessageEnd {
+            message_id: assistant_id.clone(),
+            role: "assistant",
+            message: assistant.clone(),
+            append_to_l0,
+            eviction_footprint_tokens: Self::provider_context_footprint(
+                &assistant,
+                &provider_context,
+            )?,
+            provider_context,
+        }];
+        if let Some(uncalibrated_prompt_estimate) = assistant_barrier.calibration_estimate() {
+            assistant_projections.push(Projection::MemoryCalibrationObservation {
+                uncalibrated_prompt_estimate,
+            });
         }
         let mut writes = vec![EventWrite {
             event: Some(DurableEvent::message_in_turn(
@@ -1906,17 +2052,7 @@ impl DurableBridge {
                 Some(self.binding.run_id.clone()),
                 Some(self.binding.turn_id.clone()),
             )?),
-            projections: vec![Projection::MessageEnd {
-                message_id: assistant_id.clone(),
-                role: "assistant",
-                message: assistant.clone(),
-                append_to_l0,
-                eviction_footprint_tokens: Self::provider_context_footprint(
-                    &assistant,
-                    &provider_context,
-                )?,
-                provider_context,
-            }],
+            projections: assistant_projections,
         }];
         let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];
         let mut public = vec![AgentEvent::MessageEnd {
@@ -1977,7 +2113,59 @@ impl DurableBridge {
         Vec<CommittedOutput>,
         Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
     )> {
-        let outputs = self.commit_batch(writer, batch, public).await?;
+        let error_context_message_ids: Vec<String> = batch
+            .writes
+            .iter()
+            .flat_map(|write| &write.projections)
+            .filter_map(|projection| match projection {
+                Projection::MessageEnd {
+                    message_id,
+                    message: PublicMessage::Assistant(assistant),
+                    append_to_l0: false,
+                    provider_context,
+                    ..
+                } if assistant.stop_reason == StopReason::Error && !provider_context.is_empty() => {
+                    Some(message_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if error_context_message_ids.len() > 1 {
+            bail!("one EventBatch cannot open multiple Error-context retention units");
+        }
+        if self.pending_error_provider_context.is_some() && !error_context_message_ids.is_empty() {
+            bail!("a prior Error-context retention unit has not reached applied");
+        }
+
+        self.collect_terminal_command_ids(&batch);
+        let (seqs, calibration_ratio_bits) = writer.apply_with_calibration_receipt(batch).await?;
+        if seqs.len() != public.len() {
+            bail!("durable EventBatch/public event cardinality mismatch");
+        }
+        let outputs: Vec<_> = public
+            .into_iter()
+            .zip(seqs)
+            .map(|(event, seq)| CommittedOutput {
+                event,
+                seq: Some(seq),
+            })
+            .collect();
+        let calibration_receipt_count = receipt_requests
+            .iter()
+            .filter(|(_, barrier)| barrier.calibration_estimate().is_some())
+            .count();
+        match (calibration_receipt_count, calibration_ratio_bits) {
+            (0, None) | (1, Some(_)) => {}
+            (0, Some(_)) => {
+                bail!("calibration projection has no receipt-bound MessageEnd");
+            }
+            (_, None) => {
+                bail!("calibration receipt-bound MessageEnd committed no calibration");
+            }
+            (_, Some(_)) => {
+                bail!("multiple MessageEnd receipts requested one calibration value");
+            }
+        }
         let mut committed_by_id = HashMap::new();
         for output in &outputs {
             if let AgentEvent::MessageEnd { message_id, .. } = &output.event {
@@ -1992,16 +2180,29 @@ impl DurableBridge {
         if committed_by_id.len() != receipt_requests.len() {
             bail!("atomic batch MessageEnd receipt cardinality mismatch");
         }
+        if let Some(message_id) = error_context_message_ids.into_iter().next() {
+            let message_seq = *committed_by_id.get(&message_id).ok_or_else(|| {
+                anyhow!("Error-context MessageEnd {message_id} has no committed sequence")
+            })?;
+            self.pending_error_provider_context = Some(PendingErrorProviderContext {
+                message_id,
+                message_seq,
+            });
+        }
         let mut receipts = Vec::with_capacity(receipt_requests.len());
         for (message_id, barrier) in receipt_requests {
             let message_seq = committed_by_id.remove(&message_id).ok_or_else(|| {
                 anyhow!("atomic batch omitted receipt-bound MessageEnd {message_id}")
             })?;
+            let receipt_calibration_ratio_bits = barrier
+                .calibration_estimate()
+                .map(|_| calibration_ratio_bits.expect("calibration receipt was checked"));
             receipts.push((
                 barrier,
                 MessageCommitReceipt {
                     message_id,
                     message_seq,
+                    calibration_ratio_bits: receipt_calibration_ratio_bits,
                     new_turn_id: new_turn_id.clone(),
                 },
             ));
@@ -2075,6 +2276,7 @@ impl DurableBridge {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: partial_message_seq,
+            calibration_ratio_bits: None,
             new_turn_id: Some(new_turn_id.clone()),
         });
 
@@ -2191,6 +2393,7 @@ impl DurableBridge {
                 MessageCommitReceipt {
                     message_id,
                     message_seq: user_message_seq,
+                    calibration_ratio_bits: None,
                     new_turn_id: None,
                 },
             )],
@@ -2366,6 +2569,7 @@ impl DurableBridge {
                 MessageCommitReceipt {
                     message_id: pending.message_id,
                     message_seq,
+                    calibration_ratio_bits: None,
                     new_turn_id: None,
                 },
             ));
@@ -2494,15 +2698,15 @@ mod tests {
             events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
         },
         gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
-        memory::estimate::eviction_footprint_for_payload,
+        memory::estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
         provider::{
             ModelSpec,
             types::{
-                ApiProtocol, ContextMessage, Message, ProviderContextAnchor,
-                ProviderContextFragment, ProviderContextItem, ProviderContextPayload,
-                ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-                StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
-                ValidatedToolArguments,
+                ApiProtocol, ContextMessage, Message, NativeCompactionCoverage,
+                ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+                ProviderContextPayload, ProviderOrigin, PublicAssistantContent,
+                PublicAssistantMessage, PublicMessage, StopReason, ToolCall, ToolResultMessage,
+                UserContent, UserMessage, ValidatedToolArguments,
             },
         },
         store::{
@@ -2786,6 +2990,191 @@ mod tests {
         (binding, assistant_message)
     }
 
+    struct ErrorContextFixture {
+        store: std::sync::Arc<Store>,
+        writer: EventWriter,
+        bridge: DurableBridge,
+        binding: DurableRunBinding,
+        message_id: String,
+        message: PublicMessage,
+        item_key_ref: String,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ErrorContextShape {
+        NativeOnly,
+        Mixed,
+    }
+
+    impl ErrorContextShape {
+        fn item_count(self) -> i64 {
+            match self {
+                Self::NativeOnly => 1,
+                Self::Mixed => 2,
+            }
+        }
+    }
+
+    async fn error_context_fixture(
+        owner_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        shape: ErrorContextShape,
+    ) -> ErrorContextFixture {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let (binding, owner_assistant) = owner_in_phase_with_origin(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+            spec.origin(),
+        )
+        .await;
+        let (message_id, _) = owner_assistant.expect("owner assistant");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: crate::provider::types::Usage {
+                input: 17,
+                output: 3,
+                total_tokens: 20,
+                ..crate::provider::types::Usage::default()
+            },
+            stop_reason: StopReason::Error,
+            error_message: Some("provider display error".to_owned()),
+            provider_code: Some("network_error".to_owned()),
+            interrupted: false,
+            timestamp: test_timestamp(),
+        });
+        let coverage_seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("load native Error coverage endpoint"),
+        )
+        .expect("coverage endpoint is positive");
+        let mut fragments = vec![ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": format!("cmp-{owner_id}"),
+                    "type": "compaction",
+                    "encrypted_content": "opaque-error-native",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: coverage_seq,
+                    context_fingerprint: format!("error-native-{owner_id}"),
+                },
+            },
+        }];
+        if matches!(shape, ErrorContextShape::Mixed) {
+            fragments.push(ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: serde_json::json!({
+                        "id": format!("rs-{owner_id}"),
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-error-reasoning",
+                    }),
+                },
+            });
+        }
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(message_id.clone());
+        let (barrier, receipt) = MessageCommitBarrier::channel_with_provider_context(fragments);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: message_id.clone(),
+                        message: Box::new(message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit authoritative Error terminal");
+        committed.resolve_message_receipts();
+        let committed_receipt = receipt.await.expect("Error MessageEnd receipt");
+        assert_eq!(committed_receipt.message_id, message_id);
+        assert_eq!(
+            bridge.pending_error_provider_context,
+            Some(PendingErrorProviderContext {
+                message_id: message_id.clone(),
+                message_seq: committed_receipt.message_seq,
+            })
+        );
+        let (item_key_ref, item_count): (String, i64) =
+            sqlx::query_as("SELECT MIN(key_ref), COUNT(*) FROM provider_context")
+                .fetch_one(store.pool())
+                .await
+                .expect("load mixed Error provider-context retention unit");
+        assert_eq!(
+            item_count,
+            shape.item_count(),
+            "fixture must retain its exact Error context shape"
+        );
+        ErrorContextFixture {
+            store,
+            writer,
+            bridge,
+            binding,
+            message_id,
+            message,
+            item_key_ref,
+        }
+    }
+
+    async fn assert_error_context_applied(fixture: &ErrorContextFixture) {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+                .fetch_one(fixture.store.pool())
+                .await
+                .expect("count Error provider-context rows"),
+            0
+        );
+        let (state, wrapped_key): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT state, wrapped_key FROM data_keys WHERE key_ref = ?")
+                .bind(&fixture.item_key_ref)
+                .fetch_one(fixture.store.pool())
+                .await
+                .expect("read Error provider-context key");
+        assert_eq!(state, "destroyed");
+        assert!(wrapped_key.is_none());
+        assert!(fixture.bridge.pending_error_provider_context.is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provider_context_mutations
+                 WHERE state = 'applied'",
+            )
+            .fetch_one(fixture.store.pool())
+            .await
+            .expect("count applied Error dispositions"),
+            1
+        );
+    }
+
     fn binding(command_id: &str) -> DurableRunBinding {
         DurableRunBinding {
             command_id: command_id.to_owned(),
@@ -2794,6 +3183,71 @@ mod tests {
             turn_id: "turn-a".to_owned(),
             executor_generation: ProcessGeneration::from_wire(73).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn assistant_message_receipt_carries_exact_committed_calibration_bits() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000031";
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            command_id,
+            "run-calibration",
+            "turn-calibration",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, mut assistant) = assistant.expect("assistant-started fixture");
+        let PublicMessage::Assistant(message) = &mut assistant else {
+            panic!("assistant-started fixture returned a non-assistant message");
+        };
+        message.usage.input = 200;
+        message.usage.total_tokens = 200;
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+        let (barrier, receiver) =
+            MessageCommitBarrier::channel_with_provider_context_and_calibration(Vec::new(), 100);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit calibrated assistant MessageEnd");
+        committed.resolve_message_receipts();
+        let receipt = receiver.await.expect("calibration receipt");
+
+        assert_eq!(receipt.message_id, assistant_id);
+        let receipt_bits = receipt
+            .calibration_ratio_bits
+            .expect("calibrated MessageEnd receipt carries ratio bits");
+        let stored_bits: Vec<u8> =
+            sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+                .fetch_one(store.pool())
+                .await
+                .expect("committed calibration row");
+        assert_eq!(stored_bits, receipt_bits);
+        assert!(
+            (f64::from_bits(u64::from_be_bytes(receipt_bits)) - 1.3).abs() < 1.0e-12,
+            "default 1.0 ratio updated from a 200/100 observation with alpha 0.3"
+        );
     }
 
     #[test]
@@ -3212,6 +3666,365 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_terminal_preserves_context_durably_without_l0_replay_membership() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let origin = spec.origin();
+
+        let owner_id = "00000000-0000-4000-8000-000000000079";
+        let run_id = "run-error-provider-context";
+        let turn_id = "turn-error-provider-context";
+        let (owner_binding, owner_assistant) = owner_in_phase_with_origin(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+            origin.clone(),
+        )
+        .await;
+        let (owner_assistant_id, _) = owner_assistant.expect("owner assistant");
+
+        let mut bridge = DurableBridge::new(owner_binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(owner_assistant_id.clone());
+
+        let usage = crate::provider::types::Usage {
+            input: 17,
+            output: 3,
+            total_tokens: 20,
+            ..crate::provider::types::Usage::default()
+        };
+        let error = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin,
+            usage,
+            stop_reason: StopReason::Error,
+            error_message: Some("provider display error".to_owned()),
+            provider_code: Some("network_error".to_owned()),
+            interrupted: false,
+            timestamp: test_timestamp(),
+        });
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: serde_json::json!({
+                    "id": "rs-error",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-error-reasoning",
+                }),
+            },
+        };
+
+        let (barrier, receipt) =
+            MessageCommitBarrier::channel_with_provider_context(vec![fragment.clone()]);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: owner_assistant_id.clone(),
+                        message: Box::new(error.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit authoritative Error terminal");
+        let (outputs, _, _, _) = committed.resolve_message_receipts();
+        assert!(matches!(
+            outputs.as_slice(),
+            [CommittedOutput {
+                event: AgentEvent::MessageEnd { message, .. },
+                ..
+            }] if message.as_ref() == &error
+        ));
+        let receipt = receipt.await.expect("Error MessageEnd receipt");
+        assert_eq!(receipt.message_id, owner_assistant_id);
+
+        let provider_row: (String, i64) = sqlx::query_as(
+            "SELECT message_id, eviction_tokens
+             FROM provider_context
+             WHERE message_id = ?",
+        )
+        .bind(&owner_assistant_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("durable Error provider-context row");
+        assert_eq!(provider_row.0, owner_assistant_id);
+        assert!(provider_row.1 > 0);
+
+        let membership: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages WHERE message_id = ?")
+                .bind(&owner_assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count Error L0 membership");
+        assert_eq!(membership, 0, "Error assistant must remain outside L0");
+
+        let l0_footprint: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(eviction_footprint_tokens), 0) FROM memory_batches",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("sum L0 provider-context footprint");
+        assert_eq!(
+            l0_footprint, 0,
+            "durable Error context must not be charged to replayable L0"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_and_overflow_dispositions_apply_error_context_before_next_attempt() {
+        for (shape_index, shape) in [ErrorContextShape::NativeOnly, ErrorContextShape::Mixed]
+            .into_iter()
+            .enumerate()
+        {
+            for (delay_index, delay_ms) in [2_000_u64, 0_u64].into_iter().enumerate() {
+                let ordinal = 80 + shape_index * 2 + delay_index;
+                let owner_id = format!("00000000-0000-4000-8000-{ordinal:012}");
+                let run_id = format!("run-error-retry-{ordinal}");
+                let turn_id = format!("turn-error-retry-{ordinal}");
+                let mut fixture = error_context_fixture(&owner_id, &run_id, &turn_id, shape).await;
+                let (barrier, _committed) = RetryWaitCommitBarrier::channel();
+                let committed = fixture
+                    .bridge
+                    .commit(
+                        &fixture.writer,
+                        RunOutput {
+                            binding: fixture.binding.clone(),
+                            event: AgentEvent::RetryScheduled {
+                                attempt: 1,
+                                delay_ms,
+                                retry_at: test_timestamp(),
+                                error_message: if delay_ms == 0 {
+                                    "context overflow".to_owned()
+                                } else {
+                                    "provider retry".to_owned()
+                                },
+                            },
+                            commit_barrier: None,
+                            message_commit_barrier: None,
+                            retry_wait_commit_barrier: Some(barrier),
+                            approval_command: None,
+                            approval_not_started: None,
+                            approval_cancelled: None,
+                        },
+                    )
+                    .await
+                    .expect("RetryScheduled disposition commits and applies Error Invalidate");
+                let (outputs, _, retry_barrier, _) = committed.resolve_message_receipts();
+                assert!(matches!(
+                    outputs.as_slice(),
+                    [CommittedOutput {
+                        event: AgentEvent::RetryScheduled { delay_ms: actual, .. },
+                        ..
+                    }] if *actual == delay_ms
+                ));
+                retry_barrier
+                    .expect("RetryScheduled returns its commit barrier")
+                    .committed();
+                assert_error_context_applied(&fixture).await;
+
+                let mut next_attempt_message = fixture.message.clone();
+                let PublicMessage::Assistant(next_attempt) = &mut next_attempt_message else {
+                    unreachable!("fixture assistant")
+                };
+                next_attempt.content.clear();
+                next_attempt.stop_reason = StopReason::Stop;
+                next_attempt.error_message = None;
+                next_attempt.provider_code = None;
+                let next_message_id = format!("{}-next", fixture.message_id);
+                fixture
+                    .bridge
+                    .commit(
+                        &fixture.writer,
+                        RunOutput {
+                            binding: fixture.binding.clone(),
+                            event: AgentEvent::MessageStart {
+                                message_id: next_message_id,
+                                message: Box::new(next_attempt_message),
+                            },
+                            commit_barrier: None,
+                            message_commit_barrier: None,
+                            retry_wait_commit_barrier: None,
+                            approval_command: None,
+                            approval_not_started: None,
+                            approval_cancelled: None,
+                        },
+                    )
+                    .await
+                    .expect("next attempt starts only after Error context is applied");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_error_disposition_applies_context_before_agent_end() {
+        for (ordinal, shape) in [
+            (86, ErrorContextShape::NativeOnly),
+            (87, ErrorContextShape::Mixed),
+        ] {
+            let mut fixture = error_context_fixture(
+                &format!("00000000-0000-4000-8000-{ordinal:012}"),
+                &format!("run-terminal-error-context-{ordinal}"),
+                &format!("turn-terminal-error-context-{ordinal}"),
+                shape,
+            )
+            .await;
+            let committed = fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::TurnEnd {
+                            message: Some(Box::new(fixture.message.clone())),
+                            tool_results: Vec::new(),
+                        },
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("terminal Error TurnEnd prepares and applies Invalidate");
+            assert!(matches!(
+                committed.outputs.as_slice(),
+                [CommittedOutput {
+                    event: AgentEvent::TurnEnd { .. },
+                    ..
+                }]
+            ));
+            assert_error_context_applied(&fixture).await;
+
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::AgentEnd,
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("AgentEnd follows only after terminal Error context is applied");
+        }
+    }
+
+    #[tokio::test]
+    async fn active_abort_cutoff_supersedes_pending_command_and_disposes_error_context() {
+        for (ordinal, shape) in [
+            (88, ErrorContextShape::NativeOnly),
+            (89, ErrorContextShape::Mixed),
+        ] {
+            let mut fixture = error_context_fixture(
+                &format!("00000000-0000-4000-8000-{ordinal:012}"),
+                &format!("run-abort-error-context-{ordinal}"),
+                &format!("turn-abort-error-context-{ordinal}"),
+                shape,
+            )
+            .await;
+            let superseded_id = "00000000-0000-4000-8000-000000000084";
+            persist_and_pin(
+                &fixture.store,
+                &fixture.writer,
+                2,
+                superseded_id,
+                "superseded while Error closes",
+            )
+            .await;
+            let abort_id = "00000000-0000-4000-8000-000000000085";
+            fixture
+                .writer
+                .persist_inbound(&test_abort_command(3, abort_id))
+                .await
+                .expect("persist shared Abort cutoff");
+
+            fixture
+                .bridge
+                .bind_abort(&fixture.writer, test_admitted_abort(3, abort_id))
+                .await
+                .expect("Abort cutoff atomically supersedes and prepares Error disposition");
+            assert_error_context_applied(&fixture).await;
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM inbound_commands WHERE command_id = ?",
+                )
+                .bind(superseded_id)
+                .fetch_one(fixture.store.pool())
+                .await
+                .expect("read superseded command"),
+                "superseded"
+            );
+            assert_eq!(fixture.bridge.phase, RunPhase::CancelRequested);
+
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::TurnEnd {
+                            message: Some(Box::new(fixture.message.clone())),
+                            tool_results: Vec::new(),
+                        },
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("aborted Error attempt closes after shared disposition");
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::AgentEnd,
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("aborted run closes after Error context reaches applied");
+        }
+    }
+
+    #[tokio::test]
     async fn hard_steer_partial_preserves_provider_context_and_eviction_footprint() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -3276,9 +4089,9 @@ mod tests {
             },
         };
         let expected_footprint = eviction_footprint_for_payload(&spec, &fragment.payload)
-            .expect("provider context footprint")
-            .eviction_tokens();
-        assert!(expected_footprint > 0);
+            .expect("provider context footprint");
+        let expected_footprint_tokens = expected_footprint.eviction_tokens();
+        assert!(expected_footprint_tokens > 0);
 
         let (assistant_barrier, assistant_receipt) =
             MessageCommitBarrier::channel_with_provider_context(vec![fragment.clone()]);
@@ -3323,7 +4136,7 @@ mod tests {
                 i64::try_from(receipt.message_seq).expect("message seq fits SQLite"),
                 1,
                 0,
-                i64::try_from(expected_footprint).expect("footprint fits SQLite"),
+                i64::try_from(expected_footprint_tokens).expect("footprint fits SQLite"),
             )
         );
 
@@ -3339,21 +4152,28 @@ mod tests {
         .expect("hard-steer partial L0 footprint");
         assert_eq!(
             durable_footprint,
-            i64::try_from(expected_footprint).expect("footprint fits SQLite")
+            i64::try_from(expected_footprint_tokens).expect("footprint fits SQLite")
         );
 
         let normalized =
             normalize_partial_assistant(partial).expect("normalize hard-steer partial assistant");
-        let expected_context = vec![ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: owner_assistant_id.clone(),
-                message_seq: receipt.message_seq,
-            }),
-            wire_item_index: fragment.wire_item_index,
-            ordinal: 0,
-            provider_origin: origin,
-            payload: fragment.payload,
-        }];
+        let expected_context = vec![ProviderContextItemWithFootprint::new(
+            ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: owner_assistant_id.clone(),
+                    message_seq: receipt.message_seq,
+                },
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: owner_assistant_id.clone(),
+                    message_seq: receipt.message_seq,
+                }),
+                wire_item_index: fragment.wire_item_index,
+                ordinal: 0,
+                provider_origin: origin,
+                payload: fragment.payload,
+            },
+            expected_footprint,
+        )];
         let messages = vec![ContextMessage::Persisted {
             id: owner_assistant_id,
             seq: receipt.message_seq,
