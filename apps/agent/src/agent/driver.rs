@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
+        ThreeLayerMemory,
+        compactor::apply_ready_memory,
         context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
         estimate::{ProviderContextItemWithFootprint, TokenCalibration},
         overflow::AssemblyMode,
@@ -33,6 +35,7 @@ use crate::{
         },
     },
     runtime::contracts::ProcessGeneration,
+    store::{HydratedRunState, HydrationOutcome, Store},
     tools::executor::ArtifactBrokerClient,
     tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
 };
@@ -42,7 +45,7 @@ use super::{
     run::ProviderCallAttempt,
 };
 
-type StreamStarter = dyn Fn(
+pub(crate) type StreamStarter = dyn Fn(
         ModelSpec,
         PromptContext,
         RequestOptions,
@@ -143,6 +146,13 @@ pub(crate) struct InjectedRunDriver {
     stream_starter: Arc<StreamStarter>,
     timings: RunTimingSamples,
     timing_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    memory_maintenance: Option<HydratedMemoryMaintenance>,
+}
+
+struct HydratedMemoryMaintenance {
+    store: Arc<Store>,
+    lease: crate::runtime::contracts::ProcessGenerationLease,
+    fence: crate::runtime::contracts::GenerationRecoveryFence,
 }
 
 impl InjectedRunDriver {
@@ -202,6 +212,7 @@ impl InjectedRunDriver {
             stream_starter,
             timings: RunTimingSamples::default(),
             timing_tasks: Mutex::new(Vec::new()),
+            memory_maintenance: None,
         })
     }
 
@@ -216,6 +227,50 @@ impl InjectedRunDriver {
     pub(crate) fn with_broker(mut self, broker: ArtifactBrokerClient) -> Self {
         self.assembler.set_broker(broker);
         self
+    }
+
+    /// Bind an authenticated T17 memory snapshot and its Store refresh
+    /// authority to this production-shaped driver.
+    ///
+    /// T26 remains responsible for choosing and composing the dependencies;
+    /// this method only makes the completed T17→T21 handoff expressible.
+    pub(crate) fn with_hydrated_memory(
+        mut self,
+        store: Arc<Store>,
+        hydrated: &HydratedRunState,
+    ) -> Result<Self> {
+        if store.scope() != &hydrated.scope {
+            bail!("hydrated memory Store scope does not match the authenticated run scope");
+        }
+        hydrated
+            .lease
+            .validate_exact(self.executor_generation, hydrated.lease.lease_id())
+            .map_err(|error| anyhow!("hydrated memory generation mismatch: {error}"))?;
+        hydrated
+            .fence
+            .validate_exact(&hydrated.lease, hydrated.fence.fence_id())
+            .map_err(|error| anyhow!("hydrated memory fence mismatch: {error}"))?;
+        if hydrated.receipt.intent_count != 0
+            || hydrated.receipt.generation != hydrated.lease.generation()
+            || hydrated.receipt.lease_id != hydrated.lease.lease_id()
+            || hydrated.receipt.fence_id != hydrated.fence.fence_id()
+        {
+            bail!("hydrated memory receipt does not prove a clean authenticated snapshot");
+        }
+
+        let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
+            .map_err(|error| anyhow!("hydrated memory graph is invalid: {error}"))?;
+        self.assembler.install_hydrated_memory(
+            memory,
+            &hydrated.messages,
+            hydrated.provider_context.clone(),
+        )?;
+        self.memory_maintenance = Some(HydratedMemoryMaintenance {
+            store,
+            lease: hydrated.lease.clone(),
+            fence: hydrated.fence.clone(),
+        });
+        Ok(self)
     }
 
     fn initial_message(&self) -> PublicMessage {
@@ -294,6 +349,40 @@ impl RunDriver for InjectedRunDriver {
         provider_context: Vec<ProviderContextItemWithFootprint>,
     ) {
         self.assembler.set_provider_context(provider_context);
+    }
+
+    async fn apply_idle_memory_maintenance(&self, core: &mut RunCore) -> Result<bool> {
+        let maintenance = self.memory_maintenance.as_ref().ok_or_else(|| {
+            anyhow!("idle memory maintenance has no authenticated Store/hydration binding")
+        })?;
+        let applied = apply_ready_memory(maintenance.store.clone()).await?;
+        if applied == 0 {
+            return Ok(false);
+        }
+
+        let hydrated = maintenance
+            .store
+            .hydrate(&maintenance.lease, &maintenance.fence)
+            .await
+            .context("rehydrate memory after durable idle apply")?;
+        let HydrationOutcome::Complete(hydrated) = hydrated else {
+            bail!(
+                "idle memory apply committed but authenticated rehydration remains pending physical or logical recovery"
+            );
+        };
+        let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
+            .context("rehydrated memory graph is invalid after idle apply")?;
+
+        // Session calls this only while it uniquely owns RunCore. Prepare
+        // every fallible value first, then refresh assembler and core before
+        // reporting success; provider admission cannot observe the old view.
+        self.assembler.install_hydrated_memory(
+            memory,
+            &hydrated.messages,
+            hydrated.provider_context.clone(),
+        )?;
+        core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+        Ok(true)
     }
 
     async fn start_provider_for_command(
@@ -412,7 +501,13 @@ impl RunDriver for InjectedRunDriver {
         active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         let replacement = self.assembler.recover_overflow(active_context)?;
-        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+        if self.memory_maintenance.is_some() {
+            Ok(OverflowRecoveryOutcome::RetainCanonicalContext {
+                validated_send_view: replacement,
+            })
+        } else {
+            Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+        }
     }
 
     fn install_committed_calibration(&self, ratio_bits: [u8; 8]) -> Result<()> {

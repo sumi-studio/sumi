@@ -76,6 +76,12 @@ pub(crate) struct OverflowRecoveryRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OverflowRecoveryOutcome {
     ReplacementContext(Vec<ContextMessage>),
+    /// The driver proved that a changed bounded send view exists, but the
+    /// canonical in-memory transcript must remain intact. The next provider
+    /// attempt derives that view again from the retained life log.
+    RetainCanonicalContext {
+        validated_send_view: Vec<ContextMessage>,
+    },
 }
 
 /// Result of attempting to durably commit a `ToolExecutionStart`.
@@ -527,7 +533,14 @@ impl Runner {
                             break;
                         }
                     };
-                    let OverflowRecoveryOutcome::ReplacementContext(replacement) = outcome;
+                    let (replacement, retain_canonical) = match outcome {
+                        OverflowRecoveryOutcome::ReplacementContext(replacement) => {
+                            (replacement, false)
+                        }
+                        OverflowRecoveryOutcome::RetainCanonicalContext {
+                            validated_send_view,
+                        } => (validated_send_view, true),
+                    };
                     if let Err(error) = self.validate_recovered_context(&replacement) {
                         tracing::error!(%error, ?source, "immediate overflow recovery was invalid");
                         self.close_turn_without_context(message).await?;
@@ -539,8 +552,10 @@ impl Runner {
                         format!("context overflow: {source:?}"),
                     )
                     .await?;
-                    self.context = replacement;
-                    self.core.mark_mutated();
+                    if !retain_canonical {
+                        self.context = replacement;
+                        self.core.mark_mutated();
+                    }
                 }
                 AttemptOutcome::Terminal {
                     assistant_message_id,

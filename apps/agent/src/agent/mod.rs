@@ -64,6 +64,8 @@ use durable_bridge::{
 };
 use queue::MessageQueue;
 
+#[cfg(test)]
+pub(crate) use driver::StreamStarter;
 #[allow(
     unused_imports,
     reason = "T26 constructs the injected production runtime"
@@ -314,6 +316,16 @@ impl RunCore {
         self.runtime_context = messages;
         self.provider_context = provider_context;
         self.mark_mutated();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_context(&self) -> &[ContextMessage] {
+        &self.runtime_context
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_context(&self) -> &[ProviderContextItemWithFootprint] {
+        &self.provider_context
     }
 }
 

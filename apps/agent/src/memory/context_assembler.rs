@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use sha2::Digest;
 
+use crate::memory::ThreeLayerMemory;
 use crate::memory::estimate::{
     EstimateError, ProviderContextItemWithFootprint, TokenCalibration, estimate_public_messages,
     estimate_text_tokens, eviction_footprint_for_payload, sum_saved_footprints,
@@ -16,7 +17,6 @@ use crate::memory::overflow::{
     AssemblyMode, Overflow, USER_ATTACHMENT_TRUNCATION_BYTES, context_message_to_public,
 };
 use crate::memory::transform;
-use crate::memory::{BatchState, L0Batch, ThreeLayerMemory};
 #[cfg(test)]
 use crate::provider::types::Usage;
 use crate::provider::{
@@ -43,7 +43,12 @@ pub struct ContextAssembler {
     // digest alongside the deterministic artifact identity so equal content
     // from different messages cannot reuse the wrong handle.
     attachment_handles: Mutex<HashMap<String, ([u8; 32], String)>>,
-    three_layer_memory: Mutex<Option<ThreeLayerMemory>>,
+    hydrated_three_layer: Mutex<Option<HydratedThreeLayer>>,
+}
+
+struct HydratedThreeLayer {
+    memory: ThreeLayerMemory,
+    transcript_through_seq: u64,
 }
 
 /// The exact estimate used to construct one provider attempt. Keeping it in
@@ -84,7 +89,7 @@ impl ContextAssembler {
             mode: AssemblyMode::SumiThreeLayer,
             attachment_handles: Mutex::new(HashMap::new()),
             spec,
-            three_layer_memory: Mutex::new(None),
+            hydrated_three_layer: Mutex::new(None),
         })
     }
 
@@ -107,10 +112,55 @@ impl ContextAssembler {
         self
     }
 
-    pub fn with_three_layer_memory(mut self, memory: ThreeLayerMemory) -> Self {
+    #[cfg(test)]
+    fn with_three_layer_memory(
+        mut self,
+        memory: ThreeLayerMemory,
+        transcript_through_seq: u64,
+    ) -> Self {
         *self.calib.get_mut().expect("calibration lock") = memory.calibration();
-        *self.three_layer_memory.get_mut().expect("memory lock") = Some(memory);
+        *self.hydrated_three_layer.get_mut().expect("memory lock") = Some(HydratedThreeLayer {
+            memory,
+            transcript_through_seq,
+        });
         self
+    }
+
+    /// Install one authenticated Store snapshot as the Sumi send-view source.
+    ///
+    /// The caller transcript remains the canonical life log. The snapshot
+    /// binds the exact live L0 membership to the greatest transcript sequence
+    /// observed during the same hydration transaction; later persisted
+    /// messages are overlaid until the next idle refresh.
+    pub(crate) fn install_hydrated_memory(
+        &self,
+        memory: ThreeLayerMemory,
+        hydrated_messages: &[ContextMessage],
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) -> Result<()> {
+        if self.mode != AssemblyMode::SumiThreeLayer {
+            anyhow::bail!("hydrated three-layer memory requires sumi_three_layer assembly mode");
+        }
+        let transcript_through_seq = hydrated_transcript_cutoff(hydrated_messages)?;
+        for message in memory.l0().iter().flat_map(|batch| &batch.messages) {
+            let ContextMessage::Persisted { seq, .. } = message else {
+                anyhow::bail!("hydrated L0 contains a synthetic message");
+            };
+            if *seq > transcript_through_seq {
+                anyhow::bail!(
+                    "hydrated L0 message sequence {seq} exceeds transcript cutoff {transcript_through_seq}"
+                );
+            }
+        }
+
+        let calibration = memory.calibration();
+        *self.calib.lock().expect("calibration lock") = calibration;
+        *self.provider_context.lock().expect("provider context lock") = provider_context;
+        *self.hydrated_three_layer.lock().expect("memory lock") = Some(HydratedThreeLayer {
+            memory,
+            transcript_through_seq,
+        });
+        Ok(())
     }
 
     pub fn spec(&self) -> &ModelSpec {
@@ -163,8 +213,9 @@ impl ContextAssembler {
             .lock()
             .expect("provider context lock")
             .clone();
+        let active_view = self.active_send_messages(context)?;
         let mut messages = overflow.recover_context_with_provider_context(
-            context.to_vec(),
+            active_view,
             is_first_user_call,
             &provider_context,
         )?;
@@ -217,11 +268,8 @@ impl ContextAssembler {
         // completed shelves while Idle. At this API-preflight fallback we retain
         // only the bounded, replay-safe send-view recovery. It neither changes
         // durable membership nor tries to imitate promotion in process memory.
-        overflow.recover_context_with_provider_context(
-            active_context.to_vec(),
-            false,
-            &provider_context,
-        )
+        let active_view = self.active_send_messages(active_context)?;
+        overflow.recover_context_with_provider_context(active_view, false, &provider_context)
     }
 
     /// Install the exact calibration value returned by a committed
@@ -247,7 +295,7 @@ impl ContextAssembler {
         &self,
         message_id: &str,
         message_seq: u64,
-        message: &AssistantMessage,
+        _message: &AssistantMessage,
         fragments: &[ProviderContextFragment],
     ) -> Result<()> {
         let destination = self.spec.origin();
@@ -262,20 +310,6 @@ impl ContextAssembler {
             fragments,
         )?;
         provider_context.extend(new_items);
-
-        if let Some(memory) = self
-            .three_layer_memory
-            .lock()
-            .expect("memory lock")
-            .as_mut()
-        {
-            let context_message = ContextMessage::Persisted {
-                id: message_id.to_owned(),
-                seq: message_seq,
-                message: Message::Assistant(message.clone()),
-            };
-            append_to_open_l0_batch(memory, context_message)?;
-        }
 
         Ok(())
     }
@@ -297,11 +331,43 @@ impl ContextAssembler {
         *self.memory_blocks.lock().expect("memory blocks lock") = memory_blocks;
     }
 
-    fn three_layer_memory_is_present(&self) -> bool {
-        self.three_layer_memory
-            .lock()
-            .expect("memory lock")
-            .is_some()
+    fn active_send_messages(&self, life_log: &[ContextMessage]) -> Result<Vec<ContextMessage>> {
+        let hydrated = self.hydrated_three_layer.lock().expect("memory lock");
+        let Some(hydrated) = hydrated.as_ref() else {
+            return Ok(life_log.to_vec());
+        };
+
+        let mut active = Vec::new();
+        let mut active_ids = std::collections::HashSet::new();
+        for message in hydrated
+            .memory
+            .l0()
+            .iter()
+            .flat_map(|batch| batch.messages.iter())
+        {
+            let ContextMessage::Persisted { id, .. } = message else {
+                anyhow::bail!("three-layer L0 contains a synthetic message");
+            };
+            if !active_ids.insert(id.clone()) {
+                anyhow::bail!("three-layer L0 contains duplicate message id {id}");
+            }
+            active.push(message.clone());
+        }
+
+        for message in life_log {
+            match message {
+                ContextMessage::Persisted { id, seq, .. }
+                    if *seq > hydrated.transcript_through_seq =>
+                {
+                    if active_ids.insert(id.clone()) {
+                        active.push(message.clone());
+                    }
+                }
+                ContextMessage::Synthetic { .. } => active.push(message.clone()),
+                ContextMessage::Persisted { .. } => {}
+            }
+        }
+        Ok(active)
     }
 
     async fn apply_user_attachment_truncation(
@@ -451,13 +517,13 @@ impl ContextAssembler {
     }
 
     fn current_memory_blocks(&self) -> Vec<MemoryBlock> {
-        if let Some(memory) = self
-            .three_layer_memory
+        if let Some(hydrated) = self
+            .hydrated_three_layer
             .lock()
             .expect("memory lock")
             .as_ref()
         {
-            memory_blocks_from_three_layer(memory)
+            memory_blocks_from_three_layer(&hydrated.memory)
         } else {
             self.memory_blocks
                 .lock()
@@ -497,11 +563,6 @@ impl ContextAssembler {
 
         Ok(total)
     }
-}
-
-fn public_estimate_for_context(messages: &[ContextMessage]) -> Result<u64> {
-    let public: Vec<_> = messages.iter().map(context_message_to_public).collect();
-    estimate_public_messages(&public).map_err(Into::into)
 }
 
 fn provider_context_footprint_for_messages(
@@ -546,19 +607,20 @@ fn estimate_tool_definitions(tools: &[ToolDefinition]) -> Result<u64> {
     Ok(total)
 }
 
-fn append_to_open_l0_batch(memory: &mut ThreeLayerMemory, message: ContextMessage) -> Result<()> {
-    // The simplest incremental policy: append to the open batch, or start one.
-    if let Some(batch) = memory.l0_mut().back_mut()
-        && batch.state == BatchState::Open
-    {
-        batch.messages.push(message);
-        batch.est_tokens = public_estimate_for_context(&batch.messages)?;
-        return Ok(());
+fn hydrated_transcript_cutoff(messages: &[ContextMessage]) -> Result<u64> {
+    let mut previous = 0_u64;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            anyhow::bail!("hydrated transcript contains a synthetic message");
+        };
+        if *seq <= previous {
+            anyhow::bail!(
+                "hydrated transcript sequence is not strictly increasing: {seq} after {previous}"
+            );
+        }
+        previous = *seq;
     }
-    let seq = memory.allocate_l0_batch_seq();
-    let est = public_estimate_for_context(std::slice::from_ref(&message))?;
-    memory.push_l0(L0Batch::new(vec![message], seq, 0, est));
-    Ok(())
+    Ok(previous)
 }
 
 fn memory_blocks_from_three_layer(memory: &ThreeLayerMemory) -> Vec<MemoryBlock> {
@@ -780,9 +842,9 @@ fn fragments_to_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::ConsolidatedMemory;
     use crate::memory::estimate::EvictionFootprint;
-    use crate::provider::types::{StopReason, UserMessage};
+    use crate::memory::{BatchState, ConsolidatedMemory, L0Batch};
+    use crate::provider::types::{StopReason, ToolResultMessage, UserMessage};
     use chrono::Utc;
 
     fn model_spec() -> ModelSpec {
@@ -1263,7 +1325,7 @@ mod tests {
 
         let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), model_spec())
             .expect("valid prompt")
-            .with_three_layer_memory(memory);
+            .with_three_layer_memory(memory, 2);
         let recovered = assembler
             .recover_overflow(&[first, second, newest.clone()])
             .expect("bounded fallback recovery");
@@ -1272,8 +1334,8 @@ mod tests {
             recovered.contains(&newest),
             "active user must survive fallback"
         );
-        let memory = assembler.three_layer_memory.lock().expect("memory lock");
-        let l0 = memory.as_ref().expect("configured memory").l0();
+        let memory = assembler.hydrated_three_layer.lock().expect("memory lock");
+        let l0 = memory.as_ref().expect("configured memory").memory.l0();
         assert_eq!(l0.len(), 2, "fallback must not append a full-history batch");
         assert_eq!(l0[0].id, sealed_id);
         assert_eq!(l0[1].id, open_id);
@@ -1332,11 +1394,101 @@ mod tests {
         );
         let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec)
             .expect("valid prompt")
-            .with_three_layer_memory(memory);
+            .with_three_layer_memory(memory, 0);
         let result = assembler.assemble(&[], 1).await.expect("assemble");
         assert_eq!(result.memory_blocks.len(), 1);
         assert_eq!(result.memory_blocks[0].layer, MemoryLayer::L2);
         assert_eq!(result.memory_blocks[0].text, "L2 summary");
+    }
+
+    #[tokio::test]
+    async fn hydrated_send_view_excludes_promoted_history_and_keeps_live_role_suffix() {
+        let promoted = user("promoted old history", 1);
+        let live_l0 = user("exact hydrated L0", 2);
+        let post_hydration_user = user("new user", 3);
+        let spec = model_spec();
+        let post_hydration_tool_call = ContextMessage::Persisted {
+            id: "assistant-4".to_owned(),
+            seq: 4,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    tool_call: crate::provider::types::ToolCall {
+                        id: "call-4".to_owned(),
+                        name: "fixture".to_owned(),
+                        arguments: serde_json::from_value(serde_json::json!({}))
+                            .expect("object tool arguments"),
+                    },
+                    wire_item_index: 0,
+                }],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let post_hydration_tool = ContextMessage::Persisted {
+            id: "tool-4".to_owned(),
+            seq: 5,
+            message: Message::ToolResult(ToolResultMessage {
+                tool_call_id: "call-4".to_owned(),
+                tool_name: "fixture".to_owned(),
+                content: vec![UserContent::Text {
+                    text: "new tool".to_owned(),
+                }],
+                details: serde_json::json!({}),
+                is_error: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let post_hydration_assistant = assistant_with_thinking(6, "new private", 1);
+
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(
+                    "summary of promoted old history".to_owned(),
+                ),
+                est_tokens: 8,
+            },
+            TokenCalibration::default(),
+        );
+        memory.push_l0(L0Batch::new(vec![live_l0.clone()], 1, 0, 5));
+        let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), model_spec())
+            .expect("valid prompt")
+            .with_three_layer_memory(memory, 2);
+
+        let result = assembler
+            .assemble(
+                &[
+                    promoted,
+                    live_l0,
+                    post_hydration_user,
+                    post_hydration_tool_call,
+                    post_hydration_tool,
+                    post_hydration_assistant,
+                ],
+                1,
+            )
+            .await
+            .expect("assemble exact hydrated view");
+        let seqs = result
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ContextMessage::Persisted { seq, .. } => Some(*seq),
+                ContextMessage::Synthetic { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seqs, [2, 3, 4, 5, 6]);
+        assert_eq!(result.memory_blocks.len(), 1);
+        assert_eq!(
+            result.memory_blocks[0].text,
+            "summary of promoted old history"
+        );
     }
 
     #[tokio::test]

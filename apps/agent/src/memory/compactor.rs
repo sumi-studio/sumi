@@ -1849,6 +1849,36 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
     })
 }
 
+/// Apply every contiguous completed memory shelf through the authoritative
+/// EventWriter transaction boundary.
+///
+/// This operation deliberately depends only on Store. The background
+/// compactor owns speculative provider work; an idle Session owns promotion
+/// and can therefore apply completed shelves without constructing another
+/// compaction provider.
+pub(crate) async fn apply_ready_memory(store: Arc<Store>) -> Result<usize> {
+    let mut applied = 0;
+    loop {
+        let mut progress = false;
+        for kind in [
+            MemoryJobKind::CompactL0,
+            MemoryJobKind::CompactL1,
+            MemoryJobKind::ConsolidateL2,
+        ] {
+            let outcome = apply_next_completed_job(store.clone(), kind).await?;
+            if outcome == ApplyProgress::Applied {
+                applied += 1;
+            }
+            if outcome.made_progress() {
+                progress = true;
+            }
+        }
+        if !progress {
+            return Ok(applied);
+        }
+    }
+}
+
 async fn advance_apply_cursor(
     store: Arc<Store>,
     kind: MemoryJobKind,
@@ -2278,26 +2308,7 @@ impl CompactWorker {
     /// intentionally an explicit maintenance operation; compaction workers
     /// only produce encrypted shelves and never block the conversation path.
     pub(crate) async fn apply_ready(&self) -> Result<usize> {
-        let mut applied = 0;
-        loop {
-            let mut progress = false;
-            for kind in [
-                MemoryJobKind::CompactL0,
-                MemoryJobKind::CompactL1,
-                MemoryJobKind::ConsolidateL2,
-            ] {
-                let outcome = apply_next_completed_job(self.store.clone(), kind).await?;
-                if outcome == ApplyProgress::Applied {
-                    applied += 1;
-                }
-                if outcome.made_progress() {
-                    progress = true;
-                }
-            }
-            if !progress {
-                return Ok(applied);
-            }
-        }
+        apply_ready_memory(self.store.clone()).await
     }
 
     async fn maintenance_cycle(&self) -> Result<()> {
@@ -2405,18 +2416,30 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::memory::estimate::{EvictionFootprint, legacy_serialized_bytes_eviction_footprint};
+    use crate::agent::{InjectedRunDriver, RunCore, RunDriver, StreamStarter};
+    use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
+    use crate::memory::estimate::{
+        EvictionFootprint, eviction_footprint_for_payload,
+        legacy_serialized_bytes_eviction_footprint,
+    };
+    use crate::provider::RequestOptions;
     use crate::provider::types::{
-        ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
-        ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
-        ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+        ApiProtocol, NativeCompactionCoverage, PromptContext, ProviderContextAnchor,
+        ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEventStream,
+        ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall, ToolResultMessage, Usage,
+        UserMessage, ValidatedToolArguments,
+    };
+    use crate::runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
-        DataKeyPurpose, EncryptedProviderContextRecord, MemoryBatchMessageRecord,
-        MemoryBatchRecord, MemoryBatchState, MemoryJobKind, MemoryJobRecord, MemoryLayer,
-        ProviderContextKeyAnchor, ProviderContextMutationApplier, ProviderContextMutationBuilder,
-        Store, TranscriptRecord, provider_context_idempotency_key,
+        ApplicationKind, DataKeyPurpose, EncryptedProviderContextRecord, HydrationOutcome,
+        InjectedCommand, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+        MemoryJobKind, MemoryJobRecord, MemoryLayer, ProviderContextKeyAnchor,
+        ProviderContextMutationApplier, ProviderContextMutationBuilder, RunPhase, Store,
+        TranscriptRecord, provider_context_idempotency_key,
     };
+    use crate::tools::{ToolRegistryBuilder, WorkspacePaths};
     use tokio_util::sync::CancellationToken;
 
     fn timestamp() -> DateTime<Utc> {
@@ -3136,6 +3159,219 @@ mod tests {
                 .await
                 .expect("open test store"),
         )
+    }
+
+    async fn seed_completed_authenticated_turn(
+        store: &Arc<Store>,
+        spec: &ModelSpec,
+        user_text: &str,
+        assistant_message_id: &str,
+        assistant: PublicMessage,
+        provider_context: Vec<ProviderContextFragment>,
+    ) {
+        let eviction_footprint_tokens = provider_context
+            .iter()
+            .try_fold(0_u64, |total, fragment| {
+                let footprint = eviction_footprint_for_payload(spec, &fragment.payload)?;
+                total
+                    .checked_add(footprint.eviction_tokens())
+                    .ok_or(crate::memory::estimate::EstimateError::ArithmeticOverflow)
+            })
+            .expect("fixture provider-context footprint");
+        let command_id = "20000000-0000-4000-8000-000000000001";
+        let command_seq = 1_u64;
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let envelope = CommandEnvelope {
+            seq: command_seq,
+            command_id: CommandId::parse(command_id).expect("fixture command id"),
+            command: Command::UserMessage {
+                text: user_text.to_owned(),
+                attachments: Vec::new(),
+            },
+        };
+        let writer = EventWriter::new(store.clone());
+        writer
+            .persist_inbound(&InboundCommand::Valid(envelope))
+            .await
+            .expect("persist fixture command");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: command_id.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify fixture command");
+
+        let user_id = crate::store::user_message_id(command_id);
+        let received_at: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind(command_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fixture command received_at");
+        let user = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: user_text.to_owned(),
+            }],
+            timestamp: DateTime::parse_from_rfc3339(&received_at)
+                .expect("fixture received_at")
+                .with_timezone(&Utc),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "agent_start",
+                                "run_id": run_id.clone(),
+                            }))
+                            .expect("fixture AgentStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "turn_start",
+                                "run_id": run_id.clone(),
+                                "turn_id": turn_id.clone(),
+                            }))
+                            .expect("fixture TurnStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &user_id, &user)
+                                .expect("fixture user MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &user_id, &user)
+                                .expect("fixture user MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: user_id,
+                                role: "user",
+                                message: user,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(
+                    command_seq,
+                    CommandId::parse(command_id).expect("fixture command id"),
+                )],
+            })
+            .await
+            .expect("commit fixture user injection");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_message_id,
+                            &assistant,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("fixture assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open fixture assistant");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                assistant_message_id,
+                                &assistant,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("fixture assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: assistant_message_id.to_owned(),
+                            role: "assistant",
+                            message: assistant.clone(),
+                            append_to_l0: true,
+                            provider_context,
+                            eviction_footprint_tokens,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(run_id.clone(), turn_id, assistant, Vec::new())
+                                .expect("fixture TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end(run_id.clone()).expect("fixture AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit fixture assistant terminal");
     }
 
     async fn insert_memory_fixture(store: &Store, kind: &str, transition: MemoryTransition) {
@@ -4810,6 +5046,328 @@ mod tests {
         assert_eq!(key_state.get::<String, _>("state"), "destroyed");
         assert!(key_state.get::<Option<Vec<u8>>, _>("wrapped_key").is_none());
         assert!(key_state.get::<Option<Vec<u8>>, _>("wrap_nonce").is_none());
+    }
+
+    #[tokio::test]
+    async fn injected_driver_idle_apply_refreshes_store_core_and_next_provider_view() {
+        let store = test_store().await;
+        let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
+        let promoted_marker = "PROMOTED_OLD_ASSISTANT";
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![
+                PublicAssistantContent::Thinking {
+                    thinking: "private old reasoning".to_owned(),
+                    signature_field: "encrypted_content".to_owned(),
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::Text {
+                    text: format!("{promoted_marker} {}", "x".repeat(24_000)),
+                    wire_item_index: 1,
+                },
+            ],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let reasoning = ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "rs-idle-apply",
+                "encrypted_content": "opaque-idle-apply",
+                "summary": [],
+            }),
+        };
+        seed_completed_authenticated_turn(
+            &store,
+            &spec,
+            &format!("LARGE_LIFE_LOG_USER {}", "u".repeat(24_000)),
+            "idle-old-assistant",
+            assistant,
+            vec![ProviderContextFragment {
+                wire_item_index: Some(0),
+                payload: reasoning,
+            }],
+        )
+        .await;
+
+        let source = sqlx::query(
+            "SELECT id, version, batch_seq, est_tokens
+             FROM memory_batches WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("live L0 source");
+        let source_id: String = source.get("id");
+        let source_version: i64 = source.get("version");
+        let source_est_tokens: i64 = source.get("est_tokens");
+        let target_id = Uuid::now_v7().to_string();
+        let batch_seq = 1_i64;
+        let source_uuid = BatchId::parse_str(&source_id).expect("source batch UUID");
+        insert_memory_fixture(
+            &store,
+            "fixture_reserve_idle_compaction",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(
+                    source_uuid,
+                    u64::try_from(source_version).expect("source version"),
+                )]),
+                expected_source_states: BTreeMap::from([(source_uuid, MemoryBatchState::Open)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_uuid,
+                    expected_version: u64::try_from(source_version).expect("source version"),
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: u64::try_from(source_est_tokens).expect("source estimate"),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    &target_id,
+                    MemoryLayer::L1,
+                    1,
+                    batch_seq,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                job_inserts: vec![MemoryJobRecord::new(
+                    "30000000-0000-4000-8000-000000000001",
+                    MemoryJobKind::CompactL0,
+                    batch_seq,
+                    vec![source_id.clone()],
+                    BTreeMap::from([
+                        (source_id.clone(), source_version + 1),
+                        (target_id.clone(), 0),
+                    ]),
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let compact_worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&spec, None, &[]).expect("select compact model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("durable promoted summary".to_owned()),
+                ..FakeProvider::default()
+            }),
+            cancel: CancellationToken::new(),
+        };
+        compact_worker
+            .process_all_pending()
+            .await
+            .expect("complete speculative shelf");
+
+        let generation = ProcessGeneration::from_wire(41).expect("fixture generation");
+        let lease =
+            ProcessGenerationLease::new(generation, "idle-memory-lease").expect("fixture lease");
+        let fence = GenerationRecoveryFence::new(&lease, "idle-memory-fence")
+            .expect("fixture recovery fence");
+        let hydrated = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate completed shelf before idle apply")
+        {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("completed shelf must be ready for T21 composition: {other:?}"),
+        };
+        assert_eq!(hydrated.provider_context.len(), 1);
+
+        let registry = ToolRegistryBuilder::default().build();
+        let prompt = PromptContext {
+            system_prompt: "fixture".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+        };
+        let observed_prompts = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
+        let observed = observed_prompts.clone();
+        let starter: Arc<StreamStarter> = Arc::new(move |spec, prompt, _, cancel, _| {
+            observed.lock().expect("prompt capture lock").push(prompt);
+            let (_tx, rx) = mpsc::channel(1);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        });
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("fixture workspace")),
+            Some(generation),
+            starter,
+        )
+        .expect("construct injected driver")
+        .with_hydrated_memory(store.clone(), &hydrated)
+        .expect("install authenticated memory boundary");
+        let mut core = RunCore::new();
+        core.install_hydrated_context(hydrated.messages.clone(), hydrated.provider_context.clone());
+
+        assert!(
+            RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
+                .await
+                .expect("Store-backed idle apply and refresh")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("life-log row count"),
+            2,
+            "promotion must not delete canonical transcript history"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM memory_batch_messages WHERE batch_id = ?"
+            )
+            .bind(&source_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("promoted source membership"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?"
+            )
+            .bind(&source_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("promoted source footprint"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provider_context WHERE message_id = 'idle-old-assistant'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("erased promoted provider context"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&target_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("promoted L1 target"),
+            "promoted"
+        );
+        assert_eq!(core.runtime_context().len(), 2);
+        assert!(core.provider_context().is_empty());
+
+        let _attempt = RunDriver::start_provider_for_command(
+            &driver,
+            0,
+            core.runtime_context(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("later provider call uses refreshed assembler");
+        {
+            let prompts = observed_prompts.lock().expect("prompt capture lock");
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].memory_blocks.len(), 1);
+            assert_eq!(prompts[0].memory_blocks[0].text, "durable promoted summary");
+            assert!(prompts[0].provider_context.is_empty());
+            assert!(prompts[0].messages.is_empty());
+            assert!(
+                !serde_json::to_string(&prompts[0])
+                    .expect("serialize prompt")
+                    .contains(promoted_marker)
+            );
+        }
+
+        let l1 = sqlx::query("SELECT version, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("refreshed L1 source");
+        let l1_version: i64 = l1.get("version");
+        let l1_est_tokens: i64 = l1.get("est_tokens");
+        let l2_target_id = Uuid::now_v7().to_string();
+        let l1_uuid = BatchId::parse_str(&target_id).expect("L1 source UUID");
+        insert_memory_fixture(
+            &store,
+            "fixture_reserve_pending_rehydrate",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(
+                    l1_uuid,
+                    u64::try_from(l1_version).expect("L1 source version"),
+                )]),
+                expected_source_states: BTreeMap::from([(l1_uuid, MemoryBatchState::Promoted)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: l1_uuid,
+                    expected_version: u64::try_from(l1_version).expect("L1 source version"),
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: u64::try_from(l1_est_tokens).expect("L1 estimate"),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    &l2_target_id,
+                    MemoryLayer::L2,
+                    1,
+                    1,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                job_inserts: vec![MemoryJobRecord::new(
+                    "30000000-0000-4000-8000-000000000002",
+                    MemoryJobKind::CompactL1,
+                    1,
+                    vec![target_id.clone()],
+                    BTreeMap::from([(target_id.clone(), l1_version + 1), (l2_target_id, 0)]),
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
+        compact_worker
+            .process_all_pending()
+            .await
+            .expect("complete second shelf");
+        let pending_command_id = "20000000-0000-4000-8000-000000000002";
+        EventWriter::new(store.clone())
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse(pending_command_id).expect("pending command id"),
+                command: Command::UserMessage {
+                    text: "pending logical suffix".to_owned(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .await
+            .expect("persist pending logical hydration fixture");
+        let epoch_before_failed_refresh = core.mutation_epoch();
+        let context_before_failed_refresh = core.runtime_context().to_vec();
+        let provider_before_failed_refresh = core.provider_context().to_vec();
+        let error = RunDriver::apply_idle_memory_maintenance(&driver, &mut core)
+            .await
+            .expect_err("pending logical hydration must fail closed after durable apply");
+        assert!(
+            error
+                .to_string()
+                .contains("pending physical or logical recovery")
+        );
+        assert_eq!(core.mutation_epoch(), epoch_before_failed_refresh);
+        assert_eq!(core.runtime_context(), context_before_failed_refresh);
+        assert_eq!(
+            core.provider_context(),
+            provider_before_failed_refresh,
+            "a pending rehydration must not partially refresh RunCore"
+        );
     }
 
     #[tokio::test]
