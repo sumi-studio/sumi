@@ -948,7 +948,6 @@ pub(crate) enum ApplyOutcome {
 #[derive(Debug, Default)]
 struct InvalidatedIds {
     key_refs: BTreeSet<AuthenticatedProviderContextKeyRef>,
-    deleted_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1754,20 +1753,9 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .await?;
             self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
-            if invalidated.deleted_ids.is_empty() {
-                self.finish_mutation(
-                    transaction,
-                    mutation_id,
-                    "applied",
-                    Some("already_satisfied"),
-                )
+            self.finish_mutation(transaction, mutation_id, "applied", None)
                 .await?;
-                Ok(ApplyOutcome::AlreadySatisfied)
-            } else {
-                self.finish_mutation(transaction, mutation_id, "applied", None)
-                    .await?;
-                Ok(ApplyOutcome::Applied)
-            }
+            Ok(ApplyOutcome::Applied)
         }
     }
 
@@ -2001,7 +1989,6 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 "authenticated provider-context row delete",
             )?;
             result.key_refs.insert(target.key_ref);
-            result.deleted_ids.insert(target.id);
         }
         Ok(result)
     }
@@ -2031,14 +2018,11 @@ impl<'a> ProviderContextMutationApplier<'a> {
         let mut targets = Vec::new();
         let mut owner_evidence = Vec::new();
         for id in target_ids {
-            let Some(row) = rows_by_id.remove(&id) else {
-                // Absence is accepted only after the prepared mutation intent
-                // and its key material have authenticated in this transaction.
-                // SQLite commits the destructive phase atomically, so this is
-                // idempotent convergence on a prior durable state, never
-                // recovery from a partially applied current transaction.
-                continue;
-            };
+            let row = rows_by_id.remove(&id).ok_or_else(|| {
+                anyhow!(
+                    "prepared provider-context mutation target {id} is absent and has no authenticated erasure evidence"
+                )
+            })?;
             let owner_message = messages.iter().find_map(|message| match message {
                 ContextMessage::Persisted { id, seq, message }
                     if id == &row.item.retention_owner.message_id
@@ -4800,20 +4784,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_converges_when_all_targets_already_deleted() {
+    async fn invalidate_recovery_rejects_all_absent_targets_without_erasure_evidence() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
+            .await
+            .unwrap();
 
         let record = reasoning_record(&store, "message-1", 7).await;
         let record_id = record.id().to_owned();
+        let key_ref = record.key_ref.clone();
         record.insert(store.pool()).await.unwrap();
-
-        // Simulate a previous successful apply (or external deletion) by removing the target.
-        sqlx::query("DELETE FROM provider_context WHERE id = ?")
-            .bind(&record_id)
-            .execute(store.pool())
-            .await
-            .unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -4829,34 +4812,63 @@ mod tests {
         .expect("build invalidate intent");
 
         applier.prepare(&intent).await.unwrap();
+
+        // A database attacker removes the live row without zeroing its
+        // ciphertext or destroying its canonical key.
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind(&record_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
         assert_eq!(
-            applier.apply("invalidate-all-gone").await.unwrap(),
-            ApplyOutcome::AlreadySatisfied
+            data_key_state(&store, &key_ref).await.as_deref(),
+            Some("active"),
+            "external row deletion is not authenticated crypto-erasure"
+        );
+        let before = destructive_state_snapshot(&store).await;
+
+        let error = applier
+            .recover()
+            .await
+            .expect_err("prepared Invalidate recovery must reject an absent exact target");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&record_id)
+                && message.contains("absent")
+                && message.contains("no authenticated erasure evidence"),
+            "{message}"
+        );
+        assert_eq!(
+            destructive_state_snapshot(&store).await,
+            before,
+            "absence rejection must preserve the prepared mutation, active key, event log/head, transcript, replace head, and L0 footprint"
         );
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind(record_id)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(remaining, 0);
-
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        let mutation: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, finished_at, terminal_reason
+             FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind("invalidate-all-gone")
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(reason.as_deref(), Some("already_satisfied"));
+        assert_eq!(mutation, ("prepared".to_owned(), None, None));
+        assert_eq!(
+            data_key_state(&store, &key_ref).await.as_deref(),
+            Some("active"),
+            "the store must not claim that the externally deleted ciphertext was erased"
+        );
     }
 
     #[tokio::test]
-    async fn invalidate_converges_when_some_targets_already_deleted() {
+    async fn invalidate_recovery_rejects_partial_absence_before_touching_present_target() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
-        seed_message(&store, "message-2", 9).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
+        seed_message_in_open_l0_batch(&store, "message-2", 9, 1_000_000)
+            .await
+            .unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7), ("message-2", 9)])
             .await
             .unwrap();
@@ -4865,15 +4877,11 @@ mod tests {
         let record2 = reasoning_record_with(&store, "message-2", 9, 0, 0).await;
         let record1_id = record1.id().to_owned();
         let record2_id = record2.id().to_owned();
+        let record1_key_ref = record1.key_ref.clone();
+        let record2_key_ref = record2.key_ref.clone();
+        assert_ne!(record1_key_ref, record2_key_ref);
         record1.insert(store.pool()).await.unwrap();
         record2.insert(store.pool()).await.unwrap();
-
-        // One target disappears before the intent is applied.
-        sqlx::query("DELETE FROM provider_context WHERE id = ?")
-            .bind(&record1_id)
-            .execute(store.pool())
-            .await
-            .unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -4889,28 +4897,151 @@ mod tests {
         .expect("build invalidate intent");
 
         applier.prepare(&intent).await.unwrap();
+
+        // One target disappears after prepare but without an authenticated
+        // erasure record. The surviving target must not be touched.
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind(&record1_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let before = destructive_state_snapshot(&store).await;
+
+        let error = applier
+            .recover()
+            .await
+            .expect_err("partial target absence must roll Invalidate recovery back");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&record1_id)
+                && message.contains("absent")
+                && message.contains("no authenticated erasure evidence"),
+            "{message}"
+        );
         assert_eq!(
-            applier.apply("invalidate-partial").await.unwrap(),
-            ApplyOutcome::Applied
+            destructive_state_snapshot(&store).await,
+            before,
+            "partial absence rejection must preserve the present target, both active keys, event log/head, transcript, replace head, mutation, and L0 state"
         );
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id IN (?, ?)")
-                .bind(record1_id)
-                .bind(record2_id)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(remaining, 0);
-
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        let present: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind(&record2_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            present, 1,
+            "the authenticated present target was not deleted"
+        );
+        let mutation: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, finished_at, terminal_reason
+             FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind("invalidate-partial")
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(reason, None);
+        assert_eq!(mutation, ("prepared".to_owned(), None, None));
+        assert_eq!(
+            data_key_state(&store, &record1_key_ref).await.as_deref(),
+            Some("active"),
+            "the absent target's key must remain honestly active"
+        );
+        assert_eq!(
+            data_key_state(&store, &record2_key_ref).await.as_deref(),
+            Some("active"),
+            "the present target's key must not be destroyed"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_absent_invalidation_target_before_insert_or_head_update() {
+        let store = store().await;
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
+            .await
+            .unwrap();
+
+        let old = reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let old_id = old.id().to_owned();
+        let old_key_ref = old.key_ref.clone();
+        old.insert(store.pool()).await.unwrap();
+        let replacement = reasoning_record_with(&store, "message-1", 7, 1, 0).await;
+        let replacement_id = replacement.id().to_owned();
+
+        let applier = ProviderContextMutationApplier::new(&store);
+        let intent = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            store.scope().clone(),
+            "replace-absent-invalidation-target".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec![old_id.clone()],
+            &replacement,
+            &reasoning_item_with("message-1", 7, 1, 0),
+            1,
+            1,
+        )
+        .expect("build Replace with an exact invalidation target");
+        applier.prepare(&intent).await.unwrap();
+
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind(&old_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let before = destructive_state_snapshot(&store).await;
+
+        let error = applier
+            .apply("replace-absent-invalidation-target")
+            .await
+            .expect_err("Replace must reject an absent invalidation target");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&old_id)
+                && message.contains("absent")
+                && message.contains("no authenticated erasure evidence"),
+            "{message}"
+        );
+        assert_eq!(
+            destructive_state_snapshot(&store).await,
+            before,
+            "Replace absence rejection must not insert, advance its head, change L0, terminalize the mutation, or erase a key"
+        );
+
+        let replacement_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind(&replacement_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(replacement_count, 0);
+        let head_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context_replace_heads")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(head_count, 0);
+        let mutation: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, finished_at, terminal_reason
+             FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind("replace-absent-invalidation-target")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation, ("prepared".to_owned(), None, None));
+        assert_eq!(
+            data_key_state(&store, &old_key_ref).await.as_deref(),
+            Some("active"),
+            "external deletion of the old row is not evidence that its canonical key was erased"
+        );
     }
 
     #[tokio::test]

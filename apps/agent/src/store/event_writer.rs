@@ -4797,11 +4797,11 @@ async fn validate_prepared_error_context_fences(
         });
     if common_mutation_apply_only {
         // The common applier re-authenticates the already-prepared intent,
-        // fixed target ids, key proofs, and every present target row before
-        // deleting rows or erasing unreferenced keys. Already-absent targets
-        // are accepted only for prepared-mutation idempotence; SQLite commits
-        // each application atomically, so no partially applied transaction is
-        // observable here.
+        // fixed target ids, key proofs, and every target row before
+        // deleting rows or erasing unreferenced keys. Every fixed target must
+        // still exist: SQLite commits each application atomically, so a
+        // prepared mutation cannot legitimately represent a partially applied
+        // deletion, and there is no durable erasure tombstone to prove one.
         return Ok(());
     }
 
