@@ -372,6 +372,17 @@ pub trait GatewayReader: Send {
 #[async_trait]
 pub trait GatewayWriter: Send {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()>;
+
+    /// Sends one Session-owned committed group without losing its ordering
+    /// boundary between frames. Most transports only need FIFO iteration;
+    /// SessionGateway overrides this so every terminal ACK in the group stays
+    /// behind the same durable replay barrier.
+    async fn send_batch(&mut self, frames: Vec<OutboundFrame>) -> Result<()> {
+        for frame in frames {
+            self.send(frame).await?;
+        }
+        Ok(())
+    }
 }
 
 /// An established transport that can transfer each half to its sole owner.

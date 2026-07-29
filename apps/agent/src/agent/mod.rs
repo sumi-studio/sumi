@@ -148,6 +148,21 @@ impl OutboundHandle {
         Ok(())
     }
 
+    async fn enqueue_reliable_wait(
+        &self,
+        frames: Vec<OutboundFrame>,
+    ) -> Result<(), SessionFailure> {
+        self.tx
+            .send(OutboundItem {
+                frames,
+                volatile: false,
+            })
+            .await
+            .map_err(|_| SessionFailure::OutboundClosed)?;
+        self.progress.enqueued.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     fn enqueue_volatile(&self, frame: OutboundFrame) {
         if self
             .volatile_in_flight
@@ -181,13 +196,11 @@ async fn own_gateway_writer<W: GatewayWriter>(
 ) -> Result<()> {
     while let Some(item) = outbound.recv().await {
         let volatile = item.volatile;
-        for frame in item.frames {
-            if let Err(error) = writer.send(frame).await {
-                if volatile {
-                    volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
-                }
-                return Err(error);
+        if let Err(error) = writer.send_batch(item.frames).await {
+            if volatile {
+                volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
             }
+            return Err(error);
         }
         if volatile {
             volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -885,7 +898,8 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = receipt.ack;
         let receipt_origin = receipt.origin;
         let received_at = receipt.received_at;
-        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])?;
+        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])
+            .await?;
         if receipt_origin == InboundReceiptOrigin::Replay {
             return Ok(());
         }
@@ -1192,7 +1206,8 @@ impl<G: Gateway + 'static> Session<G> {
             .map(|ack| ack.command_id.clone())
             .collect();
         for ack in acks.drain(..) {
-            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
+                .await?;
         }
         // Drop deferred commands that were durably superseded by this Abort.
         let mut retained = Vec::with_capacity(self.deferred_commands.len());
@@ -1467,7 +1482,8 @@ impl<G: Gateway + 'static> Session<G> {
             status: CommandAckStatus::Applied,
             reject_reason: None,
         };
-        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
+            .await?;
         Ok(())
     }
 
@@ -1482,7 +1498,8 @@ impl<G: Gateway + 'static> Session<G> {
                 )
                 .await?;
             for ack in terminal.drain(..) {
-                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
+                    .await?;
             }
             return Ok(());
         }
@@ -1663,7 +1680,8 @@ impl<G: Gateway + 'static> Session<G> {
                 .apply_idle_abort_cutoff(abort.envelope().command_id.as_str(), abort_seq)
                 .await?;
             for ack in terminal.drain(..) {
-                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
+                    .await?;
             }
             while self
                 .deferred_commands
@@ -1879,7 +1897,7 @@ impl<G: Gateway + 'static> Session<G> {
         }
         if reliable {
             if !frames.is_empty() {
-                self.enqueue_reliable(frames)?;
+                self.enqueue_reliable(frames).await?;
             }
         } else if volatile {
             for frame in frames {
@@ -1893,8 +1911,9 @@ impl<G: Gateway + 'static> Session<G> {
         self.outbound.as_ref().ok_or(SessionFailure::OutboundClosed)
     }
 
-    fn enqueue_reliable(&mut self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
-        match self.outbound_handle()?.enqueue_reliable(frames) {
+    async fn enqueue_reliable(&mut self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
+        let outbound = self.outbound_handle()?.clone();
+        match outbound.enqueue_reliable_wait(frames).await {
             Err(SessionFailure::OutboundClosed) => match self.writer_done.try_recv() {
                 Ok(result) => result.map_err(|error| gateway_failure("send", error)),
                 Err(oneshot::error::TryRecvError::Closed) => Err(SessionFailure::OutboundClosed),

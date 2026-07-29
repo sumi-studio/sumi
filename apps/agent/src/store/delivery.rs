@@ -4,11 +4,12 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use sqlx::Row;
+use thiserror::Error;
 use tokio::{sync::mpsc, time::timeout};
 use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
-use crate::gateway::supervisor::DeliveryEpoch;
+use crate::gateway::supervisor::{DeliveryEpoch, DeliveryEpochFailure};
 
 use super::{DataKeyPurpose, Store, crypto::decrypt_content};
 
@@ -17,6 +18,17 @@ use super::PublicProjectionBuilder;
 
 const DELIVERY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+
+/// A live delivery-channel failure. The supervisor owns recovery from this
+/// transport condition; it is not evidence that Session's committed Store
+/// state is corrupt.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum DeliveryTransportError {
+    #[error("delivery send timed out")]
+    SendTimedOut,
+    #[error("delivery receiver closed")]
+    ReceiverClosed,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeliveryMode {
@@ -54,10 +66,11 @@ impl DeliveryChannel {
     }
 
     async fn send(&self, frame: DeliveryFrame) -> Result<()> {
-        timeout(DELIVERY_SEND_TIMEOUT, self.sender.send(frame))
-            .await
-            .context("delivery send timed out")?
-            .context("delivery receiver closed")
+        match timeout(DELIVERY_SEND_TIMEOUT, self.sender.send(frame)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DeliveryTransportError::ReceiverClosed.into()),
+            Err(_) => Err(DeliveryTransportError::SendTimedOut.into()),
+        }
     }
 }
 
@@ -90,12 +103,12 @@ enum PumpState {
     Idle,
     CatchingUp {
         epoch: DeliveryEpoch,
-        failure_tx: Option<mpsc::UnboundedSender<String>>,
+        failure_tx: Option<mpsc::UnboundedSender<DeliveryEpochFailure>>,
         pending_durable: usize,
     },
     Online {
         epoch: DeliveryEpoch,
-        failure_tx: Option<mpsc::UnboundedSender<String>>,
+        failure_tx: Option<mpsc::UnboundedSender<DeliveryEpochFailure>>,
         pending_durable: usize,
     },
 }
@@ -108,12 +121,26 @@ pub(crate) struct DeliveryPump {
     durable_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
-struct PendingDurable<'a> {
-    pump: &'a DeliveryPump,
-    epoch: DeliveryEpoch,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DurableDeliveryOutcome {
+    Enqueued,
+    EpochLost,
 }
 
-impl Drop for PendingDurable<'_> {
+/// Proof that one durable callback belongs to the captured delivery epoch.
+///
+/// The adapter creates this reservation while it still owns the pump slot and
+/// registers the matching completion fence before releasing that slot.
+/// Invalidation therefore either observes and fails the fence, or happens
+/// before delivery and makes `deliver` return `EpochLost`; there is no
+/// unowned interval in which a stale pump can silently consume the callback.
+pub(crate) struct DurableDeliveryReservation {
+    pump: DeliveryPump,
+    epoch: DeliveryEpoch,
+    seq: u64,
+}
+
+impl Drop for DurableDeliveryReservation {
     fn drop(&mut self) {
         let mut state = self.pump.lock_state();
         match &mut *state {
@@ -133,6 +160,63 @@ impl Drop for PendingDurable<'_> {
             }
             PumpState::Idle | PumpState::CatchingUp { .. } | PumpState::Online { .. } => {}
         }
+    }
+}
+
+impl DurableDeliveryReservation {
+    pub(crate) fn epoch(&self) -> DeliveryEpoch {
+        self.epoch
+    }
+
+    pub(crate) async fn deliver(&self) -> Result<DurableDeliveryOutcome> {
+        let _serial = self.pump.durable_serial.lock().await;
+        let (epoch, failure_tx) = match &*self.pump.lock_state() {
+            PumpState::Idle => return Ok(DurableDeliveryOutcome::EpochLost),
+            PumpState::CatchingUp {
+                epoch, failure_tx, ..
+            }
+            | PumpState::Online {
+                epoch, failure_tx, ..
+            } if *epoch == self.epoch => (*epoch, failure_tx.clone()),
+            PumpState::CatchingUp { .. } | PumpState::Online { .. } => {
+                return Ok(DurableDeliveryOutcome::EpochLost);
+            }
+        };
+        if let Err(err) = send_event_range(
+            &self.pump.store,
+            &self.pump.channel,
+            &epoch,
+            self.seq,
+            self.seq,
+        )
+        .await
+        {
+            let mut state = self.pump.lock_state();
+            // A replacement epoch may have been installed while the bounded
+            // durable send was waiting. Only the epoch that initiated the send
+            // may transition itself to Idle or notify its failure supervisor.
+            if matches!(
+                &*state,
+                PumpState::CatchingUp { epoch: current, .. }
+                    | PumpState::Online { epoch: current, .. }
+                    if *current == epoch
+            ) {
+                *state = PumpState::Idle;
+                if let Some(failure_tx) = failure_tx {
+                    let failure = if err.is::<DeliveryTransportError>() {
+                        DeliveryEpochFailure::Reconnect(format!("durable delivery failed: {err:#}"))
+                    } else {
+                        DeliveryEpochFailure::Fatal(format!(
+                            "durable delivery failed permanently: {err:#}"
+                        ))
+                    };
+                    let _ = failure_tx.send(failure);
+                }
+                return Err(err);
+            }
+            return Ok(DurableDeliveryOutcome::EpochLost);
+        }
+        Ok(DurableDeliveryOutcome::Enqueued)
     }
 }
 
@@ -176,7 +260,7 @@ impl DeliveryPump {
     pub(crate) fn install_supervised_epoch(
         &self,
         epoch: DeliveryEpoch,
-        failure_tx: mpsc::UnboundedSender<String>,
+        failure_tx: mpsc::UnboundedSender<DeliveryEpochFailure>,
     ) {
         *self.lock_state() = PumpState::CatchingUp {
             epoch,
@@ -229,10 +313,8 @@ impl DeliveryPump {
         true
     }
 
-    pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
-        // Preserve the EventWriter's post-commit durable FIFO while keeping the
-        // shared adapter selection/state lock out of the bounded channel await.
-        let admission_epoch = {
+    pub(crate) fn reserve_durable(&self, seq: u64) -> Option<DurableDeliveryReservation> {
+        let epoch = {
             let mut state = self.lock_state();
             match &mut *state {
                 PumpState::CatchingUp {
@@ -248,45 +330,22 @@ impl DeliveryPump {
                     *pending_durable = pending_durable.saturating_add(1);
                     *epoch
                 }
-                PumpState::Idle => return Ok(()),
+                PumpState::Idle => return None,
             }
         };
-        let _pending = PendingDurable {
-            pump: self,
-            epoch: admission_epoch,
-        };
-        let _serial = self.durable_serial.lock().await;
-        let (epoch, failure_tx) = match &*self.lock_state() {
-            PumpState::Idle => return Ok(()),
-            PumpState::CatchingUp {
-                epoch, failure_tx, ..
-            }
-            | PumpState::Online {
-                epoch, failure_tx, ..
-            } if *epoch == admission_epoch => (*epoch, failure_tx.clone()),
-            PumpState::CatchingUp { .. } | PumpState::Online { .. } => return Ok(()),
-        };
-        if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
-            let mut state = self.lock_state();
-            // A replacement epoch may have been installed while the bounded
-            // durable send was waiting. Only the epoch that initiated the send
-            // may transition itself to Idle or notify its failure supervisor.
-            // A late failure from an invalidated epoch is stale transport
-            // noise, not an EventWriter failure: drop it after proving that
-            // this epoch no longer owns the slot.
-            if matches!(
-                &*state,
-                PumpState::CatchingUp { epoch: current, .. }
-                    | PumpState::Online { epoch: current, .. }
-                    if *current == epoch
-            ) {
-                *state = PumpState::Idle;
-                if let Some(failure_tx) = failure_tx {
-                    let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
-                }
-                return Err(err);
-            }
-            return Ok(());
+        Some(DurableDeliveryReservation {
+            pump: self.clone(),
+            epoch,
+            seq,
+        })
+    }
+
+    pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
+        // Direct pump users do not need to distinguish a stale epoch. The T17
+        // adapter uses `reserve_durable` so it can turn that proof into a
+        // reconnect barrier without leaking a completion fence.
+        if let Some(reservation) = self.reserve_durable(seq) {
+            let _ = reservation.deliver().await?;
         }
         Ok(())
     }
@@ -319,10 +378,12 @@ impl DeliveryPump {
                 {
                     *state = PumpState::Idle;
                     if let Some(failure_tx) = failure_tx {
-                        let _ = failure_tx.send("volatile delivery receiver closed".to_owned());
+                        let _ = failure_tx.send(DeliveryEpochFailure::Reconnect(
+                            "volatile delivery receiver closed".to_owned(),
+                        ));
                     }
                 }
-                bail!("delivery receiver closed")
+                Err(DeliveryTransportError::ReceiverClosed.into())
             }
         }
     }
