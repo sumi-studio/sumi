@@ -113,7 +113,7 @@ impl<'de> Deserialize<'de> for PersonalityAgentId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "DirectChatProvenanceWire")]
 pub struct DirectChatProvenanceV1 {
     version: u8,
     tenant_id: String,
@@ -173,11 +173,56 @@ impl DirectChatProvenanceV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DirectChatProvenanceWire {
+    version: u8,
+    tenant_id: String,
+    personality_agent_id: PersonalityAgentId,
+    actor: HumanActorProvenance,
+    source: DirectChatSource,
+}
+
+impl TryFrom<DirectChatProvenanceWire> for DirectChatProvenanceV1 {
+    type Error = RuntimeContractError;
+
+    fn try_from(wire: DirectChatProvenanceWire) -> Result<Self, Self::Error> {
+        if wire.version != DIRECT_CHAT_PROVENANCE_VERSION {
+            return Err(RuntimeContractError::DirectChatProvenanceWrongVersion);
+        }
+        Ok(Self {
+            version: wire.version,
+            tenant_id: validate_provenance_identity(wire.tenant_id, "tenant id")?,
+            personality_agent_id: wire.personality_agent_id,
+            actor: wire.actor,
+            source: wire.source,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "HumanActorProvenanceWire")]
 pub struct HumanActorProvenance {
     kind: HumanActorKind,
     principal_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HumanActorProvenanceWire {
+    kind: HumanActorKind,
+    principal_id: String,
+}
+
+impl TryFrom<HumanActorProvenanceWire> for HumanActorProvenance {
+    type Error = RuntimeContractError;
+
+    fn try_from(wire: HumanActorProvenanceWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: wire.kind,
+            principal_id: validate_provenance_identity(wire.principal_id, "human principal id")?,
+        })
+    }
 }
 
 impl HumanActorProvenance {
@@ -231,7 +276,12 @@ fn validate_provenance_identity(
     value: String,
     kind: &'static str,
 ) -> Result<String, RuntimeContractError> {
-    if value.is_empty() || value.len() > MAX_PROVENANCE_ID_BYTES {
+    let bytes = value.as_bytes();
+    let valid_first = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
+    let valid_rest = bytes.iter().skip(1).all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'/' | b'-')
+    });
+    if bytes.len() > MAX_PROVENANCE_ID_BYTES || !valid_first || !valid_rest {
         return Err(RuntimeContractError::InvalidProvenanceIdentity { kind });
     }
     Ok(value)
@@ -573,16 +623,31 @@ mod tests {
             ),
         ] {
             let parsed = serde_json::from_str::<DirectChatProvenanceV1>(&raw);
-            if raw.contains(r#""version":2"#) {
-                assert!(
-                    parsed
-                        .expect("shape decodes before typed validation")
-                        .validate(&PersonalityAgentId::parse(PAID).unwrap())
-                        .is_err()
-                );
-            } else {
-                assert!(parsed.is_err());
-            }
+            assert!(parsed.is_err());
+        }
+    }
+
+    #[test]
+    fn direct_chat_provenance_deserialization_enforces_id_grammar_and_bounds() {
+        for (tenant_id, principal_id) in [
+            ("".to_owned(), "human".to_owned()),
+            ("tenant".to_owned(), "".to_owned()),
+            (" tenant".to_owned(), "human".to_owned()),
+            ("tenant".to_owned(), "human name".to_owned()),
+            ("tenant".to_owned(), "人間".to_owned()),
+            ("tenant".to_owned(), "h".repeat(MAX_PROVENANCE_ID_BYTES + 1)),
+        ] {
+            let raw = serde_json::json!({
+                "version": 1,
+                "tenant_id": &tenant_id,
+                "personality_agent_id": PAID,
+                "actor": {"kind": "human", "principal_id": &principal_id},
+                "source": {"surface": "direct_chat"}
+            });
+            assert!(
+                serde_json::from_value::<DirectChatProvenanceV1>(raw).is_err(),
+                "unexpectedly accepted tenant={tenant_id:?}, principal={principal_id:?}"
+            );
         }
     }
 
