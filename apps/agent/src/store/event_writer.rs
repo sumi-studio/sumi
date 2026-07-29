@@ -1319,6 +1319,7 @@ enum PreparedProjection {
         intent_key_proof: Vec<u8>,
         insert_key_ref: Option<String>,
         insert_key_proof: Option<Vec<u8>>,
+        affected_memory_batch_ids: Vec<String>,
     },
     ProviderContextMutationPrepare {
         disposition: ErrorContextDisposition,
@@ -1440,6 +1441,17 @@ fn memory_projection_keys(write: &PreparedWrite) -> BTreeSet<MemoryProjectionKey
                     entity: MemoryProjectionEntity::Calibration,
                     id: MEMORY_CALIBRATION_ID.to_owned(),
                 });
+            }
+            PreparedProjection::ProviderContextMutation {
+                affected_memory_batch_ids,
+                ..
+            } => {
+                keys.extend(affected_memory_batch_ids.iter().cloned().map(|id| {
+                    MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id,
+                    }
+                }));
             }
             _ => {}
         }
@@ -1807,15 +1819,18 @@ impl EventWriter {
     }
 
     /// Common destructive half of the Error-context disposition. The
-    /// disposition EventWrite prepares first; this eventless application is
-    /// also exactly what cold-boot mutation recovery executes.
+    /// disposition EventWrite prepares first; this audited MemoryMaintenance
+    /// application is also exactly what cold-boot mutation recovery executes.
     pub(crate) async fn apply_error_context_disposition(
         &self,
         disposition: &ErrorContextDisposition,
     ) -> Result<()> {
         self.apply(EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(DurableEvent::memory_maintenance(format!(
+                    "provider_context_mutation:{}",
+                    disposition.mutation_id()
+                ))?),
                 projections: vec![Projection::ProviderContextMutation(
                     ProviderContextMutation {
                         mutation_id: disposition.mutation_id().to_owned(),
@@ -2752,6 +2767,12 @@ impl EventWriter {
             let write_event_seq = write.event.as_ref().map(|event| event.seq);
             let memory_keys = memory_projection_keys(&write);
             let memory_bearing = !memory_keys.is_empty();
+            let provider_context_mutation = write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutation { .. }
+                )
+            });
             if memory_bearing && prepared_write_has_physical_recovery(&write) {
                 bail!("memory projection writes cannot carry PhysicalRecovery");
             }
@@ -2774,7 +2795,10 @@ impl EventWriter {
                 );
             }
 
-            if !memory_bearing && let Some(event) = write.event.take() {
+            if !memory_bearing
+                && !provider_context_mutation
+                && let Some(event) = write.event.take()
+            {
                 append_prepared_event(
                     self.store.as_ref(),
                     &mut transaction,
@@ -2847,6 +2871,18 @@ impl EventWriter {
                     .checked_add(finalized_metadata_growth)
                     .ok_or_else(|| anyhow!("finalized EventBatch byte count overflow"))?;
                 EventBatchSizer::validate(command_bounds, finalized_transaction_bytes)?;
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
+            } else if provider_context_mutation {
+                let event = write
+                    .event
+                    .take()
+                    .expect("provider-context mutation event was validated");
                 append_prepared_event(
                     self.store.as_ref(),
                     &mut transaction,
@@ -3283,6 +3319,7 @@ impl EventWriter {
                             intent_key_proof: sized.intent_key_proof,
                             insert_key_ref: sized.insert_key_ref,
                             insert_key_proof: sized.insert_key_proof,
+                            affected_memory_batch_ids: sized.affected_memory_batch_ids,
                         });
                     }
                     Projection::ProviderContextMutationPrepare(disposition) => {
@@ -4745,7 +4782,9 @@ impl BootstrapRecoveryGuard<'_> {
         for (mutation_id,) in rows {
             self.apply_recovery_batch(EventBatch {
                 writes: vec![EventWrite {
-                    event: None,
+                    event: Some(DurableEvent::memory_maintenance(format!(
+                        "provider_context_mutation:{mutation_id}"
+                    ))?),
                     projections: vec![Projection::ProviderContextMutation(
                         super::provider_context::ProviderContextMutation {
                             mutation_id: mutation_id.clone(),
@@ -5113,7 +5152,9 @@ async fn revalidate_prepared_key_refs(
 /// durable rows and the ordered prepared write set. A prepare ends semantic
 /// usability but does not make the rows disappear; therefore a later
 /// MessageStart/AgentEnd in the same batch is still forbidden. Only the common
-/// eventless mutation application can make the next transaction eligible.
+/// mutation application can make the next transaction eligible. Its
+/// MemoryMaintenance event carries audit and memory-projection commitments,
+/// but no lifecycle transition.
 async fn validate_prepared_error_context_fences(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
@@ -5121,7 +5162,10 @@ async fn validate_prepared_error_context_fences(
 ) -> Result<()> {
     let common_mutation_apply_only = !prepared.is_empty()
         && prepared.iter().all(|write| {
-            write.event.is_none()
+            write
+                .event
+                .as_ref()
+                .is_some_and(|event| event.kind == "memory_maintenance")
                 && !write.projections.is_empty()
                 && write.projections.iter().all(|projection| {
                     matches!(
@@ -5525,6 +5569,22 @@ fn validate_batch_shape_with_recovery(
 ) -> Result<Vec<ExpectedInjection>> {
     if batch.writes.is_empty() {
         bail!("EventBatch must contain at least one write");
+    }
+    let has_provider_context_mutation = batch.writes.iter().any(|write| {
+        write
+            .projections
+            .iter()
+            .any(|projection| matches!(projection, Projection::ProviderContextMutation(_)))
+    });
+    if has_provider_context_mutation
+        && (batch.writes.len() != 1
+            || batch.writes[0].projections.len() != 1
+            || !matches!(
+                batch.writes[0].projections[0],
+                Projection::ProviderContextMutation(_)
+            ))
+    {
+        bail!("ProviderContextMutation must be the only projection in the only EventBatch write");
     }
     EventBatchSizer::validate(
         BatchBounds {
@@ -6560,8 +6620,10 @@ fn validate_batch_shape_with_recovery(
         for projection in &write.projections {
             match projection {
                 Projection::ProviderContextMutation(_) => {
-                    if write.event.is_some() {
-                        bail!("ProviderContextMutation projection must be eventless");
+                    if !has_memory_maintenance {
+                        bail!(
+                            "ProviderContextMutation projection requires a same-write MemoryMaintenance event"
+                        );
                     }
                     if memory_transition_seen || memory_job_update_seen || provider_context_seen {
                         bail!("only one terminal mutation projection is allowed per EventWrite");
@@ -10274,6 +10336,9 @@ pub(super) async fn seed_provider_context_owner_event_evidence(
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
+    EventWriter::new(Arc::new(store.clone()))
+        .reset_checkpoint_after_direct_fixture_mutation()
+        .await;
     Ok(())
 }
 
@@ -11667,9 +11732,13 @@ async fn apply_projection(
             .await
             .context("failed to persist inbound command")?;
         }
-        PreparedProjection::ProviderContextMutation { mutation_id, .. } => {
+        PreparedProjection::ProviderContextMutation {
+            mutation_id,
+            affected_memory_batch_ids,
+            ..
+        } => {
             ProviderContextMutationApplier::new(store)
-                .apply_in_transaction(transaction, &mutation_id)
+                .apply_in_transaction(transaction, &mutation_id, &affected_memory_batch_ids)
                 .await
                 .context("failed to apply provider-context mutation projection")?;
         }
@@ -12900,7 +12969,7 @@ mod tests {
         },
         memory::{
             L0_BATCH_MIN,
-            context_assembler::bind_sumi_replay_for_test,
+            context_assembler::{bind_sumi_replay_for_origin_test, bind_sumi_replay_for_test},
             estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
         },
         provider::{
@@ -16675,6 +16744,60 @@ mod tests {
                 .contains("same-batch idle-startup supersede and AgentEnd"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn provider_context_mutation_is_exclusive_to_one_event_batch_write() {
+        let mutation = || {
+            Projection::ProviderContextMutation(ProviderContextMutation {
+                mutation_id: "exclusive-provider-mutation".to_owned(),
+            })
+        };
+        let event = || {
+            DurableEvent::memory_maintenance(
+                "provider_context_mutation:exclusive-provider-mutation",
+            )
+            .expect("provider-context MemoryMaintenance fixture")
+        };
+        let cases = [
+            EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(event()),
+                        projections: vec![mutation()],
+                    },
+                    EventWrite {
+                        event: None,
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(event()),
+                    projections: vec![
+                        mutation(),
+                        Projection::CommandApplied {
+                            command_id: "unrelated-command".to_owned(),
+                            command_seq: 1,
+                            run_id: None,
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            },
+        ];
+
+        for batch in cases {
+            let error = validate_batch_shape(&Redactor::v1(), &batch)
+                .err()
+                .expect("ProviderContextMutation must exclude every sibling write");
+            assert_eq!(
+                error.to_string(),
+                "ProviderContextMutation must be the only projection in the only EventBatch write"
+            );
+        }
     }
 
     #[tokio::test]
@@ -24739,7 +24862,13 @@ mod tests {
             .expect("persist Error kill disposition prepare");
         EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(
+                    DurableEvent::memory_maintenance(format!(
+                        "provider_context_mutation:{}",
+                        disposition.mutation_id()
+                    ))
+                    .expect("Error kill provider-context mutation event"),
+                ),
                 projections: vec![Projection::ProviderContextMutation(
                     ProviderContextMutation {
                         mutation_id: disposition.mutation_id().to_owned(),
@@ -24822,13 +24951,42 @@ mod tests {
                     format!("{scenario}.{boundary}\n")
                 );
 
-                // Opening is the common post-prepare recovery boundary. Any
-                // committed prepare is authenticated and applied before this
-                // Store can be hydrated.
+                // Hydration owns the common post-prepare recovery boundary
+                // while holding the bootstrap writer gate. Opening validates
+                // startup state but deliberately does not mutate it.
                 let reopened: Arc<Store> = Store::open(&database_path, scope(), test_provider())
                     .await
                     .expect("reopen Error-context kill store")
                     .into();
+                let prepare_committed = scenario != "error_context_message_end"
+                    && (scenario == "error_context_disposition_apply"
+                        || boundary == "after_commit");
+                if prepare_committed {
+                    let lease = test_lease(1);
+                    let fence = test_fence(&lease);
+                    let recovery_steps = match reopened
+                        .hydrate(&lease, &fence)
+                        .await
+                        .expect("hydrate committed Error disposition")
+                    {
+                        HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+                        HydrationOutcome::Complete(_) => {
+                            panic!("open Error run must retain a logical resume suffix")
+                        }
+                        HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                            panic!(
+                                "committed Error disposition needs logical, not physical, recovery: {intents:?}"
+                            )
+                        }
+                    };
+                    assert!(matches!(
+                        recovery_steps.as_slice(),
+                        [RecoveryStep::ResumeAssistantFromDurableEvents {
+                            pending_error_context: None,
+                            ..
+                        }]
+                    ));
+                }
                 let (message_ends, turn_ends, agent_ends, context_rows, mutations): (
                     i64,
                     i64,
@@ -24856,9 +25014,6 @@ mod tests {
                 assert!(turn_ends <= 1, "Error attempt disposition duplicated");
                 assert!(mutations <= 1, "Error disposition intent duplicated");
 
-                let prepare_committed = scenario != "error_context_message_end"
-                    && (scenario == "error_context_disposition_apply"
-                        || boundary == "after_commit");
                 if prepare_committed {
                     assert_eq!(
                         (message_ends, turn_ends, context_rows, mutations),
@@ -25740,7 +25895,7 @@ mod tests {
             send_provider_context.is_empty(),
             "context anchored to a transformed-away Error assistant must not be sent"
         );
-        let next_prompt = PromptContext::new(
+        let mut next_prompt = PromptContext::new(
             "continue the durable conversation".to_owned(),
             Vec::new(),
             send_messages,
@@ -25750,6 +25905,12 @@ mod tests {
                 .collect(),
             Vec::new(),
         );
+        bind_sumi_replay_for_origin_test(
+            &mut next_prompt,
+            spec.origin(),
+            Some(native_coverage_seq),
+        )
+        .expect("bind exact normalized Error restart view");
         let next_request = build_responses_request(&spec, &next_prompt, &RequestOptions::default())
             .expect("next Responses request after Error restart");
         let wire = next_request.to_string();
@@ -25863,11 +26024,24 @@ mod tests {
         reopened.pool().close().await;
         drop(reopened);
 
-        // Store::finish_open owns common mutation recovery before hydration.
-        // Reopening at the post-prepare crash boundary must authenticate and
-        // apply the intent once, erase the target/key, and only then permit
-        // logical recovery to close the run.
+        // Hydration owns common mutation recovery under the bootstrap writer
+        // gate. At the post-prepare crash boundary it must authenticate and
+        // apply the intent once, erase the target/key, and only then expose
+        // the logical suffix needed to close the run.
         let recovered = file_test_store(&path).await;
+        let recovered_steps = match recovered
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate through common Error mutation recovery")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+            HydrationOutcome::Complete(_) => {
+                panic!("open assistant suffix must keep hydration fail-closed")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("Error disposition has no physical process recovery: {intents:?}")
+            }
+        };
         let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
             .fetch_one(recovered.pool())
             .await
@@ -25893,19 +26067,6 @@ mod tests {
         .expect("read recovered Error mutation");
         assert_eq!(recovered_mutation_state, "applied");
 
-        let recovered_steps = match recovered
-            .hydrate(&lease, &fence)
-            .await
-            .expect("hydrate only after common Error mutation recovery")
-        {
-            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
-            HydrationOutcome::Complete(_) => {
-                panic!("open assistant suffix must keep hydration fail-closed")
-            }
-            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
-                panic!("Error disposition has no physical process recovery: {intents:?}")
-            }
-        };
         let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
             .fetch_one(recovered.pool())
             .await
@@ -26578,6 +26739,29 @@ mod tests {
             l0_footprint, 0,
             "durable Error context must not become replay or eviction footprint"
         );
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let recovery_steps = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("cold hydration accepts an Error assistant excluded from L0")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+            HydrationOutcome::Complete(_) => {
+                panic!("undisposed Error context must remain a logical recovery boundary")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("Error context needs logical, not physical, recovery: {intents:?}")
+            }
+        };
+        assert!(matches!(
+            recovery_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: Some(pending),
+                ..
+            }] if pending.message_id == message_id && pending.item_count == 1
+        ));
     }
 
     #[tokio::test]

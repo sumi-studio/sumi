@@ -1575,6 +1575,7 @@ pub(in crate::store) struct ProviderContextProjectionSize {
     pub(crate) intent_key_proof: Vec<u8>,
     pub(crate) insert_key_ref: Option<String>,
     pub(crate) insert_key_proof: Option<Vec<u8>>,
+    pub(crate) affected_memory_batch_ids: Vec<String>,
 }
 
 /// Transactional owner for `provider_context_mutations` prepare/apply.
@@ -1973,6 +1974,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             ),
             insert_key_ref: None,
             insert_key_proof: None,
+            affected_memory_batch_ids: Vec::new(),
         })
     }
 
@@ -2018,6 +2020,9 @@ impl<'a> ProviderContextMutationApplier<'a> {
         } else {
             (None, None)
         };
+        let affected_memory_batch_ids = self
+            .affected_memory_batch_ids(&mut transaction, &full)
+            .await?;
 
         transaction.commit().await?;
         Ok(ProviderContextProjectionSize {
@@ -2030,7 +2035,63 @@ impl<'a> ProviderContextMutationApplier<'a> {
             ),
             insert_key_ref,
             insert_key_proof,
+            affected_memory_batch_ids,
         })
+    }
+
+    async fn affected_memory_batch_ids(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        full: &FullIntent,
+    ) -> Result<Vec<String>> {
+        let mut batch_ids = BTreeSet::new();
+
+        for target_id in &full.invalidate_ids {
+            let target: Option<(Option<String>, i64)> = sqlx::query_as(
+                "SELECT message_id, eviction_tokens
+                 FROM provider_context
+                 WHERE id = ?",
+            )
+            .bind(target_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let Some((Some(message_id), eviction_tokens)) = target else {
+                continue;
+            };
+            if eviction_tokens <= 0 {
+                continue;
+            }
+            batch_ids.extend(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT batch_id
+                     FROM memory_batch_messages
+                     WHERE message_id = ?",
+                )
+                .bind(message_id)
+                .fetch_all(&mut **transaction)
+                .await?,
+            );
+        }
+
+        if full.is_replace()
+            && full.eviction_tokens > 0
+            && let Some(message_id) = full.message_id.as_deref()
+        {
+            batch_ids.extend(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT mb.id
+                     FROM memory_batches mb
+                     JOIN memory_batch_messages mbm ON mbm.batch_id = mb.id
+                     WHERE mbm.message_id = ? AND mb.layer = ?",
+                )
+                .bind(message_id)
+                .bind(MemoryLayer::L0.as_i64())
+                .fetch_all(&mut **transaction)
+                .await?,
+            );
+        }
+
+        Ok(batch_ids.into_iter().collect())
     }
 
     async fn authenticate_replace_retention_owner(
@@ -2085,12 +2146,19 @@ impl<'a> ProviderContextMutationApplier<'a> {
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         mutation_id: &str,
+        expected_memory_batch_ids: &[String],
     ) -> Result<ApplyOutcome> {
         let projection_checkpoint =
             verify_provider_context_projection_set(self.store, transaction).await?;
         let (full, _mutation_key, intent_key) = self
             .load_and_verify_full_intent(transaction, mutation_id)
             .await?;
+        let actual_memory_batch_ids = self.affected_memory_batch_ids(transaction, &full).await?;
+        if actual_memory_batch_ids != expected_memory_batch_ids {
+            bail!(
+                "provider-context mutation affected memory batches changed between prepare and apply"
+            );
+        }
 
         if full.is_replace() {
             if full.key_ref.is_empty() || full.ciphertext.is_empty() {
@@ -2401,11 +2469,13 @@ impl<'a> ProviderContextMutationApplier<'a> {
 
     #[cfg(test)]
     pub(crate) async fn apply(&self, mutation_id: &str) -> Result<ApplyOutcome> {
-        use super::event_writer::{EventBatch, EventWrite, EventWriter};
+        use super::event_writer::{DurableEvent, EventBatch, EventWrite, EventWriter};
         EventWriter::new(std::sync::Arc::new(self.store.clone()))
             .apply(EventBatch {
                 writes: vec![EventWrite {
-                    event: None,
+                    event: Some(DurableEvent::memory_maintenance(format!(
+                        "provider_context_mutation:{mutation_id}"
+                    ))?),
                     projections: vec![super::event_writer::Projection::ProviderContextMutation(
                         ProviderContextMutation {
                             mutation_id: mutation_id.to_owned(),
@@ -2421,7 +2491,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
 
     #[cfg(test)]
     pub(crate) async fn recover(&self) -> Result<()> {
-        use super::event_writer::{EventBatch, EventWrite, EventWriter};
+        use super::event_writer::{DurableEvent, EventBatch, EventWrite, EventWriter};
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT mutation_id FROM provider_context_mutations
              WHERE state = 'prepared'
@@ -2435,7 +2505,9 @@ impl<'a> ProviderContextMutationApplier<'a> {
             EventWriter::new(std::sync::Arc::new(self.store.clone()))
                 .apply(EventBatch {
                     writes: vec![EventWrite {
-                        event: None,
+                        event: Some(DurableEvent::memory_maintenance(format!(
+                            "provider_context_mutation:{mutation_id}"
+                        ))?),
                         projections: vec![
                             super::event_writer::Projection::ProviderContextMutation(
                                 ProviderContextMutation {
@@ -3093,6 +3165,14 @@ mod tests {
         footprint_tokens: i64,
     ) -> anyhow::Result<String> {
         seed_message(store, message_id, seq).await?;
+        seed_existing_message_in_open_l0_batch(store, message_id, footprint_tokens).await
+    }
+
+    async fn seed_existing_message_in_open_l0_batch(
+        store: &Store,
+        message_id: &str,
+        footprint_tokens: i64,
+    ) -> anyhow::Result<String> {
         let batch_id = uuid::Uuid::now_v7().to_string();
         EventWriter::new(std::sync::Arc::new(store.clone()))
             .apply(EventBatch {
@@ -3474,6 +3554,10 @@ mod tests {
             .verify_and_size(mutation_id)
             .await
             .expect("hostile fixture reaches EventWriter apply validation");
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("count durable fixture events before rejected apply");
 
         let error = applier
             .apply(mutation_id)
@@ -3513,10 +3597,10 @@ mod tests {
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(store.pool())
             .await
-            .expect("count durable events after rejected eventless apply");
+            .expect("count durable events after rejected mutation apply");
         assert_eq!(
-            events, 0,
-            "rejected provider-context projection must remain eventless"
+            events, events_before,
+            "rejected provider-context projection must not append an event"
         );
         let footprint: i64 = sqlx::query_scalar(
             "SELECT eviction_footprint_tokens FROM memory_batches WHERE layer = ?",
@@ -4042,10 +4126,11 @@ mod tests {
     #[tokio::test]
     async fn replace_head_is_monotonic_and_idempotent() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
 
@@ -4220,10 +4305,11 @@ mod tests {
     #[tokio::test]
     async fn replace_prepare_enforces_expected_latest_id_and_allows_cas_update() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
 
@@ -4562,9 +4648,7 @@ mod tests {
         // Remove the active window before checking that a different fingerprint
         // produces a distinct canonical idempotency key. Active native windows
         // are independently unique per provider-origin scope.
-        sqlx::query("DELETE FROM provider_context WHERE id = ?")
-            .bind(a.id())
-            .execute(store.pool())
+        delete_provider_context_with_projection_commitment(&store, a.id())
             .await
             .expect("remove first active native window");
         base.ordinal = 1;
@@ -4641,10 +4725,11 @@ mod tests {
     #[tokio::test]
     async fn replacement_preserves_data_key_when_same_anchor_is_reinserted() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
         let old_record = reasoning_record(&store, "message-1", 7).await;
@@ -4834,23 +4919,25 @@ mod tests {
     #[tokio::test]
     async fn invalidate_rejects_other_provider_context_key_before_any_destructive_drift() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
-            .await
-            .unwrap();
-        seed_message_in_open_l0_batch(&store, "message-2", 9, 1_000_000)
-            .await
-            .unwrap();
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 9).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7), ("message-2", 9)])
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-2", 1_000_000)
             .await
             .unwrap();
 
         let target = reasoning_record(&store, "message-1", 7).await;
         let target_id = target.id().to_owned();
         let target_key_ref = target.key_ref.clone();
-        target.insert(store.pool()).await.unwrap();
+        target.insert_committed(&store).await.unwrap();
         let other = reasoning_record(&store, "message-2", 9).await;
         let other_key_ref = other.key_ref.clone();
-        other.insert(store.pool()).await.unwrap();
+        other.insert_committed(&store).await.unwrap();
         assert_ne!(target_key_ref, other_key_ref);
 
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4866,12 +4953,24 @@ mod tests {
         .expect("build hostile invalidation");
         applier.prepare(&prepared).await.unwrap();
 
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin authenticated key swap");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before key swap");
         sqlx::query("UPDATE provider_context SET key_ref = ? WHERE id = ?")
             .bind(&other_key_ref)
             .bind(&target_id)
-            .execute(store.pool())
+            .execute(&mut *transaction)
             .await
             .expect("swap target to another live provider-context key");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent key swap");
+        transaction.commit().await.expect("commit hostile key swap");
         let before = destructive_state_snapshot(&store).await;
 
         let error = applier
@@ -4897,15 +4996,16 @@ mod tests {
             DataKeyPurpose::Mutation,
         ] {
             let store = store().await;
-            seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            seed_message(&store, "message-1", 7).await.unwrap();
+            seed_owner_event_evidence(&store, &[("message-1", 7)])
                 .await
                 .unwrap();
-            seed_owner_event_evidence(&store, &[("message-1", 7)])
+            seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
                 .await
                 .unwrap();
             let target = reasoning_record(&store, "message-1", 7).await;
             let target_id = target.id().to_owned();
-            target.insert(store.pool()).await.unwrap();
+            target.insert_committed(&store).await.unwrap();
 
             let mutation_key = store
                 .conversation_key(DataKeyPurpose::Mutation)
@@ -4932,12 +5032,27 @@ mod tests {
             .expect("build hostile invalidation");
             applier.prepare(&prepared).await.unwrap();
 
+            let mut transaction = store
+                .pool()
+                .begin()
+                .await
+                .expect("begin authenticated wrong-purpose key swap");
+            let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+                .await
+                .expect("authenticate provider-context set before wrong-purpose key swap");
             sqlx::query("UPDATE provider_context SET key_ref = ? WHERE id = ?")
                 .bind(&wrong_key_ref)
                 .bind(&target_id)
-                .execute(store.pool())
+                .execute(&mut *transaction)
                 .await
                 .expect("swap target to active wrong-purpose key");
+            commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+                .await
+                .expect("commit authenticated inconsistent wrong-purpose key swap");
+            transaction
+                .commit()
+                .await
+                .expect("commit wrong-purpose key swap");
             let before = destructive_state_snapshot(&store).await;
 
             let error = applier
@@ -4963,10 +5078,11 @@ mod tests {
     async fn replace_rejects_tampered_target_metadata_or_footprint_before_destructive_writes() {
         for tamper in ["metadata", "footprint"] {
             let store = store().await;
-            seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            seed_message(&store, "message-1", 7).await.unwrap();
+            seed_owner_event_evidence(&store, &[("message-1", 7)])
                 .await
                 .unwrap();
-            seed_owner_event_evidence(&store, &[("message-1", 7)])
+            seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
                 .await
                 .unwrap();
             let old = reasoning_record_with(&store, "message-1", 7, 0, 0).await;
@@ -4975,7 +5091,7 @@ mod tests {
                 .eviction_tokens
                 .checked_add(1)
                 .expect("test footprint increment");
-            old.insert(store.pool()).await.unwrap();
+            old.insert_committed(&store).await.unwrap();
             let replacement = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
             let mutation_id = format!("hostile-replace-{tamper}");
 
@@ -4999,6 +5115,14 @@ mod tests {
             .expect("build hostile Replace");
             applier.prepare(&prepared).await.unwrap();
 
+            let mut transaction = store
+                .pool()
+                .begin()
+                .await
+                .expect("begin authenticated target tamper");
+            let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+                .await
+                .expect("authenticate provider-context set before target tamper");
             match tamper {
                 "metadata" => {
                     sqlx::query(
@@ -5007,7 +5131,7 @@ mod tests {
                          WHERE id = ?",
                     )
                     .bind(&old_id)
-                    .execute(store.pool())
+                    .execute(&mut *transaction)
                     .await
                     .expect("tamper target provider metadata");
                 }
@@ -5018,12 +5142,16 @@ mod tests {
                                 .expect("hostile footprint fits SQLite"),
                         )
                         .bind(&old_id)
-                        .execute(store.pool())
+                        .execute(&mut *transaction)
                         .await
                         .expect("tamper target footprint");
                 }
                 _ => unreachable!(),
             }
+            commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+                .await
+                .expect("commit authenticated inconsistent target tamper");
+            transaction.commit().await.expect("commit target tamper");
             let before = destructive_state_snapshot(&store).await;
 
             let error = applier
@@ -5048,18 +5176,19 @@ mod tests {
     #[tokio::test]
     async fn invalidate_rejects_cross_row_ciphertext_id_binding_before_destruction() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
         let target = reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         let target_id = target.id().to_owned();
-        target.insert(store.pool()).await.unwrap();
+        target.insert_committed(&store).await.unwrap();
         let other = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let other_ciphertext = other.ciphertext.clone();
-        other.insert(store.pool()).await.unwrap();
+        other.insert_committed(&store).await.unwrap();
 
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
@@ -5074,12 +5203,24 @@ mod tests {
         .expect("build hostile invalidation");
         applier.prepare(&prepared).await.unwrap();
 
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin authenticated ciphertext swap");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before ciphertext swap");
         sqlx::query("UPDATE provider_context SET ciphertext = ? WHERE id = ?")
             .bind(other_ciphertext)
             .bind(&target_id)
-            .execute(store.pool())
+            .execute(&mut *transaction)
             .await
             .expect("copy ciphertext from another authenticated row id");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent ciphertext swap");
+        transaction.commit().await.expect("commit ciphertext swap");
         let before = destructive_state_snapshot(&store).await;
 
         let error = applier
@@ -5663,10 +5804,11 @@ mod tests {
     #[tokio::test]
     async fn invalidate_recovery_rejects_all_absent_targets_without_erasure_evidence() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
 
@@ -5738,13 +5880,15 @@ mod tests {
     #[tokio::test]
     async fn invalidate_recovery_rejects_partial_absence_before_touching_present_target() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
-            .await
-            .unwrap();
-        seed_message_in_open_l0_batch(&store, "message-2", 9, 1_000_000)
-            .await
-            .unwrap();
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 9).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7), ("message-2", 9)])
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-2", 1_000_000)
             .await
             .unwrap();
 
@@ -5830,10 +5974,11 @@ mod tests {
     #[tokio::test]
     async fn replace_rejects_absent_invalidation_target_before_insert_or_head_update() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
 
@@ -6505,13 +6650,15 @@ mod tests {
     #[tokio::test]
     async fn replace_head_survives_row_deletion_and_supersedes_older_prepared_replace() {
         let store = store().await;
-        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
-            .await
-            .unwrap();
-        seed_message_in_open_l0_batch(&store, "message-2", 8, 1_000_000)
-            .await
-            .unwrap();
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 8).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7), ("message-2", 8)])
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(&store, "message-2", 1_000_000)
             .await
             .unwrap();
 
@@ -6909,12 +7056,14 @@ mod tests {
             "error must describe kind mismatch"
         );
     }
+    #[tokio::test]
     async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_shared_key() {
         let store = store().await;
-        let batch_id = seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
             .await
             .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
+        let batch_id = seed_existing_message_in_open_l0_batch(&store, "message-1", 1_000_000)
             .await
             .unwrap();
 
@@ -6949,17 +7098,60 @@ mod tests {
         )
         .expect("build replace");
         applier.prepare(&prepared).await.unwrap();
-        // A prepared Replace can be applied after its L0 batch has compacted;
-        // accounting must still use the extant membership.
-        sqlx::query("UPDATE memory_batches SET state = 'compacted' WHERE id = ?")
-            .bind(&batch_id)
-            .execute(store.pool())
+        let affected_memory_batch_ids = applier
+            .verify_and_size("mutation-1")
             .await
-            .unwrap();
+            .unwrap()
+            .affected_memory_batch_ids;
+        assert_eq!(affected_memory_batch_ids, vec![batch_id.clone()]);
+
+        // The prepared affected set is only a preflight witness. Re-derive it
+        // under the apply transaction so an intervening membership change
+        // cannot leave an updated footprint outside the authenticated delta.
+        sqlx::query(
+            "DELETE FROM memory_batch_messages
+             WHERE batch_id = ? AND message_id = ?",
+        )
+        .bind(&batch_id)
+        .bind("message-1")
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = applier
+            .apply_in_transaction(&mut transaction, "mutation-1", &affected_memory_batch_ids)
+            .await
+            .expect_err("membership drift must invalidate the prepared affected set");
+        assert!(
+            error
+                .to_string()
+                .contains("affected memory batches changed between prepare and apply"),
+            "{error:#}"
+        );
+        transaction.rollback().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM provider_context_mutations WHERE mutation_id = 'mutation-1'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            "prepared"
+        );
+        sqlx::query(
+            "INSERT INTO memory_batch_messages(batch_id, message_id, ord)
+             VALUES(?, ?, 1)",
+        )
+        .bind(&batch_id)
+        .bind("message-1")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
         let mut transaction = store.pool().begin().await.unwrap();
         assert_eq!(
             applier
-                .apply_in_transaction(&mut transaction, "mutation-1")
+                .apply_in_transaction(&mut transaction, "mutation-1", &affected_memory_batch_ids,)
                 .await
                 .unwrap(),
             ApplyOutcome::Applied
@@ -7055,17 +7247,17 @@ mod tests {
         );
 
         // Seed an open L0 batch whose footprint already includes the old record.
-        seed_message_in_open_l0_batch(
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
+            .await
+            .unwrap();
+        seed_existing_message_in_open_l0_batch(
             &store,
             "message-1",
-            7,
             i64::try_from(old_footprint).unwrap(),
         )
         .await
         .unwrap();
-        seed_owner_event_evidence(&store, &[("message-1", 7)])
-            .await
-            .unwrap();
 
         let old_record = reasoning_record_from_item(&store, &old_item).await;
         let old_id = old_record.id().to_owned();

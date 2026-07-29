@@ -513,7 +513,7 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 
 永続contentを作る`ProviderEvent.content_index`はadapterがflatten済みwire slotとして発行し、assemblerが同値を`wire_item_index`へ変換する。`u32`へ表現不能ならtruncateせずErrorとする。`ReasoningSummary*`のindexだけはdisplay専用の別namespaceで、永続content位置へ変換しない。
 
-通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は `event=None + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の置換無効化と新 window の暗号化 INSERT を1 transaction で行う。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
+通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は同じ EventWrite の `MemoryMaintenance + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の置換無効化と新 window の暗号化 INSERT を1 transaction で行う。footprintへ影響する場合は、prepare時とapply transaction内で完全一致を確認した対象batch集合について、同じ`MemoryMaintenance`へ認証済みmemory projection deltaを載せる。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
 
 ストリームの型は `pi:ai/src/utils/event-stream.ts` の `EventStream`(push/AsyncIterator/最終結果Promise)に対応して:
 
@@ -1701,7 +1701,8 @@ CREATE TABLE provider_context (
   FOREIGN KEY(message_id, message_seq) REFERENCES messages(id, seq) ON DELETE CASCADE
 );
 
--- event=Noneのprovider-context mutationをprepare→applyでexactly-onceにする内部intent/log。
+-- same-write MemoryMaintenanceを伴うprovider-context mutationを
+-- prepare→applyでexactly-onceにする内部intent/log。
 CREATE TABLE provider_context_mutations (
   mutation_id TEXT PRIMARY KEY,
   state TEXT NOT NULL,          -- prepared | applied | superseded
@@ -2171,7 +2172,7 @@ IDはdedicated compactionではprovider request ID、L0 promotionではmemory jo
 
 Replaceの「現在latest」はactive `provider_context` rowだけで判定せず、`provider_context_replace_heads`の永続high-watermarkを正典とする。scopeはversioned keyed HMACで`provider_instance_id/protocol/model/kind`へ束縛し、比較は`(config_generation, window_ordinal)`の辞書順とする。Replace適用transactionは新row INSERTと同時に、candidate tupleがheadより大きい場合だけheadをCAS前進し、同値なら`latest_insert_id`一致を要求する。candidateがhead未満ならactive rowが空でも`superseded/newer_replace`、同値かつ同一insertなら`applied/already_satisfied`で終端する。Invalidate、promotion、mode切替、crypto-erase、通常のprovider-context retentionによるrow削除はheadを後退・削除しない。agent deathだけがagent DBと共にmutation/head全体を破棄する。したがってB適用後にB rowが正当に削除されても、古いAのordinalはheadとの比較で必ずsupersededになる。
 
-初回適用では両variantの`invalidate_ids`重複と`Invalidate`の空リストを拒否する(`Replace`の初回INSERTだけは空を許す)。減算量は入力値ではなく、上記規則で削除対象と確定した現存rowの保存済み`eviction_tokens`をmessage→`memory_batch_messages`で対応batchへ集約して求め、`UPDATE ... SET eviction_footprint_tokens = eviction_footprint_tokens - ? WHERE id=? AND eviction_footprint_tokens >= ?`の更新件数を検証する。これにより重複減算・underflow・promotionとの競合をfail-closedにする。footprint-only accounting mutationは§7.4どおりbatch versionを進めない。対象data keyのdestroy、row削除、batch減算、Replaceの新row INSERT、mutationのterminal化を1 transactionに置く。L0→L1 promotionも同じ削除プリミティブをcaller-stable mutation IDで使い、競合時はalready-satisfied規則へ収束する。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
+初回適用では両variantの`invalidate_ids`重複と`Invalidate`の空リストを拒否する(`Replace`の初回INSERTだけは空を許す)。減算量は入力値ではなく、上記規則で削除対象と確定した現存rowの保存済み`eviction_tokens`をmessage→`memory_batch_messages`で対応batchへ集約して求め、`UPDATE ... SET eviction_footprint_tokens = eviction_footprint_tokens - ? WHERE id=? AND eviction_footprint_tokens >= ?`の更新件数を検証する。これにより重複減算・underflow・promotionとの競合をfail-closedにする。footprint-only accounting mutationは§7.4どおりbatch versionを進めない。対象data keyのdestroy、row削除、batch減算、Replaceの新row INSERT、mutationのterminal化を1 transactionに置く。L0→L1 promotionも同じ削除プリミティブをcaller-stable mutation IDで使い、競合時はalready-satisfied規則へ収束する。`ProviderContextMutation`はEventBatch唯一のwriteかつ唯一のprojectionとし、prepare時に得たaffected batch集合をapply transaction内で再導出して完全一致をprojection前に要求する。適用にはsame-write `MemoryMaintenance`を必須とし、footprintへ影響する場合はそのeventへ対象batchの認証済みmemory projection deltaを載せる。provider-context projection後にeventをappendする順序は意図的であり、Replaceのretention owner認証はprojection前の認証済みevent headを参照する。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result等の内部投影だけに限定し、`ProviderContextMutation`には許可しない。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
 
 mode/fingerprint切替では、対象rowの無効化・選択mode/fingerprintの更新・`config_generation`のCAS前進・mutationのterminal化も同じtransactionに置く。`provider_context`の後続INSERTは生成開始時のgenerationと現在値の一致、および現在のmode/fingerprintを検証するため、切替成功後に旧generationのrowが再出現することはない。競合したprepared操作は上記generation比較でalready-satisfiedまたはsupersededへ閉じ、一度terminalになったIDの異なるdigestは異なる操作として拒否する。
 

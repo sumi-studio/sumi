@@ -1243,11 +1243,27 @@ impl Store {
             let Some(anchor) = context.item.origin_message.as_ref() else {
                 continue;
             };
-            if !persisted_messages.contains_key(anchor.message_id.as_str()) {
-                bail!(
-                    "provider-context footprint references unknown transcript message {}",
-                    anchor.message_id
-                );
+            let owner = persisted_messages
+                .get(anchor.message_id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "provider-context footprint references unknown transcript message {}",
+                        anchor.message_id
+                    )
+                })?;
+            // Error assistants are durable lifetime owners for retained native
+            // context, but are deliberately excluded from L0. Keep their
+            // provider rows available for disposition without projecting a
+            // footprint onto a membership that must not exist.
+            if matches!(
+                owner,
+                ContextMessage::Persisted {
+                    message: Message::Assistant(assistant),
+                    ..
+                } if assistant.stop_reason == StopReason::Error
+            ) {
+                continue;
             }
             let total = anchored_footprints
                 .entry(anchor.message_id.clone())

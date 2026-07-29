@@ -472,6 +472,15 @@ impl ThreeLayerMemory {
                     membership.batch_id
                 );
             };
+            if matches!(
+                &membership.message,
+                ContextMessage::Persisted {
+                    message: crate::provider::types::Message::Assistant(assistant),
+                    ..
+                } if assistant.stop_reason == crate::provider::types::StopReason::Error
+            ) {
+                bail!("Error assistant {id} must not belong to an L0 memory batch");
+            }
             if !member_message_ids.insert(id.clone()) {
                 bail!("hydrated memory message {id} belongs to more than one L0 batch");
             }
@@ -1624,7 +1633,10 @@ fn l0_runtime_state(state: MemoryBatchState) -> Result<BatchState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::types::{Message, UserContent, UserMessage};
+    use crate::provider::types::{
+        ApiProtocol, AssistantMessage, Message, ProviderOrigin, StopReason, Usage, UserContent,
+        UserMessage,
+    };
 
     fn persisted_user(id: &str, seq: u64, text: &str) -> ContextMessage {
         ContextMessage::Persisted {
@@ -1634,6 +1646,29 @@ mod tests {
                 content: vec![UserContent::Text {
                     text: text.to_owned(),
                 }],
+                timestamp: Utc::now(),
+            }),
+        }
+    }
+
+    fn persisted_error(id: &str, seq: u64) -> ContextMessage {
+        ContextMessage::Persisted {
+            id: id.to_owned(),
+            seq,
+            message: Message::Assistant(AssistantMessage {
+                content: Vec::new(),
+                model: "test-model".to_owned(),
+                provider: "test-provider".to_owned(),
+                origin: ProviderOrigin {
+                    provider_instance_id: "test-provider-instance".to_owned(),
+                    protocol: ApiProtocol::OpenAiResponses,
+                    model: "test-model".to_owned(),
+                },
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("retryable failure".to_owned()),
+                provider_code: None,
+                interrupted: false,
                 timestamp: Utc::now(),
             }),
         }
@@ -1741,6 +1776,40 @@ mod tests {
             .expect("provider context cannot survive outside live L0");
         assert!(
             error.to_string().contains("does not belong to a live L0"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_error_assistant_membership_even_with_zero_footprint() {
+        let batch_id = Uuid::now_v7();
+        let message = persisted_error("error-assistant", 1);
+        let estimate = message_estimate(&message);
+        let hydrated = HydratedMemoryRuntime::new(
+            vec![HydratedMemoryBatch::new(
+                batch_id,
+                MemoryLayer::L0,
+                1,
+                1,
+                0,
+                MemoryBatchState::Open,
+                estimate,
+                0,
+                None,
+            )],
+            vec![HydratedMemoryMembership::new(batch_id, 1, message)],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let error = ThreeLayerMemory::from_hydrated(hydrated)
+            .err()
+            .expect("Error assistant membership must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Error assistant error-assistant must not belong to an L0"),
             "{error:#}"
         );
     }
