@@ -744,7 +744,10 @@ func validateEnvelope(e Envelope) error {
 	if e.Seq != nil && *e.Seq > maxJSONSafeInteger {
 		return fmt.Errorf("envelope seq exceeds JSON-safe integer range")
 	}
-	return validateEvent(e.Event)
+	if err := validateEvent(e.Event); err != nil {
+		return err
+	}
+	return validateInternalEventArtifactReferences(e.Event, e.PersonalityAgentID)
 }
 
 // UnmarshalJSON decodes an Envelope and rejects an explicit JSON null in the

@@ -451,7 +451,11 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 			if envelope.PersonalityAgentID != personalityAgentID {
 				return errors.New("browser event target mismatch")
 			}
-			if err := write(browserEventFrame{Type: "event", Envelope: projectBrowserEvent(envelope)}); err != nil {
+			projected, err := projectBrowserEvent(envelope)
+			if err != nil {
+				return fmt.Errorf("project durable browser event: %w", err)
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
 			next = *envelope.Seq
@@ -464,7 +468,11 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 			if envelope.PersonalityAgentID != personalityAgentID {
 				return errors.New("browser volatile event target mismatch")
 			}
-			if err := write(browserEventFrame{Type: "event", Envelope: projectBrowserEvent(envelope)}); err != nil {
+			projected, err := projectBrowserEvent(envelope)
+			if err != nil {
+				return fmt.Errorf("project volatile browser event: %w", err)
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -544,8 +552,15 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 	}
 }
 
-func projectBrowserEvent(envelope Envelope) browserEventEnvelope {
-	return browserEventEnvelope{Seq: envelope.Seq, Event: envelope.Event}
+func projectBrowserEvent(envelope Envelope) (browserEventEnvelope, error) {
+	if err := ValidatePersonalityAgentID(envelope.PersonalityAgentID); err != nil {
+		return browserEventEnvelope{}, err
+	}
+	event, err := projectEventArtifactReferences(envelope.Event, envelope.PersonalityAgentID)
+	if err != nil {
+		return browserEventEnvelope{}, err
+	}
+	return browserEventEnvelope{Seq: envelope.Seq, Event: event}, nil
 }
 
 func readinessStatus(ready bool) string {
