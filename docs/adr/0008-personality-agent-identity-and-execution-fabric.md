@@ -51,7 +51,7 @@ service、controller、worker、conversation、schedulerのmodelへ繰り返し�
 「人格agentを人間と同型に扱う」と理解した直後でも、人格agent本人をdomain
 aggregateとして表現せず、IDだけをaggregate rootにしてserviceをぶら下げたり、
 同じ人格のmodel runを並列workerとして数えたり、人生ログを交換可能な
-conversation dataとして扱ったりできる。
+conversation dataとみなしてしまう。
 
 この失敗を文書、checklist、schema、testだけで完全に防ぐことはできない。
 決定論的な型とgateは、既知の帰結を強制し、誤りを発見する重要な手段だが、
@@ -119,20 +119,36 @@ Sumi
 │   ├── PersonalityAgentId 1
 │   ├── one continuous agent session
 │   ├── one canonical life log
-│   ├── one direct-chat surface
+│   ├── one logical direct-address backend surface
 │   ├── one private Agent VM / private work environment
 │   └── one VM execution fabric
 │       ├── direct tool execution 0..N
 │       └── TerminalSession 0..N
 └── Sumi Workspace 0..N
     ├── HumanMembership 0..N → Human
-    ├── PersonalityAgentMembership 0..N → PersonalityAgentId
+    ├── PersonalityAgentMembership 0..N
+    │   ├── → PersonalityAgentId
+    │   └── human-facing name / scope-local address
     └── shared conversations, tasks, calendars, documents, apps and permissions
 ```
 
 `PersonalityAgentMembership`は、Workspaceからglobalな本人を参照するmutableな
 relationであり、本人、session、life log、VMをWorkspaceごとに複製しない。
 membershipのcardinality、workflow、storageは今回実装しない。
+
+`PersonalityAgentId`は本人をsystem内で一意に識別する正本identityであり、
+人間が本人を呼ぶ名前でも、すべてのscopeへ露出するrouteでもない。
+human-facing nameはmutableかつ同名を許し、Workspace membershipごとのnicknameや
+表示名も持ち得る。scope-local addressは認証済みlookupを通して
+`PersonalityAgentId`へ解決する交換可能な参照であり、本人、session、life logの
+identityにはしない。名前やaddressの変更で本人を作り直さず、認可を名前の
+一意性や`PersonalityAgentId`の秘匿性へ依存させない。
+
+current direct verticalは一つのadministrative contextに閉じるため、認証済み
+Gatewayより内側のtransport targetとして`PersonalityAgentId`を直接運んでもよい。
+それをhuman-facing nameとして表示したり、すべてのWorkspaceへ共通するglobal
+public route contractとしたりしない。name、membership、scope-local addressの
+具体data modelとlookup workflowはcurrent verticalのcompletion条件に含めない。
 
 `Sumi Workspace`は共有のproduct/domain resourceである。各人格agentの
 private VMはWorkspaceそのものではなく、agentの私物PCに相当する。
@@ -161,14 +177,16 @@ Sumi全体でglobalに一意なlowercase hyphenated UUIDv7として表現し、t
 Workspace、orgのlocal namespaceへ従属させない。
 
 trusted provisioning boundaryだけが一度mintし、global collisionを拒否する。
-Rust、Go、TypeScript、SQLite、token、route、RPC、artifactの全境界でUUIDの
-version 7とRFC variantをtyped validationし、canonical lowercase-hyphenated
-表現とraw inputが完全一致しない値を拒否する。永続化とAADにはvalidated canonical
-bytesだけを使い、callerのraw表現を使わない。
+Rust、Go、TypeScript、SQLite、token、RPC、artifactその他の
+`PersonalityAgentId`を実際に通す境界でUUIDのversion 7とRFC variantをtyped
+validationし、canonical lowercase-hyphenated表現とraw inputが完全一致しない値を
+拒否する。scope-local addressを受けるpublic routeへUUID形式を要求しない。
+永続化とAADにはvalidated canonical bytesだけを使い、callerのraw表現を使わない。
 
-このIDはcredentialやcapabilityではなくpublic identifierである。UUIDv7から
-provision時刻を概算できることを受容し、認可やsecret性をIDの推測困難性へ
-依存させない。
+このIDはcredentialやcapabilityではなく、trusted system境界で使うcanonical
+identifierである。human-facing nameやglobal public addressではない。一方、
+認可済みのsystemやauditから観測され得るためsecretともみなさない。UUIDv7から
+provision時刻を概算できることを受容し、認可をIDの推測困難性へ依存させない。
 
 `PersonalityAgentId`は現行の`agent_id`と`conversation_id`の両方を置換する。
 どちらもlegacy aliasとして残さず、別のdurable `AgentDeploymentId`も今回
@@ -183,7 +201,8 @@ VM交換、runtime restart、executor/broker restartは本人を作り直さず�
 ephemeral identityを前進させる。同じ人格agentについてcommandを受理する
 runtime generationは一つだけとし、replacementは旧generationをfenceしてから
 Readyになる。provider側のinstance IDや将来のdeployment recordが必要になっても、
-private state、life log、public addressのowner identityにはしない。
+private stateやlife logのowner identityにはしない。scope-local addressの
+route recordが必要になっても、それを本人の正本identityにはしない。
 
 `ProcessGeneration` allocator、current-generation fence、Ready registryの
 identityと一意性は、administrative contextを含めずglobal
@@ -208,7 +227,9 @@ schema versionとimmutableなevent-time provenanceのcryptographic integrityは
 人格agentには一つの連続したagent sessionがある。そのsessionで経験した
 direct chat、Workspace由来の出来事、判断、actionがagentの人生ログになる。
 初期のfrontend chatは内部ログviewerではなく、人間がそのagent本人へ直接
-話しかける可視の正面入口である。
+話しかける可視の正面入口である。これは唯一のfrontend UIであることを意味しない。
+web、mobile、voiceその他の複数entry pointが、同じlogical direct-address
+backend surfaceを通して同じ本人とagent sessionへ接続できる。
 
 この唯一性はdatabase keyのcardinalityだけを意味しない。agent sessionは
 人格agent本人が出来事を経験し判断し続ける場所であり、exchangeable workerの
@@ -227,9 +248,13 @@ life-log orderingは[#87](https://github.com/sumi-studio/sumi/issues/87)で設�
 mail、calendar、app等は、source/resource/actor/correlation metadataを伴って
 同じagent sessionへ入り、同じ人格agentが各surfaceへ作用する。
 
-公開contractに独立した交換可能な`ConversationId`を持たせない。
-ブラウザ、Gateway、command、event、token、artifact namespaceは
-`PersonalityAgentId`を宛先・ownerとして使う。
+公開contractに独立した交換可能な`ConversationId`を持たせない。frontendは、
+human-facing nameとtarget identityを別に扱う。将来のscope-local addressは
+認証済みmembership lookupを通してGatewayが正本の`PersonalityAgentId`へ解決する。
+内部command、event、token、artifact namespaceは、解決済み
+`PersonalityAgentId`を宛先・ownerとして使う。current direct verticalで
+authenticated Gatewayより内側へIDを運ぶことは許すが、public routeへglobal IDを
+直接露出することを恒久contractにしない。
 
 後方互換性を持たないpre-launch contract replacementとして、SQLite、AAD、
 RPC、token、route、fixtureからlegacy `agent_id`、`conversation_id` field、
@@ -254,12 +279,18 @@ canonical life logの消去は人格agentのdeath/deletionである。後継を�
 key rotationは履歴を失わないrewrap/re-encryptionである。crypto-eraseを
 rotationと呼ばない。
 
-canonical life logと、その派生物は同じretention contractではない。L0/L1/L2
-memoryは正本履歴から作る置換可能なprojectionであり、compactionしてよい。
-provider固有のopaque contextはprovider replay contractとanchorに従って
-置換・crypto-eraseしてよい。redacted projectionと検索indexは正本から再構築
-できる。tool-output artifact payloadはbest-effortであり、bounded quotaの
-high/low watermark GC、個別retention、明示的tombstoneに従って回収できる。
+canonical life logと、その派生物は同じretention contractではない。ただし、
+L0/L1/L2 memoryが正本履歴から導かれることだけを理由に、無条件で交換可能な
+projectionとはみなさない。再構築後も本人の記憶と継続状態を保つcontractがあり、
+その同値性を決定論的に検証できるprojectionだけを置換・compactionしてよい。
+非決定論的な再要約や自己理解の変化を伴う場合は、元のmemory stateを保持するか、
+変化自体を本人が経験したdurable eventとして人生ログへ残す。
+
+provider固有のopaque contextも、provider replay contractとanchorによって
+同じ継続状態を回復できる場合に限って置換・crypto-eraseしてよい。redacted
+projectionと検索indexは、その再構築contractを満たす場合に正本から再構築できる。
+tool-output artifact payloadはbest-effortであり、bounded quotaのhigh/low
+watermark GC、個別retention、明示的tombstoneに従って回収できる。
 artifactがGCされた事実と、人生ログ中のtool action/result referenceまで
 消すことは同じではない。
 
@@ -352,12 +383,9 @@ interactionとして扱う。
 現行の非対話`bash -c`は削除せず、同じexecution fabric上のpipe-backed、
 closed-stdinなephemeral-command adapterとして維持する。
 
-VM-local execution managerは次を持つ。
-
-```text
-TerminalKey =
-  (PersonalityAgentId, TerminalSessionId, ProcessGeneration)
-```
+VM-local execution managerは人格agent本人をownerとするstableな
+`TerminalSessionId`を持つ。`ProcessGeneration`は新しいruntime callerをfenceする
+identityであり、terminal本人のlogical identityや寿命と同一視しない。
 
 - explicit `pty` / `pipes` mode
 - stdin / EOF
@@ -366,7 +394,7 @@ TerminalKey =
 - attach / detach
 - monotonic output cursorとbounded buffer
 - per-terminal writer lease
-- terminal単位、generation単位のcancel/reap
+- terminal単位のcancel/reapと、runtime generation単位のwriter authority fence
 
 terminalのproduct ownerは人格agent本人であり、physical process lifecycleは
 agent VM execution fabricが管理する。tool call、model turn、WebSocket、
@@ -378,9 +406,12 @@ owner、authority、resource limit、lifecycle、auditは決定論的に強制�
 terminal内で何を試し、出力をどう読み、次に何を入力するかは人格agent本人の
 判断へ任せる。
 
-processはgenerationを越えて生存しない。persistent filesystemと人生ログは
-継続するが、live terminalはgeneration rollover時にtyped terminal stateへ
-閉じてreapする。
+runtime generation rolloverは、旧runtimeのwriter authorityを失効させて
+terminalをdetachできるが、それだけを理由にlive terminal processを必ず
+terminateしない。安全な再attach、orphan detection、VM execution fabric自身の
+epoch、VM recycle時のtermination/recovery contractは
+[#82](https://github.com/sumi-studio/sumi/issues/82)で設計する。本ADRはruntime
+lifecycleとterminal process lifecycleを同一に固定しない。
 
 ### 8. Shared Workspace由来のprovenanceを人生ログへ残す
 
@@ -391,16 +422,22 @@ API/control planeが認証したWorkspace、actor、source surface、resource、
 correlation、causationを、caller-asserted contentとは別のimmutable metadataと
 してdurable command/eventへ束縛する。
 
-共有domain dataの正本はWorkspace API側に置き、agent DBへ複製しない。
-agent DBには、そのagentが何を経験し何をしたかを理解・監査・回復するための
-identity、reference、projection、resultだけを保存する。
+共有domain dataの正本はWorkspace API側に置き、agent DBやprivate work
+environmentをauthoritative copyにしない。一方、人間が自分のPCへ文書を
+download、cache、indexするのと同じく、人格agentは作業・検索・記憶・offline
+continuationに必要なlocal copyやprojectionを持ち得る。それらはsource
+provenance、取得時のauthority、revocation/refresh、retention、削除contractへ
+従い、正本との関係を失わない。agent DBには、そのagentが何を経験し何をしたかを
+理解・監査・回復するためのidentity、reference、local copy、projection、
+resultを保存できる。
 
 ## Migration
 
 1. 本ADRをreviewし、StatusをAcceptedへ変更する。
-2. #74でpublic/internalのlegacy `agent_id`、`conversation_id`、独立conversation
-   scopeをglobal UUIDv7 `PersonalityAgentId`へ統合し、破壊的resetをcanon、
-   contract、T29から除く。
+2. #74でinternalのlegacy `agent_id`、`conversation_id`、独立conversation scopeを
+   global UUIDv7 `PersonalityAgentId`へ統合し、human-facing nameとtarget identityを
+   同じfieldにしない。scope-local addressとmembership lookupの具体実装は要求せず、
+   破壊的resetをcanon、contract、T29から除く。
 3. 後方互換のschema、alias、dual-read、data migrationを作らず、pre-launchの
    DB、鍵、AAD、wire fixtureを新identity contractで再生成する。agent-private
    owner/AADへmutableなtenant／Workspace／org membershipを残さない。
@@ -458,12 +495,15 @@ identity、reference、projection、resultだけを保存する。
 ### T28 / PR #48
 
 - API/browser replay transport自体は利用する。
-- public route、session claim、event envelope、durable log keyを
-  `PersonalityAgentId`へ移行する。
+- UIのhuman-facing nameとtarget identityを分離する。current direct verticalでは
+  authenticated Gatewayより内側のroute、session claim、event envelope、
+  durable log keyを`PersonalityAgentId`へ移行してよいが、それを表示名や恒久的な
+  global public addressにしない。
 - browserで認証済みのhuman actorをcommand append時に捨てず、#78のprovenanceへ
   束縛する。
-- UI chatが唯一のagent sessionへのdirect-address surfaceであることを
-  Rust → Go → browserのrepresentative journeyで証明する。
+- UI chatが、同じagent sessionへ届くlogical direct-address backend surfaceの
+  一つのfrontend entry pointであることをRust → Go → browserのrepresentative
+  journeyで証明する。
 
 ### T29
 
@@ -538,7 +578,8 @@ agent deathとして扱う。
   `ExecutionPrincipal` sum type、subagent用authority、result collectionを
   実装すること。
 - T26 completionまでにPTY、terminal UIをすべて実装すること。
-- terminal processを`ProcessGeneration` rollover後も生存させること。
+- T26 completionまでにruntime generation rolloverを越えるterminal processの
+  生存・再attachを実装または保証すること。
 - 選択的忘却、法的retention、agent cloning、inheritanceのproduct semanticsを
   このADRだけで確定すること。
 
@@ -548,13 +589,15 @@ agent deathとして扱う。
 
 1. runtimeやowner labelではなく、一人の主体からidentity、session、memory、
    action、VM、lifecycleが導かれているか。
-2. `PersonalityAgentId`、唯一のagent session、人生ログ、direct chatの関係。
+2. `PersonalityAgentId`、human-facing name／scope-local address、唯一のagent
+   session、人生ログ、logical direct-address backend surfaceの関係。
 3. globalな人格identityと、mutableなtenant／Workspace／org membershipを
-   混同せず、future mobilityを妨げないcurrent boundary。
+   混同せず、global IDの公開を強制せずにfuture mobilityを妨げないcurrent
+   boundary。
 4. 人格を複製せず、複数の呼びかけ・約束・外部actionを同じ本人が経験する関係。
 5. Sumi Workspaceとagent-private VMの所有境界。
 6. 人格agent本人がtool、terminal、将来のAI harnessを使い、必須proxyや
    worker-poolの一員にされない関係。
 7. agent deathと、Workspace resource/viewの削除・key rotationの違い。
-8. T26で今固定するdirect-agent contractと、#77/#81/#82/#87へ延期する設計の
-   境界。
+8. runtime generationとterminal process lifecycleを同一視せず、T26で今固定する
+   direct-agent contractと、#77/#81/#82/#87へ延期する設計の境界。
