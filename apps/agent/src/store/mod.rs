@@ -61,7 +61,9 @@ pub(crate) use self::physical_recovery::{
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
 #[cfg(test)]
-pub(crate) use self::provider_context::EncryptedProviderContextRecord;
+pub(crate) use self::provider_context::{
+    EncryptedProviderContextRecord, provider_context_record_id,
+};
 pub(crate) use self::provider_context::{ProviderContextKind, provider_context_idempotency_key};
 #[cfg(test)]
 pub(crate) use self::provider_context::{
@@ -140,9 +142,7 @@ fn pending_error_context_recovery(
         .collect();
     let mut pending = BTreeMap::<(String, u64), usize>::new();
     for item in provider_context {
-        let Some(anchor) = item.origin_message.as_ref() else {
-            continue;
-        };
+        let anchor = &item.retention_owner;
         if error_messages
             .get(&(anchor.message_id.as_str(), anchor.message_seq))
             .copied()
@@ -701,6 +701,62 @@ impl Store {
                     serde_json::from_slice(&plaintext).with_context(|| {
                         format!("provider-context record {id} is not a valid ProviderContextItem")
                     })?;
+                if item.retention_owner.message_id.is_empty() {
+                    bail!("provider-context record {id} has an empty retention owner");
+                }
+                let expected_record_id = self::provider_context::provider_context_record_id(&item);
+                if id != expected_record_id {
+                    bail!(
+                        "provider-context record {id} row id does not match authenticated retention owner"
+                    );
+                }
+                let expected_key_ref = provider_context_key_ref(
+                    &self.scope,
+                    &format!(
+                        "{}:{}",
+                        item.retention_owner.message_id, item.retention_owner.message_seq
+                    ),
+                );
+                if key_ref != expected_key_ref {
+                    bail!(
+                        "provider-context record {id} key_ref does not match authenticated retention owner"
+                    );
+                }
+                let owner_message = seq_to_message
+                    .get(&item.retention_owner.message_seq)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} retention owner {}:{} does not resolve to a persisted message",
+                            item.retention_owner.message_id,
+                            item.retention_owner.message_seq
+                        )
+                    })?;
+                let (owner_id, owner_assistant) = match owner_message {
+                    ContextMessage::Persisted {
+                        id,
+                        message: Message::Assistant(assistant),
+                        ..
+                    } => (id, assistant),
+                    _ => {
+                        bail!(
+                            "provider-context record {id} retention owner {}:{} does not resolve to a persisted assistant MessageEnd",
+                            item.retention_owner.message_id,
+                            item.retention_owner.message_seq
+                        );
+                    }
+                };
+                if owner_id != &item.retention_owner.message_id {
+                    bail!(
+                        "provider-context record {id} retention owner {}:{} resolves to a different message id",
+                        item.retention_owner.message_id,
+                        item.retention_owner.message_seq
+                    );
+                }
+                if owner_assistant.origin != item.provider_origin {
+                    bail!(
+                        "provider-context record {id} provider_origin does not match its retention-owner assistant origin"
+                    );
+                }
 
                 if item.origin_message.as_ref().map(|a| a.message_id.as_str())
                     != stored_message_id.as_deref()
@@ -791,62 +847,14 @@ impl Store {
                         }
                     }
                     ProviderContextPayload::EncryptedReasoning { .. } => {
-                        if item.origin_message.is_none() {
+                        if item.origin_message.as_ref() != Some(&item.retention_owner) {
                             bail!(
-                                "provider-context record {id} encrypted reasoning must have an origin message"
+                                "provider-context record {id} encrypted reasoning origin message must match its retention owner"
                             );
                         }
                         if item.wire_item_index.is_none() {
                             bail!(
                                 "provider-context record {id} encrypted reasoning must have a wire_item_index"
-                            );
-                        }
-                    }
-                }
-
-                match &item.payload {
-                    ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    | ProviderContextPayload::AnthropicCompaction { .. } => {
-                        // Native compaction is unanchored; the authenticated plaintext origin is the
-                        // source of truth for provider identity. Do not infer from prior messages.
-                    }
-                    ProviderContextPayload::EncryptedReasoning { .. } => {
-                        let anchor = item.origin_message.as_ref().ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} encrypted reasoning is missing an anchor"
-                        )
-                    })?;
-                        let anchor_message = seq_to_message.get(&anchor.message_seq).ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} anchor {}:{} does not resolve to a persisted message",
-                            anchor.message_id,
-                            anchor.message_seq
-                        )
-                    })?;
-                        let (anchor_id, assistant) = match anchor_message {
-                            ContextMessage::Persisted {
-                                id,
-                                message: Message::Assistant(assistant),
-                                ..
-                            } => (id, assistant),
-                            _ => {
-                                bail!(
-                                    "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
-                                    anchor.message_id,
-                                    anchor.message_seq
-                                );
-                            }
-                        };
-                        if anchor_id != &anchor.message_id {
-                            bail!(
-                                "provider-context record {id} anchor {}:{} resolves to a different message id",
-                                anchor.message_id,
-                                anchor.message_seq
-                            );
-                        }
-                        if assistant.origin != item.provider_origin {
-                            bail!(
-                                "provider-context record {id} provider_origin does not match the anchored assistant origin"
                             );
                         }
                     }
@@ -877,15 +885,10 @@ impl Store {
                             );
                         }
 
-                        let request_id =
-                            crate::store::provider_context::native_request_id_from_record_id(&id)
-                                .ok_or_else(|| {
-                                anyhow!(
-                                    "provider-context record {id} has a non-canonical native row id"
-                                )
-                            })?;
-                        let expected_idempotency_key =
-                            provider_context_idempotency_key(&request_id, &item);
+                        let expected_idempotency_key = provider_context_idempotency_key(
+                            &item.retention_owner.message_id,
+                            &item,
+                        );
                         if stored_idempotency_key != expected_idempotency_key {
                             bail!(
                                 "provider-context record {id} idempotency key does not match authenticated native item"
@@ -903,14 +906,9 @@ impl Store {
                                 "provider-context record {id} reasoning payload must not carry coverage metadata"
                             );
                         }
-                        let anchor = item.origin_message.as_ref().ok_or_else(|| {
-                        anyhow!(
-                            "provider-context record {id} encrypted reasoning is missing an anchor"
-                        )
-                    })?;
                         let expected_idempotency_key =
                             self::provider_context::provider_context_idempotency_key(
-                                &anchor.message_id,
+                                &item.retention_owner.message_id,
                                 &item,
                             );
                         if stored_idempotency_key != expected_idempotency_key {

@@ -97,43 +97,32 @@ impl ProviderContextKind {
     }
 }
 
-/// Extracts the request/message identity from a native provider-context record id.
+/// Canonical durable row identity for one provider-context item.
 ///
-/// Native compaction rows use the canonical id form
-/// `{request_id}:{message_seq}:{wire_label}:{ordinal}` where `message_seq` and
-/// `ordinal` are decimal and `wire_label` is `"_"` for unanchored native windows.
-/// Because `request_id` may itself contain `':'` separators, this parses from the
-/// fixed trailing fields rather than splitting naively from the start.
-pub(crate) fn native_request_id_from_record_id(id: &str) -> Option<String> {
-    let mut parts = id.rsplitn(4, ':');
-    let ordinal = parts.next()?;
-    if ordinal.parse::<u32>().is_err() {
-        return None;
-    }
-    let wire_label = parts.next()?;
-    if wire_label != "_" {
-        return None;
-    }
-    let message_seq = parts.next()?;
-    if message_seq.parse::<u64>().is_err() {
-        return None;
-    }
-    let request_id = parts.next()?;
-    if request_id.is_empty() {
-        return None;
-    }
-    Some(request_id.to_owned())
+/// The exact owning MessageEnd is encrypted inside `ProviderContextItem` and
+/// repeated in the row identity bound by AEAD AAD. Hydration requires both
+/// representations to agree, so lifecycle ownership never depends on the
+/// nullable semantic `origin_message` columns.
+pub(crate) fn provider_context_record_id(item: &ProviderContextItem) -> String {
+    let wire_label = item
+        .wire_item_index
+        .map_or_else(|| "_".to_owned(), |index| index.to_string());
+    format!(
+        "{}:{}:{wire_label}:{}",
+        item.retention_owner.message_id, item.retention_owner.message_seq, item.ordinal
+    )
 }
 
 /// Canonical idempotency key for provider-context records.
 ///
-/// Regular reasoning items use `message_id:wire_item_index:ordinal:kind`;
-/// native/dedicated compaction windows use `request_id:coverage_seq:fingerprint`.
+/// Regular reasoning items use
+/// `owner_message_id:wire_item_index:ordinal:kind`; native/dedicated compaction
+/// windows use `owner_message_id:coverage_seq:fingerprint`.
 /// The key is stored in `provider_context.idempotency_key` and used for
 /// uniqueness and mutation-intent HMACs, while the row `id` remains a distinct
 /// stable record identifier.
 pub(crate) fn provider_context_idempotency_key(
-    request_id: &str,
+    owner_message_id: &str,
     item: &ProviderContextItem,
 ) -> String {
     match &item.payload {
@@ -143,7 +132,7 @@ pub(crate) fn provider_context_idempotency_key(
                 .map_or_else(|| "_".to_owned(), |index| index.to_string());
             format!(
                 "{}:{}:{}:{}",
-                request_id,
+                owner_message_id,
                 wire_label,
                 item.ordinal,
                 ProviderContextKind::from_payload(&item.payload).as_str()
@@ -153,7 +142,7 @@ pub(crate) fn provider_context_idempotency_key(
         | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
             format!(
                 "{}:{}:{}",
-                request_id, coverage.through_message_seq, coverage.context_fingerprint
+                owner_message_id, coverage.through_message_seq, coverage.context_fingerprint
             )
         }
     }
@@ -2048,11 +2037,13 @@ mod tests {
 
     fn reasoning_item(message_id: impl Into<String>, message_seq: u64) -> ProviderContextItem {
         let origin = reasoning_origin();
+        let retention_owner = ProviderContextAnchor {
+            message_id: message_id.into(),
+            message_seq,
+        };
         ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: message_id.into(),
-                message_seq,
-            }),
+            retention_owner: retention_owner.clone(),
+            origin_message: Some(retention_owner),
             wire_item_index: Some(0),
             ordinal: 0,
             provider_origin: origin.clone(),
@@ -2070,6 +2061,26 @@ mod tests {
         id: &str,
     ) -> EncryptedProviderContextRecord {
         reasoning_record_with(store, message_id, message_seq, id, 0, 0).await
+    }
+
+    async fn canonical_reasoning_record_with(
+        store: &Store,
+        message_id: &str,
+        message_seq: u64,
+        wire_item_index: u32,
+        ordinal: u32,
+    ) -> EncryptedProviderContextRecord {
+        let item = reasoning_item_with(message_id, message_seq, wire_item_index, ordinal);
+        let id = provider_context_record_id(&item);
+        reasoning_record_with(
+            store,
+            message_id,
+            message_seq,
+            &id,
+            wire_item_index,
+            ordinal,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2123,11 +2134,13 @@ mod tests {
         ordinal: u32,
     ) -> ProviderContextItem {
         let origin = reasoning_origin();
+        let retention_owner = ProviderContextAnchor {
+            message_id: message_id.into(),
+            message_seq,
+        };
         ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: message_id.into(),
-                message_seq,
-            }),
+            retention_owner: retention_owner.clone(),
+            origin_message: Some(retention_owner),
             wire_item_index: Some(wire_item_index),
             ordinal,
             provider_origin: origin.clone(),
@@ -2146,11 +2159,13 @@ mod tests {
         content: &str,
     ) -> ProviderContextItem {
         let origin = reasoning_origin();
+        let retention_owner = ProviderContextAnchor {
+            message_id: message_id.into(),
+            message_seq,
+        };
         ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: message_id.into(),
-                message_seq,
-            }),
+            retention_owner: retention_owner.clone(),
+            origin_message: Some(retention_owner),
             wire_item_index: Some(wire_item_index),
             ordinal,
             provider_origin: origin.clone(),
@@ -2312,7 +2327,7 @@ mod tests {
         assert!(wrong_anchor.is_err());
 
         // Insert a valid reasoning row.
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         record.insert(store.pool()).await.unwrap();
 
         // Duplicate (message_id, wire_item_index, item_ordinal) must fail.
@@ -2801,7 +2816,12 @@ mod tests {
         }
     }
 
-    fn native_compaction_item(anthropic: bool, coverage: u64) -> ProviderContextItem {
+    fn native_compaction_item(
+        anthropic: bool,
+        owner_message_id: &str,
+        owner_message_seq: u64,
+        coverage: u64,
+    ) -> ProviderContextItem {
         let provider_origin = ProviderOrigin {
             provider_instance_id: "provider-instance-1".to_owned(),
             protocol: if anthropic {
@@ -2816,6 +2836,10 @@ mod tests {
             context_fingerprint: "fp-1".to_owned(),
         };
         ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: owner_message_id.to_owned(),
+                message_seq: owner_message_seq,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -2838,19 +2862,19 @@ mod tests {
         }
     }
 
-    async fn insert_native_compaction(
-        store: &Store,
-        request_id: &str,
-        item: &ProviderContextItem,
-    ) -> String {
+    async fn insert_native_compaction(store: &Store, item: &ProviderContextItem) -> String {
+        let request_id = &item.retention_owner.message_id;
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: format!(
+                    "{}:{}",
+                    item.retention_owner.message_id, item.retention_owner.message_seq
+                ),
             })
             .await
             .expect("mint native provider-context key");
-        let id = format!("{request_id}:4:_:{}", item.ordinal);
+        let id = provider_context_record_id(item);
         EncryptedProviderContextRecord::encrypt(
             item,
             &item.provider_origin.provider_instance_id,
@@ -2883,6 +2907,10 @@ mod tests {
             .unwrap();
 
         let mut base = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
                 message_seq: 7,
@@ -3218,7 +3246,7 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         record.insert(store.pool()).await.unwrap();
 
         let messages = vec![ContextMessage::Persisted {
@@ -3238,20 +3266,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_rejects_authenticated_retention_owner_row_id_mismatch() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 8).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-1:7".to_owned(),
+            })
+            .await
+            .unwrap();
+        let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".to_owned(),
+                message_seq: 8,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id": "cmp-owner-mismatch",
+                    "type": "compaction",
+                    "encrypted_content": "opaque",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fp-owner-mismatch".to_owned(),
+                },
+            },
+        };
+        let mut row_identity = item.clone();
+        row_identity.retention_owner = ProviderContextAnchor {
+            message_id: "message-1".to_owned(),
+            message_seq: 7,
+        };
+        EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            provider_context_record_id(&row_identity),
+            provider_context_idempotency_key("message-2", &item),
+            dummy_footprint(),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt mismatched owner fixture")
+        .insert(store.pool())
+        .await
+        .unwrap();
+
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-1".to_owned(),
+                seq: 7,
+                message: assistant_message(openai_responses_origin()),
+            },
+            ContextMessage::Persisted {
+                id: "message-2".to_owned(),
+                seq: 8,
+                message: assistant_message(openai_responses_origin()),
+            },
+        ];
+        let error = {
+            let mut transaction = store.pool().begin().await.unwrap();
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("authenticated owner and AAD row id mismatch must fail closed");
+        assert!(
+            format!("{error:#}").contains("row id does not match authenticated retention owner"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_retention_owner_key_binding_mismatch() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let wrong_key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "different-message:9".to_owned(),
+            })
+            .await
+            .unwrap();
+        let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id": "cmp-key-mismatch",
+                    "type": "compaction",
+                    "encrypted_content": "opaque",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fp-key-mismatch".to_owned(),
+                },
+            },
+        };
+        EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            provider_context_record_id(&item),
+            provider_context_idempotency_key("message-1", &item),
+            dummy_footprint(),
+            &wrong_key,
+            store.scope(),
+        )
+        .expect("encrypt wrong-key fixture")
+        .insert(store.pool())
+        .await
+        .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(openai_responses_origin()),
+        }];
+        let error = {
+            let mut transaction = store.pool().begin().await.unwrap();
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("retention owner and key-ref mismatch must fail closed");
+        assert!(
+            format!("{error:#}").contains("key_ref does not match authenticated retention owner"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_legacy_provider_context_without_retention_owner() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        let item = reasoning_item("message-1", 7);
+        let record_id = provider_context_record_id(&item);
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-1:7".to_owned(),
+            })
+            .await
+            .unwrap();
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            &item.provider_origin.provider_instance_id,
+            item.provider_origin.protocol,
+            &item.provider_origin.model,
+            &record_id,
+            provider_context_idempotency_key("message-1", &item),
+            reasoning_footprint(&item),
+            &key,
+            store.scope(),
+        )
+        .unwrap();
+        record.insert(store.pool()).await.unwrap();
+
+        let mut legacy_value = serde_json::to_value(&item).unwrap();
+        legacy_value
+            .as_object_mut()
+            .expect("provider context serializes as an object")
+            .remove("retention_owner");
+        let legacy_plaintext = serde_json::to_vec(&legacy_value).unwrap();
+        let aad = store.scope().row_aad(
+            "provider_context",
+            &record_id,
+            DataKeyPurpose::ProviderContext,
+        );
+        let legacy_ciphertext = encrypt_content(&key, &legacy_plaintext, &aad).unwrap();
+        sqlx::query("UPDATE provider_context SET ciphertext = ? WHERE id = ?")
+            .bind(legacy_ciphertext)
+            .bind(&record_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = {
+            let mut transaction = store.pool().begin().await.unwrap();
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("legacy plaintext without a durable owner must not be inferred");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not a valid ProviderContextItem"),
+            "{message}"
+        );
+        assert!(
+            message.contains("missing field `retention_owner`"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn hydrate_rejects_provider_context_ordinal_gap_after_row_loss() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
-        reasoning_record_with(&store, "message-1", 7, "pc-0", 0, 0)
+        let first = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let first_id = first.id().to_owned();
+        first.insert(store.pool()).await.unwrap();
+        canonical_reasoning_record_with(&store, "message-1", 7, 0, 1)
             .await
             .insert(store.pool())
             .await
             .unwrap();
-        reasoning_record_with(&store, "message-1", 7, "pc-1", 0, 1)
-            .await
-            .insert(store.pool())
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM provider_context WHERE id = 'pc-0'")
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind(first_id)
             .execute(store.pool())
             .await
             .unwrap();
@@ -3279,13 +3522,14 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let record_id = record.id().to_owned();
         record.insert(store.pool()).await.unwrap();
 
         // Tamper with the stored provider-origin metadata. The authenticated plaintext
         // still carries the real origin, so hydration must detect the mismatch.
         sqlx::query("UPDATE provider_context SET provider_instance_id = 'tampered' WHERE id = ?")
-            .bind("pc-1")
+            .bind(record_id)
             .execute(store.pool())
             .await
             .expect("tamper stored provider instance id");
@@ -3319,12 +3563,16 @@ mod tests {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
+                anchor_id: "message-1:1".to_owned(),
             })
             .await
             .unwrap();
 
         let mut item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3341,16 +3589,14 @@ mod tests {
                 },
             },
         };
-        // Native row ids are canonical `{request_id}:{message_seq}:{wire_label}:{ordinal}`;
-        // the request identity may contain ':' separators, so it is parsed from the
-        // fixed trailing fields during hydration.
+        let later_id = provider_context_record_id(&item);
         let later = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "request-a:1:_:0",
-            provider_context_idempotency_key("request-a", &item),
+            later_id,
+            provider_context_idempotency_key("message-1", &item),
             dummy_footprint(),
             &key,
             store.scope(),
@@ -3360,6 +3606,10 @@ mod tests {
 
         // A different model keeps this a distinct native-compaction scope so the
         // active-native-window unique index is respected while still testing sort order.
+        item.retention_owner = ProviderContextAnchor {
+            message_id: "message-2".to_owned(),
+            message_seq: 2,
+        };
         item.ordinal = 0;
         item.provider_origin = openai_responses_origin_with_model("model-2");
         item.payload = ProviderContextPayload::OpenAiCompactedWindow {
@@ -3373,15 +3623,23 @@ mod tests {
                 context_fingerprint: "fp-b".to_owned(),
             },
         };
+        let second_key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-2:2".to_owned(),
+            })
+            .await
+            .unwrap();
+        let earlier_id = provider_context_record_id(&item);
         let earlier_reasoning = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-2",
-            "request-b:1:_:0",
-            provider_context_idempotency_key("request-b", &item),
+            earlier_id,
+            provider_context_idempotency_key("message-2", &item),
             dummy_footprint(),
-            &key,
+            &second_key,
             store.scope(),
         )
         .expect("encrypt earlier compaction");
@@ -3397,7 +3655,7 @@ mod tests {
             ContextMessage::Persisted {
                 id: "message-2".to_owned(),
                 seq: 2,
-                message: assistant_message(origin),
+                message: assistant_message(openai_responses_origin_with_model("model-2")),
             },
         ];
         let hydrated = {
@@ -3433,12 +3691,16 @@ mod tests {
         let compaction_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: "message-2:2".to_owned(),
             })
             .await
             .unwrap();
 
         let compaction_item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".to_owned(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -3455,13 +3717,14 @@ mod tests {
                 },
             },
         };
+        let compaction_id = provider_context_record_id(&compaction_item);
         let compaction = EncryptedProviderContextRecord::encrypt(
             &compaction_item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "request-1:2:_:0",
-            provider_context_idempotency_key("request-1", &compaction_item),
+            compaction_id,
+            provider_context_idempotency_key("message-2", &compaction_item),
             dummy_footprint(),
             &compaction_key,
             store.scope(),
@@ -3470,7 +3733,7 @@ mod tests {
         compaction.insert(store.pool()).await.unwrap();
 
         // Anchored reasoning at seq 2.
-        let reasoning = reasoning_record_with(&store, "message-2", 2, "pc-reasoning", 0, 0).await;
+        let reasoning = canonical_reasoning_record_with(&store, "message-2", 2, 0, 0).await;
         reasoning.insert(store.pool()).await.unwrap();
 
         let messages = vec![
@@ -3626,12 +3889,16 @@ mod tests {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: "message-1:7".to_owned(),
             })
             .await
             .unwrap();
 
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
                 message_seq: 7,
@@ -3651,13 +3918,14 @@ mod tests {
                 },
             },
         };
+        let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "pc-tamper-origin",
-            provider_context_idempotency_key("request-1", &item),
+            record_id,
+            provider_context_idempotency_key("message-1", &item),
             dummy_footprint(),
             &key,
             store.scope(),
@@ -3668,7 +3936,16 @@ mod tests {
 
         let error = {
             let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_provider_context(&[], &mut transaction).await
+            store
+                .hydrate_provider_context(
+                    &[ContextMessage::Persisted {
+                        id: "message-1".to_owned(),
+                        seq: 7,
+                        message: assistant_message(openai_responses_origin()),
+                    }],
+                    &mut transaction,
+                )
+                .await
         }
         .expect_err("hydration must reject native compaction with an origin message");
         let message = format!("{error:#}");
@@ -3681,16 +3958,21 @@ mod tests {
     #[tokio::test]
     async fn hydrate_rejects_native_compaction_with_wire_item_index() {
         let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: "message-1:7".to_owned(),
             })
             .await
             .unwrap();
 
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            },
             origin_message: None,
             wire_item_index: Some(0),
             ordinal: 1,
@@ -3707,13 +3989,14 @@ mod tests {
                 },
             },
         };
+        let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "pc-tamper-wire",
-            provider_context_idempotency_key("request-1", &item),
+            record_id,
+            provider_context_idempotency_key("message-1", &item),
             dummy_footprint(),
             &key,
             store.scope(),
@@ -3724,7 +4007,16 @@ mod tests {
 
         let error = {
             let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_provider_context(&[], &mut transaction).await
+            store
+                .hydrate_provider_context(
+                    &[ContextMessage::Persisted {
+                        id: "message-1".to_owned(),
+                        seq: 7,
+                        message: assistant_message(openai_responses_origin()),
+                    }],
+                    &mut transaction,
+                )
+                .await
         }
         .expect_err("hydration must reject native compaction with a wire_item_index");
         let message = format!("{error:#}");
@@ -3750,12 +4042,13 @@ mod tests {
         let mut item = reasoning_item("message-1", 7);
         item.wire_item_index = None;
         let origin = reasoning_origin();
+        let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             &origin.provider_instance_id,
             origin.protocol,
             &origin.model,
-            "pc-tamper-reasoning-wire",
+            record_id,
             provider_context_idempotency_key("message-1", &item),
             reasoning_footprint(&item),
             &key,
@@ -3787,11 +4080,12 @@ mod tests {
     #[tokio::test]
     async fn hydrate_rejects_encrypted_reasoning_without_origin_message() {
         let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "tamper:0".to_owned(),
+                anchor_id: "message-1:7".to_owned(),
             })
             .await
             .unwrap();
@@ -3799,12 +4093,13 @@ mod tests {
         let mut item = reasoning_item("message-1", 7);
         item.origin_message = None;
         let origin = reasoning_origin();
+        let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             &origin.provider_instance_id,
             origin.protocol,
             &origin.model,
-            "pc-tamper-reasoning-origin",
+            record_id,
             provider_context_idempotency_key("message-1", &item),
             reasoning_footprint(&item),
             &key,
@@ -3850,7 +4145,7 @@ mod tests {
         .expect_err("hydration must reject encrypted reasoning without an origin message");
         let message = format!("{error:#}");
         assert!(
-            message.contains("encrypted reasoning must have an origin message"),
+            message.contains("encrypted reasoning origin message must match its retention owner"),
             "{message}"
         );
     }
@@ -3860,12 +4155,13 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let record_id = record.id().to_owned();
         record.insert(store.pool()).await.unwrap();
 
         sqlx::query("UPDATE provider_context SET eviction_tokens = ? WHERE id = ?")
             .bind(999i64)
-            .bind("pc-1")
+            .bind(record_id)
             .execute(store.pool())
             .await
             .unwrap();
@@ -3900,6 +4196,10 @@ mod tests {
             model: "anthropic".to_owned(),
         };
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-legacy".to_owned(),
+                message_seq: 7,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "message-legacy".to_owned(),
                 message_seq: 7,
@@ -3930,7 +4230,7 @@ mod tests {
             &origin.provider_instance_id,
             origin.protocol,
             &origin.model,
-            "pc-legacy-v1",
+            provider_context_record_id(&item),
             provider_context_idempotency_key("message-legacy", &item),
             footprint,
             &key,
@@ -3961,12 +4261,13 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let record_id = record.id().to_owned();
         record.insert(store.pool()).await.unwrap();
 
         sqlx::query("UPDATE provider_context SET eviction_estimator_version = ? WHERE id = ?")
             .bind(99i64)
-            .bind("pc-1")
+            .bind(record_id)
             .execute(store.pool())
             .await
             .unwrap();
@@ -3995,7 +4296,7 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         record.insert(store.pool()).await.unwrap();
 
         // The reasoning record was bound to reasoning_origin(); supply an assistant
@@ -4017,7 +4318,7 @@ mod tests {
         .expect_err("hydration must reject reasoning with mismatched assistant origin");
         let message = format!("{error:#}");
         assert!(
-            message.contains("provider_origin does not match the anchored assistant origin"),
+            message.contains("provider_origin does not match its retention-owner assistant origin"),
             "{message}"
         );
     }
@@ -4027,7 +4328,8 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let record = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let record_id = record.id().to_owned();
         record.insert(store.pool()).await.unwrap();
 
         // The persisted message at seq 7 has a different id than the anchor claims.
@@ -4048,7 +4350,7 @@ mod tests {
         .expect_err("hydration must reject an anchor that resolves to a different message id");
         let message = format!("{error:#}");
         assert!(
-            message.contains("pc-1"),
+            message.contains(&record_id),
             "error should name the provider-context record id: {message}"
         );
         assert!(
@@ -4094,12 +4396,16 @@ mod tests {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: "message-1:1".to_owned(),
             })
             .await
             .unwrap();
 
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
@@ -4314,14 +4620,16 @@ mod tests {
             for seq in [1, 2, 3, 5] {
                 seed_non_message_event(&store, seq).await.unwrap();
             }
-            seed_message(&store, "message-4", 4).await.unwrap();
+            seed_message(&store, "request:with:colons", 4)
+                .await
+                .unwrap();
             seed_message(&store, "message-6", 6).await.unwrap();
 
-            let item = native_compaction_item(anthropic, 4);
-            insert_native_compaction(&store, "request:with:colons", &item).await;
+            let item = native_compaction_item(anthropic, "request:with:colons", 4, 4);
+            insert_native_compaction(&store, &item).await;
             let messages = vec![
                 ContextMessage::Persisted {
-                    id: "message-4".to_owned(),
+                    id: "request:with:colons".to_owned(),
                     seq: 4,
                     message: assistant_message(item.provider_origin.clone()),
                 },
@@ -4347,10 +4655,12 @@ mod tests {
     async fn hydrate_native_compaction_rejects_tampered_idempotency_for_both_protocols() {
         for anthropic in [false, true] {
             let store = store().await;
-            seed_message(&store, "message-4", 4).await.unwrap();
+            seed_message(&store, "request:with:colons", 4)
+                .await
+                .unwrap();
             seed_message(&store, "message-6", 6).await.unwrap();
-            let item = native_compaction_item(anthropic, 4);
-            let id = insert_native_compaction(&store, "request:with:colons", &item).await;
+            let item = native_compaction_item(anthropic, "request:with:colons", 4, 4);
+            let id = insert_native_compaction(&store, &item).await;
             sqlx::query("UPDATE provider_context SET idempotency_key = 'tampered' WHERE id = ?")
                 .bind(&id)
                 .execute(store.pool())
@@ -4359,7 +4669,7 @@ mod tests {
 
             let messages = vec![
                 ContextMessage::Persisted {
-                    id: "message-4".to_owned(),
+                    id: "request:with:colons".to_owned(),
                     seq: 4,
                     message: assistant_message(item.provider_origin.clone()),
                 },
@@ -4387,10 +4697,10 @@ mod tests {
     #[tokio::test]
     async fn hydrate_native_compaction_rejects_reordered_messages() {
         let store = store().await;
-        seed_message(&store, "message-4", 4).await.unwrap();
+        seed_message(&store, "request-1", 4).await.unwrap();
         seed_message(&store, "message-6", 6).await.unwrap();
-        let item = native_compaction_item(false, 4);
-        insert_native_compaction(&store, "request-1", &item).await;
+        let item = native_compaction_item(false, "request-1", 4, 4);
+        insert_native_compaction(&store, &item).await;
         let messages = vec![
             ContextMessage::Persisted {
                 id: "message-6".to_owned(),
@@ -4398,7 +4708,7 @@ mod tests {
                 message: assistant_message(item.provider_origin.clone()),
             },
             ContextMessage::Persisted {
-                id: "message-4".to_owned(),
+                id: "request-1".to_owned(),
                 seq: 4,
                 message: assistant_message(item.provider_origin.clone()),
             },
@@ -4422,13 +4732,17 @@ mod tests {
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "native:0".to_owned(),
+                anchor_id: "message-3:3".to_owned(),
             })
             .await
             .unwrap();
 
         // Persisted messages at seq 1 and 3 (gaps are legal), but coverage claims seq 5.
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-3".to_owned(),
+                message_seq: 3,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
@@ -4445,13 +4759,14 @@ mod tests {
                 },
             },
         };
+        let record_id = provider_context_record_id(&item);
         let compaction = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "request-1:1:_:1",
-            provider_context_idempotency_key("request-1", &item),
+            record_id,
+            provider_context_idempotency_key("message-3", &item),
             dummy_footprint(),
             &key,
             store.scope(),

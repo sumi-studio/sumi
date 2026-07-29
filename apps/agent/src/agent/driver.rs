@@ -2243,6 +2243,10 @@ mod tests {
         let active_context = vec![user, error, cross_model];
         let active_context_clone = active_context.clone();
         let error_provider_context = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "e1".to_owned(),
+                message_seq: 2,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "e1".to_owned(),
                 message_seq: 2,
@@ -2256,6 +2260,10 @@ mod tests {
             },
         };
         let surviving_provider_context = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "a1".to_owned(),
+                message_seq: 3,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "a1".to_owned(),
                 message_seq: 3,

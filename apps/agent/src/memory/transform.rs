@@ -215,10 +215,11 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
 /// Restrict durable provider context to the final provider send view.
 ///
 /// Hydration authenticates and retains provider-context rows independently of
-/// L0 replay. Anchored context is sendable only while its exact persisted
+/// L0 replay. Context is sendable only while its exact durable retention owner
 /// `(message_id, message_seq)` survives transcript normalization. Native
-/// compaction context is intentionally unanchored and remains subject to the
-/// adapter's separate coverage/fingerprint validation.
+/// compaction remains semantically unanchored, but its authenticated owner
+/// still prevents context retained by an Error MessageEnd from leaking into a
+/// later provider request.
 pub fn provider_context_for_send_view(
     messages: &[ContextMessage],
     provider_context: &[ProviderContextItem],
@@ -234,9 +235,10 @@ pub fn provider_context_for_send_view(
     provider_context
         .iter()
         .filter(|item| {
-            item.origin_message.as_ref().is_none_or(|anchor| {
-                anchors.contains(&(anchor.message_id.as_str(), anchor.message_seq))
-            })
+            anchors.contains(&(
+                item.retention_owner.message_id.as_str(),
+                item.retention_owner.message_seq,
+            ))
         })
         .cloned()
         .collect()
@@ -579,6 +581,10 @@ mod tests {
             assistant(Vec::new(), StopReason::Stop, false),
         )];
         let anchored = |message_id: &str, message_seq: u64| ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: message_id.to_owned(),
                 message_seq,
@@ -592,6 +598,10 @@ mod tests {
             },
         };
         let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "kept".to_owned(),
+                message_seq: 7,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
@@ -604,6 +614,13 @@ mod tests {
                 },
             },
         };
+        let removed_native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "error-owner".to_owned(),
+                message_seq: 6,
+            },
+            ..native.clone()
+        };
 
         let result = provider_context_for_send_view(
             &send_messages,
@@ -612,6 +629,7 @@ mod tests {
                 anchored("kept", 8),
                 anchored("removed", 7),
                 native.clone(),
+                removed_native,
             ],
         );
 

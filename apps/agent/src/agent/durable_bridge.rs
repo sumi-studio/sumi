@@ -2631,11 +2631,11 @@ mod tests {
         provider::{
             ModelSpec,
             types::{
-                ApiProtocol, ContextMessage, Message, ProviderContextAnchor,
-                ProviderContextFragment, ProviderContextItem, ProviderContextPayload,
-                ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-                StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
-                ValidatedToolArguments,
+                ApiProtocol, ContextMessage, Message, NativeCompactionCoverage,
+                ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+                ProviderContextPayload, ProviderOrigin, PublicAssistantContent,
+                PublicAssistantMessage, PublicMessage, StopReason, ToolCall, ToolResultMessage,
+                UserContent, UserMessage, ValidatedToolArguments,
             },
         },
         store::{
@@ -2929,10 +2929,26 @@ mod tests {
         item_key_ref: String,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ErrorContextShape {
+        NativeOnly,
+        Mixed,
+    }
+
+    impl ErrorContextShape {
+        fn item_count(self) -> i64 {
+            match self {
+                Self::NativeOnly => 1,
+                Self::Mixed => 2,
+            }
+        }
+    }
+
     async fn error_context_fixture(
         owner_id: &str,
         run_id: &str,
         turn_id: &str,
+        shape: ErrorContextShape,
     ) -> ErrorContextFixture {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -2968,25 +2984,47 @@ mod tests {
             interrupted: false,
             timestamp: test_timestamp(),
         });
-        let fragment = ProviderContextFragment {
-            wire_item_index: Some(1),
-            payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiResponses,
-                item: serde_json::json!({
-                    "id": format!("rs-{owner_id}"),
-                    "type": "reasoning",
-                    "summary": [],
-                    "encrypted_content": "opaque-error-reasoning",
-                }),
+        let coverage_seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("load native Error coverage endpoint"),
+        )
+        .expect("coverage endpoint is positive");
+        let mut fragments = vec![ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": format!("cmp-{owner_id}"),
+                    "type": "compaction",
+                    "encrypted_content": "opaque-error-native",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: coverage_seq,
+                    context_fingerprint: format!("error-native-{owner_id}"),
+                },
             },
-        };
+        }];
+        if matches!(shape, ErrorContextShape::Mixed) {
+            fragments.push(ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: serde_json::json!({
+                        "id": format!("rs-{owner_id}"),
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-error-reasoning",
+                    }),
+                },
+            });
+        }
 
         let mut bridge = DurableBridge::new(binding.clone());
         bridge.phase = RunPhase::AssistantStarted;
         bridge.turn_open = true;
         bridge.assistant_open = Some(message_id.clone());
-        let (barrier, receipt) =
-            MessageCommitBarrier::channel_with_provider_context(vec![fragment]);
+        let (barrier, receipt) = MessageCommitBarrier::channel_with_provider_context(fragments);
         let committed = bridge
             .commit(
                 &writer,
@@ -3016,12 +3054,16 @@ mod tests {
                 message_seq: committed_receipt.message_seq,
             })
         );
-        let item_key_ref: String =
-            sqlx::query_scalar("SELECT key_ref FROM provider_context WHERE message_id = ?")
-                .bind(&message_id)
+        let (item_key_ref, item_count): (String, i64) =
+            sqlx::query_as("SELECT MIN(key_ref), COUNT(*) FROM provider_context")
                 .fetch_one(store.pool())
                 .await
-                .expect("load Error provider-context item key");
+                .expect("load mixed Error provider-context retention unit");
+        assert_eq!(
+            item_count,
+            shape.item_count(),
+            "fixture must retain its exact Error context shape"
+        );
         ErrorContextFixture {
             store,
             writer,
@@ -3035,13 +3077,10 @@ mod tests {
 
     async fn assert_error_context_applied(fixture: &ErrorContextFixture) {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM provider_context WHERE message_id = ?",
-            )
-            .bind(&fixture.message_id)
-            .fetch_one(fixture.store.pool())
-            .await
-            .expect("count Error provider-context rows"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+                .fetch_one(fixture.store.pool())
+                .await
+                .expect("count Error provider-context rows"),
             0
         );
         let (state, wrapped_key): (String, Option<Vec<u8>>) =
@@ -3617,69 +3656,111 @@ mod tests {
 
     #[tokio::test]
     async fn retry_and_overflow_dispositions_apply_error_context_before_next_attempt() {
-        for (ordinal, delay_ms) in [(80_u16, 2_000_u64), (81_u16, 0_u64)] {
-            let owner_id = format!("00000000-0000-4000-8000-{ordinal:012}");
-            let run_id = format!("run-error-retry-{ordinal}");
-            let turn_id = format!("turn-error-retry-{ordinal}");
-            let mut fixture = error_context_fixture(&owner_id, &run_id, &turn_id).await;
-            let (barrier, _committed) = RetryWaitCommitBarrier::channel();
+        for (shape_index, shape) in [ErrorContextShape::NativeOnly, ErrorContextShape::Mixed]
+            .into_iter()
+            .enumerate()
+        {
+            for (delay_index, delay_ms) in [2_000_u64, 0_u64].into_iter().enumerate() {
+                let ordinal = 80 + shape_index * 2 + delay_index;
+                let owner_id = format!("00000000-0000-4000-8000-{ordinal:012}");
+                let run_id = format!("run-error-retry-{ordinal}");
+                let turn_id = format!("turn-error-retry-{ordinal}");
+                let mut fixture = error_context_fixture(&owner_id, &run_id, &turn_id, shape).await;
+                let (barrier, _committed) = RetryWaitCommitBarrier::channel();
+                let committed = fixture
+                    .bridge
+                    .commit(
+                        &fixture.writer,
+                        RunOutput {
+                            binding: fixture.binding.clone(),
+                            event: AgentEvent::RetryScheduled {
+                                attempt: 1,
+                                delay_ms,
+                                retry_at: test_timestamp(),
+                                error_message: if delay_ms == 0 {
+                                    "context overflow".to_owned()
+                                } else {
+                                    "provider retry".to_owned()
+                                },
+                            },
+                            commit_barrier: None,
+                            message_commit_barrier: None,
+                            retry_wait_commit_barrier: Some(barrier),
+                            approval_command: None,
+                            approval_not_started: None,
+                            approval_cancelled: None,
+                        },
+                    )
+                    .await
+                    .expect("RetryScheduled disposition commits and applies Error Invalidate");
+                let (outputs, _, retry_barrier, _) = committed.resolve_message_receipts();
+                assert!(matches!(
+                    outputs.as_slice(),
+                    [CommittedOutput {
+                        event: AgentEvent::RetryScheduled { delay_ms: actual, .. },
+                        ..
+                    }] if *actual == delay_ms
+                ));
+                retry_barrier
+                    .expect("RetryScheduled returns its commit barrier")
+                    .committed();
+                assert_error_context_applied(&fixture).await;
+
+                let mut next_attempt_message = fixture.message.clone();
+                let PublicMessage::Assistant(next_attempt) = &mut next_attempt_message else {
+                    unreachable!("fixture assistant")
+                };
+                next_attempt.content.clear();
+                next_attempt.stop_reason = StopReason::Stop;
+                next_attempt.error_message = None;
+                next_attempt.provider_code = None;
+                let next_message_id = format!("{}-next", fixture.message_id);
+                fixture
+                    .bridge
+                    .commit(
+                        &fixture.writer,
+                        RunOutput {
+                            binding: fixture.binding.clone(),
+                            event: AgentEvent::MessageStart {
+                                message_id: next_message_id,
+                                message: Box::new(next_attempt_message),
+                            },
+                            commit_barrier: None,
+                            message_commit_barrier: None,
+                            retry_wait_commit_barrier: None,
+                            approval_command: None,
+                            approval_not_started: None,
+                            approval_cancelled: None,
+                        },
+                    )
+                    .await
+                    .expect("next attempt starts only after Error context is applied");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_error_disposition_applies_context_before_agent_end() {
+        for (ordinal, shape) in [
+            (86, ErrorContextShape::NativeOnly),
+            (87, ErrorContextShape::Mixed),
+        ] {
+            let mut fixture = error_context_fixture(
+                &format!("00000000-0000-4000-8000-{ordinal:012}"),
+                &format!("run-terminal-error-context-{ordinal}"),
+                &format!("turn-terminal-error-context-{ordinal}"),
+                shape,
+            )
+            .await;
             let committed = fixture
                 .bridge
                 .commit(
                     &fixture.writer,
                     RunOutput {
                         binding: fixture.binding.clone(),
-                        event: AgentEvent::RetryScheduled {
-                            attempt: 1,
-                            delay_ms,
-                            retry_at: test_timestamp(),
-                            error_message: if delay_ms == 0 {
-                                "context overflow".to_owned()
-                            } else {
-                                "provider retry".to_owned()
-                            },
-                        },
-                        commit_barrier: None,
-                        message_commit_barrier: None,
-                        retry_wait_commit_barrier: Some(barrier),
-                        approval_command: None,
-                        approval_not_started: None,
-                        approval_cancelled: None,
-                    },
-                )
-                .await
-                .expect("RetryScheduled disposition commits and applies Error Invalidate");
-            let (outputs, _, retry_barrier, _) = committed.resolve_message_receipts();
-            assert!(matches!(
-                outputs.as_slice(),
-                [CommittedOutput {
-                    event: AgentEvent::RetryScheduled { delay_ms: actual, .. },
-                    ..
-                }] if *actual == delay_ms
-            ));
-            retry_barrier
-                .expect("RetryScheduled returns its commit barrier")
-                .committed();
-            assert_error_context_applied(&fixture).await;
-
-            let mut next_attempt_message = fixture.message.clone();
-            let PublicMessage::Assistant(next_attempt) = &mut next_attempt_message else {
-                unreachable!("fixture assistant")
-            };
-            next_attempt.content.clear();
-            next_attempt.stop_reason = StopReason::Stop;
-            next_attempt.error_message = None;
-            next_attempt.provider_code = None;
-            let next_message_id = format!("{}-next", fixture.message_id);
-            fixture
-                .bridge
-                .commit(
-                    &fixture.writer,
-                    RunOutput {
-                        binding: fixture.binding.clone(),
-                        event: AgentEvent::MessageStart {
-                            message_id: next_message_id,
-                            message: Box::new(next_attempt_message),
+                        event: AgentEvent::TurnEnd {
+                            message: Some(Box::new(fixture.message.clone())),
+                            tool_results: Vec::new(),
                         },
                         commit_barrier: None,
                         message_commit_barrier: None,
@@ -3690,145 +3771,121 @@ mod tests {
                     },
                 )
                 .await
-                .expect("next attempt starts only after Error context is applied");
+                .expect("terminal Error TurnEnd prepares and applies Invalidate");
+            assert!(matches!(
+                committed.outputs.as_slice(),
+                [CommittedOutput {
+                    event: AgentEvent::TurnEnd { .. },
+                    ..
+                }]
+            ));
+            assert_error_context_applied(&fixture).await;
+
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::AgentEnd,
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("AgentEnd follows only after terminal Error context is applied");
         }
     }
 
     #[tokio::test]
-    async fn terminal_error_disposition_applies_context_before_agent_end() {
-        let mut fixture = error_context_fixture(
-            "00000000-0000-4000-8000-000000000082",
-            "run-terminal-error-context",
-            "turn-terminal-error-context",
-        )
-        .await;
-        let committed = fixture
-            .bridge
-            .commit(
-                &fixture.writer,
-                RunOutput {
-                    binding: fixture.binding.clone(),
-                    event: AgentEvent::TurnEnd {
-                        message: Some(Box::new(fixture.message.clone())),
-                        tool_results: Vec::new(),
-                    },
-                    commit_barrier: None,
-                    message_commit_barrier: None,
-                    retry_wait_commit_barrier: None,
-                    approval_command: None,
-                    approval_not_started: None,
-                    approval_cancelled: None,
-                },
-            )
-            .await
-            .expect("terminal Error TurnEnd prepares and applies Invalidate");
-        assert!(matches!(
-            committed.outputs.as_slice(),
-            [CommittedOutput {
-                event: AgentEvent::TurnEnd { .. },
-                ..
-            }]
-        ));
-        assert_error_context_applied(&fixture).await;
-
-        fixture
-            .bridge
-            .commit(
-                &fixture.writer,
-                RunOutput {
-                    binding: fixture.binding.clone(),
-                    event: AgentEvent::AgentEnd,
-                    commit_barrier: None,
-                    message_commit_barrier: None,
-                    retry_wait_commit_barrier: None,
-                    approval_command: None,
-                    approval_not_started: None,
-                    approval_cancelled: None,
-                },
-            )
-            .await
-            .expect("AgentEnd follows only after terminal Error context is applied");
-    }
-
-    #[tokio::test]
     async fn active_abort_cutoff_supersedes_pending_command_and_disposes_error_context() {
-        let mut fixture = error_context_fixture(
-            "00000000-0000-4000-8000-000000000083",
-            "run-abort-error-context",
-            "turn-abort-error-context",
-        )
-        .await;
-        let superseded_id = "00000000-0000-4000-8000-000000000084";
-        persist_and_pin(
-            &fixture.store,
-            &fixture.writer,
-            2,
-            superseded_id,
-            "superseded while Error closes",
-        )
-        .await;
-        let abort_id = "00000000-0000-4000-8000-000000000085";
-        fixture
-            .writer
-            .persist_inbound(&test_abort_command(3, abort_id))
-            .await
-            .expect("persist shared Abort cutoff");
-
-        fixture
-            .bridge
-            .bind_abort(&fixture.writer, test_admitted_abort(3, abort_id))
-            .await
-            .expect("Abort cutoff atomically supersedes and prepares Error disposition");
-        assert_error_context_applied(&fixture).await;
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT status FROM inbound_commands WHERE command_id = ?",
+        for (ordinal, shape) in [
+            (88, ErrorContextShape::NativeOnly),
+            (89, ErrorContextShape::Mixed),
+        ] {
+            let mut fixture = error_context_fixture(
+                &format!("00000000-0000-4000-8000-{ordinal:012}"),
+                &format!("run-abort-error-context-{ordinal}"),
+                &format!("turn-abort-error-context-{ordinal}"),
+                shape,
             )
-            .bind(superseded_id)
-            .fetch_one(fixture.store.pool())
-            .await
-            .expect("read superseded command"),
-            "superseded"
-        );
-        assert_eq!(fixture.bridge.phase, RunPhase::CancelRequested);
-
-        fixture
-            .bridge
-            .commit(
+            .await;
+            let superseded_id = "00000000-0000-4000-8000-000000000084";
+            persist_and_pin(
+                &fixture.store,
                 &fixture.writer,
-                RunOutput {
-                    binding: fixture.binding.clone(),
-                    event: AgentEvent::TurnEnd {
-                        message: Some(Box::new(fixture.message.clone())),
-                        tool_results: Vec::new(),
+                2,
+                superseded_id,
+                "superseded while Error closes",
+            )
+            .await;
+            let abort_id = "00000000-0000-4000-8000-000000000085";
+            fixture
+                .writer
+                .persist_inbound(&test_abort_command(3, abort_id))
+                .await
+                .expect("persist shared Abort cutoff");
+
+            fixture
+                .bridge
+                .bind_abort(&fixture.writer, test_admitted_abort(3, abort_id))
+                .await
+                .expect("Abort cutoff atomically supersedes and prepares Error disposition");
+            assert_error_context_applied(&fixture).await;
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM inbound_commands WHERE command_id = ?",
+                )
+                .bind(superseded_id)
+                .fetch_one(fixture.store.pool())
+                .await
+                .expect("read superseded command"),
+                "superseded"
+            );
+            assert_eq!(fixture.bridge.phase, RunPhase::CancelRequested);
+
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::TurnEnd {
+                            message: Some(Box::new(fixture.message.clone())),
+                            tool_results: Vec::new(),
+                        },
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
                     },
-                    commit_barrier: None,
-                    message_commit_barrier: None,
-                    retry_wait_commit_barrier: None,
-                    approval_command: None,
-                    approval_not_started: None,
-                    approval_cancelled: None,
-                },
-            )
-            .await
-            .expect("aborted Error attempt closes after shared disposition");
-        fixture
-            .bridge
-            .commit(
-                &fixture.writer,
-                RunOutput {
-                    binding: fixture.binding.clone(),
-                    event: AgentEvent::AgentEnd,
-                    commit_barrier: None,
-                    message_commit_barrier: None,
-                    retry_wait_commit_barrier: None,
-                    approval_command: None,
-                    approval_not_started: None,
-                    approval_cancelled: None,
-                },
-            )
-            .await
-            .expect("aborted run closes after Error context reaches applied");
+                )
+                .await
+                .expect("aborted Error attempt closes after shared disposition");
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event: AgentEvent::AgentEnd,
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("aborted run closes after Error context reaches applied");
+        }
     }
 
     #[tokio::test]
@@ -3965,6 +4022,10 @@ mod tests {
         let normalized =
             normalize_partial_assistant(partial).expect("normalize hard-steer partial assistant");
         let expected_context = vec![ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: owner_assistant_id.clone(),
+                message_seq: receipt.message_seq,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: owner_assistant_id.clone(),
                 message_seq: receipt.message_seq,

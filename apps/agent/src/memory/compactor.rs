@@ -157,6 +157,10 @@ impl CompactError {
 /// };
 ///
 /// let item = ProviderContextItem {
+///     retention_owner: ProviderContextAnchor {
+///         message_id: "m1".into(),
+///         message_seq: 1,
+///     },
 ///     origin_message: Some(ProviderContextAnchor {
 ///         message_id: "m1".into(),
 ///         message_seq: 1,
@@ -2379,7 +2383,7 @@ mod tests {
         MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
         MemoryLayer, ProviderContextKeyAnchor, ProviderContextMutationApplier,
         ProviderContextMutationBuilder, Store, TranscriptRecord, encrypt_content,
-        provider_context_idempotency_key,
+        provider_context_idempotency_key, provider_context_record_id,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -2516,6 +2520,10 @@ mod tests {
     fn provider_context_variants() -> Vec<ProviderContextItem> {
         vec![
             ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "m1".to_owned(),
+                    message_seq: 1,
+                },
                 origin_message: Some(ProviderContextAnchor {
                     message_id: "m1".to_owned(),
                     message_seq: 1,
@@ -2529,6 +2537,10 @@ mod tests {
                 },
             },
             ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "m1".to_owned(),
+                    message_seq: 1,
+                },
                 origin_message: Some(ProviderContextAnchor {
                     message_id: "m1".to_owned(),
                     message_seq: 1,
@@ -2545,6 +2557,10 @@ mod tests {
                 },
             },
             ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "m1".to_owned(),
+                    message_seq: 1,
+                },
                 origin_message: Some(ProviderContextAnchor {
                     message_id: "m1".to_owned(),
                     message_seq: 1,
@@ -4460,12 +4476,16 @@ mod tests {
             .await
             .expect("provider context key");
         let item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: message_id.clone(),
+                message_seq,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: message_id.clone(),
                 message_seq,
             }),
             wire_item_index: Some(0),
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
@@ -4477,12 +4497,13 @@ mod tests {
                 }),
             },
         };
+        let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             "test-instance",
             ApiProtocol::OpenAiResponses,
             "openai-responses",
-            "pc-1",
+            &record_id,
             provider_context_idempotency_key(&message_id, &item),
             legacy_serialized_bytes_eviction_footprint(&item.payload).expect("legacy footprint"),
             &key,
@@ -4509,12 +4530,11 @@ mod tests {
         worker.process_all_pending().await.expect("complete job");
         assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
 
-        let erased: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
-                .bind(&message_id)
-                .fetch_one(store.pool())
-                .await
-                .expect("count provider context");
+        let erased: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind(&record_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count provider context");
         assert_eq!(
             erased, 0,
             "provider context must be erased when L0 source batch is dropped"
@@ -4845,9 +4865,13 @@ mod tests {
             .expect("provider context key");
 
         let covered_item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: message_id.clone(),
+                message_seq,
+            },
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"type": "message", "role": "assistant", "content": []})],
@@ -4857,12 +4881,13 @@ mod tests {
                 },
             },
         };
+        let covered_record_id = provider_context_record_id(&covered_item);
         let covered = EncryptedProviderContextRecord::encrypt(
             &covered_item,
             "test-instance",
             ApiProtocol::OpenAiResponses,
             "openai-responses",
-            "pc-openai-covered",
+            &covered_record_id,
             provider_context_idempotency_key(&message_id, &covered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
             &key,
@@ -4900,7 +4925,7 @@ mod tests {
             "pc-openai-prepared-retry",
         )
         .build_replace(
-            Some("pc-openai-covered".to_owned()),
+            Some(covered_record_id.clone()),
             Vec::new(),
             &covered,
             &covered_item,
@@ -4910,36 +4935,64 @@ mod tests {
         .expect("build prepared retry");
         applier.prepare(&retry).await.expect("prepare retry");
 
-        // Unrelated: coverage endpoint does not belong to this batch and lives in a
-        // different provider scope, so it is not the same active native window as the
-        // covered record.
+        // Unrelated: this native window is owned by an assistant outside the
+        // source batch. Native payloads keep no semantic origin_message, so
+        // retention must follow the authenticated owner instead.
         let unrelated_origin = ProviderOrigin {
             provider_instance_id: "test-instance-unrelated".to_owned(),
             protocol: ApiProtocol::OpenAiResponses,
             model: "openai-responses-unrelated".to_owned(),
         };
+        let unrelated_assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model-unrelated".to_owned(),
+            provider: "test-provider-unrelated".to_owned(),
+            origin: unrelated_origin.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let (unrelated_source_id, _unrelated_target_id) =
+            insert_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
+        let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
+        let unrelated_message_seq = 200u64;
+        let unrelated_key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
+            })
+            .await
+            .expect("unrelated provider context key");
         let uncovered_item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: unrelated_message_id.clone(),
+                message_seq: unrelated_message_seq,
+            },
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: unrelated_origin.clone(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"type": "message", "role": "assistant", "content": []})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 999,
+                    through_message_seq: unrelated_message_seq,
                     context_fingerprint: "fp-openai-uncovered".to_owned(),
                 },
             },
         };
+        let uncovered_record_id = provider_context_record_id(&uncovered_item);
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,
             "test-instance-unrelated",
             ApiProtocol::OpenAiResponses,
             "openai-responses-unrelated",
-            "pc-openai-uncovered",
-            provider_context_idempotency_key(&message_id, &uncovered_item),
+            &uncovered_record_id,
+            provider_context_idempotency_key(&unrelated_message_id, &uncovered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
-            &key,
+            &unrelated_key,
             store.scope(),
         )
         .expect("encrypt uncovered");
@@ -4964,7 +5017,7 @@ mod tests {
 
         let covered_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind("pc-openai-covered")
+                .bind(&covered_record_id)
                 .fetch_one(store.pool())
                 .await
                 .expect("count covered");
@@ -4975,7 +5028,7 @@ mod tests {
 
         let uncovered_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind("pc-openai-uncovered")
+                .bind(&uncovered_record_id)
                 .fetch_one(store.pool())
                 .await
                 .expect("count uncovered");
@@ -4983,15 +5036,25 @@ mod tests {
             uncovered_count, 1,
             "unrelated OpenAI compacted window must remain"
         );
-        let shared_key_state: String =
+        let covered_key_state: String =
             sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
                 .bind(&key.key_ref)
                 .fetch_one(store.pool())
                 .await
-                .expect("read still-referenced provider-context key");
+                .expect("read erased provider-context key");
         assert_eq!(
-            shared_key_state, "active",
-            "a key still referenced by unrelated provider context must remain active"
+            covered_key_state, "destroyed",
+            "the dropped owner's provider-context key must be destroyed"
+        );
+        let unrelated_key_state: String =
+            sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
+                .bind(&unrelated_key.key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("read retained provider-context key");
+        assert_eq!(
+            unrelated_key_state, "active",
+            "the unrelated owner's provider-context key must remain active"
         );
 
         for mutation_id in ["pc-openai-applied", "pc-openai-prepared-retry"] {
@@ -5019,7 +5082,7 @@ mod tests {
             .expect("recovery after erasure must converge");
         let covered_after_recovery: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind("pc-openai-covered")
+                .bind(&covered_record_id)
                 .fetch_one(store.pool())
                 .await
                 .expect("count covered after recovery");
@@ -5062,9 +5125,13 @@ mod tests {
             .expect("provider context key");
 
         let covered_item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: message_id.clone(),
+                message_seq,
+            },
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type": "compaction", "content": "anthropic summary"}),
@@ -5074,12 +5141,13 @@ mod tests {
                 },
             },
         };
+        let covered_record_id = provider_context_record_id(&covered_item);
         let covered = EncryptedProviderContextRecord::encrypt(
             &covered_item,
             "test-instance",
             ApiProtocol::AnthropicMessages,
             "anthropic",
-            "pc-anthropic-covered",
+            &covered_record_id,
             provider_context_idempotency_key(&message_id, &covered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
             &key,
@@ -5088,36 +5156,64 @@ mod tests {
         .expect("encrypt covered");
         covered.insert(store.pool()).await.expect("insert covered");
 
-        // Unrelated: coverage endpoint does not belong to this batch and lives in a
-        // different provider scope, so it is not the same active native window as the
-        // covered record.
+        // Unrelated: this native window is owned by an assistant outside the
+        // source batch. Native payloads keep no semantic origin_message, so
+        // retention must follow the authenticated owner instead.
         let unrelated_origin = ProviderOrigin {
             provider_instance_id: "test-instance-unrelated".to_owned(),
             protocol: ApiProtocol::AnthropicMessages,
             model: "anthropic-unrelated".to_owned(),
         };
+        let unrelated_assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model-unrelated".to_owned(),
+            provider: "test-provider-unrelated".to_owned(),
+            origin: unrelated_origin.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let (unrelated_source_id, _unrelated_target_id) =
+            insert_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
+        let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
+        let unrelated_message_seq = 200u64;
+        let unrelated_key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
+            })
+            .await
+            .expect("unrelated provider context key");
         let uncovered_item = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: unrelated_message_id.clone(),
+                message_seq: unrelated_message_seq,
+            },
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: unrelated_origin.clone(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type": "compaction", "content": "anthropic summary"}),
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 999,
+                    through_message_seq: unrelated_message_seq,
                     context_fingerprint: "fp-anthropic-uncovered".to_owned(),
                 },
             },
         };
+        let uncovered_record_id = provider_context_record_id(&uncovered_item);
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,
             "test-instance-unrelated",
             ApiProtocol::AnthropicMessages,
             "anthropic-unrelated",
-            "pc-anthropic-uncovered",
-            provider_context_idempotency_key(&message_id, &uncovered_item),
+            &uncovered_record_id,
+            provider_context_idempotency_key(&unrelated_message_id, &uncovered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
-            &key,
+            &unrelated_key,
             store.scope(),
         )
         .expect("encrypt uncovered");
@@ -5142,7 +5238,7 @@ mod tests {
 
         let covered_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind("pc-anthropic-covered")
+                .bind(&covered_record_id)
                 .fetch_one(store.pool())
                 .await
                 .expect("count covered");
@@ -5153,7 +5249,7 @@ mod tests {
 
         let uncovered_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
-                .bind("pc-anthropic-uncovered")
+                .bind(&uncovered_record_id)
                 .fetch_one(store.pool())
                 .await
                 .expect("count uncovered");
@@ -5161,6 +5257,20 @@ mod tests {
             uncovered_count, 1,
             "unrelated Anthropic compaction must remain"
         );
+        let covered_key_state: String =
+            sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
+                .bind(&key.key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("read erased provider-context key");
+        assert_eq!(covered_key_state, "destroyed");
+        let unrelated_key_state: String =
+            sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
+                .bind(&unrelated_key.key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("read retained provider-context key");
+        assert_eq!(unrelated_key_state, "active");
     }
 
     #[tokio::test]

@@ -58,7 +58,7 @@ use super::{
     provider_context::{
         EncryptedProviderContextRecord, PreparedProviderContextMutation, ProviderContextMutation,
         ProviderContextMutationApplier, ProviderContextMutationBuilder,
-        provider_context_idempotency_key,
+        provider_context_idempotency_key, provider_context_record_id,
     },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -1573,32 +1573,17 @@ impl EventWriter {
                 "Error-context disposition target {message_id}/{message_seq} is not an authenticated Error assistant MessageEnd"
             );
         }
-        let authenticated_item_count = provider_context
+        let mut invalidate_ids = provider_context
             .iter()
             .filter(|item| {
-                item.origin_message.as_ref().is_some_and(|anchor| {
-                    anchor.message_id == message_id && anchor.message_seq == message_seq
-                })
+                item.retention_owner.message_id == message_id
+                    && item.retention_owner.message_seq == message_seq
             })
-            .count();
-
-        let invalidate_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM provider_context
-             WHERE message_id = ? AND message_seq = ?
-             ORDER BY id",
-        )
-        .bind(message_id)
-        .bind(message_seq_i64)
-        .fetch_all(&mut *authentication)
-        .await
-        .context("failed to fix Error provider-context disposition target set")?;
+            .map(provider_context_record_id)
+            .collect::<Vec<_>>();
+        invalidate_ids.sort();
         if invalidate_ids.is_empty() {
             bail!("Error-context disposition requires at least one active target row");
-        }
-        if invalidate_ids.len() != authenticated_item_count {
-            bail!(
-                "Error-context disposition target set does not match authenticated provider context"
-            );
         }
         authentication.commit().await?;
 
@@ -2467,7 +2452,8 @@ impl EventWriter {
 
         let mut transaction = self.store.pool().begin().await?;
         revalidate_prepared_key_refs(self.store.as_ref(), &mut transaction, &prepared).await?;
-        validate_prepared_error_context_fences(&mut transaction, &prepared).await?;
+        validate_prepared_error_context_fences(self.store.as_ref(), &mut transaction, &prepared)
+            .await?;
         let transaction_event_head =
             load_verified_event_head_in_transaction(self.store.as_ref(), &mut transaction).await?;
         if transaction_event_head != previous_event_head {
@@ -3261,10 +3247,7 @@ impl EventWriter {
         for item in items {
             let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
                 .context("failed to compute provider-context eviction footprint")?;
-            let wire_label = item
-                .wire_item_index
-                .map_or_else(|| "_".to_owned(), |index| index.to_string());
-            let id = format!("{message_id}:{message_seq}:{wire_label}:{}", item.ordinal);
+            let id = provider_context_record_id(&item);
             let idempotency_key = provider_context_idempotency_key(message_id, &item);
             let record = EncryptedProviderContextRecord::encrypt(
                 &item,
@@ -4802,27 +4785,54 @@ async fn revalidate_prepared_key_refs(
 /// MessageStart/AgentEnd in the same batch is still forbidden. Only the common
 /// eventless mutation application can make the next transaction eligible.
 async fn validate_prepared_error_context_fences(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     prepared: &[PreparedWrite],
 ) -> Result<()> {
-    let mut pending_units: usize = usize::try_from(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM (
-                 SELECT pc.message_id, pc.message_seq
-                 FROM provider_context pc
-                 JOIN messages m ON m.id = pc.message_id AND m.seq = pc.message_seq
-                 WHERE m.role = 'assistant'
-                   AND json_extract(m.payload, '$.stop_reason') = 'error'
-                 GROUP BY pc.message_id, pc.message_seq
-             )",
-        )
-        .fetch_one(&mut **transaction)
-        .await
-        .context("failed to inspect pending Error provider-context retention units")?,
-    )
-    .context("pending Error provider-context count is negative or too large")?;
-    if pending_units > 1 {
-        bail!("multiple pending Error provider-context retention units violate the attempt fence");
+    let common_mutation_apply_only = !prepared.is_empty()
+        && prepared.iter().all(|write| {
+            write.event.is_none()
+                && !write.projections.is_empty()
+                && write.projections.iter().all(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::ProviderContextMutation { .. }
+                    )
+                })
+        });
+    if common_mutation_apply_only {
+        // The common applier re-authenticates the already-prepared intent,
+        // fixed target ids, and key proofs before deleting rows and erasing
+        // unreferenced keys. It is the only path allowed to bypass discovery:
+        // requiring live-row hydration here would make recovery impossible
+        // after a partial delete or crypto-erasure.
+        return Ok(());
+    }
+
+    let provider_context_rows =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to inspect provider-context rows for the Error attempt fence")?;
+    let mut pending_units = 0usize;
+    if provider_context_rows != 0 {
+        if provider_context_rows < 0 {
+            bail!("provider-context row count is negative");
+        }
+        authenticate_event_log_snapshot(store, transaction)
+            .await
+            .context("failed to authenticate event history for the Error attempt fence")?;
+        let messages = store
+            .hydrate_messages(transaction)
+            .await
+            .context("failed to authenticate transcript for the Error attempt fence")?;
+        let provider_context = store
+            .hydrate_provider_context(&messages, transaction)
+            .await
+            .context("failed to authenticate provider context for the Error attempt fence")?;
+        pending_units = usize::from(
+            super::pending_error_context_recovery(&messages, &provider_context)?.is_some(),
+        );
     }
 
     for write in prepared {
@@ -22359,20 +22369,35 @@ mod tests {
         let PublicMessage::Assistant(assistant) = &message else {
             unreachable!("fixture assistant")
         };
-        let fragment = ProviderContextFragment {
-            wire_item_index: Some(1),
-            payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiResponses,
-                item: json!({
-                    "id": "rs-error-kill",
-                    "type": "reasoning",
-                    "summary": [],
-                    "encrypted_content": "opaque-error-kill",
-                }),
+        let fragments = vec![
+            ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "id": "cmp-error-kill",
+                        "type": "compaction",
+                        "encrypted_content": "opaque-native-error-kill",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 4,
+                        context_fingerprint: "error-kill-native-fingerprint".to_owned(),
+                    },
+                },
             },
-        };
-        let eviction_footprint_tokens =
-            eviction_footprint_for_test(&assistant.origin, std::slice::from_ref(&fragment));
+            ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "id": "rs-error-kill",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-error-kill",
+                    }),
+                },
+            },
+        ];
+        let eviction_footprint_tokens = eviction_footprint_for_test(&assistant.origin, &fragments);
         EventWrite {
             event: Some(
                 DurableEvent::message_in_turn(
@@ -22390,7 +22415,7 @@ mod tests {
                 message,
                 append_to_l0: false,
                 eviction_footprint_tokens,
-                provider_context: vec![fragment],
+                provider_context: fragments,
             }],
         }
     }
@@ -22598,8 +22623,7 @@ mod tests {
                            AND json_extract(envelope, '$.message_id')='error-context-kill-assistant'),
                         (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
                         (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
-                        (SELECT COUNT(*) FROM provider_context
-                         WHERE message_id='error-context-kill-assistant'),
+                        (SELECT COUNT(*) FROM provider_context),
                         (SELECT COUNT(*) FROM provider_context_mutations)",
                 )
                 .fetch_one(reopened.pool())
@@ -22643,7 +22667,7 @@ mod tests {
                 } else {
                     assert_eq!(
                         (message_ends, turn_ends, context_rows, mutations),
-                        (1, 0, 1, 0)
+                        (1, 0, 2, 0)
                     );
                     let lease = test_lease(1);
                     let fence = test_fence(&lease);
@@ -22663,7 +22687,7 @@ mod tests {
                             pending_error_context: Some(pending),
                             ..
                         }] if pending.message_id == "error-context-kill-assistant"
-                            && pending.item_count == 1
+                            && pending.item_count == 2
                     ));
                 }
                 reopened.pool().close().await;
@@ -22891,7 +22915,6 @@ mod tests {
             })
             .await
             .expect("persist user injection");
-
         let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let timestamp = durable_test_timestamp();
         let message = AssistantMessage {
@@ -22951,6 +22974,10 @@ mod tests {
         };
         let expected_context = vec![
             ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                },
                 origin_message: None,
                 wire_item_index: window.wire_item_index,
                 ordinal: 0,
@@ -22958,6 +22985,10 @@ mod tests {
                 payload: window.payload.clone(),
             },
             ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                },
                 origin_message: Some(ProviderContextAnchor {
                     message_id: assistant_id.to_owned(),
                     message_seq: 0,
@@ -23174,6 +23205,7 @@ mod tests {
         let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
         let mut expected_context = expected_context;
         for item in &mut expected_context {
+            item.retention_owner.message_seq = message_seq;
             if let Some(anchor) = item.origin_message.as_mut() {
                 anchor.message_seq = message_seq;
             }
@@ -23269,6 +23301,13 @@ mod tests {
             })
             .await
             .expect("persist user injection");
+        let native_coverage_seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("load native Error coverage endpoint"),
+        )
+        .expect("coverage endpoint is positive");
 
         let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let assistant_id = "error-assistant-with-context";
@@ -23288,15 +23327,17 @@ mod tests {
             timestamp: durable_test_timestamp(),
         };
         let error_context = ProviderContextFragment {
-            wire_item_index: Some(1),
-            payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiResponses,
-                item: json!({
-                    "id": "rs-error-restart",
-                    "type": "reasoning",
-                    "summary": [],
-                    "encrypted_content": "ERROR_CONTEXT_MUST_NOT_REPLAY",
-                }),
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id": "cmp-error-restart",
+                    "type": "compaction",
+                    "encrypted_content": "ERROR_NATIVE_CONTEXT_MUST_NOT_REPLAY",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: native_coverage_seq,
+                    context_fingerprint: "error-native-restart-fingerprint".to_owned(),
+                },
             },
         };
         let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
@@ -23375,6 +23416,10 @@ mod tests {
             1,
             "authenticated durable Error context must survive hydration"
         );
+        assert!(
+            hydrated.provider_context[0].origin_message.is_none(),
+            "native Error context must remain semantically unanchored"
+        );
         assert!(hydrated.messages.iter().any(|message| {
             matches!(
                 message,
@@ -23427,32 +23472,12 @@ mod tests {
         let wire = next_request.to_string();
         assert!(wire.contains("continue after error restart"));
         assert!(!wire.contains("ERROR_MESSAGE_MUST_NOT_REPLAY"));
-        assert!(!wire.contains("ERROR_CONTEXT_MUST_NOT_REPLAY"));
+        assert!(!wire.contains("ERROR_NATIVE_CONTEXT_MUST_NOT_REPLAY"));
 
-        let item_key_ref: String = sqlx::query_scalar(
-            "SELECT key_ref FROM provider_context
-             WHERE message_id = ? AND message_seq = ?",
-        )
-        .bind(assistant_id)
-        .bind(
-            i64::try_from(
-                hydrated
-                    .recovery_steps
-                    .iter()
-                    .find_map(|step| match step {
-                        RecoveryStep::ResumeAssistantFromDurableEvents {
-                            pending_error_context: Some(pending),
-                            ..
-                        } => Some(pending.message_seq),
-                        _ => None,
-                    })
-                    .expect("authenticated pending Error recovery packet"),
-            )
-            .expect("message seq fits SQLite"),
-        )
-        .fetch_one(reopened.pool())
-        .await
-        .expect("load Error item key ref");
+        let item_key_ref: String = sqlx::query_scalar("SELECT key_ref FROM provider_context")
+            .fetch_one(reopened.pool())
+            .await
+            .expect("load native Error item key ref");
         let error_message_seq = hydrated
             .recovery_steps
             .iter()
@@ -23523,12 +23548,10 @@ mod tests {
         .await
         .expect("read prepared Error disposition");
         assert_eq!(prepared_state, "prepared");
-        let retained_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
-                .bind(assistant_id)
-                .fetch_one(reopened.pool())
-                .await
-                .expect("count retained rows after prepare");
+        let retained_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count retained rows after prepare");
         assert_eq!(
             retained_rows, 1,
             "prepare is durable but common application owns deletion"
@@ -23563,12 +23586,10 @@ mod tests {
         // apply the intent once, erase the target/key, and only then permit
         // logical recovery to close the run.
         let recovered = file_test_store(&path).await;
-        let recovered_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
-                .bind(assistant_id)
-                .fetch_one(recovered.pool())
-                .await
-                .expect("count recovered Error rows");
+        let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(recovered.pool())
+            .await
+            .expect("count recovered Error rows");
         assert_eq!(recovered_rows, 0);
         let (item_key_state, wrapped_key): (String, Option<Vec<u8>>) =
             sqlx::query_as("SELECT state, wrapped_key FROM data_keys WHERE key_ref = ?")

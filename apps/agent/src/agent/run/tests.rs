@@ -1360,6 +1360,10 @@ async fn hard_steer_provider_context_reaches_the_next_live_provider_attempt() {
         .next()
         .expect("provider context fragment");
     let expected = ProviderContextItem {
+        retention_owner: ProviderContextAnchor {
+            message_id: "assistant-0".to_owned(),
+            message_seq: hard_steer_seq,
+        },
         origin_message: Some(ProviderContextAnchor {
             message_id: "assistant-0".to_owned(),
             message_seq: hard_steer_seq,
@@ -1497,6 +1501,10 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
     assert_eq!(
         core.provider_context,
         vec![ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant-0".to_owned(),
+                message_seq: hard_steer_seq,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant-0".to_owned(),
                 message_seq: hard_steer_seq,
