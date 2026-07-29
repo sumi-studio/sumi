@@ -1175,7 +1175,7 @@ async fn run_responses_stream(
         match transport.next_event().await {
             Ok(Some(event)) => {
                 if let Err(error) = validate_event_name(event.event.as_deref(), &event.data) {
-                    close_responses_partial(&mut receive, &mut assembler);
+                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
                     finish_responses_error(
                         &priority_terminal_tx,
                         &mut assembler,
@@ -1191,7 +1191,7 @@ async fn run_responses_stream(
                 let pushed = match receive.push_json(&event.data) {
                     Ok(pushed) => pushed,
                     Err(error) => {
-                        close_responses_partial(&mut receive, &mut assembler);
+                        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
                         finish_responses_error(
                             &priority_terminal_tx,
                             &mut assembler,
@@ -1216,7 +1216,8 @@ async fn run_responses_stream(
                         EmitResult::Sent => {}
                         EmitResult::Closed => return,
                         EmitResult::Cancelled => {
-                            close_responses_partial(&mut receive, &mut assembler);
+                            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
+                                .await;
                             finish_failure_with_context(
                                 &priority_terminal_tx,
                                 &mut assembler,
@@ -1264,7 +1265,7 @@ async fn run_responses_stream(
                 let error = receive
                     .finish_eof()
                     .expect_err("loop returns immediately after a terminal response");
-                close_responses_partial(&mut receive, &mut assembler);
+                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
                 finish_responses_error(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1278,7 +1279,7 @@ async fn run_responses_stream(
                 return;
             }
             Err(error) => {
-                close_responses_partial(&mut receive, &mut assembler);
+                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1714,12 +1715,31 @@ fn close_partial(receive: &mut ChatReceiveState, assembler: &mut MessageAssemble
     }
 }
 
-fn close_responses_partial(receive: &mut ResponsesReceiveState, assembler: &mut MessageAssembler) {
+async fn close_responses_partial(
+    tx: &mpsc::Sender<ProviderEvent>,
+    receive: &mut ResponsesReceiveState,
+    assembler: &mut MessageAssembler,
+    cancel: &CancellationToken,
+) {
     for event in receive.fail() {
+        // Reserve the ordered-lane slot before mutating the authoritative
+        // producer snapshot. A cancellation must still be able to abandon an
+        // unread normal backlog; in that case an unsent synthetic rejection
+        // cannot be allowed into the abort terminal.
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            permit = tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            }
+        };
         if let Err(error) = assembler.apply(&event) {
+            drop(permit);
             tracing::error!(%error, "failed to close partial Responses output");
             break;
         }
+        permit.send(event);
     }
 }
 
@@ -5796,6 +5816,249 @@ fi
         assert!(output.message.content.iter().any(
             |content| matches!(content, AssistantContent::ToolCall { tool_call, .. } if tool_call.name == "weather")
         ));
+    }
+
+    const RESPONSES_PARTIAL_TOOL_PREFIX: &str = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-partial\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc-partial\",\"type\":\"function_call\",\"call_id\":\"call-partial\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n"
+    );
+
+    fn partial_responses_tool_context() -> PromptContext {
+        PromptContext {
+            tools: vec![ToolDefinition {
+                name: "weather".to_owned(),
+                description: "Weather".to_owned(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }),
+            }],
+            ..empty_context()
+        }
+    }
+
+    fn assert_responses_partial_rejection_before_failure(
+        events: &[ProviderEvent],
+        expected_provider_code: &str,
+    ) {
+        assert_eq!(
+            event_types(events),
+            ["start", "tool_call_start", "tool_call_rejected", "error"],
+            "the consumer must receive the synthetic result before terminal validation"
+        );
+        let [
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 0 },
+            ProviderEvent::ToolCallRejected {
+                content_index: 0,
+                rejected,
+                synthetic_result,
+            },
+            ProviderEvent::Error {
+                reason: StopReason::Error,
+                output,
+            },
+        ] = events
+        else {
+            panic!("unexpected partial Responses failure sequence: {events:?}");
+        };
+        assert_eq!(rejected.id, "call-partial");
+        assert_eq!(rejected.name, "weather");
+        assert_eq!(synthetic_result.tool_call_id, rejected.id);
+        assert_eq!(synthetic_result.tool_name, rejected.name);
+        assert!(synthetic_result.is_error);
+        assert_eq!(output.message.stop_reason, StopReason::Error);
+        assert!(!output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some(expected_provider_code)
+        );
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [AssistantContent::RejectedToolCall { rejected: terminal_rejected, .. }]
+                if terminal_rejected == rejected
+        ));
+        assert_eq!(
+            reconstruct_terminal(events),
+            output.message.clone(),
+            "the consumer assembler must accept the emitted rejection/result before the authoritative terminal"
+        );
+    }
+
+    enum PartialResponsesFailure {
+        MalformedInput,
+        Eof,
+        Transport,
+    }
+
+    async fn partial_responses_failure_events(
+        failure: PartialResponsesFailure,
+    ) -> Vec<ProviderEvent> {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let schemas = FrozenToolSchemaRegistry::compile(&partial_responses_tool_context().tools)
+            .expect("tool schema");
+        let mut receive = ResponsesReceiveState::with_budget(schemas, ResponseBudget::default());
+        let mut assembler = MessageAssembler::new();
+        assembler
+            .apply(&ProviderEvent::Start)
+            .expect("producer Start");
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+
+        let pushed = receive
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"weather","arguments":""}}"#,
+            )
+            .expect("partial function call");
+        assert_eq!(pushed.events.len(), 1);
+        assert!(matches!(
+            emit(
+                &tx,
+                &mut assembler,
+                pushed.events.into_iter().next().expect("tool start"),
+                &cancel
+            )
+            .await,
+            EmitResult::Sent
+        ));
+        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await;
+
+        match failure {
+            PartialResponsesFailure::MalformedInput => {
+                let error = receive
+                    .push_json("fixture malformed input")
+                    .expect_err("malformed input must fail Responses normalization");
+                finish_responses_error(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error,
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+            PartialResponsesFailure::Eof => {
+                let error = receive
+                    .finish_eof()
+                    .expect_err("unfinished Responses output must reject EOF");
+                finish_responses_error(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error,
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+            PartialResponsesFailure::Transport => {
+                let error = SseError::Transport("fixture transport failure".to_owned());
+                finish_failure_with_context(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    &transport_error_code(&error),
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+        }
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            committed,
+        );
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn responses_partial_tool_rejection_reaches_consumer_before_failure_terminal() {
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::MalformedInput).await,
+            "invalid_provider_stream",
+        );
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::Eof).await,
+            "stream_ended_without_terminal_event",
+        );
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::Transport).await,
+            "transport_error",
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_partial_tool_cancellation_keeps_priority_over_unsent_rejection() {
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let prefix = stream::once(async {
+                    Ok::<String, Infallible>(RESPONSES_PARTIAL_TOOL_PREFIX.to_owned())
+                });
+                let stalled = stream::pending::<Result<String, Infallible>>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(prefix.chain(stalled)))
+                    .expect("response")
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.base_url = base_url;
+        let cancel = CancellationToken::new();
+        let mut stream = stream_with_api_key(
+            spec,
+            partial_responses_tool_context(),
+            RequestOptions::default(),
+            cancel.clone(),
+            Some("test-key".to_owned()),
+        );
+        assert!(matches!(stream.recv().await, Some(ProviderEvent::Start)));
+        assert!(matches!(
+            stream.recv().await,
+            Some(ProviderEvent::ToolCallStart { content_index: 0 })
+        ));
+        cancel.cancel();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("Responses cancellation must retain priority")
+            .expect("priority terminal");
+        let ProviderEvent::Error {
+            reason: StopReason::Aborted,
+            output,
+        } = terminal
+        else {
+            panic!("cancellation must emit an Aborted terminal");
+        };
+        assert!(output.message.interrupted);
+        assert!(output.message.content.is_empty());
+        assert!(
+            stream.recv().await.is_none(),
+            "terminal must fuse the stream"
+        );
+        server.abort();
     }
 
     #[tokio::test]

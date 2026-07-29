@@ -652,6 +652,11 @@ pub struct ProviderEventStream {
     shadow: MessageAssembler,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
     producer_task: Option<tokio::task::JoinHandle<()>>,
+    // A non-cancelled failure terminal cannot overtake normalized events that
+    // were already committed to the ordered lane. In particular, a partial
+    // tool-call rejection carries its synthetic result only in that event,
+    // while the terminal contains the authoritative rejected-call snapshot.
+    pending_priority_terminal: Option<ProviderEvent>,
     start_emitted: bool,
     terminal_emitted: bool,
 }
@@ -672,6 +677,7 @@ impl ProviderEventStream {
             shadow: MessageAssembler::new(),
             success_terminal_committed: Arc::new(SuccessTerminalCommit::new()),
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -695,6 +701,7 @@ impl ProviderEventStream {
             shadow: MessageAssembler::with_budget(budget),
             success_terminal_committed,
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -907,10 +914,49 @@ impl Stream for ProviderEventStream {
             success_committed = self.success_terminal_committed.is_committed();
         }
         if !success_committed {
+            if let Some(terminal) = self.pending_priority_terminal.take() {
+                if self.cancel.is_cancelled() {
+                    return Poll::Ready(Some(self.accept_event(terminal)));
+                }
+                if let Some(rx) = self.rx.as_mut() {
+                    match rx.poll_recv(cx) {
+                        Poll::Ready(Some(ProviderEvent::Start)) => {
+                            tracing::warn!("discarded duplicate producer Start event");
+                            self.pending_priority_terminal = Some(terminal);
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Some(event)) => {
+                            self.pending_priority_terminal = Some(terminal);
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        Poll::Ready(None) | Poll::Pending => {}
+                    }
+                }
+                return Poll::Ready(Some(self.accept_event(terminal)));
+            }
             if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
                 match priority_rx.poll_recv(cx) {
                     Poll::Ready(Some(event)) => {
                         debug_assert!(event.is_terminal());
+                        if self.cancel.is_cancelled() {
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        if let Some(rx) = self.rx.as_mut() {
+                            match rx.poll_recv(cx) {
+                                Poll::Ready(Some(ProviderEvent::Start)) => {
+                                    tracing::warn!("discarded duplicate producer Start event");
+                                    self.pending_priority_terminal = Some(event);
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Some(normal)) => {
+                                    self.pending_priority_terminal = Some(event);
+                                    return Poll::Ready(Some(self.accept_event(normal)));
+                                }
+                                Poll::Ready(None) | Poll::Pending => {}
+                            }
+                        }
                         return Poll::Ready(Some(self.accept_event(event)));
                     }
                     Poll::Ready(None) => self.priority_terminal_rx = None,
