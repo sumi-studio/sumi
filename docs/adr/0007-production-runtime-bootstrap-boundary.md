@@ -56,12 +56,14 @@ T17はT16へ依存し、T16はT15へ依存するため、T15でproduction bootst
   既存`idempotency_key`とToolExecution Start/Finish APIは変更しない。完全な`RunCore`、
   T19〜T21のThreeLayerMemory、T23のApprovalBroker、production ToolRegistryを構築せず、物理kill/reapも
   実施済みと主張しない。決定論的テストは正しいproofを明示注入し、欠落・破損proofをfail-closedにする。
-- T29のconversation resetは、physical recovery適用済みconversationでも1つのagent DB transactionで
-  `physical_recovery_receipt_intents`子、`physical_recovery_receipt_applications`親、参照先`agent_events`/
-  `tool_executions`の順に削除する。1つのagent DBにはactive conversationが1つだけでledger行に`conversation_id`がないため、
-  fixtureは対象agent DBとは別のcontrol-plane tenant/agent identity、別agent DB、別artifact subtreeを持つ第二agentを使う。
-  対象の全行・旧artifact subtree消去と第二agentのledger/event/execution/artifact不変を同時に検証し、同一DBの
-  「別conversation」やFK回避のconstraint無効化を隔離証拠にしない。
+- T29はconversation resetを提供しない。[ADR 0008](0008-personality-agent-identity-and-execution-fabric.md)に従い、
+  canonical life logの削除はagent deathであり、同じ`PersonalityAgentId`を継続・再利用して同じ人格を保存することはできない。
+  後継は新しい`PersonalityAgentId`としてprovisionする。外部`deletion_tombstones`とsupervisor/orchestrationによる
+  agent-death/deletion state machine、およびその実装・削除順序は[#76](https://github.com/sumi-studio/sumi/issues/76)へ延期する。
+  #76の受入では`PersonalityAgentId`ごとの隔離を証明し、同じWorkspace・administrative contextの第二agentを用いて、
+  対象agentのDB/life log/recovery ledger/event/execution/private workspace/artifact/keyだけが削除対象となり、第二agentの
+  private stateが不変であることを検証する。これはT17/T27のphysical recovery proof、fail-closed、idempotenceの契約を
+  弱めず、T29がlife-log削除後のconversation resetまたは同一人格の継続を提供しないことを明示する。
 - T24はproduction `GatewayConnector`/`ConnectionSupervisor`と認証済み接続fenceを所有する。
   `ConnectionEpoch`は再接続ごとに変わるT24-local identityであり、shared process identityではない。T24は各
   `ConnectionEpoch`についてtransport-neutral opaque `DeliveryEpoch`をexactly onceで1つmint/mapし、epoch終了時に対応mappingを
