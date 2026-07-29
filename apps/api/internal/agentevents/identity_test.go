@@ -159,6 +159,125 @@ func TestCommandStoreIdempotencyBindsAuthenticatedEnvelopeAcrossTargets(t *testi
 	}
 }
 
+func TestCommandStoreIdempotencySerializesCrossTargetRaceWithinOneStore(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	command := json.RawMessage(`{"type":"user_message","text":"same-store","attachments":[]}`)
+	provenances := []DirectChatProvenance{
+		testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		testDirectChatProvenance("018f47a2-9b3c-7def-9abc-0123456789ac"),
+	}
+	results := make(chan error, len(provenances))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, provenance := range provenances {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := store.Append(context.Background(), provenance, "same-store-global-key", command)
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var accepted, conflicts int
+	for err := range results {
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, errIdempotencyConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected same-store append result: %v", err)
+		}
+	}
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf("same-store cross-target race: accepted=%d conflicts=%d", accepted, conflicts)
+	}
+}
+
+func TestCommandStoreIdempotencyGuardHonorsContextCancellation(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	store.idempotencyGuard <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, appendErr := store.Append(
+		ctx,
+		testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		"waiting-key",
+		json.RawMessage(`{"type":"abort"}`),
+	)
+	<-store.idempotencyGuard
+	if !errors.Is(appendErr, context.DeadlineExceeded) {
+		t.Fatalf("guard wait ignored context cancellation: %v", appendErr)
+	}
+}
+
+func TestCommandStoreCloseWaitsForIdempotencyGuardBeforeClosingFlock(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.idempotencyGuard <- struct{}{}
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- store.Close()
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		store.mu.Lock()
+		closed := store.closed
+		store.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not enter closed state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("Close returned before the idempotency guard was released: %v", err)
+	default:
+	}
+
+	<-store.idempotencyGuard
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after the idempotency guard was released")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := store.Append(
+		ctx,
+		testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		"after-close",
+		json.RawMessage(`{"type":"abort"}`),
+	); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("keyed append after Close did not fail promptly as closed: %v", err)
+	}
+}
+
 func TestCommandStoreRestartRejectsLegacyTargetlessRecord(t *testing.T) {
 	dir := t.TempDir()
 	personalityAgentID := "018f47a2-9b3c-7def-8abc-0123456789ab"

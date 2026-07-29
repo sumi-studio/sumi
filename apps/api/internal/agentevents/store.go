@@ -39,7 +39,11 @@ type CommandStore struct {
 	dir             string
 	states          map[string]*personalityAgentState
 	idempotencyLock *os.File
-	closed          bool
+	// idempotencyGuard serializes keyed appends that share this store's one
+	// flock file description. flock alone does not exclude goroutines using
+	// the same open file description.
+	idempotencyGuard chan struct{}
+	closed           bool
 }
 
 // fileHandle abstracts the per-personality-agent log file so tests can inject
@@ -202,8 +206,9 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 	}
 
 	s := &CommandStore{
-		dir:    abs,
-		states: make(map[string]*personalityAgentState),
+		dir:              abs,
+		states:           make(map[string]*personalityAgentState),
+		idempotencyGuard: make(chan struct{}, 1),
 	}
 	idempotencyLockPath := filepath.Join(abs, ".idempotency.lock")
 	idempotencyLock, err := os.OpenFile(idempotencyLockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
@@ -260,12 +265,31 @@ func (s *CommandStore) Close() error {
 		st.closed = true
 		st.mu.Unlock()
 	}
+	// A keyed append holds this guard from before its flock acquisition until
+	// after its per-PAID append completes. Taking it here keeps the shared flock
+	// descriptor alive for every in-flight keyed path.
+	s.idempotencyGuard <- struct{}{}
 	if s.idempotencyLock != nil {
 		if err := s.idempotencyLock.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		s.idempotencyLock = nil
 	}
+	<-s.idempotencyGuard
 	return firstErr
+}
+
+func (s *CommandStore) acquireIdempotencyGuard(ctx context.Context) error {
+	select {
+	case s.idempotencyGuard <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *CommandStore) releaseIdempotencyGuard() {
+	<-s.idempotencyGuard
 }
 
 // poisonLocked marks a personality-agent state as unusable and closes its file so
@@ -309,10 +333,25 @@ func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenan
 	}
 
 	if idempotencyKey != "" {
-		if err := flockContext(ctx, s.idempotencyLock.Fd(), syscall.LOCK_EX); err != nil {
+		if err := s.acquireIdempotencyGuard(ctx); err != nil {
+			return CommandEnvelope{}, fmt.Errorf("lock in-process global idempotency index: %w", err)
+		}
+		defer s.releaseIdempotencyGuard()
+
+		if err := lockMutexContext(ctx, &s.mu); err != nil {
+			return CommandEnvelope{}, err
+		}
+		if s.closed || s.idempotencyLock == nil {
+			s.mu.Unlock()
+			return CommandEnvelope{}, errors.New("command store is closed")
+		}
+		idempotencyLock := s.idempotencyLock
+		s.mu.Unlock()
+
+		if err := flockContext(ctx, idempotencyLock.Fd(), syscall.LOCK_EX); err != nil {
 			return CommandEnvelope{}, fmt.Errorf("lock global idempotency index: %w", err)
 		}
-		defer func() { _ = syscall.Flock(int(s.idempotencyLock.Fd()), syscall.LOCK_UN) }()
+		defer func() { _ = syscall.Flock(int(idempotencyLock.Fd()), syscall.LOCK_UN) }()
 
 		existing, found, err := s.findIdempotencyRecord(ctx, idempotencyKey)
 		if err != nil {
