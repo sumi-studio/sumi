@@ -574,7 +574,7 @@ mod tests {
         };
         assert!(
             unwrap_data_key(
-                data_key.key_ref,
+                data_key.key_ref.clone(),
                 DataKeyPurpose::Transcript,
                 &wrapped,
                 &nonce,

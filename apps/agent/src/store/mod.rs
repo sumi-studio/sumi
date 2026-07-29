@@ -2824,9 +2824,10 @@ mod tests {
         .expect("insert legacy credential fixture");
         pool.close().await;
 
-        let error = Store::open(&database, scope(), provider())
-            .await
-            .expect_err("legacy schema and credentials must fail closed");
+        let error = match Store::open(&database, scope(), provider()).await {
+            Ok(_) => panic!("legacy schema and credentials must fail closed"),
+            Err(error) => error,
+        };
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("migration") || rendered.contains("already exists"),
