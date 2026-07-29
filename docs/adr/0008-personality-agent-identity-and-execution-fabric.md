@@ -1,6 +1,6 @@
 # ADR 0008: 人格agentのidentity・所有境界・VM内execution fabric
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-28
 - Amends:
   - [ADR 0002](0002-agent-stack.md)
@@ -358,6 +358,14 @@ process epochを識別する。VM boot、runtime generation、RPC process boot�
 exact action、scope、audience、lifetime、idempotencyへ束縛する具体contractは
 [#77](https://github.com/sumi-studio/sumi/issues/77)へ延期する。
 
+この延期は、一体のtrusted personality-agent runtimeだけがexecutorを呼び、
+subagent、AI harness、その他のcomponentへendpoint credentialを渡さないcurrent
+direct pathに限る。agent-scoped credential、`ProcessGeneration`、
+`RpcBootNonce`だけをper-call authorityとはみなさない。別principalへexecutor
+accessを与える前に#77のverifierを完成させ、missing、stale、mismatched、
+replayed、revoked、wrong-audience、wrong-generation、widened authorityをeffect
+より前にfail-closedで拒否する。
+
 人間、reviewer、policy engineはdecision actor/sourceであり、人格agent本人の
 代替ではない。Gatewayで認証したWorkspace actor、decision source、人格agent、
 exact call、outcomeをEventWriterのdurable auditへ残す。client payload内の
@@ -433,24 +441,23 @@ resultを保存できる。
 
 ## Migration
 
-1. 本ADRをreviewし、StatusをAcceptedへ変更する。
-2. #74でinternalのlegacy `agent_id`、`conversation_id`、独立conversation scopeを
+1. #74でinternalのlegacy `agent_id`、`conversation_id`、独立conversation scopeを
    global UUIDv7 `PersonalityAgentId`へ統合し、human-facing nameとtarget identityを
    同じfieldにしない。scope-local addressとmembership lookupの具体実装は要求せず、
    破壊的resetをcanon、contract、T29から除く。
-3. 後方互換のschema、alias、dual-read、data migrationを作らず、pre-launchの
+2. 後方互換のschema、alias、dual-read、data migrationを作らず、pre-launchの
    DB、鍵、AAD、wire fixtureを新identity contractで再生成する。agent-private
    owner/AADへmutableなtenant／Workspace／org membershipを残さない。
-4. #75でper-agent deployment namespaceと、同じWorkspaceかつ同じ
+3. #75でper-agent deployment namespaceと、同じWorkspaceかつ同じ
    administrative scopeに属する二agent間のisolationをT26へ固定する。
-5. #79、#80のendpoint/credential/readinessをT26へ組み込み、現在の直接agent
+4. #79、#80のendpoint/credential/readinessをT26へ組み込み、現在の直接agent
    verticalを完成させる。
-6. #87で一人のagentのattention、複数のcommitment、外部actionを、人格複製なしに
+5. #87で一人のagentのattention、複数のcommitment、外部actionを、人格複製なしに
    扱うmodelを設計する。current single-active-runをidentity contractにしない。
-7. #77、#81、#82はcurrent direct-agent verticalから切り離して段階導入し、
+6. #77、#81、#82はcurrent direct-agent verticalから切り離して段階導入し、
    本人のdirect pathを常に回帰fixtureで守る。特に#81のsubagent実装は今回の
    agent-foundation completionに含めない。
-8. #76でT29をagent-death lifecycleとして再設計する。
+7. #76でT29をagent-death lifecycleとして再設計する。
 
 ## Consequences for current tasks
 
