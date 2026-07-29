@@ -2302,7 +2302,7 @@ impl EventWriter {
             receipt: &receipt,
         };
         let outcome = self
-            .apply_locked_with_failpoint(batch, None, None, None, Some(context), &mut guard)
+            .apply_locked_with_failpoint(batch, None, None, Some(context), &mut guard)
             .await?;
         let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
             anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
@@ -2317,16 +2317,9 @@ impl EventWriter {
         fail_after_writes: usize,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(
-            batch,
-            Some(fail_after_writes),
-            None,
-            None,
-            None,
-            &mut guard,
-        )
-        .await
-        .map(|outcome| outcome.seqs)
+        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
+            .await
+            .map(|outcome| outcome.seqs)
     }
 
     #[cfg(all(test, unix))]
@@ -2343,24 +2336,11 @@ impl EventWriter {
             batch,
             None,
             Some((name, after_commit, readiness_path)),
-            None,
             physical_recovery,
             &mut guard,
         )
         .await
         .map(|outcome| outcome.seqs)
-    }
-
-    #[cfg(test)]
-    async fn apply_after_prepare_destroy_key(
-        &self,
-        batch: EventBatch,
-        key_ref: &str,
-    ) -> Result<Vec<u64>> {
-        let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), None, &mut guard)
-            .await
-            .map(|outcome| outcome.seqs)
     }
 
     pub(crate) async fn apply_idle_abort_cutoff(
@@ -2704,7 +2684,7 @@ impl EventWriter {
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None, physical_recovery, state)
+        self.apply_locked_with_failpoint(batch, None, None, physical_recovery, state)
             .await
             .map(|outcome| outcome.seqs)
     }
@@ -2714,7 +2694,6 @@ impl EventWriter {
         batch: EventBatch,
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
-        destroy_after_prepare: Option<&str>,
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<ApplyBatchOutcome> {
@@ -2767,10 +2746,6 @@ impl EventWriter {
                         (name.as_str(), *after_commit, path.as_path())
                     })
             });
-
-        if let Some(key_ref) = destroy_after_prepare {
-            self.store.destroy_private_key_ref(key_ref).await?;
-        }
 
         let mut transaction = self.store.pool().begin().await?;
         revalidate_prepared_key_refs(self.store.as_ref(), &mut transaction, &prepared).await?;
@@ -20193,42 +20168,6 @@ mod tests {
                 .expect("event count"),
             0
         );
-    }
-
-    #[tokio::test]
-    async fn key_destroyed_after_prepare_prevents_any_ciphertext_row_from_committing() {
-        let store = test_store().await;
-        let writer = EventWriter::new(store.clone());
-        let event_key = store
-            .private_key(DataKeyPurpose::Event)
-            .await
-            .expect("event key");
-        let batch = EventBatch {
-            writes: vec![EventWrite {
-                event: Some(
-                    DurableEvent::new(&json!({"type":"agent_start","run_id":"run-key-race"}))
-                        .expect("durable event"),
-                ),
-                projections: Vec::new(),
-            }],
-            injected_commands: Vec::new(),
-        };
-        let error = writer
-            .apply_after_prepare_destroy_key(batch, &event_key.key_ref)
-            .await
-            .expect_err("destroy commit between prepare and begin must fail closed");
-        assert!(error.to_string().contains("is not active"));
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await
-            .expect("count event rows");
-        assert_eq!(events, 0);
-        let state: String = sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref=?")
-            .bind(&event_key.key_ref)
-            .fetch_one(store.pool())
-            .await
-            .expect("read destroyed key state");
-        assert_eq!(state, "destroyed");
     }
 
     #[tokio::test]

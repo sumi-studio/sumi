@@ -3281,8 +3281,12 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     .fetch_one(&mut **transaction)
                     .await?;
             if count == 0 {
+                let erase_target = super::DerivedRetentionEraseTarget::new(
+                    key_ref.0.clone(),
+                    super::DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+                )?;
                 self.store
-                    .destroy_private_key_ref_in_transaction(transaction, &key_ref.0)
+                    .destroy_private_key_ref_in_transaction(transaction, &erase_target)
                     .await
                     .with_context(|| {
                         format!(

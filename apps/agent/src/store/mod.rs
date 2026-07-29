@@ -329,6 +329,50 @@ pub(crate) struct ArtifactKeyAnchor {
     pub artifact_handle: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DerivedRetentionEraseAuthority {
+    ProviderContextInvalidation,
+    MemorySummaryDeletion,
+    ArtifactDeletion,
+}
+
+impl DerivedRetentionEraseAuthority {
+    const fn purpose(self) -> DataKeyPurpose {
+        match self {
+            Self::ProviderContextInvalidation => DataKeyPurpose::ProviderContext,
+            Self::MemorySummaryDeletion => DataKeyPurpose::MemorySummary,
+            Self::ArtifactDeletion => DataKeyPurpose::Artifact,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderContextInvalidation => "provider_context_invalidation",
+            Self::MemorySummaryDeletion => "memory_summary_deletion",
+            Self::ArtifactDeletion => "artifact_deletion",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DerivedRetentionEraseTarget {
+    key_ref: String,
+    authority: DerivedRetentionEraseAuthority,
+}
+
+impl DerivedRetentionEraseTarget {
+    pub(crate) fn new(
+        key_ref: impl Into<String>,
+        authority: DerivedRetentionEraseAuthority,
+    ) -> Result<Self> {
+        let key_ref = key_ref.into();
+        if key_ref.is_empty() {
+            bail!("derived-retention crypto-erase key_ref must not be empty");
+        }
+        Ok(Self { key_ref, authority })
+    }
+}
+
 impl AgentScope {
     pub(crate) const fn new(personality_agent_id: PersonalityAgentId) -> Self {
         Self {
@@ -2077,6 +2121,22 @@ impl Store {
         if let Some(key) = self.load_active_private_key(purpose).await? {
             return Ok(key);
         }
+        let prior_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM data_keys
+             WHERE scope='personality_agent' AND personality_agent_id=? AND purpose=?
+               AND retention_unit='agent'",
+        )
+        .bind(self.scope.personality_agent_id.as_str())
+        .bind(purpose.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to inspect canonical agent-unit key history")?;
+        if prior_rows != 0 {
+            bail!(
+                "canonical {} agent-unit key is unavailable and cannot be recreated",
+                purpose.as_str()
+            );
+        }
 
         let wrapping_key = self.key_provider.current_key().await?;
         let key_ref = format!("{}-{}", purpose.as_str(), Uuid::now_v7());
@@ -2400,11 +2460,9 @@ impl Store {
     pub(crate) async fn destroy_private_key_ref_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
-        key_ref: &str,
+        target: &DerivedRetentionEraseTarget,
     ) -> Result<()> {
-        if key_ref.is_empty() {
-            bail!("crypto-erase key_ref must not be empty");
-        }
+        let key_ref = target.key_ref.as_str();
         let row = sqlx::query(
             "SELECT scope, purpose, personality_agent_id, retention_unit,
                     state, wrapped_key, wrap_nonce, destroyed_at
@@ -2419,12 +2477,22 @@ impl Store {
         let scope: String = row.try_get("scope")?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
-        validate_retention_unit(purpose, row.try_get("retention_unit")?)?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
         if scope != DataKeyScope::PersonalityAgent.as_str()
             || personality_agent_id != self.scope.personality_agent_id.as_str()
-            || purpose == DataKeyPurpose::Workspace
+            || purpose != target.authority.purpose()
+            || retention_unit == "agent"
+            || !matches!(
+                purpose,
+                DataKeyPurpose::ProviderContext
+                    | DataKeyPurpose::MemorySummary
+                    | DataKeyPurpose::Artifact
+            )
         {
-            bail!("crypto-erase key_ref {key_ref} is outside the active personality agent scope");
+            bail!(
+                "crypto-erase key_ref {key_ref} is not an authorized derived retention-unit target"
+            );
         }
 
         let state: String = row.try_get("state")?;
@@ -2436,6 +2504,13 @@ impl Store {
                 {
                     bail!("active key_ref {key_ref} has incomplete wrapped key material");
                 }
+                tracing::info!(
+                    personality_agent_id = %self.scope.personality_agent_id,
+                    key_ref,
+                    authority = target.authority.as_str(),
+                    purpose = purpose.as_str(),
+                    "crypto-erasing derived retention-unit key"
+                );
                 let result = sqlx::query(
                     "UPDATE data_keys
                      SET state = 'destroyed', wrapped_key = NULL, wrap_nonce = NULL,
@@ -2470,9 +2545,12 @@ impl Store {
         dead_code,
         reason = "T11 product crypto-erase boundary is wired to lifecycle callers in M3"
     )]
-    pub(crate) async fn destroy_private_key_ref(&self, key_ref: &str) -> Result<()> {
+    pub(crate) async fn destroy_derived_retention_key(
+        &self,
+        target: &DerivedRetentionEraseTarget,
+    ) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
-        self.destroy_private_key_ref_in_transaction(&mut transaction, key_ref)
+        self.destroy_private_key_ref_in_transaction(&mut transaction, target)
             .await?;
         transaction.commit().await?;
         Ok(())
@@ -3166,14 +3244,66 @@ mod tests {
             .expect("reuse active command key");
         assert_eq!(key.key_ref, duplicate.key_ref);
 
+        let command_target = DerivedRetentionEraseTarget::new(
+            key.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ArtifactDeletion,
+        )
+        .unwrap();
         store
-            .destroy_private_key_ref(&key.key_ref)
+            .destroy_derived_retention_key(&command_target)
             .await
-            .expect("destroy command key");
+            .expect_err("canonical command key cannot be selectively erased");
+        sqlx::query(
+            "UPDATE data_keys
+             SET state='destroyed', wrap_nonce=NULL, wrapped_key=NULL, destroyed_at='agent-death'
+             WHERE key_ref=?",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("simulate supervisor-owned whole-agent key destruction");
+        assert!(
+            store
+                .private_key(DataKeyPurpose::Command)
+                .await
+                .expect_err("destroyed canonical command key cannot be replaced")
+                .to_string()
+                .contains("cannot be recreated")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM data_keys
+                 WHERE personality_agent_id=? AND purpose='command' AND retention_unit='agent'"
+            )
+            .bind(scope().personality_agent_id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            1
+        );
+        let artifact = store
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/state-transition",
+                    scope().personality_agent_id
+                ),
+            })
+            .await
+            .unwrap();
+        let artifact_target = DerivedRetentionEraseTarget::new(
+            artifact.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ArtifactDeletion,
+        )
+        .unwrap();
+        store
+            .destroy_derived_retention_key(&artifact_target)
+            .await
+            .expect("destroy derived artifact key");
         let destroyed = sqlx::query(
             "SELECT state, wrapped_key, wrap_nonce, destroyed_at FROM data_keys WHERE key_ref = ?",
         )
-        .bind(&key.key_ref)
+        .bind(&artifact.key_ref)
         .fetch_one(store.pool())
         .await
         .expect("read destroyed key");
@@ -3184,7 +3314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_ref_crypto_erase_is_scoped_transactional_and_idempotent() {
+    async fn derived_crypto_erase_is_typed_transactional_and_idempotent() {
         let store = store().await;
         let transcript = store
             .private_key(DataKeyPurpose::Transcript)
@@ -3198,20 +3328,39 @@ mod tests {
             .await
             .expect("mint provider-context anchor key");
 
-        for key_ref in [&transcript.key_ref, &provider_anchor.key_ref] {
-            store
-                .destroy_private_key_ref(key_ref)
+        let transcript_target = DerivedRetentionEraseTarget::new(
+            transcript.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+        )
+        .unwrap();
+        store
+            .destroy_derived_retention_key(&transcript_target)
+            .await
+            .expect_err("canonical transcript key cannot be selectively erased");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref=?")
+                .bind(&transcript.key_ref)
+                .fetch_one(store.pool())
                 .await
-                .expect("destroy conversation key");
+                .unwrap(),
+            "active"
+        );
+
+        let provider_target = DerivedRetentionEraseTarget::new(
+            provider_anchor.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+        )
+        .unwrap();
+        for target in [&provider_target, &provider_target] {
             store
-                .destroy_private_key_ref(key_ref)
+                .destroy_derived_retention_key(target)
                 .await
-                .expect("repeated destroy is an idempotent no-op");
+                .expect("derived-key destroy is idempotent");
             let row = sqlx::query(
                 "SELECT state, wrapped_key, wrap_nonce, destroyed_at
                  FROM data_keys WHERE key_ref = ?",
             )
-            .bind(key_ref)
+            .bind(&provider_anchor.key_ref)
             .fetch_one(store.pool())
             .await
             .expect("read destroyed key");
@@ -3226,13 +3375,19 @@ mod tests {
             .await
             .expect("mint PAID-owned workspace key");
         let error = store
-            .destroy_private_key_ref(&workspace.key_ref)
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    workspace.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::ArtifactDeletion,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("private crypto erase must reject the workspace key");
         assert!(
             error
                 .to_string()
-                .contains("outside the active personality agent scope")
+                .contains("not an authorized derived retention-unit target")
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref=?",)
@@ -3290,7 +3445,13 @@ mod tests {
         let second_ciphertext =
             encrypt_content(&second, b"second-anchor", &second_aad).expect("encrypt second anchor");
         store
-            .destroy_private_key_ref(&first.key_ref)
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    first.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+                )
+                .unwrap(),
+            )
             .await
             .expect("erase first anchor only");
         assert!(
@@ -3398,7 +3559,13 @@ mod tests {
         let job_ciphertext =
             encrypt_content(&job, b"job-summary", &job_aad).expect("encrypt job summary");
         store
-            .destroy_private_key_ref(&batch.key_ref)
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    batch.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::MemorySummaryDeletion,
+                )
+                .unwrap(),
+            )
             .await
             .expect("erase only the batch summary key");
         assert!(
