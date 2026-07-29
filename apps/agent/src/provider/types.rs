@@ -1062,6 +1062,39 @@ pub fn validate_native_suffix(
     Ok(previous)
 }
 
+/// Validate either a canonical transcript containing the covered boundary or
+/// an already-selected exact suffix produced by the runtime assembler.
+///
+/// The exact-suffix form omits every persisted row through `coverage`; all
+/// remaining persisted sequences must therefore be strictly greater than it.
+pub(crate) fn validate_native_window_replay(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<(), String> {
+    let contains_coverage = messages.iter().any(
+        |message| matches!(message, ContextMessage::Persisted { seq, .. } if *seq == coverage),
+    );
+    if contains_coverage {
+        validate_native_suffix(messages, Some(coverage))?;
+        return Ok(());
+    }
+
+    validate_native_suffix(messages, None)?;
+    let first_suffix_seq = messages.iter().find_map(|message| match message {
+        ContextMessage::Persisted { seq, .. } => Some(*seq),
+        ContextMessage::Synthetic { .. } => None,
+    });
+    let Some(first_suffix_seq) = first_suffix_seq else {
+        return Err("native compacted window requires persisted replay history".into());
+    };
+    if first_suffix_seq <= coverage {
+        return Err(
+            "native compacted window replay neither contains coverage nor starts after it".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Hydration alias for [`validate_native_suffix`].
 ///
 /// This is a convenience wrapper that retains the old `coverage: u64` signature

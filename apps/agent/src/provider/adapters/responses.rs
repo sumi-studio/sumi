@@ -891,7 +891,7 @@ fn convert_input(
     } else {
         None
     };
-    let (coverage_seq, mut native_items) = native
+    let (coverage_seq, native_items) = native
         .map(|(coverage, items)| (Some(coverage), Some(items)))
         .unwrap_or((None, None));
     for memory in &context.memory_blocks {
@@ -910,6 +910,9 @@ fn convert_input(
                 ),
             }],
         }));
+    }
+    if let Some(items) = native_items {
+        output.extend(items);
     }
 
     let mut context_by_anchor: BTreeMap<(String, u64), Vec<&ProviderContextItem>> = BTreeMap::new();
@@ -950,9 +953,6 @@ fn convert_input(
             ContextMessage::Persisted { id, seq, message } => {
                 if !persisted_started {
                     persisted_started = true;
-                    if let Some(items) = native_items.take() {
-                        output.extend(items);
-                    }
                 }
                 if coverage_seq.is_some_and(|coverage| *seq <= coverage) {
                     if suffix_started {
@@ -1173,11 +1173,6 @@ fn convert_input(
             }
         }
     }
-    if native_items.is_some() {
-        return Err(ResponsesAdapterError::InvalidContext(
-            "native compacted window requires a persisted message suffix".into(),
-        ));
-    }
     if !context_by_anchor.is_empty() {
         return Err(ResponsesAdapterError::InvalidContext(
             "provider context anchor was not found in L0".into(),
@@ -1236,9 +1231,9 @@ fn prepare_native_window(
             .map_err(|error| format!("invalid native compacted window item: {error}"))?;
         validated.push(item.clone());
     }
-    let _ = crate::provider::types::validate_native_suffix(
+    crate::provider::types::validate_native_window_replay(
         &context.messages,
-        Some(coverage.through_message_seq),
+        coverage.through_message_seq,
     )
     .map_err(|error| error.to_string())?;
     Ok(Some((coverage.through_message_seq, validated)))
@@ -4591,8 +4586,11 @@ mod tests {
         });
 
         let input = convert_input(&spec, &context, true).expect("valid native replay");
-        assert_eq!(input[0]["content"][0]["text"], "leading-synthetic");
-        assert_eq!(&input[1..=window.len()], window.as_slice());
+        assert_eq!(&input[..window.len()], window.as_slice());
+        assert_eq!(
+            input[window.len()]["content"][0]["text"],
+            "leading-synthetic"
+        );
         assert_eq!(input.len(), window.len() + 3);
         assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
         assert_eq!(input[window.len() + 2]["content"][0]["text"], "message-10");
@@ -4721,10 +4719,10 @@ mod tests {
 
         context.provider_context = vec![native];
         context.messages = vec![persisted_user(10)];
-        let fallback = convert_input(&spec, &context, true).expect("suffix gap fallback");
-        let fallback = Value::Array(fallback).to_string();
-        assert!(fallback.contains("message-10"));
-        assert!(!fallback.contains("opaque"));
+        let exact_suffix = convert_input(&spec, &context, true).expect("exact suffix replay");
+        let exact_suffix = Value::Array(exact_suffix).to_string();
+        assert!(exact_suffix.contains("message-10"));
+        assert!(exact_suffix.contains("opaque"));
         context.messages = vec![
             persisted_user(9),
             ContextMessage::Synthetic {

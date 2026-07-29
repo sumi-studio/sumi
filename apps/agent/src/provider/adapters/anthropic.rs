@@ -753,11 +753,10 @@ fn validate_native_replay(
             "native compaction context fingerprint mismatch".into(),
         ));
     }
-    crate::provider::types::validate_native_suffix(
+    crate::provider::types::validate_native_window_replay(
         &context.messages,
-        Some(coverage.through_message_seq),
+        coverage.through_message_seq,
     )
-    .map(|_| ())
     .map_err(AnthropicAdapterError::InvalidContext)
 }
 
@@ -3247,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn native_fingerprint_and_suffix_gap_fall_back_without_sending_stale_block() {
+    fn native_fingerprint_falls_back_and_exact_suffix_replays_bound_block() {
         let spec = spec();
         let mut durable = context(vec![persisted(1), persisted(2)]);
         durable.provider_context.push(ProviderContextItem {
@@ -3296,8 +3295,8 @@ mod tests {
                 ..RequestOptions::default()
             },
         )
-        .expect("suffix gap fallback");
-        assert!(!request.to_string().contains("GAP"));
+        .expect("exact suffix replay");
+        assert!(request.to_string().contains("GAP"));
     }
 
     #[test]

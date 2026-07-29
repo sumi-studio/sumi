@@ -2,7 +2,7 @@
 //! replay normalization (transform), 50KB user attachment truncation, and the
 //! provider-native vs Sumi three-layer mode decision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
@@ -20,7 +20,7 @@ use crate::memory::transform;
 #[cfg(test)]
 use crate::provider::types::Usage;
 use crate::provider::{
-    ModelSpec,
+    ModelSpec, ProtocolCompat,
     context_fingerprint::compute_context_fingerprint,
     types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryBlock, MemoryLayer,
@@ -49,6 +49,16 @@ pub struct ContextAssembler {
 struct HydratedThreeLayer {
     memory: ThreeLayerMemory,
     transcript_through_seq: u64,
+}
+
+struct BoundProviderContext {
+    items: Vec<ProviderContextItemWithFootprint>,
+    native_window: Option<BoundNativeWindow>,
+}
+
+struct BoundNativeWindow {
+    item: ProviderContextItemWithFootprint,
+    through_message_seq: u64,
 }
 
 /// The exact estimate used to construct one provider attempt. Keeping it in
@@ -207,24 +217,22 @@ impl ContextAssembler {
     ) -> Result<AssembledPrompt> {
         let overflow = Overflow::new(self.calibration(), self.mode);
         let is_first_user_call = trigger == ProviderCallTrigger::FirstAfterUser;
+        let destination = self.spec.origin();
 
-        let provider_context = self
-            .provider_context
-            .lock()
-            .expect("provider context lock")
-            .clone();
-        let active_view = self.send_source_messages(context, &provider_context)?;
+        let provider_context = self.bind_provider_context(&destination)?;
+        let active_view =
+            self.send_source_messages(context, provider_context.native_window.as_ref())?;
         let mut messages = overflow.recover_context_with_provider_context(
             active_view,
             is_first_user_call,
-            &provider_context,
+            &provider_context.items,
         )?;
-        messages = transform::transform(&messages, &self.spec.origin());
+        messages = transform::transform(&messages, &destination);
 
         self.apply_user_attachment_truncation(&mut messages).await?;
 
         let (memory_blocks, selected_context, messages) =
-            self.assemble_provider_view(messages, &self.spec.origin())?;
+            self.assemble_provider_view(messages, &destination, &provider_context);
 
         let estimate =
             self.compute_uncalibrated_estimate(&memory_blocks, &messages, &selected_context)?;
@@ -252,11 +260,7 @@ impl ContextAssembler {
         active_context: &[ContextMessage],
     ) -> Result<Vec<ContextMessage>> {
         let overflow = Overflow::new(self.calibration(), self.mode);
-        let provider_context = self
-            .provider_context
-            .lock()
-            .expect("provider context lock")
-            .clone();
+        let provider_context = self.bind_provider_context(&self.spec.origin())?;
 
         // Promotion is a durable MemoryTransition: it removes batch membership,
         // crypto-erases provider context, and advances the apply cursor in the
@@ -268,8 +272,9 @@ impl ContextAssembler {
         // completed shelves while Idle. At this API-preflight fallback we retain
         // only the bounded, replay-safe send-view recovery. It neither changes
         // durable membership nor tries to imitate promotion in process memory.
-        let active_view = self.send_source_messages(active_context, &provider_context)?;
-        overflow.recover_context_with_provider_context(active_view, false, &provider_context)
+        let active_view =
+            self.send_source_messages(active_context, provider_context.native_window.as_ref())?;
+        overflow.recover_context_with_provider_context(active_view, false, &provider_context.items)
     }
 
     /// Install the exact calibration value returned by a committed
@@ -373,18 +378,35 @@ impl ContextAssembler {
     fn send_source_messages(
         &self,
         life_log: &[ContextMessage],
-        provider_context: &[ProviderContextItemWithFootprint],
+        native_window: Option<&BoundNativeWindow>,
     ) -> Result<Vec<ContextMessage>> {
-        if self.mode == AssemblyMode::ProviderNative {
-            let fingerprint = self.destination_fingerprint()?;
-            if find_native_window(provider_context, &self.spec.origin(), &fingerprint).is_some() {
-                // A matching native window owns its covered prefix. Its suffix
-                // is therefore selected from the canonical transcript rather
-                // than Sumi's independently promoted L0 membership.
-                return Ok(life_log.to_vec());
-            }
+        if let Some(native_window) = native_window {
+            return select_native_suffix(life_log, native_window.through_message_seq);
         }
         self.active_send_messages(life_log)
+    }
+
+    fn bind_provider_context(&self, destination: &ProviderOrigin) -> Result<BoundProviderContext> {
+        let items = self
+            .provider_context
+            .lock()
+            .expect("provider context lock")
+            .clone();
+        let native_window = if self.mode == AssemblyMode::ProviderNative
+            && supports_native_compaction(&self.spec)
+        {
+            let fingerprint = self.destination_fingerprint()?;
+            find_native_window(&items, destination, &fingerprint).map(|item| BoundNativeWindow {
+                through_message_seq: native_coverage_through(item),
+                item: item.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(BoundProviderContext {
+            items,
+            native_window,
+        })
     }
 
     async fn apply_user_attachment_truncation(
@@ -459,54 +481,37 @@ impl ContextAssembler {
         &self,
         messages: Vec<ContextMessage>,
         destination: &ProviderOrigin,
-    ) -> Result<(
+        provider_context: &BoundProviderContext,
+    ) -> (
         Vec<MemoryBlock>,
         Vec<ProviderContextItemWithFootprint>,
         Vec<ContextMessage>,
-    )> {
-        let provider_context = self
-            .provider_context
-            .lock()
-            .expect("provider context lock")
-            .clone();
+    ) {
+        if let Some(native_window) = &provider_context.native_window {
+            let suffix_map: HashMap<&str, &ContextMessage> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    ContextMessage::Persisted { id, .. } => Some((id.as_str(), message)),
+                    ContextMessage::Synthetic { .. } => None,
+                })
+                .collect();
+            let mut suffix_reasoning: Vec<_> = provider_context
+                .items
+                .iter()
+                .filter(|it| {
+                    matches_sumi_reasoning_with_anchor_check(
+                        it,
+                        destination,
+                        &suffix_map,
+                        native_window.through_message_seq,
+                    )
+                })
+                .collect();
+            suffix_reasoning.sort_by_key(|entry| provider_context_order_key(entry));
+            let mut result_context = vec![native_window.item.clone()];
+            result_context.extend(suffix_reasoning.into_iter().cloned());
 
-        if self.mode == AssemblyMode::ProviderNative {
-            let fingerprint = self.destination_fingerprint()?;
-            if let Some(item) = find_native_window(&provider_context, destination, &fingerprint) {
-                let through = native_coverage_through(item);
-                let suffix: Vec<ContextMessage> = messages
-                    .iter()
-                    .filter(|message| match message {
-                        ContextMessage::Persisted { seq, .. } => *seq > through,
-                        ContextMessage::Synthetic { .. } => true,
-                    })
-                    .cloned()
-                    .collect();
-
-                let mut result_context = vec![item.clone()];
-                let suffix_map: HashMap<&str, &ContextMessage> = suffix
-                    .iter()
-                    .filter_map(|message| match message {
-                        ContextMessage::Persisted { id, .. } => Some((id.as_str(), message)),
-                        ContextMessage::Synthetic { .. } => None,
-                    })
-                    .collect();
-                let mut suffix_reasoning: Vec<_> = provider_context
-                    .iter()
-                    .filter(|it| {
-                        matches_sumi_reasoning_with_anchor_check(
-                            it,
-                            destination,
-                            &suffix_map,
-                            through,
-                        )
-                    })
-                    .collect();
-                suffix_reasoning.sort_by_key(|entry| provider_context_order_key(entry));
-                result_context.extend(suffix_reasoning.into_iter().cloned());
-
-                return Ok((Vec::new(), result_context, suffix));
-            }
+            return (Vec::new(), result_context, messages);
         }
 
         let message_map: HashMap<&str, &ContextMessage> = messages
@@ -518,6 +523,7 @@ impl ContextAssembler {
             .collect();
 
         let mut selected_provider_context: Vec<_> = provider_context
+            .items
             .iter()
             .filter(|it| matches_sumi_reasoning(it, destination, &message_map))
             .cloned()
@@ -525,7 +531,7 @@ impl ContextAssembler {
         selected_provider_context.sort_by_key(provider_context_order_key);
 
         let memory_blocks = self.current_memory_blocks();
-        Ok((memory_blocks, selected_provider_context, messages))
+        (memory_blocks, selected_provider_context, messages)
     }
 
     fn destination_fingerprint(&self) -> Result<String> {
@@ -640,6 +646,78 @@ fn hydrated_transcript_cutoff(messages: &[ContextMessage]) -> Result<u64> {
     Ok(previous)
 }
 
+fn select_native_suffix(
+    life_log: &[ContextMessage],
+    through_message_seq: u64,
+) -> Result<Vec<ContextMessage>> {
+    let mut coverage_index = None;
+    let mut covered_tool_call_ids = HashSet::new();
+    for (index, message) in life_log.iter().enumerate() {
+        let ContextMessage::Persisted { seq, message, .. } = message else {
+            continue;
+        };
+        if *seq == through_message_seq && coverage_index.replace(index).is_some() {
+            anyhow::bail!("native coverage sequence {through_message_seq} appears more than once");
+        }
+        if *seq <= through_message_seq
+            && let Message::Assistant(assistant) = message
+        {
+            for content in &assistant.content {
+                match content {
+                    AssistantContent::ToolCall { tool_call, .. } => {
+                        covered_tool_call_ids.insert(tool_call.id.clone());
+                    }
+                    AssistantContent::RejectedToolCall { rejected, .. } => {
+                        covered_tool_call_ids.insert(rejected.id.clone());
+                    }
+                    AssistantContent::Text { .. } | AssistantContent::Thinking { .. } => {}
+                }
+            }
+        }
+    }
+    let coverage_index = coverage_index.ok_or_else(|| {
+        anyhow::anyhow!(
+            "native coverage sequence {through_message_seq} is absent from the canonical life log"
+        )
+    })?;
+    let first_persisted_suffix = life_log.iter().enumerate().find_map(|(index, message)| {
+        matches!(
+            message,
+            ContextMessage::Persisted { seq, .. } if *seq > through_message_seq
+        )
+        .then_some(index)
+    });
+
+    let mut suffix = Vec::new();
+    for (index, message) in life_log.iter().enumerate() {
+        match message {
+            ContextMessage::Persisted { seq, .. } if *seq > through_message_seq => {
+                suffix.push(message.clone());
+            }
+            ContextMessage::Persisted { .. } => {}
+            ContextMessage::Synthetic { message: synthetic } => {
+                if index <= coverage_index
+                    || transform::is_generated_replay_artifact(message)
+                    || matches!(
+                        synthetic,
+                        Message::ToolResult(result)
+                            if covered_tool_call_ids.contains(&result.tool_call_id)
+                    )
+                {
+                    continue;
+                }
+                if first_persisted_suffix.is_some_and(|first| index > first) {
+                    anyhow::bail!(
+                        "native suffix contains an unsequenced synthetic input after persisted history"
+                    );
+                }
+                suffix.push(message.clone());
+            }
+        }
+    }
+    Ok(suffix)
+}
+
 fn memory_blocks_from_three_layer(memory: &ThreeLayerMemory) -> Vec<MemoryBlock> {
     let mut blocks = Vec::new();
     let l2_summary = memory.l2().summary.expose();
@@ -693,10 +771,15 @@ fn find_native_window<'a>(
     destination: &ProviderOrigin,
     fingerprint: &str,
 ) -> Option<&'a ProviderContextItemWithFootprint> {
-    provider_context
-        .iter()
-        .rev()
-        .find(|entry| match &entry.item.payload {
+    let mut matching = provider_context.iter().filter(|entry| {
+        if entry.item.provider_origin != *destination
+            || entry.item.origin_message.is_some()
+            || entry.item.wire_item_index.is_some()
+            || entry.item.ordinal != 0
+        {
+            return false;
+        }
+        match &entry.item.payload {
             ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } => {
                 matches_openai_protocol(destination.protocol)
                     && coverage.context_fingerprint == fingerprint
@@ -706,7 +789,10 @@ fn find_native_window<'a>(
                     && coverage.context_fingerprint == fingerprint
             }
             _ => false,
-        })
+        }
+    });
+    let item = matching.next()?;
+    matching.next().is_none().then_some(item)
 }
 
 fn native_coverage_through(entry: &ProviderContextItemWithFootprint) -> u64 {
@@ -724,6 +810,14 @@ fn matches_openai_protocol(protocol: ApiProtocol) -> bool {
         protocol,
         ApiProtocol::OpenAiChatCompletions | ApiProtocol::OpenAiResponses
     )
+}
+
+fn supports_native_compaction(spec: &ModelSpec) -> bool {
+    match &spec.compat {
+        ProtocolCompat::Responses(compat) => compat.supports_native_compact,
+        ProtocolCompat::Anthropic(compat) => compat.supports_native_compact,
+        ProtocolCompat::Chat(_) => false,
+    }
 }
 
 fn matches_sumi_reasoning(
@@ -861,7 +955,10 @@ mod tests {
     use super::*;
     use crate::memory::estimate::EvictionFootprint;
     use crate::memory::{BatchState, ConsolidatedMemory, L0Batch};
-    use crate::provider::types::{StopReason, ToolResultMessage, UserMessage};
+    use crate::provider::{
+        RequestOptions,
+        types::{StopReason, ToolResultMessage, UserMessage, ValidatedToolArguments},
+    };
     use chrono::Utc;
 
     fn model_spec() -> ModelSpec {
@@ -1164,6 +1261,102 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ContextMessage::Persisted { seq: 3, .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn native_window_cuts_covered_tool_call_before_transform_and_responses_serialization() {
+        let spec = responses_spec();
+        let covered_call_id = "covered-call";
+        let covered = ContextMessage::Persisted {
+            id: "assistant-1".to_owned(),
+            seq: 1,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    tool_call: crate::provider::types::ToolCall {
+                        id: covered_call_id.to_owned(),
+                        name: "fixture".to_owned(),
+                        arguments: serde_json::from_value::<ValidatedToolArguments>(
+                            serde_json::json!({}),
+                        )
+                        .expect("object tool arguments"),
+                    },
+                    wire_item_index: 0,
+                }],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let uncovered = user("after native coverage", 2);
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": "fc-covered",
+                    "type": "function_call",
+                    "call_id": covered_call_id,
+                    "name": "fixture",
+                    "arguments": "{}",
+                })],
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        };
+        let prompt = PromptContext {
+            system_prompt: "System.".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: vec![native.clone()],
+            tools: Vec::new(),
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone())
+            .expect("native assembler")
+            .with_mode(AssemblyMode::ProviderNative);
+
+        let assembled = assembler
+            .assemble(&[covered, uncovered.clone()], 1)
+            .await
+            .expect("assemble exact native suffix");
+        assert_eq!(assembled.provider_context, vec![native]);
+        assert_eq!(assembled.messages, vec![uncovered]);
+        let assembled_json = serde_json::to_string(&assembled).expect("serialize assembled prompt");
+        assert!(!assembled_json.contains(transform::MISSING_TOOL_RESULT_TEXT));
+        assert!(!assembled_json.contains("missing_tool_result"));
+
+        let request = crate::provider::adapters::responses::build_request(
+            &spec,
+            &assembled,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("serialize native window before uncovered suffix");
+        let input = request["input"].as_array().expect("Responses input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], covered_call_id);
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "after native coverage");
+        let request_json = request.to_string();
+        assert!(!request_json.contains("function_call_output"));
+        assert!(!request_json.contains(transform::MISSING_TOOL_RESULT_TEXT));
+        assert!(!request_json.contains("missing_tool_result"));
     }
 
     #[tokio::test]
