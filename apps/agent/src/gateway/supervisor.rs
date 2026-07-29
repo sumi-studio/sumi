@@ -7772,7 +7772,18 @@ mod tests {
 
         let adapter = seams::T17StoreAdapter::new(store.clone());
         let (hydration_tx, hydration_rx) = watch::channel(None);
-        let latch = seams::T17HydrationLatch::new(hydration_rx);
+        let rpc_identity = crate::runtime::contracts::RpcIdentity::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            crate::runtime::contracts::RpcBootNonce::new("t17-t24-boot").unwrap(),
+        );
+        let authority = crate::runtime::authority::RuntimeEpochAuthority::new(
+            rpc_identity,
+            lease.clone(),
+            fence.clone(),
+        )
+        .unwrap();
+        let latch = seams::T17HydrationLatch::new(hydration_rx, authority);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));

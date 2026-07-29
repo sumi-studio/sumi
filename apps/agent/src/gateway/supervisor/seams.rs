@@ -22,6 +22,7 @@ use super::{
 };
 use crate::agent::AgentEvent;
 use crate::gateway::Envelope;
+use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::ProcessGeneration;
 use crate::store::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
@@ -67,6 +68,7 @@ fn parse_projected_event(seq: u64, projection: &str) -> Result<serde_json::Value
 #[derive(Clone)]
 pub struct T17HydrationLatch {
     rx: watch::Receiver<Option<HydrationReceiptIdentity>>,
+    authority: RuntimeEpochAuthority,
     observed: Arc<Mutex<Option<HydrationReady>>>,
 }
 
@@ -77,31 +79,53 @@ impl fmt::Debug for T17HydrationLatch {
 }
 
 impl T17HydrationLatch {
-    pub(crate) fn new(rx: watch::Receiver<Option<HydrationReceiptIdentity>>) -> Self {
+    pub(crate) fn new(
+        rx: watch::Receiver<Option<HydrationReceiptIdentity>>,
+        authority: RuntimeEpochAuthority,
+    ) -> Self {
         Self {
             rx,
+            authority,
             observed: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn validate_receipt(
+        &self,
+        generation: ProcessGeneration,
+        receipt: &HydrationReceiptIdentity,
+    ) -> Result<HydrationReady> {
+        self.authority
+            .validate_generation(generation)
+            .context("T17 hydration wait requested the wrong runtime generation")?;
+        if receipt.personality_agent_id != *self.authority.personality_agent_id()
+            || receipt.generation != self.authority.generation()
+            || receipt.lease_id != self.authority.lease().lease_id()
+            || receipt.fence_id != self.authority.fence().fence_id()
+            || receipt.intent_count != 0
+        {
+            bail!(
+                "T17 hydration receipt does not match the exact PAID, lease, generation, fence, and clean intent set"
+            );
+        }
+        Ok(HydrationReady {
+            generation,
+            receipt_identity: receipt.stable_id(),
+        })
     }
 }
 
 #[async_trait]
 impl HydrationLatch for T17HydrationLatch {
     async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
+        self.authority
+            .validate_generation(generation)
+            .context("T17 hydration wait requested the wrong runtime generation")?;
         let mut rx = self.rx.clone();
         loop {
             let receipt = rx.borrow().clone();
             if let Some(receipt) = receipt {
-                if receipt.generation != generation {
-                    bail!(
-                        "T17 hydration receipt generation mismatch: expected {generation}, got {}",
-                        receipt.generation
-                    );
-                }
-                let ready = HydrationReady {
-                    generation,
-                    receipt_identity: receipt.stable_id(),
-                };
+                let ready = self.validate_receipt(generation, &receipt)?;
                 let mut observed = self.observed.lock().unwrap();
                 if let Some(previous) = observed.as_ref()
                     && previous.generation == generation
@@ -702,5 +726,94 @@ impl CredentialProvider for T26CredentialProvider {
              Contract: read the current short-lived agent token and its typed delivery \
              authorization from the same authenticated control-plane credential."
         )
+    }
+}
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    use crate::runtime::contracts::{
+        GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease, RpcBootNonce,
+        RpcIdentity,
+    };
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
+
+    fn authority() -> RuntimeEpochAuthority {
+        let personality_agent_id = PersonalityAgentId::parse(PAID).unwrap();
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let rpc_identity = RpcIdentity::new(
+            personality_agent_id.clone(),
+            generation,
+            RpcBootNonce::new("boot-a").unwrap(),
+        );
+        let lease =
+            ProcessGenerationLease::new(personality_agent_id, generation, "lease-a").unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "fence-a").unwrap();
+        RuntimeEpochAuthority::new(rpc_identity, lease, fence).unwrap()
+    }
+
+    fn receipt(
+        personality_agent_id: &str,
+        lease_id: &str,
+        generation: u64,
+        fence_id: &str,
+        intent_count: usize,
+    ) -> HydrationReceiptIdentity {
+        HydrationReceiptIdentity {
+            personality_agent_id: PersonalityAgentId::parse(personality_agent_id).unwrap(),
+            lease_id: lease_id.to_owned(),
+            generation: ProcessGeneration::from_wire(generation).unwrap(),
+            fence_id: fence_id.to_owned(),
+            intent_count,
+        }
+    }
+
+    async fn wait_with(
+        authority: RuntimeEpochAuthority,
+        receipt: HydrationReceiptIdentity,
+    ) -> Result<HydrationReady> {
+        let (_tx, rx) = watch::channel(Some(receipt));
+        let generation = authority.generation();
+        T17HydrationLatch::new(rx, authority)
+            .wait_for(generation)
+            .await
+    }
+
+    #[tokio::test]
+    async fn t17_ready_requires_exact_paid_lease_generation_fence_and_clean_receipt() {
+        let expected = authority();
+        let ready = wait_with(expected.clone(), receipt(PAID, "lease-a", 7, "fence-a", 0))
+            .await
+            .unwrap();
+        assert_eq!(ready.generation, expected.generation());
+
+        for invalid in [
+            receipt(OTHER_PAID, "lease-a", 7, "fence-a", 0),
+            receipt(PAID, "lease-stale", 7, "fence-a", 0),
+            receipt(PAID, "lease-a", 8, "fence-a", 0),
+            receipt(PAID, "lease-a", 7, "fence-stale", 0),
+            receipt(PAID, "lease-a", 7, "fence-a", 1),
+        ] {
+            let error = wait_with(expected.clone(), invalid)
+                .await
+                .expect_err("mismatched hydration authority must stay NotReady");
+            assert!(
+                error.to_string().contains("exact PAID"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn t17_ready_rejects_wrong_wait_generation_before_observing_receipt() {
+        let expected = authority();
+        let (_tx, rx) = watch::channel(Some(receipt(PAID, "lease-a", 7, "fence-a", 0)));
+        let error = T17HydrationLatch::new(rx, expected)
+            .wait_for(ProcessGeneration::from_wire(8).unwrap())
+            .await
+            .expect_err("wrong generation must fail closed");
+        assert!(error.to_string().contains("wrong runtime generation"));
     }
 }
