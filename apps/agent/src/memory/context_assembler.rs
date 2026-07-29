@@ -957,7 +957,10 @@ mod tests {
     use crate::memory::{BatchState, ConsolidatedMemory, L0Batch};
     use crate::provider::{
         RequestOptions,
-        types::{StopReason, ToolResultMessage, UserMessage, ValidatedToolArguments},
+        types::{
+            RejectedToolCall, StopReason, ToolArgumentError, ToolResultMessage, UserMessage,
+            ValidatedToolArguments,
+        },
     };
     use chrono::Utc;
 
@@ -967,6 +970,10 @@ mod tests {
 
     fn responses_spec() -> ModelSpec {
         ModelSpec::preset("openai-responses").expect("preset")
+    }
+
+    fn anthropic_spec() -> ModelSpec {
+        ModelSpec::preset("anthropic").expect("preset")
     }
 
     fn responses_reasoning_payload(value: &str) -> ProviderContextPayload {
@@ -1004,6 +1011,32 @@ mod tests {
                 content: vec![UserContent::Text {
                     text: text.to_owned(),
                 }],
+                timestamp: Utc::now(),
+            }),
+        }
+    }
+
+    fn rejected_assistant(spec: &ModelSpec, seq: u64, id: &str) -> ContextMessage {
+        ContextMessage::Persisted {
+            id: format!("assistant-{seq}"),
+            seq,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::RejectedToolCall {
+                    rejected: RejectedToolCall {
+                        id: id.to_owned(),
+                        name: "fixture".to_owned(),
+                        error: ToolArgumentError::SchemaViolation,
+                    },
+                    wire_item_index: 0,
+                }],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
                 timestamp: Utc::now(),
             }),
         }
@@ -1357,6 +1390,167 @@ mod tests {
         assert!(!request_json.contains("function_call_output"));
         assert!(!request_json.contains(transform::MISSING_TOOL_RESULT_TEXT));
         assert!(!request_json.contains("missing_tool_result"));
+    }
+
+    #[tokio::test]
+    async fn responses_native_window_precedes_normalized_rejection_suffix() {
+        let spec = responses_spec();
+        let life_log = vec![
+            user("covered", 1),
+            user("before rejected call", 2),
+            rejected_assistant(&spec, 3, "rejected-call"),
+            user("after rejected call", 4),
+        ];
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![serde_json::json!({
+                    "id": "cmp-rejection",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-rejection",
+                })],
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(
+            PromptContext {
+                provider_context: vec![native.clone()],
+                ..simple_prompt()
+            },
+            spec.clone(),
+        )
+        .expect("native assembler")
+        .with_mode(AssemblyMode::ProviderNative);
+
+        let assembled = assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble normalized rejection suffix");
+        assert_eq!(assembled.provider_context, vec![native]);
+        assert!(matches!(
+            assembled.messages.as_slice(),
+            [
+                ContextMessage::Persisted { seq: 2, .. },
+                ContextMessage::Synthetic {
+                    message: Message::User(_),
+                },
+                ContextMessage::Persisted { seq: 4, .. },
+            ]
+        ));
+
+        let request = crate::provider::adapters::responses::build_request(
+            &spec,
+            &assembled,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("retain native window across normalized rejection suffix");
+        let input = request["input"].as_array().expect("Responses input array");
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["id"], "cmp-rejection");
+        assert_eq!(input[1]["content"][0]["text"], "before rejected call");
+        assert!(
+            input[2]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("引数検証に失敗"))
+        );
+        assert_eq!(input[3]["content"][0]["text"], "after rejected call");
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_block_precedes_normalized_rejection_suffix() {
+        let spec = anthropic_spec();
+        let life_log = vec![
+            user("covered", 1),
+            user("before rejected call", 2),
+            rejected_assistant(&spec, 3, "rejected-call"),
+            user("after rejected call", 4),
+        ];
+        let fingerprint = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec.clone())
+            .expect("fingerprint assembler")
+            .destination_fingerprint()
+            .expect("fingerprint");
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: serde_json::json!({
+                    "type": "compaction",
+                    "content": "opaque-rejection",
+                }),
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(
+            PromptContext {
+                provider_context: vec![native.clone()],
+                ..simple_prompt()
+            },
+            spec.clone(),
+        )
+        .expect("native assembler")
+        .with_mode(AssemblyMode::ProviderNative);
+
+        let assembled = assembler
+            .assemble(&life_log, 1)
+            .await
+            .expect("assemble normalized rejection suffix");
+        assert_eq!(assembled.provider_context, vec![native]);
+        assert!(matches!(
+            assembled.messages.as_slice(),
+            [
+                ContextMessage::Persisted { seq: 2, .. },
+                ContextMessage::Synthetic {
+                    message: Message::User(_),
+                },
+                ContextMessage::Persisted { seq: 4, .. },
+            ]
+        ));
+
+        let request = crate::provider::adapters::anthropic::build_request(
+            &spec,
+            &assembled,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("retain native block across normalized rejection suffix");
+        let messages = request["messages"]
+            .as_array()
+            .expect("Anthropic messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "compaction");
+        assert_eq!(messages[0]["content"][0]["content"], "opaque-rejection");
+        assert_eq!(messages[1]["role"], "user");
+        let serialized = serde_json::to_string(messages).expect("serialize Anthropic messages");
+        let before = serialized
+            .find("before rejected call")
+            .expect("before marker");
+        let rejection = serialized.find("引数検証に失敗").expect("rejection marker");
+        let after = serialized
+            .find("after rejected call")
+            .expect("after marker");
+        assert!(before < rejection && rejection < after);
+        assert!(request.get("context_management").is_some());
     }
 
     #[tokio::test]

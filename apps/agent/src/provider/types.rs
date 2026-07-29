@@ -1062,37 +1062,58 @@ pub fn validate_native_suffix(
     Ok(previous)
 }
 
-/// Validate either a canonical transcript containing the covered boundary or
-/// an already-selected exact suffix produced by the runtime assembler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeReplayShape {
+    CanonicalHistory,
+    NormalizedExactSuffix,
+}
+
+/// Validate either authenticated canonical history containing the covered
+/// boundary or an already-bound normalized exact suffix produced by the
+/// runtime assembler.
 ///
-/// The exact-suffix form omits every persisted row through `coverage`; all
-/// remaining persisted sequences must therefore be strictly greater than it.
+/// Canonical history retains the stricter pre-normalization placement rule:
+/// synthetic rows may only lead persisted history. A normalized exact suffix
+/// has already been transformed, so generated synthetic rows remain valid in
+/// their vector position. Its persisted rows must still be positive, strictly
+/// increasing, and all greater than `coverage`.
 pub(crate) fn validate_native_window_replay(
     messages: &[ContextMessage],
     coverage: u64,
-) -> Result<(), String> {
+) -> Result<NativeReplayShape, String> {
     let contains_coverage = messages.iter().any(
         |message| matches!(message, ContextMessage::Persisted { seq, .. } if *seq == coverage),
     );
     if contains_coverage {
         validate_native_suffix(messages, Some(coverage))?;
-        return Ok(());
+        return Ok(NativeReplayShape::CanonicalHistory);
     }
 
-    validate_native_suffix(messages, None)?;
-    let first_suffix_seq = messages.iter().find_map(|message| match message {
-        ContextMessage::Persisted { seq, .. } => Some(*seq),
-        ContextMessage::Synthetic { .. } => None,
-    });
-    let Some(first_suffix_seq) = first_suffix_seq else {
-        return Err("native compacted window requires persisted replay history".into());
-    };
-    if first_suffix_seq <= coverage {
-        return Err(
-            "native compacted window replay neither contains coverage nor starts after it".into(),
-        );
+    let mut previous = None;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            continue;
+        };
+        if *seq == 0 {
+            return Err("persisted native replay sequence must be greater than zero".into());
+        }
+        if *seq <= coverage {
+            return Err(
+                "native compacted window replay neither contains coverage nor starts after it"
+                    .into(),
+            );
+        }
+        if previous.is_some_and(|value| value >= *seq) {
+            return Err(
+                "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
+            );
+        }
+        previous = Some(*seq);
     }
-    Ok(())
+    if previous.is_none() {
+        return Err("native compacted window requires persisted replay history".into());
+    }
+    Ok(NativeReplayShape::NormalizedExactSuffix)
 }
 
 /// Hydration alias for [`validate_native_suffix`].
@@ -2031,6 +2052,34 @@ mod tests {
             },
         ];
         assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
+    }
+
+    #[test]
+    fn native_window_replay_distinguishes_canonical_from_normalized_exact_suffix() {
+        let persisted = |seq| ContextMessage::Persisted {
+            id: format!("m-{seq}"),
+            seq,
+            message: Message::Assistant(assistant_message()),
+        };
+        let synthetic = ContextMessage::Synthetic {
+            message: Message::Assistant(assistant_message()),
+        };
+
+        assert_eq!(
+            validate_native_window_replay(&[persisted(2), persisted(4)], 2)
+                .expect("canonical coverage boundary"),
+            NativeReplayShape::CanonicalHistory
+        );
+        assert_eq!(
+            validate_native_window_replay(
+                &[persisted(4), synthetic.clone(), persisted(7), synthetic,],
+                2,
+            )
+            .expect("normalized suffix keeps generated synthetics in vector order"),
+            NativeReplayShape::NormalizedExactSuffix
+        );
+        assert!(validate_native_window_replay(&[persisted(2), persisted(4)], 3).is_err());
+        assert!(validate_native_window_replay(&[persisted(4), persisted(3)], 2).is_err());
     }
 
     #[test]

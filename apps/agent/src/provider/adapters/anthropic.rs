@@ -406,7 +406,9 @@ fn convert_messages(
             ProviderContextPayload::OpenAiCompactedWindow { .. }
         )
     });
-    let mut native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
+    let bound_native_required = native_context_requires_bound_window(context);
+    let native_enabled = native_compaction && compat.supports_native_compact && !has_foreign_native;
+    let mut native = if native_enabled {
         context
             .provider_context
             .iter()
@@ -417,13 +419,22 @@ fn convert_messages(
                 _ => None,
             })
             .collect::<Vec<_>>()
+    } else if bound_native_required {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "normalized exact suffix requires its bound native Anthropic context".into(),
+        ));
     } else {
         Vec::new()
     };
-    if let Err(error) = validate_native_replay(spec, context, &native) {
-        tracing::warn!(reason = %error, "discarded stale Anthropic native context");
-        native.clear();
-    }
+    let native_shape = match validate_native_replay(spec, context, &native) {
+        Ok(shape) => shape,
+        Err(error) if bound_native_required => return Err(error),
+        Err(error) => {
+            tracing::warn!(reason = %error, "discarded stale Anthropic native context");
+            native.clear();
+            None
+        }
+    };
     let (coverage_seq, mut native_block) = if let Some((_, block, coverage)) = native.first() {
         if !context.memory_blocks.is_empty() {
             return Err(AnthropicAdapterError::InvalidContext(
@@ -440,6 +451,14 @@ fn convert_messages(
     } else {
         (None, None)
     };
+
+    if matches!(
+        native_shape,
+        Some(crate::provider::types::NativeReplayShape::NormalizedExactSuffix)
+    ) && let Some(block) = native_block.take()
+    {
+        push_turn(&mut messages, "assistant", vec![block]);
+    }
 
     let mut opaque_by_anchor = BTreeMap::<(String, u64), Vec<&ProviderContextItem>>::new();
     for item in &context.provider_context {
@@ -487,15 +506,7 @@ fn convert_messages(
                     message,
                 )
             }
-            ContextMessage::Synthetic { message } => {
-                if coverage_seq.is_some() && persisted_started {
-                    return Err(AnthropicAdapterError::InvalidContext(
-                        "native compaction suffix requires persisted message sequence numbers"
-                            .into(),
-                    ));
-                }
-                (None, message)
-            }
+            ContextMessage::Synthetic { message } => (None, message),
         };
         match message {
             Message::User(user) => {
@@ -723,9 +734,9 @@ fn validate_native_replay(
     spec: &ModelSpec,
     context: &PromptContext,
     native: &[(&ProviderContextItem, &Value, &NativeCompactionCoverage)],
-) -> Result<(), AnthropicAdapterError> {
+) -> Result<Option<crate::provider::types::NativeReplayShape>, AnthropicAdapterError> {
     let Some((item, block, coverage)) = native.first().copied() else {
-        return Ok(());
+        return Ok(None);
     };
     if native.len() != 1 {
         return Err(AnthropicAdapterError::InvalidContext(
@@ -757,7 +768,32 @@ fn validate_native_replay(
         &context.messages,
         coverage.through_message_seq,
     )
+    .map(Some)
     .map_err(AnthropicAdapterError::InvalidContext)
+}
+
+fn native_context_requires_bound_window(context: &PromptContext) -> bool {
+    context
+        .provider_context
+        .iter()
+        .filter_map(|item| match &item.payload {
+            ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+            | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+                Some(coverage.through_message_seq)
+            }
+            ProviderContextPayload::EncryptedReasoning { .. } => None,
+        })
+        .any(|coverage| {
+            let persisted = context.messages.iter().filter_map(|message| match message {
+                ContextMessage::Persisted { seq, .. } => Some(*seq),
+                ContextMessage::Synthetic { .. } => None,
+            });
+            let mut found = false;
+            let all_after_coverage = persisted
+                .inspect(|_| found = true)
+                .all(|seq| seq > coverage);
+            !found || all_after_coverage
+        })
 }
 
 fn anthropic_user_content(content: &UserContent, supports_images: bool) -> Value {
@@ -1984,11 +2020,39 @@ pub fn request_coverage(
     if !ensure_anthropic_spec(spec)?.supports_native_compact || !native_compaction {
         return Ok(None);
     }
-    let Some(through_message_seq) =
-        crate::provider::types::validate_native_suffix(&context.messages, None)
-            .map_err(AnthropicAdapterError::InvalidContext)?
-    else {
-        return Ok(None);
+    let exact_suffix_coverage = context.provider_context.iter().find_map(|item| {
+        let ProviderContextPayload::AnthropicCompaction { coverage, .. } = &item.payload else {
+            return None;
+        };
+        (!context.messages.iter().any(|message| {
+            matches!(
+                message,
+                ContextMessage::Persisted { seq, .. }
+                    if *seq == coverage.through_message_seq
+            )
+        }))
+        .then_some(coverage.through_message_seq)
+    });
+    let through_message_seq = if let Some(coverage) = exact_suffix_coverage {
+        crate::provider::types::validate_native_window_replay(&context.messages, coverage)
+            .map_err(AnthropicAdapterError::InvalidContext)?;
+        context
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ContextMessage::Persisted { seq, .. } => Some(*seq),
+                ContextMessage::Synthetic { .. } => None,
+            })
+            .expect("validated exact suffix contains persisted history")
+    } else {
+        let Some(through_message_seq) =
+            crate::provider::types::validate_native_suffix(&context.messages, None)
+                .map_err(AnthropicAdapterError::InvalidContext)?
+        else {
+            return Ok(None);
+        };
+        through_message_seq
     };
     let context_fingerprint = context_fingerprint(spec, context).expect("spec was validated above");
     Ok(Some(NativeCompactionCoverage {
@@ -3297,6 +3361,28 @@ mod tests {
         )
         .expect("exact suffix replay");
         assert!(request.to_string().contains("GAP"));
+        assert!(matches!(
+            build_request(&spec, &gap, &RequestOptions::default()),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("requires its bound native Anthropic context")
+        ));
+        if let ProviderContextPayload::AnthropicCompaction { coverage, .. } =
+            &mut gap.provider_context[0].payload
+        {
+            coverage.context_fingerprint = "wrong".into();
+        }
+        assert!(matches!(
+            build_request(
+                &spec,
+                &gap,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("context fingerprint mismatch")
+        ));
     }
 
     #[test]

@@ -880,14 +880,25 @@ fn convert_input(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
+    let bound_native_required = native_context_requires_bound_window(context);
+    let native_enabled = native_compaction && compat.supports_native_compact && !has_foreign_native;
+    let native = if native_enabled {
         match prepare_native_window(spec, context, &compacted) {
             Ok(native) => native,
+            Err(error) if bound_native_required => {
+                return Err(ResponsesAdapterError::InvalidContext(format!(
+                    "cannot discard native context from a normalized exact suffix: {error}"
+                )));
+            }
             Err(error) => {
                 tracing::warn!(reason = %error, "discarded stale Responses native context");
                 None
             }
         }
+    } else if bound_native_required {
+        return Err(ResponsesAdapterError::InvalidContext(
+            "normalized exact suffix requires its bound native Responses context".into(),
+        ));
     } else {
         None
     };
@@ -947,13 +958,9 @@ fn convert_input(
 
     let mut previous_suffix_seq = None;
     let mut suffix_started = false;
-    let mut persisted_started = false;
     for message in &context.messages {
         let (anchor, message) = match message {
             ContextMessage::Persisted { id, seq, message } => {
-                if !persisted_started {
-                    persisted_started = true;
-                }
                 if coverage_seq.is_some_and(|coverage| *seq <= coverage) {
                     if suffix_started {
                         return Err(ResponsesAdapterError::InvalidContext(
@@ -980,15 +987,7 @@ fn convert_input(
                     message,
                 )
             }
-            ContextMessage::Synthetic { message } => {
-                if coverage_seq.is_some() && persisted_started {
-                    return Err(ResponsesAdapterError::InvalidContext(
-                        "native compacted window suffix requires persisted message sequence numbers"
-                            .into(),
-                    ));
-                }
-                (None, message)
-            }
+            ContextMessage::Synthetic { message } => (None, message),
         };
         match message {
             Message::User(user) => {
@@ -1179,6 +1178,30 @@ fn convert_input(
         ));
     }
     Ok(output)
+}
+
+fn native_context_requires_bound_window(context: &PromptContext) -> bool {
+    context
+        .provider_context
+        .iter()
+        .filter_map(|item| match &item.payload {
+            ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+            | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+                Some(coverage.through_message_seq)
+            }
+            ProviderContextPayload::EncryptedReasoning { .. } => None,
+        })
+        .any(|coverage| {
+            let persisted = context.messages.iter().filter_map(|message| match message {
+                ContextMessage::Persisted { seq, .. } => Some(*seq),
+                ContextMessage::Synthetic { .. } => None,
+            });
+            let mut found = false;
+            let all_after_coverage = persisted
+                .inspect(|_| found = true)
+                .all(|seq| seq > coverage);
+            !found || all_after_coverage
+        })
 }
 
 fn prepare_native_window(
@@ -4723,6 +4746,27 @@ mod tests {
         let exact_suffix = Value::Array(exact_suffix).to_string();
         assert!(exact_suffix.contains("message-10"));
         assert!(exact_suffix.contains("opaque"));
+        assert!(matches!(
+            convert_input(&spec, &context, false),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("requires its bound native Responses context")
+        ));
+        let exact_fingerprint = context_fingerprint(&spec, &context).unwrap();
+        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
+            &mut context.provider_context[0].payload
+        {
+            coverage.context_fingerprint = "wrong".into();
+        }
+        assert!(matches!(
+            convert_input(&spec, &context, true),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("cannot discard native context")
+        ));
+        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
+            &mut context.provider_context[0].payload
+        {
+            coverage.context_fingerprint = exact_fingerprint;
+        }
         context.messages = vec![
             persisted_user(9),
             ContextMessage::Synthetic {
@@ -4732,8 +4776,13 @@ mod tests {
                 }),
             },
         ];
-        let fallback = convert_input(&spec, &context, true).expect("placement fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
+        let normalized_suffix =
+            convert_input(&spec, &context, true).expect("normalized exact suffix");
+        assert!(
+            Value::Array(normalized_suffix)
+                .to_string()
+                .contains("opaque")
+        );
     }
 
     #[test]
