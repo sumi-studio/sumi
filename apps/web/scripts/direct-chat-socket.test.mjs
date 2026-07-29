@@ -79,6 +79,23 @@ test("retries an uncertain command with its original key and stops after accepta
   socket.close();
 });
 
+test("a terminal idempotency conflict clears its pending key without reconnect resend", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  socket.sendCommand({ type: "abort" }, "conflicting-key");
+  first.receive({ type: "command_rejected", idempotency_key: "conflicting-key", reject_reason: "idempotency_conflict" });
+  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  first.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  socket.close();
+});
+
 test("tracks browser connection separately from authoritative agent readiness", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
