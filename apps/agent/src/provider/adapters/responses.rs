@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{self, Write},
+};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -2139,8 +2142,9 @@ impl ResponsesReceiveState {
                 Ok(ResponsesPush::default())
             }
             "reasoning" => {
+                validate_canonical_reasoning_item(item)
+                    .map_err(ResponsesAdapterError::InvalidEvent)?;
                 let final_summary = reasoning_summary_text(item)?;
-                validate_reasoning_content(item).map_err(ResponsesAdapterError::InvalidEvent)?;
                 let Some(OutputSlot::Reasoning {
                     id,
                     summary_slot,
@@ -2170,7 +2174,11 @@ impl ResponsesReceiveState {
                 let started = *started;
                 let summary_slot = *summary_slot;
                 let encrypted = optional_encrypted_content(item)?;
-                self.commit_charges(encrypted.map_or(0, str::len), usize::from(started), 0)?;
+                // Durability replays the canonical JSON object as a whole, so
+                // its complete compact footprint belongs to adapter state.
+                let retained_item_bytes =
+                    serialized_json_bytes(item, self.budget.max_content_bytes)?;
+                self.commit_charges(retained_item_bytes, usize::from(started), 0)?;
                 self.completed_items
                     .insert(index, Value::Object(item.clone()));
                 self.slots.remove(&index);
@@ -2295,8 +2303,12 @@ impl ResponsesReceiveState {
             } else {
                 (String::new(), String::new())
             };
-            let (provider_context, opaque_bytes) =
-                backfilled_reasoning_fragments(response, &self.reasoning_fragments)?;
+            let (provider_context, opaque_bytes) = backfilled_reasoning_fragments(
+                response,
+                &self.reasoning_fragments,
+                self.content_bytes,
+                self.budget.max_content_bytes,
+            )?;
             let mut events = Vec::new();
             self.commit_charges(opaque_bytes, self.slots.len().saturating_add(1), 0)?;
             self.reasoning_fragments = provider_context;
@@ -2603,6 +2615,46 @@ fn checked_counter(
     Ok(next)
 }
 
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(bytes) = self.bytes.checked_add(buffer.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::other("serialized JSON byte count overflowed"));
+        };
+        self.bytes = bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes(
+    value: &Map<String, Value>,
+    limit: usize,
+) -> Result<usize, ResponsesAdapterError> {
+    let mut counter = JsonByteCounter::default();
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if counter.overflowed {
+            return Err(ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit,
+            });
+        }
+        return Err(ResponsesAdapterError::InvalidEvent(format!(
+            "reasoning item serialization failed: {error}"
+        )));
+    }
+    Ok(counter.bytes)
+}
+
 fn required_str<'a>(
     object: &'a Map<String, Value>,
     field: &str,
@@ -2889,6 +2941,8 @@ fn item_identity_bytes(item: &Map<String, Value>) -> Result<usize, ResponsesAdap
 fn backfilled_reasoning_fragments(
     response: &Map<String, Value>,
     fragments: &[(String, ProviderContextFragment)],
+    current_content_bytes: usize,
+    max_content_bytes: usize,
 ) -> Result<(Vec<(String, ProviderContextFragment)>, usize), ResponsesAdapterError> {
     let output = response
         .get("output")
@@ -2899,6 +2953,11 @@ fn backfilled_reasoning_fragments(
     if output.is_empty() {
         return Ok((fragments.to_vec(), 0));
     }
+    let retained_ids = fragments
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    let mut additional_bytes = 0usize;
     let mut encrypted = HashMap::new();
     for (index, item) in output.iter().enumerate() {
         let Some(item) = item.as_object() else {
@@ -2917,10 +2976,28 @@ fn backfilled_reasoning_fragments(
         } else {
             None
         };
-        if let Some(encrypted_content) = encrypted_content
-            && encrypted
+        if encrypted_content.is_some() {
+            let id = required_str(item, "id")?;
+            if !retained_ids.contains(id) {
+                // Preflight a terminal-only opaque item before cloning it into
+                // the retained context returned to the consumer.
+                let retained_item_bytes = serialized_json_bytes(item, max_content_bytes)?;
+                additional_bytes = additional_bytes.checked_add(retained_item_bytes).ok_or(
+                    ResponsesAdapterError::ResponseLimitExceeded {
+                        resource: "content_bytes",
+                        limit: max_content_bytes,
+                    },
+                )?;
+                checked_counter(
+                    current_content_bytes,
+                    additional_bytes,
+                    max_content_bytes,
+                    "content_bytes",
+                )?;
+            }
+            if encrypted
                 .insert(
-                    required_str(item, "id")?.to_owned(),
+                    id.to_owned(),
                     (
                         u32::try_from(index).map_err(|_| {
                             ResponsesAdapterError::InvalidEvent(
@@ -2928,14 +3005,14 @@ fn backfilled_reasoning_fragments(
                             )
                         })?,
                         item.clone(),
-                        encrypted_content.len(),
                     ),
                 )
                 .is_some()
-        {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "duplicate encrypted reasoning id in terminal output".into(),
-            ));
+            {
+                return Err(ResponsesAdapterError::InvalidEvent(
+                    "duplicate encrypted reasoning id in terminal output".into(),
+                ));
+            }
         }
     }
     let mut result = fragments.to_vec();
@@ -2946,7 +3023,7 @@ fn backfilled_reasoning_fragments(
                 "duplicate retained reasoning fragment id".into(),
             ));
         }
-        let Some((index, item, _)) = encrypted.remove(id) else {
+        let Some((index, item)) = encrypted.remove(id) else {
             return Err(ResponsesAdapterError::InvalidEvent(
                 "retained encrypted reasoning is orphaned from terminal output".into(),
             ));
@@ -2961,14 +3038,7 @@ fn backfilled_reasoning_fragments(
             item: Value::Object(item),
         };
     }
-    let mut additional_bytes = 0usize;
-    for (id, (index, item, encrypted_len)) in encrypted {
-        additional_bytes = additional_bytes.checked_add(encrypted_len).ok_or(
-            ResponsesAdapterError::ResponseLimitExceeded {
-                resource: "content_bytes",
-                limit: usize::MAX,
-            },
-        )?;
+    for (id, (index, item)) in encrypted {
         result.push((
             id,
             ProviderContextFragment {
@@ -3097,52 +3167,7 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
             validate_optional_caller(object.get("caller"), "function_call_output", true)?;
         }
         "reasoning" => {
-            ensure_only_fields(
-                object,
-                &[
-                    "id",
-                    "summary",
-                    "type",
-                    "content",
-                    "encrypted_content",
-                    "status",
-                ],
-                "reasoning",
-            )?;
-            if !object.get("id").is_some_and(Value::is_string)
-                || !object.get("summary").is_some_and(Value::is_array)
-            {
-                return Err("invalid reasoning item".into());
-            }
-            for part in object["summary"]
-                .as_array()
-                .expect("checked reasoning summary array")
-            {
-                let part = part
-                    .as_object()
-                    .ok_or_else(|| "reasoning summary part must be an object".to_owned())?;
-                ensure_only_fields(part, &["text", "type"], "reasoning summary part")?;
-                if part.get("type").and_then(Value::as_str) != Some("summary_text")
-                    || !part.get("text").is_some_and(Value::is_string)
-                {
-                    return Err(
-                        "reasoning summary part must be summary_text with string text".into(),
-                    );
-                }
-            }
-            validate_reasoning_content(object)?;
-            if let Some(encrypted) = object.get("encrypted_content") {
-                match encrypted {
-                    Value::Null => {}
-                    Value::String(encrypted) if !encrypted.is_empty() => {}
-                    _ => {
-                        return Err(
-                            "reasoning encrypted_content must be null or a non-empty string".into(),
-                        );
-                    }
-                }
-            }
-            validate_optional_status(object, "reasoning", false)?;
+            validate_canonical_reasoning_item(object)?;
         }
         "compaction" => {
             ensure_only_fields(
@@ -3406,6 +3431,53 @@ fn require_u64(object: &Map<String, Value>, field: &str, parent: &str) -> Result
     } else {
         Err(format!("{parent} {field} must be a non-negative integer"))
     }
+}
+
+fn validate_canonical_reasoning_item(object: &Map<String, Value>) -> Result<(), String> {
+    ensure_only_fields(
+        object,
+        &[
+            "id",
+            "summary",
+            "type",
+            "content",
+            "encrypted_content",
+            "status",
+        ],
+        "reasoning",
+    )?;
+    if !object.get("id").is_some_and(Value::is_string)
+        || !object.get("summary").is_some_and(Value::is_array)
+    {
+        return Err("invalid reasoning item".into());
+    }
+    for part in object["summary"]
+        .as_array()
+        .expect("checked reasoning summary array")
+    {
+        let part = part
+            .as_object()
+            .ok_or_else(|| "reasoning summary part must be an object".to_owned())?;
+        ensure_only_fields(part, &["text", "type"], "reasoning summary part")?;
+        if part.get("type").and_then(Value::as_str) != Some("summary_text")
+            || !part.get("text").is_some_and(Value::is_string)
+        {
+            return Err("reasoning summary part must be summary_text with string text".into());
+        }
+    }
+    validate_reasoning_content(object)?;
+    if let Some(encrypted) = object.get("encrypted_content") {
+        match encrypted {
+            Value::Null => {}
+            Value::String(encrypted) if !encrypted.is_empty() => {}
+            _ => {
+                return Err(
+                    "reasoning encrypted_content must be null or a non-empty string".into(),
+                );
+            }
+        }
+    }
+    validate_optional_status(object, "reasoning", false)
 }
 
 fn validate_reasoning_content(object: &Map<String, Value>) -> Result<(), String> {
@@ -4976,8 +5048,32 @@ mod tests {
             r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
         ).is_err());
 
+        let retained = json!({
+            "id":"r",
+            "type":"reasoning",
+            "summary":[],
+            "content":[{"type":"reasoning_text","text":"retained"}],
+            "encrypted_content":"x"
+        });
+        let retained_bytes =
+            serialized_json_bytes(retained.as_object().expect("item object"), usize::MAX).unwrap();
+        assert!(retained_bytes > 2);
+        let without_encrypted = json!({"id":"r","type":"reasoning","summary":[]});
+        let without_encrypted_bytes = serialized_json_bytes(
+            without_encrypted.as_object().expect("item object"),
+            usize::MAX,
+        )
+        .unwrap();
+        let terminal_backfill =
+            json!({"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"});
+        let terminal_backfill_bytes = serialized_json_bytes(
+            terminal_backfill.as_object().expect("item object"),
+            usize::MAX,
+        )
+        .unwrap();
         let budget = ResponseBudget {
-            max_content_bytes: 1,
+            // The old accounting of id + encrypted_content would accept this item.
+            max_content_bytes: 2,
             max_wire_bytes: usize::MAX,
             max_events: usize::MAX,
             max_preview_work_bytes: usize::MAX,
@@ -4989,14 +5085,22 @@ mod tests {
         ).unwrap();
         assert!(matches!(
             state.push_json(
-                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}}"#,
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"retained"}],"encrypted_content":"x"}}"#,
             ),
             Err(ResponsesAdapterError::ResponseLimitExceeded { resource: "content_bytes", .. })
         ));
         assert!(state.provider_context().is_empty());
+        assert!(state.completed_items.is_empty());
+        state.budget.max_content_bytes = 1 + without_encrypted_bytes;
         state.push_json(
             r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
         ).expect("failed opaque charge did not mutate semantic state");
+        assert_eq!(state.content_bytes, 1 + without_encrypted_bytes);
+
+        // A terminal-only encrypted-content backfill retains another complete
+        // canonical item, not only the encrypted string.
+        state.budget.max_content_bytes =
+            state.content_bytes + "resp".len() + "gpt-5.6".len() + terminal_backfill_bytes - 1;
         let terminal = r#"{"type":"response.completed","sequence_number":2,"response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}}"#;
         assert!(matches!(
             state.push_json(terminal),
@@ -5006,6 +5110,13 @@ mod tests {
             })
         ));
         assert!(state.provider_context().is_empty());
+        state.budget.max_content_bytes += 1;
+        let terminal = state
+            .push_json(terminal)
+            .expect("exact full-item backfill budget is accepted")
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.provider_context.len(), 1);
     }
 
     #[test]
@@ -5586,7 +5697,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_item_content_is_validated_before_stream_state_or_context_mutation() {
+    fn reasoning_items_are_canonical_before_stream_state_or_context_mutation() {
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         assert!(state
             .push_json(
@@ -5608,6 +5719,21 @@ mod tests {
             state.event_count,
             state.completed_items.len(),
             state.reasoning_fragments.len(),
+        );
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"future_provider_field":"not canonical","encrypted_content":"opaque"}}"#,
+            )
+            .is_err());
+        assert_eq!(
+            (
+                state.next_sequence_number,
+                state.content_bytes,
+                state.event_count,
+                state.completed_items.len(),
+                state.reasoning_fragments.len(),
+            ),
+            before_done
         );
         assert!(state
             .push_json(
