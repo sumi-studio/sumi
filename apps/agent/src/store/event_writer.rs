@@ -76,6 +76,35 @@ use super::{
 
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
+const INBOUND_ADMISSION_RECORD_VERSION: u8 = 2;
+const INBOUND_ADMISSION_RECORD_HMAC_DOMAIN: &[u8] = b"sumi-inbound-admission-record/v2";
+
+#[derive(Serialize)]
+struct InboundAdmissionRecordV2<'a> {
+    version: u8,
+    seq: u64,
+    command_id: &'a str,
+    personality_agent_id: &'a str,
+    provenance_json: &'a str,
+    command_kind: &'a str,
+    payload_key_ref: &'a str,
+    payload_hmac: &'a [u8],
+    reject_reason: Option<&'a str>,
+    reject_actual_bytes: Option<u64>,
+}
+
+fn admission_record_hmac(
+    key: &super::crypto::DataKeyMaterial,
+    record: &InboundAdmissionRecordV2<'_>,
+) -> Result<Vec<u8>> {
+    let canonical = serde_json::to_vec(record)
+        .context("failed to serialize canonical inbound admission record")?;
+    Ok(super::crypto::keyed_proof(
+        key,
+        INBOUND_ADMISSION_RECORD_HMAC_DOMAIN,
+        &canonical,
+    ))
+}
 
 #[derive(Serialize)]
 struct MemorySummaryPayload<'a> {
@@ -1048,6 +1077,8 @@ pub(crate) enum Projection {
     CommandRejected {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         raw_command: RejectedCommandPayload,
         payload_digest: Option<KeyedCommandDigest>,
@@ -1319,6 +1350,8 @@ enum PreparedProjection {
     CommandInsert {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance_json: String,
         command_kind: &'static str,
         payload_key_ref: String,
         payload_key_proof: Vec<u8>,
@@ -1327,6 +1360,7 @@ enum PreparedProjection {
         status: &'static str,
         reject_reason: Option<&'static str>,
         reject_actual_bytes: Option<u64>,
+        admission_record_hmac: Vec<u8>,
     },
     ProviderContextMutation {
         mutation_id: String,
@@ -1530,6 +1564,8 @@ struct CommandInsertInput<'a> {
     key: &'a super::crypto::DataKeyMaterial,
     seq: u64,
     command_id: String,
+    personality_agent_id: &'a PersonalityAgentId,
+    provenance: &'a DirectChatProvenanceV1,
     command_kind: &'static str,
     canonical_payload: &'a [u8],
     rejection: Option<CommandRejectReason>,
@@ -1967,6 +2003,13 @@ impl EventWriter {
         admission: InboundAdmissionMode,
     ) -> Result<InboundReceipt> {
         let mut guard = self.gate.lock().await;
+        if inbound.personality_agent_id() != self.store.scope().personality_agent_id() {
+            bail!("inbound command targets a different private personality-agent store");
+        }
+        inbound
+            .provenance()
+            .validate(self.store.scope().personality_agent_id())
+            .context("inbound command provenance does not match the private store")?;
         if let InboundCommand::Invalid {
             reason,
             raw_command,
@@ -2034,6 +2077,7 @@ impl EventWriter {
                 command_id,
                 command_kind,
                 rejection,
+                inbound.provenance(),
                 &canonical_payload,
                 payload_digest,
             )
@@ -2062,12 +2106,16 @@ impl EventWriter {
             InboundCommand::Invalid {
                 seq,
                 command_id,
+                personality_agent_id,
+                provenance,
                 reason,
                 raw_command,
                 payload_digest,
             } => Projection::CommandRejected {
                 seq: *seq,
                 command_id: command_id.to_string(),
+                personality_agent_id: personality_agent_id.clone(),
+                provenance: provenance.clone(),
                 reason: reason.clone(),
                 raw_command: raw_command.clone(),
                 payload_digest: payload_digest.clone(),
@@ -3327,6 +3375,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq: envelope.seq,
                             command_id: envelope.command_id.to_string(),
+                            personality_agent_id: &envelope.personality_agent_id,
+                            provenance: &envelope.provenance,
                             command_kind: command_kind(&envelope.command),
                             canonical_payload: &payload,
                             rejection: None,
@@ -3341,6 +3391,8 @@ impl EventWriter {
                     Projection::CommandRejected {
                         seq,
                         command_id,
+                        personality_agent_id,
+                        provenance,
                         reason,
                         raw_command,
                         payload_digest,
@@ -3349,6 +3401,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq,
                             command_id,
+                            personality_agent_id: &personality_agent_id,
+                            provenance: &provenance,
                             command_kind: "invalid",
                             canonical_payload: raw_command.authenticated_bytes().unwrap_or(&[]),
                             rejection: Some(reason),
@@ -3464,11 +3518,21 @@ impl EventWriter {
             key,
             seq,
             command_id,
+            personality_agent_id,
+            provenance,
             command_kind,
             canonical_payload,
             rejection,
             provided_digest,
         } = input;
+        if personality_agent_id != self.store.scope().personality_agent_id() {
+            bail!("command insert targets a different private personality-agent store");
+        }
+        provenance
+            .validate(personality_agent_id)
+            .context("command insert provenance target mismatch")?;
+        let provenance_json =
+            serde_json::to_string(provenance).context("failed to serialize command provenance")?;
         let aad = self.store.scope().row_aad(
             "inbound_commands",
             seq.to_string(),
@@ -3506,9 +3570,26 @@ impl EventWriter {
             ),
             None => ("received", None, None),
         };
+        let admission_record_hmac = admission_record_hmac(
+            key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq,
+                command_id: &command_id,
+                personality_agent_id: personality_agent_id.as_str(),
+                provenance_json: &provenance_json,
+                command_kind,
+                payload_key_ref: &key.key_ref,
+                payload_hmac: &payload_hmac,
+                reject_reason,
+                reject_actual_bytes,
+            },
+        )?;
         Ok(PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id: personality_agent_id.clone(),
+            provenance_json,
             command_kind,
             payload_key_ref: key.key_ref.clone(),
             payload_key_proof: super::crypto::keyed_proof(
@@ -3521,6 +3602,7 @@ impl EventWriter {
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         })
     }
 
@@ -4506,7 +4588,9 @@ impl EventWriter {
         let mut group: Option<(InjectionApplication, String, String)> = None;
         for (command, expected) in commands.iter().zip(expected) {
             let row = sqlx::query(
-                "SELECT command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
+                "SELECT personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                        payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                        admission_record_version, admission_record_hmac,
                         status, run_phase, application_kind, run_id, turn_id, received_at
                  FROM inbound_commands
                  WHERE seq = ? AND command_id = ?",
@@ -4575,6 +4659,50 @@ impl EventWriter {
                 Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
             let digest: Vec<u8> = row.try_get("payload_hmac")?;
             verify_command_payload_digest(&key, &plaintext, &digest)?;
+            let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+            let provenance_json: String = row.try_get("provenance_json")?;
+            let persisted_provenance: DirectChatProvenanceV1 =
+                serde_json::from_str(&provenance_json)
+                    .context("durable injected command provenance is invalid")?;
+            if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+                || persisted_provenance != command.provenance
+                || serde_json::to_string(&persisted_provenance)? != provenance_json
+            {
+                bail!("injected command provenance does not exactly match its durable receipt");
+            }
+            let admission_record_version: i64 = row.try_get("admission_record_version")?;
+            if admission_record_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+                bail!("unsupported inbound admission record version");
+            }
+            let reject_reason: Option<String> = row.try_get("reject_reason")?;
+            let reject_actual_bytes = row
+                .try_get::<Option<i64>, _>("reject_actual_bytes")?
+                .map(|value| sqlite_u64(value, "rejected command byte count"))
+                .transpose()?;
+            let expected_admission_hmac = admission_record_hmac(
+                &key,
+                &InboundAdmissionRecordV2 {
+                    version: INBOUND_ADMISSION_RECORD_VERSION,
+                    seq: command.seq,
+                    command_id: command.command_id.as_str(),
+                    personality_agent_id: &stored_personality_agent_id,
+                    provenance_json: &provenance_json,
+                    command_kind: &command_kind,
+                    payload_key_ref: &key_ref,
+                    payload_hmac: &digest,
+                    reject_reason: reject_reason.as_deref(),
+                    reject_actual_bytes,
+                },
+            )?;
+            let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+            if expected_admission_hmac
+                .as_slice()
+                .ct_eq(&stored_admission_hmac)
+                .unwrap_u8()
+                != 1
+            {
+                bail!("inbound admission record HMAC mismatch");
+            }
 
             let mut parsed: Command = serde_json::from_slice(&plaintext)
                 .context("durable injected command payload is invalid")?;
@@ -4700,12 +4828,14 @@ impl EventWriter {
         command_id: &str,
         incoming_kind: &str,
         incoming_rejection: Option<&CommandRejectReason>,
+        incoming_provenance: &DirectChatProvenanceV1,
         canonical_payload: &[u8],
         incoming_digest: Option<&KeyedCommandDigest>,
     ) -> Result<Option<CommandAck>> {
         let by_id = sqlx::query(
-            "SELECT seq, command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
-                    reject_reason, reject_actual_bytes
+            "SELECT seq, personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                    payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac
              FROM inbound_commands WHERE command_id = ?",
         )
         .bind(command_id)
@@ -4757,6 +4887,53 @@ impl EventWriter {
             bail!("command replay references a non-command data key");
         }
         let digest: Vec<u8> = row.try_get("payload_hmac")?;
+        let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+        if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+            || stored_personality_agent_id != incoming_provenance.personality_agent_id().as_str()
+        {
+            bail!("command replay personality-agent identity mismatch");
+        }
+        let provenance_json: String = row.try_get("provenance_json")?;
+        let stored_provenance: DirectChatProvenanceV1 = serde_json::from_str(&provenance_json)
+            .context("persisted command provenance is invalid")?;
+        let canonical_stored_provenance = serde_json::to_string(&stored_provenance)
+            .context("failed to canonicalize persisted command provenance")?;
+        if provenance_json != canonical_stored_provenance
+            || &stored_provenance != incoming_provenance
+        {
+            bail!("command replay provenance mismatch");
+        }
+        let admission_version: i64 = row.try_get("admission_record_version")?;
+        if admission_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+            bail!("unsupported inbound admission record version");
+        }
+        let reject_actual_bytes = stored_actual
+            .map(|value| sqlite_u64(value, "rejected command byte count"))
+            .transpose()?;
+        let expected_admission_hmac = admission_record_hmac(
+            &key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq: stored_seq,
+                command_id,
+                personality_agent_id: &stored_personality_agent_id,
+                provenance_json: &provenance_json,
+                command_kind: &stored_kind,
+                payload_key_ref: &key_ref,
+                payload_hmac: &digest,
+                reject_reason: stored_reason.as_deref(),
+                reject_actual_bytes,
+            },
+        )?;
+        let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+        if expected_admission_hmac
+            .as_slice()
+            .ct_eq(&stored_admission_hmac)
+            .unwrap_u8()
+            != 1
+        {
+            bail!("inbound admission record HMAC mismatch");
+        }
         let ciphertext = row.try_get::<Option<Vec<u8>>, _>("payload_ciphertext")?;
         if let Some(incoming_digest) = incoming_digest {
             if incoming_digest.key_ref() != key_ref {
@@ -4804,6 +4981,7 @@ impl EventWriter {
         Ok(Some(CommandAck {
             seq: sqlite_u64(row.get::<i64, _>("seq"), "stored command sequence")?,
             command_id: command_id.to_owned(),
+            personality_agent_id: self.store.scope().personality_agent_id.clone(),
             status,
             reject_reason: row.try_get("reject_reason")?,
         }))
@@ -11828,6 +12006,8 @@ async fn apply_projection(
         PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id,
+            provenance_json,
             command_kind,
             payload_key_ref,
             payload_key_proof: _,
@@ -11836,16 +12016,21 @@ async fn apply_projection(
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         } => {
             sqlx::query(
                 "INSERT INTO inbound_commands(
-                    seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                    seq, command_id, personality_agent_id, provenance_json,
+                    command_kind, payload_ciphertext, payload_key_ref,
                     payload_hmac, status, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac,
                     application_kind, run_id, turn_id, run_phase, received_at, applied_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
             )
             .bind(sqlite_i64(seq, "command sequence")?)
             .bind(command_id)
+            .bind(personality_agent_id.as_str())
+            .bind(provenance_json)
             .bind(command_kind)
             .bind(payload_ciphertext)
             .bind(payload_key_ref)
@@ -11857,6 +12042,8 @@ async fn apply_projection(
                     .map(|value| sqlite_i64(value, "rejected command byte count"))
                     .transpose()?,
             )
+            .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+            .bind(admission_record_hmac)
             .bind(Utc::now().to_rfc3339())
             .bind(if status == "rejected" {
                 Some(Utc::now().to_rfc3339())
@@ -24226,6 +24413,8 @@ mod tests {
                     projections: vec![Projection::CommandRejected {
                         seq: 1,
                         command_id: "00000000-0000-4000-8000-000000000021".to_owned(),
+                        personality_agent_id: scope().personality_agent_id,
+                        provenance: test_provenance(),
                         reason: CommandRejectReason::SchemaViolation,
                         raw_command: RejectedCommandPayload::Present(
                             crate::gateway::SensitiveCommandPayload::new(

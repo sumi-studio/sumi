@@ -96,6 +96,9 @@ CREATE TABLE event_log_heads (
 CREATE TABLE inbound_commands (
   seq INTEGER PRIMARY KEY CHECK (seq >= 0),
   command_id TEXT NOT NULL UNIQUE,
+  personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
+  provenance_json TEXT NOT NULL,
   command_kind TEXT NOT NULL,
   payload_ciphertext BLOB,
   payload_key_ref TEXT REFERENCES data_keys(key_ref),
@@ -103,6 +106,8 @@ CREATE TABLE inbound_commands (
   status TEXT NOT NULL,
   reject_reason TEXT,
   reject_actual_bytes INTEGER,
+  admission_record_version INTEGER NOT NULL CHECK (admission_record_version = 2),
+  admission_record_hmac BLOB NOT NULL CHECK (length(admission_record_hmac) = 32),
   application_kind TEXT,
   run_id TEXT,
   turn_id TEXT,
