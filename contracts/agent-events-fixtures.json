@@ -5,7 +5,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 1,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": { "type": "agent_start" }
       }
     }
@@ -16,7 +16,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 2,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -31,7 +31,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 3,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "message_start",
           "message_id": "00000000-0000-4000-8000-000000000002",
@@ -50,7 +50,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 4,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "message_end",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -117,7 +117,6 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
-        "conversation_id": "conversation-1",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -135,7 +134,6 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
-        "conversation_id": "conversation-1",
         "event": {
           "type": "error",
           "message": "bad"
@@ -150,6 +148,7 @@
       "ack": {
         "seq": 5,
         "command_id": "00000000-0000-4000-8000-000000000001",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "status": "received"
       }
     }
@@ -161,6 +160,7 @@
       "ack": {
         "seq": 6,
         "command_id": "00000000-0000-4000-8000-000000000001",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "status": "rejected",
         "reject_reason": "oversized"
       }
@@ -171,6 +171,14 @@
     "wire": {
       "seq": 1,
       "command_id": "00000000-0000-4000-8000-000000000001",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+      "provenance": {
+        "version": 1,
+        "tenant_id": "tenant-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "actor": { "kind": "human", "principal_id": "alice@example.com" },
+        "source": { "surface": "direct_chat" }
+      },
       "command": {
         "type": "user_message",
         "text": "hi",
@@ -183,6 +191,14 @@
     "wire": {
       "seq": 2,
       "command_id": "00000000-0000-4000-8000-000000000002",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+      "provenance": {
+        "version": 1,
+        "tenant_id": "tenant-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "actor": { "kind": "human", "principal_id": "bob@example.com" },
+        "source": { "surface": "direct_chat" }
+      },
       "command": { "type": "abort" }
     }
   },
@@ -191,6 +207,14 @@
     "wire": {
       "seq": 3,
       "command_id": "00000000-0000-4000-8000-000000000003",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+      "provenance": {
+        "version": 1,
+        "tenant_id": "tenant-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "actor": { "kind": "human", "principal_id": "alice@example.com" },
+        "source": { "surface": "direct_chat" }
+      },
       "command": {
         "type": "approval_decision",
         "request_id": "req-1",
@@ -203,6 +227,14 @@
     "wire": {
       "seq": 4,
       "command_id": "00000000-0000-4000-8000-000000000004",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+      "provenance": {
+        "version": 1,
+        "tenant_id": "tenant-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "actor": { "kind": "human", "principal_id": "bob@example.com" },
+        "source": { "surface": "direct_chat" }
+      },
       "command": {
         "type": "approval_decision",
         "request_id": "req-2",
@@ -319,7 +351,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 9007199254740991,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": { "type": "agent_start" }
       }
     }
@@ -359,7 +391,6 @@
     "wire": {
       "frame_type": "event",
       "envelope": {
-        "conversation_id": "conversation-1",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -402,7 +433,7 @@
       "frame_type": "event",
       "envelope": {
         "seq": 10,
-        "conversation_id": "conversation-1",
+        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -438,7 +469,7 @@
   "agent_hello": {
     "kind": "agent_hello",
     "wire": {
-      "agent_id": "agent-1",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "generation": "7",
       "last_sent_event_seq": "0",
       "last_received_command_seq": "0",
@@ -448,6 +479,7 @@
   "api_hello": {
     "kind": "api_hello",
     "wire": {
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "accepted_generation": "7",
       "last_received_event_seq": "3",
       "next_command_seq": "2"
@@ -456,7 +488,7 @@
   "agent_hello_max_seq": {
     "kind": "agent_hello",
     "wire": {
-      "agent_id": "agent-1",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "generation": "7",
       "last_sent_event_seq": "9007199254740991",
       "last_received_command_seq": "9007199254740991",
@@ -466,6 +498,7 @@
   "api_hello_max_seq": {
     "kind": "api_hello",
     "wire": {
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "accepted_generation": "7",
       "last_received_event_seq": "9007199254740991",
       "next_command_seq": "9007199254740991"
@@ -474,7 +507,7 @@
   "agent_hello_max_safe_generation": {
     "kind": "agent_hello",
     "wire": {
-      "agent_id": "agent-1",
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "generation": "9007199254740991",
       "last_sent_event_seq": "0",
       "last_received_command_seq": "0",
@@ -484,6 +517,7 @@
   "api_hello_max_safe_generation": {
     "kind": "api_hello",
     "wire": {
+      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
       "accepted_generation": "9007199254740991",
       "last_received_event_seq": "0",
       "next_command_seq": "1"
@@ -501,31 +535,7 @@
     "wire": {
       "type": "command",
       "idempotency_key": "00000000-0000-4000-8000-000000000001",
-      "command": {
-        "type": "user_message",
-        "text": "hello",
-        "attachments": []
-      }
-    }
-  },
-  "browser_command_frame_abort": {
-    "kind": "browser_command_frame",
-    "wire": {
-      "type": "command",
-      "idempotency_key": "00000000-0000-4000-8000-000000000002",
-      "command": { "type": "abort" }
-    }
-  },
-  "browser_command_frame_approval": {
-    "kind": "browser_command_frame",
-    "wire": {
-      "type": "command",
-      "idempotency_key": "00000000-0000-4000-8000-000000000003",
-      "command": {
-        "type": "approval_decision",
-        "request_id": "00000000-0000-4000-8000-000000000004",
-        "decision": { "type": "approve_once" }
-      }
+      "content": "hello"
     }
   },
   "browser_event_frame": {
@@ -534,7 +544,6 @@
       "type": "event",
       "envelope": {
         "seq": 1,
-        "conversation_id": "conversation-1",
         "event": { "type": "agent_start" }
       }
     }
@@ -543,21 +552,16 @@
     "kind": "browser_command_accepted",
     "wire": {
       "type": "command_accepted",
-      "envelope": {
-        "seq": 1,
-        "command_id": "00000000-0000-4000-8000-000000000001",
-        "command": {
-          "type": "user_message",
-          "text": "hello",
-          "attachments": []
-        }
-      }
+      "idempotency_key": "00000000-0000-4000-8000-000000000001",
+      "command_id": "00000000-0000-4000-8000-000000000001",
+      "seq": 1
     }
   },
   "browser_command_rejected": {
     "kind": "browser_command_rejected",
     "wire": {
       "type": "command_rejected",
+      "idempotency_key": "00000000-0000-4000-8000-000000000001",
       "reject_reason": "unknown_command"
     }
   },
@@ -565,7 +569,23 @@
     "kind": "browser_command_rejected",
     "wire": {
       "type": "command_rejected",
+      "idempotency_key": "00000000-0000-4000-8000-000000000002",
       "reject_reason": "not_allowed"
+    }
+  },
+  "browser_direct_chat_status": {
+    "kind": "browser_direct_chat_status",
+    "wire": {
+      "type": "direct_chat_status",
+      "status": "ready"
+    }
+  },
+  "browser_command_rejected_idempotency_conflict": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "idempotency_key": "00000000-0000-4000-8000-000000000003",
+      "reject_reason": "idempotency_conflict"
     }
   }
 }

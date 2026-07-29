@@ -52,6 +52,7 @@ const kindToDef = {
   browser_event_frame: "BrowserEventFrame",
   browser_command_accepted: "BrowserCommandAcceptedFrame",
   browser_command_rejected: "BrowserCommandRejectedFrame",
+  browser_direct_chat_status: "DirectChatStatusFrame",
 };
 
 const validators = new Map();
@@ -73,6 +74,36 @@ function describeErrors(errors) {
 
 const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
 let failed = false;
+
+for (const route of ["/direct-chat/commands", "/direct-chat/ws"]) {
+  if (openApi.paths?.[route] === undefined) {
+    console.error(`OpenAPI is missing required direct-chat route ${route}`);
+    failed = true;
+  }
+}
+for (const legacyRoute of [
+  "/conversations/{conversation_id}/commands",
+  "/conversations/{conversation_id}/ws",
+]) {
+  if (openApi.paths?.[legacyRoute] !== undefined) {
+    console.error(`OpenAPI still exposes legacy route ${legacyRoute}`);
+    failed = true;
+  }
+}
+
+const directChatPost = openApi.paths?.["/direct-chat/commands"]?.post;
+const idempotencyParameter = directChatPost?.parameters?.find(
+  (parameter) => parameter.in === "header" && parameter.name === "Idempotency-Key",
+);
+if (
+  !idempotencyParameter?.required ||
+  idempotencyParameter.schema?.minLength !== 1 ||
+  idempotencyParameter.schema?.maxLength !== 1024 ||
+  directChatPost?.responses?.["409"] === undefined
+) {
+  console.error("Direct-chat HTTP admission must require Idempotency-Key (1..1024) and expose 409.");
+  failed = true;
+}
 
 const boundedDecimalCases = [
   {
@@ -172,7 +203,6 @@ const counterexamples = [
     name: "volatile envelope with disallowed seq",
     def: "Envelope",
     value: {
-      conversation_id: "conversation-1",
       event: { type: "error", message: "x" },
       seq: 1,
     },
@@ -181,7 +211,7 @@ const counterexamples = [
     name: "hello rejects noncanonical decimal",
     def: "AgentHello",
     value: {
-      agent_id: "agent-1",
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       generation: "07",
       last_sent_event_seq: "0",
       last_received_command_seq: "0",
@@ -192,6 +222,7 @@ const counterexamples = [
     name: "hello rejects overflowing cursor",
     def: "ApiHello",
     value: {
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       accepted_generation: "7",
       last_received_event_seq: "18446744073709551616",
       next_command_seq: "1",
@@ -201,6 +232,7 @@ const counterexamples = [
     name: "hello rejects overflowing generation",
     def: "ApiHello",
     value: {
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       accepted_generation: "9223372036854775808",
       last_received_event_seq: "0",
       next_command_seq: "1",
@@ -210,7 +242,7 @@ const counterexamples = [
     name: "durable envelope missing seq",
     def: "Envelope",
     value: {
-      conversation_id: "conversation-1",
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "agent_start" },
     },
   },
@@ -218,7 +250,7 @@ const counterexamples = [
     name: "envelope with extra property",
     def: "Envelope",
     value: {
-      conversation_id: "conversation-1",
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "agent_start" },
       seq: 1,
       extra: "bad",
@@ -228,6 +260,120 @@ const counterexamples = [
     name: "event with extra property",
     def: "AgentEvent",
     value: { type: "agent_start", extra: "bad" },
+  },
+  ...[
+    "018f1e72-6e9a-1c20-8e90-123456789abc",
+    "018f1e72-6e9a-4c20-8e90-123456789abc",
+    "018f1e72-6e9a-6c20-8e90-123456789abc",
+    "018f1e72-6e9a-7c20-7e90-123456789abc",
+    "018F1E72-6E9A-7C20-8E90-123456789ABC",
+    "{018f1e72-6e9a-7c20-8e90-123456789abc}",
+    "urn:uuid:018f1e72-6e9a-7c20-8e90-123456789abc",
+    "018f1e726e9a7c208e90123456789abc",
+    " 018f1e72-6e9a-7c20-8e90-123456789abc ",
+  ].map((value) => ({
+    name: `personality agent ID rejects '${value}'`,
+    def: "PersonalityAgentId",
+    value,
+  })),
+  {
+    name: "provenance rejects a missing actor",
+    def: "DirectChatProvenanceV1",
+    value: {
+      version: 1,
+      tenant_id: "tenant-1",
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
+      source: { surface: "direct_chat" },
+    },
+  },
+  {
+    name: "provenance rejects an unknown field",
+    def: "DirectChatProvenanceV1",
+    value: {
+      version: 1,
+      tenant_id: "tenant-1",
+      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
+      actor: { kind: "human", principal_id: "alice" },
+      source: { surface: "direct_chat" },
+      extra: true,
+    },
+  },
+  {
+    name: "command envelope rejects legacy agent_id",
+    def: "CommandEnvelope",
+    value: {
+      seq: 1,
+      command_id: "00000000-0000-4000-8000-000000000001",
+      agent_id: "agent-1",
+      command: { type: "abort" },
+    },
+  },
+  {
+    name: "command ack rejects missing personality agent ID",
+    def: "CommandAck",
+    value: {
+      seq: 1,
+      command_id: "00000000-0000-4000-8000-000000000001",
+      status: "received",
+    },
+  },
+  {
+    name: "command ack rejects malformed personality agent ID",
+    def: "CommandAck",
+    value: {
+      seq: 1,
+      command_id: "00000000-0000-4000-8000-000000000001",
+      personality_agent_id: "018f1e72-6e9a-7c20-7e90-123456789abc",
+      status: "received",
+    },
+  },
+  {
+    name: "API hello rejects missing personality agent ID",
+    def: "ApiHello",
+    value: {
+      accepted_generation: "7",
+      last_received_event_seq: "0",
+      next_command_seq: "1",
+    },
+  },
+  {
+    name: "browser command rejects an empty idempotency key",
+    def: "BrowserCommandFrame",
+    value: { type: "command", idempotency_key: "", content: "hello" },
+  },
+  {
+    name: "browser command rejects a legacy command payload",
+    def: "BrowserCommandFrame",
+    value: {
+      type: "command",
+      idempotency_key: "key-1",
+      command: { type: "user_message", text: "hello", attachments: [] },
+    },
+  },
+  {
+    name: "browser event rejects an internal target",
+    def: "BrowserEventFrame",
+    value: {
+      type: "event",
+      envelope: {
+        seq: 1,
+        personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
+        event: { type: "agent_start" },
+      },
+    },
+  },
+  {
+    name: "browser acceptance rejects an internal command envelope",
+    def: "BrowserCommandAcceptedFrame",
+    value: {
+      type: "command_accepted",
+      envelope: { seq: 1, command_id: "00000000-0000-4000-8000-000000000001" },
+    },
+  },
+  {
+    name: "browser rejection requires its idempotency key",
+    def: "BrowserCommandRejectedFrame",
+    value: { type: "command_rejected", reject_reason: "idempotency_conflict" },
   },
 ];
 
