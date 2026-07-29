@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,17 @@ func newRouter() (*http.ServeMux, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	localControl, enabled, err := localControlServerFromEnv(runtime)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("local control fixture: %w", err)
+	}
+	if enabled {
+		if err := localControl.RegisterRoutes(mux); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("register local control fixture: %w", err)
+		}
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	return mux, nil
 }
@@ -104,16 +116,101 @@ var errTokenSecretMissing = errors.New("SUMI_AGENT_TOKEN_SECRET not set")
 var errBrowserSessionSecretMissing = errors.New("SUMI_BROWSER_SESSION_SECRET not set")
 
 func tokenVerifierFromEnv() (agentevents.TokenVerifier, error) {
-	b64 := os.Getenv("SUMI_AGENT_TOKEN_SECRET")
-	if b64 == "" {
-		return nil, errTokenSecretMissing
-	}
-	secret, err := base64.StdEncoding.DecodeString(b64)
+	secret, err := tokenSecretFromEnv()
 	if err != nil {
 		return nil, err
 	}
 	audience := os.Getenv("SUMI_AGENT_TOKEN_AUDIENCE")
 	return agentevents.NewHMACTokenVerifier(secret, audience)
+}
+
+func tokenSecretFromEnv() ([]byte, error) {
+	b64 := os.Getenv("SUMI_AGENT_TOKEN_SECRET")
+	if b64 == "" {
+		return nil, errTokenSecretMissing
+	}
+	return base64.StdEncoding.DecodeString(b64)
+}
+
+// localControlServerFromEnv is an explicit local/CI fixture switch. Production
+// routing never registers these endpoints unless the switch and the complete
+// one-runtime authorization binding are present.
+func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevents.LocalControlServer, bool, error) {
+	switch enabled := os.Getenv("SUMI_LOCAL_CONTROL_ENABLED"); enabled {
+	case "", "0":
+		return nil, false, nil
+	case "1":
+	default:
+		return nil, false, errors.New("SUMI_LOCAL_CONTROL_ENABLED must be 0 or 1")
+	}
+
+	required := func(name string) (string, error) {
+		value := os.Getenv(name)
+		if value == "" {
+			return "", fmt.Errorf("%s not set", name)
+		}
+		return value, nil
+	}
+	bearer, err := required("SUMI_LOCAL_CONTROL_BEARER")
+	if err != nil {
+		return nil, false, err
+	}
+	tenantID, err := required("SUMI_LOCAL_CONTROL_TENANT_ID")
+	if err != nil {
+		return nil, false, err
+	}
+	personalityAgentID, err := required("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")
+	if err != nil {
+		return nil, false, err
+	}
+	generationRaw, err := required("SUMI_LOCAL_CONTROL_GENERATION")
+	if err != nil {
+		return nil, false, err
+	}
+	generation, err := strconv.ParseUint(generationRaw, 10, 64)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse SUMI_LOCAL_CONTROL_GENERATION: %w", err)
+	}
+	rpcBootNonce, err := required("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE")
+	if err != nil {
+		return nil, false, err
+	}
+	deliveryRaw, err := required("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION")
+	if err != nil {
+		return nil, false, err
+	}
+	signingSecret, err := tokenSecretFromEnv()
+	if err != nil {
+		return nil, false, err
+	}
+	agentAudience := os.Getenv("SUMI_AGENT_TOKEN_AUDIENCE")
+	if agentAudience == "" {
+		agentAudience = agentevents.DefaultAgentAudience()
+	}
+	controlAudience := os.Getenv("SUMI_LOCAL_CONTROL_AUDIENCE")
+	if controlAudience == "" {
+		controlAudience = agentAudience
+	}
+	if controlAudience != agentAudience {
+		return nil, false, errors.New("SUMI_LOCAL_CONTROL_AUDIENCE must match SUMI_AGENT_TOKEN_AUDIENCE")
+	}
+	control, err := agentevents.NewLocalControlServer(
+		runtime,
+		signingSecret,
+		[]agentevents.LocalRuntimeAuthorization{{
+			BearerToken:           bearer,
+			TenantID:              tenantID,
+			PersonalityAgentID:    personalityAgentID,
+			Generation:            generation,
+			RPCBootNonce:          rpcBootNonce,
+			Audience:              controlAudience,
+			DeliveryAuthorization: agentevents.LocalDeliveryAuthorization(deliveryRaw),
+		}},
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	return control, true, nil
 }
 
 // browserSessionVerifierFromEnv is deliberately separate from the agent token

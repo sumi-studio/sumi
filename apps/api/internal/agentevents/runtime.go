@@ -129,7 +129,11 @@ func updateCRC(crc uint32, data []byte) uint32 {
 type runtimeState struct {
 	Generation               uint64  `json:"generation"`
 	HydrationReceiptIdentity *string `json:"hydration_receipt_identity"`
-	present                  bool
+	// LocalControl is present only when the explicitly enabled local/CI
+	// control plane owns this state file. The browser fixture's direct
+	// PublishRuntimeState helper deliberately leaves it nil.
+	LocalControl *localControlDurableState `json:"local_control,omitempty"`
+	present      bool
 }
 
 type durableEventRecord struct {
@@ -646,19 +650,30 @@ func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (
 		return runtimeState{}, err
 	}
 	path := g.statePath(personalityAgentID)
-	info, err := os.Lstat(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return runtimeState{}, nil
 	}
 	if err != nil {
+		return runtimeState{}, fmt.Errorf("open durable runtime state: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
 		return runtimeState{}, fmt.Errorf("inspect durable runtime state: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
 		return runtimeState{}, errors.New("invalid durable runtime state")
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := io.ReadAll(io.LimitReader(file, maxLocalControlDurableStateBytes+1))
 	if err != nil {
 		return runtimeState{}, err
+	}
+	if len(raw) > maxLocalControlDurableStateBytes {
+		return runtimeState{}, errors.New("durable runtime state exceeds maximum allowed size")
+	}
+	if err := checkDuplicateKeys(raw); err != nil {
+		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
 	}
 	var state runtimeState
 	if err := unmarshalStrict(raw, &state); err != nil {
@@ -669,6 +684,9 @@ func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (
 	}
 	if state.Generation > maxProcessGeneration {
 		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
+	}
+	if err := validateLocalControlRuntimeState(personalityAgentID, state); err != nil {
+		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
 	}
 	state.present = true
 	return state, nil

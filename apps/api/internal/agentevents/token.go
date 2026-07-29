@@ -15,6 +15,10 @@ import (
 const defaultAgentAudience = "sumi:agent:events"
 const maxSignedTokenBytes = 8 * 1024
 
+// DefaultAgentAudience returns the strict audience used by agent bearer
+// credentials when production/local wiring does not override it.
+func DefaultAgentAudience() string { return defaultAgentAudience }
+
 // HMACTokenVerifier validates short-lived agent tokens signed with HMAC-SHA256.
 // It is a T28 production wiring point for the API-side token verification seam.
 type HMACTokenVerifier struct {

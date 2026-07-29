@@ -325,3 +325,163 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 		t.Fatalf("idempotency key did not return the same command: %+v vs %+v", env1, env2)
 	}
 }
+
+func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *testing.T) {
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "0")
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	mux, err := newRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		agentevents.LocalRuntimeStatePublishPath,
+		strings.NewReader(`{}`),
+	)
+	request.RemoteAddr = "127.0.0.1:12345"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("disabled local control route: got %d, want 404", recorder.Code)
+	}
+
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-control-bearer-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", "0198f0f4-9b72-7000-8000-000000000001")
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
+	commandDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
+	mux, err = newRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	publication := []byte(`{
+		"publication_id":"startup-fixture",
+		"personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001",
+		"generation":7,
+		"rpc_boot_nonce":"boot-fixture",
+		"expected_revision":null,
+		"state":"not_ready",
+		"hydration_receipt_identity":null,
+		"reason":"startup"
+	}`)
+	req, err := http.NewRequest(
+		http.MethodPost,
+		server.URL+agentevents.LocalRuntimeStatePublishPath,
+		bytes.NewReader(publication),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer server-fixture-control-bearer-32-bytes-minimum")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("explicitly enabled local control route: got %d, want 200", resp.StatusCode)
+	}
+
+	// A local API process restart can be provisioned with the next exact
+	// runtime epoch while reusing the same durable PAID-keyed registry.
+	server.Close()
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-next-control-bearer-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "8")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture-next")
+	mux, err = newRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedServer := httptest.NewServer(mux)
+	defer restartedServer.Close()
+	rollover := []byte(`{
+		"publication_id":"startup-fixture-next",
+		"personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001",
+		"generation":8,
+		"rpc_boot_nonce":"boot-fixture-next",
+		"expected_revision":null,
+		"state":"not_ready",
+		"hydration_receipt_identity":null,
+		"reason":"startup"
+	}`)
+	req, err = http.NewRequest(
+		http.MethodPost,
+		restartedServer.URL+agentevents.LocalRuntimeStatePublishPath,
+		bytes.NewReader(rollover),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer server-fixture-next-control-bearer-32-bytes-minimum")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("higher generation after API restart: got %d, want 200", resp.StatusCode)
+	}
+	var ack struct {
+		Generation uint64 `json:"generation"`
+		Revision   uint64 `json:"revision"`
+		State      string `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.Generation != 8 || ack.Revision != 2 || ack.State != "not_ready" {
+		t.Fatalf("restart rollover ack mismatch: %+v", ack)
+	}
+}
+
+func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing.T) {
+	store, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "true")
+	if _, _, err := localControlServerFromEnv(gateway); err == nil {
+		t.Fatal("ambiguous local control enablement was accepted")
+	}
+
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "")
+	if _, _, err := localControlServerFromEnv(gateway); err == nil ||
+		!strings.Contains(err.Error(), "SUMI_LOCAL_CONTROL_BEARER") {
+		t.Fatalf("partial local control config was not rejected precisely: %v", err)
+	}
+
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-control-bearer-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", "0198f0f4-9b72-7000-8000-000000000001")
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
+	t.Setenv("SUMI_AGENT_TOKEN_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "wrong-audience")
+	if _, _, err := localControlServerFromEnv(gateway); err == nil ||
+		!strings.Contains(err.Error(), "must match") {
+		t.Fatalf("issuer/verifier audience split was accepted: %v", err)
+	}
+}
