@@ -2669,7 +2669,8 @@ mod tests {
                 drop(tx);
                 ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
             });
-        let (spec, prompt, registry, workspace) = dependencies();
+        let (_, prompt, registry, workspace) = dependencies();
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let driver = InjectedRunDriver::with_stream_starter(
             spec.clone(),
             RequestOptions::default(),
@@ -2733,7 +2734,33 @@ mod tests {
                 timestamp: Utc::now(),
             }),
         };
-        let active_context = vec![user, error, cross_model];
+        let same_model_owner = ContextMessage::Persisted {
+            id: "a2".to_owned(),
+            seq: 4,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Text {
+                        text: "same-model visible".to_owned(),
+                        wire_item_index: 0,
+                    },
+                    AssistantContent::Thinking {
+                        thinking: "same-model private".to_owned(),
+                        signature_field: "reasoning_content".to_owned(),
+                        wire_item_index: 1,
+                    },
+                ],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let active_context = vec![user, error, cross_model, same_model_owner];
         let active_context_clone = active_context.clone();
         let error_provider_context = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
@@ -2749,7 +2776,12 @@ mod tests {
             provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: spec.protocol,
-                item: json!({"opaque": "must not be sent"}),
+                item: json!({
+                    "id": "rs-error",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-error-reasoning",
+                }),
             },
         };
         let error_provider_context = ProviderContextItemWithFootprint::new(
@@ -2762,19 +2794,24 @@ mod tests {
         );
         let surviving_provider_context = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
-                message_id: "a1".to_owned(),
-                message_seq: 3,
+                message_id: "a2".to_owned(),
+                message_seq: 4,
             },
             origin_message: Some(ProviderContextAnchor {
-                message_id: "a1".to_owned(),
-                message_seq: 3,
+                message_id: "a2".to_owned(),
+                message_seq: 4,
             }),
-            wire_item_index: Some(0),
+            wire_item_index: Some(1),
             ordinal: 0,
             provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: spec.protocol,
-                item: json!({"opaque": "survives"}),
+                item: json!({
+                    "id": "rs-survives",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-surviving-reasoning",
+                }),
             },
         };
         let surviving_provider_context_with_footprint = ProviderContextItemWithFootprint::new(
@@ -2821,8 +2858,8 @@ mod tests {
         );
         assert_eq!(
             captured.messages.len(),
-            2,
-            "Error assistant must be excluded while cross-model visible text is retained"
+            3,
+            "Error assistant must be excluded while cross-model visible text and same-model owner are retained"
         );
         let ContextMessage::Persisted {
             message: Message::Assistant(assistant),
