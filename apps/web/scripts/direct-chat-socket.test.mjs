@@ -116,12 +116,32 @@ test("tracks browser connection separately from authoritative agent readiness", 
 test("rejects legacy target-bearing and malformed server frames", () => {
   assert.equal(parseDirectChatServerFrame(event(1, { type: "agent_start" }), 0)?.type, "event");
   assert.equal(parseDirectChatServerFrame({ type: "event", envelope: { conversation_id: "legacy", seq: 1, event: { type: "agent_start" } } }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame(event(1, { type: "agent_start", personality_agent_id: "internal" }), 0), undefined);
+  assert.equal(parseDirectChatServerFrame(event(1, { type: "message_end", message_id: "message-1", message: { role: "assistant", content: [], tenant_id: "internal" } }), 0), undefined);
+  assert.equal(parseDirectChatServerFrame(event(1, { type: "approval_requested", request: { id: "request-1", personality_agent_id: "internal", action: {} } }), 0), undefined);
   assert.equal(parseDirectChatServerFrame({ type: "command_accepted", idempotency_key: "k" }, 0), undefined);
   for (const command_id of ["command-1", "00000000-0000-4000-8000-00000000000", "00000000-0000-4000-8000-00000000000G", "00000000-0000-4000-8000-000000000001 ", "0000000a-0000-4000-8000-000000000001".toUpperCase()]) {
     assert.equal(parseDirectChatServerFrame({ type: "command_accepted", idempotency_key: "k", command_id, seq: 1 }, 0), undefined);
   }
   assert.equal(parseDirectChatServerFrame(accepted("k"), 0)?.type, "command_accepted");
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
+});
+
+test("allows identity-like keys inside explicit AnyJSON payloads", () => {
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "tool_execution_start",
+    tool_call_id: "tool-1",
+    tool_name: "read_file",
+    args: { source: "document", personality_agent_id: "payload-value" },
+  }), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(event(1, {
+    type: "approval_requested",
+    request: {
+      id: "request-1",
+      action: { source: "review-projection" },
+      args_summary: { personality_agent_id: "payload-value" },
+    },
+  }), 0)?.type, "event");
 });
 
 test("reconstructs and deduplicates durable messages and tool state after reload/replay", () => {

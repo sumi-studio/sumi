@@ -53,6 +53,22 @@ const RejectReasons = new Set([
   "idempotency_conflict",
 ]);
 const UUIDPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const InternalIdentityOrProvenanceFields = new Set([
+  "personality_agent_id",
+  "conversation_id",
+  "agent_id",
+  "tenant_id",
+  "user_id",
+  "actor",
+  "actor_id",
+  "source",
+  "source_surface",
+  "workspace_id",
+  "resource_id",
+  "correlation_id",
+  "causation_id",
+  "provenance",
+]);
 const DurableEventTypes = new Set([
   "agent_start",
   "agent_end",
@@ -86,6 +102,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key));
+}
+
+// Public projections must never carry routing identity or authenticated
+// provenance at their structural boundary. This deliberately does not recurse:
+// tool args, review projections, and summaries are legitimate AnyJSON payloads.
+function hasInternalIdentityOrProvenance(value: Record<string, unknown>): boolean {
+  return Object.keys(value).some((key) => InternalIdentityOrProvenanceFields.has(key));
 }
 
 function isSafeSequence(value: unknown): value is number {
@@ -133,14 +156,14 @@ function isSafeMessageContent(value: unknown): boolean {
 }
 
 function isSafeMessage(value: unknown): boolean {
-  return isRecord(value) && typeof value.role === "string" &&
+  return isRecord(value) && !hasInternalIdentityOrProvenance(value) && typeof value.role === "string" &&
     Array.isArray(value.content) && value.content.every(isSafeMessageContent);
 }
 
 function isSafeEventForUI(
   value: unknown,
 ): value is Record<string, unknown> & { type: string } {
-  if (!isRecord(value) || typeof value.type !== "string" || !value.type) return false;
+  if (!isRecord(value) || hasInternalIdentityOrProvenance(value) || typeof value.type !== "string" || !value.type) return false;
   if (value.type === "message_start" || value.type === "message_end") {
     return typeof value.message_id === "string" && isSafeMessage(value.message);
   }
@@ -155,7 +178,8 @@ function isSafeEventForUI(
   if (value.type === "tool_execution_end") return typeof value.tool_call_id === "string";
   if (value.type === "steered") return typeof value.mode === "string";
   if (value.type === "approval_requested") {
-    return isRecord(value.request) && typeof value.request.id === "string";
+    return isRecord(value.request) && !hasInternalIdentityOrProvenance(value.request) &&
+      typeof value.request.id === "string";
   }
   if (value.type === "approval_resolved") return typeof value.request_id === "string";
   return true;
