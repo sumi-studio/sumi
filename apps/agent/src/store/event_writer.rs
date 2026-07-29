@@ -57,8 +57,7 @@ use super::{
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
         EncryptedProviderContextRecord, PreparedProviderContextMutation, ProviderContextMutation,
-        ProviderContextMutationApplier, ProviderContextMutationBuilder,
-        provider_context_idempotency_key, provider_context_record_id,
+        ProviderContextMutationApplier, ProviderContextMutationBuilder, provider_context_record_id,
     },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -3247,15 +3246,11 @@ impl EventWriter {
         for item in items {
             let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
                 .context("failed to compute provider-context eviction footprint")?;
-            let id = provider_context_record_id(&item);
-            let idempotency_key = provider_context_idempotency_key(message_id, &item);
             let record = EncryptedProviderContextRecord::encrypt(
                 &item,
                 &assistant.origin.provider_instance_id,
                 assistant.origin.protocol,
                 &assistant.origin.model,
-                &id,
-                &idempotency_key,
                 eviction_footprint,
                 &key,
                 self.store.scope(),

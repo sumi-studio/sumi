@@ -710,12 +710,9 @@ impl Store {
                         "provider-context record {id} row id does not match authenticated retention owner"
                     );
                 }
-                let expected_key_ref = provider_context_key_ref(
+                let expected_key_ref = self::provider_context::provider_context_owner_key_ref(
                     &self.scope,
-                    &format!(
-                        "{}:{}",
-                        item.retention_owner.message_id, item.retention_owner.message_seq
-                    ),
+                    &item.retention_owner,
                 );
                 if key_ref != expected_key_ref {
                     bail!(
@@ -885,10 +882,7 @@ impl Store {
                             );
                         }
 
-                        let expected_idempotency_key = provider_context_idempotency_key(
-                            &item.retention_owner.message_id,
-                            &item,
-                        );
+                        let expected_idempotency_key = provider_context_idempotency_key(&item);
                         if stored_idempotency_key != expected_idempotency_key {
                             bail!(
                                 "provider-context record {id} idempotency key does not match authenticated native item"
@@ -907,10 +901,7 @@ impl Store {
                             );
                         }
                         let expected_idempotency_key =
-                            self::provider_context::provider_context_idempotency_key(
-                                &item.retention_owner.message_id,
-                                &item,
-                            );
+                            self::provider_context::provider_context_idempotency_key(&item);
                         if stored_idempotency_key != expected_idempotency_key {
                             bail!(
                                 "provider-context record {id} idempotency key does not match decrypted reasoning item"
