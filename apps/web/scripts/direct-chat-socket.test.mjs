@@ -321,6 +321,36 @@ test("accepts every exact event shape emitted by the browser E2E fixture", () =>
   }
 });
 
+test("validates RFC3339 calendar, time, fraction, and offset components exactly", () => {
+  const retry = (retry_at) => event(1, {
+    type: "retry_scheduled",
+    attempt: 1,
+    delay_ms: 100,
+    retry_at,
+    error_message: "retry",
+  });
+  for (const invalid of [
+    "2026-02-29T00:00:00Z",
+    "1900-02-29T00:00:00Z",
+    "2026-04-31T00:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T23:60:00Z",
+    "2026-01-01T23:59:60Z",
+    "2026-01-01T00:00:00+24:00",
+    "2026-01-01T00:00:00-00:60",
+  ]) {
+    assert.equal(parseDirectChatServerFrame(retry(invalid), 0), undefined);
+  }
+  for (const valid of [
+    "0000-01-01T00:00:00Z",
+    "2024-02-29T23:59:59Z",
+    "2024-02-29T23:59:59.123456789+23:59",
+    "9999-12-31T00:00:00.0-00:00",
+  ]) {
+    assert.equal(parseDirectChatServerFrame(retry(valid), 0)?.type, "event");
+  }
+});
+
 test("reconstructs and deduplicates durable messages and tool state after reload/replay", () => {
   const replay = [
     event(1, { type: "message_start", message_id: "user-1", message: { role: "user", content: [{ type: "text", text: "persisted user" }] } }),
