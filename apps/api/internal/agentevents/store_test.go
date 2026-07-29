@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -273,6 +274,74 @@ func TestCommandStore_ContextCancellation(t *testing.T) {
 	_, err = store.Append(ctx, "conv-1", "", cmd)
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
+	}
+}
+
+func TestCommandStoreBlockedConversationDoesNotBlockOtherConversation(t *testing.T) {
+	skipIfNoFlock(t)
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const blocked = "conv-blocked"
+	if _, err := store.Append(context.Background(), blocked, "", json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := os.OpenFile(commandLogPath(dir, blocked), os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN)
+
+	blockedDone := make(chan error, 1)
+	go func() { _, err := store.NextCommandSeq(context.Background(), blocked); blockedDone <- err }()
+	time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := store.Append(ctx, "conv-independent", "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {
+		t.Fatalf("blocked conversation serialized unrelated append: %v", err)
+	}
+	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-blockedDone; err != nil {
+		t.Fatalf("blocked conversation did not recover: %v", err)
+	}
+}
+
+func TestCommandStoreFirstLoadFlockHonorsCancellation(t *testing.T) {
+	skipIfNoFlock(t)
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const conversationID = "conv-first-load-cancel"
+	blocker, err := os.OpenFile(commandLogPath(dir, conversationID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := store.NextCommandSeq(ctx, conversationID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first load must propagate deadline, got %v", err)
+	}
+	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := store.NextCommandSeq(context.Background(), conversationID); err != nil || next != 1 {
+		t.Fatalf("cancelled load must not leak partial state: next=%d err=%v", next, err)
 	}
 }
 

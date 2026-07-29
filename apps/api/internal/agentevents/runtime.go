@@ -70,6 +70,41 @@ type ackCacheEntry struct {
 	ack CommandAck
 }
 
+const maxNextCommandAckStateBytes = 16 << 20
+
+type compactAckState byte
+
+const (
+	ackStateAbsent compactAckState = iota
+	ackStateReceived
+	ackStateTerminal
+)
+
+type compactAckStates []byte
+
+func newCompactAckStates(commandCount int) (compactAckStates, error) {
+	if commandCount < 0 || commandCount > maxNextCommandAckStateBytes*4 {
+		return nil, fmt.Errorf(
+			"command ACK cursor for %d commands exceeds %d-byte budget",
+			commandCount,
+			maxNextCommandAckStateBytes,
+		)
+	}
+	byteCount := (commandCount + 3) / 4
+	return make(compactAckStates, byteCount), nil
+}
+
+func (s compactAckStates) get(index int) compactAckState {
+	shift := uint((index % 4) * 2)
+	return compactAckState((s[index/4] >> shift) & 0x3)
+}
+
+func (s compactAckStates) set(index int, state compactAckState) {
+	shift := uint((index % 4) * 2)
+	mask := byte(0x3 << shift)
+	s[index/4] = (s[index/4] &^ mask) | byte(state)<<shift
+}
+
 // crc32OfFilePrefix returns the CRC-32/IEEE checksum of the first `size` bytes
 // of `file`. It re-seeks to the start and streams the prefix so it works for
 // large logs without loading them into memory.
@@ -259,6 +294,51 @@ func (g *DurableGateway) HasCommands(ctx context.Context, claims TokenClaims) (b
 	return g.commands.HasCommands(ctx, claims.ConversationID)
 }
 
+// NextCommandSeq returns the earliest command without a durable terminal ACK.
+// It is the sole replay cursor authority: agent hello state may bound it, but
+// can never advance it past an ACK the API has not durably recorded.
+func (g *DurableGateway) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+	file, err := g.newFile(g.ackPath(claims.ConversationID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
+		return 0, fmt.Errorf("lock durable ack log for replay cursor: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+
+	// Take the command view after excluding ACK appenders. Any command appended
+	// after this snapshot cannot acquire an ACK until this scan releases the
+	// per-conversation file lock, so returning snapshot.nextSeq is conservative.
+	snapshot, err := g.commands.commandSnapshot(ctx, claims.ConversationID)
+	if err != nil {
+		return 0, err
+	}
+	states, err := newCompactAckStates(len(snapshot.commands))
+	if err != nil {
+		return 0, err
+	}
+	if err := scanAckCursor(ctx, file, snapshot, states); err != nil {
+		return 0, err
+	}
+	if len(snapshot.commands) == 0 {
+		return snapshot.nextSeq, nil
+	}
+	for index, command := range snapshot.commands {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if states.get(index) != ackStateTerminal {
+			return command.Seq, nil
+		}
+	}
+	if snapshot.nextSeq > maxJSONSafeInteger {
+		return 0, fmt.Errorf("next_command_seq would exceed JSON-safe integer range")
+	}
+	return snapshot.nextSeq, nil
+}
+
 func (g *DurableGateway) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
 	return g.commands.CatchUp(ctx, claims.ConversationID, fromSeq)
 }
@@ -321,9 +401,7 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 			ack.CommandID,
 		)
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.appendCommandAckLocked(claims.ConversationID, ack)
+	return g.appendCommandAck(ctx, claims.ConversationID, ack)
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -735,18 +813,24 @@ func (g *DurableGateway) IsApprovalPending(conversationID, requestID string) boo
 	return g.pendingApprovals[conversationID] != nil && g.pendingApprovals[conversationID][requestID]
 }
 
-func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack CommandAck) error {
-	st := g.stateFor(conversationID)
+func (g *DurableGateway) appendCommandAck(ctx context.Context, conversationID string, ack CommandAck) error {
 	path := g.ackPath(conversationID)
 	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	// Lock only this ACK log while waiting for I/O. The process-wide cache lock
+	// is acquired afterwards, so unrelated conversations remain independent.
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock durable ack log for append: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return err
+	}
+	defer g.mu.Unlock()
+	st := g.stateFor(conversationID)
 
 	if err := g.refreshAckTailLocked(file, st); err != nil {
 		return err
@@ -1038,6 +1122,105 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 
 	st.ackSize = offset
 	st.ackCRC = crc
+	return nil
+}
+
+// scanAckCursor validates and folds the ACK log in one pass using two bits per
+// durable command. It deliberately does not populate the bounded ACK tail:
+// NextCommandSeq needs one restart-safe cursor calculation, not another
+// unbounded history cache.
+func scanAckCursor(ctx context.Context, file durableFileHandle, snapshot commandLogSnapshot, states compactAckStates) error {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek durable ack log for replay cursor: %w", err)
+	}
+	r := bufio.NewReader(file)
+	var offset int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lineStart := offset
+		line, readErr := r.ReadBytes('\n')
+		offset += int64(len(line))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) != 0 {
+			var ack CommandAck
+			if err := json.Unmarshal(trimmed, &ack); err != nil {
+				if readErr == io.EOF && isIncompleteJSONError(err) {
+					if truncErr := file.Truncate(lineStart); truncErr != nil {
+						return fmt.Errorf("truncate partial durable ack tail: %w", truncErr)
+					}
+					if syncErr := file.Sync(); syncErr != nil {
+						return fmt.Errorf("sync after truncating partial durable ack tail: %w", syncErr)
+					}
+					return nil
+				}
+				return fmt.Errorf("decode durable ack log for replay cursor: %w", err)
+			}
+			if err := foldAckCursorRecord(snapshot, states, ack); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				if _, err := file.Seek(0, io.SeekEnd); err != nil {
+					return fmt.Errorf("seek durable ack log end for newline repair: %w", err)
+				}
+				if _, err := file.Write([]byte{'\n'}); err != nil {
+					return fmt.Errorf("repair missing trailing newline in durable ack log: %w", err)
+				}
+				if err := file.Sync(); err != nil {
+					return fmt.Errorf("sync repaired durable ack log trailing newline: %w", err)
+				}
+			}
+			return nil
+		}
+		if readErr != nil {
+			return fmt.Errorf("read durable ack log for replay cursor: %w", readErr)
+		}
+	}
+}
+
+// foldAckCursorRecord owns validation at the compact-state transition
+// boundary. The decoder also validates, but no alternate construction path can
+// make an unknown status terminal merely by bypassing it.
+func foldAckCursorRecord(snapshot commandLogSnapshot, states compactAckStates, ack CommandAck) error {
+	if err := validateCommandAck(ack); err != nil {
+		return fmt.Errorf("validate durable ack log for replay cursor: %w", err)
+	}
+	if len(snapshot.commands) == 0 {
+		return fmt.Errorf("durable ACK seq %d has no matching command", ack.Seq)
+	}
+	firstSeq := snapshot.commands[0].Seq
+	if ack.Seq < firstSeq {
+		return fmt.Errorf("durable ACK seq %d precedes command log", ack.Seq)
+	}
+	delta := ack.Seq - firstSeq
+	if delta >= uint64(len(snapshot.commands)) {
+		return fmt.Errorf("durable ACK seq %d has no matching command", ack.Seq)
+	}
+	index := int(delta)
+	command := snapshot.commands[index]
+	if command.Seq != ack.Seq || command.CommandID != ack.CommandID {
+		return fmt.Errorf("durable ACK identity mismatch at seq %d: command_id=%q ack_command_id=%q", ack.Seq, command.CommandID, ack.CommandID)
+	}
+	switch states.get(index) {
+	case ackStateAbsent:
+		if ack.Status == "received" {
+			states.set(index, ackStateReceived)
+		} else {
+			states.set(index, ackStateTerminal)
+		}
+	case ackStateReceived:
+		if ack.Status == "received" {
+			return fmt.Errorf("durable ACK seq %d repeats received transition", ack.Seq)
+		}
+		states.set(index, ackStateTerminal)
+	case ackStateTerminal:
+		return fmt.Errorf("durable ACK seq %d has multiple terminal transitions", ack.Seq)
+	default:
+		return fmt.Errorf("durable ACK seq %d has invalid compact state", ack.Seq)
+	}
 	return nil
 }
 

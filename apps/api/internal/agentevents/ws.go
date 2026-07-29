@@ -52,6 +52,12 @@ type CommandSource interface {
 	FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 	// HasCommands distinguishes an empty log from a retained log starting at 1.
 	HasCommands(ctx context.Context, claims TokenClaims) (bool, error)
+	// NextCommandSeq returns the first command whose durable ACK state is not
+	// terminal, or one past the command tail when every retained command is
+	// terminal. The API's own ACK log is authoritative: an agent-reported
+	// last_applied cursor cannot prove that ApplyAck completed before a socket
+	// was lost.
+	NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
 	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
 	// Live returns commands from fromSeq onward. The source must ensure that no
@@ -266,14 +272,22 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("first command seq %d exceeds JSON-safe integer range", firstSeq)
 	}
 
-	// Use a checked increment so last_applied_command_seq at the JSON-safe
-	// maximum cannot wrap around and emit an out-of-range next_command_seq.
+	// The API's durable terminal ACK state chooses replay. A wire send followed
+	// by disconnect before ApplyAck therefore replays the command even if the
+	// agent had applied it locally but did not finish recording the ACK.
 	if hello.LastAppliedCommandSeq > maxJSONSafeInteger-1 {
 		return fmt.Errorf("next_command_seq would exceed JSON-safe integer range")
 	}
-	nextSeq := hello.LastAppliedCommandSeq + 1
+	maxNextSeq := hello.LastAppliedCommandSeq + 1
+	nextSeq, err := s.Commands.NextCommandSeq(helloCtx, claims)
+	if err != nil {
+		return fmt.Errorf("next command seq: %w", err)
+	}
 	if nextSeq < firstSeq {
-		nextSeq = firstSeq
+		return fmt.Errorf("next_command_seq %d precedes retained command log at %d", nextSeq, firstSeq)
+	}
+	if nextSeq > maxNextSeq {
+		return fmt.Errorf("API terminal ACK state is ahead of agent: next_command_seq %d exceeds locally applied bound %d", nextSeq, maxNextSeq)
 	}
 	if nextSeq > maxJSONSafeInteger {
 		return fmt.Errorf("next_command_seq %d exceeds JSON-safe integer range", nextSeq)
@@ -337,10 +351,9 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	stopPumps := func() {
 		stopOnce.Do(func() {
 			cancel()
-			// Cancellation alone cannot interrupt gorilla's blocking ReadJSON.
-			// Poison both halves immediately rather than waiting for PongWait.
-			_ = conn.SetReadDeadline(time.Now())
-			_ = conn.SetWriteDeadline(time.Now())
+			// Close is allowed concurrently with gorilla's sole reader and writer.
+			// Deadline mutation here would race either pump.
+			_ = conn.Close()
 		})
 	}
 

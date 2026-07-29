@@ -38,6 +38,7 @@ type fakeCommandSource struct {
 	mu           sync.Mutex
 	commands     []CommandEnvelope
 	ackSeq       uint64
+	acks         map[uint64]CommandAck
 	catchUpCalls uint64
 	catchUpDelay time.Duration
 	live         chan CommandEnvelope
@@ -58,7 +59,7 @@ func (f *failingLiveCommandSource) Live(ctx context.Context, claims TokenClaims,
 }
 
 func newFakeCommandSource() *fakeCommandSource {
-	return &fakeCommandSource{live: make(chan CommandEnvelope, 16)}
+	return &fakeCommandSource{acks: make(map[uint64]CommandAck), live: make(chan CommandEnvelope, 16)}
 }
 
 func (f *fakeCommandSource) FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
@@ -75,6 +76,21 @@ func (f *fakeCommandSource) HasCommands(ctx context.Context, claims TokenClaims)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.commands) != 0, nil
+}
+
+func (f *fakeCommandSource) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.commands) == 0 {
+		return 1, nil
+	}
+	for _, command := range f.commands {
+		ack, ok := f.acks[command.Seq]
+		if !ok || ack.Status == "received" {
+			return command.Seq, nil
+		}
+	}
+	return f.commands[len(f.commands)-1].Seq + 1, nil
 }
 
 func (f *fakeCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
@@ -111,6 +127,7 @@ func (f *fakeCommandSource) ApplyAck(ctx context.Context, claims TokenClaims, ac
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ackSeq = ack.Seq
+	f.acks[ack.Seq] = ack
 	return nil
 }
 
@@ -609,6 +626,13 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 			Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
 		})
 	}
+	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{
+		Seq:       1,
+		CommandID: "00000000-0000-4000-8000-000000000001",
+		Status:    "applied",
+	}); err != nil {
+		t.Fatalf("seed durable terminal ACK: %v", err)
+	}
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -644,6 +668,43 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 	}
 	if received.Seq != 2 {
 		t.Fatalf("expected catch-up command seq 2, got %d", received.Seq)
+	}
+}
+
+func TestWebSocketDurableAckGapOverridesAgentLastAppliedCursor(t *testing.T) {
+	srv, _, _, cs, _, hl := newTestServer(t)
+	hl.setReady()
+	cs.pushCommand(CommandEnvelope{
+		Seq:       1,
+		CommandID: "00000000-0000-4000-8000-000000000001",
+		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+	})
+	if err := cs.ApplyAck(context.Background(), TokenClaims{}, CommandAck{Seq: 1, CommandID: "00000000-0000-4000-8000-000000000001", Status: "received"}); err != nil {
+		t.Fatal(err)
+	}
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7, LastReceivedCommandSeq: 1, LastAppliedCommandSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var hello ApiHello
+	if err := conn.ReadJSON(&hello); err != nil {
+		t.Fatal(err)
+	}
+	if hello.NextCommandSeq != 1 {
+		t.Fatalf("nonterminal durable ACK must override agent cursor: got %d", hello.NextCommandSeq)
+	}
+	var replay CommandEnvelope
+	if err := conn.ReadJSON(&replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.Seq != 1 {
+		t.Fatalf("expected replay seq 1, got %d", replay.Seq)
 	}
 }
 

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -245,6 +247,137 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	}
 	if lines := strings.Count(string(raw), "\n"); lines != 2 {
 		t.Fatalf("expected received+applied records without duplicates, got %d lines", lines)
+	}
+}
+
+func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t *testing.T) {
+	storeDir, runtimeDir := t.TempDir(), t.TempDir()
+	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := TokenClaims{ConversationID: "conversation-ack-restart"}
+	first, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"one","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"two","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "received"}); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq {
+		t.Fatalf("nonterminal durable ACK must replay seq %d: next=%d err=%v", second.Seq, next, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedStore, reopened, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedStore.Close()
+	if next, err := reopened.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq {
+		t.Fatalf("restart lost nonterminal durable ACK gap: next=%d err=%v", next, err)
+	}
+	if err := reopened.ApplyAck(context.Background(), claims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := reopened.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq+1 {
+		t.Fatalf("terminal ACK prefix must advance to %d: next=%d err=%v", second.Seq+1, next, err)
+	}
+}
+
+func TestFoldAckCursorRecordRejectsInvalidTransitionWithoutStateChange(t *testing.T) {
+	const commandID = "00000000-0000-4000-8000-000000000001"
+	snapshot := commandLogSnapshot{commands: []CommandEnvelope{{Seq: 1, CommandID: commandID}}, nextSeq: 2}
+	states, err := newCompactAckStates(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = foldAckCursorRecord(snapshot, states, CommandAck{Seq: 1, CommandID: commandID, Status: "completed"})
+	if err == nil || !strings.Contains(err.Error(), `status "completed" is not valid`) {
+		t.Fatalf("constructed unknown ACK status must fail closed, got %v", err)
+	}
+	if got := states.get(0); got != ackStateAbsent {
+		t.Fatalf("invalid ACK changed state to %d", got)
+	}
+}
+
+func TestDurableGatewayNextCommandSeqFlockHonorsCancellation(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-cancelled-cursor"}
+	if _, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(gateway.ackPath(claims.ConversationID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := gateway.NextCommandSeq(ctx, claims); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("locked replay cursor must honor cancellation, got %v", err)
+	}
+}
+
+func TestDurableGatewayNextCommandSeqRejectsMalformedAndConflictingRestartAckHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lines func(CommandEnvelope) []string
+	}{
+		{
+			name: "malformed status",
+			lines: func(command CommandEnvelope) []string {
+				return []string{fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"completed"}`, command.Seq, command.CommandID)}
+			},
+		},
+		{
+			name: "conflicting terminal transitions",
+			lines: func(command CommandEnvelope) []string {
+				return []string{
+					fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"applied"}`, command.Seq, command.CommandID),
+					fmt.Sprintf(`{"seq":%d,"command_id":%q,"status":"applied"}`, command.Seq, command.CommandID),
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeDir, runtimeDir := t.TempDir(), t.TempDir()
+			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims := TokenClaims{ConversationID: "conversation-invalid-ack-history"}
+			command, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(strings.Join(tc.lines(command), "\n")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopenedStore, reopened, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopenedStore.Close()
+			if next, err := reopened.NextCommandSeq(context.Background(), claims); err == nil {
+				t.Fatalf("invalid durable ACK history advanced replay cursor to %d", next)
+			}
+		})
 	}
 }
 
