@@ -1079,10 +1079,37 @@ impl Store {
                         "provider-context record {id} row id does not match authenticated retention owner"
                     );
                 }
-                let expected_key_ref = self::provider_context::provider_context_owner_key_ref(
+                let native_coordinates = match &item.payload {
+                    ProviderContextPayload::EncryptedReasoning { .. } => None,
+                    ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    | ProviderContextPayload::AnthropicCompaction { .. } => {
+                        let coordinates: Option<(i64, i64)> = sqlx::query_as(
+                            "SELECT max_config_generation, max_window_ordinal
+                             FROM provider_context_replace_heads
+                             WHERE latest_insert_id=?",
+                        )
+                        .bind(&id)
+                        .fetch_optional(&mut **transaction)
+                        .await
+                        .context("failed to load native provider-context retention coordinates")?;
+                        match coordinates {
+                            Some((generation, ordinal)) => Some((
+                                u64::try_from(generation).context(
+                                    "native provider-context config generation is negative",
+                                )?,
+                                u64::try_from(ordinal).context(
+                                    "native provider-context window ordinal is negative",
+                                )?,
+                            )),
+                            None => Some((0, u64::from(item.ordinal))),
+                        }
+                    }
+                };
+                let expected_key_ref = self::provider_context::provider_context_item_key_ref(
                     &self.scope,
-                    &item.retention_owner,
-                );
+                    &item,
+                    native_coordinates,
+                )?;
                 if key_ref != expected_key_ref {
                     bail!(
                         "provider-context record {id} key_ref does not match authenticated retention owner"
@@ -1758,6 +1785,17 @@ impl Store {
         table: &str,
         row_id: &str,
     ) -> Result<HydratedMemorySummary> {
+        let retention_kind = match table {
+            "memory_batches" => "batch",
+            "memory_jobs" => "job",
+            _ => bail!("unsupported memory-summary table {table}"),
+        };
+        let expected_key_ref = memory_summary_key_ref(&self.scope, retention_kind, row_id);
+        if key_ref != expected_key_ref {
+            bail!(
+                "{table} projection for {row_id} uses a memory-summary key outside its exact retention unit"
+            );
+        }
         let redaction_version = u32::try_from(stored_redaction_version).with_context(|| {
             format!("{table} projection for {row_id} has redaction version out of u32 range")
         })?;
@@ -2256,6 +2294,20 @@ impl Store {
         .await
     }
 
+    pub(crate) async fn provider_context_item_key(
+        &self,
+        item: &ProviderContextItem,
+        native_coordinates: Option<(u64, u64)>,
+    ) -> Result<DataKeyMaterial> {
+        let anchor_id =
+            self::provider_context::provider_context_retention_anchor_id(item, native_coordinates)?;
+        self.provider_context_key(&ProviderContextKeyAnchor {
+            personality_agent_id: self.scope.personality_agent_id.clone(),
+            anchor_id,
+        })
+        .await
+    }
+
     #[allow(
         dead_code,
         reason = "artifact broker wiring consumes this key boundary"
@@ -2264,13 +2316,10 @@ impl Store {
         if anchor.personality_agent_id != self.scope.personality_agent_id {
             bail!("artifact anchor belongs to a different personality agent");
         }
-        let required_prefix = format!("artifact://{}/", self.scope.personality_agent_id);
-        if anchor.artifact_handle.len() > 2048
-            || !anchor.artifact_handle.starts_with(&required_prefix)
-            || anchor.artifact_handle.len() == required_prefix.len()
-        {
-            bail!("artifact handle must be a non-empty PAID-scoped artifact URI");
-        }
+        validate_artifact_retention_handle(
+            &self.scope.personality_agent_id,
+            &anchor.artifact_handle,
+        )?;
         self.anchored_private_key(
             DataKeyPurpose::Artifact,
             "artifact",
@@ -2604,6 +2653,33 @@ fn validate_retention_unit(purpose: DataKeyPurpose, retention_unit: &str) -> Res
     Ok(())
 }
 
+fn validate_artifact_retention_handle(
+    personality_agent_id: &PersonalityAgentId,
+    handle: &str,
+) -> Result<()> {
+    let prefix = format!("artifact://{personality_agent_id}/");
+    let suffix = handle
+        .strip_prefix(&prefix)
+        .ok_or_else(|| anyhow!("artifact handle must target the authenticated PAID"))?;
+    let mut components = suffix.split('/');
+    let kind = components.next().unwrap_or_default();
+    let artifact_id = components.next().unwrap_or_default();
+    if !matches!(kind, "attachments" | "tool-output") || components.next().is_some() {
+        bail!("artifact handle must use one canonical kind and one artifact ID");
+    }
+    if artifact_id.is_empty()
+        || artifact_id.len() > 200
+        || artifact_id == "."
+        || artifact_id == ".."
+        || !artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("artifact handle contains an invalid artifact ID");
+    }
+    Ok(())
+}
+
 fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
     let retention_unit = anchored_retention_unit("provider_context", scope, anchor_id);
     format!(
@@ -2611,6 +2687,18 @@ fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
         retention_unit
             .split_once(':')
             .expect("provider-context retention unit has a separator")
+            .1
+    )
+}
+
+pub(super) fn memory_summary_key_ref(scope: &AgentScope, unit_kind: &str, unit_id: &str) -> String {
+    let retention_unit =
+        anchored_retention_unit("memory_summary", scope, &format!("{unit_kind}:{unit_id}"));
+    format!(
+        "memory_summary-{}",
+        retention_unit
+            .split_once(':')
+            .expect("memory-summary retention unit has a kind separator")
             .1
     )
 }
@@ -3036,7 +3124,7 @@ mod tests {
             .artifact_key(&ArtifactKeyAnchor {
                 personality_agent_id: scope().personality_agent_id,
                 artifact_handle: format!(
-                    "artifact://{}/null-identity-test",
+                    "artifact://{}/attachments/null-identity-test",
                     scope().personality_agent_id
                 ),
             })
@@ -3101,55 +3189,71 @@ mod tests {
     #[tokio::test]
     async fn migration_rejects_invalid_data_key_check_fixtures() {
         let store = store().await;
-        let mut invalid = vec![
+        let paid = scope().personality_agent_id.to_string();
+        let invalid = vec![
             (
-                "unknown",
+                "invalid-scope",
+                "conversation",
                 "transcript",
-                Some("0198f0f4-9b72-7000-8000-000000000001"),
+                Some(paid.as_str()),
+                "agent".to_owned(),
             ),
             (
-                "0198f0f4-9b72-7000-8000-000000000001",
+                "invalid-purpose",
+                "personality_agent",
                 "unknown",
-                Some("0198f0f4-9b72-7000-8000-000000000001"),
+                Some(paid.as_str()),
+                "agent".to_owned(),
             ),
             (
-                "0198f0f4-9b72-7000-8000-000000000001",
-                "workspace",
-                Some("0198f0f4-9b72-7000-8000-000000000001"),
+                "invalid-paid",
+                "personality_agent",
+                "transcript",
+                Some("conversation-1"),
+                "agent".to_owned(),
             ),
-            ("0198f0f4-9b72-7000-8000-000000000001", "transcript", None),
             (
-                "agent",
-                "workspace",
-                Some("0198f0f4-9b72-7000-8000-000000000001"),
+                "missing-paid",
+                "personality_agent",
+                "transcript",
+                None,
+                "agent".to_owned(),
+            ),
+            (
+                "shared-wrong-retention",
+                "personality_agent",
+                "transcript",
+                Some(paid.as_str()),
+                format!("artifact:{}", "0".repeat(64)),
+            ),
+            (
+                "provider-wrong-retention",
+                "personality_agent",
+                "provider_context",
+                Some(paid.as_str()),
+                "agent".to_owned(),
             ),
         ];
-        for purpose in [
-            "transcript",
-            "event",
-            "memory_summary",
-            "provider_context",
-            "command",
-            "mutation",
-            "artifact",
-        ] {
-            invalid.push(("agent", purpose, None));
-        }
-        for (scope, purpose, personality_agent_id) in invalid {
+        for (key_ref, key_scope, purpose, personality_agent_id, retention_unit) in invalid {
             let result = sqlx::query(
                 "INSERT INTO data_keys(
-                    key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, ?, ?, ?, ?, 'wrap', X'00', X'00', 'active', 'now', NULL)",
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, 'wrap', X'00', X'00', 'active', 'now', NULL)",
             )
-            .bind(format!("{scope}-{purpose}-{personality_agent_id:?}"))
-            .bind(scope)
+            .bind(key_ref)
+            .bind(key_scope)
             .bind(purpose)
             .bind(personality_agent_id)
+            .bind(retention_unit)
             .bind(WRAP_ALGORITHM)
             .execute(store.pool())
             .await;
-            assert!(result.is_err(), "fixture must violate CHECK constraints");
+            assert!(
+                result.is_err(),
+                "single-field invalid fixture {key_ref} must violate its constraint"
+            );
         }
     }
 
@@ -3285,7 +3389,7 @@ mod tests {
             .artifact_key(&ArtifactKeyAnchor {
                 personality_agent_id: scope().personality_agent_id,
                 artifact_handle: format!(
-                    "artifact://{}/state-transition",
+                    "artifact://{}/attachments/state-transition",
                     scope().personality_agent_id
                 ),
             })
@@ -3494,14 +3598,50 @@ mod tests {
                 .await
                 .expect_err("handle PAID must match the authenticated Store")
                 .to_string()
-                .contains("PAID-scoped artifact URI")
+                .contains("authenticated PAID")
+        );
+        for invalid_suffix in [
+            "unknown/id",
+            "attachments",
+            "attachments/",
+            "attachments/.",
+            "attachments/..",
+            "attachments/id/extra",
+            "attachments/non_ascii_é",
+        ] {
+            assert!(
+                store
+                    .artifact_key(&ArtifactKeyAnchor {
+                        personality_agent_id: scope().personality_agent_id,
+                        artifact_handle: format!(
+                            "artifact://{}/{invalid_suffix}",
+                            scope().personality_agent_id
+                        ),
+                    })
+                    .await
+                    .is_err(),
+                "unrouteable artifact handle suffix {invalid_suffix:?} must be rejected"
+            );
+        }
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: scope().personality_agent_id,
+                    artifact_handle: format!(
+                        "artifact://{}/tool-output/{}",
+                        scope().personality_agent_id,
+                        "a".repeat(201)
+                    ),
+                })
+                .await
+                .is_err()
         );
         assert!(
             store
                 .artifact_key(&ArtifactKeyAnchor {
                     personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
                     artifact_handle: format!(
-                        "artifact://{}/wrong-typed-anchor",
+                        "artifact://{}/attachments/wrong-typed-anchor",
                         scope().personality_agent_id
                     ),
                 })
@@ -3804,7 +3944,7 @@ mod tests {
             .artifact_key(&ArtifactKeyAnchor {
                 personality_agent_id: scope().personality_agent_id,
                 artifact_handle: format!(
-                    "artifact://{}/retention-test",
+                    "artifact://{}/attachments/retention-test",
                     scope().personality_agent_id
                 ),
             })
@@ -4186,12 +4326,8 @@ mod tests {
         };
         let footprint =
             eviction_footprint_for_payload(&spec, &item.payload).expect("canonical footprint");
-        let anchor_id = format!("{message_id}:{message_seq}");
         let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                personality_agent_id: store.scope().personality_agent_id.clone(),
-                anchor_id,
-            })
+            .provider_context_item_key(&item, None)
             .await
             .expect("mint provider context key");
         let record = EncryptedProviderContextRecord::encrypt(
@@ -4782,10 +4918,10 @@ mod tests {
             .memory_summary_key("batch", "batch-wrong-key")
             .await
             .expect("mint memory summary key");
-        let transcript_key = store
-            .private_key(DataKeyPurpose::Transcript)
+        let other_memory_key = store
+            .memory_summary_key("batch", "different-batch")
             .await
-            .expect("mint transcript key");
+            .expect("mint a different batch summary key");
         let payload = test_memory_payload();
         let (ciphertext, projection, version) = encrypt_memory_projection(
             &store,
@@ -4796,7 +4932,7 @@ mod tests {
         );
         let error = authenticate_memory_summary(
             &store,
-            &transcript_key.key_ref,
+            &other_memory_key.key_ref,
             &ciphertext,
             &projection,
             i64::from(version),
@@ -4808,8 +4944,7 @@ mod tests {
         .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
-            message.contains("has purpose transcript")
-                && message.contains("expected memory_summary"),
+            message.contains("outside its exact retention unit"),
             "{message}"
         );
     }
@@ -4939,10 +5074,10 @@ mod tests {
             .memory_summary_key("job", "job-wrong-key")
             .await
             .expect("mint memory summary key");
-        let transcript_key = store
-            .private_key(DataKeyPurpose::Transcript)
+        let other_memory_key = store
+            .memory_summary_key("job", "different-job")
             .await
-            .expect("mint transcript key");
+            .expect("mint a different job summary key");
         let payload = test_memory_payload();
         let (ciphertext, projection, version) = encrypt_memory_projection(
             &store,
@@ -4953,7 +5088,7 @@ mod tests {
         );
         let error = authenticate_memory_summary(
             &store,
-            &transcript_key.key_ref,
+            &other_memory_key.key_ref,
             &ciphertext,
             &projection,
             i64::from(version),
@@ -4965,8 +5100,7 @@ mod tests {
         .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
-            message.contains("has purpose transcript")
-                && message.contains("expected memory_summary"),
+            message.contains("outside its exact retention unit"),
             "{message}"
         );
     }

@@ -49,8 +49,8 @@ use crate::{
 
 use super::{
     BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
-    InjectionBatchSizeInput, InjectionCommandSizeInput, ProviderContextKeyAnchor,
-    PublicProjectionBuilder, Redactor, Store, command_payload_digest,
+    InjectionBatchSizeInput, InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store,
+    command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
@@ -1329,8 +1329,7 @@ enum PreparedProjection {
         interrupted: bool,
         l0_disposition: L0Disposition,
         provider_context: Vec<EncryptedProviderContextRecord>,
-        provider_context_key_ref: Option<String>,
-        provider_context_key_proof: Option<Vec<u8>>,
+        provider_context_key_proofs: Vec<(String, Vec<u8>)>,
         eviction_footprint_tokens: u64,
         /// Public transcript estimate for this message, used to durably update
         /// the open L0 batch's `est_tokens`.
@@ -3328,10 +3327,7 @@ impl EventWriter {
                             interrupted,
                             l0_disposition,
                             provider_context: provider_context_records,
-                            provider_context_key_ref: provider_context_key
-                                .as_ref()
-                                .map(|(r, _)| r.clone()),
-                            provider_context_key_proof: provider_context_key.map(|(_, p)| p),
+                            provider_context_key_proofs: provider_context_key,
                             eviction_footprint_tokens,
                             public_est,
                             create_l0_batch,
@@ -3639,10 +3635,10 @@ impl EventWriter {
     ) -> Result<(
         Vec<EncryptedProviderContextRecord>,
         u64,
-        Option<(String, Vec<u8>)>,
+        Vec<(String, Vec<u8>)>,
     )> {
         if fragments.is_empty() {
-            return Ok((Vec::new(), 0, None));
+            return Ok((Vec::new(), 0, Vec::new()));
         }
 
         let PublicMessage::Assistant(assistant) = message else {
@@ -3665,25 +3661,29 @@ impl EventWriter {
         )
         .map_err(anyhow::Error::msg)?;
 
-        let anchor_id = format!("{message_id}:{message_seq}");
-        let key = self
-            .store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                personality_agent_id: self.store.scope().personality_agent_id.clone(),
-                anchor_id,
-            })
-            .await?;
-
-        let key_ref = key.key_ref.clone();
-        let key_proof = super::crypto::keyed_proof(
-            &key,
-            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-            PREPARED_KEY_MATERIAL_PROOF,
-        );
-
         let mut records = Vec::with_capacity(items.len());
+        let mut key_proofs = BTreeMap::new();
         let mut eviction_footprint_tokens = 0u64;
         for item in items {
+            let native_coordinates = match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => None,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => {
+                    Some((0, u64::from(item.ordinal)))
+                }
+            };
+            let key = self
+                .store
+                .provider_context_item_key(&item, native_coordinates)
+                .await?;
+            key_proofs.insert(
+                key.key_ref.clone(),
+                super::crypto::keyed_proof(
+                    &key,
+                    PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                    PREPARED_KEY_MATERIAL_PROOF,
+                ),
+            );
             let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
                 .context("failed to compute provider-context eviction footprint")?;
             let record = EncryptedProviderContextRecord::encrypt(
@@ -3704,7 +3704,7 @@ impl EventWriter {
         Ok((
             records,
             eviction_footprint_tokens,
-            Some((key_ref, key_proof)),
+            key_proofs.into_iter().collect(),
         ))
     }
 
@@ -5197,8 +5197,7 @@ async fn revalidate_prepared_key_refs(
                 PreparedProjection::MessageEnd {
                     raw_key_ref,
                     raw_key_proof,
-                    provider_context_key_ref,
-                    provider_context_key_proof,
+                    provider_context_key_proofs,
                     ..
                 } => {
                     insert_prepared_key_expectation(
@@ -5207,9 +5206,7 @@ async fn revalidate_prepared_key_refs(
                         DataKeyPurpose::Transcript,
                         raw_key_proof,
                     )?;
-                    if let (Some(key_ref), Some(proof)) =
-                        (provider_context_key_ref, provider_context_key_proof)
-                    {
+                    for (key_ref, proof) in provider_context_key_proofs {
                         insert_prepared_key_expectation(
                             &mut refs,
                             key_ref,
@@ -11791,8 +11788,7 @@ async fn apply_projection(
             interrupted,
             l0_disposition,
             provider_context,
-            provider_context_key_ref: _,
-            provider_context_key_proof: _,
+            provider_context_key_proofs: _,
             eviction_footprint_tokens,
             public_est,
             create_l0_batch,
@@ -12024,7 +12020,8 @@ async fn apply_projection(
             job_mutations,
             ..
         } => {
-            apply_memory_job_update(transaction, expected_source_versions, job_mutations).await?;
+            apply_memory_job_update(store, transaction, expected_source_versions, job_mutations)
+                .await?;
         }
         PreparedProjection::MemoryTransition {
             expected_source_versions,
@@ -12379,13 +12376,14 @@ async fn verify_source_states(
 }
 
 async fn apply_memory_job_update(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
     job_mutations: Vec<PreparedMemoryJobMutation>,
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
     for job in job_mutations {
-        apply_memory_job_mutation(transaction, job).await?;
+        apply_memory_job_mutation(store, transaction, job).await?;
     }
     Ok(())
 }
@@ -12598,7 +12596,7 @@ async fn apply_memory_transition(
     }
 
     for job in job_mutations {
-        apply_memory_job_mutation(transaction, job).await?;
+        apply_memory_job_mutation(store, transaction, job).await?;
     }
     if let Some(cursor) = cursor_advance {
         let cursor_record = MemoryApplyCursorRecord {
@@ -12642,6 +12640,15 @@ async fn apply_memory_batch_mutation(
     batch: PreparedMemoryBatchMutation,
     store: &Store,
 ) -> Result<()> {
+    if let Some(summary) = &batch.summary {
+        let expected = super::memory_summary_key_ref(store.scope(), "batch", &batch.batch_id);
+        if summary.key_ref != expected {
+            bail!(
+                "memory batch {} summary key is outside its exact retention unit",
+                batch.batch_id
+            );
+        }
+    }
     if batch.delete_membership {
         let owner_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT m.id, m.seq
@@ -12755,9 +12762,19 @@ async fn apply_memory_batch_mutation(
 }
 
 async fn apply_memory_job_mutation(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     job: PreparedMemoryJobMutation,
 ) -> Result<()> {
+    if let Some(result) = &job.result {
+        let expected = super::memory_summary_key_ref(store.scope(), "job", &job.job_id);
+        if result.key_ref != expected {
+            bail!(
+                "memory job {} result key is outside its exact retention unit",
+                job.job_id
+            );
+        }
+    }
     let (result_key_ref, result_ciphertext, result_projection, result_redaction_version) =
         match job.result {
             Some(result) => (
@@ -13402,6 +13419,7 @@ mod tests {
         .expect("insert running job without lease");
 
         apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "null-lease-job".to_owned(),
@@ -20283,9 +20301,13 @@ mod tests {
 
         let provider_context_key_ref = match &prepared[0].projections[0] {
             PreparedProjection::MessageEnd {
-                provider_context_key_ref: Some(key_ref),
+                provider_context_key_proofs,
                 ..
-            } => key_ref.clone(),
+            } => provider_context_key_proofs
+                .first()
+                .expect("one provider-context key proof")
+                .0
+                .clone(),
             _ => panic!("prepared MessageEnd must carry a provider-context key proof"),
         };
 
@@ -28028,6 +28050,17 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let (_, _, message_id) = seed_assistant_with_reasoning(&store, &writer).await;
+        let key_refs: Vec<String> =
+            sqlx::query_scalar("SELECT key_ref FROM provider_context ORDER BY id")
+                .fetch_all(store.pool())
+                .await
+                .expect("load exact provider-context retention keys");
+        assert_eq!(key_refs.len(), 3);
+        assert_eq!(
+            key_refs.iter().collect::<BTreeSet<_>>().len(),
+            3,
+            "each reasoning item and native window must use an independent retention key"
+        );
 
         let lease = test_lease(1);
         let fence = test_fence(&lease);
@@ -28713,8 +28746,7 @@ mod tests {
             interrupted: false,
             l0_disposition: L0Disposition::Append,
             provider_context: vec![],
-            provider_context_key_ref: None,
-            provider_context_key_proof: None,
+            provider_context_key_proofs: Vec::new(),
             eviction_footprint_tokens: 1,
             public_est: 0,
             create_l0_batch: None,
@@ -28755,6 +28787,7 @@ mod tests {
         .expect("insert running job with lease");
 
         apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "lease-job".to_owned(),
@@ -28785,6 +28818,7 @@ mod tests {
         );
 
         let error = apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "lease-job".to_owned(),
@@ -28805,6 +28839,77 @@ mod tests {
             "{error:#}"
         );
         transaction.rollback().await.expect("rollback test fixture");
+    }
+
+    #[tokio::test]
+    async fn memory_mutations_reject_cross_unit_summary_keys_before_writes() {
+        let store = test_store().await;
+        let wrong_batch_key = store
+            .memory_summary_key("batch", "different-batch")
+            .await
+            .unwrap();
+        let wrong_job_key = store
+            .memory_summary_key("job", "different-job")
+            .await
+            .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+
+        let batch_error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "target-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: Some(MemoryBatchSummary {
+                    key_ref: wrong_batch_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+                est_tokens: 0,
+                footprint_delta: 0,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect_err("batch summary key from another batch must fail before commit");
+        assert!(
+            batch_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        let job_error = apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "target-job".to_owned(),
+                expected_status: "running",
+                new_status: "ready",
+                attempts: 1,
+                attempts_delta: 0,
+                expected_lease_until: None,
+                new_lease_until: None,
+                source_versions: None,
+                result: Some(MemoryJobResult {
+                    key_ref: wrong_job_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+            },
+        )
+        .await
+        .expect_err("job result key from another job must fail before commit");
+        assert!(
+            job_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -28944,8 +29049,7 @@ mod tests {
             l0_batch_id: Some("l0-batch".to_owned()),
             l0_batch_message_ord: Some(1),
             provider_context: vec![],
-            provider_context_key_ref: None,
-            provider_context_key_proof: None,
+            provider_context_key_proofs: Vec::new(),
             eviction_footprint_tokens: 42,
             public_est: 0,
             seal_transition: None,
