@@ -159,6 +159,64 @@ const schemaOnlyAjv = new Ajv2020({
   validateFormats: false,
 });
 
+const httpRejectionCases = [
+  {
+    name: "HTTP pre-sequence rejection",
+    definition: "DirectChatCommandRejectedResponse",
+    valid: [
+      { error: "invalid_command", reject_reason: "schema_violation" },
+      {
+        error: "invalid_command",
+        idempotency_key: "valid-key",
+        reject_reason: "oversized",
+      },
+    ],
+    invalid: [
+      {
+        error: "invalid_command",
+        idempotency_key: "",
+        reject_reason: "schema_violation",
+      },
+      { error: "invalid_command", reject_reason: "idempotency_conflict" },
+    ],
+  },
+  {
+    name: "HTTP idempotency conflict",
+    definition: "DirectChatCommandIdempotencyConflictResponse",
+    valid: [
+      {
+        error: "idempotency_conflict",
+        idempotency_key: "valid-key",
+        reject_reason: "idempotency_conflict",
+      },
+    ],
+    invalid: [
+      { error: "idempotency_conflict", reject_reason: "idempotency_conflict" },
+      {
+        error: "idempotency_conflict",
+        idempotency_key: "",
+        reject_reason: "idempotency_conflict",
+      },
+    ],
+  },
+];
+
+for (const { name, definition, valid, invalid } of httpRejectionCases) {
+  const validate = schemaOnlyAjv.compile(openApi.components.schemas[definition]);
+  for (const value of valid) {
+    if (!validate(value)) {
+      console.error(`${name} rejected valid response: ${describeErrors(validate.errors)}`);
+      failed = true;
+    }
+  }
+  for (const value of invalid) {
+    if (validate(value)) {
+      console.error(`${name} accepted invalid response: ${JSON.stringify(value)}`);
+      failed = true;
+    }
+  }
+}
+
 for (const { name, valid, invalid } of boundedDecimalCases) {
   const agentEventsDefinition = schema.$defs[name];
   const openApiDefinition = openApi.components.schemas[name];

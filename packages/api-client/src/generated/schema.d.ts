@@ -170,10 +170,19 @@ export interface components {
             command_id: string;
             seq: components["schemas"]["JsonSafeInteger"];
         };
-        DirectChatCommandRejection: {
-            idempotency_key: string;
+        DirectChatCommandRejectedResponse: {
+            /** @constant */
+            error: "invalid_command";
+            idempotency_key?: string;
             /** @enum {string} */
-            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict";
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        };
+        DirectChatCommandIdempotencyConflictResponse: {
+            /** @constant */
+            error: "idempotency_conflict";
+            idempotency_key: string;
+            /** @constant */
+            reject_reason: "idempotency_conflict";
         };
         /** @description placeholder for v1; no attachments are accepted yet */
         Attachment: {
@@ -659,7 +668,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DirectChatCommandRejection"];
+                    "application/json": components["schemas"]["DirectChatCommandRejectedResponse"];
                 };
             };
             /** @description Missing or invalid browser session cookie */
@@ -675,7 +684,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DirectChatCommandRejection"];
+                    "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
                 };
             };
         };

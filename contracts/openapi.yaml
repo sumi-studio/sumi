@@ -57,13 +57,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DirectChatCommandRejection"
+                $ref: "#/components/schemas/DirectChatCommandRejectedResponse"
         "409":
           description: Idempotency key was already used for different content
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DirectChatCommandRejection"
+                $ref: "#/components/schemas/DirectChatCommandIdempotencyConflictResponse"
         "401":
           description: Missing or invalid browser session cookie
   /direct-chat/ws:
@@ -194,15 +194,30 @@ components:
           pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         seq:
           $ref: "#/components/schemas/JsonSafeInteger"
-    DirectChatCommandRejection:
+    DirectChatCommandRejectedResponse:
       type: object
-      required: [idempotency_key, reject_reason]
+      required: [error, reject_reason]
       additionalProperties: false
       properties:
+        error:
+          const: invalid_command
         idempotency_key:
           type: string
           minLength: 1
           maxLength: 1024
         reject_reason:
           type: string
-          enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict]
+          enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+    DirectChatCommandIdempotencyConflictResponse:
+      type: object
+      required: [error, idempotency_key, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: idempotency_conflict
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        reject_reason:
+          const: idempotency_conflict
