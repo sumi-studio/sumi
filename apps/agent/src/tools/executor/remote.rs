@@ -882,7 +882,7 @@ mod tests {
             Ok(ExecutorResponse::Bash {
                 result: bash_result(
                     "done",
-                    Some("artifact://conversation-1/tool-output/exec-log"),
+                    Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
                     Some(0),
                     false,
                     None,
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(outputs[6].details["matches"][0]["line_number"], 3);
         assert_eq!(
             outputs[7].details["artifact_handle"],
-            "artifact://conversation-1/tool-output/exec-log"
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"
         );
         assert!(
             matches!(outputs[7].content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("Command exited with code 0."))
@@ -991,7 +991,7 @@ mod tests {
             "read_file",
             "f",
             "r",
-            json!({"path":"artifact://conversation-1/attachments/a","limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","limit":100}),
             CancellationToken::new(),
             noop.clone(),
         )
@@ -1002,7 +1002,7 @@ mod tests {
             "grep",
             "f",
             "g",
-            json!({"path":"artifact://conversation-1/attachments/a","pattern":"found"}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","pattern":"found"}),
             CancellationToken::new(),
             noop,
         )
@@ -1051,7 +1051,7 @@ mod tests {
             "read_file",
             "f",
             "chunk-1",
-            json!({"path":"artifact://conversation-1/attachments/a","offset":7,"limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","offset":7,"limit":100}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1062,7 +1062,7 @@ mod tests {
             "read_file",
             "f",
             "chunk-2",
-            json!({"path":"artifact://conversation-1/attachments/a","offset":10,"limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","offset":10,"limit":100}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconstructs_over_100_kib_single_line_across_exact_pages() {
-        let path = "artifact://conversation-1/attachments/a";
+        let path = "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a";
         let source = "x".repeat(110 * 1024);
         let capacity = artifact_source_capacity();
         let fake = Arc::new(ArtifactSourceInvoker::new(path, source.as_bytes().to_vec()));
@@ -1229,7 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_eof_with_more_than_2000_lines_continues_without_loss() {
-        let path = "artifact://conversation-1/attachments/lines";
+        let path = "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/lines";
         let source = "x\n".repeat(2_100);
         let capacity = artifact_source_capacity();
         let fake = Arc::new(ArtifactSourceInvoker::new(path, source.as_bytes().to_vec()));
@@ -1300,7 +1300,7 @@ mod tests {
             "read_file",
             "f",
             "near-envelope",
-            json!({"path":"artifact://conversation-1/attachments/a"}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a"}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1362,7 +1362,7 @@ mod tests {
                 "read_file",
                 "f",
                 "invalid-limit",
-                json!({"path":"artifact://conversation-1/attachments/a","limit":limit}),
+                json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","limit":limit}),
                 CancellationToken::new(),
                 Arc::new(|_| {}),
             )
@@ -1474,7 +1474,6 @@ mod tests {
         let client = Arc::new(ExecutorClient::new(
             socket,
             RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap(),
-            "conversation-1",
         ));
         let registry = remote_executor_registry(client).unwrap();
         let error = run(
@@ -1538,7 +1537,7 @@ mod tests {
     fn bash_resource_limit_truth_is_preserved() {
         let mut result = bash_result(
             "partial",
-            Some("artifact://conversation-1/tool-output/exec-log"),
+            Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
             None,
             false,
             Some(ResourceLimit::WallTime { limit_seconds: 120 }),
@@ -1554,7 +1553,7 @@ mod tests {
         assert_eq!(output.details["resource_limit"]["type"], "wall_time");
         assert_eq!(output.details["resource_limit"]["limit_seconds"], 120);
         assert!(
-            matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("artifact://conversation-1/tool-output/exec-log") && text.contains("WallTime"))
+            matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log") && text.contains("WallTime"))
         );
     }
 
@@ -1582,7 +1581,7 @@ mod tests {
         ] {
             let result = bash_result(
                 "output",
-                Some("artifact://conversation-1/tool-output/exec-log"),
+                Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
                 exit_code,
                 cancelled,
                 resource_limit.clone(),

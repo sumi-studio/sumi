@@ -2434,7 +2434,7 @@ mod tests {
         UserMessage, ValidatedToolArguments,
     };
     use crate::runtime::contracts::{
-        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
         ApplicationKind, DataKeyPurpose, EncryptedProviderContextRecord, HydrationOutcome,
@@ -2445,6 +2445,17 @@ mod tests {
     };
     use crate::tools::{ToolRegistryBuilder, WorkspacePaths};
     use tokio_util::sync::CancellationToken;
+
+    const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
+    fn provenance(store: &Store) -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new(
+            "tenant-1",
+            store.scope().personality_agent_id.clone(),
+            "human-1",
+        )
+        .expect("canonical direct-chat provenance")
+    }
 
     fn timestamp() -> DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -3171,7 +3182,7 @@ mod tests {
 
     async fn test_store() -> Arc<Store> {
         Arc::new(
-            Store::session_test_store("compactor-test")
+            Store::session_test_store(PERSONALITY_AGENT_ID)
                 .await
                 .expect("open test store"),
         )
@@ -3201,6 +3212,8 @@ mod tests {
         let envelope = CommandEnvelope {
             seq: command_seq,
             command_id: CommandId::parse(command_id).expect("fixture command id"),
+            personality_agent_id: store.scope().personality_agent_id.clone(),
+            provenance: provenance(store),
             command: Command::UserMessage {
                 text: user_text.to_owned(),
                 attachments: Vec::new(),
@@ -3227,7 +3240,8 @@ mod tests {
             .await
             .expect("classify fixture command");
 
-        let user_id = crate::store::user_message_id(command_id);
+        let user_id =
+            crate::store::user_message_id(&store.scope().personality_agent_id, command_id);
         let received_at: String =
             sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
                 .bind(command_id)
@@ -3314,6 +3328,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     command_seq,
                     CommandId::parse(command_id).expect("fixture command id"),
+                    provenance(store),
                 )],
             })
             .await
@@ -3534,7 +3549,7 @@ mod tests {
             .await
             .expect("initialize fixture EventWriter checkpoint");
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("transcript key");
         let redactor = store.redactor();
@@ -5419,6 +5434,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq: 2,
                 command_id: CommandId::parse(pending_command_id).expect("pending command id"),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
+                provenance: provenance(&store),
                 command: Command::UserMessage {
                     text: "pending logical suffix".to_owned(),
                     attachments: Vec::new(),
@@ -5763,7 +5780,7 @@ mod tests {
         )
         .expect("encrypt covered");
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5784,7 +5801,7 @@ mod tests {
         // insert. Promotion must terminalize and scrub it together with the
         // already-applied mutation copy.
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mutation key for retry");
         let retry = ProviderContextMutationBuilder::new(

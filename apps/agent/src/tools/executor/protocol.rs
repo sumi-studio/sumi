@@ -160,44 +160,36 @@ pub enum ExecutorResponse {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactOperation {
     BeginToolOutput {
-        conversation_id: String,
         execution_id: String,
         content: Vec<u8>,
     },
     AppendToolOutput {
-        conversation_id: String,
         handle: String,
         offset: u64,
         content: Vec<u8>,
     },
     FinishToolOutput {
-        conversation_id: String,
         handle: String,
     },
     ReadArtifact {
-        conversation_id: String,
         handle: String,
         offset: u64,
         limit: usize,
     },
     GrepArtifact {
-        conversation_id: String,
         handle: String,
         pattern: String,
     },
     PutAttachment {
-        conversation_id: String,
         artifact_id: String,
         content: String,
     },
     BeginAttachment {
-        conversation_id: String,
         artifact_id: String,
         total_bytes: u64,
         content_digest: String,
     },
     AppendAttachment {
-        conversation_id: String,
         artifact_id: String,
         total_bytes: u64,
         content_digest: String,
@@ -205,7 +197,6 @@ pub enum ArtifactOperation {
         content: Vec<u8>,
     },
     FinishAttachment {
-        conversation_id: String,
         artifact_id: String,
         total_bytes: u64,
         content_digest: String,
@@ -263,27 +254,12 @@ impl RpcOperationValidation for ExecutorOperation {
 impl RpcOperationValidation for ArtifactOperation {
     fn validate(&self) -> Result<(), ToolError> {
         match self {
-            Self::BeginToolOutput {
-                conversation_id,
-                execution_id,
-                ..
-            } => {
-                validate_artifact_handle_component(conversation_id)?;
-                validate_rpc_id(conversation_id, "conversation_id")?;
+            Self::BeginToolOutput { execution_id, .. } => {
                 validate_artifact_handle_component(execution_id)?;
                 validate_rpc_id(execution_id, "execution_id")
             }
-            Self::AppendToolOutput {
-                conversation_id,
-                handle,
-                ..
-            }
-            | Self::FinishToolOutput {
-                conversation_id,
-                handle,
-            } => {
-                validate_rpc_id(conversation_id, "conversation_id")?;
-                let parsed = parse_artifact_handle_for_conversation(handle, conversation_id)?;
+            Self::AppendToolOutput { handle, .. } | Self::FinishToolOutput { handle } => {
+                let parsed = parse_artifact_handle(handle)?;
                 if parsed.kind != ArtifactKind::ToolOutput {
                     return Err(ToolError::InvalidPath(
                         "tool-output mutation requires a tool-output artifact handle".to_owned(),
@@ -291,23 +267,12 @@ impl RpcOperationValidation for ArtifactOperation {
                 }
                 Ok(())
             }
-            Self::ReadArtifact {
-                conversation_id,
-                handle,
-                limit,
-                ..
-            } => {
-                validate_rpc_id(conversation_id, "conversation_id")?;
-                parse_artifact_handle_for_conversation(handle, conversation_id)?;
+            Self::ReadArtifact { handle, limit, .. } => {
+                parse_artifact_handle(handle)?;
                 validate_rpc_read_limit(*limit)
             }
-            Self::GrepArtifact {
-                conversation_id,
-                handle,
-                pattern,
-            } => {
-                validate_rpc_id(conversation_id, "conversation_id")?;
-                parse_artifact_handle_for_conversation(handle, conversation_id)?;
+            Self::GrepArtifact { handle, pattern } => {
+                parse_artifact_handle(handle)?;
                 if pattern.is_empty() {
                     return Err(ToolError::Protocol(
                         "RPC grep pattern must be non-empty".to_owned(),
@@ -315,42 +280,29 @@ impl RpcOperationValidation for ArtifactOperation {
                 }
                 Ok(())
             }
-            Self::PutAttachment {
-                conversation_id,
-                artifact_id,
-                ..
-            } => {
-                validate_artifact_handle_component(conversation_id)?;
-                validate_rpc_id(conversation_id, "conversation_id")?;
+            Self::PutAttachment { artifact_id, .. } => {
                 validate_artifact_handle_component(artifact_id)?;
                 Ok(())
             }
             Self::BeginAttachment {
-                conversation_id,
                 artifact_id,
                 content_digest,
                 ..
             }
             | Self::FinishAttachment {
-                conversation_id,
                 artifact_id,
                 content_digest,
                 ..
             } => {
-                validate_artifact_handle_component(conversation_id)?;
-                validate_rpc_id(conversation_id, "conversation_id")?;
                 validate_artifact_handle_component(artifact_id)?;
                 validate_attachment_digest(content_digest)
             }
             Self::AppendAttachment {
-                conversation_id,
                 artifact_id,
                 content_digest,
                 content,
                 ..
             } => {
-                validate_artifact_handle_component(conversation_id)?;
-                validate_rpc_id(conversation_id, "conversation_id")?;
                 validate_artifact_handle_component(artifact_id)?;
                 validate_attachment_digest(content_digest)?;
                 if content.is_empty() || content.len() > MAX_ATTACHMENT_CHUNK_BYTES {
@@ -361,6 +313,27 @@ impl RpcOperationValidation for ArtifactOperation {
                 Ok(())
             }
         }
+    }
+}
+
+impl ArtifactOperation {
+    pub(super) fn validate_authenticated_owner(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+    ) -> Result<(), ToolError> {
+        let handle = match self {
+            Self::AppendToolOutput { handle, .. }
+            | Self::FinishToolOutput { handle }
+            | Self::ReadArtifact { handle, .. }
+            | Self::GrepArtifact { handle, .. } => handle,
+            Self::BeginToolOutput { .. }
+            | Self::PutAttachment { .. }
+            | Self::BeginAttachment { .. }
+            | Self::AppendAttachment { .. }
+            | Self::FinishAttachment { .. } => return Ok(()),
+        };
+        parse_artifact_handle_for_personality_agent(handle, personality_agent_id)?;
+        Ok(())
     }
 }
 
@@ -673,20 +646,15 @@ fn validate_executor_execution_id(execution_id: &str) -> Result<(), ToolError> {
     validate_rpc_id(execution_id, "execution_id")
 }
 
-pub(super) fn validate_conversation_id(conversation_id: &str) -> Result<(), ToolError> {
-    validate_artifact_handle_component(conversation_id)?;
-    validate_rpc_id(conversation_id, "conversation_id")
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ArtifactKind {
     Attachments,
     ToolOutput,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ParsedArtifactHandle<'a> {
-    pub conversation_id: &'a str,
+    pub personality_agent_id: PersonalityAgentId,
     pub kind: ArtifactKind,
     pub artifact_id: &'a str,
 }
@@ -696,7 +664,8 @@ pub(super) fn parse_artifact_handle(handle: &str) -> Result<ParsedArtifactHandle
         .strip_prefix("artifact://")
         .ok_or_else(|| ToolError::InvalidPath("invalid artifact handle scheme".to_owned()))?;
     let mut components = suffix.split('/');
-    let conversation_id = components.next().unwrap_or_default();
+    let personality_agent_id = PersonalityAgentId::parse(components.next().unwrap_or_default())
+        .map_err(|error| ToolError::InvalidPath(error.to_string()))?;
     let kind = match components.next().unwrap_or_default() {
         "attachments" => ArtifactKind::Attachments,
         "tool-output" => ArtifactKind::ToolOutput,
@@ -712,24 +681,22 @@ pub(super) fn parse_artifact_handle(handle: &str) -> Result<ParsedArtifactHandle
             "artifact handle has extra path components".to_owned(),
         ));
     }
-    validate_artifact_handle_component(conversation_id)?;
-    validate_rpc_id(conversation_id, "conversation_id")?;
     validate_artifact_handle_component(artifact_id)?;
     Ok(ParsedArtifactHandle {
-        conversation_id,
+        personality_agent_id,
         kind,
         artifact_id,
     })
 }
 
-fn parse_artifact_handle_for_conversation<'a>(
+fn parse_artifact_handle_for_personality_agent<'a>(
     handle: &'a str,
-    expected_conversation_id: &str,
+    expected_personality_agent_id: &PersonalityAgentId,
 ) -> Result<ParsedArtifactHandle<'a>, ToolError> {
     let parsed = parse_artifact_handle(handle)?;
-    if parsed.conversation_id != expected_conversation_id {
+    if &parsed.personality_agent_id != expected_personality_agent_id {
         return Err(ToolError::InvalidPath(
-            "artifact belongs to another conversation".to_owned(),
+            "artifact belongs to another personality agent".to_owned(),
         ));
     }
     Ok(parsed)
@@ -1312,8 +1279,9 @@ mod tests {
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
                 operation: ArtifactOperation::ReadArtifact {
-                    conversation_id: "conversation-1".to_owned(),
-                    handle: "artifact://conversation-1/tool-output/execution-1".to_owned(),
+                    handle:
+                        "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1"
+                            .to_owned(),
                     offset: 0,
                     limit,
                 },
@@ -1327,32 +1295,27 @@ mod tests {
     }
 
     #[test]
-    fn artifact_operations_validate_identity_handle_and_pattern_fields() {
-        let handle = "artifact://conversation-1/tool-output/execution-1";
+    fn artifact_operations_validate_handle_and_pattern_fields() {
+        let handle = "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1";
         let valid = vec![
             ArtifactOperation::BeginToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 execution_id: "execution-1".to_owned(),
                 content: vec![],
             },
             ArtifactOperation::AppendToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
                 offset: u64::MAX,
                 content: vec![],
             },
             ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
             },
             ArtifactOperation::ReadArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
                 offset: u64::MAX,
                 limit: MAX_RPC_READ_BYTES,
             },
             ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
                 pattern: "needle".to_owned(),
             },
@@ -1371,54 +1334,23 @@ mod tests {
 
         let invalid = vec![
             ArtifactOperation::BeginToolOutput {
-                conversation_id: "".to_owned(),
-                execution_id: "execution-1".to_owned(),
-                content: vec![],
-            },
-            ArtifactOperation::AppendToolOutput {
-                conversation_id: "".to_owned(),
-                handle: handle.to_owned(),
-                offset: 0,
-                content: vec![],
-            },
-            ArtifactOperation::FinishToolOutput {
-                conversation_id: "".to_owned(),
-                handle: handle.to_owned(),
-            },
-            ArtifactOperation::ReadArtifact {
-                conversation_id: "c".repeat(MAX_RPC_ID_BYTES + 1),
-                handle: handle.to_owned(),
-                offset: 0,
-                limit: MAX_RPC_READ_BYTES,
-            },
-            ArtifactOperation::GrepArtifact {
-                conversation_id: "".to_owned(),
-                handle: handle.to_owned(),
-                pattern: "needle".to_owned(),
-            },
-            ArtifactOperation::BeginToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 execution_id: "".to_owned(),
                 content: vec![],
             },
             ArtifactOperation::AppendToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 handle: "".to_owned(),
                 offset: 0,
                 content: vec![],
             },
             ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 handle: "/workspace/not-an-artifact".to_owned(),
             },
             ArtifactOperation::ReadArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: "workspace-file".to_owned(),
                 offset: 0,
                 limit: MAX_RPC_READ_BYTES,
             },
             ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
                 pattern: "".to_owned(),
             },
@@ -1437,13 +1369,35 @@ mod tests {
     }
 
     #[test]
+    fn artifact_operation_wire_has_no_nested_owner_override() {
+        let raw = json!({
+            "personality_agent_id": PAID,
+            "generation": 7,
+            "nonce": "boot-nonce",
+            "request_id": "request-1",
+            "operation": {
+                "type": "read_artifact",
+                "personality_agent_id": "0198f0f4-9b72-7000-8000-000000000002",
+                "handle": format!("artifact://{PAID}/tool-output/execution-1"),
+                "offset": 0,
+                "limit": MAX_RPC_READ_BYTES,
+            },
+        });
+        let encoded = serde_json::to_vec(&raw).unwrap();
+
+        assert!(matches!(
+            decode_rpc_line::<ArtifactOperation>(&encoded, &identity()),
+            Err(ToolError::Protocol(message)) if message.contains("unknown field")
+        ));
+    }
+
+    #[test]
     fn artifact_operations_enforce_kind_specific_access() {
-        let tool_output = "artifact://conversation-1/tool-output/execution-1";
-        let attachment = "artifact://conversation-1/attachments/input-1";
+        let tool_output = "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1";
+        let attachment = "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/input-1";
         let cases = [
             (
                 ArtifactOperation::AppendToolOutput {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: tool_output.to_owned(),
                     offset: 0,
                     content: vec![],
@@ -1452,14 +1406,12 @@ mod tests {
             ),
             (
                 ArtifactOperation::FinishToolOutput {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: tool_output.to_owned(),
                 },
                 true,
             ),
             (
                 ArtifactOperation::AppendToolOutput {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: attachment.to_owned(),
                     offset: 0,
                     content: vec![],
@@ -1468,14 +1420,12 @@ mod tests {
             ),
             (
                 ArtifactOperation::FinishToolOutput {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: attachment.to_owned(),
                 },
                 false,
             ),
             (
                 ArtifactOperation::ReadArtifact {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: tool_output.to_owned(),
                     offset: 0,
                     limit: MAX_RPC_READ_BYTES,
@@ -1484,7 +1434,6 @@ mod tests {
             ),
             (
                 ArtifactOperation::ReadArtifact {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: attachment.to_owned(),
                     offset: 0,
                     limit: MAX_RPC_READ_BYTES,
@@ -1493,7 +1442,6 @@ mod tests {
             ),
             (
                 ArtifactOperation::GrepArtifact {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: tool_output.to_owned(),
                     pattern: "needle".to_owned(),
                 },
@@ -1501,7 +1449,6 @@ mod tests {
             ),
             (
                 ArtifactOperation::GrepArtifact {
-                    conversation_id: "conversation-1".to_owned(),
                     handle: attachment.to_owned(),
                     pattern: "needle".to_owned(),
                 },
@@ -1533,17 +1480,13 @@ mod tests {
 
     #[test]
     fn begin_tool_output_ids_are_canonical_handle_components() {
-        for (conversation_id, execution_id) in [
-            ("conversation-1._".to_owned(), "execution_1.test".to_owned()),
-            ("c".repeat(MAX_RPC_ID_BYTES), "e".repeat(MAX_RPC_ID_BYTES)),
-        ] {
+        for execution_id in ["execution_1.test".to_owned(), "e".repeat(MAX_RPC_ID_BYTES)] {
             let encoded = serde_json::to_vec(&RpcRequest {
                 personality_agent_id: PAID.parse().unwrap(),
                 generation: 7,
                 nonce: "boot-nonce".to_owned(),
                 request_id: "request-1".to_owned(),
                 operation: ArtifactOperation::BeginToolOutput {
-                    conversation_id,
                     execution_id,
                     content: vec![],
                 },
@@ -1559,34 +1502,28 @@ mod tests {
             "会話".to_owned(),
             "x".repeat(201),
         ] {
-            for (conversation_id, execution_id) in [
-                (invalid_component.clone(), "execution-1".to_owned()),
-                ("conversation-1".to_owned(), invalid_component.clone()),
-            ] {
-                let encoded = serde_json::to_vec(&RpcRequest {
-                    personality_agent_id: PAID.parse().unwrap(),
-                    generation: 7,
-                    nonce: "boot-nonce".to_owned(),
-                    request_id: "request-1".to_owned(),
-                    operation: ArtifactOperation::BeginToolOutput {
-                        conversation_id,
-                        execution_id,
-                        content: vec![],
-                    },
-                })
-                .unwrap();
-                assert!(matches!(
-                    decode_rpc_line::<ArtifactOperation>(&encoded, &identity()),
-                    Err(ToolError::InvalidPath(message))
-                        if message == "invalid artifact handle component"
-                ));
-            }
+            let encoded = serde_json::to_vec(&RpcRequest {
+                personality_agent_id: PAID.parse().unwrap(),
+                generation: 7,
+                nonce: "boot-nonce".to_owned(),
+                request_id: "request-1".to_owned(),
+                operation: ArtifactOperation::BeginToolOutput {
+                    execution_id: invalid_component,
+                    content: vec![],
+                },
+            })
+            .unwrap();
+            assert!(matches!(
+                decode_rpc_line::<ArtifactOperation>(&encoded, &identity()),
+                Err(ToolError::InvalidPath(message))
+                    if message == "invalid artifact handle component"
+            ));
         }
     }
 
     #[test]
     fn executor_operations_only_decode_artifact_inputs_for_routable_tools() {
-        let handle = "artifact://conversation-1/tool-output/execution-1";
+        let handle = "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1";
         let invalid = [
             ExecutorOperation::WriteFile {
                 path: handle.to_owned(),
@@ -1705,18 +1642,23 @@ mod tests {
     #[test]
     fn artifact_handle_parser_enforces_the_canonical_three_segment_shape() {
         assert_eq!(
-            parse_artifact_handle("artifact://conversation-1/attachments/attachment_1.json")
-                .unwrap(),
+            parse_artifact_handle(
+                "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/attachment_1.json"
+            )
+            .unwrap(),
             ParsedArtifactHandle {
-                conversation_id: "conversation-1",
+                personality_agent_id: PAID.parse().unwrap(),
                 kind: ArtifactKind::Attachments,
                 artifact_id: "attachment_1.json",
             },
         );
         assert_eq!(
-            parse_artifact_handle("artifact://conversation-1/tool-output/execution-1").unwrap(),
+            parse_artifact_handle(
+                "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1"
+            )
+            .unwrap(),
             ParsedArtifactHandle {
-                conversation_id: "conversation-1",
+                personality_agent_id: PAID.parse().unwrap(),
                 kind: ArtifactKind::ToolOutput,
                 artifact_id: "execution-1",
             },
@@ -1725,19 +1667,22 @@ mod tests {
         let invalid = vec![
             "".to_owned(),
             "artifact://".to_owned(),
-            "artifact://conversation-1/tool-output/".to_owned(),
-            "artifact://conversation-1/tool-output".to_owned(),
-            "artifact://conversation-1/tool-output/id/extra".to_owned(),
-            "artifact://conversation-1/unknown/id".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/id/extra".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/unknown/id".to_owned(),
             "artifact://./tool-output/id".to_owned(),
             "artifact://../tool-output/id".to_owned(),
-            "artifact://conversation-1/tool-output/.".to_owned(),
-            "artifact://conversation-1/tool-output/..".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/.".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/..".to_owned(),
             "artifact://conversation 1/tool-output/id".to_owned(),
             "artifact://会話/tool-output/id".to_owned(),
-            "artifact://conversation-1/tool-output/invalid:id".to_owned(),
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/invalid:id".to_owned(),
             format!("artifact://{}/tool-output/id", "c".repeat(201)),
-            format!("artifact://conversation-1/tool-output/{}", "a".repeat(201)),
+            format!(
+                "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/{}",
+                "a".repeat(201)
+            ),
         ];
         for handle in invalid {
             assert!(
@@ -1746,28 +1691,19 @@ mod tests {
             );
         }
         assert!(
-            parse_artifact_handle_for_conversation(
-                "artifact://conversation-2/tool-output/id",
-                "conversation-1",
+            parse_artifact_handle_for_personality_agent(
+                "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/id",
+                &PAID.parse().unwrap(),
             )
             .is_err()
         );
     }
 
     #[test]
-    fn artifact_conversation_component_matches_the_rpc_id_bound() {
-        let valid_conversation = format!("{}-._", "c".repeat(MAX_RPC_ID_BYTES - 3));
-        let invalid_conversation = format!("{}-._", "c".repeat(MAX_RPC_ID_BYTES - 2));
-        assert_eq!(valid_conversation.len(), MAX_RPC_ID_BYTES);
-        assert_eq!(invalid_conversation.len(), MAX_RPC_ID_BYTES + 1);
-
-        let valid_handle = format!("artifact://{valid_conversation}/attachments/artifact-_.");
-        assert_eq!(
-            parse_artifact_handle(&valid_handle)
-                .expect("128-byte conversation component")
-                .conversation_id,
-            valid_conversation,
-        );
+    fn artifact_owner_component_is_a_strict_canonical_personality_agent_id() {
+        let valid_handle = format!("artifact://{PAID}/attachments/artifact-_.");
+        let parsed = parse_artifact_handle(&valid_handle).expect("canonical PAID handle");
+        assert_eq!(parsed.personality_agent_id.as_str(), PAID);
         assert_eq!(
             resolve_input("read_file", &valid_handle).unwrap(),
             InputRoute::Artifact
@@ -1778,7 +1714,6 @@ mod tests {
             nonce: "boot-nonce".to_owned(),
             request_id: "request-1".to_owned(),
             operation: ArtifactOperation::ReadArtifact {
-                conversation_id: valid_conversation.clone(),
                 handle: valid_handle,
                 offset: 0,
                 limit: MAX_RPC_READ_BYTES,
@@ -1787,10 +1722,7 @@ mod tests {
         .unwrap();
         assert!(decode_rpc_line::<ArtifactOperation>(&valid_request, &identity()).is_ok());
 
-        let max_artifact_id_handle = format!(
-            "artifact://{valid_conversation}/tool-output/{}",
-            "a".repeat(200)
-        );
+        let max_artifact_id_handle = format!("artifact://{PAID}/tool-output/{}", "a".repeat(200));
         assert_eq!(
             parse_artifact_handle(&max_artifact_id_handle)
                 .expect("artifact IDs retain their 200-byte bound")
@@ -1799,35 +1731,15 @@ mod tests {
             200
         );
 
-        let invalid_handle = format!("artifact://{invalid_conversation}/attachments/artifact-_.");
-        for result in [
-            parse_artifact_handle(&invalid_handle).map(|_| ()),
-            resolve_input("read_file", &invalid_handle).map(|_| ()),
+        for invalid_owner in [
+            "not-a-uuid",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "0198F0F4-9B72-7000-8000-000000000001",
         ] {
-            assert!(matches!(
-                result,
-                Err(ToolError::Protocol(message))
-                    if message == "RPC conversation_id must contain 1..=128 bytes"
-            ));
+            let invalid_handle = format!("artifact://{invalid_owner}/attachments/artifact-_.");
+            assert!(parse_artifact_handle(&invalid_handle).is_err());
+            assert!(resolve_input("read_file", &invalid_handle).is_err());
         }
-        let invalid_request = serde_json::to_vec(&RpcRequest {
-            personality_agent_id: PAID.parse().unwrap(),
-            generation: 7,
-            nonce: "boot-nonce".to_owned(),
-            request_id: "request-1".to_owned(),
-            operation: ArtifactOperation::ReadArtifact {
-                conversation_id: invalid_conversation,
-                handle: invalid_handle,
-                offset: 0,
-                limit: MAX_RPC_READ_BYTES,
-            },
-        })
-        .unwrap();
-        assert!(matches!(
-            decode_rpc_line::<ArtifactOperation>(&invalid_request, &identity()),
-            Err(ToolError::Protocol(message))
-                if message == "RPC conversation_id must contain 1..=128 bytes"
-        ));
     }
 
     #[test]
@@ -2058,7 +1970,7 @@ mod tests {
 
     #[test]
     fn only_read_file_and_grep_accept_artifact_inputs() {
-        let handle = "artifact://conversation/tool-output/execution";
+        let handle = "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution";
         assert_eq!(
             resolve_input("read_file", handle).unwrap(),
             InputRoute::Artifact
@@ -2095,7 +2007,7 @@ mod tests {
         assert_eq!(
             resolve_input(
                 "read_file",
-                "artifact://another-conversation/attachments/input_1.txt",
+                "artifact://0198f0f4-9b72-7000-8000-000000000002/attachments/input_1.txt",
             )
             .unwrap(),
             InputRoute::Artifact,
@@ -2115,7 +2027,6 @@ mod tests {
             nonce: "nonce".to_owned(),
             request_id: "attachment-chunk".to_owned(),
             operation: ArtifactOperation::AppendAttachment {
-                conversation_id: "conversation-1".to_owned(),
                 artifact_id: "input-1".to_owned(),
                 total_bytes: (MAX_ATTACHMENT_CHUNK_BYTES * 2) as u64,
                 content_digest: "a".repeat(64),

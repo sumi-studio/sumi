@@ -30,7 +30,7 @@ use super::{
     ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
     RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
 };
-use crate::runtime::contracts::RpcIdentity;
+use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
@@ -473,10 +473,11 @@ impl BlockingWorkRegistry {
 
     async fn execute_reserved(
         broker: Arc<ArtifactBroker>,
+        personality_agent_id: PersonalityAgentId,
         operation: ArtifactOperation,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<ArtifactResponse, ToolError> {
-        tokio::task::spawn_blocking(move || broker.execute(operation))
+        tokio::task::spawn_blocking(move || broker.execute(&personality_agent_id, operation))
             .await
             .map_err(|_| io_error("artifact blocking worker stopped"))?
     }
@@ -485,10 +486,9 @@ impl BlockingWorkRegistry {
 pub async fn run_tool_executor_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
-    let personality_agent_id = identity.personality_agent_id().to_string();
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let fs = WorkspaceFs::open(&workspace).context("failed to open executor workspace")?;
-    let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), personality_agent_id);
+    let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
     run_executor_service_with_writer(
@@ -589,13 +589,18 @@ async fn serve_broker_connection(
         lifecycle.begin_request(&request.request_id)?;
     }
     let request_id = request.request_id;
+    let personality_agent_id = identity.personality_agent_id().clone();
     let (result_tx, result_rx) = oneshot::channel();
     let job_request_id = request_id.clone();
     tokio::spawn(async move {
-        let result =
-            BlockingWorkRegistry::execute_reserved(broker, request.operation, blocking_permit)
-                .await
-                .map_err(rpc_error);
+        let result = BlockingWorkRegistry::execute_reserved(
+            broker,
+            personality_agent_id,
+            request.operation,
+            blocking_permit,
+        )
+        .await
+        .map_err(rpc_error);
         let lifecycle_result = lifecycle
             .lock()
             .map_err(|_| ToolError::Protocol("artifact lifecycle lock poisoned".to_owned()))
@@ -1397,7 +1402,13 @@ fn decode_artifact_request(
     identity: &RpcIdentity,
 ) -> Result<Result<RpcRequest<ArtifactOperation>, (String, RpcError)>, ToolError> {
     match decode_rpc_line::<ArtifactOperation>(line, identity) {
-        Ok(request) => Ok(Ok(request)),
+        Ok(request) => match request
+            .operation
+            .validate_authenticated_owner(identity.personality_agent_id())
+        {
+            Ok(()) => Ok(Ok(request)),
+            Err(validation_error) => Ok(Err((request.request_id, rpc_error(validation_error)))),
+        },
         Err(validation_error) => {
             let request = match serde_json::from_slice::<RpcRequest<ArtifactOperation>>(line) {
                 Ok(request) => request,
@@ -1736,6 +1747,65 @@ mod tests {
             .code,
             "rpc_indeterminate"
         );
+    }
+
+    #[test]
+    fn artifact_request_owner_comes_only_from_authenticated_rpc_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap();
+        let matching = RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+            request_id: "matching".to_owned(),
+            operation: ArtifactOperation::ReadArtifact {
+                handle: format!("artifact://{PAID}/tool-output/execution-1"),
+                offset: 0,
+                limit: 1,
+            },
+        };
+        let encoded = serde_json::to_vec(&matching).unwrap();
+        assert!(matches!(
+            decode_artifact_request(&encoded, &identity),
+            Ok(Ok(request)) if request.request_id == "matching"
+        ));
+
+        let cross_owner = RpcRequest {
+            personality_agent_id: PAID.parse().unwrap(),
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+            request_id: "cross-owner".to_owned(),
+            operation: ArtifactOperation::ReadArtifact {
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/execution-1"
+                    .to_owned(),
+                offset: 0,
+                limit: 1,
+            },
+        };
+        let encoded = serde_json::to_vec(&cross_owner).unwrap();
+        assert!(matches!(
+            decode_artifact_request(&encoded, &identity),
+            Ok(Err((request_id, RpcError { code, .. })))
+                if request_id == "cross-owner" && code == "invalid_path"
+        ));
+
+        let nested_override = serde_json::json!({
+            "personality_agent_id": PAID,
+            "generation": 7,
+            "nonce": "boot-nonce",
+            "request_id": "nested-owner",
+            "operation": {
+                "type": "read_artifact",
+                "personality_agent_id": "0198f0f4-9b72-7000-8000-000000000002",
+                "handle": format!("artifact://{PAID}/tool-output/execution-1"),
+                "offset": 0,
+                "limit": 1,
+            },
+        });
+        let encoded = serde_json::to_vec(&nested_override).unwrap();
+        assert!(matches!(
+            decode_artifact_request(&encoded, &identity),
+            Err(ToolError::Protocol(message)) if message.contains("unknown field")
+        ));
     }
 
     #[tokio::test]

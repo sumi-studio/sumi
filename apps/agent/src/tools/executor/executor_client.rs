@@ -19,12 +19,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::protocol::{parse_artifact_handle, validate_conversation_id};
+use super::protocol::parse_artifact_handle;
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
     RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
-use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
+use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
     ToolError,
     fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
@@ -69,20 +69,14 @@ impl Default for Deadlines {
 pub struct ExecutorClient {
     socket: PathBuf,
     identity: RpcIdentity,
-    conversation_id: String,
     deadlines: Deadlines,
 }
 
 impl ExecutorClient {
-    pub fn new(
-        socket: impl Into<PathBuf>,
-        identity: RpcIdentity,
-        conversation_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(socket: impl Into<PathBuf>, identity: RpcIdentity) -> Self {
         Self {
             socket: socket.into(),
             identity,
-            conversation_id: conversation_id.into(),
             deadlines: Deadlines::default(),
         }
     }
@@ -101,9 +95,8 @@ impl ExecutorClient {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
-        validate_conversation_id(&self.conversation_id)?;
         operation.validate()?;
-        validate_operation_for_conversation(&operation, &self.conversation_id)?;
+        validate_operation_for_personality_agent(&operation, self.identity.personality_agent_id())?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
             return Err(ToolError::Protocol(
                 "ExecutorClient owns cancel request construction".to_owned(),
@@ -244,10 +237,10 @@ impl ExecutorClient {
                             }
                             let response = result.map_err(|error| map_rpc_error(&operation, error));
                             if let Ok(response) = &response {
-                                validate_response_for_conversation(
+                                validate_response_for_personality_agent(
                                     &operation,
                                     response,
-                                    &self.conversation_id,
+                                    self.identity.personality_agent_id(),
                                 )
                                     .map_err(as_indeterminate)?;
                             }
@@ -454,12 +447,12 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     }
 }
 
-fn validate_response_for_conversation(
+fn validate_response_for_personality_agent(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
-    conversation_id: &str,
+    personality_agent_id: &PersonalityAgentId,
 ) -> Result<(), ToolError> {
-    validate_operation_for_conversation(operation, conversation_id)?;
+    validate_operation_for_personality_agent(operation, personality_agent_id)?;
     let valid = match (operation, response) {
         (
             ExecutorOperation::ReadFile { path, limit, .. },
@@ -495,7 +488,7 @@ fn validate_response_for_conversation(
                     parse_artifact_handle(handle).is_ok_and(|parsed| {
                         parsed.kind == super::protocol::ArtifactKind::ToolOutput
                             && parsed.artifact_id == execution_id
-                            && parsed.conversation_id == conversation_id
+                            && &parsed.personality_agent_id == personality_agent_id
                     })
                 })
         }
@@ -510,9 +503,9 @@ fn validate_response_for_conversation(
     }
 }
 
-fn validate_operation_for_conversation(
+fn validate_operation_for_personality_agent(
     operation: &ExecutorOperation,
-    conversation_id: &str,
+    personality_agent_id: &PersonalityAgentId,
 ) -> Result<(), ToolError> {
     let path = match operation {
         ExecutorOperation::ReadFile { path, .. } | ExecutorOperation::Grep { path, .. } => path,
@@ -522,11 +515,11 @@ fn validate_operation_for_conversation(
         return Ok(());
     }
     let parsed = parse_artifact_handle(path)?;
-    if parsed.conversation_id == conversation_id {
+    if &parsed.personality_agent_id == personality_agent_id {
         Ok(())
     } else {
         Err(ToolError::InvalidPath(
-            "artifact belongs to another conversation".to_owned(),
+            "artifact belongs to another personality agent".to_owned(),
         ))
     }
 }
@@ -536,7 +529,12 @@ fn validate_response(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
 ) -> Result<(), ToolError> {
-    validate_response_for_conversation(operation, response, "conversation-1")
+    validate_response_for_personality_agent(
+        operation,
+        response,
+        &PersonalityAgentId::parse("0198f0f4-9b72-7000-8000-000000000001")
+            .expect("canonical UUIDv7"),
+    )
 }
 
 fn read_file_result_within_limit(
@@ -703,8 +701,7 @@ mod tests {
                 let broker_socket = broker_socket.clone();
                 sessions.push(tokio::spawn(async move {
                     let fs = WorkspaceFs::open(&workspace).unwrap();
-                    let broker =
-                        ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+                    let broker = ArtifactBrokerClient::new(broker_socket, identity());
                     let (read, write) = stream.into_split();
                     run_executor_service(read, write, identity(), workspace, fs, broker)
                         .await
@@ -731,7 +728,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let fs = WorkspaceFs::open(&workspace).unwrap();
-            let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+            let broker = ArtifactBrokerClient::new(broker_socket, identity());
             let (read, write) = stream.into_split();
             run_executor_service_with_cancel_delay(
                 read,
@@ -763,7 +760,7 @@ mod tests {
             let (read, write) = tokio::io::split(executor_stream);
             let service = tokio::spawn(async move {
                 let fs = WorkspaceFs::open(&workspace).unwrap();
-                let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+                let broker = ArtifactBrokerClient::new(broker_socket, identity());
                 run_executor_service(read, write, identity(), workspace, fs, broker)
                     .await
                     .unwrap();
@@ -815,8 +812,7 @@ mod tests {
     async fn real_service_success_and_ordered_updates() {
         let root = temp_root("success-updates");
         let (socket, service) = spawn_real_service(&root, 2);
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let response = client
             .execute(
                 write_operation("write-1", "written.txt", "content"),
@@ -868,7 +864,7 @@ mod tests {
         let (socket, service) = spawn_real_service(&root, 1);
         let updates = Arc::new(Mutex::new(Vec::new()));
         let updates_callback = updates.clone();
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -899,8 +895,7 @@ mod tests {
     async fn real_service_cancellation_waits_for_ack_and_terminal() {
         let root = temp_root("cancel");
         let (socket, service) = spawn_real_service(&root, 1);
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         let started = Arc::new(Semaphore::new(0));
@@ -968,7 +963,7 @@ mod tests {
         let mut deadlines = test_deadlines();
         deadlines.frame = Duration::from_secs(15);
         deadlines.overall = Duration::from_secs(20);
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(deadlines)
             .execute(
                 ExecutorOperation::Bash {
@@ -999,10 +994,8 @@ mod tests {
     async fn concurrent_clients_remain_execution_isolated() {
         let root = temp_root("concurrent");
         let (socket, service) = spawn_real_service(&root, 2);
-        let first = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
-        let second = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let first = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
+        let second = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let (first, second) = tokio::join!(
             first.execute(
                 write_operation("execution-a", "a.txt", "alpha"),
@@ -1052,13 +1045,13 @@ mod tests {
                 write_json_line(
                     &mut write,
                     json!({
-                        "type":"terminal", "generation":7, "nonce":nonce,
+                        "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":nonce,
                         "request_id":request_id, "result":{"Ok":{"type":"written"}}
                     }),
                 )
                 .await;
             });
-            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let error = ExecutorClient::new(&socket, identity())
                 .with_deadlines(test_deadlines())
                 .execute(
                     write_operation("wrong-frame", "x", "x"),
@@ -1077,12 +1070,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_conversation_artifact_routes_fail_before_service_contact() {
-        let root = temp_root("cross-conversation-preflight");
+    async fn cross_personality_agent_artifact_routes_fail_before_service_contact() {
+        let root = temp_root("cross-personality-agent-preflight");
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
 
         for operation in [
             ExecutorOperation::ReadFile {
@@ -1092,13 +1084,14 @@ mod tests {
                 execution_id: "malformed-read".to_owned(),
             },
             ExecutorOperation::ReadFile {
-                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/read".to_owned(),
                 offset: 0,
                 limit: 4,
                 execution_id: "cross-read".to_owned(),
             },
             ExecutorOperation::Grep {
-                path: "artifact://conversation-2/attachments/input".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/attachments/input"
+                    .to_owned(),
                 pattern: "needle".to_owned(),
                 execution_id: "cross-grep".to_owned(),
             },
@@ -1177,7 +1170,7 @@ mod tests {
         );
 
         let artifact_read = ExecutorOperation::ReadFile {
-            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read".to_owned(),
             offset: 0,
             limit: 4,
             execution_id: "read-artifact".to_owned(),
@@ -1211,7 +1204,8 @@ mod tests {
                 &artifact_read,
                 &ExecutorResponse::Artifact {
                     response: ArtifactResponse::Begun {
-                        handle: "artifact://conversation-1/tool-output/read".to_owned(),
+                        handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read"
+                            .to_owned(),
                         offset: 0,
                     },
                 },
@@ -1220,7 +1214,7 @@ mod tests {
         );
 
         let artifact_grep = ExecutorOperation::Grep {
-            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read".to_owned(),
             pattern: "needle".to_owned(),
             execution_id: "grep-artifact".to_owned(),
         };
@@ -1250,13 +1244,13 @@ mod tests {
 
         for forged_operation in [
             ExecutorOperation::ReadFile {
-                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/read".to_owned(),
                 offset: 0,
                 limit: 4,
                 execution_id: "forged-read".to_owned(),
             },
             ExecutorOperation::Grep {
-                path: "artifact://conversation-2/tool-output/grep".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/grep".to_owned(),
                 pattern: "needle".to_owned(),
                 execution_id: "forged-grep".to_owned(),
             },
@@ -1276,13 +1270,13 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(
-                validate_response_for_conversation(
+                validate_response_for_personality_agent(
                     &forged_operation,
                     &forged_response,
-                    "conversation-1",
+                    &PAID.parse().unwrap(),
                 )
                 .is_err(),
-                "accepted a bounded cross-conversation artifact response"
+                "accepted a bounded cross-personality-agent artifact response"
             );
         }
     }
@@ -1373,7 +1367,7 @@ mod tests {
         assert!(validate_response(&grep, &ExecutorResponse::Grepped { matches }).is_err());
 
         let artifact_grep = ExecutorOperation::Grep {
-            path: "artifact://conversation-1/tool-output/grep".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/grep".to_owned(),
             pattern: "x".to_owned(),
             execution_id: "artifact-grep-lines".to_owned(),
         };
@@ -1567,9 +1561,9 @@ mod tests {
         );
 
         for handle in [
-            "artifact://conversation-2/tool-output/bash-bounds",
-            "artifact://conversation-1/attachments/bash-bounds",
-            "artifact://conversation-1/tool-output/other-execution",
+            "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/bash-bounds",
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/bash-bounds",
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/other-execution",
         ] {
             let mut wrong_claim = result.clone();
             wrong_claim.artifact_handle = Some(handle.to_owned());
@@ -1757,7 +1751,7 @@ mod tests {
                     "timeout" => tokio::time::sleep(Duration::from_secs(1)).await,
                     "trailing" => {
                         let terminal = json!({
-                            "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                            "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                             "request_id":request["request_id"],
                             "result":{"Ok":{"type":"written"}}
                         });
@@ -1770,7 +1764,7 @@ mod tests {
             let mut deadlines = test_deadlines();
             deadlines.frame = Duration::from_millis(80);
             deadlines.overall = Duration::from_millis(250);
-            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let error = ExecutorClient::new(&socket, identity())
                 .with_deadlines(deadlines)
                 .execute(
                     write_operation("bad-reply", "x", "x"),
@@ -1811,7 +1805,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         // A token cancelled before emission must produce no service contact.
-        let pre = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let pre = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(write_operation("pre", "x", "x"), cancel, Arc::new(|_| {}))
             .await;
@@ -1823,7 +1817,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let error = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -1859,7 +1853,7 @@ mod tests {
             } else {
                 write_operation("sync-write", "written.txt", "written")
             };
-            let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let response = ExecutorClient::new(&socket, identity())
                 .with_deadlines(test_deadlines())
                 .execute(operation, cancel, Arc::new(|_| {}))
                 .await
@@ -1896,7 +1890,7 @@ mod tests {
             write_json_line(
                 &mut write,
                 json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                     "request_id":cancel["request_id"],
                     "result":{"Ok":{"type":"cancel_too_late"}}
                 }),
@@ -1905,7 +1899,7 @@ mod tests {
             write_json_line(
                 &mut write,
                 json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                     "request_id":operation["request_id"],
                     "result":{"Ok":{"type":"bash","result":{
                         "output":"done", "truncation":truncation,
@@ -1922,7 +1916,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {

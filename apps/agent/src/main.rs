@@ -68,11 +68,9 @@ async fn main() -> Result<()> {
     let config = config::Config::load().await?;
 
     let model_spec = config.model_spec()?;
-    let conversation_id = config.conversation_id.clone();
+    let personality_agent_id = config.personality_agent_id.clone();
     let scope = AgentScope {
-        tenant_id: env::var("SUMI_TENANT_ID").unwrap_or_else(|_| "local-tenant".to_owned()),
-        agent_id: env::var("SUMI_AGENT_ID").unwrap_or_else(|_| "local-agent".to_owned()),
-        conversation_id: conversation_id.clone(),
+        personality_agent_id: personality_agent_id.clone(),
     };
     let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
         "SUMI_AGENT_WRAPPING_KEY",
@@ -86,7 +84,7 @@ async fn main() -> Result<()> {
         DataKeyPurpose::Event,
         DataKeyPurpose::Transcript,
     ] {
-        store.conversation_key(purpose).await?;
+        store.private_key(purpose).await?;
     }
     let event_writer = EventWriter::new(store.clone());
     event_writer.initialize_recovery_checkpoint().await?;
@@ -108,7 +106,7 @@ async fn main() -> Result<()> {
         StdioGateway::new(command_digest_factory).split();
 
     tracing::info!(
-        conversation_id,
+        personality_agent_id = %personality_agent_id,
         workspace = %config.workspace.display(),
         database_path = %config.database_path.display(),
         model_preset = ?config.model.preset,
@@ -129,7 +127,7 @@ async fn main() -> Result<()> {
                     .send(OutboundFrame::Event {
                         envelope: Envelope {
                             seq: None,
-                            conversation_id: conversation_id.clone(),
+                            personality_agent_id: personality_agent_id.clone(),
                             event: serde_json::json!({
                                 "type": "error",
                                 "message": "invalid command envelope",
@@ -141,6 +139,14 @@ async fn main() -> Result<()> {
             }
             Err(error) => return Err(error),
         };
+
+        if inbound.personality_agent_id() != &personality_agent_id
+            || inbound.provenance().personality_agent_id() != &personality_agent_id
+        {
+            anyhow::bail!(
+                "stdio command target/provenance does not match configured personality_agent_id"
+            );
+        }
 
         let receipt_ack = admission.receive(&event_writer, &inbound).await?;
         if receipt_ack.status != CommandAckStatus::Received {

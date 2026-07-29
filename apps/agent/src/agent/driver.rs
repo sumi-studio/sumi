@@ -970,7 +970,6 @@ mod tests {
         let client = Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
             RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity"),
-            "conversation-1",
         ));
         let registry = remote_executor_registry(client).expect("remote registry");
         let prompt = PromptContext {
