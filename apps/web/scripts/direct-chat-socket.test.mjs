@@ -68,8 +68,14 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   const wire = FakeWebSocket.instances.at(-1);
   assert.equal(new URL(wire.url).pathname, "/direct-chat/ws");
   assert.equal(new URL(wire.url).search, "");
-  wire.open();
+  assert.deepEqual(wire.sent, []);
   assert.equal(socket.sendCommand({ type: "user_message", text: "hello", attachments: [] }, "key-1"), true);
+  assert.deepEqual(wire.sent, []);
+  wire.open();
+  assert.deepEqual(wire.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.deepEqual(wire.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  wire.receive({ type: "direct_chat_status", status: "ready" });
   const commands = wire.sent.map(JSON.parse).filter((frame) => frame.type === "command");
   assert.deepEqual(commands, [{ type: "command", idempotency_key: "key-1", command: { type: "user_message", text: "hello", attachments: [] } }]);
   assert.equal(JSON.stringify(commands).includes("personality_agent_id"), false);
@@ -86,11 +92,16 @@ test("retries an uncertain command with its original key and stops after accepta
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
   socket.sendCommand({ type: "abort" }, "stable-key");
   first.close();
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  second.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  second.receive({ type: "direct_chat_status", status: "ready" });
   const resent = second.sent.map(JSON.parse).filter((frame) => frame.type === "command");
   assert.deepEqual(resent, [{ type: "command", idempotency_key: "stable-key", command: { type: "abort" } }]);
   second.receive(accepted("stable-key"));
@@ -109,6 +120,7 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
   socket.sendCommand({ type: "abort" }, "conflicting-key");
   first.receive({ type: "command_rejected", idempotency_key: "conflicting-key", reject_reason: "idempotency_conflict" });
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
@@ -120,21 +132,22 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   socket.close();
 });
 
-test("a terminal unavailable rejection clears its pending key without closing or reconnect resend", () => {
+test("unavailable status retains pending commands without sending until ready", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.connect();
-  const first = FakeWebSocket.instances.at(-1);
-  first.open();
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
   socket.sendCommand({ type: "abort" }, "unavailable-key");
-  first.receive({ type: "command_rejected", idempotency_key: "unavailable-key", reject_reason: "unavailable" });
-  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
-  assert.equal(first.readyState, FakeWebSocket.OPEN);
-  first.close();
-  socket.connect();
-  const second = FakeWebSocket.instances.at(-1);
-  second.open();
-  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["unavailable-key"]);
+  assert.equal(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["unavailable-key"]);
+  assert.equal(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  wire.receive({ type: "direct_chat_status", status: "ready" });
+  assert.deepEqual(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command"), [
+    { type: "command", idempotency_key: "unavailable-key", command: { type: "abort" } },
+  ]);
   socket.close();
 });
 

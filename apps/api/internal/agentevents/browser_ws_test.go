@@ -266,8 +266,8 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err := first.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, first, "unavailable")
 	assertBrowserEvent(t, first, "agent_start", true)
+	assertDirectChatStatus(t, first, "unavailable")
 	_ = first.Close()
 	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	seq = 2
@@ -280,8 +280,8 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err := second.WriteJSON(browserHello{Type: "hello", LastEventSeq: 1}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, second, "unavailable")
 	assertBrowserEvent(t, second, "agent_end", true)
+	assertDirectChatStatus(t, second, "unavailable")
 }
 
 func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
@@ -340,6 +340,23 @@ func assertDirectChatStatus(t *testing.T, conn *websocket.Conn, want string) {
 	}
 }
 
+func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, raw, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected connection to close before any frame, got %s", raw)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("server hung instead of closing browser connection: %v", err)
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected websocket close/EOF, got %T: %v", err, err)
+	}
+}
+
 func signBrowserSession(t *testing.T, secret []byte, claims userSessionWireClaims) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
@@ -351,6 +368,61 @@ func signBrowserSession(t *testing.T, secret []byte, claims userSessionWireClaim
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte(header + "." + encoded))
 	return header + "." + encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         1,
+	}, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, cookie, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "must-not-be-admitted",
+		Command:        json.RawMessage(`{"type":"user_message","text":"blocked by replay","attachments":[]}`),
+	})
+
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("replay failure admitted a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
 }
 
 func TestBrowserServerCommandStateGuards(t *testing.T) {
@@ -557,20 +629,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	// The close may win the race with this write. Either outcome is acceptable,
 	// but the following read must observe a prompt close rather than a timeout.
 	_ = conn.WriteJSON(browserCommandFrame{Type: "command", IdempotencyKey: "ignored", Command: json.RawMessage(`{"type":"abort"}`)})
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	var ignored browserCommandAcceptedFrame
-	err = conn.ReadJSON(&ignored)
-	if err == nil {
-		t.Fatal("expected connection to close after corrupt state, got a command acceptance")
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		t.Fatalf("server hung instead of closing after corrupt state: %v", err)
-	}
-	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("expected websocket close/EOF after corrupt state, got %T: %v", err, err)
-	}
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
 }
 
 func TestDecodeBrowserCommandRequiresContractValidIdempotencyKey(t *testing.T) {

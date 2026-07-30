@@ -764,6 +764,7 @@ export class DirectChatSocket {
   private retry?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private lastEventSeq = 0;
+  private admissionReady = false;
   private readonly pending = new Map<string, DirectChatCommand>();
   private readonly listeners = new Set<Listener>();
   private readonly connectionListeners = new Set<ConnectionListener>();
@@ -795,9 +796,9 @@ export class DirectChatSocket {
       if (this.socket !== socket) return;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
+      this.admissionReady = false;
       this.setReadyState("unknown");
       this.sendRaw({ type: "hello", last_event_seq: this.lastEventSeq });
-      this.flushPending();
     };
     socket.onerror = () => {};
     socket.onmessage = (message) => {
@@ -824,8 +825,11 @@ export class DirectChatSocket {
       if (frame.type === "event" && "seq" in frame.envelope) {
         this.lastEventSeq = frame.envelope.seq;
       }
-      if (frame.type === "direct_chat_status")
+      if (frame.type === "direct_chat_status") {
+        this.admissionReady = frame.status === "ready";
         this.setReadyState(frame.status === "ready" ? "ready" : "not_ready");
+        if (this.admissionReady) this.flushPending();
+      }
       if (frame.type === "command_accepted")
         this.pending.delete(frame.idempotency_key);
       if (frame.type === "command_rejected")
@@ -835,6 +839,7 @@ export class DirectChatSocket {
     socket.onclose = () => {
       if (this.socket !== socket) return;
       this.socket = undefined;
+      this.admissionReady = false;
       this.setConnectionState("closed");
       this.setReadyState("unknown");
       this.scheduleReconnect();
@@ -873,11 +878,13 @@ export class DirectChatSocket {
     this.clearRetry();
     const socket = this.socket;
     this.socket = undefined;
+    this.admissionReady = false;
     socket?.close();
   }
 
   private flushPending() {
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.admissionReady || this.socket?.readyState !== WebSocket.OPEN)
+      return;
     for (const [idempotency_key, command] of this.pending) {
       this.sendRaw({ type: "command", idempotency_key, command });
     }

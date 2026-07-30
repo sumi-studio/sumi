@@ -397,6 +397,21 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 		return conn.WriteJSON(frame)
 	}
+	// Subscribe before replay so volatile traffic produced during catch-up stays
+	// queued, then validate and emit the complete durable suffix synchronously.
+	// Status is the browser's command-admission barrier, so neither it nor the
+	// read pump may start while replay can still fail.
+	next, err := s.browserDurableCatchUp(
+		ctx,
+		claims.PersonalityAgentID,
+		hello.LastEventSeq,
+		write,
+	)
+	if err != nil {
+		return err
+	}
+	// Replay may block on the durable log, so sample readiness only after it
+	// completes instead of publishing a status captured before the barrier.
 	ready, err := s.Events.IsPersonalityAgentReady(ctx, claims.PersonalityAgentID)
 	if err != nil {
 		return fmt.Errorf("read direct-chat readiness: %w", err)
@@ -407,7 +422,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 
 	writerErr := make(chan error, 1)
 	go func() {
-		err := s.browserEventPump(ctx, claims.PersonalityAgentID, hello.LastEventSeq, ready, volatile, write)
+		err := s.browserEventPump(ctx, claims.PersonalityAgentID, next, ready, volatile, write)
 		writerErr <- err
 		if err != nil && !errors.Is(err, context.Canceled) {
 			cancel()
@@ -432,25 +447,10 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 	ticker := time.NewTicker(s.Events.pollInterval())
 	defer ticker.Stop()
 	for {
-		durable, err := s.Events.EventCatchUp(ctx, personalityAgentID, next)
+		var err error
+		next, err = s.browserDurableCatchUp(ctx, personalityAgentID, next, write)
 		if err != nil {
-			return fmt.Errorf("browser durable event catch-up: %w", err)
-		}
-		for _, envelope := range durable {
-			if envelope.Seq == nil {
-				return errors.New("durable replay returned a volatile event")
-			}
-			if envelope.PersonalityAgentID != personalityAgentID {
-				return errors.New("browser event target mismatch")
-			}
-			projected, err := projectBrowserEvent(envelope)
-			if err != nil {
-				return fmt.Errorf("project durable browser event: %w", err)
-			}
-			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
-				return err
-			}
-			next = *envelope.Seq
+			return err
 		}
 		select {
 		case envelope, ok := <-volatile:
@@ -482,6 +482,36 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 			}
 		}
 	}
+}
+
+func (s *BrowserServer) browserDurableCatchUp(
+	ctx context.Context,
+	personalityAgentID string,
+	lastConsumed uint64,
+	write func(any) error,
+) (uint64, error) {
+	durable, err := s.Events.EventCatchUp(ctx, personalityAgentID, lastConsumed)
+	if err != nil {
+		return lastConsumed, fmt.Errorf("browser durable event catch-up: %w", err)
+	}
+	next := lastConsumed
+	for _, envelope := range durable {
+		if envelope.Seq == nil {
+			return next, errors.New("durable replay returned a volatile event")
+		}
+		if envelope.PersonalityAgentID != personalityAgentID {
+			return next, errors.New("browser event target mismatch")
+		}
+		projected, err := projectBrowserEvent(envelope)
+		if err != nil {
+			return next, fmt.Errorf("project durable browser event: %w", err)
+		}
+		if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
+			return next, err
+		}
+		next = *envelope.Seq
+	}
+	return next, nil
 }
 
 func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, write func(any) error) error {
