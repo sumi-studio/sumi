@@ -323,6 +323,66 @@ async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
 }
 
 #[tokio::test]
+async fn concurrent_stale_socket_starters_leave_one_live_owner() {
+    let mut fixture = Fixture::new().await;
+    std::fs::write(fixture.workspace.join("source.txt"), "owned").unwrap();
+    let stale = std::os::unix::net::UnixListener::bind(&fixture.executor_socket).unwrap();
+    drop(stale);
+
+    let mut first = spawn_executor(
+        &fixture.workspace,
+        &fixture.broker_socket,
+        &fixture.executor_socket,
+        NONCE,
+    );
+    let mut second = spawn_executor(
+        &fixture.workspace,
+        &fixture.broker_socket,
+        &fixture.executor_socket,
+        NONCE,
+    );
+    wait_for_socket(&fixture.executor_socket).await;
+
+    let first_lost = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = first.try_wait().unwrap() {
+                assert!(!status.success());
+                return true;
+            }
+            if let Some(status) = second.try_wait().unwrap() {
+                assert!(!status.success());
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("one concurrent starter did not fail closed");
+
+    if first_lost {
+        assert!(second.try_wait().unwrap().is_none());
+        fixture.executor = Some(second);
+    } else {
+        assert!(first.try_wait().unwrap().is_none());
+        fixture.executor = Some(first);
+    }
+    let request = read_file_request(
+        NONCE,
+        "request-concurrent-owner",
+        "execution-concurrent-owner",
+        "source.txt",
+    );
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &request).await),
+        "owned"
+    );
+    let lock_path = fixture.root.join("executor.sock.lock");
+    let lock_metadata = std::fs::symlink_metadata(lock_path).unwrap();
+    assert!(lock_metadata.file_type().is_file());
+    assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[tokio::test]
 async fn disconnect_and_explicit_cancel_reap_children_without_poisoning_manager() {
     let mut fixture = Fixture::new().await;
     std::fs::write(fixture.workspace.join("source.txt"), "still-live").unwrap();
@@ -461,7 +521,7 @@ async fn unconsumed_output_does_not_block_cancel_reap_or_later_connections() {
 }
 
 #[tokio::test]
-async fn connection_admission_is_bounded_and_recovers_after_release() {
+async fn idle_initial_connections_expire_before_valid_connection_admission() {
     let mut fixture = Fixture::new().await;
     std::fs::write(fixture.workspace.join("source.txt"), "bounded").unwrap();
     fixture.start_executor(NONCE).await;
@@ -474,38 +534,69 @@ async fn connection_admission_is_bounded_and_recovers_after_release() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut overloaded = UnixStream::connect(&fixture.executor_socket).await.unwrap();
-    let request = read_file_request(
-        NONCE,
-        "request-over-capacity",
-        "execution-over-capacity",
-        "source.txt",
-    );
-    let mut bytes = serde_json::to_vec(&request).unwrap();
-    bytes.push(b'\n');
-    let _ = overloaded.write_all(&bytes).await;
-    let _ = overloaded.shutdown().await;
-    let mut lines = BufReader::new(overloaded).lines();
-    match timeout(Duration::from_secs(1), lines.next_line())
-        .await
-        .expect("over-capacity connection was not closed")
-    {
-        Ok(None) | Err(_) => {}
-        Ok(Some(line)) => panic!("over-capacity connection executed work: {line}"),
-    }
-
-    drop(idle);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The valid 33rd peer waits in the listener backlog instead of being
+    // dropped. The initial-frame tier expires the 32 idle sockets after one
+    // second, independently of the 135-second promoted connection lifetime.
     let accepted = read_file_request(
         NONCE,
-        "request-after-capacity",
-        "execution-after-capacity",
+        "request-valid-after-idle",
+        "execution-valid-after-idle",
         "source.txt",
     );
     assert_eq!(
         terminal_content(&exchange(&fixture.executor_socket, &accepted).await),
         "bounded"
     );
+    drop(idle);
+}
+
+#[tokio::test]
+async fn completed_primary_requests_close_even_when_clients_keep_write_halves_open() {
+    let mut fixture = Fixture::new().await;
+    std::fs::write(fixture.workspace.join("source.txt"), "released").unwrap();
+    fixture.start_executor(NONCE).await;
+
+    let mut completed_clients = Vec::new();
+    for index in 0..32 {
+        let mut stream = UnixStream::connect(&fixture.executor_socket).await.unwrap();
+        let request = read_file_request(
+            NONCE,
+            &format!("request-completed-open-{index}"),
+            &format!("execution-completed-open-{index}"),
+            "source.txt",
+        );
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await.unwrap();
+        // Intentionally retain the client write half after one primary
+        // operation. The server must emit the terminal and close its session.
+        let mut line = String::new();
+        timeout(
+            Duration::from_secs(5),
+            BufReader::new(&mut stream).read_line(&mut line),
+        )
+        .await
+        .expect("completed connection did not receive a terminal")
+        .expect("read terminal");
+        let terminal: Value = serde_json::from_str(&line).expect("decode terminal");
+        assert_eq!(
+            terminal["result"]["Ok"]["result"]["content"],
+            Value::String("released".to_owned())
+        );
+        completed_clients.push(stream);
+    }
+
+    let later = read_file_request(
+        NONCE,
+        "request-after-completed-open",
+        "execution-after-completed-open",
+        "source.txt",
+    );
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &later).await),
+        "released"
+    );
+    drop(completed_clients);
 }
 
 #[tokio::test]

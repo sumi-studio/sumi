@@ -8,6 +8,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use super::protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE;
 use super::{ExecutorResponse, RpcError, RpcLifecycleTracker};
 use crate::tools::ToolError;
 
@@ -56,11 +58,33 @@ pub(super) struct ExecutorManager {
 
 impl ExecutorManager {
     pub(super) fn new(operation_capacity: usize) -> Arc<Self> {
+        Self::with_registry(operation_capacity, ManagerRegistry::default())
+    }
+
+    fn with_registry(operation_capacity: usize, registry: ManagerRegistry) -> Arc<Self> {
         assert!(operation_capacity > 0);
         Arc::new(Self {
-            registry: Arc::new(Mutex::new(ManagerRegistry::default())),
+            registry: Arc::new(Mutex::new(registry)),
             admission: Arc::new(Semaphore::new(operation_capacity)),
         })
+    }
+
+    #[cfg(test)]
+    fn with_test_boot_uniqueness_budget(
+        operation_capacity: usize,
+        capacity: usize,
+        cancel_reserve: usize,
+    ) -> Arc<Self> {
+        Self::with_registry(
+            operation_capacity,
+            ManagerRegistry {
+                lifecycle: RpcLifecycleTracker::with_test_boot_uniqueness_budget(
+                    capacity,
+                    cancel_reserve,
+                ),
+                ..ManagerRegistry::default()
+            },
+        )
     }
 
     pub(super) async fn begin_execution(
@@ -279,6 +303,14 @@ impl ExecutorManager {
             .map(|registry| registry.active.len())
             .unwrap_or(usize::MAX)
     }
+
+    #[cfg(test)]
+    fn tracked_identity_count(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|registry| registry.lifecycle.tracked_identity_count())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 fn retain_outcome(registry: &mut ManagerRegistry, execution_id: String, outcome: RetainedOutcome) {
@@ -396,5 +428,119 @@ mod tests {
             manager.retained_outcome("execution-drop"),
             Some(Err(RpcError { code, .. })) if code == "rpc_indeterminate"
         ));
+    }
+
+    #[tokio::test]
+    async fn replay_after_outcome_eviction_is_rejected_before_side_effects() {
+        let manager = ExecutorManager::new(1);
+        for index in 0..4_097 {
+            let mut lease = manager
+                .begin_execution(
+                    format!("request-{index}"),
+                    format!("execution-{index}"),
+                    None,
+                )
+                .await
+                .expect("admit unique execution");
+            lease
+                .complete(Ok(ExecutorResponse::CancelAccepted {}))
+                .expect("complete execution");
+        }
+
+        assert_eq!(manager.retained_outcome("execution-0"), None);
+        assert!(manager.retained_outcome("execution-4096").is_some());
+
+        let mut side_effects = 0;
+        let replay = manager
+            .begin_execution("request-0".to_owned(), "execution-replay".to_owned(), None)
+            .await;
+        if replay.is_ok() {
+            side_effects += 1;
+        }
+        assert!(matches!(
+            replay,
+            Err(ToolError::Protocol(message)) if message == "RPC request_id must be unique"
+        ));
+        assert_eq!(side_effects, 0);
+        assert_eq!(manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_boot_budget_rejects_mutation_but_reserves_active_cancel() {
+        let manager = ExecutorManager::with_test_boot_uniqueness_budget(2, 4, 1);
+        let cancel = CancellationToken::new();
+        let mut active = manager
+            .begin_execution(
+                "request-active".to_owned(),
+                "execution-active".to_owned(),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("admit active execution");
+        let mut completed = manager
+            .begin_execution(
+                "request-completed".to_owned(),
+                "execution-completed".to_owned(),
+                None,
+            )
+            .await
+            .expect("fill boot uniqueness budget");
+        completed
+            .complete(Ok(ExecutorResponse::CancelAccepted {}))
+            .expect("complete second execution");
+        drop(completed);
+        assert_eq!(manager.tracked_identity_count(), 4);
+
+        assert!(matches!(
+            manager
+                .begin_execution(
+                    "request-completed".to_owned(),
+                    "execution-replay-request".to_owned(),
+                    None,
+                )
+                .await,
+            Err(ToolError::Protocol(message)) if message == "RPC request_id must be unique"
+        ));
+        assert!(matches!(
+            manager
+                .begin_execution(
+                    "request-new".to_owned(),
+                    "execution-new".to_owned(),
+                    None,
+                )
+                .await,
+            Err(ToolError::Protocol(message))
+                if message == RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE
+        ));
+        assert!(matches!(
+            manager
+                .begin_execution(
+                    "request-replay-execution".to_owned(),
+                    "execution-completed".to_owned(),
+                    None,
+                )
+                .await,
+            Err(ToolError::Protocol(message)) if message == "RPC execution_id must be unique"
+        ));
+        assert_eq!(manager.tracked_identity_count(), 4);
+        assert_eq!(manager.active_count(), 1);
+
+        let CancelDecision::Accepted(cancelled) = manager
+            .cancel_execution("request-cancel", "execution-active")
+            .expect("cancel reserve admits active cancellation")
+        else {
+            panic!("active execution was not cancellable");
+        };
+        assert!(cancel.is_cancelled());
+        assert_eq!(manager.tracked_identity_count(), 5);
+        active
+            .complete(Ok(ExecutorResponse::CancelAccepted {}))
+            .expect("complete cancelled execution");
+        assert_eq!(
+            cancelled.await.expect("cancel completion"),
+            Ok(ExecutorResponse::CancelAccepted {})
+        );
+        assert_eq!(manager.tracked_identity_count(), 5);
+        assert!(manager.tracked_identity_count() <= 4 + 1);
     }
 }

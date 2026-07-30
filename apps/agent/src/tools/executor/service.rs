@@ -2,9 +2,10 @@
 
 use std::{
     env,
+    fs::{File, OpenOptions},
     future::{Future, poll_fn},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -31,6 +32,7 @@ use super::{
     ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
     RpcRequest, decode_rpc_line, encode_rpc_frame,
     manager::{CancelDecision, ExecutionLease, ExecutorManager},
+    protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE,
     resolve_input,
 };
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
@@ -54,11 +56,60 @@ const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
 const EXECUTOR_CANCEL_SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
 const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
 const EXECUTOR_OPERATION_CAPACITY: usize = 8;
+const EXECUTOR_INITIAL_FRAME_DEADLINE: Duration = Duration::from_secs(1);
 const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(135);
 const SOCKET_CONNECT_DEADLINE: Duration = Duration::from_secs(1);
 const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
 const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
+
+struct OwnedUnixListener {
+    listener: UnixListener,
+    // The stable adjacent inode is intentionally retained for the complete
+    // listener lifetime. Cooperating starters may inspect it but never unlink
+    // it, avoiding a lock-file replacement race during handoff.
+    _ownership_lock: File,
+}
+
+struct ExecutorInput<R> {
+    read: R,
+    first_line: Option<Vec<u8>>,
+    close_after_primary: bool,
+    #[cfg(test)]
+    test_controls: ExecutorTestControls,
+}
+
+impl<R> ExecutorInput<R> {
+    fn new(read: R) -> Self {
+        Self {
+            read,
+            first_line: None,
+            close_after_primary: false,
+            #[cfg(test)]
+            test_controls: ExecutorTestControls::default(),
+        }
+    }
+
+    fn prefetched(read: R, first_line: Vec<u8>) -> Self {
+        Self {
+            read,
+            first_line: Some(first_line),
+            close_after_primary: true,
+            #[cfg(test)]
+            test_controls: ExecutorTestControls::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_controls(read: R, test_controls: ExecutorTestControls) -> Self {
+        Self {
+            read,
+            first_line: None,
+            close_after_primary: false,
+            test_controls,
+        }
+    }
+}
 
 /// Wait until a Unix-domain endpoint accepts a connection. A missing endpoint
 /// may still be starting; every other error fails closed.
@@ -84,7 +135,8 @@ async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
 
 /// Bind without stealing a live endpoint. Only a connection-refused path that
 /// is itself a Unix socket is eligible for stale-socket cleanup.
-async fn bind_unix_listener(path: &Path, label: &str) -> Result<UnixListener> {
+async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListener> {
+    let ownership_lock = acquire_socket_ownership(path, label)?;
     match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
         Ok(Ok(_)) => {
             bail!(
@@ -126,7 +178,72 @@ async fn bind_unix_listener(path: &Path, label: &str) -> Result<UnixListener> {
     // A supervisor-owned setgid IPC directory supplies the shared group.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
         .with_context(|| format!("failed to restrict {label} socket {}", path.display()))?;
-    Ok(listener)
+    Ok(OwnedUnixListener {
+        listener,
+        _ownership_lock: ownership_lock,
+    })
+}
+
+fn acquire_socket_ownership(path: &Path, label: &str) -> Result<File> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no file name"))?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    let lock_path = path.with_file_name(lock_name);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "failed to securely open {label} socket ownership lock {}",
+                lock_path.display()
+            )
+        })?;
+    validate_socket_ownership_lock(&lock, &lock_path, label)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        bail!(
+            "{label} socket {} is already owned by another starter: {error}",
+            path.display()
+        );
+    }
+    // Revalidate after locking so an unlink/replacement between open and
+    // flock cannot establish a second cooperating ownership inode.
+    validate_socket_ownership_lock(&lock, &lock_path, label)?;
+    Ok(lock)
+}
+
+fn validate_socket_ownership_lock(lock: &File, path: &Path, label: &str) -> Result<()> {
+    let descriptor = lock
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} ownership lock descriptor"))?;
+    let pathname = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect {label} socket ownership lock {}",
+            path.display()
+        )
+    })?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !descriptor.file_type().is_file()
+        || descriptor.uid() != effective_uid
+        || descriptor.nlink() != 1
+        || descriptor.mode() & 0o777 != 0o600
+        || pathname.file_type().is_symlink()
+        || !pathname.file_type().is_file()
+        || pathname.dev() != descriptor.dev()
+        || pathname.ino() != descriptor.ino()
+    {
+        bail!(
+            "{label} socket ownership lock {} is not a stable uid-owned 0600 regular file",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -572,15 +689,13 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
     let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
     run_executor_service_with_writer(
-        stdin,
+        ExecutorInput::new(stdin),
         ExecutorWriter::start_atomic_progress(stdout),
         identity,
         workspace,
         fs,
         broker,
         manager,
-        #[cfg(test)]
-        ExecutorTestControls::default(),
     )
     .await
 }
@@ -600,30 +715,65 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         .await
         .context("artifact broker socket is not ready")?;
     let listener = bind_unix_listener(&executor_socket, "executor").await?;
+    let handshakes = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
     let connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
     let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
 
     loop {
+        // Stop accepting at the bounded handshake frontier instead of
+        // accepting and dropping the next potentially valid peer. A queued
+        // peer remains in the kernel backlog until an idle handshake expires.
+        let handshake_permit = handshakes
+            .clone()
+            .acquire_owned()
+            .await
+            .context("executor initial-frame admission is closed")?;
         let (stream, _) = listener
+            .listener
             .accept()
             .await
             .context("failed to accept executor connection")?;
-        let Ok(connection_permit) = connections.clone().try_acquire_owned() else {
-            tracing::warn!("executor connection capacity reached");
-            drop(stream);
-            continue;
-        };
         let identity = identity.clone();
         let workspace = workspace.clone();
         let broker_socket = broker_socket.clone();
         let manager = manager.clone();
+        let connections = connections.clone();
         tokio::spawn(async move {
+            let (read, write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let first_line =
+                match timeout(EXECUTOR_INITIAL_FRAME_DEADLINE, read_frame(&mut read)).await {
+                    Ok(Ok(Some(line))) => line,
+                    Ok(Ok(None)) => return,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "executor socket rejected initial frame");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("executor socket initial-frame deadline elapsed");
+                        return;
+                    }
+                };
+            if let Err(error) = decode_executor_request(&first_line, &identity) {
+                tracing::warn!(%error, "executor socket rejected unauthenticated initial frame");
+                return;
+            }
+            drop(handshake_permit);
+            let Ok(connection_permit) = connections.try_acquire_owned() else {
+                tracing::warn!("executor authenticated connection capacity reached");
+                return;
+            };
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
-                let (read, write) = stream.into_split();
                 let fs = WorkspaceFs::open(&workspace)?;
                 let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
-                run_executor_service_with_manager(
-                    read, write, identity, workspace, fs, broker, manager,
+                run_executor_service_with_writer(
+                    ExecutorInput::prefetched(read, first_line),
+                    ExecutorWriter::start(write),
+                    identity,
+                    workspace,
+                    fs,
+                    broker,
+                    manager,
                 )
                 .await
             })
@@ -806,15 +956,13 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     run_executor_service_with_writer(
-        read,
+        ExecutorInput::new(read),
         ExecutorWriter::start(write),
         identity,
         workspace,
         fs,
         broker,
         manager,
-        #[cfg(test)]
-        ExecutorTestControls::default(),
     )
     .await
 }
@@ -834,71 +982,77 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     run_executor_service_with_writer(
-        read,
+        ExecutorInput::with_test_controls(read, test_controls),
         ExecutorWriter::start(write),
         identity,
         workspace,
         fs,
         broker,
         ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
-        test_controls,
     )
     .await
 }
 
 async fn run_executor_service_with_writer<R>(
-    read: R,
+    input: ExecutorInput<R>,
     (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
     identity: RpcIdentity,
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
     manager: Arc<ExecutorManager>,
-    #[cfg(test)] test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let result = run_executor_loop(
-        read,
-        &writer,
-        identity,
-        workspace,
-        fs,
-        broker,
-        manager,
-        #[cfg(test)]
-        test_controls,
-    )
-    .await;
+    let result = run_executor_loop(input, &writer, identity, workspace, fs, broker, manager).await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
 }
 
 async fn run_executor_loop<R>(
-    read: R,
+    input: ExecutorInput<R>,
     writer: &ExecutorWriter,
     identity: RpcIdentity,
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
     manager: Arc<ExecutorManager>,
-    #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
+    let ExecutorInput {
+        read,
+        mut first_line,
+        close_after_primary,
+        #[cfg(test)]
+        mut test_controls,
+    } = input;
     let mut read = BufReader::new(read);
     loop {
-        let Some(line) = read_frame(&mut read).await? else {
-            return Ok(());
+        let line = match first_line.take() {
+            Some(line) => line,
+            None => {
+                let Some(line) = read_frame(&mut read).await? else {
+                    return Ok(());
+                };
+                line
+            }
         };
         let request = match decode_executor_request(&line, &identity)? {
             Ok(request) => request,
             Err((request_id, error)) => {
-                manager.reject_request(&request_id)?;
-                writer.terminal(&identity, request_id, Err(error)).await?;
+                let result = match manager.reject_request(&request_id) {
+                    Ok(()) => Err(error),
+                    Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                    Err(error) => return Err(error.into()),
+                };
+                writer.terminal(&identity, request_id, result).await?;
+                if close_after_primary {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -908,13 +1062,26 @@ where
                 execution_id,
             } => {
                 let cancel = CancellationToken::new();
-                let mut execution = manager
+                let mut execution = match manager
                     .begin_execution(
                         request.request_id.clone(),
                         execution_id.clone(),
                         Some(cancel),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(execution) => execution,
+                    Err(error) if is_boot_uniqueness_exhausted(&error) => {
+                        writer
+                            .terminal(&identity, request.request_id, Err(rpc_error(error)))
+                            .await?;
+                        if close_after_primary {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 run_bash_request(
                     &mut read,
                     writer,
@@ -935,13 +1102,17 @@ where
                 .await?;
             }
             ExecutorOperation::Cancel { execution_id } => {
-                let result = match manager.cancel_execution(&request.request_id, &execution_id)? {
-                    CancelDecision::Accepted(completed) => settle_manager_cancel(completed).await,
-                    CancelDecision::TooLate => Ok(ExecutorResponse::CancelTooLate {}),
-                    CancelDecision::Unknown => Err(RpcError {
+                let result = match manager.cancel_execution(&request.request_id, &execution_id) {
+                    Ok(CancelDecision::Accepted(completed)) => {
+                        settle_manager_cancel(completed).await
+                    }
+                    Ok(CancelDecision::TooLate) => Ok(ExecutorResponse::CancelTooLate {}),
+                    Ok(CancelDecision::Unknown) => Err(RpcError {
                         code: "protocol".to_owned(),
                         resource_limit: None,
                     }),
+                    Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                    Err(error) => return Err(error.into()),
                 };
                 writer
                     .terminal(&identity, request.request_id, result)
@@ -949,9 +1120,22 @@ where
             }
             operation => {
                 let execution_id = operation_execution_id(&operation).to_owned();
-                let mut execution = manager
+                let mut execution = match manager
                     .begin_execution(request.request_id.clone(), execution_id, None)
-                    .await?;
+                    .await
+                {
+                    Ok(execution) => execution,
+                    Err(error) if is_boot_uniqueness_exhausted(&error) => {
+                        writer
+                            .terminal(&identity, request.request_id, Err(rpc_error(error)))
+                            .await?;
+                        if close_after_primary {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let result = execute_non_bash(&fs, &broker, operation)
                     .await
                     .map_err(rpc_error);
@@ -960,6 +1144,9 @@ where
                     .terminal(&identity, request.request_id, result)
                     .await?;
             }
+        }
+        if close_after_primary {
+            return Ok(());
         }
     }
 }
@@ -1634,8 +1821,18 @@ fn rpc_error(error: ToolError) -> RpcError {
         ToolError::Io(_) => bounded_error("io"),
         ToolError::Rpc(_) => bounded_error("rpc"),
         ToolError::RpcIndeterminate(_) => bounded_error("rpc_indeterminate"),
+        ToolError::Protocol(message) if message == RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE => {
+            bounded_error(RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE)
+        }
         ToolError::Protocol(_) => bounded_error("protocol"),
     }
+}
+
+fn is_boot_uniqueness_exhausted(error: &ToolError) -> bool {
+    matches!(
+        error,
+        ToolError::Protocol(message) if message == RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE
+    )
 }
 
 fn bounded_error(code: &str) -> RpcError {
@@ -1723,6 +1920,75 @@ mod tests {
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::{runtime::contracts::MAX_PROCESS_GENERATION, tools::executor::decode_rpc_frame};
+
+    #[tokio::test]
+    async fn socket_ownership_lock_rejects_symlink_and_unsafe_permissions_before_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "sumi-executor-socket-lock-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root).expect("create socket lock test directory");
+
+        let symlink_socket = root.join("symlink.sock");
+        drop(
+            std::os::unix::net::UnixListener::bind(&symlink_socket)
+                .expect("bind stale symlink-case socket"),
+        );
+        let symlink_target = root.join("lock-target");
+        std::fs::write(&symlink_target, b"do-not-follow").expect("write symlink target");
+        std::fs::set_permissions(&symlink_target, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict symlink target");
+        symlink(&symlink_target, root.join("symlink.sock.lock")).expect("install lock symlink");
+        assert!(
+            bind_unix_listener(&symlink_socket, "test").await.is_err(),
+            "a symlink ownership lock must fail closed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&symlink_socket)
+                .expect("stale socket remains")
+                .file_type()
+                .is_socket()
+        );
+        assert_eq!(
+            std::fs::read(&symlink_target).expect("read untouched symlink target"),
+            b"do-not-follow"
+        );
+
+        let permissive_socket = root.join("permissive.sock");
+        drop(
+            std::os::unix::net::UnixListener::bind(&permissive_socket)
+                .expect("bind stale permission-case socket"),
+        );
+        let permissive_lock = root.join("permissive.sock.lock");
+        std::fs::write(&permissive_lock, b"").expect("create permissive lock");
+        std::fs::set_permissions(&permissive_lock, std::fs::Permissions::from_mode(0o666))
+            .expect("make lock permissive");
+        assert!(
+            bind_unix_listener(&permissive_socket, "test")
+                .await
+                .is_err(),
+            "an overly permissive ownership lock must fail closed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&permissive_socket)
+                .expect("second stale socket remains")
+                .file_type()
+                .is_socket()
+        );
+
+        std::fs::remove_dir_all(root).expect("remove socket lock test directory");
+    }
+
+    #[test]
+    fn boot_uniqueness_exhaustion_has_a_rollover_specific_wire_code() {
+        let error = rpc_error(ToolError::Protocol(
+            RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE.to_owned(),
+        ));
+        assert_eq!(error.code, RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE);
+        assert_eq!(error.resource_limit, None);
+    }
 
     #[test]
     fn bootstrap_generation_accepts_sqlite_domain_and_rejects_the_next_value() {
