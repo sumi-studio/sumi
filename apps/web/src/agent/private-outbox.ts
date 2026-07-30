@@ -210,6 +210,15 @@ export class PrivateOutbox {
     return entry.text;
   }
 
+  clear(): void {
+    if (this.entriesValue.length === 0) {
+      this.persist();
+      return;
+    }
+    this.entriesValue = [];
+    this.persist();
+  }
+
   private recover(
     index: number,
     reason: string,

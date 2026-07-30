@@ -107,6 +107,39 @@ test("admission is provisional and canonical user arrival replaces it", () => {
   assert.deepEqual(store.getState().recoverableDrafts, []);
 });
 
+test("authority reset disposes conversation and private delivery state", () => {
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox();
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "old-authority-key",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("private old text"), true);
+  transport.emit({
+    type: "event",
+    envelope: {
+      seq: 1,
+      event: { type: "agent_start" },
+    },
+  } as DirectChatServerFrame);
+  assert.notEqual(store.getState().conversation.entryOrder.length, 0);
+  assert.notEqual(outbox.entries().length, 0);
+
+  store.getState().resetAuthority();
+
+  assert.deepEqual(store.getState().conversation.entryOrder, []);
+  assert.deepEqual(store.getState().conversation.entries, {});
+  assert.deepEqual(store.getState().recoverableDrafts, []);
+  assert.deepEqual(outbox.entries(), []);
+  assert.equal(store.getState().connection, "closed");
+  assert.equal(store.getState().ready, "unknown");
+  const sentBeforeReconnect = transport.sent.length;
+  store.getState().connect();
+  assert.equal(transport.sent.length, sentBeforeReconnect);
+});
+
 test("disposition before admission is reconciled when the receipt arrives", () => {
   for (const status of ["applied", "superseded", "rejected"] as const) {
     const transport = new FakeTransport();

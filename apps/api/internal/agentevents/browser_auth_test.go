@@ -394,6 +394,161 @@ func TestBrowserAuthLogoutRevokesSessionAndClosesOnlyItsConnections(t *testing.T
 	}
 }
 
+func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
+	bindings := &fakeBindingResolver{claims: UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}}
+	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
+	closer := &fakeBrowserConnectionCloser{}
+	server.Connections = closer
+	first, err := sessions.IssueSession(context.Background(), bindings.claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClaims, err := sessions.VerifySession(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf, csrfCookie := obtainCSRF(t, server)
+	exchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"replacement"}`))
+	exchange.Header.Set("Origin", browserAuthTestOrigin)
+	exchange.Header.Set("Content-Type", "application/json")
+	exchange.Header.Set("X-CSRF-Token", csrf)
+	exchange.AddCookie(csrfCookie)
+	exchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
+	exchangeRecorder := httptest.NewRecorder()
+	server.serveSessionExchange(exchangeRecorder, exchange)
+	if exchangeRecorder.Code != http.StatusNoContent {
+		t.Fatalf("replacement exchange: %d %s", exchangeRecorder.Code, exchangeRecorder.Body.String())
+	}
+	if _, err := sessions.VerifySession(context.Background(), first); err == nil {
+		t.Fatal("replacement left the old session authoritative")
+	}
+	if len(closer.sessionIDs) != 1 || closer.sessionIDs[0] != firstClaims.sessionID {
+		t.Fatalf("replacement closed sessions %v, want old SID %q", closer.sessionIDs, firstClaims.sessionID)
+	}
+	replacementCookies := exchangeRecorder.Result().Cookies()
+	if len(replacementCookies) != 1 {
+		t.Fatalf("replacement cookies = %d, want 1", len(replacementCookies))
+	}
+	second := replacementCookies[0].Value
+	secondClaims, err := sessions.VerifySession(context.Background(), second)
+	if err != nil {
+		t.Fatalf("replacement session is invalid: %v", err)
+	}
+	replayedExchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"concurrent-replay"}`))
+	replayedExchange.Header.Set("Origin", browserAuthTestOrigin)
+	replayedExchange.Header.Set("Content-Type", "application/json")
+	replayedExchange.Header.Set("X-CSRF-Token", csrf)
+	replayedExchange.AddCookie(csrfCookie)
+	replayedExchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
+	replayedRecorder := httptest.NewRecorder()
+	server.serveSessionExchange(replayedRecorder, replayedExchange)
+	if replayedRecorder.Code != http.StatusServiceUnavailable || len(replayedRecorder.Result().Cookies()) != 0 {
+		t.Fatalf("retired replacement credential minted another session: %d %+v", replayedRecorder.Code, replayedRecorder.Result().Cookies())
+	}
+	if _, err := sessions.VerifySession(context.Background(), second); err != nil {
+		t.Fatalf("replayed old credential invalidated replacement: %v", err)
+	}
+
+	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logout.Header.Set("Origin", browserAuthTestOrigin)
+	logout.Header.Set("X-CSRF-Token", csrf)
+	logout.AddCookie(csrfCookie)
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: second})
+	logoutRecorder := httptest.NewRecorder()
+	server.serveLogout(logoutRecorder, logout)
+	if logoutRecorder.Code != http.StatusNoContent {
+		t.Fatalf("replacement logout: %d %s", logoutRecorder.Code, logoutRecorder.Body.String())
+	}
+	if _, err := sessions.VerifySession(context.Background(), second); err == nil {
+		t.Fatal("logout left replacement session authoritative")
+	}
+	if len(closer.sessionIDs) != 2 || closer.sessionIDs[1] != secondClaims.sessionID {
+		t.Fatalf("replacement lifecycle closed sessions %v", closer.sessionIDs)
+	}
+}
+
+func TestBrowserAuthReplacementFailsClosedWhenOldSessionCannotBeRetired(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
+	bindings := &fakeBindingResolver{claims: UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}}
+	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
+	sessions.maxRevoked = 0
+	first, err := sessions.IssueSession(context.Background(), bindings.claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf, csrfCookie := obtainCSRF(t, server)
+	exchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"replacement"}`))
+	exchange.Header.Set("Origin", browserAuthTestOrigin)
+	exchange.Header.Set("Content-Type", "application/json")
+	exchange.Header.Set("X-CSRF-Token", csrf)
+	exchange.AddCookie(csrfCookie)
+	exchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
+	recorder := httptest.NewRecorder()
+	server.serveSessionExchange(recorder, exchange)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503", recorder.Code)
+	}
+	if len(recorder.Result().Cookies()) != 0 {
+		t.Fatal("replacement published a cookie after retirement failed")
+	}
+	if _, err := sessions.VerifySession(context.Background(), first); err != nil {
+		t.Fatalf("failed retirement unexpectedly invalidated old session: %v", err)
+	}
+}
+
+func TestBrowserAuthDuplicateCookieLogoutRevokesEveryVerifiableSession(t *testing.T) {
+	server, sessions := newTestBrowserAuthServer(t, &fakeFirebaseVerifier{}, &fakeBindingResolver{})
+	closer := &fakeBrowserConnectionCloser{}
+	server.Connections = closer
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	first, err := sessions.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := sessions.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf, csrfCookie := obtainCSRF(t, server)
+	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logout.Header.Set("Origin", browserAuthTestOrigin)
+	logout.Header.Set("X-CSRF-Token", csrf)
+	logout.AddCookie(csrfCookie)
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: "malformed"})
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: second})
+	recorder := httptest.NewRecorder()
+	server.serveLogout(recorder, logout)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("duplicate-cookie logout: %d %s", recorder.Code, recorder.Body.String())
+	}
+	for _, signed := range []string{first, second} {
+		if _, err := sessions.VerifySession(context.Background(), signed); err == nil {
+			t.Fatal("duplicate-cookie logout left a verifiable session authoritative")
+		}
+	}
+	if len(closer.sessionIDs) != 2 {
+		t.Fatalf("closed sessions = %v, want two", closer.sessionIDs)
+	}
+	cleared := recorder.Result().Cookies()
+	if len(cleared) != 2 || cleared[0].Name != BrowserSessionCookie || cleared[0].MaxAge >= 0 {
+		t.Fatalf("logout did not clear authoritative cookie: %+v", cleared)
+	}
+}
+
 func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{}
@@ -409,7 +564,6 @@ func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
 	}{
 		{name: "exchange", method: http.MethodPost, path: "/auth/session", call: server.serveSessionExchange},
 		{name: "status", method: http.MethodGet, path: "/auth/session", call: server.serveSessionStatus},
-		{name: "logout", method: http.MethodPost, path: "/auth/logout", call: server.serveLogout},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"id_token":"token"}`))

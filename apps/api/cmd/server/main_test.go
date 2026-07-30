@@ -21,6 +21,7 @@ import (
 	"time"
 
 	firebaseauth "firebase.google.com/go/v4/auth"
+	"github.com/gorilla/websocket"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
@@ -223,6 +224,53 @@ func TestAllowedOriginsFromEnv(t *testing.T) {
 	})
 }
 
+func TestBrowserSessionConfigurationRejectsEveryPartialGroup(t *testing.T) {
+	clearBrowserConfiguration(t)
+	for _, tc := range []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "secret only", env: "SUMI_BROWSER_SESSION_SECRET", value: base64.StdEncoding.EncodeToString(testSessionSecret)},
+		{name: "audience only", env: "SUMI_BROWSER_SESSION_AUDIENCE", value: agentevents.DefaultBrowserAudience()},
+		{name: "origins only", env: "SUMI_BROWSER_WS_ALLOWED_ORIGINS", value: testBrowserOrigin},
+		{name: "auth dependency only", env: "SUMI_AUTH_FIREBASE_UID", value: "firebase-user"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearBrowserConfiguration(t)
+			t.Setenv(tc.env, tc.value)
+			if _, _, err := browserSessionConfigFromEnv(); err == nil {
+				t.Fatal("partial browser-session configuration did not fail startup")
+			}
+		})
+	}
+
+	t.Run("complete group", func(t *testing.T) {
+		clearBrowserConfiguration(t)
+		t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
+		t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
+		t.Setenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS", testBrowserOrigin)
+		sessions, origins, err := browserSessionConfigFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sessions == nil || len(origins) != 1 || origins[0] != testBrowserOrigin {
+			t.Fatalf("unexpected complete browser config: sessions=%v origins=%v", sessions, origins)
+		}
+	})
+}
+
+func clearBrowserConfiguration(t *testing.T) {
+	t.Helper()
+	for _, name := range append([]string{
+		"SUMI_BROWSER_SESSION_SECRET",
+		"SUMI_BROWSER_SESSION_AUDIENCE",
+		"SUMI_BROWSER_WS_ALLOWED_ORIGINS",
+	}, browserAuthEnvironmentNames...) {
+		t.Setenv(name, "")
+	}
+}
+
 func TestBrowserAuthDisabledWithoutExplicitFirebaseUID(t *testing.T) {
 	t.Setenv("SUMI_AUTH_FIREBASE_UID", "")
 	server, enabled, err := browserAuthServerFromEnv(
@@ -235,6 +283,78 @@ func TestBrowserAuthDisabledWithoutExplicitFirebaseUID(t *testing.T) {
 	}
 	if enabled || server != nil {
 		t.Fatal("auth routes must remain disabled without explicit Firebase UID binding")
+	}
+}
+
+func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *testing.T) {
+	store, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	sessions, err := agentevents.NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	browser := agentevents.NewBrowserServer(sessions, runtime, runtime)
+	browser.AllowedOrigins = []string{testBrowserOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	session, err := sessions.IssueSession(context.Background(), agentevents.UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}, time.Minute)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/direct-chat/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Origin": {testBrowserOrigin},
+		"Cookie": {agentevents.BrowserSessionCookie + "=" + session},
+	})
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{"type": "hello", "last_event_seq": 0}); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for browser.ConnectionStats().Active != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if browser.ConnectionStats().Active != 1 {
+		_ = store.Close()
+		t.Fatal("browser socket was not retained by the gateway")
+	}
+
+	app := &application{store: store, browser: browser}
+	if err := app.Close(); err != nil {
+		t.Fatalf("application close: %v", err)
+	}
+	if stats := browser.ConnectionStats(); stats.Active != 0 {
+		t.Fatalf("application close returned before browser drain: %+v", stats)
+	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("hijacked browser socket remained open after application close")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("application shutdown did not close hijacked socket: %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("idempotent application close: %v", err)
 	}
 }
 

@@ -34,7 +34,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context) (runErr error) {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -48,7 +48,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer app.Close()
+	defer func() {
+		runErr = errors.Join(runErr, app.Close())
+	}()
 
 	publicServer := &http.Server{
 		Addr:              publicAddress,
@@ -154,13 +156,26 @@ type application struct {
 	localMux      *http.ServeMux
 	localListener *localControlListenerConfig
 	store         *agentevents.CommandStore
+	browser       *agentevents.BrowserServer
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 func (a *application) Close() error {
-	if a == nil || a.store == nil {
+	if a == nil {
 		return nil
 	}
-	return a.store.Close()
+	a.closeOnce.Do(func() {
+		if a.browser != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
+			cancel()
+		}
+		if a.store != nil {
+			a.closeErr = errors.Join(a.closeErr, a.store.Close())
+		}
+	})
+	return a.closeErr
 }
 
 func newRouter() (*http.ServeMux, error) {
@@ -176,9 +191,9 @@ func newApplicationFromEnv() (*application, error) {
 	if err != nil && !errors.Is(err, errTokenSecretMissing) {
 		return nil, fmt.Errorf("agent token verifier: %w", err)
 	}
-	sv, err := browserSessionVerifierFromEnv()
-	if err != nil && !errors.Is(err, errBrowserSessionSecretMissing) {
-		return nil, fmt.Errorf("browser session verifier: %w", err)
+	sv, browserOrigins, err := browserSessionConfigFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("browser session configuration: %w", err)
 	}
 
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
@@ -200,12 +215,12 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
 
-	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
-	authServer, authEnabled, err := browserAuthServerFromEnv(context.Background(), sv, browserAllowedOriginsFromEnv())
+	authServer, authEnabled, err := browserAuthServerFromEnv(context.Background(), sv, browserOrigins)
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("browser auth: %w", err)
@@ -238,6 +253,7 @@ func newApplicationFromEnv() (*application, error) {
 		localMux:      localMux,
 		localListener: localListener,
 		store:         store,
+		browser:       browser,
 	}, nil
 }
 
@@ -1443,6 +1459,28 @@ func allowedOriginsFromEnv() []string {
 
 func browserAllowedOriginsFromEnv() []string {
 	return originsFromEnv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")
+}
+
+func browserSessionConfigFromEnv() (*agentevents.HMACUserSessionVerifier, []string, error) {
+	secretConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_SECRET")) != ""
+	audienceConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")) != ""
+	originsConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")) != ""
+	authConfigured := browserAuthConfiguredFromEnv()
+	if !secretConfigured && !audienceConfigured && !originsConfigured && !authConfigured {
+		return nil, nil, nil
+	}
+	if !secretConfigured || !audienceConfigured || !originsConfigured {
+		return nil, nil, errors.New("SUMI_BROWSER_SESSION_SECRET, SUMI_BROWSER_SESSION_AUDIENCE, and SUMI_BROWSER_WS_ALLOWED_ORIGINS must be configured together")
+	}
+	origins := browserAllowedOriginsFromEnv()
+	if len(origins) == 0 {
+		return nil, nil, errors.New("SUMI_BROWSER_WS_ALLOWED_ORIGINS must contain at least one exact origin")
+	}
+	sessions, err := browserSessionVerifierFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	return sessions, origins, nil
 }
 
 func originsFromEnv(name string) []string {

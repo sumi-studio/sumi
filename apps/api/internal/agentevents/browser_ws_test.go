@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -512,6 +513,78 @@ func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
 	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 0, Accepted: 1})
 }
 
+func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	agentClaims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, agentClaims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	writeReached := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var writeHookCalls int
+	browser.beforeWrite = func() {
+		writeHookCalls++
+		if writeHookCalls == 1 {
+			close(writeReached)
+			<-releaseWrite
+		}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	expires := time.Now().Add(2 * time.Second).Unix()
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Iat:                expires - int64(time.Minute/time.Second),
+		Exp:                expires,
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, session, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writeReached:
+	case <-time.After(time.Second):
+		t.Fatal("durable replay did not reach its first write")
+	}
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "must-not-append-after-expiry",
+		Command:        json.RawMessage(`{"type":"user_message","text":"expired","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(time.Unix(expires, 0).Add(100 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	close(releaseWrite)
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("expiry crossing replay appended command: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
 func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -580,7 +653,10 @@ func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn
 		t.Fatalf("server hung instead of closing browser connection: %v", err)
 	}
 	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+	if !errors.As(err, &closeErr) &&
+		!errors.Is(err, io.EOF) &&
+		!errors.Is(err, net.ErrClosed) &&
+		!errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("expected websocket close/EOF, got %T: %v", err, err)
 	}
 }

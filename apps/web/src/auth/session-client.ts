@@ -19,6 +19,28 @@ export class AuthAPIError extends Error {
   }
 }
 
+export class SumiSessionCompensatedError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(
+      "Sumi session verification failed after exchange; the session was logged out.",
+    );
+    this.name = "SumiSessionCompensatedError";
+    this.cause = cause;
+  }
+}
+
+export class SumiSessionCompensationFailedError extends AggregateError {
+  constructor(exchangeError: unknown, logoutError: unknown) {
+    super(
+      [exchangeError, logoutError],
+      "Sumi session verification failed and compensating logout did not complete.",
+    );
+    this.name = "SumiSessionCompensationFailedError";
+  }
+}
+
 async function fetchCSRFToken(): Promise<string> {
   const response = await fetch("/auth/csrf", {
     credentials: "include",
@@ -57,6 +79,36 @@ export async function exchangeFirebaseIDToken(idToken: string): Promise<void> {
   });
   if (!response.ok) {
     throw await authAPIError(response);
+  }
+}
+
+/**
+ * The exchange response commits HttpOnly authority before the browser can
+ * confirm its status. Keep both operations in one mutation and compensate
+ * with a Sumi logout if any post-commit status read fails.
+ */
+export async function establishSumiSession(
+  idToken: string,
+): Promise<Extract<SumiSessionStatus, { authenticated: true }>> {
+  let exchangeCommitted = false;
+  try {
+    await exchangeFirebaseIDToken(idToken);
+    exchangeCommitted = true;
+    const session = await getSumiSession();
+    if (!session.authenticated) {
+      throw new AuthAPIError("Sumi session was not established.", 401);
+    }
+    return session;
+  } catch (error) {
+    if (exchangeCommitted) {
+      try {
+        await logoutSumiSession();
+      } catch (logoutError) {
+        throw new SumiSessionCompensationFailedError(error, logoutError);
+      }
+      throw new SumiSessionCompensatedError(error);
+    }
+    throw error;
   }
 }
 
@@ -144,7 +196,8 @@ async function readAuthResponseText(response: Response): Promise<string> {
   const declaredLength = response.headers.get("content-length");
   if (
     declaredLength !== null &&
-    (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxAuthResponseBytes)
+    (!/^\d+$/.test(declaredLength) ||
+      Number(declaredLength) > maxAuthResponseBytes)
   ) {
     throw new Error("Authentication response exceeds the allowed size.");
   }

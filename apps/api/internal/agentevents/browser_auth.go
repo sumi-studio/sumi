@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -119,6 +120,7 @@ type BrowserAuthServer struct {
 	SessionTTL     time.Duration
 	Connections    BrowserSessionConnectionCloser
 	random         io.Reader
+	sessionMu      sync.Mutex
 }
 
 func NewBrowserAuthServer(
@@ -215,6 +217,31 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 		writeBrowserAuthError(w, http.StatusForbidden, "account is not authorized")
 		return
 	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if existing, cookieErr := uniqueBrowserSessionCookie(r); cookieErr == nil {
+		previous, verifyErr := s.Sessions.VerifySession(r.Context(), existing.Value)
+		if verifyErr == nil {
+			revoked, revokeErr := s.Sessions.RevokeSession(r.Context(), existing.Value)
+			if revokeErr != nil {
+				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+				return
+			}
+			if revoked.sessionID != previous.sessionID {
+				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+				return
+			}
+			if s.Connections != nil {
+				s.Connections.CloseBrowserSession(revoked.sessionID)
+			}
+		} else if _, revokeErr := s.Sessions.RevokeSession(r.Context(), existing.Value); revokeErr == nil {
+			// A still-signed, unexpired cookie which no longer verifies is a
+			// retired lifecycle credential. A concurrent/replayed exchange
+			// must not mint a second replacement from it.
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			return
+		}
+	}
 	ttl := s.SessionTTL
 	if ttl == 0 {
 		ttl = defaultBrowserSessionTTL
@@ -264,20 +291,23 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}
-	cookie, err := uniqueBrowserSessionCookie(r)
-	if err != nil && !errors.Is(err, errBrowserSessionMissing) {
-		writeBrowserAuthError(w, http.StatusBadRequest, "duplicate session cookies")
-		return
-	}
-	if err == nil {
-		claims, revokeErr := s.Sessions.RevokeSession(r.Context(), cookie.Value)
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for _, cookie := range r.CookiesNamed(BrowserSessionCookie) {
+		claims, verifyErr := s.Sessions.VerifySession(r.Context(), cookie.Value)
+		if verifyErr != nil {
+			continue
+		}
+		revoked, revokeErr := s.Sessions.RevokeSession(r.Context(), cookie.Value)
 		if revokeErr == nil {
-			if s.Connections != nil {
-				s.Connections.CloseBrowserSession(claims.sessionID)
+			if revoked.sessionID != claims.sessionID {
+				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+				return
 			}
-		} else if errors.Is(revokeErr, errRevocationCapacity) ||
-			errors.Is(revokeErr, context.Canceled) ||
-			errors.Is(revokeErr, context.DeadlineExceeded) {
+			if s.Connections != nil {
+				s.Connections.CloseBrowserSession(revoked.sessionID)
+			}
+		} else {
 			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 			return
 		}

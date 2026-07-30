@@ -17,13 +17,19 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
+import {
+  bindDirectChatAuthority,
+  clearDirectChatAuthority,
+} from "../agent/auth-authority";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
   AuthAPIError,
-  exchangeFirebaseIDToken,
+  establishSumiSession,
   getSumiSession,
   logoutSumiSession,
+  SumiSessionCompensatedError,
+  SumiSessionCompensationFailedError,
   type SumiSessionStatus,
 } from "./session-client";
 
@@ -106,6 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const authGeneration = useRef(0);
   const sessionMutation = useRef<Promise<void>>(Promise.resolve());
   const signInPending = useRef(false);
+  const serverSession = useRef<SumiSessionStatus>(session);
 
   const nextGeneration = useCallback(() => {
     authGeneration.current += 1;
@@ -156,11 +163,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const nextSession = await getSumiSession();
       if (!isCurrentGeneration(generation)) return "checking";
-      setSession(nextSession);
+      serverSession.current = nextSession;
       const nextState = nextSession.authenticated
         ? "authenticated"
         : "unauthenticated";
-      setSessionState(nextState);
+      flushSync(() => {
+        if (nextSession.authenticated) {
+          bindDirectChatAuthority(nextSession.user.id);
+        } else {
+          clearDirectChatAuthority();
+        }
+        setSession(nextSession);
+        setSessionState(nextState);
+      });
       return nextState;
     } catch (error) {
       if (!isCurrentGeneration(generation)) return "checking";
@@ -192,14 +207,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (!isCurrentGeneration(generation)) return;
           const idToken = await getIdToken(result.user, true);
           if (!isCurrentGeneration(generation)) return;
-          await exchangeFirebaseIDToken(idToken);
-          const nextSession = await getSumiSession();
-          if (!nextSession.authenticated) {
-            throw new Error("Sumi session was not established.");
-          }
-          if (!isCurrentGeneration(generation)) return;
-          setSession(nextSession);
-          setSessionState("authenticated");
+          const nextSession = await establishSumiSession(idToken);
+          // The HttpOnly authority changed even if logout claimed the UI
+          // generation while this serialized exchange was in flight.
+          flushSync(() => {
+            bindDirectChatAuthority(nextSession.user.id);
+            serverSession.current = nextSession;
+            if (!isCurrentGeneration(generation)) return;
+            setSession(nextSession);
+            setSessionState("authenticated");
+          });
         });
         if (!isCurrentGeneration(generation)) {
           // A logout that began while the provider popup was open owns the
@@ -207,6 +224,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           await signOut(auth).catch(() => undefined);
         }
       } catch (error) {
+        if (
+          (error instanceof SumiSessionCompensatedError ||
+            error instanceof SumiSessionCompensationFailedError) &&
+          isCurrentGeneration(generation)
+        ) {
+          flushSync(() => {
+            clearDirectChatAuthority();
+            serverSession.current = { authenticated: false };
+            setSession({ authenticated: false });
+            setSessionState(
+              error instanceof SumiSessionCompensatedError
+                ? "unauthenticated"
+                : "unavailable",
+            );
+          });
+        }
         // A Firebase account is display state, not Sumi authorization. Do not
         // retain it when the server-owned identity binding/exchange failed.
         if (firebaseSignInCompleted) {
@@ -223,7 +256,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
-    const previousSession = session;
     const generation = nextGeneration();
     // Commit AuthGate's unmount before the first await below. ChatScreen's
     // cleanup then closes its upgraded socket before this request clears the
@@ -233,19 +265,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await serializeSessionMutation(async () => {
         await logoutSumiSession();
       });
-      if (!isCurrentGeneration(generation)) return;
-      setSession({ authenticated: false });
-      setSessionState("unauthenticated");
-      await signOut(getFirebaseAuth()).catch(() => undefined);
     } catch (error) {
       if (!isCurrentGeneration(generation)) return;
-      setSession(previousSession);
+      const retainedSession = serverSession.current;
+      setSession(retainedSession);
       setSessionState(
-        previousSession.authenticated ? "authenticated" : "unauthenticated",
+        retainedSession.authenticated ? "authenticated" : "unauthenticated",
       );
       throw error;
     }
-  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation, session]);
+    if (isCurrentGeneration(generation)) {
+      // Server logout is the authority transition. Commit it before touching
+      // optional Firebase/emulator display-state cleanup, which may throw
+      // synchronously during setup.
+      flushSync(() => {
+        clearDirectChatAuthority();
+        serverSession.current = { authenticated: false };
+        setSession({ authenticated: false });
+        setSessionState("unauthenticated");
+      });
+    }
+    await signOutFirebaseBestEffort();
+  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
   const user = useMemo<AuthUser | null>(() => {
     if (!session.authenticated) {
@@ -302,4 +343,13 @@ function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
   return provider;
+}
+
+async function signOutFirebaseBestEffort(): Promise<void> {
+  try {
+    const auth = getFirebaseAuth();
+    await signOut(auth).catch(() => undefined);
+  } catch {
+    // Firebase is cleanup-only after Sumi authority has ended.
+  }
 }

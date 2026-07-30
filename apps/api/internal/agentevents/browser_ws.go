@@ -32,6 +32,8 @@ type BrowserServer struct {
 	connectionsMu sync.Mutex
 	connections   map[*websocket.Conn]browserConnection
 	accepted      uint64
+	closing       bool
+	beforeWrite   func()
 }
 
 type browserConnection struct {
@@ -296,7 +298,9 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Sessions.AuthorizeSession(r.Context(), claims, func() error {
-		s.addConnection(conn, claims.sessionID)
+		if !s.addConnection(conn, claims.sessionID) {
+			return errors.New("browser gateway is shutting down")
+		}
 		return nil
 	}); err != nil {
 		_ = conn.WriteControl(
@@ -310,24 +314,62 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if err := s.run(r.Context(), conn, claims); err != nil && !errors.Is(err, context.Canceled) {
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), time.Now().Add(s.writeTimeout()))
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if deadline.After(time.Now()) {
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), deadline)
+		}
 	}
 }
 
-// CloseBrowserConnections is a bounded lifecycle operation for server
-// shutdown/replacement. Reconnecting browsers retain their durable cursor and
-// replay from the authoritative event log; no event is synthesized here.
+// CloseBrowserConnections closes the current socket generation while allowing
+// reconnect. Browsers retain their durable cursor and replay from the
+// authoritative event log; no event is synthesized here.
 func (s *BrowserServer) CloseBrowserConnections() {
+	for _, conn := range s.browserConnections(false) {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway reconnect"), time.Now().Add(s.writeTimeout()))
+		_ = conn.Close()
+	}
+}
+
+// ShutdownBrowserConnections permanently closes admission for this gateway
+// instance and waits boundedly for every hijacked handler to drain.
+func (s *BrowserServer) ShutdownBrowserConnections(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("browser shutdown context is required")
+	}
+	connections := s.browserConnections(true)
+	for _, conn := range connections {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway shutdown"), time.Now().Add(s.writeTimeout()))
+		_ = conn.Close()
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.connectionsMu.Lock()
+		active := len(s.connections)
+		s.connectionsMu.Unlock()
+		if active == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *BrowserServer) browserConnections(shutdown bool) []*websocket.Conn {
 	s.connectionsMu.Lock()
+	if shutdown {
+		s.closing = true
+	}
 	connections := make([]*websocket.Conn, 0, len(s.connections))
 	for conn := range s.connections {
 		connections = append(connections, conn)
 	}
 	s.connectionsMu.Unlock()
-	for _, conn := range connections {
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway reconnect"), time.Now().Add(s.writeTimeout()))
-		_ = conn.Close()
-	}
+	return connections
 }
 
 // CloseBrowserSession terminates only live sockets authorized by the matching
@@ -364,11 +406,15 @@ func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
 	}
 }
 
-func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string) {
+func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string) bool {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
+	if s.closing {
+		return false
+	}
 	s.connections[conn] = browserConnection{sessionID: sessionID, conn: conn}
 	s.accepted++
+	return true
 }
 
 func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
@@ -378,7 +424,7 @@ func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
 }
 
 func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims) error {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := browserSessionOperationContext(ctx, claims)
 	defer cancel()
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
@@ -423,7 +469,12 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout())); err != nil {
+					deadline := s.sessionDeadline(claims, s.writeTimeout())
+					if ctx.Err() != nil || !deadline.After(time.Now()) {
+						cancel()
+						return
+					}
+					if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
 						cancel()
 						return
 					}
@@ -438,7 +489,17 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	write := func(frame any) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout())); err != nil {
+		if s.beforeWrite != nil {
+			s.beforeWrite()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if !deadline.After(time.Now()) {
+			return context.DeadlineExceeded
+		}
+		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
 		return conn.WriteJSON(frame)
@@ -470,7 +531,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	go func() {
 		err := s.browserEventPump(ctx, claims.PersonalityAgentID, next, ready, volatile, write)
 		writerErr <- err
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil {
 			cancel()
 			// A durable replay or bounded live-queue failure must terminate the
 			// blocked reader too; otherwise this browser session would remain
@@ -745,6 +806,10 @@ func (s *BrowserServer) pingInterval() time.Duration {
 }
 
 func (s *BrowserServer) sessionReadDeadline(claims UserSessionClaims, interval time.Duration) time.Time {
+	return s.sessionDeadline(claims, interval)
+}
+
+func (s *BrowserServer) sessionDeadline(claims UserSessionClaims, interval time.Duration) time.Time {
 	deadline := time.Now().Add(interval)
 	if !claims.expiresAt.IsZero() && claims.expiresAt.Before(deadline) {
 		return claims.expiresAt

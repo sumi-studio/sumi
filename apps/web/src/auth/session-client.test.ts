@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AuthAPIError,
+  establishSumiSession,
   exchangeFirebaseIDToken,
   getSumiSession,
   logoutSumiSession,
+  SumiSessionCompensatedError,
+  SumiSessionCompensationFailedError,
 } from "./session-client";
 
 afterEach(() => {
@@ -64,6 +67,80 @@ describe("Sumi browser session client", () => {
       "/auth/session",
       expect.objectContaining({ credentials: "include", cache: "no-store" }),
     );
+  });
+
+  it("compensates a committed exchange before surfacing status failure", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "e".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "status unavailable" }), {
+          status: 503,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "f".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const failure = await establishSumiSession("firebase-id-token").catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(SumiSessionCompensatedError);
+    expect((failure as SumiSessionCompensatedError).cause).toMatchObject({
+      status: 503,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/auth/csrf",
+      "/auth/session",
+      "/auth/session",
+      "/auth/csrf",
+      "/auth/logout",
+    ]);
+  });
+
+  it("surfaces an explicit fail-closed error when compensation cannot complete", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "g".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response("invalid status", { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "h".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "logout unavailable" }), {
+          status: 503,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      establishSumiSession("firebase-id-token"),
+    ).rejects.toBeInstanceOf(SumiSessionCompensationFailedError);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/auth/csrf",
+      "/auth/session",
+      "/auth/session",
+      "/auth/csrf",
+      "/auth/logout",
+    ]);
   });
 
   it("protects logout with a fresh CSRF token", async () => {

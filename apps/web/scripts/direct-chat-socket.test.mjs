@@ -151,6 +151,36 @@ test("unavailable status retains pending commands without sending until ready", 
   socket.close();
 });
 
+test("authority reset drops replay cursor and pending commands before reconnect", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive(event(1, { type: "agent_start" }));
+  socket.sendCommand({ type: "abort" }, "old-authority-key");
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["old-authority-key"]);
+
+  socket.resetAuthority();
+
+  assert.equal(first.readyState, FakeWebSocket.CLOSED);
+  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 0 },
+  ]);
+  second.receive({ type: "direct_chat_status", status: "ready" });
+  assert.equal(
+    second.sent
+      .map(JSON.parse)
+      .filter((frame) => frame.type === "command").length,
+    0,
+  );
+  socket.close();
+});
+
 test("tracks browser connection separately from authoritative agent readiness", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();

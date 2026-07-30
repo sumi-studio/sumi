@@ -25,6 +25,7 @@ import { userMessageIdFromCommandId } from "./user-message-id";
 export interface DirectChatTransport {
   connect(): void;
   close(): void;
+  resetAuthority?(): void;
   sendCommand(command: unknown, idempotencyKey?: string): boolean;
   onFrame(listener: (frame: DirectChatServerFrame) => void): () => void;
   onConnection(
@@ -46,6 +47,7 @@ export interface ConversationState {
   recoverableDrafts: RecoverableDraft[];
   connect: () => void;
   disconnect: () => void;
+  resetAuthority: () => void;
   sendMessage: (text: string) => boolean;
   restoreDraft: (idempotencyKey: string) => string | undefined;
   discardDraft: (idempotencyKey: string) => boolean;
@@ -287,6 +289,19 @@ export function createConversationStore({
         connection = "closed";
         ready = "unknown";
         publish();
+      },
+      resetAuthority() {
+        started = false;
+        if (transport.resetAuthority) {
+          transport.resetAuthority();
+        } else {
+          transport.close();
+        }
+        outbox.clear();
+        session = createAgentSession();
+        connection = "closed";
+        ready = "unknown";
+        publish(null);
       },
       sendMessage(text) {
         const normalized = text.trim();

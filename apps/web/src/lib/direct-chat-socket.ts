@@ -947,6 +947,20 @@ export class DirectChatSocket {
     socket?.close();
   }
 
+  /**
+   * Drops every piece of authority-scoped transport state. A normal close
+   * preserves replay and retry state for reconnect; an identity transition
+   * must not.
+   */
+  resetAuthority() {
+    this.close();
+    this.reconnectAttempt = 0;
+    this.lastEventSeq = 0;
+    this.pending.clear();
+    this.setConnectionState("closed");
+    this.setReadyState("unknown");
+  }
+
   private flushPending() {
     if (!this.admissionReady || this.socket?.readyState !== WebSocket.OPEN)
       return;

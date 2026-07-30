@@ -20,6 +20,26 @@ const (
 	maxAuthSessionTTL     = time.Hour
 )
 
+var browserAuthEnvironmentNames = []string{
+	"SUMI_AUTH_FIREBASE_UID",
+	"SUMI_AUTH_FIREBASE_TENANT_ID",
+	"SUMI_AUTH_TENANT_ID",
+	"SUMI_AUTH_USER_ID",
+	"SUMI_AUTH_PERSONALITY_AGENT_ID",
+	"SUMI_AUTH_FIREBASE_PROJECT_ID",
+	"SUMI_AUTH_ALLOW_INSECURE_COOKIES",
+	"SUMI_AUTH_SESSION_TTL",
+}
+
+func browserAuthConfiguredFromEnv() bool {
+	for _, name := range browserAuthEnvironmentNames {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 type firebaseAdminIDTokenVerifier struct {
 	client firebaseIDTokenClient
 }
@@ -55,15 +75,10 @@ func browserAuthServerFromEnv(
 ) (*agentevents.BrowserAuthServer, bool, error) {
 	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
 	if firebaseUID == "" {
-		for _, name := range []string{
-			"SUMI_AUTH_FIREBASE_TENANT_ID",
-			"SUMI_AUTH_TENANT_ID",
-			"SUMI_AUTH_USER_ID",
-			"SUMI_AUTH_PERSONALITY_AGENT_ID",
-			"SUMI_AUTH_FIREBASE_PROJECT_ID",
-			"SUMI_AUTH_ALLOW_INSECURE_COOKIES",
-			"SUMI_AUTH_SESSION_TTL",
-		} {
+		for _, name := range browserAuthEnvironmentNames {
+			if name == "SUMI_AUTH_FIREBASE_UID" {
+				continue
+			}
 			if strings.TrimSpace(os.Getenv(name)) != "" {
 				return nil, false, errors.New("SUMI_AUTH_FIREBASE_UID is required when any SUMI_AUTH_* setting is configured")
 			}
