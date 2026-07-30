@@ -192,6 +192,84 @@ test("approval request and resolution preserve structured decision", () => {
   }
 });
 
+test("cancelled approval closes its linked pending tool trace and durable replay is ignored", () => {
+  let session = createAgentSession();
+  const request = approvalRequest("approval-cancelled", "call-cancelled");
+  session = apply(session, {
+    seq: 40,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    seq: 41,
+    event: {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000012",
+      message: assistantToolCall("call-cancelled"),
+    },
+  });
+  session = apply(session, {
+    seq: 42,
+    event: { type: "approval_requested", request },
+  });
+  const resolution: BrowserEventEnvelope = {
+    seq: 43,
+    event: {
+      type: "approval_resolved",
+      request_id: request.id,
+      resolution: "cancelled",
+    },
+  };
+  session = apply(session, resolution);
+  const resolved = session;
+  session = apply(session, resolution);
+
+  assert.equal(session, resolved);
+  const approval = session.conversation.entries[`approval:${request.id}`];
+  const tool = session.conversation.runs["run:40"].trace.find(
+    (entry) => entry.type === "tool" && entry.id === request.tool_call_id,
+  );
+  assert.equal(approval?.kind, "approval");
+  if (approval?.kind === "approval") assert.equal(approval.status, "cancelled");
+  assert.equal(tool?.type, "tool");
+  if (tool?.type === "tool") assert.equal(tool.status, "cancelled");
+});
+
+test("denied approval closes its linked running tool trace", () => {
+  let session = createAgentSession();
+  const request = approvalRequest("approval-denied", "call-denied");
+  session = apply(session, {
+    seq: 50,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    seq: 51,
+    event: {
+      type: "tool_execution_start",
+      tool_call_id: request.tool_call_id,
+      tool_name: request.tool_name,
+      args: {},
+    },
+  });
+  session = apply(session, {
+    seq: 52,
+    event: { type: "approval_requested", request },
+  });
+  session = apply(session, {
+    seq: 53,
+    event: {
+      type: "approval_resolved",
+      request_id: request.id,
+      resolution: { decision: { type: "deny" } },
+    },
+  });
+
+  const tool = session.conversation.runs["run:50"].trace.find(
+    (entry) => entry.type === "tool" && entry.id === request.tool_call_id,
+  );
+  assert.equal(tool?.type, "tool");
+  if (tool?.type === "tool") assert.equal(tool.status, "cancelled");
+});
+
 test("durable user messages materialize once under their server message id", () => {
   let session = createAgentSession();
   const envelope: BrowserEventEnvelope = {
@@ -239,6 +317,36 @@ function assistantMessage(text: string): PublicAssistantMessage {
     provider_code: null,
     interrupted: false,
     timestamp: Timestamp,
+  };
+}
+
+function assistantToolCall(toolCallId: string): PublicAssistantMessage {
+  return {
+    ...assistantMessage(""),
+    content: [
+      {
+        type: "tool_call",
+        tool_call: { id: toolCallId, name: "bash", arguments: {} },
+        wire_item_index: 0,
+      },
+    ],
+  };
+}
+
+function approvalRequest(id: string, toolCallId: string): ApprovalRequest {
+  return {
+    id,
+    tool_call_id: toolCallId,
+    tool_name: "bash",
+    action: { reviewable: { command: "git status" } },
+    args_summary: { command: "git status" },
+    reason: "shell access",
+    audit: {
+      outcome: "allow",
+      risk: "low",
+      authorization: "medium",
+      rationale: "read only",
+    },
   };
 }
 

@@ -588,7 +588,7 @@ function applyApprovalResolved(
       status,
       decision,
     });
-    if (status === "denied" && approvalEntry?.kind === "approval") {
+    if (status !== "allowed" && approvalEntry?.kind === "approval") {
       conversation = patchRun(conversation, runId, (run) => ({
         ...run,
         trace: run.trace.map((entry) =>
