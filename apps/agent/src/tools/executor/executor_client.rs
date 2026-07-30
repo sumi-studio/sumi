@@ -171,7 +171,7 @@ impl ExecutorClient {
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ExecutorResponse, ToolError> {
-        let cancellable_bash = matches!(operation, ExecutorOperation::Bash { .. });
+        let cancellation_mode = cancellation_mode(&operation);
         let execution_id = operation_execution_id(&operation).to_owned();
         let request_id = format!("executor-{}", Uuid::now_v7());
         let encoded = encode_request(&self.identity, &request_id, operation.clone())?;
@@ -233,7 +233,7 @@ impl ExecutorClient {
                 cancel_deadline.unwrap_or_else(|| Instant::now() + self.deadlines.frame);
             tokio::select! {
                 biased;
-                _ = cancel.cancelled(), if cancel_request_id.is_none() => {
+                _ = cancel.cancelled(), if cancel_request_id.is_none() && cancellation_mode.sends_cancel() => {
                     let id = format!("executor-cancel-{}", Uuid::now_v7());
                     let cancel_bytes = encode_request(
                         &self.identity,
@@ -319,7 +319,7 @@ impl ExecutorClient {
             .ok_or_else(|| indeterminate("executor response lacked operation terminal"))?;
         validate_cancel_settlement(
             cancel_request_id.is_some(),
-            cancellable_bash,
+            cancellation_mode.is_active_bash(),
             cancel_terminal,
             &result,
         )?;
@@ -379,6 +379,44 @@ fn validate_cancel_settlement(
 enum CancelTerminal {
     Accepted,
     TooLate,
+}
+
+#[derive(Clone, Copy)]
+enum CancellationMode {
+    /// Health authenticates a fixed endpoint but has no execution identity.
+    /// It is cancellable only before its request is emitted.
+    None,
+    /// Synchronous executor operations cannot be actively stopped, but a
+    /// post-emission cancellation must be settled against their terminal.
+    SettlementOnly,
+    /// Bash is the one executor operation the service can actively stop.
+    ActiveBash,
+}
+
+impl CancellationMode {
+    const fn sends_cancel(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn is_active_bash(self) -> bool {
+        matches!(self, Self::ActiveBash)
+    }
+}
+
+fn cancellation_mode(operation: &ExecutorOperation) -> CancellationMode {
+    match operation {
+        ExecutorOperation::Health { .. } | ExecutorOperation::Cancel { .. } => {
+            CancellationMode::None
+        }
+        ExecutorOperation::Bash { .. } => CancellationMode::ActiveBash,
+        ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::WriteFile { .. }
+        | ExecutorOperation::EditFile { .. }
+        | ExecutorOperation::RemoveFile { .. }
+        | ExecutorOperation::ListDir { .. }
+        | ExecutorOperation::Glob { .. }
+        | ExecutorOperation::Grep { .. } => CancellationMode::SettlementOnly,
+    }
 }
 
 fn encode_request(
@@ -1222,6 +1260,62 @@ mod tests {
             server.await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn health_cancellation_after_emission_never_sends_an_empty_cancel() {
+        let root = temp_root("health-cancel-after-emission");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_server = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let request = read_request(&mut read).await;
+            assert_eq!(request["operation"]["type"], "health");
+
+            // The request is now on the wire, but the executor has not replied.
+            // Health has no execution identity to cancel, so the client must wait
+            // for its authenticated terminal rather than emit Cancel { "" }.
+            cancel_server.cancel();
+            assert!(
+                timeout(Duration::from_millis(100), read_request(&mut read))
+                    .await
+                    .is_err(),
+                "health cancellation must not send a follow-up cancel request"
+            );
+            write_json_line(
+                &mut write,
+                json!({
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
+                    "request_id":request["request_id"],
+                    "result":{"Ok":{"type":"healthy", "service_role":"tool_executor"}}
+                }),
+            )
+            .await;
+        });
+
+        let response = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .execute(
+                ExecutorOperation::Health {
+                    service_role: ExecutorServiceRole::ToolExecutor,
+                },
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("post-emission health cancellation must preserve health result");
+        assert_eq!(
+            response,
+            ExecutorResponse::Healthy {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            }
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
