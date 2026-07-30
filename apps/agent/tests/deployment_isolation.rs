@@ -116,14 +116,25 @@ fn launch_env(command: &mut Command, paid: &str) {
 fn docker_fixture_host_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("docker")
-            .arg("info")
-            .output()
-            .is_ok_and(|output| output.status.success())
-            && Command::new("docker")
-                .args(["image", "inspect", "debian:bookworm-slim"])
-                .output()
-                .is_ok_and(|output| output.status.success())
+        timeout_available()
+            && bounded_docker_output(
+                deploy_dir().parent().unwrap().parent().unwrap(),
+                10,
+                &["info".into()],
+            )
+            .status
+            .success()
+            && bounded_docker_output(
+                deploy_dir().parent().unwrap().parent().unwrap(),
+                10,
+                &[
+                    "image".into(),
+                    "inspect".into(),
+                    "debian:bookworm-slim".into(),
+                ],
+            )
+            .status
+            .success()
     })
 }
 
@@ -187,26 +198,27 @@ done
 install -d -m 0750 -o "$3" -g "$4" "/host-run/sumi/local-control/$1"
 install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lock"
 "#;
-        let setup = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                "/run:/host-run",
-                "debian:bookworm-slim",
-                "bash",
-                "-c",
-                setup_script,
-                "--",
-                &compact,
-                &project,
-                &server_uid.to_string(),
-                &control_gid.to_string(),
-            ])
-            .output()
-            .unwrap();
+        let setup = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "-v".into(),
+                "/run:/host-run".into(),
+                "debian:bookworm-slim".into(),
+                "bash".into(),
+                "-c".into(),
+                setup_script.into(),
+                "--".into(),
+                compact.clone(),
+                project.clone(),
+                server_uid.to_string(),
+                control_gid.to_string(),
+            ],
+        );
         if !setup.status.success() {
             eprintln!(
                 "HOST_UNAVAILABLE: fixed trust-anchor provisioning failed: {}",
@@ -257,23 +269,25 @@ rmdir /host-run/sumi/local-control 2>/dev/null || true
 rmdir /host-run/sumi/supervisor-locks 2>/dev/null || true
 rmdir /host-run/sumi 2>/dev/null || true
 "#;
-        let _ = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                "/run:/host-run",
-                "debian:bookworm-slim",
-                "bash",
-                "-c",
-                cleanup_script,
-                "--",
-                &compact,
-                &self.project,
-            ])
-            .output();
+        let _ = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "-v".into(),
+                "/run:/host-run".into(),
+                "debian:bookworm-slim".into(),
+                "bash".into(),
+                "-c".into(),
+                cleanup_script.into(),
+                "--".into(),
+                compact,
+                self.project.clone(),
+            ],
+        );
     }
 }
 
@@ -307,6 +321,7 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
             "SUMI_LOCAL_CONTROL_SOCKET_GID",
             fixture.control_gid.to_string(),
         );
+    preserve_docker_transport(command);
 }
 
 fn wait_for_child_exit(
@@ -326,14 +341,33 @@ fn wait_for_child_exit(
 }
 
 fn bounded_docker_output(workdir: &std::path::Path, seconds: u64, args: &[String]) -> Output {
-    Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .arg("--preserve-status")
         .arg(format!("{seconds}s"))
         .arg("docker")
         .args(args)
         .current_dir(workdir)
-        .output()
-        .expect("run bounded Docker command")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
+    preserve_docker_transport(&mut command);
+    command.output().expect("run bounded Docker command")
+}
+
+fn preserve_docker_transport(command: &mut Command) {
+    for key in [
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "HOME",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
 }
 
 fn timeout_available() -> bool {
@@ -1291,6 +1325,11 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
     assert!(inspect.status.success());
     let inspect: JsonValue = serde_json::from_slice(&inspect.stdout).unwrap();
     let container = &inspect[0];
+    assert_eq!(
+        container["State"]["Running"].as_bool(),
+        Some(true),
+        "executor container stopped before the read-only mount probe: {container}"
+    );
     let environment = container["Config"]["Env"].as_array().unwrap();
     assert!(environment.iter().all(|entry| {
         !entry
@@ -1343,21 +1382,49 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         "unexpected read_file response: {read_file}"
     );
 
+    let before_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
+    assert!(before_write.status.success());
+    let before_write: JsonValue = serde_json::from_slice(&before_write.stdout).unwrap();
+    assert_eq!(
+        before_write[0]["State"]["Running"].as_bool(),
+        Some(true),
+        "executor container stopped before write denial probe: {}",
+        before_write[0]
+    );
     let write = smoke.docker(
         10,
         vec![
             "exec".into(),
             "--user".into(),
             "10002:10002".into(),
+            "--env".into(),
+            "LC_ALL=C".into(),
             smoke.container.clone(),
-            "/bin/sh".into(),
-            "-ec".into(),
-            "touch /workspace/must-not-write".into(),
+            "/usr/bin/touch".into(),
+            "/workspace/must-not-write".into(),
         ],
+    );
+    let write_output = format!(
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&write.stdout),
+        String::from_utf8_lossy(&write.stderr)
     );
     assert!(
         !write.status.success(),
-        "executor container wrote through its read-only workspace mount"
+        "executor container wrote through its read-only workspace mount: {write_output}"
+    );
+    assert!(
+        write_output.contains("Read-only file system"),
+        "write denial was not the expected read-only-filesystem failure: {write_output}"
+    );
+    let after_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
+    assert!(after_write.status.success());
+    let after_write: JsonValue = serde_json::from_slice(&after_write.stdout).unwrap();
+    assert_eq!(
+        after_write[0]["State"]["Running"].as_bool(),
+        Some(true),
+        "executor container stopped during write denial probe: {}",
+        after_write[0]
     );
     let host_write_check = smoke.docker(
         30,
@@ -1378,6 +1445,40 @@ fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
         ],
     );
     assert!(host_write_check.status.success());
+
+    let health_after = exchange_executor_socket(
+        &socket,
+        serde_json::json!({
+            "personality_agent_id": paid,
+            "generation": 1,
+            "nonce": nonce,
+            "request_id": "health-after-write-denial",
+            "operation": {"type": "health", "service_role": "tool_executor"},
+        }),
+    );
+    assert_eq!(
+        health_after["result"]["Ok"]["type"].as_str(),
+        Some("healthy"),
+        "executor Health failed after write denial: {health_after}"
+    );
+    let read_after = exchange_executor_socket(
+        &socket,
+        serde_json::json!({
+            "personality_agent_id": paid,
+            "generation": 1,
+            "nonce": nonce,
+            "request_id": "read-after-write-denial",
+            "operation": {
+                "type": "read_file", "path": "note.txt", "offset": 0,
+                "limit": 1024, "execution_id": "read-after-write-denial"
+            },
+        }),
+    );
+    assert_eq!(
+        read_after["result"]["Ok"]["result"]["content"].as_str(),
+        Some("read-file-content\n"),
+        "executor read_file failed after write denial: {read_after}"
+    );
 }
 
 #[test]
@@ -2568,6 +2669,89 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
     let stop = stop
         .output()
         .expect("stop owned Docker/AppArmor acceptance");
+    // `stop` uses the non-secret lifecycle descriptor and deliberately leaves
+    // project resources available for operator status/cleanup. This opt-in
+    // test instead owns the UUID-derived project and must remove its exact
+    // build images and named volumes before it can claim acceptance.
+    let mut cleanup = Command::new("timeout");
+    cleanup
+        .args(["--preserve-status", "60s", "docker", "compose"])
+        .args(["--project-name", &fixture.project, "--file"])
+        .arg(deploy_dir().join("compose.yaml"))
+        .args([
+            "down",
+            "--remove-orphans",
+            "--volumes",
+            "--rmi",
+            "local",
+            "--timeout",
+            "10",
+        ]);
+    launch_owned_acceptance_env(&mut cleanup, &fixture);
+    let cleanup = cleanup
+        .output()
+        .expect("remove exact owned Compose acceptance resources");
+    assert!(
+        cleanup.status.success(),
+        "owned Compose resource cleanup failed: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    let project_label = format!("label=com.docker.compose.project={}", fixture.project);
+    for (kind, args) in [
+        (
+            "containers",
+            vec![
+                "ps".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "networks",
+            vec![
+                "network".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "volumes",
+            vec![
+                "volume".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "local images",
+            vec![
+                "image".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("reference={}-*", fixture.project),
+            ],
+        ),
+    ] {
+        let leftovers =
+            bounded_docker_output(deploy_dir().parent().unwrap().parent().unwrap(), 20, &args);
+        assert!(
+            leftovers.status.success(),
+            "cannot inspect owned Compose {kind}: {}",
+            String::from_utf8_lossy(&leftovers.stderr)
+        );
+        assert!(
+            leftovers.stdout.is_empty(),
+            "owned Compose {kind} survived cleanup: {}",
+            String::from_utf8_lossy(&leftovers.stdout)
+        );
+    }
     assert!(
         stop.status.success(),
         "real deployment cleanup failed: {}",
