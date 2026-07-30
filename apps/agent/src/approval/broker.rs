@@ -340,11 +340,17 @@ impl ApprovalBroker {
         );
         match (current.authority_binding(), policy.authority_binding()) {
             (
-                Some((current_tenant, current_agent, current_version, current_digest)),
-                Some((next_tenant, next_agent, next_version, next_digest)),
+                Some((
+                    current_tenant,
+                    current_personality_agent_id,
+                    current_version,
+                    current_digest,
+                )),
+                Some((next_tenant, next_personality_agent_id, next_version, next_digest)),
             ) => {
                 anyhow::ensure!(
-                    current_tenant == next_tenant && current_agent == next_agent,
+                    current_tenant == next_tenant
+                        && current_personality_agent_id == next_personality_agent_id,
                     "replacement policy changed approval authority scope"
                 );
                 anyhow::ensure!(
@@ -961,11 +967,17 @@ mod tests {
             },
         },
         gateway::ApprovalDecision as GatewayApprovalDecision,
+        runtime::contracts::PersonalityAgentId,
         store::Redactor,
     };
 
     fn projector() -> SecretAwareActionProjector {
         SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture())
+    }
+
+    fn personality_agent_id(value: &str) -> PersonalityAgentId {
+        PersonalityAgentId::parse(value)
+            .expect("test personality_agent_id must be a canonical UUIDv7")
     }
 
     fn read_file_call(path: &str) -> ToolCall {
@@ -1401,7 +1413,7 @@ mod tests {
         let authority = |version: u64, rules: Vec<ApprovalRule>| ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: personality_agent_id("018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e"),
             version,
             issued_at: now - chrono::Duration::minutes(1),
             expires_at: now + chrono::Duration::hours(1),
@@ -1470,7 +1482,7 @@ mod tests {
         let bundle = |version: u64| ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: personality_agent_id("018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e"),
             version,
             issued_at: now - chrono::Duration::minutes(1),
             expires_at: now + chrono::Duration::hours(1),
@@ -1528,25 +1540,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn replacement_rejects_a_different_verified_authority_scope() {
+    async fn replacement_rejects_a_different_verified_authority_provenance_or_owner() {
         let now = Utc::now();
-        let bundle = |tenant_id: &str, agent_id: &str, version: u64| ApprovalPolicyBundle {
-            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
-            tenant_id: tenant_id.to_owned(),
-            agent_id: agent_id.to_owned(),
-            version,
-            issued_at: now - chrono::Duration::minutes(1),
-            expires_at: now + chrono::Duration::hours(1),
-            rules: Vec::new(),
+        let bundle = |tenant_id: &str, personality_agent_id: PersonalityAgentId, version: u64| {
+            ApprovalPolicyBundle {
+                schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+                tenant_id: tenant_id.to_owned(),
+                personality_agent_id,
+                version,
+                issued_at: now - chrono::Duration::minutes(1),
+                expires_at: now + chrono::Duration::hours(1),
+                rules: Vec::new(),
+            }
         };
-        let current = Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 1))
-            .expect("current verified policy");
+        let paid_a = personality_agent_id("018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e");
+        let paid_b = personality_agent_id("018f8a9e-65c1-7b6c-9e4d-2a3b4c5d6e7f");
+        let current =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_a.clone(), 1))
+                .expect("current verified policy");
         let same_scope =
-            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 2))
-                .expect("same-scope replacement policy");
-        let replacement =
-            Policy::from_verified_bundle("/workspace", &bundle("tenant-b", "agent-a", 3))
-                .expect("replacement verified policy");
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_a.clone(), 2))
+                .expect("same-provenance and same-owner replacement policy");
+        let tenant_replacement =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-b", paid_a.clone(), 3))
+                .expect("replacement with different event-time tenant provenance");
+        let owner_replacement =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_b, 3))
+                .expect("replacement with different PAID owner");
         let broker = ApprovalBroker::headless(current, projector());
 
         let unsigned = Policy::new("/workspace");
@@ -1566,7 +1586,7 @@ mod tests {
             .expect("same-scope policy replacement must remain allowed");
 
         let rollback =
-            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 1))
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", paid_a.clone(), 1))
                 .expect("rollback policy");
         let rollback_error = broker
             .replace_policy(rollback)
@@ -1574,7 +1594,7 @@ mod tests {
             .expect_err("authority bundle rollback must fail closed");
         assert!(rollback_error.to_string().contains("strictly newer"));
 
-        let mut conflicting_bundle = bundle("tenant-a", "agent-a", 2);
+        let mut conflicting_bundle = bundle("tenant-a", paid_a, 2);
         conflicting_bundle.rules.push(ApprovalRule {
             id: "conflict".to_owned(),
             tool: "bash".to_owned(),
@@ -1592,11 +1612,17 @@ mod tests {
             .expect_err("same-version conflicting authority bundle must fail closed");
         assert!(conflict_error.to_string().contains("strictly newer"));
 
-        let error = broker
-            .replace_policy(replacement)
+        let tenant_error = broker
+            .replace_policy(tenant_replacement)
             .await
-            .expect_err("cross-authority replacement must fail closed");
-        assert!(error.to_string().contains("authority scope"));
+            .expect_err("cross-tenant approval provenance replacement must fail closed");
+        assert!(tenant_error.to_string().contains("authority scope"));
+
+        let owner_error = broker
+            .replace_policy(owner_replacement)
+            .await
+            .expect_err("cross-PAID owner replacement must fail closed");
+        assert!(owner_error.to_string().contains("authority scope"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -22,6 +22,33 @@ OAuth bridge for OpenAI Responses:
 
 The gate unconditionally requires the first turn to return and preserve non-empty encrypted provider context, then replay it into the second turn.
 
+### Opt-in ten-turn Terra stress probe
+
+The default release gate remains the two-turn contract above.  Set
+`SUMI_LIVE_TEST_TURNS=10` only to exercise the stronger state-transition probe;
+it is pinned to `gpt-5.6-terra` (an explicit different
+`SUMI_CODEX_RESPONSES_MODEL` is rejected).  The probe drives three live Session
+segments—turns 1-4, hydrate/reopen, 5-7, hydrate/reopen, 8-10—with text-only
+and `echo_value` turns interleaved.  It matches every Applied ACK by command
+sequence, requires exactly six durable tool results (so no tool effect is
+duplicated), requires ten durable user messages, and repeats the
+encrypted-context privacy scan after both hydrations. Provider-context row
+counts are intentionally not asserted monotonic because bounded compaction and
+retention may replace or erase old rows; the invariant is non-empty,
+authenticated, private context continuity at every segment and hydration.
+The stress probe uses `medium` reasoning effort: model selection and effort
+remain separate choices, and these deliberately simple turns do not justify
+the release gate's first-turn `high` effort.
+
+Run it with the same loopback bridge and environment as the release gate:
+
+```sh
+SUMI_LIVE_TEST=1 SUMI_LIVE_TEST_TURNS=10 \
+  SUMI_CODEX_RESPONSES_MODEL=gpt-5.6-terra \
+  cargo test --manifest-path apps/agent/Cargo.toml \
+  provider::tests::live_codex_responses_provider_release_gate -- --nocapture
+```
+
 Start the bridge and export its secret:
 
 ```sh

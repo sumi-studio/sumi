@@ -82,15 +82,18 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 			}
 			roundTripGeneric(t, name, wireRaw)
 		case "browser_hello":
-			var hello browserHello
-			if err := json.Unmarshal(wireRaw, &hello); err != nil {
+			hello, err := decodeBrowserHello(wireRaw)
+			if err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserHello: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &hello)
 		case "browser_command_frame":
-			var frame browserCommandFrame
-			if err := json.Unmarshal(wireRaw, &frame); err != nil {
+			frame, err := decodeBrowserCommand(wireRaw)
+			if err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserCommandFrame: %v", name, err)
+			}
+			if _, err := validateBrowserCommand(frame.Command); err != nil {
+				t.Fatalf("fixture %q: validate BrowserCommandFrame: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &frame)
 		case "browser_event_frame":
@@ -109,6 +112,12 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 			var frame browserCommandRejectedFrame
 			if err := json.Unmarshal(wireRaw, &frame); err != nil {
 				t.Fatalf("fixture %q: unmarshal BrowserCommandRejectedFrame: %v", name, err)
+			}
+			roundTripJSON(t, name, wireRaw, &frame)
+		case "browser_direct_chat_status":
+			var frame directChatStatusFrame
+			if err := json.Unmarshal(wireRaw, &frame); err != nil {
+				t.Fatalf("fixture %q: unmarshal DirectChatStatusFrame: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &frame)
 		default:
@@ -227,7 +236,7 @@ func TestOutboundFrameRejectsExplicitNullRejectReason(t *testing.T) {
 	}
 
 	// rejected status with a valid string reject_reason must be accepted.
-	raw = []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"rejected","reject_reason":"unknown_command"}}`)
+	raw = []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","status":"rejected","reject_reason":"unknown_command"}}`)
 	if err := json.Unmarshal(raw, &frame); err != nil {
 		t.Fatalf("expected valid rejected ack to be accepted, got %v", err)
 	}
@@ -235,7 +244,7 @@ func TestOutboundFrameRejectsExplicitNullRejectReason(t *testing.T) {
 
 func TestOutboundFrameRejectsExplicitNullWrongBranch(t *testing.T) {
 	tests := []string{
-		`{"frame_type":"event","envelope":{"seq":1,"conversation_id":"c","event":{"type":"agent_start"}},"ack":null}`,
+		`{"frame_type":"event","envelope":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}},"ack":null}`,
 		`{"frame_type":"command_ack","envelope":null,"ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"received"}}`,
 	}
 	for _, raw := range tests {
@@ -285,7 +294,7 @@ func sortedKeys(m map[string]any) []string {
 
 func TestEnvelopeRejectsExplicitNullSeq(t *testing.T) {
 	for _, eventType := range []string{"message_update", "tool_execution_update", "error"} {
-		raw := []byte(fmt.Sprintf(`{"seq":null,"conversation_id":"c","event":{"type":"%s"}}`, eventType))
+		raw := []byte(fmt.Sprintf(`{"seq":null,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"%s"}}`, eventType))
 		var env Envelope
 		if err := json.Unmarshal(raw, &env); err == nil {
 			t.Fatalf("expected seq:null to be rejected for volatile event %q", eventType)
@@ -293,26 +302,26 @@ func TestEnvelopeRejectsExplicitNullSeq(t *testing.T) {
 	}
 
 	// Durable events require a non-null seq; explicit null is not allowed.
-	raw := []byte(`{"seq":null,"conversation_id":"c","event":{"type":"agent_start"}}`)
+	raw := []byte(`{"seq":null,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}`)
 	var env Envelope
 	if err := json.Unmarshal(raw, &env); err == nil {
 		t.Fatal("expected seq:null to be rejected for durable event")
 	}
 
 	// Missing seq is fine for volatile events.
-	raw = []byte(`{"conversation_id":"c","event":{"type":"error","message":"x"}}`)
+	raw = []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"x"}}`)
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("expected missing seq for volatile event, got %v", err)
 	}
 
 	// Missing seq is rejected for durable events.
-	raw = []byte(`{"conversation_id":"c","event":{"type":"agent_start"}}`)
+	raw = []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}`)
 	if err := json.Unmarshal(raw, &env); err == nil {
 		t.Fatal("expected missing seq to be rejected for durable event")
 	}
 
 	// A valid integer seq is accepted for durable events.
-	raw = []byte(`{"seq":7,"conversation_id":"c","event":{"type":"agent_start"}}`)
+	raw = []byte(`{"seq":7,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}`)
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("expected integer seq for durable event, got %v", err)
 	}
@@ -321,7 +330,7 @@ func TestEnvelopeRejectsExplicitNullSeq(t *testing.T) {
 	}
 
 	// A seq is rejected for volatile events even when non-null.
-	raw = []byte(`{"seq":7,"conversation_id":"c","event":{"type":"error","message":"x"}}`)
+	raw = []byte(`{"seq":7,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"x"}}`)
 	if err := json.Unmarshal(raw, &env); err == nil {
 		t.Fatal("expected non-null seq to be rejected for volatile event")
 	}
@@ -345,7 +354,7 @@ func TestUnmarshalStrictRejectsTrailingData(t *testing.T) {
 }
 
 func TestOutboundFrameRejectsTrailingData(t *testing.T) {
-	raw := []byte(`{"frame_type":"event","envelope":{"seq":1,"conversation_id":"c","event":{"type":"agent_start"}}} trailing`)
+	raw := []byte(`{"frame_type":"event","envelope":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}} trailing`)
 	var frame OutboundFrame
 	if err := json.Unmarshal(raw, &frame); err == nil {
 		t.Fatal("expected trailing data to be rejected for OutboundFrame")
@@ -353,7 +362,7 @@ func TestOutboundFrameRejectsTrailingData(t *testing.T) {
 }
 
 func TestAgentHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"agent_id":"agent-1","generation":"7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":true}`)
+	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":true}`)
 	var hello AgentHello
 	if err := json.Unmarshal(raw, &hello); err == nil {
 		t.Fatal("expected unknown fields to be rejected for AgentHello")
@@ -361,7 +370,7 @@ func TestAgentHelloRejectsUnknownFields(t *testing.T) {
 }
 
 func TestApiHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"accepted_generation":"7","last_received_event_seq":"0","next_command_seq":"1","extra":true}`)
+	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"7","last_received_event_seq":"0","next_command_seq":"1","extra":true}`)
 	var hello ApiHello
 	if err := json.Unmarshal(raw, &hello); err == nil {
 		t.Fatal("expected unknown fields to be rejected for ApiHello")
@@ -369,7 +378,7 @@ func TestApiHelloRejectsUnknownFields(t *testing.T) {
 }
 
 func TestAgentHelloAcceptsFullWidthGenerationAndCursors(t *testing.T) {
-	raw := []byte(`{"agent_id":"agent-1","generation":"9223372036854775807","last_sent_event_seq":"18446744073709551615","last_received_command_seq":"18446744073709551615","last_applied_command_seq":"18446744073709551615"}`)
+	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"9223372036854775807","last_sent_event_seq":"18446744073709551615","last_received_command_seq":"18446744073709551615","last_applied_command_seq":"18446744073709551615"}`)
 	var hello AgentHello
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		t.Fatalf("expected full-width hello to be accepted: %v", err)
@@ -381,11 +390,11 @@ func TestAgentHelloAcceptsFullWidthGenerationAndCursors(t *testing.T) {
 
 func TestHelloRejectsNonCanonicalDecimalAndOverflow(t *testing.T) {
 	tests := []string{
-		`{"agent_id":"agent-1","generation":"07","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"agent_id":"agent-1","generation":"+7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"agent_id":"agent-1","generation":"7","last_sent_event_seq":"18446744073709551616","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"agent_id":"agent-1","generation":7,"last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"accepted_generation":"9223372036854775808","last_received_event_seq":"0","next_command_seq":"1"}`,
+		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"07","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"+7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"7","last_sent_event_seq":"18446744073709551616","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":7,"last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"9223372036854775808","last_received_event_seq":"0","next_command_seq":"1"}`,
 	}
 	for _, raw := range tests {
 		var hello AgentHello
@@ -404,7 +413,7 @@ func TestHelloRejectsNonCanonicalDecimalAndOverflow(t *testing.T) {
 
 func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
 	hello := AgentHello{
-		AgentID:                "agent-1",
+		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Generation:             maxProcessGeneration + 1,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
@@ -417,6 +426,7 @@ func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
 
 func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
 	hello := ApiHello{
+		PersonalityAgentID:   "018f47a2-9b3c-7def-8abc-0123456789ab",
 		AcceptedGeneration:   maxProcessGeneration + 1,
 		LastReceivedEventSeq: 0,
 		NextCommandSeq:       1,
@@ -428,6 +438,7 @@ func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
 
 func TestHelloMarshalUsesCanonicalDecimalStrings(t *testing.T) {
 	hello := ApiHello{
+		PersonalityAgentID:   "018f47a2-9b3c-7def-8abc-0123456789ab",
 		AcceptedGeneration:   maxProcessGeneration,
 		LastReceivedEventSeq: ^uint64(0),
 		NextCommandSeq:       ^uint64(0),
@@ -436,7 +447,7 @@ func TestHelloMarshalUsesCanonicalDecimalStrings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal full-width API hello: %v", err)
 	}
-	if got, want := string(encoded), `{"accepted_generation":"9223372036854775807","last_received_event_seq":"18446744073709551615","next_command_seq":"18446744073709551615"}`; got != want {
+	if got, want := string(encoded), `{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"9223372036854775807","last_received_event_seq":"18446744073709551615","next_command_seq":"18446744073709551615"}`; got != want {
 		t.Fatalf("hello wire mismatch\n got: %s\nwant: %s", got, want)
 	}
 }

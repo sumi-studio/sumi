@@ -314,7 +314,10 @@ pub(crate) fn finalize_hard_steer_batches(
 
     // Batch 2: Steered, TurnStart, user MessageStart/End with atomic owner hand-off.
     let user_message = build_user_message(command)?;
-    let user_message_id = crate::store::user_message_id(&command.envelope().command_id);
+    let user_message_id = crate::store::user_message_id(
+        &command.envelope().personality_agent_id,
+        &command.envelope().command_id,
+    );
     let previous_owner_id = owner.command_id.clone();
     let previous_owner_seq = owner.command_seq;
     let new_command_id = command.envelope().command_id.to_string();
@@ -387,6 +390,7 @@ pub(crate) fn finalize_hard_steer_batches(
         injected_commands: vec![InjectedCommand::new(
             new_command_seq,
             command.envelope().command_id.clone(),
+            command.envelope().provenance.clone(),
         )],
     };
 
@@ -675,7 +679,10 @@ pub(crate) fn steer_group_injection_batch(snapshot: SteerGroupSnapshot) -> Resul
 
     for command in &commands {
         let user_message = build_user_message(command)?;
-        let user_message_id = crate::store::user_message_id(&command.envelope().command_id);
+        let user_message_id = crate::store::user_message_id(
+            &command.envelope().personality_agent_id,
+            &command.envelope().command_id,
+        );
         let new_command_id = command.envelope().command_id.to_string();
         let new_command_seq = command.envelope().seq;
 
@@ -734,6 +741,7 @@ pub(crate) fn steer_group_injection_batch(snapshot: SteerGroupSnapshot) -> Resul
         injected_commands.push(InjectedCommand::new(
             new_command_seq,
             command.envelope().command_id.clone(),
+            command.envelope().provenance.clone(),
         ));
 
         previous_owner_id = new_command_id;
@@ -820,6 +828,8 @@ mod tests {
 
     fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::UserMessage {
@@ -832,6 +842,35 @@ mod tests {
     fn test_admitted(seq: u64, command_id: &str, text: &str) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
+                seq,
+                command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: text.to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            test_timestamp(),
+        )
+    }
+
+    fn test_admitted_by(
+        seq: u64,
+        command_id: &str,
+        text: &str,
+        principal_id: &str,
+    ) -> AdmittedCommand {
+        let personality_agent_id = crate::gateway::test_personality_agent_id();
+        AdmittedCommand::new(
+            CommandEnvelope {
+                provenance: crate::runtime::contracts::DirectChatProvenanceV1::new(
+                    "tenant-test",
+                    personality_agent_id.clone(),
+                    principal_id,
+                )
+                .expect("valid direct-chat provenance"),
+                personality_agent_id,
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::UserMessage {
@@ -880,6 +919,7 @@ mod tests {
         phase: RunPhase,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -908,7 +948,8 @@ mod tests {
             .await
             .expect("classify owner");
 
-        let message_id = crate::store::user_message_id(command_id);
+        let message_id =
+            crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "owner".to_owned(),
@@ -976,6 +1017,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
+                    crate::gateway::test_direct_chat_provenance(),
                 )],
             })
             .await
@@ -1130,6 +1172,48 @@ mod tests {
             .retire_committed()
             .expect("retire restored attempt");
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn grouped_steer_injection_preserves_each_human_actor() {
+        let snapshot = SteerGroupSnapshot {
+            application_kind: ApplicationKind::RetrySteer,
+            run_id: "run-group-actors".to_owned(),
+            turn_id: "turn-group-actors".to_owned(),
+            previous_owner: DurableRunBinding {
+                provenance: crate::gateway::test_direct_chat_provenance(),
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                command_seq: 1,
+                run_id: "run-group-actors".to_owned(),
+                turn_id: "turn-group-actors".to_owned(),
+                executor_generation: crate::runtime::contracts::ProcessGeneration::MIN,
+            },
+            commands: vec![
+                test_admitted_by(
+                    2,
+                    "00000000-0000-4000-8000-000000000002",
+                    "first",
+                    "human-a",
+                ),
+                test_admitted_by(
+                    3,
+                    "00000000-0000-4000-8000-000000000003",
+                    "second",
+                    "human-b",
+                ),
+            ],
+            closing_turn_message: None,
+            closing_tool_results: Vec::new(),
+        };
+
+        let batch = steer_group_injection_batch(snapshot).expect("build grouped steer batch");
+        let actors = batch
+            .injected_commands
+            .iter()
+            .map(|command| command.provenance().actor().principal_id())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actors, ["human-a", "human-b"]);
     }
 
     #[tokio::test]

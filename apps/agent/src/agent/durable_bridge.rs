@@ -16,7 +16,7 @@ use crate::{
             ToolResultMessage,
         },
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{DirectChatProvenanceV1, ProcessGeneration},
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent,
         ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
@@ -46,6 +46,7 @@ use super::{AdmittedCommand, AgentEvent, ApprovalResolution, run::LENGTH_LOOP_CO
 pub(crate) struct DurableRunBinding {
     pub command_id: String,
     pub command_seq: u64,
+    pub provenance: DirectChatProvenanceV1,
     pub run_id: String,
     pub turn_id: String,
     pub executor_generation: ProcessGeneration,
@@ -56,6 +57,7 @@ impl DurableRunBinding {
         Self {
             command_id: command.envelope().command_id.to_string(),
             command_seq: command.envelope().seq,
+            provenance: command.envelope().provenance.clone(),
             run_id: Uuid::now_v7().to_string(),
             turn_id: Uuid::now_v7().to_string(),
             executor_generation,
@@ -1164,13 +1166,19 @@ impl DurableBridge {
                     let state = approval_state(&resolution);
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
                     let mut resolution_projections = vec![
                         Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
-                            actor: "user".to_owned(),
+                            actor: actor.clone(),
                         }),
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
@@ -1186,7 +1194,7 @@ impl DurableBridge {
                             event: Some(DurableEvent::approval_resolved(
                                 request_id.clone(),
                                 resolution,
-                                "user".to_owned(),
+                                actor,
                             )?),
                             projections: resolution_projections,
                         },
@@ -1564,12 +1572,18 @@ impl DurableBridge {
                 } else {
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let projections = vec![
                         Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
-                            actor: "user".to_owned(),
+                            actor: actor.clone(),
                         }),
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
@@ -1583,7 +1597,7 @@ impl DurableBridge {
                         DurableEvent::approval_resolved(
                             request_id.clone(),
                             resolution.clone(),
-                            "user".to_owned(),
+                            actor,
                         )?,
                         projections,
                         AgentEvent::ApprovalResolved {
@@ -1776,6 +1790,7 @@ impl DurableBridge {
                 self.binding.command_seq,
                 crate::gateway::CommandId::parse(&self.binding.command_id)
                     .map_err(anyhow::Error::msg)?,
+                self.binding.provenance.clone(),
             ));
         } else if let PublicMessage::ToolResult(result) = &message {
             let tool_call_id = result.tool_call_id.clone();
@@ -2304,6 +2319,7 @@ impl DurableBridge {
         self.assistant_open = None;
         self.pending_hard_steer_inject_batch = Some(inject_batch);
         self.pending_hard_steer_user_message_id = Some(crate::store::user_message_id(
+            &command.envelope().personality_agent_id,
             &command.envelope().command_id,
         ));
         self.pending_hard_steer = Some(command);
@@ -2431,7 +2447,10 @@ impl DurableBridge {
             .as_ref()
             .and_then(|group| group.commands().get(index))
             .ok_or_else(|| anyhow!("steer group member disappeared before MessageEnd"))?;
-        let expected_message_id = crate::store::user_message_id(&command.envelope().command_id);
+        let expected_message_id = crate::store::user_message_id(
+            &command.envelope().personality_agent_id,
+            &command.envelope().command_id,
+        );
         if message_id != expected_message_id {
             bail!("steer group message identity does not derive from its command");
         }
@@ -2530,7 +2549,10 @@ impl DurableBridge {
         let message_start_base = public.len();
         for (index, command) in commands.iter().enumerate() {
             let user_message = super::steer::build_user_message(command)?;
-            let user_message_id = crate::store::user_message_id(&command.envelope().command_id);
+            let user_message_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
             let start_seq = next_seq()?;
             let end_seq = next_seq()?;
             public.push(CommittedOutput {
@@ -2551,7 +2573,10 @@ impl DurableBridge {
             let pending = messages.get(index).ok_or_else(|| {
                 anyhow!("steer group committed without a matching MessageEnd receipt request")
             })?;
-            let expected_id = crate::store::user_message_id(&command.envelope().command_id);
+            let expected_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
             if pending.message_id != expected_id {
                 bail!("steer group receipt message id mismatch");
             }
@@ -2723,6 +2748,8 @@ mod tests {
 
     fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::UserMessage {
@@ -2735,6 +2762,8 @@ mod tests {
     fn test_admitted(seq: u64, command_id: &str, text: &str) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::UserMessage {
@@ -2748,6 +2777,8 @@ mod tests {
 
     fn test_abort_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::Abort {},
@@ -2757,6 +2788,8 @@ mod tests {
     fn test_admitted_abort(seq: u64, command_id: &str) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::Abort {},
@@ -2773,6 +2806,8 @@ mod tests {
     ) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::ApprovalDecision {
@@ -2846,6 +2881,7 @@ mod tests {
         assistant_origin: ProviderOrigin,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -2872,7 +2908,8 @@ mod tests {
             .await
             .expect("classify owner");
 
-        let message_id = crate::store::user_message_id(command_id);
+        let message_id =
+            crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "owner".to_owned(),
@@ -2939,6 +2976,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
+                    crate::gateway::test_direct_chat_provenance(),
                 )],
             })
             .await
@@ -3177,6 +3215,7 @@ mod tests {
 
     fn binding(command_id: &str) -> DurableRunBinding {
         DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: "run-a".to_owned(),
@@ -3310,6 +3349,8 @@ mod tests {
 
         let command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test command id"),
@@ -3472,7 +3513,10 @@ mod tests {
                 "SELECT COUNT(*) FROM agent_events
                  WHERE json_extract(envelope, '$.message_id')=?",
             )
-            .bind(crate::store::user_message_id(steer_id))
+            .bind(crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                steer_id,
+            ))
             .fetch_one(store.pool())
             .await
             .expect("count staged steer injection events"),
@@ -3576,7 +3620,10 @@ mod tests {
             .expect("commit hard-steer partial assistant");
         committed.resolve_message_receipts();
 
-        let user_message_id = crate::store::user_message_id(&steer_command.envelope().command_id);
+        let user_message_id = crate::store::user_message_id(
+            &steer_command.envelope().personality_agent_id,
+            &steer_command.envelope().command_id,
+        );
         let user_message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
@@ -3638,6 +3685,7 @@ mod tests {
             timestamp: test_timestamp(),
         });
         let tool_binding = DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: owner_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -4442,7 +4490,8 @@ mod tests {
             .await
             .expect("buffer new turn start while steer group is pending");
 
-        let user_message_id = crate::store::user_message_id(steer_id);
+        let user_message_id =
+            crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), steer_id);
         let user_message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
@@ -4970,6 +5019,8 @@ mod tests {
 
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),
@@ -5019,6 +5070,8 @@ mod tests {
         let decision_command = |seq: u64, request_id: &str| {
             AdmittedCommand::new(
                 CommandEnvelope {
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
+                    provenance: crate::gateway::test_direct_chat_provenance(),
                     seq,
                     command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                         .expect("canonical test UUID"),
@@ -5088,6 +5141,8 @@ mod tests {
 
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 3,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000003")
                     .expect("canonical test UUID"),
@@ -5120,6 +5175,8 @@ mod tests {
 
         let steer_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),

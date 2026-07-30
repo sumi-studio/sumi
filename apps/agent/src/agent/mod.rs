@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use thiserror::Error;
@@ -26,6 +26,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -39,14 +40,20 @@ use crate::{
         overflow::OverflowSource,
         types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::{
+        authority::RuntimeEpochAuthority,
+        contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity},
+    },
     store::{
         ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
-        EventWriter, InboundAdmission, InboundReceiptOrigin, Projection,
-        RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
-        ToolExecutionMutation,
+        EventWriter, HydratedRunState, HydrationReceiptIdentity, InboundAdmission,
+        InboundReceiptOrigin, Projection, RecoveryRequired as AdmissionRecoveryRequired,
+        RecoveryStep, ResumeDirective, Store, ToolExecutionMutation,
     },
 };
+
+#[cfg(test)]
+use crate::store::SuffixRecovery;
 
 mod driver;
 mod durable_bridge;
@@ -54,6 +61,8 @@ pub(crate) mod events;
 mod provider_projection;
 mod queue;
 mod run;
+#[cfg(test)]
+mod start_authority_tests;
 mod steer;
 
 pub(crate) use durable_bridge::DurableRunBinding;
@@ -108,6 +117,12 @@ const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// This is not provider retry backoff; it only prevents one stalled local task
 /// from blocking the Session event lane indefinitely.
 const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Once the graceful shutdown deadline has made the durable boundary
+/// indeterminate, do not detach the still-owned worker while reporting that
+/// outcome. The abort itself is not settlement: retain and join the exact
+/// handle within this independent ownership bound.
+const RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -211,12 +226,41 @@ async fn own_gateway_writer<W: GatewayWriter>(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HydratedSessionBinding {
+    binding_id: Uuid,
+    runtime: RuntimeEpochAuthority,
+    receipt: HydrationReceiptIdentity,
+    core_ownership_id: Uuid,
+    core_mutation_epoch: u64,
+}
+
+impl HydratedSessionBinding {
+    fn validate_receipt(&self) -> Result<()> {
+        if self.receipt.intent_count != 0
+            || self.receipt.personality_agent_id != *self.runtime.personality_agent_id()
+            || self.receipt.generation != self.runtime.generation()
+            || self.receipt.lease_id != self.runtime.lease().lease_id()
+            || self.receipt.fence_id != self.runtime.fence().fence_id()
+        {
+            bail!(
+                "hydration receipt does not prove the authenticated runtime epoch at a clean recovery fixed point"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The sole mutable conversation value transferred into and out of a worker.
 /// It is intentionally neither `Clone` nor wrapped in shared mutability.
 #[derive(Debug)]
 pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
+    /// Private proof that this exact, still-unmutated core was constructed
+    /// from the authenticated T17 snapshot accepted for one runtime epoch.
+    /// Session rechecks the proof before touching Store keys or gateway state.
+    hydrated_session_binding_id: Option<Uuid>,
     pending_controls: MessageQueue<AdmittedCommand>,
     pending_overflow_apply: Option<OverflowSource>,
     /// In-memory persisted send context returned with the unique core. T21
@@ -235,6 +279,10 @@ pub(crate) struct RunCore {
     /// Session reserves the token around `bind_hard_steer` so the provider is
     /// only cancelled after the durable step-zero commit succeeds.
     attempt_cancellation: Option<Arc<AttemptCancellation>>,
+    /// One Session-owned runtime shutdown lineage. Each worker receives a
+    /// child token, and every externally backed phase derives from that child.
+    /// This is runtime-only state and is never used as durable replay proof.
+    runtime_shutdown: CancellationToken,
     approval: Option<Arc<ApprovalBroker>>,
     #[cfg(test)]
     fixture_bypass_approval: bool,
@@ -245,6 +293,7 @@ impl RunCore {
         Self {
             ownership_id: Uuid::now_v7(),
             mutation_epoch: 0,
+            hydrated_session_binding_id: None,
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
@@ -252,6 +301,7 @@ impl RunCore {
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
+            runtime_shutdown: CancellationToken::new(),
             approval: None,
             #[cfg(test)]
             fixture_bypass_approval: false,
@@ -264,6 +314,7 @@ impl RunCore {
         mut self,
         provider_context: Vec<ProviderContextItemWithFootprint>,
     ) -> Self {
+        self.hydrated_session_binding_id = None;
         self.provider_context = provider_context;
         self
     }
@@ -277,11 +328,13 @@ impl RunCore {
     }
 
     pub(crate) fn mark_mutated(&mut self) {
+        self.hydrated_session_binding_id = None;
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
     pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
         self.approval = Some(broker);
+        self.mark_mutated();
     }
 
     #[cfg(test)]
@@ -293,15 +346,21 @@ impl RunCore {
 
     pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {
         self.pending_controls.push(command)?;
+        self.hydrated_session_binding_id = None;
         Ok(())
     }
 
     pub(crate) fn next_followup(&mut self) -> Option<AdmittedCommand> {
-        self.pending_controls.pop_one()
+        let command = self.pending_controls.pop_one();
+        if command.is_some() {
+            self.hydrated_session_binding_id = None;
+        }
+        command
     }
 
     pub(crate) fn requeue_followup_front(&mut self, command: AdmittedCommand) -> Result<()> {
         self.pending_controls.push_front(command)?;
+        self.hydrated_session_binding_id = None;
         Ok(())
     }
 
@@ -311,6 +370,7 @@ impl RunCore {
 
     pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
         self.pending_overflow_apply.get_or_insert(source);
+        self.hydrated_session_binding_id = None;
     }
 
     pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
@@ -319,6 +379,7 @@ impl RunCore {
 
     pub(crate) fn clear_pending_overflow_apply(&mut self) {
         self.pending_overflow_apply = None;
+        self.hydrated_session_binding_id = None;
     }
 
     pub(crate) fn install_hydrated_context(
@@ -339,6 +400,105 @@ impl RunCore {
     #[cfg(test)]
     pub(crate) fn provider_context(&self) -> &[ProviderContextItemWithFootprint] {
         &self.provider_context
+    }
+}
+
+enum SessionStartAuthorityKind {
+    Hydrated(Box<HydratedSessionBinding>),
+    #[cfg(test)]
+    UnhydratedFixture(ProcessGeneration),
+}
+
+/// Authenticated authority required to transfer one hydrated `RunCore` into a
+/// Session. It is deliberately neither `Clone` nor constructible from bare
+/// identity values in production.
+pub(crate) struct SessionStartAuthority {
+    kind: SessionStartAuthorityKind,
+}
+
+impl SessionStartAuthority {
+    /// Bind a completed T17 hydration result to the exact runtime epoch that
+    /// requested it and construct the only RunCore that this authority admits.
+    ///
+    /// T26 may inspect `hydrated` first to compose approval, memory, and driver
+    /// dependencies, but Session state itself is always initialized from the
+    /// authenticated messages and provider context here.
+    pub(crate) fn from_hydrated(
+        runtime: RuntimeEpochAuthority,
+        hydrated: &HydratedRunState,
+        approval: Arc<ApprovalBroker>,
+    ) -> Result<(RunCore, Self)> {
+        if hydrated.scope.personality_agent_id != *runtime.personality_agent_id() {
+            bail!("hydrated Store scope does not match the authenticated runtime PAID");
+        }
+        if hydrated.lease != *runtime.lease() {
+            bail!("hydrated process-generation lease is stale for the authenticated runtime epoch");
+        }
+        if hydrated.fence != *runtime.fence() {
+            bail!("hydrated recovery fence is stale for the authenticated runtime epoch");
+        }
+        if hydrated.resume != ResumeDirective::AdmitCommands {
+            bail!("hydration result does not authorize command admission");
+        }
+
+        let mut core = RunCore::new();
+        core.runtime_context = hydrated.messages.clone();
+        core.provider_context = hydrated.provider_context.clone();
+        // Approval is a security-sensitive dependency of this exact RunCore.
+        // Compose it before minting the binding; every later replacement goes
+        // through `set_approval` and invalidates the binding.
+        core.approval = Some(approval);
+        let binding = HydratedSessionBinding {
+            binding_id: Uuid::now_v7(),
+            runtime,
+            receipt: hydrated.receipt.clone(),
+            core_ownership_id: core.ownership_id,
+            core_mutation_epoch: core.mutation_epoch,
+        };
+        binding.validate_receipt()?;
+        core.hydrated_session_binding_id = Some(binding.binding_id);
+        Ok((
+            core,
+            Self {
+                kind: SessionStartAuthorityKind::Hydrated(Box::new(binding)),
+            },
+        ))
+    }
+
+    fn validate_for(&self, store: &Store, core: &RunCore) -> Result<ProcessGeneration> {
+        match &self.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                binding.validate_receipt()?;
+                if store.scope().personality_agent_id != *binding.runtime.personality_agent_id() {
+                    bail!("Session Store PAID does not match the authenticated runtime epoch");
+                }
+                if core.hydrated_session_binding_id != Some(binding.binding_id)
+                    || core.ownership_id != binding.core_ownership_id
+                    || core.mutation_epoch != binding.core_mutation_epoch
+                {
+                    bail!(
+                        "RunCore is not the exact unmutated core bound to this hydration authority"
+                    );
+                }
+                Ok(binding.runtime.generation())
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(generation) => Ok(*generation),
+        }
+    }
+
+    fn uses_completed_hydration(&self) -> bool {
+        matches!(&self.kind, SessionStartAuthorityKind::Hydrated(_))
+    }
+
+    #[cfg(test)]
+    fn unhydrated_fixture(generation: ProcessGeneration) -> Self {
+        // Existing T15/T16 actor tests exercise post-start behavior with
+        // synthetic stores and cores. Production has no conversion from a
+        // bare generation; focused authority tests use `start_hydrated`.
+        Self {
+            kind: SessionStartAuthorityKind::UnhydratedFixture(generation),
+        }
     }
 }
 
@@ -426,6 +586,12 @@ pub(crate) enum RunCompletion {
         core: RunCore,
         failure: WorkerFailure,
     },
+    /// The durable life log advanced beyond the worker's in-memory replay
+    /// state. There is deliberately no RunCore to recover: the next owner must
+    /// hydrate from the authoritative Store before another run can start.
+    RehydrationRequired {
+        failure: WorkerFailure,
+    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -439,6 +605,16 @@ pub(crate) enum WorkerFailure {
 }
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
+    /// Hydrated production starts must preserve the complete executor RPC
+    /// identity through the worker/driver boundary.
+    fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "run worker is not bound to a production executor RPC identity"
+        ))
+    }
+
+    /// Generation-only validation is retained for explicit unhydrated test
+    /// fixtures; it cannot admit a hydrated production Session.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
     fn apply_idle_memory_maintenance<'a>(
@@ -548,12 +724,16 @@ where
 
 #[cfg(test)]
 fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
-    let core = match completion {
-        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
-    };
-    RunCompletion::Failed {
-        core,
-        failure: WorkerFailure::EventChannelClosed,
+    match completion {
+        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => {
+            RunCompletion::Failed {
+                core,
+                failure: WorkerFailure::EventChannelClosed,
+            }
+        }
+        RunCompletion::RehydrationRequired { .. } => RunCompletion::RehydrationRequired {
+            failure: WorkerFailure::EventChannelClosed,
+        },
     }
 }
 
@@ -611,6 +791,12 @@ pub(crate) enum SessionResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLoopExit {
+    GatewayClosed,
+    ShutdownRequested,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SessionFailure {
     #[error("session startup is recovery-gated by T17-owned suffix: {steps:?}")]
@@ -623,6 +809,8 @@ pub(crate) enum SessionFailure {
     CompletionChannelClosed,
     #[error("run worker event channel closed")]
     EventChannelClosed,
+    #[error("runtime shutdown exceeded its bounded grace period; active RunCore ownership is lost")]
+    RuntimeShutdownOwnershipLost,
     #[error("gateway closed while a run owned RunCore")]
     GatewayClosedDuringRun,
     #[error("gateway {operation} failed: {source}")]
@@ -649,13 +837,16 @@ pub(crate) struct Session<G: Gateway> {
     writer_done: oneshot::Receiver<Result<()>>,
     writer_join: Option<JoinHandle<()>>,
     gateway_type: PhantomData<G>,
-    conversation_id: String,
+    personality_agent_id: PersonalityAgentId,
     writer: EventWriter,
     admission: InboundAdmission,
     recovery_steps: Vec<RecoveryStep>,
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
+    /// Retains the authenticated runtime/hydration proof for the whole
+    /// Session lifetime; `executor_generation` is derived from this proof.
+    start_authority: SessionStartAuthority,
     executor_generation: ProcessGeneration,
     /// T15 already applies the idle/post-run Abort cutoff and supplies the
     /// injected cancellation and phase-observation seams. Commands received
@@ -668,12 +859,43 @@ pub(crate) struct Session<G: Gateway> {
     /// worker exclusively owns `RunCore`. Retain it until the next idle
     /// boundary; it is independent of a run-local overflow marker.
     maintenance_ready_pending: bool,
-    /// A bridge/Store refusal means the worker's returned core may be ahead of
-    /// the durable transcript and must never be exposed as recovered.
+    /// A bridge/Store refusal can leave a returned core ahead of durability;
+    /// a post-receipt worker failure can leave it behind. Neither state is a
+    /// recoverable life-log snapshot.
     durable_core_invalidated: bool,
+    /// The root of the cancellation lineage installed by `run` or
+    /// `run_until_cancelled`. Workers receive children, so completing one run
+    /// cannot cancel a later run or the Session itself.
+    runtime_shutdown: CancellationToken,
+    #[cfg(test)]
+    active_take_observer: Option<oneshot::Sender<bool>>,
 }
 
 impl<G: Gateway + 'static> Session<G> {
+    /// All-cfg typed entry point exercised directly by the hydration-authority
+    /// tests and used by T26 production composition.
+    pub(crate) async fn start_hydrated(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        Self::start_inner(store, gateway, core, worker, start_authority).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn start(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        Self::start_hydrated(store, gateway, core, worker, start_authority).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn start(
         store: Store,
         gateway: G,
@@ -681,19 +903,71 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
-        worker.validate_executor_generation(executor_generation)?;
-        let conversation_id = store.scope().conversation_id.clone();
+        Self::start_fixture(store, gateway, core, worker, executor_generation).await
+    }
+
+    #[cfg(test)]
+    async fn start_fixture(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        executor_generation: ProcessGeneration,
+    ) -> Result<Self> {
+        Self::start_inner(
+            store,
+            gateway,
+            core,
+            worker,
+            SessionStartAuthority::unhydrated_fixture(executor_generation),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        start_authority: SessionStartAuthority,
+    ) -> Result<Self> {
+        // Every authority/core/Store check precedes key creation, recovery,
+        // gateway splitting, task creation, and worker validation.
+        let executor_generation = start_authority.validate_for(&store, &core)?;
+        match &start_authority.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                worker.validate_runtime_identity(binding.runtime.rpc_identity())?;
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => {
+                worker.validate_executor_generation(executor_generation)?;
+            }
+        }
+        let personality_agent_id = store.scope().personality_agent_id.clone();
         let store = Arc::new(store);
         for purpose in [
             DataKeyPurpose::Command,
             DataKeyPurpose::Event,
             DataKeyPurpose::Transcript,
         ] {
-            store.conversation_key(purpose).await?;
+            store.private_key(purpose).await?;
         }
         let writer = EventWriter::new(store.clone());
         writer.initialize_recovery_checkpoint().await?;
-        let recovery_steps = SuffixRecovery::recover_t12_prefix(&store, &writer).await?;
+        let recovery_steps = match &start_authority.kind {
+            // `HydratedRunState::resume == AdmitCommands` is T17's unique
+            // fixed-point authority. Re-running T12 recovery here would make a
+            // second bootstrap decision after the authenticated snapshot.
+            SessionStartAuthorityKind::Hydrated(_) => Vec::new(),
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => {
+                SuffixRecovery::recover_t12_prefix(&store, &writer).await?
+            }
+        };
+        debug_assert!(
+            !start_authority.uses_completed_hydration() || recovery_steps.is_empty(),
+            "completed hydration must not produce a second recovery plan"
+        );
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
         let (gateway_reader, gateway_writer) = gateway.split();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
@@ -722,25 +996,70 @@ impl<G: Gateway + 'static> Session<G> {
             writer_done,
             writer_join: Some(writer_join),
             gateway_type: PhantomData,
-            conversation_id,
+            personality_agent_id,
             writer,
             admission,
             recovery_steps,
             core: Some(core),
             active: None,
             worker,
+            start_authority,
             executor_generation,
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             maintenance_ready_pending: false,
             durable_core_invalidated: false,
+            runtime_shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            active_take_observer: None,
         })
     }
 
     pub(crate) async fn run(mut self) -> SessionResult {
-        match self.run_until_exit().await {
-            Ok(()) => {
+        let shutdown = CancellationToken::new();
+        self.runtime_shutdown = shutdown.clone();
+        match self.run_until_exit(&shutdown).await {
+            Ok(SessionLoopExit::GatewayClosed) => {
                 // Gateway EOF is terminal. Do not wait for an arbitrary
                 // transport send to finish after the reader has closed.
+                self.abort_writer().await;
+                SessionResult::Completed(
+                    self.core
+                        .take()
+                        .expect("clean idle exit retains the unique RunCore"),
+                )
+            }
+            Ok(SessionLoopExit::ShutdownRequested) => {
+                unreachable!("the private run token is never cancelled")
+            }
+            Err(failure) => {
+                if self.active.is_some() {
+                    self.shutdown_active().await;
+                }
+                self.abort_writer().await;
+                let ownership = if self.durable_core_invalidated {
+                    self.core.take();
+                    RunOwnership::Lost
+                } else {
+                    self.core.take().map_or(RunOwnership::Lost, |core| {
+                        RunOwnership::Recovered(Box::new(core))
+                    })
+                };
+                SessionResult::Failed { failure, ownership }
+            }
+        }
+    }
+
+    /// Install shutdown as an input to the Session event loop. No outer
+    /// `select!` cancels `run_until_exit`, so mutation-heavy admission,
+    /// persistence, completion, and ownership-transfer handlers always run to
+    /// a boundary before shutdown is observed.
+    pub(crate) async fn run_until_cancelled(
+        mut self,
+        shutdown: CancellationToken,
+    ) -> SessionResult {
+        self.runtime_shutdown = shutdown.clone();
+        match self.run_until_exit(&shutdown).await {
+            Ok(SessionLoopExit::GatewayClosed) => {
                 self.abort_writer().await;
                 SessionResult::Completed(
                     self.core
@@ -763,6 +1082,30 @@ impl<G: Gateway + 'static> Session<G> {
                 };
                 SessionResult::Failed { failure, ownership }
             }
+            Ok(SessionLoopExit::ShutdownRequested) => {
+                if self.active.is_some() {
+                    if let Err(failure) = self.shutdown_active_gracefully().await {
+                        self.abort_writer().await;
+                        let ownership = if self.durable_core_invalidated {
+                            self.core.take();
+                            RunOwnership::Lost
+                        } else {
+                            self.core.take().map_or(RunOwnership::Lost, |core| {
+                                RunOwnership::Recovered(Box::new(core))
+                            })
+                        };
+                        return SessionResult::Failed { failure, ownership };
+                    }
+                }
+                self.abort_writer().await;
+                match self.core.take() {
+                    Some(core) => SessionResult::Completed(core),
+                    None => SessionResult::Failed {
+                        failure: SessionFailure::RuntimeShutdownOwnershipLost,
+                        ownership: RunOwnership::Lost,
+                    },
+                }
+            }
         }
     }
 
@@ -776,26 +1119,34 @@ impl<G: Gateway + 'static> Session<G> {
         Ok(())
     }
 
-    async fn run_until_exit(&mut self) -> Result<(), SessionFailure> {
+    async fn run_until_exit(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<SessionLoopExit, SessionFailure> {
         loop {
             if self.active.is_none() {
                 self.apply_idle_memory_maintenance().await?;
                 enum IdleSelected {
+                    Shutdown,
                     Command(Result<InboundCommand>),
                     Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
                 }
                 let selected = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => IdleSelected::Shutdown,
                     command = self.gateway_reader.next_command() => IdleSelected::Command(command),
                     writer = &mut self.writer_done => IdleSelected::Writer(writer),
                 };
                 let inbound = match selected {
+                    IdleSelected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                     IdleSelected::Command(Ok(inbound)) => inbound,
                     IdleSelected::Command(Err(error))
                         if error.downcast_ref::<GatewayClosed>().is_some() =>
                     {
                         // Preserve a writer failure that won the race with
                         // EOF without waiting for a transport still in send.
-                        return self.gateway_closed_result(false);
+                        self.gateway_closed_result(false)?;
+                        return Ok(SessionLoopExit::GatewayClosed);
                     }
                     IdleSelected::Command(Err(error)) => {
                         return Err(gateway_failure("receive", error));
@@ -808,6 +1159,7 @@ impl<G: Gateway + 'static> Session<G> {
 
             #[allow(clippy::large_enum_variant)]
             enum Selected {
+                Shutdown,
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
                 Event(Option<RunOutput>),
@@ -819,6 +1171,7 @@ impl<G: Gateway + 'static> Session<G> {
                 tokio::select! {
                     biased;
                     completion = &mut active.completion_rx => Selected::Completion(completion),
+                    _ = shutdown.cancelled() => Selected::Shutdown,
                     command = self.gateway_reader.next_command() => Selected::Command(command),
                     event = active.events_rx.recv() => Selected::Event(event),
                     writer = &mut self.writer_done => Selected::Writer(writer),
@@ -826,12 +1179,14 @@ impl<G: Gateway + 'static> Session<G> {
             };
 
             match selected {
+                Selected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                 Selected::Completion(completion) => self.finish_run(completion).await?,
                 Selected::Command(Ok(inbound)) => self.admit_and_route(inbound).await?,
                 Selected::Command(Err(error))
                     if error.downcast_ref::<GatewayClosed>().is_some() =>
                 {
-                    return self.gateway_closed_result(true);
+                    self.gateway_closed_result(true)?;
+                    return Ok(SessionLoopExit::GatewayClosed);
                 }
                 Selected::Command(Err(error)) => {
                     return Err(gateway_failure("receive", error));
@@ -879,6 +1234,17 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
+        if inbound.personality_agent_id() != &self.personality_agent_id
+            || inbound.provenance().personality_agent_id() != &self.personality_agent_id
+        {
+            return Err(anyhow::anyhow!(
+                "command target mismatch before Store admission: session={}, command={}, provenance={}",
+                self.personality_agent_id,
+                inbound.personality_agent_id(),
+                inbound.provenance().personality_agent_id(),
+            )
+            .into());
+        }
         // Capture live ingress before durable admission. Replay returns before
         // construction below and therefore never fabricates a monotonic span.
         let received_monotonic = Instant::now();
@@ -1479,6 +1845,7 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = CommandAck {
             seq,
             command_id,
+            personality_agent_id: self.personality_agent_id.clone(),
             status: CommandAckStatus::Applied,
             reject_reason: None,
         };
@@ -1577,6 +1944,7 @@ impl<G: Gateway + 'static> Session<G> {
         core.worker_phase = Some(phase_tx);
         let attempt_cancellation = Arc::new(AttemptCancellation::default());
         core.attempt_cancellation = Some(attempt_cancellation.clone());
+        core.runtime_shutdown = self.runtime_shutdown.child_token();
         let approval = core.approval.clone();
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
@@ -1607,36 +1975,96 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         completion: std::result::Result<RunCompletion, oneshot::error::RecvError>,
     ) -> std::result::Result<(), SessionFailure> {
-        let mut active = self.active.take().expect("completion requires active run");
-        let completion = match completion {
-            Ok(completion) => completion,
+        self.finish_run_with_route(completion, true).await
+    }
+
+    fn install_run_completion_ownership(
+        &mut self,
+        completion: RunCompletion,
+    ) -> Option<WorkerFailure> {
+        match completion {
+            RunCompletion::Completed(core) => {
+                self.core = Some(core);
+                None
+            }
+            RunCompletion::Failed { core, failure } => {
+                self.core = Some(core);
+                Some(failure)
+            }
+            RunCompletion::RehydrationRequired { failure } => {
+                self.core = None;
+                self.durable_core_invalidated = true;
+                Some(failure)
+            }
+        }
+    }
+
+    async fn finish_run_with_route(
+        &mut self,
+        completion: std::result::Result<RunCompletion, oneshot::error::RecvError>,
+        route_after_completion: bool,
+    ) -> std::result::Result<(), SessionFailure> {
+        // A successful completion transfer carries the unique RunCore or a
+        // durable invalidation verdict. Install that ownership state before
+        // the first await, while retaining ActiveRun through join and drain.
+        let worker_failure = match completion {
+            Ok(completion) => self.install_run_completion_ownership(completion),
             Err(_) => {
-                return match (&mut active.join).await {
+                let join_result = {
+                    let active = self
+                        .active
+                        .as_mut()
+                        .expect("completion requires active run");
+                    (&mut active.join).await
+                };
+                self.active.take();
+                return match join_result {
                     Err(error) => Err(worker_join_failure(error)),
                     Ok(()) => Err(SessionFailure::CompletionChannelClosed),
                 };
             }
         };
-        if let Err(error) = (&mut active.join).await {
+        let join_result = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("completion requires active run");
+            (&mut active.join).await
+        };
+        if let Err(error) = join_result {
+            self.active.take();
             return Err(worker_join_failure(error));
         }
-        let (core, worker_failure) = match completion {
-            RunCompletion::Completed(core) => (core, None),
-            RunCompletion::Failed { core, failure } => (core, Some(failure)),
+        let delivery_failure = match self.drain_active_outputs(route_after_completion).await {
+            Ok(failure) => failure,
+            Err(error) => {
+                // The joined worker cannot be awaited twice. The durable
+                // invalidation flag prevents the returned-but-ahead core from
+                // being reported as recovered.
+                self.active.take();
+                return Err(error);
+            }
         };
-        let delivery_failure = self.drain_disconnected_outputs(&mut active, true).await?;
         // A completed RunCore includes every output already produced by the
         // worker. Do not expose it until the disconnected bounded event lane
         // has been drained into SQLite, even when Gateway delivery was lost.
-        self.core = Some(core);
+        self.active.take();
+        #[cfg(test)]
+        if let Some(observer) = self.active_take_observer.take() {
+            let _ = observer.send(self.core.is_some());
+        }
         if let Some(failure) = delivery_failure {
             return Err(failure);
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
             None => {
-                self.apply_idle_memory_maintenance().await?;
-                self.route_deferred_after_run().await
+                if route_after_completion {
+                    self.apply_idle_memory_maintenance().await?;
+                    self.route_deferred_after_run().await
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -1715,44 +2143,176 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn shutdown_active(&mut self) {
-        let Some(mut active) = self.active.take() else {
+        if self.active.is_none() {
             return;
-        };
+        }
         tokio::task::yield_now().await;
-        match active.completion_rx.try_recv() {
-            Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. }) => {
-                if (&mut active.join).await.is_err() {
+        let completion = self
+            .active
+            .as_mut()
+            .expect("active run checked above")
+            .completion_rx
+            .try_recv();
+        match completion {
+            Ok(completion) => {
+                // Consume the completion's RunCore or invalidation verdict
+                // synchronously before joining the task that published it.
+                let _ = self.install_run_completion_ownership(completion);
+                let join_result = {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    (&mut active.join).await
+                };
+                if join_result.is_err() {
+                    self.active.take();
                     return;
                 }
                 // The caller already holds the primary Session failure. Commit
                 // the suffix, but do not re-enter a failed Gateway during shutdown.
-                match self.drain_disconnected_outputs(&mut active, false).await {
-                    Ok(_) => self.core = Some(core),
-                    Err(_) => self.durable_core_invalidated = true,
+                match self.drain_active_outputs(false).await {
+                    Ok(_) => {
+                        self.active.take();
+                    }
+                    Err(_) => {
+                        self.active.take();
+                        self.durable_core_invalidated = true;
+                    }
                 }
             }
             Err(oneshot::error::TryRecvError::Closed) => {
-                let _ = (&mut active.join).await;
+                {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    let _ = (&mut active.join).await;
+                }
+                self.active.take();
             }
             Err(oneshot::error::TryRecvError::Empty) => {
-                active.join.abort();
-                let _ = (&mut active.join).await;
+                {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    active.join.abort();
+                    let _ = (&mut active.join).await;
+                }
+                self.active.take();
             }
         }
     }
 
-    async fn drain_disconnected_outputs(
+    async fn shutdown_active_gracefully(&mut self) -> Result<(), SessionFailure> {
+        if self.active.is_none() {
+            return Ok(());
+        }
+        self.runtime_shutdown.cancel();
+        if let Some(approval) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.approval.as_ref())
+        {
+            approval.cancel_all();
+        }
+        let deadline = tokio::time::Instant::now() + RUNTIME_SHUTDOWN_GRACE;
+        match tokio::time::timeout_at(deadline, self.settle_active_shutdown()).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The grace period is absolute: it includes Store commits,
+                // worker settlement, output draining, and every other await in
+                // the graceful path. Cancellation of any of those operations
+                // makes the durable/worker boundary indeterminate. Abort and
+                // settle the exact retained task before reporting lost RunCore
+                // ownership; the two ownership questions are distinct.
+                self.abort_and_join_active_worker_or_fail_stop().await;
+                self.active.take();
+                self.core.take();
+                self.durable_core_invalidated = true;
+                Err(SessionFailure::RuntimeShutdownOwnershipLost)
+            }
+        }
+    }
+
+    async fn abort_and_join_active_worker_or_fail_stop(&mut self) {
+        let joined = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("shutdown timeout requires an active run");
+            active.join.abort();
+            tokio::time::timeout(RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT, &mut active.join).await
+        };
+        if joined.is_err() {
+            // Returning would drop the JoinHandle and detach a task that may
+            // still own RunCore. The durable outcome is already
+            // indeterminate, but only a process fail-stop preserves the
+            // single-owner invariant when task settlement misses its bound.
+            tracing::error!(
+                timeout_millis = RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT.as_millis(),
+                "aborted active run did not join within its ownership bound"
+            );
+            std::process::abort();
+        }
+    }
+
+    async fn settle_active_shutdown(&mut self) -> Result<(), SessionFailure> {
+        let mut events_open = true;
+        loop {
+            enum ShutdownSelected {
+                Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
+                Event(Option<RunOutput>),
+            }
+            let selected = {
+                let active = self.active.as_mut().expect("active run checked above");
+                tokio::select! {
+                    biased;
+                    completion = &mut active.completion_rx => {
+                        ShutdownSelected::Completion(completion)
+                    }
+                    event = active.events_rx.recv(), if events_open => {
+                        ShutdownSelected::Event(event)
+                    }
+                }
+            };
+            match selected {
+                ShutdownSelected::Completion(completion) => {
+                    return match self.finish_run_with_route(completion, false).await {
+                        Err(SessionFailure::Worker(WorkerFailure::Cancelled))
+                            if self.core.is_some() =>
+                        {
+                            Ok(())
+                        }
+                        result => result,
+                    };
+                }
+                ShutdownSelected::Event(Some(output)) => {
+                    self.persist_shutdown_event(output).await?;
+                }
+                ShutdownSelected::Event(None) => {
+                    // Completion publication immediately follows sender drop.
+                    // Disable the now-always-ready branch so the bounded
+                    // deadline remains observable.
+                    events_open = false;
+                }
+            }
+        }
+    }
+
+    async fn drain_active_outputs(
         &mut self,
-        active: &mut ActiveRun,
         deliver: bool,
     ) -> Result<Option<SessionFailure>, SessionFailure> {
         let mut delivery_failure = None;
-        while let Ok(output) = active.events_rx.try_recv() {
-            let committed = match active.bridge.commit(&self.writer, output).await {
-                Ok(committed) => committed,
-                Err(error) => {
-                    self.durable_core_invalidated = true;
-                    return Err(error.into());
+        loop {
+            let output = {
+                let active = self.active.as_mut().expect("drain requires active run");
+                active.events_rx.try_recv()
+            };
+            let Ok(output) = output else {
+                break;
+            };
+            let committed = {
+                let active = self.active.as_mut().expect("drain requires active run");
+                match active.bridge.commit(&self.writer, output).await {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        self.durable_core_invalidated = true;
+                        return Err(error.into());
+                    }
                 }
             };
             let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
@@ -1763,19 +2323,54 @@ impl<G: Gateway + 'static> Session<G> {
             if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
-            active.finish_committed_approval_resolutions(&outputs);
+            self.active
+                .as_mut()
+                .expect("drain retains active run")
+                .finish_committed_approval_resolutions(&outputs);
             if deliver && delivery_failure.is_none() {
+                let command_id = self
+                    .active
+                    .as_ref()
+                    .expect("drain retains active run")
+                    .bridge
+                    .command_id()
+                    .to_owned();
                 delivery_failure = self
-                    .send_committed(
-                        outputs,
-                        Some(active.bridge.command_id().to_owned()),
-                        terminal_command_ids,
-                    )
+                    .send_committed(outputs, Some(command_id), terminal_command_ids)
                     .await
                     .err();
             }
         }
         Ok(delivery_failure)
+    }
+
+    async fn persist_shutdown_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        let committed = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("shutdown event requires active run");
+            match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            }
+        };
+        let (outputs, tool_start_barrier, retry_wait_commit_barrier, _) =
+            committed.resolve_message_receipts();
+        if let Some(barrier) = tool_start_barrier {
+            barrier.committed();
+        }
+        if let Some(barrier) = retry_wait_commit_barrier {
+            barrier.committed();
+        }
+        self.active
+            .as_mut()
+            .expect("shutdown event retains active run")
+            .finish_committed_approval_resolutions(&outputs);
+        Ok(())
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
@@ -1864,7 +2459,7 @@ impl<G: Gateway + 'static> Session<G> {
             frames.push(OutboundFrame::Event {
                 envelope: crate::gateway::Envelope {
                     seq: output.seq,
-                    conversation_id: self.conversation_id.clone(),
+                    personality_agent_id: self.personality_agent_id.clone(),
                     event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
                 },
             });
@@ -1912,6 +2507,20 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn enqueue_reliable(&mut self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
+        for frame in &frames {
+            let frame_personality_agent_id = match frame {
+                OutboundFrame::Event { envelope } => &envelope.personality_agent_id,
+                OutboundFrame::CommandAck { ack } => &ack.personality_agent_id,
+            };
+            if frame_personality_agent_id != &self.personality_agent_id {
+                return Err(anyhow::anyhow!(
+                    "outbound frame personality-agent mismatch: session={}, frame={}",
+                    self.personality_agent_id,
+                    frame_personality_agent_id,
+                )
+                .into());
+            }
+        }
         let outbound = self.outbound_handle()?.clone();
         match outbound.enqueue_reliable_wait(frames).await {
             Err(SessionFailure::OutboundClosed) => match self.writer_done.try_recv() {

@@ -38,6 +38,7 @@ use crate::provider::types::{
     RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
     UserContent, UserMessage,
 };
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
 
 /// UUIDv5 namespace for deriving a user `message_id` from a canonical
 /// `command_id`. API and web consumers must use the same namespace so they can
@@ -150,6 +151,8 @@ pub enum WireError {
     JsonSafeIntegerOutOfRange(u64),
     #[error("seq `{0}` exceeds the JSON-safe integer range")]
     SeqOutOfRange(u64),
+    #[error("command provenance target does not match personality_agent_id")]
+    ProvenanceTargetMismatch,
     #[error("user message attachments must be empty")]
     NonEmptyAttachments,
 }
@@ -294,6 +297,8 @@ pub enum WireCommand {
 pub struct WireCommandEnvelope {
     seq: u64,
     command_id: String,
+    personality_agent_id: PersonalityAgentId,
+    provenance: DirectChatProvenanceV1,
     command: WireCommand,
 }
 
@@ -306,6 +311,14 @@ impl WireCommandEnvelope {
         &self.command_id
     }
 
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
+    }
+
+    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+        &self.provenance
+    }
+
     pub fn command(&self) -> &WireCommand {
         &self.command
     }
@@ -316,6 +329,8 @@ impl WireCommandEnvelope {
 struct WireCommandEnvelopeInput {
     seq: u64,
     command_id: String,
+    personality_agent_id: PersonalityAgentId,
+    provenance: DirectChatProvenanceV1,
     command: WireCommand,
 }
 
@@ -326,9 +341,15 @@ impl TryFrom<WireCommandEnvelopeInput> for WireCommandEnvelope {
         if input.seq > MAX_JSON_SAFE_INTEGER {
             return Err(WireError::SeqOutOfRange(input.seq));
         }
+        input
+            .provenance
+            .validate(&input.personality_agent_id)
+            .map_err(|_| WireError::ProvenanceTargetMismatch)?;
         Ok(Self {
             seq: input.seq,
             command_id: canonical_command_id(&input.command_id)?,
+            personality_agent_id: input.personality_agent_id,
+            provenance: input.provenance,
             command: input.command,
         })
     }
@@ -393,6 +414,7 @@ fn parse_reject_reason(reason: &str) -> Result<WireRejectReason, WireError> {
 pub struct WireCommandAck {
     seq: u64,
     command_id: String,
+    personality_agent_id: PersonalityAgentId,
     status: WireCommandAckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reject_reason: Option<WireRejectReason>,
@@ -405,6 +427,10 @@ impl WireCommandAck {
 
     pub fn command_id(&self) -> &str {
         &self.command_id
+    }
+
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub fn status(&self) -> WireCommandAckStatus {
@@ -421,6 +447,7 @@ impl WireCommandAck {
 struct WireCommandAckInput {
     seq: u64,
     command_id: String,
+    personality_agent_id: PersonalityAgentId,
     status: WireCommandAckStatus,
     // `present_or_error_on_null` rejects an explicit `reject_reason: null`;
     // the default attribute means a missing `reject_reason` yields `None`.
@@ -458,6 +485,7 @@ impl TryFrom<WireCommandAckInput> for WireCommandAck {
         Ok(Self {
             seq: input.seq,
             command_id,
+            personality_agent_id: input.personality_agent_id,
             status: input.status,
             reject_reason,
         })
@@ -473,7 +501,7 @@ impl TryFrom<WireCommandAckInput> for WireCommandAck {
 pub struct WireEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     seq: Option<u64>,
-    conversation_id: String,
+    personality_agent_id: PersonalityAgentId,
     event: WireAgentEvent,
 }
 
@@ -482,14 +510,14 @@ impl WireEnvelope {
     /// durable-seq-required / volatile-seq-forbidden rule.
     pub(crate) fn try_new(
         seq: Option<u64>,
-        conversation_id: String,
+        personality_agent_id: PersonalityAgentId,
         event: AgentEvent,
     ) -> Result<Self, WireError> {
         let event: WireAgentEvent = event.try_into()?;
         validate_seq(seq, &event)?;
         Ok(Self {
             seq,
-            conversation_id,
+            personality_agent_id,
             event,
         })
     }
@@ -498,8 +526,8 @@ impl WireEnvelope {
         self.seq
     }
 
-    pub fn conversation_id(&self) -> &str {
-        &self.conversation_id
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub fn event(&self) -> &WireAgentEvent {
@@ -515,7 +543,7 @@ struct WireEnvelopeInput {
     // enforces the durable/volatile presence rules.
     #[serde(default, deserialize_with = "present_or_error_on_null")]
     seq: Option<u64>,
-    conversation_id: String,
+    personality_agent_id: PersonalityAgentId,
     event: WireAgentEvent,
 }
 
@@ -525,7 +553,7 @@ impl TryFrom<WireEnvelopeInput> for WireEnvelope {
         validate_seq(input.seq, &input.event)?;
         Ok(Self {
             seq: input.seq,
-            conversation_id: input.conversation_id,
+            personality_agent_id: input.personality_agent_id,
             event: input.event,
         })
     }
@@ -1496,6 +1524,8 @@ impl TryFrom<CommandEnvelope> for WireCommandEnvelope {
         Ok(Self {
             seq: envelope.seq,
             command_id: envelope.command_id.as_str().to_owned(),
+            personality_agent_id: envelope.personality_agent_id,
+            provenance: envelope.provenance,
             command: envelope.command.try_into()?,
         })
     }
@@ -1527,6 +1557,7 @@ impl TryFrom<CommandAck> for WireCommandAck {
         Ok(Self {
             seq: ack.seq,
             command_id,
+            personality_agent_id: ack.personality_agent_id,
             status,
             reject_reason,
         })
@@ -1541,7 +1572,7 @@ impl TryFrom<Envelope> for WireEnvelope {
         validate_seq(envelope.seq, &event)?;
         Ok(Self {
             seq: envelope.seq,
-            conversation_id: envelope.conversation_id,
+            personality_agent_id: envelope.personality_agent_id,
             event,
         })
     }
@@ -1736,7 +1767,7 @@ mod tests {
         let tool_start = OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(1),
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({
                     "type": "tool_execution_start",
                     "tool_call_id": "call-1",
@@ -1753,7 +1784,7 @@ mod tests {
         let tool_call_end = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({
                     "type": "message_update",
                     "message_id": "00000000-0000-4000-8000-000000000003",
@@ -1838,14 +1869,42 @@ mod tests {
     #[test]
     fn durable_event_requires_seq_and_volatile_forbids_it() {
         let durable = AgentEvent::AgentStart;
-        assert!(WireEnvelope::try_new(Some(1), "c".to_owned(), durable).is_ok());
-        assert!(WireEnvelope::try_new(None, "c".to_owned(), AgentEvent::AgentStart).is_err());
+        assert!(
+            WireEnvelope::try_new(
+                Some(1),
+                crate::gateway::test_personality_agent_id(),
+                durable
+            )
+            .is_ok()
+        );
+        assert!(
+            WireEnvelope::try_new(
+                None,
+                crate::gateway::test_personality_agent_id(),
+                AgentEvent::AgentStart
+            )
+            .is_err()
+        );
 
         let volatile = AgentEvent::Error {
             message: "boom".to_owned(),
         };
-        assert!(WireEnvelope::try_new(None, "c".to_owned(), volatile.clone()).is_ok());
-        assert!(WireEnvelope::try_new(Some(1), "c".to_owned(), volatile).is_err());
+        assert!(
+            WireEnvelope::try_new(
+                None,
+                crate::gateway::test_personality_agent_id(),
+                volatile.clone()
+            )
+            .is_ok()
+        );
+        assert!(
+            WireEnvelope::try_new(
+                Some(1),
+                crate::gateway::test_personality_agent_id(),
+                volatile
+            )
+            .is_err()
+        );
 
         let update = AgentEvent::MessageUpdate {
             message_id: "00000000-0000-4000-8000-000000000002".to_owned(),
@@ -1854,8 +1913,18 @@ mod tests {
                 delta: "hi".to_owned(),
             },
         };
-        assert!(WireEnvelope::try_new(None, "c".to_owned(), update.clone()).is_ok());
-        assert!(WireEnvelope::try_new(Some(1), "c".to_owned(), update).is_err());
+        assert!(
+            WireEnvelope::try_new(
+                None,
+                crate::gateway::test_personality_agent_id(),
+                update.clone()
+            )
+            .is_ok()
+        );
+        assert!(
+            WireEnvelope::try_new(Some(1), crate::gateway::test_personality_agent_id(), update)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1892,6 +1961,8 @@ mod tests {
     #[test]
     fn command_envelope_round_trips() {
         let envelope = CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 7,
             command_id: uuid_command_id(),
             command: Command::UserMessage {
@@ -1916,6 +1987,8 @@ mod tests {
             let value = json!({
                 "seq": 1,
                 "command_id": command_id,
+                "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+                "provenance": crate::gateway::test_direct_chat_provenance(),
                 "command": {"type": "abort"},
             });
             assert!(
@@ -1926,10 +1999,52 @@ mod tests {
     }
 
     #[test]
+    fn command_envelope_requires_exact_personality_and_provenance_contract() {
+        let valid = json!({
+            "seq": 1,
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": {"type": "abort"},
+        });
+        assert!(serde_json::from_value::<WireCommandEnvelope>(valid.clone()).is_ok());
+
+        for missing_field in ["personality_agent_id", "provenance"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(missing_field);
+            assert!(
+                serde_json::from_value::<WireCommandEnvelope>(missing).is_err(),
+                "{missing_field} must not default"
+            );
+        }
+
+        for legacy_field in ["agent_id", "conversation_id"] {
+            let mut legacy = valid.clone();
+            legacy[legacy_field] = json!(crate::gateway::TEST_PERSONALITY_AGENT_ID);
+            assert!(
+                serde_json::from_value::<WireCommandEnvelope>(legacy).is_err(),
+                "{legacy_field} must not be accepted as an alias"
+            );
+        }
+
+        let mut mismatched = valid;
+        mismatched["provenance"]["personality_agent_id"] =
+            json!("018f3f8d-7b2c-7a10-8f9e-123456789abd");
+        assert!(matches!(
+            serde_json::from_value::<WireCommandEnvelope>(mismatched)
+                .unwrap_err()
+                .to_string()
+                .as_str(),
+            message if message.contains("provenance target")
+        ));
+    }
+
+    #[test]
     fn command_ack_reject_reason_rules() {
         let rejected = CommandAck {
             seq: 1,
             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             status: CommandAckStatus::Rejected,
             reject_reason: Some("oversized".to_owned()),
         };
@@ -1938,6 +2053,7 @@ mod tests {
         let rejected_missing = CommandAck {
             seq: 1,
             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             status: CommandAckStatus::Rejected,
             reject_reason: None,
         };
@@ -1951,6 +2067,7 @@ mod tests {
         let received_with_reason = CommandAck {
             seq: 2,
             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             status: CommandAckStatus::Received,
             reject_reason: Some("oversized".to_owned()),
         };
@@ -1967,7 +2084,7 @@ mod tests {
         let durable = OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(1),
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "agent_start"}),
             },
         };
@@ -1978,7 +2095,7 @@ mod tests {
         let durable_missing_seq = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "agent_start"}),
             },
         };
@@ -1987,7 +2104,7 @@ mod tests {
         let volatile_with_seq = OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(1),
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "error", "message": "x"}),
             },
         };
@@ -1996,7 +2113,7 @@ mod tests {
         let volatile_ok = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conv-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "error", "message": "x"}),
             },
         };
@@ -2010,6 +2127,7 @@ mod tests {
         let invalid_uuid = json!({
             "seq": 1,
             "command_id": "not-a-uuid",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "received"
         });
         assert!(serde_json::from_value::<WireCommandAck>(invalid_uuid).is_err());
@@ -2019,6 +2137,7 @@ mod tests {
                 ack: CommandAck {
                     seq: 1,
                     command_id: "not-a-uuid".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     status: CommandAckStatus::Received,
                     reject_reason: None,
                 }
@@ -2029,6 +2148,7 @@ mod tests {
         let rejected_without_reason = json!({
             "seq": 1,
             "command_id": valid_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "rejected"
         });
         assert!(serde_json::from_value::<WireCommandAck>(rejected_without_reason).is_err());
@@ -2036,6 +2156,7 @@ mod tests {
         let non_rejected_with_reason = json!({
             "seq": 1,
             "command_id": valid_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "received",
             "reject_reason": "oversized"
         });
@@ -2044,6 +2165,7 @@ mod tests {
         let non_rejected_with_null_reason = json!({
             "seq": 1,
             "command_id": valid_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "received",
             "reject_reason": null
         });
@@ -2052,6 +2174,7 @@ mod tests {
         let rejected_with_null_reason = json!({
             "seq": 1,
             "command_id": valid_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "rejected",
             "reject_reason": null
         });
@@ -2061,28 +2184,28 @@ mod tests {
     #[test]
     fn wire_envelope_rejects_invalid_input() {
         let durable_missing_seq = json!({
-            "conversation_id": "conv-1",
+            "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
             "event": {"type": "agent_start"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(durable_missing_seq).is_err());
 
         let durable_null_seq = json!({
             "seq": null,
-            "conversation_id": "conv-1",
+            "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
             "event": {"type": "agent_start"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(durable_null_seq).is_err());
 
         let volatile_with_seq = json!({
             "seq": 1,
-            "conversation_id": "conv-1",
+            "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
             "event": {"type": "error", "message": "x"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(volatile_with_seq).is_err());
 
         let volatile_null_seq = json!({
             "seq": null,
-            "conversation_id": "conv-1",
+            "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
             "event": {"type": "error", "message": "x"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(volatile_null_seq).is_err());
@@ -2877,6 +3000,8 @@ mod tests {
     #[test]
     fn try_from_command_envelope_rejects_non_empty_attachments() {
         let envelope = CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 1,
             command_id: uuid_command_id(),
             command: Command::UserMessage {
@@ -2988,7 +3113,8 @@ mod tests {
                 | "browser_command_frame"
                 | "browser_event_frame"
                 | "browser_command_accepted"
-                | "browser_command_rejected" => continue,
+                | "browser_command_rejected"
+                | "browser_direct_chat_status" => continue,
                 other => panic!("unknown fixture kind '{other}' for '{name}'"),
             }
             passed += 1;
@@ -3001,6 +3127,8 @@ mod tests {
         let oversized = json!({
             "seq": MAX_JSON_SAFE_INTEGER + 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
             "command": { "type": "abort" }
         });
         assert!(
@@ -3011,6 +3139,7 @@ mod tests {
         let ack = json!({
             "seq": MAX_JSON_SAFE_INTEGER + 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
             "status": "received"
         });
         assert!(
@@ -3020,7 +3149,7 @@ mod tests {
 
         let event = json!({
             "seq": MAX_JSON_SAFE_INTEGER + 1,
-            "conversation_id": "conversation-1",
+            "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
             "event": { "type": "agent_start" }
         });
         assert!(
@@ -3066,7 +3195,7 @@ mod tests {
         let err = from_json_bytes::<WireCommandAck>(command_ack).unwrap_err();
         assert!(err.to_string().contains("duplicate object key"), "{err}");
 
-        let envelope = br#"{"seq":1,"conversation_id":"c","conversation_id":"d","event":{"type":"agent_start"}}"#;
+        let envelope = br#"{"seq":1,"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abd","event":{"type":"agent_start"}}"#;
         let err = from_json_bytes::<WireEnvelope>(envelope).unwrap_err();
         assert!(err.to_string().contains("duplicate object key"), "{err}");
     }

@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,15 @@ func openRuntimeGateway(t *testing.T) *DurableGateway {
 	return gateway
 }
 
+func currentRuntimeClaims(t testing.TB, gateway *DurableGateway, personalityAgentID string) TokenClaims {
+	t.Helper()
+	const generation = uint64(1)
+	if err := gateway.PublishRuntimeState(personalityAgentID, generation, nil); err != nil {
+		t.Fatalf("publish current runtime generation: %v", err)
+	}
+	return TokenClaims{PersonalityAgentID: personalityAgentID, Generation: generation}
+}
+
 func openGatewayAt(t *testing.T, storeDir, runtimeDir string) (*CommandStore, *DurableGateway, error) {
 	t.Helper()
 	store, err := OpenCommandStore(storeDir)
@@ -72,10 +82,10 @@ func openGatewayAt(t *testing.T, storeDir, runtimeDir string) (*CommandStore, *D
 
 func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const agentID = "agent-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	const generation = uint64(7)
 
-	if err := gateway.VerifyGeneration(context.Background(), agentID, generation); err == nil {
+	if err := gateway.VerifyGeneration(context.Background(), personalityAgentID, generation); err == nil {
 		t.Fatal("missing runtime state must fail generation verification")
 	}
 
@@ -83,19 +93,19 @@ func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- gateway.WaitFor(ctx, TokenClaims{AgentID: agentID}, generation)
+		done <- gateway.WaitFor(ctx, TokenClaims{PersonalityAgentID: personalityAgentID}, generation)
 	}()
 
-	if err := gateway.publishRuntimeState(agentID, runtimeState{
+	if err := gateway.publishRuntimeState(personalityAgentID, runtimeState{
 		Generation:               7,
 		HydrationReceiptIdentity: nil,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.VerifyGeneration(context.Background(), agentID, generation); err != nil {
+	if err := gateway.VerifyGeneration(context.Background(), personalityAgentID, generation); err != nil {
 		t.Fatalf("published matching runtime state rejected generation: %v", err)
 	}
-	if err := gateway.VerifyGeneration(context.Background(), agentID, generation+1); err == nil {
+	if err := gateway.VerifyGeneration(context.Background(), personalityAgentID, generation+1); err == nil {
 		t.Fatal("mismatched runtime generation must fail verification")
 	}
 	select {
@@ -105,7 +115,7 @@ func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *
 	}
 
 	receipt := "receipt-7"
-	if err := gateway.publishRuntimeState(agentID, runtimeState{
+	if err := gateway.publishRuntimeState(personalityAgentID, runtimeState{
 		Generation:               7,
 		HydrationReceiptIdentity: &receipt,
 	}); err != nil {
@@ -116,34 +126,675 @@ func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *
 	}
 }
 
+func TestDurableGatewayFencesStaleAckDurableAndVolatileEvents(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	stale := currentRuntimeClaims(t, gateway, personalityAgentID)
+	command, err := gateway.commands.Append(
+		context.Background(),
+		testDirectChatProvenance(personalityAgentID),
+		"",
+		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := CommandAck{
+		PersonalityAgentID: personalityAgentID,
+		Seq:                command.Seq,
+		CommandID:          command.CommandID,
+		Status:             "applied",
+	}
+	volatile, unsubscribe := gateway.SubscribeBrowserVolatile(personalityAgentID)
+	defer unsubscribe()
+
+	current := stale
+	current.Generation++
+	if err := gateway.PublishRuntimeState(personalityAgentID, current.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(context.Background(), stale, ack); err == nil {
+		t.Fatal("stale generation ACK reached the durable gateway")
+	}
+	seq := uint64(1)
+	durableEvent := Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}
+	if err := gateway.Receive(context.Background(), stale, durableEvent); err == nil {
+		t.Fatal("stale generation durable event reached the durable gateway")
+	}
+	volatileEvent := Envelope{
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stale"}}`),
+	}
+	if err := gateway.Receive(context.Background(), stale, volatileEvent); err == nil {
+		t.Fatal("stale generation volatile event reached the durable gateway")
+	}
+	select {
+	case event := <-volatile:
+		t.Fatalf("stale volatile event was published: %+v", event)
+	default:
+	}
+	if _, err := os.Stat(gateway.ackPath(personalityAgentID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale ACK created durable state: %v", err)
+	}
+	last, err := gateway.LastReceivedEventSeq(context.Background(), current)
+	if err != nil || last != 0 {
+		t.Fatalf("stale durable event changed cursor: last=%d err=%v", last, err)
+	}
+
+	if err := gateway.ApplyAck(context.Background(), current, ack); err != nil {
+		t.Fatalf("current generation ACK rejected: %v", err)
+	}
+	if err := gateway.Receive(context.Background(), current, durableEvent); err != nil {
+		t.Fatalf("current generation durable event rejected: %v", err)
+	}
+	volatileEvent.Event = json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"current"}}`)
+	if err := gateway.Receive(context.Background(), current, volatileEvent); err != nil {
+		t.Fatalf("current generation volatile event rejected: %v", err)
+	}
+	select {
+	case event := <-volatile:
+		if !bytes.Contains(event.Event, []byte(`"delta":"current"`)) {
+			t.Fatalf("unexpected current volatile event: %s", event.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current volatile event was not published")
+	}
+	if next, err := gateway.NextCommandSeq(context.Background(), current); err != nil || next != command.Seq+1 {
+		t.Fatalf("current terminal ACK did not advance replay: next=%d err=%v", next, err)
+	}
+}
+
+func TestDurableGatewayRolloverCommitSerializesWithAdmittedSideEffect(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	stale := currentRuntimeClaims(t, gateway, personalityAgentID)
+	sideEffectEntered := make(chan struct{})
+	releaseSideEffect := make(chan struct{})
+	sideEffectDone := make(chan error, 1)
+	go func() {
+		sideEffectDone <- gateway.withCurrentGeneration(
+			context.Background(),
+			stale,
+			func() error {
+				close(sideEffectEntered)
+				<-releaseSideEffect
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-sideEffectEntered:
+	case <-time.After(time.Second):
+		t.Fatal("side effect did not enter generation boundary")
+	}
+
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- gateway.PublishRuntimeState(personalityAgentID, stale.Generation+1, nil)
+	}()
+	select {
+	case err := <-publishDone:
+		t.Fatalf("rollover committed across admitted side effect: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseSideEffect)
+	if err := <-sideEffectDone; err != nil {
+		t.Fatalf("admitted side effect failed: %v", err)
+	}
+	if err := <-publishDone; err != nil {
+		t.Fatalf("rollover failed after admitted side effect: %v", err)
+	}
+
+	called := false
+	if err := gateway.withCurrentGeneration(context.Background(), stale, func() error {
+		called = true
+		return nil
+	}); err == nil || called {
+		t.Fatalf("old generation side effect admitted after rollover: called=%v err=%v", called, err)
+	}
+}
+
+func TestConnectionLeaseRolloverSerializesWithCommandDelivery(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	lease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryEntered := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- gateway.WithConnectionLease(
+			context.Background(),
+			claims,
+			lease,
+			func() error {
+				close(deliveryEntered)
+				<-releaseDelivery
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-deliveryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("command delivery did not enter authoritative lease boundary")
+	}
+
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- gateway.PublishRuntimeState(
+			claims.PersonalityAgentID,
+			claims.Generation+1,
+			nil,
+		)
+	}()
+	select {
+	case err := <-publishDone:
+		t.Fatalf("rollover committed during command delivery: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseDelivery)
+	if err := <-deliveryDone; err != nil {
+		t.Fatalf("admitted command delivery failed: %v", err)
+	}
+	if err := <-publishDone; err != nil {
+		t.Fatalf("rollover after command delivery failed: %v", err)
+	}
+
+	called := false
+	err = gateway.WithConnectionLease(context.Background(), claims, lease, func() error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("old command delivery admitted after rollover: called=%v err=%v", called, err)
+	}
+}
+
+func TestConnectionLeaseLockIsIsolatedPerPersonalityAgent(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	first := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	second := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-9abc-0123456789ac")
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- gateway.WithConnectionLease(
+			context.Background(),
+			first,
+			firstLease,
+			func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first PAID lease boundary did not enter")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := gateway.ClaimConnectionLease(context.Background(), second)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second PAID lease claim failed: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first PAID lease operation stalled a different PAID")
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableGatewayRejectsMutableDirectoryAndReplacedPinnedLock(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	publicDir := t.TempDir()
+	if err := os.Chmod(publicDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(publicDir, store); err == nil {
+		t.Fatal("gateway accepted a group/world-writable runtime directory")
+	}
+
+	symlinkParent := t.TempDir()
+	symlinkPath := filepath.Join(symlinkParent, "runtime-link")
+	if err := os.Symlink(t.TempDir(), symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(symlinkPath, store); err == nil {
+		t.Fatal("gateway accepted a symlink runtime directory")
+	}
+	realParent := t.TempDir()
+	symlinkedParent := filepath.Join(t.TempDir(), "linked-parent")
+	if err := os.Symlink(realParent, symlinkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(filepath.Join(symlinkedParent, "runtime"), store); err == nil {
+		t.Fatal("gateway accepted a runtime directory beneath a symlink path component")
+	}
+
+	runtimeDir := t.TempDir()
+	gateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, gateway, personalityAgentID)
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := gateway.localControlLockPath(personalityAgentID)
+	displacedLockPath := lockPath + ".displaced"
+	if err := os.Chmod(runtimeDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(lockPath, displacedLockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway claimed through a runtime directory made mutable after open")
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway accepted a replacement for its pinned PAID lock inode")
+	}
+	after, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("refused split-lock claims changed the authoritative lease record")
+	}
+	if err := gateway.ValidateConnectionLease(context.Background(), claims, firstLease); err == nil {
+		t.Fatal("gateway continued through the replaced lock instead of failing closed")
+	}
+}
+
+func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	key := deriveLocalControlIntegrityKey([]byte("connection-lease-integrity-secret-32-bytes"))
+	if err := gateway.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	record := connectionLeaseState{
+		Version:    connectionLeaseStateVersion,
+		Generation: 7,
+		Sequence:   1,
+		LeaseID:    base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, connectionLeaseIDBytes)),
+		Active:     true,
+	}
+	if err := gateway.writeConnectionLeaseState(personalityAgentID, record); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(personalityAgentID)) {
+		t.Fatal("connection lease content leaked personality agent identity")
+	}
+	if !bytes.Contains(raw, []byte(`"integrity"`)) {
+		t.Fatal("local-control-owned connection lease was not integrity protected")
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("signed connection lease did not verify: %v", err)
+	}
+	reopened, err := OpenDurableGateway(gateway.dir, gateway.commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("gateway without local-control integrity key accepted signed connection lease")
+	}
+	if err := reopened.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("gateway with matching key rejected shared signed lease: %v", err)
+	}
+
+	var missingKeyID connectionLeaseState
+	if err := unmarshalStrict(raw, &missingKeyID); err != nil {
+		t.Fatal(err)
+	}
+	if missingKeyID.Integrity == nil {
+		t.Fatal("signed connection lease did not contain integrity metadata")
+	}
+	missingKeyID.Integrity.KeyID = ""
+	tampered, err := json.Marshal(missingKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("connection lease without an integrity key identifier was accepted")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tampered = bytes.Replace(raw, []byte(`"sequence":1`), []byte(`"sequence":2`), 1)
+	if bytes.Equal(tampered, raw) {
+		t.Fatal("test did not alter signed connection lease")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("tampered connection lease passed local-control integrity verification")
+	}
+}
+
+func TestBrowserCommandAdmissionFencesNotReadyAcrossGateways(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	provenance := testDirectChatProvenance(personalityAgentID)
+	command := json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)
+
+	if err := first.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Append(context.Background(), provenance, "startup-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway startup NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("startup NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Append(context.Background(), provenance, "shutdown-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway shutdown NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("shutdown NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
+func TestBrowserCommandAdmissionSerializesGenerationRolloverWithDurableAppend(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.acquireIdempotencyGuard(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	guardHeld := true
+	defer func() {
+		if guardHeld {
+			store.releaseIdempotencyGuard()
+		}
+	}()
+
+	appendDone := make(chan error, 1)
+	go func() {
+		_, err := first.Append(
+			context.Background(),
+			testDirectChatProvenance(personalityAgentID),
+			"before-rollover",
+			json.RawMessage(`{"type":"user_message","text":"before","attachments":[]}`),
+		)
+		appendDone <- err
+	}()
+
+	// Append acquires the authoritative shared PAID lock before waiting on the
+	// command store. Observe that lock directly so the ordering is deterministic.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lock, err := second.openRuntimeLock(personalityAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		switch {
+		case errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
+			_ = lock.Close()
+			goto appendHoldsRuntimeLock
+		case err == nil:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+		default:
+			_ = lock.Close()
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser append did not acquire the shared PAID runtime lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+appendHoldsRuntimeLock:
+	rolloverDone := make(chan error, 1)
+	go func() {
+		rolloverDone <- second.PublishRuntimeState(personalityAgentID, 8, nil)
+	}()
+	select {
+	case err := <-rolloverDone:
+		t.Fatalf("generation rollover bypassed admitted browser append: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	store.releaseIdempotencyGuard()
+	guardHeld = false
+	if err := <-appendDone; err != nil {
+		t.Fatalf("Ready command append failed: %v", err)
+	}
+	if err := <-rolloverDone; err != nil {
+		t.Fatalf("generation rollover failed: %v", err)
+	}
+	if _, err := second.Append(
+		context.Background(),
+		testDirectChatProvenance(personalityAgentID),
+		"after-rollover",
+		json.RawMessage(`{"type":"user_message","text":"after","attachments":[]}`),
+	); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("post-rollover NotReady command was admitted: %v", err)
+	}
+	if _, found, err := store.GetCommand(context.Background(), personalityAgentID, 2); err != nil || found {
+		t.Fatalf("post-rollover command reached durable seq 2: found=%v err=%v", found, err)
+	}
+}
+
+func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	oldGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, oldGateway, personalityAgentID)
+	oldKey := deriveLocalControlIntegrityKey([]byte("old-connection-integrity-secret-32-bytes"))
+	currentKey := deriveLocalControlIntegrityKey([]byte("new-connection-integrity-secret-32-bytes"))
+	if err := oldGateway.installLocalControlIntegrityKey(oldKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotated.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey},
+		[]string{personalityAgentID},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 16
+	start := make(chan struct{})
+	results := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			results <- rotated.ValidateConnectionLease(context.Background(), claims, lease)
+		}()
+	}
+	close(start)
+	for range readers {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent rotation validation failed: %v", err)
+		}
+	}
+
+	resigned, err := rotated.connectionLeaseState(personalityAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resigned.Integrity == nil ||
+		resigned.Integrity.KeyID != deriveLocalControlIntegrityKeyID(currentKey) {
+		t.Fatalf("lease was not re-signed with current key ID: %+v", resigned.Integrity)
+	}
+	if resigned.Generation != lease.Generation ||
+		resigned.Sequence != lease.Sequence ||
+		resigned.LeaseID != lease.ID ||
+		!resigned.Active {
+		t.Fatalf("rotation changed lease authority: %+v", resigned)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.installLocalControlIntegrityKey(currentKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.ValidateConnectionLease(context.Background(), claims, lease); err != nil {
+		t.Fatalf("current-only verifier rejected re-signed lease: %v", err)
+	}
+
+	resigned.Integrity.KeyID = strings.Repeat("f", 32)
+	unknownKeyRecord, err := json.Marshal(resigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rotated.connectionLeasePath(personalityAgentID), unknownKeyRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rotated.connectionLeaseState(personalityAgentID); err == nil ||
+		!strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("unknown integrity key ID did not fail closed: %v", err)
+	}
+
+	duplicateGateway := openRuntimeGateway(t)
+	if err := duplicateGateway.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey, oldKey},
+		[]string{personalityAgentID},
+	); err == nil {
+		t.Fatal("ambiguous duplicate previous integrity keys were accepted")
+	}
+}
+
 func TestDurableGatewayRejectsLegacyReadyBoolean(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const agentID = "agent-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	if err := os.WriteFile(
-		gateway.statePath(agentID),
+		gateway.statePath(personalityAgentID),
 		[]byte(`{"generation":7,"ready":true}`),
 		0o600,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gateway.state(context.Background(), agentID); err == nil {
+	if _, err := gateway.state(context.Background(), personalityAgentID); err == nil {
 		t.Fatal("legacy ready boolean must fail strict runtime-state decoding")
 	}
 }
 
 func TestDurableGatewayRuntimeStateGenerationBoundary(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const agentID = "agent-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 
-	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxProcessGeneration}); err != nil {
+	if err := gateway.publishRuntimeState(personalityAgentID, runtimeState{Generation: maxProcessGeneration}); err != nil {
 		t.Fatalf("publish max process generation failed: %v", err)
 	}
-	st, err := gateway.state(context.Background(), agentID)
+	st, err := gateway.state(context.Background(), personalityAgentID)
 	if err != nil || st.Generation != maxProcessGeneration {
 		t.Fatalf("max generation must be accepted in recovery: err=%v gen=%d", err, st.Generation)
 	}
 
-	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxProcessGeneration + 1}); err == nil {
+	if err := gateway.publishRuntimeState(personalityAgentID, runtimeState{Generation: maxProcessGeneration + 1}); err == nil {
 		t.Fatal("publish must reject generation max+1")
 	}
 
@@ -151,25 +802,25 @@ func TestDurableGatewayRuntimeStateGenerationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(gateway.statePath(agentID), raw, 0o600); err != nil {
+	if err := os.WriteFile(gateway.statePath(personalityAgentID), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gateway.state(context.Background(), agentID); err == nil {
+	if _, err := gateway.state(context.Background(), personalityAgentID); err == nil {
 		t.Fatal("recovery must reject generation max+1")
 	}
 }
 
 func TestDurableGatewayRejectsEmptyReceiptIdentity(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const agentID = "agent-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	empty := ""
-	if err := gateway.publishRuntimeState(agentID, runtimeState{
+	if err := gateway.publishRuntimeState(personalityAgentID, runtimeState{
 		Generation:               7,
 		HydrationReceiptIdentity: &empty,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gateway.state(context.Background(), agentID); err == nil {
+	if _, err := gateway.state(context.Background(), personalityAgentID); err == nil {
 		t.Fatal("empty hydration receipt identity must fail closed")
 	}
 }
@@ -191,12 +842,12 @@ func TestDurableGatewaySerializesEventSequenceAcrossInstances(t *testing.T) {
 	}
 	first.PollInterval = 5 * time.Millisecond
 	second.PollInterval = 5 * time.Millisecond
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, first, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	event := Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}
 	results := make(chan error, 2)
 	go func() { results <- first.Receive(context.Background(), claims, event) }()
@@ -227,17 +878,17 @@ func TestDurableGatewaySerializesEventSequenceAcrossInstances(t *testing.T) {
 
 func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong := CommandAck{
+	wrong := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Seq:       command.Seq,
 		CommandID: "00000000-0000-4000-8000-000000000001",
 		Status:    "received",
@@ -246,19 +897,19 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 		t.Fatal("ack with a mismatched command_id must be rejected")
 	}
 
-	received := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	received := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 	if err := gateway.ApplyAck(context.Background(), claims, received); err != nil {
 		t.Fatal(err)
 	}
 	if err := gateway.ApplyAck(context.Background(), claims, received); err != nil {
 		t.Fatalf("exact duplicate ack must be idempotent: %v", err)
 	}
-	applied := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}
+	applied := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}
 	if err := gateway.ApplyAck(context.Background(), claims, applied); err != nil {
 		t.Fatal(err)
 	}
 	reason := "schema_violation"
-	rejected := CommandAck{
+	rejected := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Seq:          command.Seq,
 		CommandID:    command.CommandID,
 		Status:       "rejected",
@@ -267,7 +918,7 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	if err := gateway.ApplyAck(context.Background(), claims, rejected); err == nil {
 		t.Fatal("terminal applied ack must reject a conflicting terminal ack")
 	}
-	raw, err := os.ReadFile(gateway.ackPath(claims.ConversationID))
+	raw, err := os.ReadFile(gateway.ackPath(claims.PersonalityAgentID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,19 +933,19 @@ func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	claims := TokenClaims{ConversationID: "conversation-ack-restart"}
-	first, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"one","attachments":[]}`))
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678982")
+	first, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"one","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"two","attachments":[]}`))
+	second, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"two","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: claims.PersonalityAgentID, Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "received"}); err != nil {
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: claims.PersonalityAgentID, Seq: second.Seq, CommandID: second.CommandID, Status: "received"}); err != nil {
 		t.Fatal(err)
 	}
 	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq {
@@ -311,7 +962,7 @@ func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t 
 	if next, err := reopened.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq {
 		t.Fatalf("restart lost nonterminal durable ACK gap: next=%d err=%v", next, err)
 	}
-	if err := reopened.ApplyAck(context.Background(), claims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "applied"}); err != nil {
+	if err := reopened.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: claims.PersonalityAgentID, Seq: second.Seq, CommandID: second.CommandID, Status: "applied"}); err != nil {
 		t.Fatal(err)
 	}
 	if next, err := reopened.NextCommandSeq(context.Background(), claims); err != nil || next != second.Seq+1 {
@@ -321,19 +972,19 @@ func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t 
 
 func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-out-of-order-terminal"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678986")
 	commands := make([]CommandEnvelope, 0, 3)
 	for i := 0; i < 3; i++ {
-		command, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+		command, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		commands = append(commands, command)
 	}
 	for _, ack := range []CommandAck{
-		{Seq: commands[2].Seq, CommandID: commands[2].CommandID, Status: "applied"},
-		{Seq: commands[0].Seq, CommandID: commands[0].CommandID, Status: "applied"},
-		{Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "received"},
+		{PersonalityAgentID: claims.PersonalityAgentID, Seq: commands[2].Seq, CommandID: commands[2].CommandID, Status: "applied"},
+		{PersonalityAgentID: claims.PersonalityAgentID, Seq: commands[0].Seq, CommandID: commands[0].CommandID, Status: "applied"},
+		{PersonalityAgentID: claims.PersonalityAgentID, Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "received"},
 	} {
 		if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 			t.Fatal(err)
@@ -342,7 +993,7 @@ func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T
 	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != commands[1].Seq {
 		t.Fatalf("first nonterminal gap = %d, want %d (err=%v)", next, commands[1].Seq, err)
 	}
-	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "applied"}); err != nil {
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: claims.PersonalityAgentID, Seq: commands[1].Seq, CommandID: commands[1].CommandID, Status: "applied"}); err != nil {
 		t.Fatal(err)
 	}
 	if next, err := gateway.NextCommandSeq(context.Background(), claims); err != nil || next != commands[2].Seq+1 {
@@ -352,33 +1003,33 @@ func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T
 
 func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T) {
 	const commandCount = 4096
-	const conversationID = "conversation-long-restart"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-012345678972"
 	storeDir, runtimeDir := t.TempDir(), t.TempDir()
 	var commandLog, ackLog bytes.Buffer
 	for i := 1; i <= commandCount; i++ {
 		commandID := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
-		record := LogRecord{CommandEnvelope: CommandEnvelope{Seq: uint64(i), CommandID: commandID, Command: json.RawMessage(`{"type":"user_message","text":"history","attachments":[]}`)}}
+		record := testLogRecord(uint64(i), commandID, json.RawMessage(`{"type":"user_message","text":"history","attachments":[]}`), personalityAgentID)
 		line, err := json.Marshal(record)
 		if err != nil {
 			t.Fatal(err)
 		}
 		commandLog.Write(line)
 		commandLog.WriteByte('\n')
-		line, err = json.Marshal(CommandAck{Seq: uint64(i), CommandID: commandID, Status: "applied"})
+		line, err = json.Marshal(CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: uint64(i), CommandID: commandID, Status: "applied"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		ackLog.Write(line)
 		ackLog.WriteByte('\n')
 	}
-	if err := os.WriteFile(commandLogPath(storeDir, conversationID), commandLog.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(commandLogPath(storeDir, personalityAgentID), commandLog.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(gateway.ackPath(conversationID), ackLog.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(gateway.ackPath(personalityAgentID), ackLog.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -391,7 +1042,7 @@ func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T)
 	defer reopenedStore.Close()
 	var readBytes atomic.Int64
 	open := reopened.newFile
-	ackPath := reopened.ackPath(conversationID)
+	ackPath := reopened.ackPath(personalityAgentID)
 	reopened.newFile = func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 		file, err := open(name, flag, perm)
 		if err != nil || name != ackPath {
@@ -399,7 +1050,7 @@ func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T)
 		}
 		return &countingDurableFile{durableFileHandle: file, readBytes: &readBytes}, nil
 	}
-	next, err := reopened.NextCommandSeq(context.Background(), TokenClaims{ConversationID: conversationID})
+	next, err := reopened.NextCommandSeq(context.Background(), TokenClaims{PersonalityAgentID: personalityAgentID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,23 +1062,23 @@ func TestDurableGatewayNextCommandSeqRestartScanIsLinearAndBounded(t *testing.T)
 	}
 }
 
-func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing.T) {
+func TestDurableGatewayNextCommandSeqDoesNotBlockOtherPersonalityAgentAck(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	firstClaims := TokenClaims{ConversationID: "conversation-slow-cursor"}
-	secondClaims := TokenClaims{ConversationID: "conversation-independent-ack"}
-	first, err := gateway.commands.Append(context.Background(), firstClaims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
+	firstClaims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678980")
+	secondClaims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678981")
+	first, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(firstClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := gateway.commands.Append(context.Background(), secondClaims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
+	second, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(secondClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.ApplyAck(context.Background(), firstClaims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+	if err := gateway.ApplyAck(context.Background(), firstClaims, CommandAck{PersonalityAgentID: firstClaims.PersonalityAgentID, Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
 		t.Fatal(err)
 	}
 	open := gateway.newFile
-	blockedPath := gateway.ackPath(firstClaims.ConversationID)
+	blockedPath := gateway.ackPath(firstClaims.PersonalityAgentID)
 	entered, release := make(chan struct{}), make(chan struct{})
 	gateway.newFile = func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 		file, err := open(name, flag, perm)
@@ -445,7 +1096,7 @@ func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing
 	}
 	ackDone := make(chan error, 1)
 	go func() {
-		ackDone <- gateway.ApplyAck(context.Background(), secondClaims, CommandAck{Seq: second.Seq, CommandID: second.CommandID, Status: "received"})
+		ackDone <- gateway.ApplyAck(context.Background(), secondClaims, CommandAck{PersonalityAgentID: secondClaims.PersonalityAgentID, Seq: second.Seq, CommandID: second.CommandID, Status: "received"})
 	}()
 	select {
 	case err := <-ackDone:
@@ -453,7 +1104,7 @@ func TestDurableGatewayNextCommandSeqDoesNotBlockOtherConversationAck(t *testing
 			t.Fatalf("independent ACK failed: %v", err)
 		}
 	case <-time.After(250 * time.Millisecond):
-		t.Fatal("one conversation's ACK scan blocked ApplyAck for another conversation")
+		t.Fatal("one personality agent's ACK scan blocked ApplyAck for another personality agent")
 	}
 	close(release)
 	if err := <-cursorDone; err != nil {
@@ -468,7 +1119,7 @@ func TestFoldAckCursorRecordRejectsInvalidTransitionWithoutStateChange(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = foldAckCursorRecord(snapshot, states, CommandAck{Seq: 1, CommandID: commandID, Status: "completed"})
+	err = foldAckCursorRecord(snapshot, states, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: 1, CommandID: commandID, Status: "completed"})
 	if err == nil || !strings.Contains(err.Error(), `status "completed" is not valid`) {
 		t.Fatalf("constructed unknown ACK status must fail closed, got %v", err)
 	}
@@ -479,11 +1130,11 @@ func TestFoldAckCursorRecordRejectsInvalidTransitionWithoutStateChange(t *testin
 
 func TestDurableGatewayNextCommandSeqFlockHonorsCancellation(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-cancelled-cursor"}
-	if _, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678983")
+	if _, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
 		t.Fatal(err)
 	}
-	file, err := os.OpenFile(gateway.ackPath(claims.ConversationID), os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(gateway.ackPath(claims.PersonalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,9 +1160,9 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 			lines: func(command CommandEnvelope) []CommandAck {
 				reason := "schema_violation"
 				return []CommandAck{
-					{Seq: command.Seq, CommandID: command.CommandID, Status: "received"},
-					{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
-					{Seq: command.Seq, CommandID: command.CommandID, Status: "rejected", RejectReason: &reason},
+					{PersonalityAgentID: command.PersonalityAgentID, Seq: command.Seq, CommandID: command.CommandID, Status: "received"},
+					{PersonalityAgentID: command.PersonalityAgentID, Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
+					{PersonalityAgentID: command.PersonalityAgentID, Seq: command.Seq, CommandID: command.CommandID, Status: "rejected", RejectReason: &reason},
 				}
 			},
 		},
@@ -519,8 +1170,8 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 			name: "identity changes then returns",
 			lines: func(command CommandEnvelope) []CommandAck {
 				return []CommandAck{
-					{Seq: command.Seq, CommandID: "00000000-0000-4000-8000-000000000099", Status: "received"},
-					{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
+					{PersonalityAgentID: command.PersonalityAgentID, Seq: command.Seq, CommandID: "00000000-0000-4000-8000-000000000099", Status: "received"},
+					{PersonalityAgentID: command.PersonalityAgentID, Seq: command.Seq, CommandID: command.CommandID, Status: "applied"},
 				}
 			},
 		},
@@ -531,8 +1182,8 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 			if err != nil {
 				t.Fatal(err)
 			}
-			claims := TokenClaims{ConversationID: "conversation-corrupt-ack-restart"}
-			command, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678984")
+			command, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -543,7 +1194,7 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 					t.Fatal(err)
 				}
 			}
-			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), log.Bytes(), 0o600); err != nil {
+			if err := os.WriteFile(gateway.ackPath(claims.PersonalityAgentID), log.Bytes(), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Close(); err != nil {
@@ -586,12 +1237,12 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			claims := TokenClaims{ConversationID: "conversation-malformed-ack-restart"}
-			command, err := store.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678985")
+			command, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(gateway.ackPath(claims.ConversationID), append([]byte(tc.ackJSON(command)), '\n'), 0o600); err != nil {
+			if err := os.WriteFile(gateway.ackPath(claims.PersonalityAgentID), append([]byte(tc.ackJSON(command)), '\n'), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.Close(); err != nil {
@@ -611,17 +1262,17 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
 	}
 }
 
-func TestDurableGatewayReceiveRejectsConversationClaimMismatch(t *testing.T) {
+func TestDurableGatewayReceiveRejectsPersonalityAgentClaimMismatch(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: "conversation-2",
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: "018f47a2-9b3c-7def-9abc-0123456789ac",
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match token claim") {
-		t.Fatalf("expected conversation claim mismatch, got %v", err)
+		t.Fatalf("expected personality agent claim mismatch, got %v", err)
 	}
 	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
 	if err != nil {
@@ -634,17 +1285,17 @@ func TestDurableGatewayReceiveRejectsConversationClaimMismatch(t *testing.T) {
 
 func TestDurableGatewayDetectsSameSizeEventReplacement(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	path := gateway.eventPath(claims.ConversationID)
+	path := gateway.eventPath(claims.PersonalityAgentID)
 	original, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -663,22 +1314,22 @@ func TestDurableGatewayDetectsSameSizeEventReplacement(t *testing.T) {
 
 func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	received := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	received := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 	if err := gateway.ApplyAck(context.Background(), claims, received); err != nil {
 		t.Fatal(err)
 	}
 
-	path := gateway.ackPath(claims.ConversationID)
+	path := gateway.ackPath(claims.PersonalityAgentID)
 	original, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -690,7 +1341,7 @@ func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
 	if err := os.WriteFile(path, replaced, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	applied := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}
+	applied := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}
 	if err := gateway.ApplyAck(context.Background(), claims, applied); err == nil {
 		t.Fatal("same-size corrupt ack replacement must invalidate the cached tail")
 	}
@@ -698,63 +1349,63 @@ func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
 
 func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	gateway.MaxConversationTails = 2
+	gateway.MaxPersonalityAgentTails = 2
 	gateway.MaxAckTail = 1
 
-	for _, conversationID := range []string{"conversation-1", "conversation-2", "conversation-3"} {
-		claims := TokenClaims{ConversationID: conversationID}
+	for _, personalityAgentID := range []string{"018f47a2-9b3c-7def-8abc-0123456789ab", "018f47a2-9b3c-7def-9abc-0123456789ac", "018f47a2-9b3c-7def-aabc-0123456789ad"} {
+		claims := currentRuntimeClaims(t, gateway, personalityAgentID)
 		seq := uint64(1)
 		if err := gateway.Receive(context.Background(), claims, Envelope{
-			Seq:            &seq,
-			ConversationID: conversationID,
-			Event:          json.RawMessage(`{"type":"agent_start"}`),
+			Seq:                &seq,
+			PersonalityAgentID: personalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	gateway.mu.Lock()
-	if len(gateway.tails) > gateway.MaxConversationTails {
+	if len(gateway.tails) > gateway.MaxPersonalityAgentTails {
 		gateway.mu.Unlock()
-		t.Fatalf("retained %d conversation tails, limit is %d", len(gateway.tails), gateway.MaxConversationTails)
+		t.Fatalf("retained %d personality agent tails, limit is %d", len(gateway.tails), gateway.MaxPersonalityAgentTails)
 	}
 	gateway.mu.Unlock()
 
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
 	if err != nil || last != 1 {
 		t.Fatalf("evicted event tail did not reload: last=%d err=%v", last, err)
 	}
 	seq := uint64(2)
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_end"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_end"}`),
 	}); err != nil {
 		t.Fatalf("event append after reload: %v", err)
 	}
 
 	for i := 0; i < 2; i++ {
-		if _, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+		if _, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	commands, err := gateway.commands.CatchUp(context.Background(), claims.ConversationID, 1)
+	commands, err := gateway.commands.CatchUp(context.Background(), claims.PersonalityAgentID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range commands {
-		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}); err != nil {
+		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// seq=1 is outside the one-entry cache, but its durable received ACK must
 	// still allow the one legal terminal transition.
 	first := commands[0]
-	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
 		t.Fatalf("evicted ACK did not reload for terminal transition: %v", err)
 	}
 	gateway.mu.Lock()
-	ackEntries := len(gateway.stateFor(claims.ConversationID).acks)
+	ackEntries := len(gateway.stateFor(claims.PersonalityAgentID).acks)
 	gateway.mu.Unlock()
 	if ackEntries > gateway.MaxAckTail {
 		t.Fatalf("retained %d ACK cache entries, limit is %d", ackEntries, gateway.MaxAckTail)
@@ -780,12 +1431,12 @@ func realOpener() func(string, int, os.FileMode) (durableFileHandle, error) {
 
 func TestDurableGatewayEventAppendRollsBackOnWriteFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	event := Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}
 
 	ff := &failingFile{failWriteOn: 1}
@@ -816,12 +1467,12 @@ func TestDurableGatewayEventAppendRollsBackOnWriteFailure(t *testing.T) {
 
 func TestDurableGatewayEventAppendRollsBackOnSyncFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	event := Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}
 
 	ff := &failingFile{failSyncOn: 1}
@@ -852,17 +1503,17 @@ func TestDurableGatewayEventAppendRollsBackOnSyncFailure(t *testing.T) {
 
 func TestDurableGatewayEventRecoversFromIncompleteFinalRecord(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	event := Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}
 	if err := gateway.Receive(context.Background(), claims, event); err != nil {
 		t.Fatal(err)
 	}
-	path := gateway.eventPath(claims.ConversationID)
+	path := gateway.eventPath(claims.PersonalityAgentID)
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -893,24 +1544,24 @@ func TestDurableGatewayEventRecoversFromIncompleteFinalRecord(t *testing.T) {
 
 func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
 	event := Envelope{
-		Seq:            &seq,
-		ConversationID: claims.ConversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}
 	if err := gateway.Receive(context.Background(), claims, event); err != nil {
 		t.Fatal(err)
 	}
 
 	corrupt := []string{
-		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"seq":2}` + "\n",
-		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"extra":true}` + "\n",
-		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"conversation_id":"conversation-1","event":{"type":"agent_end"}}}` + "\n",
+		`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"seq":2}` + "\n",
+		`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"extra":true}` + "\n",
+		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}}}` + "\n",
 	}
 	for index, line := range corrupt {
-		if err := os.WriteFile(gateway.eventPath(claims.ConversationID), append([]byte(nil), []byte(line)...), 0o600); err != nil {
+		if err := os.WriteFile(gateway.eventPath(claims.PersonalityAgentID), append([]byte(nil), []byte(line)...), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		seq = 2
@@ -928,17 +1579,17 @@ func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
 
 func TestDurableGatewayAckLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	ack := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 		t.Fatal(err)
 	}
@@ -949,10 +1600,10 @@ func TestDurableGatewayAckLogRejectsCorruptButCompleteRecords(t *testing.T) {
 		`{"seq":9007199254740992,"command_id":"00000000-0000-4000-8000-000000000001","status":"applied"}` + "\n",
 	}
 	for _, line := range corrupt {
-		if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(line), 0o600); err != nil {
+		if err := os.WriteFile(gateway.ackPath(claims.PersonalityAgentID), []byte(line), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
+		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
 			t.Fatalf("corrupt ack log line must be rejected: %s", line)
 		}
 	}
@@ -960,48 +1611,48 @@ func TestDurableGatewayAckLogRejectsCorruptButCompleteRecords(t *testing.T) {
 
 func TestDurableGatewayAckLogRejectsCorruptRecordOnFindAckLookup(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	ack := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 		t.Fatal(err)
 	}
 
 	// Evict the tail so findAckLocked must read the durable log.
 	gateway.mu.Lock()
-	gateway.tails = make(map[string]*conversationLogState)
+	gateway.tails = make(map[string]*personalityAgentLogState)
 	gateway.mu.Unlock()
 
 	corrupt := fmt.Sprintf(`{"seq":%d,"command_id":"%s","status":"received","status":"received"}`+"\n", command.Seq, command.CommandID)
-	if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(corrupt), 0o600); err != nil {
+	if err := os.WriteFile(gateway.ackPath(claims.PersonalityAgentID), []byte(corrupt), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
 		t.Fatal("findAckLocked must reject corrupt ack log")
 	}
 }
 
 func TestDurableGatewayAckAppendRollsBackOnWriteFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	ack := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 
 	ff := &failingFile{failWriteOn: 1}
 	gateway.newFile = failingOpener(ff)
@@ -1013,7 +1664,7 @@ func TestDurableGatewayAckAppendRollsBackOnWriteFailure(t *testing.T) {
 	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 		t.Fatalf("retry after rollback failed: %v", err)
 	}
-	raw, err := os.ReadFile(gateway.ackPath(claims.ConversationID))
+	raw, err := os.ReadFile(gateway.ackPath(claims.PersonalityAgentID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1024,17 +1675,17 @@ func TestDurableGatewayAckAppendRollsBackOnWriteFailure(t *testing.T) {
 
 func TestDurableGatewayAckAppendRollsBackOnSyncFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	ack := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 
 	ff := &failingFile{failSyncOn: 1}
 	gateway.newFile = failingOpener(ff)
@@ -1046,7 +1697,7 @@ func TestDurableGatewayAckAppendRollsBackOnSyncFailure(t *testing.T) {
 	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 		t.Fatalf("retry after rollback failed: %v", err)
 	}
-	raw, err := os.ReadFile(gateway.ackPath(claims.ConversationID))
+	raw, err := os.ReadFile(gateway.ackPath(claims.PersonalityAgentID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1057,21 +1708,21 @@ func TestDurableGatewayAckAppendRollsBackOnSyncFailure(t *testing.T) {
 
 func TestDurableGatewayAckRecoversFromIncompleteFinalRecord(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		claims.ConversationID,
+		testDirectChatProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	ack := CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
 	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
 		t.Fatal(err)
 	}
-	path := gateway.ackPath(claims.ConversationID)
+	path := gateway.ackPath(claims.PersonalityAgentID)
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1099,36 +1750,36 @@ func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
 	}{
 		{
 			name: "event",
-			path: func(g *DurableGateway, conversationID string) string {
-				return g.eventPath(conversationID)
+			path: func(g *DurableGateway, personalityAgentID string) string {
+				return g.eventPath(personalityAgentID)
 			},
 			run: func(t *testing.T, g *DurableGateway, claims TokenClaims) error {
 				t.Helper()
 				seq := uint64(1)
 				return g.Receive(context.Background(), claims, Envelope{
-					Seq:            &seq,
-					ConversationID: claims.ConversationID,
-					Event:          json.RawMessage(`{"type":"agent_start"}`),
+					Seq:                &seq,
+					PersonalityAgentID: claims.PersonalityAgentID,
+					Event:              json.RawMessage(`{"type":"agent_start"}`),
 				})
 			},
 		},
 		{
 			name: "ack",
-			path: func(g *DurableGateway, conversationID string) string {
-				return g.ackPath(conversationID)
+			path: func(g *DurableGateway, personalityAgentID string) string {
+				return g.ackPath(personalityAgentID)
 			},
 			run: func(t *testing.T, g *DurableGateway, claims TokenClaims) error {
 				t.Helper()
 				command, err := g.commands.Append(
 					context.Background(),
-					claims.ConversationID,
+					testDirectChatProvenance(claims.PersonalityAgentID),
 					"",
 					json.RawMessage(`{"type":"abort"}`),
 				)
 				if err != nil {
 					t.Fatal(err)
 				}
-				return g.ApplyAck(context.Background(), claims, CommandAck{
+				return g.ApplyAck(context.Background(), claims, CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 					Seq:       command.Seq,
 					CommandID: command.CommandID,
 					Status:    "received",
@@ -1140,13 +1791,13 @@ func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			gateway := openRuntimeGateway(t)
-			claims := TokenClaims{ConversationID: "conversation-1"}
+			claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 			target := filepath.Join(t.TempDir(), "redirected.log")
 			const original = "sentinel"
 			if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Symlink(target, test.path(gateway, claims.ConversationID)); err != nil {
+			if err := os.Symlink(target, test.path(gateway, claims.PersonalityAgentID)); err != nil {
 				t.Fatal(err)
 			}
 			if err := test.run(t, gateway, claims); err == nil {
@@ -1165,7 +1816,7 @@ func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
 
 func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	claims := TokenClaims{ConversationID: "conversation-1"}
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	raw := json.RawMessage(`{"type":"abort"}`)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -1179,7 +1830,7 @@ func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
 	// Append a command after Live has returned its channels. Because Live starts
 	// polling from fromSeq, the next tick must deliver it rather than advance
 	// past it.
-	env, err := gateway.commands.Append(ctx, claims.ConversationID, "key-1", raw)
+	env, err := gateway.commands.Append(ctx, testDirectChatProvenance(claims.PersonalityAgentID), "key-1", raw)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -1197,7 +1848,7 @@ func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
 }
 
 func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
-	conversationID := "conversation-1"
+	personalityAgentID := "018f47a2-9b3c-7def-8abc-0123456789ab"
 
 	cases := []struct {
 		name     string
@@ -1206,22 +1857,22 @@ func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
 	}{
 		{
 			name:     "outer/inner seq mismatch",
-			contents: []byte(`{"seq":1,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_start"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
 			wantErr:  "seq mismatch",
 		},
 		{
-			name:     "conversation mismatch",
-			contents: []byte(`{"seq":1,"event":{"seq":1,"conversation_id":"conversation-2","event":{"type":"agent_start"}}}` + "\n"),
-			wantErr:  "conversation mismatch",
+			name:     "personality agent mismatch",
+			contents: []byte(`{"seq":1,"event":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-9abc-0123456789ac","event":{"type":"agent_start"}}}` + "\n"),
+			wantErr:  "personality agent mismatch",
 		},
 		{
 			name:     "volatile event with seq",
-			contents: []byte(`{"seq":1,"event":{"seq":1,"conversation_id":"conversation-1","event":{"type":"message_update"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_update"}}}` + "\n"),
 			wantErr:  "volatile event",
 		},
 		{
 			name:     "durable event missing inner seq",
-			contents: []byte(`{"seq":1,"event":{"conversation_id":"conversation-1","event":{"type":"agent_start"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
 			wantErr:  "requires seq",
 		},
 	}
@@ -1229,10 +1880,10 @@ func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := openRuntimeGateway(t)
-			if err := os.WriteFile(g.eventPath(conversationID), tc.contents, 0o600); err != nil {
+			if err := os.WriteFile(g.eventPath(personalityAgentID), tc.contents, 0o600); err != nil {
 				t.Fatalf("write corrupt log: %v", err)
 			}
-			_, err := g.EventCatchUp(context.Background(), conversationID, 0)
+			_, err := g.EventCatchUp(context.Background(), personalityAgentID, 0)
 			if err == nil {
 				t.Fatal("expected corrupt event log to be rejected")
 			}
@@ -1245,27 +1896,27 @@ func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
 
 func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	conversationID := "conversation-1"
-	claims := TokenClaims{ConversationID: conversationID}
+	personalityAgentID := "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, gateway, personalityAgentID)
 
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}); err != nil {
 		t.Fatalf("receive event: %v", err)
 	}
 
-	caught, err := gateway.EventCatchUp(context.Background(), conversationID, 0)
+	caught, err := gateway.EventCatchUp(context.Background(), personalityAgentID, 0)
 	if err != nil {
 		t.Fatalf("catch-up: %v", err)
 	}
 	if len(caught) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(caught))
 	}
-	if caught[0].ConversationID != conversationID {
-		t.Fatalf("expected conversation %q, got %q", conversationID, caught[0].ConversationID)
+	if caught[0].PersonalityAgentID != personalityAgentID {
+		t.Fatalf("expected personality agent %q, got %q", personalityAgentID, caught[0].PersonalityAgentID)
 	}
 	if caught[0].Seq == nil || *caught[0].Seq != 1 {
 		t.Fatalf("expected seq 1, got %v", caught[0].Seq)
@@ -1274,14 +1925,14 @@ func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
 
 func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const conversationID = "conversation-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	inner := uint64(2)
-	err := gateway.appendDurableEventLocked(conversationID, durableEventRecord{
+	err := gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
-			Seq:            &inner,
-			ConversationID: conversationID,
-			Event:          json.RawMessage(`{"type":"agent_start"}`),
+			Seq:                &inner,
+			PersonalityAgentID: personalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
 		},
 	})
 	if err == nil {
@@ -1291,12 +1942,12 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 		t.Fatalf("expected seq mismatch error, got %v", err)
 	}
 
-	err = gateway.appendDurableEventLocked(conversationID, durableEventRecord{
+	err = gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
-			Seq:            nil,
-			ConversationID: conversationID,
-			Event:          json.RawMessage(`{"type":"agent_start"}`),
+			Seq:                nil,
+			PersonalityAgentID: personalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
 		},
 	})
 	if err == nil {
@@ -1309,23 +1960,26 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 
 func TestDurableGatewayTracksRunLifecycleAcrossTurnBoundaries(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	const conversationID = "conversation-1"
-	claims := TokenClaims{TenantID: "tenant-1", AgentID: "agent-1", ConversationID: conversationID, Generation: 1}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 	var seq uint64
 	receive := func(raw string) {
 		t.Helper()
 		seq++
 		if err := gateway.Receive(context.Background(), claims, Envelope{
-			Seq:            &seq,
-			ConversationID: conversationID,
-			Event:          json.RawMessage(raw),
+			Seq:                &seq,
+			PersonalityAgentID: personalityAgentID,
+			Event:              json.RawMessage(raw),
 		}); err != nil {
 			t.Fatalf("receive event %d: %v", seq, err)
 		}
 	}
 	assertInFlight := func(want bool) {
 		t.Helper()
-		if got := gateway.IsRunInFlight(conversationID); got != want {
+		if got := gateway.IsRunInFlight(personalityAgentID); got != want {
 			t.Fatalf("in-flight state after event %d = %v, want %v", seq, got, want)
 		}
 	}
@@ -1365,59 +2019,62 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 		t.Fatalf("open first gateway: %v", err)
 	}
 
-	const conversationID = "conversation-1"
-	claims := TokenClaims{TenantID: "tenant-1", AgentID: "agent-1", ConversationID: conversationID, Generation: 1}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"agent_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
 	}); err != nil {
 		t.Fatalf("receive agent_start: %v", err)
 	}
 
 	seq = 2
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"turn_start"}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"turn_start"}`),
 	}); err != nil {
 		t.Fatalf("receive turn_start: %v", err)
 	}
 
 	seq = 3
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"user","content":[{"type":"text","text":"do not clear assistant state"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"user","content":[{"type":"text","text":"do not clear assistant state"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
 	}); err != nil {
 		t.Fatalf("receive user message_end: %v", err)
 	}
 
 	seq = 4
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
 	}); err != nil {
 		t.Fatalf("receive approval_requested: %v", err)
 	}
 
 	seq = 5
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"approval_requested","request":{"id":"request-2","tool_call_id":"call-2","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"approval_requested","request":{"id":"request-2","tool_call_id":"call-2","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
 	}); err != nil {
 		t.Fatalf("receive second approval_requested: %v", err)
 	}
 
 	seq = 6
 	if err := gateway.Receive(context.Background(), claims, Envelope{
-		Seq:            &seq,
-		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"approval_resolved","request_id":"request-2","resolution":{"decision":{"type":"approve_once"}}}`),
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"approval_resolved","request_id":"request-2","resolution":{"decision":{"type":"approve_once"}}}`),
 	}); err != nil {
 		t.Fatalf("receive approval_resolved: %v", err)
 	}
@@ -1433,29 +2090,29 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	defer store.Close()
 
 	// Before reconstruction the guard state must appear empty. This is safe
-	// only because EnsureConversationStateRebuilt is invoked before command
+	// only because EnsureAgentSessionStateRebuilt is invoked before command
 	// admission in the browser WebSocket path.
-	if gateway.IsRunInFlight(conversationID) {
+	if gateway.IsRunInFlight(personalityAgentID) {
 		t.Fatal("expected no in-flight run before state rebuild")
 	}
-	if gateway.IsApprovalPending(conversationID, "request-1") {
+	if gateway.IsApprovalPending(personalityAgentID, "request-1") {
 		t.Fatal("expected no pending approvals before state rebuild")
 	}
 
-	if err := gateway.EnsureConversationStateRebuilt(context.Background(), conversationID); err != nil {
-		t.Fatalf("rebuild conversation state: %v", err)
+	if err := gateway.EnsureAgentSessionStateRebuilt(context.Background(), personalityAgentID); err != nil {
+		t.Fatalf("rebuild agent session state: %v", err)
 	}
 
-	if !gateway.IsRunInFlight(conversationID) {
+	if !gateway.IsRunInFlight(personalityAgentID) {
 		t.Fatal("expected in-flight run after state rebuild")
 	}
-	if !gateway.IsApprovalPending(conversationID, "request-1") {
+	if !gateway.IsApprovalPending(personalityAgentID, "request-1") {
 		t.Fatal("expected request-1 to be pending after state rebuild")
 	}
-	if gateway.IsApprovalPending(conversationID, "request-2") {
+	if gateway.IsApprovalPending(personalityAgentID, "request-2") {
 		t.Fatal("expected resolved request-2 not to be pending")
 	}
-	if gateway.IsApprovalPending(conversationID, "request-unknown") {
+	if gateway.IsApprovalPending(personalityAgentID, "request-unknown") {
 		t.Fatal("expected unknown request not to be pending")
 	}
 }
@@ -1470,12 +2127,12 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 		t.Fatalf("open gateway: %v", err)
 	}
 
-	const conversationID = "conversation-1"
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	// A non-contiguous durable event log must fail reconstruction rather than
 	// defaulting to an empty "no run / no approval" state.
 	if err := os.WriteFile(
-		gateway.eventPath(conversationID),
-		[]byte(`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_start"}}}`+"\n"),
+		gateway.eventPath(personalityAgentID),
+		[]byte(`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}`+"\n"),
 		0o600,
 	); err != nil {
 		t.Fatalf("write corrupt event log: %v", err)
@@ -1491,7 +2148,7 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := gateway.EnsureConversationStateRebuilt(context.Background(), conversationID); err == nil {
+	if err := gateway.EnsureAgentSessionStateRebuilt(context.Background(), personalityAgentID); err == nil {
 		t.Fatal("expected corrupt durable state to fail reconstruction")
 	} else if !strings.Contains(err.Error(), "non-contiguous") {
 		t.Fatalf("expected non-contiguous error, got %v", err)
@@ -1500,10 +2157,10 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 	// The guard must remain closed after failed reconstruction; it must not
 	// silently default to an empty state that would admit abort or
 	// approval_decision commands.
-	if gateway.IsRunInFlight(conversationID) {
+	if gateway.IsRunInFlight(personalityAgentID) {
 		t.Fatal("expected in-flight flag to remain false after failed reconstruction")
 	}
-	if gateway.IsApprovalPending(conversationID, "request-1") {
+	if gateway.IsApprovalPending(personalityAgentID, "request-1") {
 		t.Fatal("expected pending approvals to remain empty after failed reconstruction")
 	}
 }

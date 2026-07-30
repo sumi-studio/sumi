@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultBrowserAudience = "sumi:web:conversation"
+	defaultBrowserAudience = "sumi:web:direct-chat"
 	// BrowserSessionCookie is the name of the signed HttpOnly session cookie
 	// used by browser routes.
 	BrowserSessionCookie = "sumi_session"
@@ -24,12 +24,12 @@ const (
 func DefaultBrowserAudience() string { return defaultBrowserAudience }
 
 // UserSessionClaims are deliberately separate from agent TokenClaims. A
-// browser can act only as its user in one conversation; it never learns an
-// agent identity, generation, or agent gateway credential.
+// browser can act only as its authenticated human principal. The signed target
+// never comes from a public route or browser-authored command.
 type UserSessionClaims struct {
-	TenantID       string
-	UserID         string
-	ConversationID string
+	TenantID           string
+	UserID             string
+	PersonalityAgentID string
 }
 
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
@@ -44,11 +44,11 @@ type HMACUserSessionVerifier struct {
 }
 
 type userSessionWireClaims struct {
-	TenantID       string `json:"tenant_id"`
-	UserID         string `json:"user_id"`
-	ConversationID string `json:"conversation_id"`
-	Exp            int64  `json:"exp"`
-	Aud            string `json:"aud"`
+	TenantID           string `json:"tenant_id"`
+	UserID             string `json:"user_id"`
+	PersonalityAgentID string `json:"personality_agent_id"`
+	Exp                int64  `json:"exp"`
+	Aud                string `json:"aud"`
 }
 
 func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessionVerifier, error) {
@@ -115,11 +115,21 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 	if err := unmarshalStrict(claimsBytes, &claims); err != nil {
 		return UserSessionClaims{}, fmt.Errorf("parse browser session claims: %w", err)
 	}
-	if claims.TenantID == "" || claims.UserID == "" || claims.ConversationID == "" || claims.Exp == 0 {
+	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
+		!provenanceIDRegexp.MatchString(claims.UserID) ||
+		claims.PersonalityAgentID == "" ||
+		claims.Exp == 0 {
 		return UserSessionClaims{}, errors.New("browser session missing required claims")
+	}
+	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("browser session personality_agent_id: %w", err)
 	}
 	if time.Now().Unix() >= claims.Exp || claims.Aud != v.audience {
 		return UserSessionClaims{}, errors.New("browser session expired or audience mismatch")
 	}
-	return UserSessionClaims{TenantID: claims.TenantID, UserID: claims.UserID, ConversationID: claims.ConversationID}, nil
+	return UserSessionClaims{
+		TenantID:           claims.TenantID,
+		UserID:             claims.UserID,
+		PersonalityAgentID: claims.PersonalityAgentID,
+	}, nil
 }

@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
     ArtifactOperation, ArtifactResponse, MAX_ATTACHMENT_CHUNK_BYTES, MAX_RPC_LINE_BYTES, RpcError,
-    RpcFrame, RpcRequest, decode_rpc_frame,
+    RpcFrame, RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
 use crate::runtime::contracts::RpcIdentity;
 use crate::tools::{ToolError, shell_capture::ArtifactAppender};
@@ -34,7 +34,6 @@ use crate::tools::{ToolError, shell_capture::ArtifactAppender};
 pub struct ArtifactBrokerClient {
     socket: PathBuf,
     identity: RpcIdentity,
-    conversation_id: String,
 }
 
 impl ArtifactBrokerClient {
@@ -42,15 +41,10 @@ impl ArtifactBrokerClient {
     const EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
     #[cfg(test)]
     const EXCHANGE_DEADLINE: Duration = Duration::from_millis(100);
-    pub fn new(
-        socket: impl Into<PathBuf>,
-        identity: RpcIdentity,
-        conversation_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(socket: impl Into<PathBuf>, identity: RpcIdentity) -> Self {
         Self {
             socket: socket.into(),
             identity,
-            conversation_id: conversation_id.into(),
         }
     }
 
@@ -58,6 +52,8 @@ impl ArtifactBrokerClient {
         &self,
         operation: ArtifactOperation,
     ) -> Result<ArtifactResponse, ToolError> {
+        operation.validate()?;
+        operation.validate_authenticated_owner(self.identity.personality_agent_id())?;
         let request_emitted = Arc::new(AtomicBool::new(false));
         match timeout(
             Self::EXCHANGE_DEADLINE,
@@ -82,6 +78,7 @@ impl ArtifactBrokerClient {
     ) -> Result<ArtifactResponse, ToolError> {
         let request_id = format!("broker-{}", Uuid::now_v7());
         let request = RpcRequest {
+            personality_agent_id: self.identity.personality_agent_id().clone(),
             generation: self.identity.generation().to_wire(),
             nonce: self.identity.nonce().as_str().to_owned(),
             request_id: request_id.clone(),
@@ -173,7 +170,6 @@ impl ArtifactBrokerClient {
     ) -> Result<ArtifactResponse, ToolError> {
         let response = self
             .execute(ArtifactOperation::ReadArtifact {
-                conversation_id: self.conversation_id.clone(),
                 handle: handle.to_owned(),
                 offset,
                 limit,
@@ -197,7 +193,6 @@ impl ArtifactBrokerClient {
     ) -> Result<ArtifactResponse, ToolError> {
         let response = self
             .execute(ArtifactOperation::GrepArtifact {
-                conversation_id: self.conversation_id.clone(),
                 handle: handle.to_owned(),
                 pattern: pattern.to_owned(),
             })
@@ -214,6 +209,10 @@ impl ArtifactBrokerClient {
         &self.socket
     }
 
+    pub(crate) const fn identity(&self) -> &RpcIdentity {
+        &self.identity
+    }
+
     pub async fn put_attachment(
         &self,
         artifact_id: &str,
@@ -225,7 +224,6 @@ impl ArtifactBrokerClient {
         let content_digest = format!("{:x}", sha2::Sha256::digest(bytes));
         let response = self
             .execute(ArtifactOperation::BeginAttachment {
-                conversation_id: self.conversation_id.clone(),
                 artifact_id: artifact_id.to_owned(),
                 total_bytes,
                 content_digest: content_digest.clone(),
@@ -254,7 +252,6 @@ impl ArtifactBrokerClient {
                 .map_err(|_| ToolError::Protocol("attachment offset overflow".to_owned()))?;
             let response = self
                 .execute(ArtifactOperation::AppendAttachment {
-                    conversation_id: self.conversation_id.clone(),
                     artifact_id: artifact_id.to_owned(),
                     total_bytes,
                     content_digest: content_digest.clone(),
@@ -280,7 +277,6 @@ impl ArtifactBrokerClient {
         }
         let response = self
             .execute(ArtifactOperation::FinishAttachment {
-                conversation_id: self.conversation_id.clone(),
                 artifact_id: artifact_id.to_owned(),
                 total_bytes,
                 content_digest,
@@ -302,7 +298,7 @@ impl ArtifactBrokerClient {
     fn attachment_handle(&self, artifact_id: &str) -> String {
         format!(
             "artifact://{}/attachments/{artifact_id}",
-            self.conversation_id
+            self.identity.personality_agent_id()
         )
     }
 }
@@ -316,7 +312,6 @@ impl ArtifactAppender for ArtifactBrokerClient {
     ) -> Result<String, ToolError> {
         match self
             .execute(ArtifactOperation::BeginToolOutput {
-                conversation_id: self.conversation_id.clone(),
                 execution_id: execution_id.to_owned(),
                 content: initial_content.to_vec(),
             })
@@ -330,7 +325,7 @@ impl ArtifactAppender for ArtifactBrokerClient {
                     && handle
                         == format!(
                             "artifact://{}/tool-output/{execution_id}",
-                            self.conversation_id
+                            self.identity.personality_agent_id()
                         ) =>
             {
                 Ok(handle)
@@ -352,7 +347,6 @@ impl ArtifactAppender for ArtifactBrokerClient {
     ) -> Result<(), ToolError> {
         match self
             .execute(ArtifactOperation::AppendToolOutput {
-                conversation_id: self.conversation_id.clone(),
                 handle: handle.to_owned(),
                 offset,
                 content: content.to_vec(),
@@ -383,7 +377,6 @@ impl ArtifactAppender for ArtifactBrokerClient {
     async fn finish_tool_output(&self, handle: &str) -> Result<(), ToolError> {
         match self
             .execute(ArtifactOperation::FinishToolOutput {
-                conversation_id: self.conversation_id.clone(),
                 handle: handle.to_owned(),
             })
             .await?
@@ -453,6 +446,8 @@ fn indeterminate(error: ToolError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::tools::{shell_capture::ShellCapture, truncate::DEFAULT_MAX_BYTES};
     use serde_json::json;
     use std::{
@@ -524,7 +519,7 @@ mod tests {
                 "trailing" => {
                     let request: serde_json::Value = serde_json::from_str(&request).unwrap();
                     let response = json!({
-                        "type":"terminal", "generation":1, "nonce":"nonce",
+                        "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                         "request_id":request["request_id"],
                         "result":{"Ok":{"type":"finished"}}
                     });
@@ -537,15 +532,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         let error = client
             .execute(ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
-                handle: "artifact://conversation-1/tool-output/execution-1".to_owned(),
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1"
+                    .to_owned(),
             })
             .await
             .unwrap_err();
@@ -557,11 +549,36 @@ mod tests {
     #[tokio::test]
     async fn outgoing_request_rejects_out_of_domain_generation_before_connecting() {
         let error = RpcIdentity::from_wire(
+            PAID,
             crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
             "boot-nonce",
         )
         .expect_err("invalid generation");
         assert!(error.to_string().contains("generation"));
+    }
+
+    #[tokio::test]
+    async fn cross_personality_agent_handle_is_rejected_before_connecting() {
+        let client = ArtifactBrokerClient::new(
+            "/path/that/must/not/be-contacted.sock",
+            RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
+        );
+
+        let error = client
+            .execute(ArtifactOperation::ReadArtifact {
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/execution-1"
+                    .to_owned(),
+                offset: 0,
+                limit: 1,
+            })
+            .await
+            .expect_err("cross-personality-agent handle must fail locally");
+
+        assert!(matches!(
+            error,
+            ToolError::InvalidPath(message)
+                if message == "artifact belongs to another personality agent"
+        ));
     }
 
     #[tokio::test]
@@ -576,11 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn complete_request_followed_by_shutdown_failure_is_indeterminate() {
-        let client = ArtifactBrokerClient::new(
-            "/unused",
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new("/unused", RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         let written = Arc::new(Mutex::new(Vec::new()));
         let error = client
             .exchange_stream(
@@ -668,15 +682,12 @@ mod tests {
         }
         assert!(saturated, "Unix listener backlog must be saturated");
 
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         let error = client
             .execute(ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
-                handle: "artifact://conversation-1/tool-output/no-send".to_owned(),
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/no-send"
+                    .to_owned(),
             })
             .await
             .unwrap_err();
@@ -743,7 +754,7 @@ mod tests {
                 read.read_line(&mut request).await.unwrap();
                 let request: serde_json::Value = serde_json::from_str(&request).unwrap();
                 let response = json!({
-                    "type":"terminal", "generation":1, "nonce":"nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                     "request_id":request["request_id"], "result":terminal_result,
                 });
                 let mut bytes = serde_json::to_vec(&response).unwrap();
@@ -752,14 +763,14 @@ mod tests {
             });
             let client = ArtifactBrokerClient::new(
                 &socket,
-                RpcIdentity::from_wire(1, "nonce").unwrap(),
-                "conversation-1",
+                RpcIdentity::from_wire(PAID, 1, "nonce").unwrap(),
             );
             assert!(matches!(
                 client
                     .execute(ArtifactOperation::FinishToolOutput {
-                        conversation_id: "conversation-1".to_owned(),
-                        handle: "artifact://conversation-1/tool-output/trailing".to_owned(),
+                        handle:
+                            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/trailing"
+                                .to_owned(),
                     })
                     .await,
                 Err(ToolError::RpcIndeterminate(_))
@@ -783,7 +794,7 @@ mod tests {
             read.read_line(&mut request).await.unwrap();
             let request: serde_json::Value = serde_json::from_str(&request).unwrap();
             let response = json!({
-                "type":"terminal", "generation":1, "nonce":"nonce",
+                "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                 "request_id":request["request_id"],
                 "result":{"Err":{"code":"protocol","resource_limit":null}},
             });
@@ -791,16 +802,13 @@ mod tests {
             bytes.push(b'\n');
             write.write_all(&bytes).await.unwrap();
         });
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         assert!(matches!(
             client
                 .execute(ArtifactOperation::FinishToolOutput {
-                    conversation_id: "conversation-1".to_owned(),
-                    handle: "artifact://conversation-1/tool-output/error".to_owned(),
+                    handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/error"
+                        .to_owned(),
                 })
                 .await,
             Err(ToolError::Protocol(_))
@@ -841,7 +849,7 @@ mod tests {
                         let offset = initial.len() + usize::from(begin_attempts == 1);
                         json!({"Ok":{
                             "type":"begun",
-                            "handle":"artifact://conversation-1/tool-output/replay-secret",
+                            "handle":"artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/replay-secret",
                             "offset":offset,
                         }})
                     }
@@ -868,7 +876,7 @@ mod tests {
                         };
                         let next = content.len() + usize::from(*attempts == 1 && bytes == b"C");
                         let response = json!({
-                            "type":"terminal", "generation":1, "nonce":"nonce",
+                            "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                             "request_id":response_id,
                             "result":{"Ok":{"type":"appended","offset":next}},
                         });
@@ -879,7 +887,7 @@ mod tests {
                     }
                     "finish_tool_output" => {
                         let response = json!({
-                            "type":"terminal", "generation":1, "nonce":"nonce",
+                            "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                             "request_id":request_id,
                             "result":{"Ok":{"type":"finished"}},
                         });
@@ -891,7 +899,7 @@ mod tests {
                     other => panic!("unexpected operation: {other}"),
                 };
                 let response = json!({
-                    "type":"terminal", "generation":1, "nonce":"nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                     "request_id":request_id, "result":response_result,
                 });
                 let mut encoded = serde_json::to_vec(&response).unwrap();
@@ -899,11 +907,8 @@ mod tests {
                 write.write_all(&encoded).await.unwrap();
             }
         });
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         let prefix = vec![b'x'; DEFAULT_MAX_BYTES + 1];
         let mut capture = ShellCapture::new("replay-secret", &client);
         capture.push(&prefix).await.unwrap();
@@ -913,7 +918,7 @@ mod tests {
         let result = capture.finish().await.unwrap();
         assert_eq!(
             result.artifact_handle.as_deref(),
-            Some("artifact://conversation-1/tool-output/replay-secret")
+            Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/replay-secret")
         );
         assert_eq!(server.await.unwrap(), [prefix, b"ABC".to_vec()].concat());
         let _ = std::fs::remove_dir_all(root);
@@ -933,7 +938,7 @@ mod tests {
             read.read_line(&mut request).await.unwrap();
             let request: serde_json::Value = serde_json::from_str(&request).unwrap();
             let response = json!({
-                "type":"terminal", "generation":1, "nonce":"nonce",
+                "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                 "request_id":request["request_id"],
                 "result":{"Ok":{"type":"begun","handle":"artifact://other/tool-output/execution-1","offset":1}}
             });
@@ -941,11 +946,8 @@ mod tests {
             bytes.push(b'\n');
             write.write_all(&bytes).await.unwrap();
         });
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         let error = client
             .begin_tool_output("execution-1", b"x")
             .await
@@ -993,9 +995,9 @@ mod tests {
                     }
                     "finish_attachment" => {
                         let response = json!({
-                            "type":"terminal", "generation":1, "nonce":"nonce",
+                            "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                             "request_id":request_id,
-                            "result":{"Ok":{"type":"put","handle":"artifact://conversation-1/attachments/input-1"}},
+                            "result":{"Ok":{"type":"put","handle":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/input-1"}},
                         });
                         let mut encoded = serde_json::to_vec(&response).unwrap();
                         encoded.push(b'\n');
@@ -1005,7 +1007,7 @@ mod tests {
                     other => panic!("unexpected attachment operation: {other}"),
                 };
                 let response = json!({
-                    "type":"terminal", "generation":1, "nonce":"nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":1, "nonce":"nonce",
                     "request_id":request_id, "result":result,
                 });
                 let mut encoded = serde_json::to_vec(&response).unwrap();
@@ -1013,14 +1015,11 @@ mod tests {
                 write.write_all(&encoded).await.unwrap();
             }
         });
-        let client = ArtifactBrokerClient::new(
-            &socket,
-            RpcIdentity::from_wire(1, "nonce").unwrap(),
-            "conversation-1",
-        );
+        let client =
+            ArtifactBrokerClient::new(&socket, RpcIdentity::from_wire(PAID, 1, "nonce").unwrap());
         assert_eq!(
             client.put_attachment("input-1", &content).await.unwrap(),
-            "artifact://conversation-1/attachments/input-1"
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/input-1"
         );
         let (largest_line, received) = server.await.unwrap();
         assert!(largest_line <= MAX_RPC_LINE_BYTES);

@@ -38,7 +38,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::types::{ToolDefinition, UserContent, ValidatedToolArguments};
-use crate::runtime::contracts::ProcessGeneration;
+use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolRisk {
@@ -200,17 +200,14 @@ impl ToolRegistryBuilder {
     pub fn build(self) -> ToolRegistry {
         ToolRegistry {
             tools: self.tools,
-            executor_generation: None,
+            executor_identity: None,
         }
     }
 
-    pub(crate) fn build_for_executor_generation(
-        self,
-        generation: ProcessGeneration,
-    ) -> ToolRegistry {
+    pub(crate) fn build_for_executor_identity(self, identity: RpcIdentity) -> ToolRegistry {
         ToolRegistry {
             tools: self.tools,
-            executor_generation: Some(generation),
+            executor_identity: Some(identity),
         }
     }
 }
@@ -219,8 +216,9 @@ impl ToolRegistryBuilder {
 pub struct ToolRegistry {
     tools: BTreeMap<String, RegisteredTool>,
     // Local and in-memory registries do not cross an executor RPC boundary.
-    // Production remote registries bind the immutable client's generation.
-    executor_generation: Option<ProcessGeneration>,
+    // Production remote registries bind the immutable client's complete RPC
+    // identity so neither PAID nor boot nonce can be erased at composition.
+    executor_identity: Option<RpcIdentity>,
 }
 
 #[derive(Clone)]
@@ -234,12 +232,36 @@ impl ToolRegistry {
         &self,
         generation: ProcessGeneration,
     ) -> Result<(), ToolError> {
-        if let Some(bound) = self.executor_generation
-            && bound != generation
+        if let Some(bound) = &self.executor_identity
+            && bound.generation() != generation
         {
             return Err(ToolError::Protocol(format!(
-                "remote tool registry executor generation {bound} does not match injected generation {generation}"
+                "remote tool registry executor generation {} does not match injected generation {generation}",
+                bound.generation()
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate the immutable identity of a production remote registry.
+    ///
+    /// An unbound local/in-memory registry is intentionally rejected here.
+    /// Generation-only validation remains available solely for explicit
+    /// fixture composition and cannot satisfy a hydrated Session start.
+    pub(crate) fn validate_executor_identity(
+        &self,
+        identity: &RpcIdentity,
+    ) -> Result<(), ToolError> {
+        let bound = self.executor_identity.as_ref().ok_or_else(|| {
+            ToolError::Protocol(
+                "tool registry is not bound to a production executor RPC identity".to_owned(),
+            )
+        })?;
+        if bound != identity {
+            return Err(ToolError::Protocol(
+                "remote tool registry executor RPC identity does not match the authenticated Session runtime"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }

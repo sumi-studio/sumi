@@ -24,11 +24,17 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
   if (!fixtureBuild) throw new Error("browser E2E fixture was not built");
 
   let terminalFrames = 0;
+  let toolStartFrames = 0;
+  let toolEndFrames = 0;
+  let directChatSocketSeen = false;
   let markReplaySettled: (() => void) | undefined;
   const replaySettled = new Promise<void>((resolveReplay) => {
     markReplaySettled = resolveReplay;
   });
   page.on("websocket", (socket) => {
+    if (new URL(socket.url()).pathname === "/direct-chat/ws") {
+      directChatSocketSeen = true;
+    }
     socket.on("framereceived", ({ payload }) => {
       if (typeof payload !== "string") return;
       try {
@@ -43,6 +49,12 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
           JSON.stringify(event.message).includes("Terminal replay")
         ) {
           terminalFrames++;
+        }
+        if (event?.type === "tool_execution_start") {
+          toolStartFrames++;
+        }
+        if (event?.type === "tool_execution_end") {
+          toolEndFrames++;
         }
         if (event?.type === "agent_end") {
           markReplaySettled?.();
@@ -65,7 +77,9 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       (await page.request.get(`${fixture.url}/__e2e__/session`)).status(),
     ).toBe(204);
     await page.goto(webURL);
-    await expect(page.getByText("open", { exact: true })).toBeVisible();
+    await expect(page.getByText("connected", { exact: true })).toBeVisible();
+    await expect(page.getByText("agent: Ready", { exact: true })).toBeVisible();
+    await expect.poll(() => directChatSocketSeen).toBe(true);
 
     const composer = page.getByLabel("メッセージ");
     await composer.fill("initial user_message");
@@ -74,11 +88,10 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       page.getByText("streamed assistant", { exact: true }),
     ).toBeVisible();
     await expect(
-      page.getByText("Tool started: read_file", { exact: true }),
-    ).toBeVisible();
-    await expect(
       page.getByText("Tool finished: call-1", { exact: true }),
     ).toBeVisible();
+    expect(toolStartFrames).toBe(1);
+    expect(toolEndFrames).toBe(1);
 
     await composer.fill("second message is a steer");
     await page.getByRole("button", { name: "Steer" }).click();
@@ -112,7 +125,7 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
         return stats.active === 1 && stats.accepted > beforeReconnect.accepted;
       })
       .toBe(true);
-    await expect(page.getByText("open", { exact: true })).toBeVisible();
+    await expect(page.getByText("connected", { exact: true })).toBeVisible();
     await expect(
       page.getByText("Terminal replay", { exact: true }),
     ).toHaveCount(1);
@@ -206,7 +219,6 @@ function startVite(apiURL: string) {
       env: {
         ...process.env,
         VITE_API_BASE_URL: apiURL,
-        VITE_CONVERSATION_ID: "conversation-1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose};
 
-const EVENT_CHAIN_DOMAIN: &[u8] = b"sumi-event-log-chain/v1";
-const EVENT_HEAD_DOMAIN: &[u8] = b"sumi-event-log-head/v1";
+const EVENT_CHAIN_DOMAIN: &[u8] = b"sumi-event-log-chain/v2";
+const EVENT_HEAD_DOMAIN: &[u8] = b"sumi-event-log-head/v2";
 pub(super) const EVENT_DIGEST_BYTES: usize = 32;
 
 pub(super) struct EventChainEntry<'a> {
@@ -48,7 +48,7 @@ pub(super) fn authenticate_event_head(
     let aad = scope
         .row_aad(
             "event_log_heads",
-            &scope.conversation_id,
+            scope.personality_agent_id.as_str(),
             DataKeyPurpose::Event,
         )
         .canonical_bytes();
@@ -81,7 +81,7 @@ pub(super) fn verify_event_head(
     let aad = scope
         .row_aad(
             "event_log_heads",
-            &scope.conversation_id,
+            scope.personality_agent_id.as_str(),
             DataKeyPurpose::Event,
         )
         .canonical_bytes();

@@ -43,32 +43,35 @@ fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} exceeds SQLite INTEGER range"))
 }
 
-const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v1";
-const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v1";
-const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v1";
-const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v1";
-const PROJECTION_HMAC_INFO: &[u8] = b"provider-context-projection-head/v1";
-const PROJECTION_STATE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-context-durable-state/v1";
-const PROJECTION_HEAD_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-projection-head/v1";
-const PROJECTION_SCHEMA_VERSION: i64 = 1;
+const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v2";
+const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v2";
+const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v2";
+const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v2";
+const PROJECTION_HMAC_INFO: &[u8] = b"provider-context-projection-head/v2";
+const PROJECTION_STATE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-context-durable-state/v2";
+const PROJECTION_HEAD_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-projection-head/v2";
+const PROJECTION_SCHEMA_VERSION: i64 = 2;
 const PROJECTION_PAGE_SIZE: i64 = 256;
-const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v1";
+const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v2";
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
 
 /// HKDF-Extract/Expand with HMAC-SHA256, keyed by the durable mutation data key
 /// and conversation-scoped salt.  This key is used for both the plaintext HMAC
 /// and the canonical semantic-intent HMAC.
-pub(crate) fn hkdf_intent_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
-    hkdf_hmac_key(data_key, conversation_id, INTENT_HMAC_INFO)
+pub(crate) fn hkdf_intent_hmac_key(
+    data_key: &DataKeyMaterial,
+    personality_agent_id: &str,
+) -> [u8; 32] {
+    hkdf_hmac_key(data_key, personality_agent_id, INTENT_HMAC_INFO)
 }
 
-fn hkdf_projection_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
-    hkdf_hmac_key(data_key, conversation_id, PROJECTION_HMAC_INFO)
+fn hkdf_projection_hmac_key(data_key: &DataKeyMaterial, personality_agent_id: &str) -> [u8; 32] {
+    hkdf_hmac_key(data_key, personality_agent_id, PROJECTION_HMAC_INFO)
 }
 
-fn hkdf_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str, info: &[u8]) -> [u8; 32] {
-    let mut prk_mac = <Hmac<Sha256> as Mac>::new_from_slice(conversation_id.as_bytes())
+fn hkdf_hmac_key(data_key: &DataKeyMaterial, personality_agent_id: &str, info: &[u8]) -> [u8; 32] {
+    let mut prk_mac = <Hmac<Sha256> as Mac>::new_from_slice(personality_agent_id.as_bytes())
         .expect("HMAC accepts any salt length");
     prk_mac.update(data_key.bytes());
     let prk = prk_mac.finalize().into_bytes();
@@ -108,9 +111,7 @@ fn projection_head_hmac(
 ) -> Vec<u8> {
     let mut writer = CanonicalWriter::with_domain(PROJECTION_HEAD_HMAC_DOMAIN);
     writer.field(PROJECTION_SCHEMA_VERSION.to_string().as_bytes());
-    writer.field(store.scope().tenant_id.as_bytes());
-    writer.field(store.scope().agent_id.as_bytes());
-    writer.field(store.scope().conversation_id.as_bytes());
+    writer.field(store.scope().personality_agent_id.as_str().as_bytes());
     writer.field(revision.to_string().as_bytes());
     writer.field(record_count.to_string().as_bytes());
     writer.field(set_digest);
@@ -252,9 +253,10 @@ async fn provider_context_set_digest(
         &mut hasher,
         PROJECTION_SCHEMA_VERSION.to_string().as_bytes(),
     );
-    digest_field(&mut hasher, store.scope().tenant_id.as_bytes());
-    digest_field(&mut hasher, store.scope().agent_id.as_bytes());
-    digest_field(&mut hasher, store.scope().conversation_id.as_bytes());
+    digest_field(
+        &mut hasher,
+        store.scope().personality_agent_id.as_str().as_bytes(),
+    );
 
     digest_field(&mut hasher, b"provider_context");
     let mut after_id: Option<String> = None;
@@ -456,7 +458,8 @@ async fn load_authenticated_projection_head(
     if key.purpose != DataKeyPurpose::Mutation {
         bail!("provider-context projection head references a non-mutation key");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let expected = projection_head_hmac(
         store,
         &projection_key,
@@ -523,7 +526,8 @@ pub(super) async fn commit_provider_context_projection_set(
     if key.purpose != DataKeyPurpose::Mutation {
         bail!("provider-context projection head references a non-mutation key");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let head_hmac = projection_head_hmac(
         store,
         &projection_key,
@@ -591,7 +595,7 @@ pub(super) async fn initialize_provider_context_projection_head(store: &Store) -
     }
 
     let key = store
-        .conversation_key(DataKeyPurpose::Mutation)
+        .private_key(DataKeyPurpose::Mutation)
         .await
         .context("failed to initialize provider-context projection key")?;
     let mut transaction = store.pool().begin().await?;
@@ -626,7 +630,8 @@ pub(super) async fn initialize_provider_context_projection_head(store: &Store) -
     if record_count != 0 {
         bail!("provider-context projection genesis is not empty");
     }
-    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let projection_key =
+        hkdf_projection_hmac_key(&key, store.scope().personality_agent_id.as_str());
     let head_hmac = projection_head_hmac(
         store,
         &projection_key,
@@ -738,14 +743,49 @@ pub(crate) fn provider_context_idempotency_key(item: &ProviderContextItem) -> St
     }
 }
 
-pub(crate) fn provider_context_owner_key_ref(
+pub(crate) fn provider_context_retention_anchor_id(
+    item: &ProviderContextItem,
+    native_coordinates: Option<(u64, u64)>,
+) -> Result<String> {
+    let writer = match &item.payload {
+        ProviderContextPayload::EncryptedReasoning { .. } => {
+            let wire_item_index = item
+                .wire_item_index
+                .ok_or_else(|| anyhow!("reasoning retention anchor requires a wire item index"))?;
+            let mut writer =
+                CanonicalWriter::with_domain(b"sumi-provider-context-reasoning-unit/v1");
+            writer.field(item.retention_owner.message_id.as_bytes());
+            writer.field(item.retention_owner.message_seq.to_string().as_bytes());
+            writer.field(wire_item_index.to_string().as_bytes());
+            writer.field(item.ordinal.to_string().as_bytes());
+            writer
+        }
+        ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+        | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+            let (config_generation, window_ordinal) = native_coordinates.ok_or_else(|| {
+                anyhow!(
+                    "native provider-context retention anchor requires config generation and window ordinal"
+                )
+            })?;
+            let mut writer = CanonicalWriter::with_domain(b"sumi-provider-context-native-unit/v1");
+            writer.field(coverage.context_fingerprint.as_bytes());
+            writer.field(coverage.through_message_seq.to_string().as_bytes());
+            writer.field(config_generation.to_string().as_bytes());
+            writer.field(window_ordinal.to_string().as_bytes());
+            writer
+        }
+    };
+    let digest = Sha256::digest(writer.finish());
+    Ok(format!("{:x}", digest))
+}
+
+pub(crate) fn provider_context_item_key_ref(
     scope: &AgentScope,
-    owner: &ProviderContextAnchor,
-) -> String {
-    super::provider_context_key_ref(
-        scope,
-        &format!("{}:{}", owner.message_id, owner.message_seq),
-    )
+    item: &ProviderContextItem,
+    native_coordinates: Option<(u64, u64)>,
+) -> Result<String> {
+    let anchor_id = provider_context_retention_anchor_id(item, native_coordinates)?;
+    Ok(super::provider_context_key_ref(scope, &anchor_id))
 }
 
 fn validate_provider_context_item_semantics(item: &ProviderContextItem) -> Result<()> {
@@ -833,6 +873,7 @@ fn canonical_provider_context_metadata(
     scope: &AgentScope,
     item: &ProviderContextItem,
     eviction_estimator_version: u32,
+    native_coordinates: Option<(u64, u64)>,
 ) -> Result<CanonicalProviderContextMetadata> {
     validate_provider_context_item_semantics(item)?;
     let footprint = canonical_eviction_footprint(item, eviction_estimator_version)?;
@@ -864,7 +905,7 @@ fn canonical_provider_context_metadata(
         kind: ProviderContextKind::from_payload(&item.payload),
         coverage_through_seq,
         context_fingerprint,
-        key_ref: provider_context_owner_key_ref(scope, &item.retention_owner),
+        key_ref: provider_context_item_key_ref(scope, item, native_coordinates)?,
         eviction_tokens: footprint.eviction_tokens(),
         eviction_estimator_version: footprint.estimator_version(),
     })
@@ -966,6 +1007,66 @@ impl EncryptedProviderContextRecord {
         data_key: &DataKeyMaterial,
         scope: &AgentScope,
     ) -> Result<Self> {
+        let native_coordinates = match &item.payload {
+            ProviderContextPayload::EncryptedReasoning { .. } => None,
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                Some((0, u64::from(item.ordinal)))
+            }
+        };
+        Self::encrypt_with_coordinates(
+            item,
+            provider_instance_id,
+            protocol,
+            model,
+            eviction_footprint,
+            data_key,
+            scope,
+            native_coordinates,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encrypt_native_window(
+        item: &ProviderContextItem,
+        provider_instance_id: impl Into<String>,
+        protocol: ApiProtocol,
+        model: impl Into<String>,
+        eviction_footprint: EvictionFootprint,
+        data_key: &DataKeyMaterial,
+        scope: &AgentScope,
+        config_generation: u64,
+        window_ordinal: u64,
+    ) -> Result<Self> {
+        if matches!(
+            &item.payload,
+            ProviderContextPayload::EncryptedReasoning { .. }
+        ) {
+            bail!("native-window encryption requires a native provider-context payload");
+        }
+        Self::encrypt_with_coordinates(
+            item,
+            provider_instance_id,
+            protocol,
+            model,
+            eviction_footprint,
+            data_key,
+            scope,
+            Some((config_generation, window_ordinal)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encrypt_with_coordinates(
+        item: &ProviderContextItem,
+        provider_instance_id: impl Into<String>,
+        protocol: ApiProtocol,
+        model: impl Into<String>,
+        eviction_footprint: EvictionFootprint,
+        data_key: &DataKeyMaterial,
+        scope: &AgentScope,
+        native_coordinates: Option<(u64, u64)>,
+    ) -> Result<Self> {
         if data_key.purpose != DataKeyPurpose::ProviderContext {
             bail!("provider-context records require a provider_context data key");
         }
@@ -992,6 +1093,7 @@ impl EncryptedProviderContextRecord {
             scope,
             item,
             eviction_footprint.estimator_version(),
+            native_coordinates,
         )?;
         if data_key.key_ref != metadata.key_ref {
             bail!("provider-context data key does not match the deterministic retention-owner key");
@@ -1032,9 +1134,14 @@ impl EncryptedProviderContextRecord {
         &self,
         scope: &AgentScope,
         plaintext: &ProviderContextItem,
+        native_coordinates: Option<(u64, u64)>,
     ) -> Result<()> {
-        let expected =
-            canonical_provider_context_metadata(scope, plaintext, self.eviction_estimator_version)?;
+        let expected = canonical_provider_context_metadata(
+            scope,
+            plaintext,
+            self.eviction_estimator_version,
+            native_coordinates,
+        )?;
         if self.id != expected.id {
             bail!("Replace provider-context row id is not canonical for its plaintext owner");
         }
@@ -1204,8 +1311,19 @@ impl FullIntent {
         if !self.is_replace() {
             bail!("provider-context insert validation requires a Replace intent");
         }
-        let expected =
-            canonical_provider_context_metadata(scope, plaintext, self.eviction_estimator_version)?;
+        let native_coordinates = match &plaintext.payload {
+            ProviderContextPayload::EncryptedReasoning { .. } => None,
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                Some((self.config_generation, self.window_ordinal))
+            }
+        };
+        let expected = canonical_provider_context_metadata(
+            scope,
+            plaintext,
+            self.eviction_estimator_version,
+            native_coordinates,
+        )?;
         if self.provider_context_id != expected.id {
             bail!("Replace provider-context row id is not canonical for its plaintext owner");
         }
@@ -1433,14 +1551,19 @@ impl ProviderContextMutationBuilder {
         window_ordinal: u64,
     ) -> Result<PreparedProviderContextMutation> {
         insert
-            .validate_against_plaintext(&self.scope, plaintext)
+            .validate_against_plaintext(
+                &self.scope,
+                plaintext,
+                Some((config_generation, window_ordinal)),
+            )
             .context("Replace provider-context insert is not canonical")?;
         let sorted = unique_sorted(invalidate_ids)?;
         let plaintext_bytes = Zeroizing::new(
             serde_json::to_vec(plaintext)
                 .context("failed to serialize provider-context plaintext for intent")?,
         );
-        let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
+        let intent_key =
+            hkdf_intent_hmac_key(&self.mutation_key, self.scope.personality_agent_id.as_str());
         let plaintext_hmac = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext_bytes);
 
         self.build_full(
@@ -1504,7 +1627,8 @@ impl ProviderContextMutationBuilder {
             created_at: insert.map(|r| r.created_at.clone()).unwrap_or_default(),
         };
 
-        let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
+        let intent_key =
+            hkdf_intent_hmac_key(&self.mutation_key, self.scope.personality_agent_id.as_str());
         let semantic = semantic_intent_bytes(&full);
         let intent_hmac = hmac_sha256(&intent_key, INTENT_HMAC_DOMAIN, &semantic);
 
@@ -1761,8 +1885,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &mutation_id,
                 DataKeyPurpose::Mutation,
             );
-            let intent_key =
-                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let intent_key = hkdf_intent_hmac_key(
+                &mutation_key,
+                self.store.scope().personality_agent_id.as_str(),
+            );
             let full = self.decrypt_full_intent(
                 &mutation_key,
                 &intent_ciphertext,
@@ -1989,7 +2115,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &prepared.mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
 
         if let Some((state, key_ref, hmac, hmac_key_id, ciphertext, _prepared_at)) = existing {
             if state != "prepared" {
@@ -2127,7 +2256,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &prepared.mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let full = self.decrypt_full_intent(
             &mutation_key,
             &prepared.intent_ciphertext,
@@ -2526,7 +2658,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .context("failed to deserialize full mutation intent")?;
 
         let semantic = semantic_intent_bytes(&full);
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let recomputed = hmac_sha256(&intent_key, INTENT_HMAC_DOMAIN, &semantic);
         if recomputed.as_slice().ct_eq(&stored_hmac).unwrap_u8() != 1 {
             bail!("provider-context mutation intent HMAC mismatch");
@@ -2551,7 +2686,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &full.protocol,
                 &full.model,
                 &full.kind,
-                &self.store.scope().conversation_id,
+                self.store.scope().personality_agent_id.as_str(),
                 intent_key,
             );
 
@@ -2853,7 +2988,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &mutation_key,
+            self.store.scope().personality_agent_id.as_str(),
+        );
         let full = self.decrypt_full_intent(
             &mutation_key,
             &intent_ciphertext,
@@ -2872,7 +3010,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             &full.protocol,
             &full.model,
             &full.kind,
-            &self.store.scope().conversation_id,
+            self.store.scope().personality_agent_id.as_str(),
             intent_key,
         )
     }
@@ -3131,8 +3269,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 &mutation_id,
                 DataKeyPurpose::Mutation,
             );
-            let intent_key =
-                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let intent_key = hkdf_intent_hmac_key(
+                &mutation_key,
+                self.store.scope().personality_agent_id.as_str(),
+            );
             let full = self.decrypt_full_intent(
                 &mutation_key,
                 &original_ciphertext,
@@ -3258,8 +3398,12 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     .fetch_one(&mut **transaction)
                     .await?;
             if count == 0 {
+                let erase_target = super::DerivedRetentionEraseTarget::new(
+                    key_ref.0.clone(),
+                    super::DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+                )?;
                 self.store
-                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref.0)
+                    .destroy_private_key_ref_in_transaction(transaction, &erase_target)
                     .await
                     .with_context(|| {
                         format!(
@@ -3394,18 +3538,18 @@ fn replace_scope_key(
     protocol: &str,
     model: &str,
     kind: &str,
-    conversation_id: &str,
+    personality_agent_id: &str,
     intent_key: &[u8],
 ) -> String {
     let mut writer = CanonicalWriter::with_domain(SCOPE_KEY_DOMAIN);
-    writer.field(conversation_id.as_bytes());
+    writer.field(personality_agent_id.as_bytes());
     writer.field(provider_instance_id.as_bytes());
     writer.field(protocol.as_bytes());
     writer.field(model.as_bytes());
     writer.field(kind.as_bytes());
     let digest = hmac_sha256(
         intent_key,
-        b"sumi-provider-context-scope-digest/v1",
+        b"sumi-provider-context-scope-digest/v2",
         &writer.finish(),
     );
     encode_hex(&digest)
@@ -3442,7 +3586,7 @@ mod tests {
     use crate::store::{
         DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
         MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState, MemoryTransition,
-        Projection, ProviderContextKeyAnchor, Store,
+        Projection, Store,
     };
 
     fn dummy_footprint() -> EvictionFootprint {
@@ -3452,7 +3596,7 @@ mod tests {
     }
 
     async fn store() -> Store {
-        Store::session_test_store("conversation-1")
+        Store::session_test_store("0198f0f4-9b72-7000-8000-000000000001")
             .await
             .expect("open test store")
     }
@@ -3461,7 +3605,7 @@ mod tests {
     async fn projection_verifier_preflights_mutation_and_replace_head_bytes_before_paging() {
         let store = store().await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         sqlx::query(
@@ -3534,7 +3678,7 @@ mod tests {
             .initialize_recovery_checkpoint()
             .await?;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let message = PublicMessage::Assistant(PublicAssistantMessage {
@@ -3666,7 +3810,7 @@ mod tests {
             .initialize_recovery_checkpoint()
             .await?;
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
         sqlx::query(
@@ -3725,6 +3869,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retention_anchors_use_exact_reasoning_and_native_coordinates() {
+        let reasoning = reasoning_item_with("message-1", 7, 2, 3);
+        let mut same_reasoning_coordinates = reasoning.clone();
+        same_reasoning_coordinates.provider_origin.model = "different-model".to_owned();
+        assert_eq!(
+            provider_context_retention_anchor_id(&reasoning, None).unwrap(),
+            provider_context_retention_anchor_id(&same_reasoning_coordinates, None).unwrap(),
+            "reasoning retention identity is exactly owner, wire item index, and ordinal"
+        );
+        let mut different_reasoning_ordinal = reasoning.clone();
+        different_reasoning_ordinal.ordinal += 1;
+        assert_ne!(
+            provider_context_retention_anchor_id(&reasoning, None).unwrap(),
+            provider_context_retention_anchor_id(&different_reasoning_ordinal, None).unwrap()
+        );
+
+        let native = native_compaction_item(false, "owner-1", 7, 4);
+        let mut same_native_coordinates = native.clone();
+        same_native_coordinates.retention_owner.message_id = "different-owner".to_owned();
+        same_native_coordinates.provider_origin.model = "different-model".to_owned();
+        assert_eq!(
+            provider_context_retention_anchor_id(&native, Some((5, 6))).unwrap(),
+            provider_context_retention_anchor_id(&same_native_coordinates, Some((5, 6))).unwrap(),
+            "native retention identity is exactly fingerprint, coverage, generation, and window ordinal"
+        );
+        assert_ne!(
+            provider_context_retention_anchor_id(&native, Some((5, 6))).unwrap(),
+            provider_context_retention_anchor_id(&native, Some((5, 7))).unwrap()
+        );
+        assert_ne!(
+            provider_context_retention_anchor_id(&native, Some((5, 6))).unwrap(),
+            provider_context_retention_anchor_id(&native, Some((6, 6))).unwrap()
+        );
+    }
+
     async fn reasoning_record(
         store: &Store,
         message_id: &str,
@@ -3748,10 +3928,7 @@ mod tests {
         let store = store().await;
         let item = reasoning_item("message-1", 7);
         let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
+            .provider_context_item_key(&item, None)
             .await
             .expect("mint reasoning anchor key");
         let canonical = reasoning_footprint(&item);
@@ -3847,16 +4024,12 @@ mod tests {
         ordinal: u32,
         content: &str,
     ) -> EncryptedProviderContextRecord {
-        let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
-            anchor_id: format!("{message_id}:{message_seq}"),
-        };
-        let key = store
-            .provider_context_key(&anchor)
-            .await
-            .expect("mint reasoning anchor key");
         let item =
             reasoning_item_with_content(message_id, message_seq, wire_item_index, ordinal, content);
+        let key = store
+            .provider_context_item_key(&item, None)
+            .await
+            .expect("mint reasoning anchor key");
         let origin = reasoning_origin();
         EncryptedProviderContextRecord::encrypt(
             &item,
@@ -3877,15 +4050,11 @@ mod tests {
         wire_item_index: u32,
         ordinal: u32,
     ) -> EncryptedProviderContextRecord {
-        let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
-            anchor_id: format!("{message_id}:{message_seq}"),
-        };
+        let item = reasoning_item_with(message_id, message_seq, wire_item_index, ordinal);
         let key = store
-            .provider_context_key(&anchor)
+            .provider_context_item_key(&item, None)
             .await
             .expect("mint reasoning anchor key");
-        let item = reasoning_item_with(message_id, message_seq, wire_item_index, ordinal);
         let origin = reasoning_origin();
         EncryptedProviderContextRecord::encrypt(
             &item,
@@ -3925,8 +4094,10 @@ mod tests {
         let plaintext_bytes = Zeroizing::new(
             serde_json::to_vec(plaintext).expect("serialize unchecked Replace plaintext"),
         );
-        let intent_key =
-            hkdf_intent_hmac_key(&builder.mutation_key, &builder.scope.conversation_id);
+        let intent_key = hkdf_intent_hmac_key(
+            &builder.mutation_key,
+            builder.scope.personality_agent_id.as_str(),
+        );
         let plaintext_hmac = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext_bytes);
         builder
             .build_full(
@@ -3979,10 +4150,7 @@ mod tests {
                     .await
                     .expect("seed a different authenticated owner in the same conversation");
                 let wrong_owner_key = store
-                    .provider_context_key(&ProviderContextKeyAnchor {
-                        conversation_id: store.scope().conversation_id.clone(),
-                        anchor_id: "different-owner:8".to_owned(),
-                    })
+                    .provider_context_item_key(&reasoning_item("different-owner", 8), None)
                     .await
                     .expect("mint same-conversation wrong-owner key");
                 insert.key_ref = wrong_owner_key.key_ref.clone();
@@ -3994,7 +4162,7 @@ mod tests {
         // prepared by an older or compromised caller. Apply must independently
         // re-authenticate it inside EventWriter's transaction.
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let prepared = build_unchecked_replace_for_test(
@@ -4080,10 +4248,7 @@ mod tests {
         let item = reasoning_item("message-1", 7);
         let origin = reasoning_origin();
         let wrong_owner_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "different-owner:8".to_owned(),
-            })
+            .provider_context_item_key(&reasoning_item("different-owner", 8), None)
             .await
             .expect("mint same-conversation wrong-owner key");
 
@@ -4110,7 +4275,7 @@ mod tests {
         bad_id.id = "noncanonical-provider-context-id".to_owned();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -4124,7 +4289,7 @@ mod tests {
         bad_idempotency.idempotency_key = "noncanonical-idempotency-key".to_owned();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("reuse mutation key"),
             store.scope().clone(),
@@ -4138,7 +4303,7 @@ mod tests {
         bad_key.key_ref = wrong_owner_key.key_ref.clone();
         let error = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("reuse mutation key"),
             store.scope().clone(),
@@ -4243,7 +4408,7 @@ mod tests {
             data_keys: snapshot_rows(
                 store,
                 "SELECT json_array(
-                    key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                    key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
                     hex(wrap_nonce), hex(wrapped_key), state, created_at, destroyed_at
                  ) FROM data_keys ORDER BY key_ref",
             )
@@ -4283,9 +4448,9 @@ mod tests {
             event_heads: snapshot_rows(
                 store,
                 "SELECT json_array(
-                    conversation_id, last_seq, event_count, hex(chain_digest),
+                    personality_agent_id, last_seq, event_count, hex(chain_digest),
                     key_ref, hex(head_hmac), updated_at
-                 ) FROM event_log_heads ORDER BY conversation_id",
+                 ) FROM event_log_heads ORDER BY personality_agent_id",
             )
             .await,
             memory_batches: snapshot_rows(
@@ -4402,7 +4567,7 @@ mod tests {
     async fn durable_state_commitment_detects_deletion_of_lone_prepared_mutation() {
         let store = store().await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4439,7 +4604,7 @@ mod tests {
             .unwrap();
         let record = reasoning_record(&store, "message-1", 7).await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4513,7 +4678,7 @@ mod tests {
         let record = reasoning_record(&store, "message-1", 7).await;
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4551,10 +4716,7 @@ mod tests {
             &different_origin.model,
             reasoning_footprint(&different_item),
             &store
-                .provider_context_key(&ProviderContextKeyAnchor {
-                    conversation_id: store.scope().conversation_id.clone(),
-                    anchor_id: "message-1:7".to_owned(),
-                })
+                .provider_context_item_key(&different_item, None)
                 .await
                 .expect("mint different anchor key"),
             store.scope(),
@@ -4562,7 +4724,7 @@ mod tests {
         .expect("encrypt different reasoning");
 
         let mutation_key2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let conflicting = ProviderContextMutationBuilder::new(
@@ -4592,7 +4754,7 @@ mod tests {
             .unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4619,7 +4781,7 @@ mod tests {
         let b_item = reasoning_item_with("message-1", 7, 0, 1);
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_b = ProviderContextMutationBuilder::new(
@@ -4637,7 +4799,7 @@ mod tests {
 
         // Equal (gen, ord) with the same insert id is already satisfied.
         let mutation_key_a2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_a2 = ProviderContextMutationBuilder::new(
@@ -4655,7 +4817,7 @@ mod tests {
 
         // Equal (gen, ord) with a different insert id is superseded.
         let mutation_key_c = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_c = ProviderContextMutationBuilder::new(
@@ -4676,7 +4838,7 @@ mod tests {
         let e = reasoning_record_with(&store, "message-1", 7, 0, 2).await;
         let e_id = e.id().to_owned();
         let mutation_key_e = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let intent_e =
@@ -4723,7 +4885,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4771,7 +4933,7 @@ mod tests {
             .unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -4798,7 +4960,7 @@ mod tests {
         let b_item = reasoning_item_with("message-1", 7, 0, 1);
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let stale = ProviderContextMutationBuilder::new(
@@ -4822,7 +4984,7 @@ mod tests {
 
         // CAS update: re-prepare a pending intent after correcting only expected_latest_id.
         let mutation_key_d = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let pending = ProviderContextMutationBuilder::new(
@@ -4864,7 +5026,7 @@ mod tests {
 
         // The same newer Replace with the correct expected head succeeds.
         let mutation_key_c = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("reuse mutation key");
         let correct =
@@ -4888,7 +5050,7 @@ mod tests {
         let record = reasoning_record(&store, "message-1", 7).await;
         let record_id = record.id().to_owned();
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5006,18 +5168,14 @@ mod tests {
     async fn native_compaction_record(
         store: &Store,
         item: &ProviderContextItem,
+        config_generation: u64,
+        window_ordinal: u64,
     ) -> EncryptedProviderContextRecord {
         let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!(
-                    "{}:{}",
-                    item.retention_owner.message_id, item.retention_owner.message_seq
-                ),
-            })
+            .provider_context_item_key(item, Some((config_generation, window_ordinal)))
             .await
             .expect("mint native provider-context key");
-        EncryptedProviderContextRecord::encrypt(
+        EncryptedProviderContextRecord::encrypt_native_window(
             item,
             &item.provider_origin.provider_instance_id,
             item.provider_origin.protocol,
@@ -5025,13 +5183,15 @@ mod tests {
             dummy_footprint(),
             &key,
             store.scope(),
+            config_generation,
+            window_ordinal,
         )
         .expect("encrypt native compaction")
     }
 
     async fn insert_native_compaction(store: &Store, item: &ProviderContextItem) -> String {
         let id = provider_context_record_id(item);
-        native_compaction_record(store, item)
+        native_compaction_record(store, item, 0, u64::from(item.ordinal))
             .await
             .insert_committed(store)
             .await
@@ -5064,7 +5224,12 @@ mod tests {
 
             let item = native_compaction_item(anthropic, "retention-owner", 6, 4);
             let id = insert_native_compaction(&store, &item).await;
-            let key_ref = provider_context_owner_key_ref(store.scope(), &item.retention_owner);
+            let key_ref = provider_context_item_key_ref(
+                store.scope(),
+                &item,
+                Some((0, u64::from(item.ordinal))),
+            )
+            .expect("derive exact native provider-context key");
 
             erase_owners(&store, [("coverage-owner", 4)])
                 .await
@@ -5113,14 +5278,11 @@ mod tests {
                 .await
                 .unwrap();
             let item = native_compaction_item(false, "owner", 7, 4);
-            let record = native_compaction_record(&store, &item).await;
+            let record = native_compaction_record(&store, &item, 1, 1).await;
             let insert_key_ref = record.key_ref.clone();
             let mutation_id = format!("retention-{initial_state}");
             let intent = ProviderContextMutationBuilder::new(
-                store
-                    .conversation_key(DataKeyPurpose::Mutation)
-                    .await
-                    .unwrap(),
+                store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
                 store.scope().clone(),
                 mutation_id.clone(),
             )
@@ -5224,7 +5386,7 @@ mod tests {
         .unwrap();
 
         let dropped_item = native_compaction_item(false, "dropped-owner", 7, 4);
-        let dropped_record = native_compaction_record(&store, &dropped_item).await;
+        let dropped_record = native_compaction_record(&store, &dropped_item, 1, 1).await;
         assert!(
             dropped_record.message_id.is_none(),
             "native fixture must exercise the unanchored row shape"
@@ -5236,10 +5398,7 @@ mod tests {
         let dropped_id = dropped_record.id().to_owned();
         let dropped_key_ref = dropped_record.key_ref.clone();
         let dropped_intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "drop-native",
         )
@@ -5251,10 +5410,7 @@ mod tests {
         let kept_id = kept_record.id().to_owned();
         let kept_key_ref = kept_record.key_ref.clone();
         let kept_intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "keep-reasoning",
         )
@@ -5474,10 +5630,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let intent = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "overlapping-invalidate",
         )
@@ -5514,14 +5667,6 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut base = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -5543,6 +5688,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&base, Some((0, u64::from(base.ordinal))))
+            .await
+            .unwrap();
 
         let a = EncryptedProviderContextRecord::encrypt(
             &base,
@@ -5560,6 +5709,10 @@ mod tests {
         // on the canonical idempotency key, even though the (message_id, NULL, ordinal)
         // tuple differs.
         base.ordinal = 1;
+        let key = store
+            .provider_context_item_key(&base, Some((0, u64::from(base.ordinal))))
+            .await
+            .unwrap();
         let b = EncryptedProviderContextRecord::encrypt(
             &base,
             "provider-instance-1",
@@ -5600,6 +5753,10 @@ mod tests {
         };
         // keep the plaintext origin in sync with the payload kind
         base.provider_origin = openai_responses_origin();
+        let key = store
+            .provider_context_item_key(&base, Some((0, u64::from(base.ordinal))))
+            .await
+            .unwrap();
         let c = EncryptedProviderContextRecord::encrypt(
             &base,
             "provider-instance-1",
@@ -5628,7 +5785,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5658,7 +5815,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_preserves_data_key_when_same_anchor_is_reinserted() {
+    async fn invalidating_one_reasoning_item_preserves_its_sibling_key_and_plaintext() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_owner_event_evidence(&store, &[("message-1", 7)])
+            .await
+            .unwrap();
+        let first = canonical_reasoning_record_with(&store, "message-1", 7, 0, 0).await;
+        let second = canonical_reasoning_record_with(&store, "message-1", 7, 1, 0).await;
+        let first_id = first.id().to_owned();
+        let first_key_ref = first.key_ref().to_owned();
+        let second_key_ref = second.key_ref().to_owned();
+        assert_ne!(first_key_ref, second_key_ref);
+        first.insert_committed(&store).await.unwrap();
+        second.insert_committed(&store).await.unwrap();
+
+        let mutation = ProviderContextMutationBuilder::new(
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
+            store.scope().clone(),
+            "invalidate-one-reasoning-item",
+        )
+        .build_invalidate(None, vec![first_id])
+        .unwrap();
+        let applier = ProviderContextMutationApplier::new(&store);
+        applier.prepare(&mutation).await.unwrap();
+        assert_eq!(
+            applier
+                .apply("invalidate-one-reasoning-item")
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            data_key_state(&store, &first_key_ref).await.as_deref(),
+            Some("destroyed")
+        );
+        assert_eq!(
+            data_key_state(&store, &second_key_ref).await.as_deref(),
+            Some("active")
+        );
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let hydrated = {
+            let mut transaction = store.pool().begin().await.unwrap();
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+                .unwrap()
+        };
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].item.wire_item_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn replacement_destroys_only_the_invalidated_reasoning_item_key() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7)])
@@ -5669,11 +5883,11 @@ mod tests {
             .unwrap();
         let old_record = reasoning_record(&store, "message-1", 7).await;
         let old_id = old_record.id().to_owned();
-        let key_ref = old_record.key_ref.clone();
+        let old_key_ref = old_record.key_ref.clone();
         let applier = ProviderContextMutationApplier::new(&store);
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -5693,9 +5907,11 @@ mod tests {
 
         let new_record = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let new_id = new_record.id().to_owned();
+        let new_key_ref = new_record.key_ref.clone();
+        assert_ne!(old_key_ref, new_key_ref);
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let prepared = ProviderContextMutationBuilder::new(
@@ -5730,10 +5946,13 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "new provider_context row must be inserted");
 
-        let state = data_key_state(&store, &key_ref).await.expect("key exists");
         assert_eq!(
-            state, "active",
-            "shared anchor key must stay active while replacement row references it"
+            data_key_state(&store, &old_key_ref).await.as_deref(),
+            Some("destroyed")
+        );
+        assert_eq!(
+            data_key_state(&store, &new_key_ref).await.as_deref(),
+            Some("active")
         );
 
         let old_envelope: Vec<u8> = sqlx::query_scalar(
@@ -5757,7 +5976,7 @@ mod tests {
         let closed: FullIntent = serde_json::from_slice(&plaintext).unwrap();
         assert!(
             closed.key_ref.is_empty() && closed.ciphertext.is_empty(),
-            "deleted insert envelope must be scrubbed even while its shared key remains active"
+            "deleted insert envelope must be scrubbed after its exact key is destroyed"
         );
     }
 
@@ -5776,16 +5995,13 @@ mod tests {
         let shared_key_ref = old.key_ref.clone();
         old.insert_committed(&store).await.unwrap();
 
-        let replacement_item = reasoning_item_with("message-1", 7, 0, 1);
-        let replacement = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
+        let replacement_item = reasoning_item("message-1", 7);
+        let replacement = reasoning_record(&store, "message-1", 7).await;
         let replacement_id = replacement.id().to_owned();
         assert_eq!(replacement.key_ref, shared_key_ref);
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared_replace = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "prepared-shared-insert",
         )
@@ -5794,10 +6010,7 @@ mod tests {
         applier.prepare(&prepared_replace).await.unwrap();
 
         let invalidate = ProviderContextMutationBuilder::new(
-            store
-                .conversation_key(DataKeyPurpose::Mutation)
-                .await
-                .unwrap(),
+            store.private_key(DataKeyPurpose::Mutation).await.unwrap(),
             store.scope().clone(),
             "invalidate-shared-live",
         )
@@ -5834,7 +6047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_data_key_survives_until_last_reference_is_invalidated() {
+    async fn reasoning_item_keys_are_destroyed_independently() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7)])
@@ -5848,14 +6061,16 @@ mod tests {
 
         let b = reasoning_record_with(&store, "message-1", 7, 1, 0).await;
         let b_id = b.id().to_owned();
+        let b_key_ref = b.key_ref.clone();
+        assert_ne!(key_ref, b_key_ref);
         b.insert_committed(&store).await.unwrap();
 
         let mutation_key_a = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key a");
         let mutation_key_b = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key b");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5870,10 +6085,13 @@ mod tests {
         applier.prepare(&invalidate_a).await.unwrap();
         applier.apply("mutation-a").await.unwrap();
 
-        let state = data_key_state(&store, &key_ref).await.expect("key exists");
         assert_eq!(
-            state, "active",
-            "shared key must stay active while pc-b references it"
+            data_key_state(&store, &key_ref).await.as_deref(),
+            Some("destroyed")
+        );
+        assert_eq!(
+            data_key_state(&store, &b_key_ref).await.as_deref(),
+            Some("active")
         );
 
         let invalidate_b = ProviderContextMutationBuilder::new(
@@ -5886,15 +6104,14 @@ mod tests {
         applier.prepare(&invalidate_b).await.unwrap();
         applier.apply("mutation-b").await.unwrap();
 
-        let state = data_key_state(&store, &key_ref).await.expect("key exists");
         assert_eq!(
-            state, "destroyed",
-            "shared key must be destroyed after last reference"
+            data_key_state(&store, &b_key_ref).await.as_deref(),
+            Some("destroyed")
         );
     }
 
     #[tokio::test]
-    async fn invalidation_rejects_cross_conversation_provider_context() {
+    async fn invalidation_rejects_cross_personality_agent_provider_context() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_message(&store, "message-2", 9).await.unwrap();
@@ -5904,20 +6121,30 @@ mod tests {
         let cross_key_ref = cross_record.key_ref.clone();
         cross_record.insert_committed(&store).await.unwrap();
 
-        // Tamper with the data_keys row so it appears to belong to another conversation,
-        // simulating a cross-conversation row referenced by this conversation's store.
+        // Disable the relationship check only for the deliberate corruption,
+        // while preserving the canonical UUIDv7 column contract.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(store.pool())
+            .await
+            .expect("disable fixture foreign keys");
         sqlx::query(
-            "UPDATE data_keys SET conversation_id = 'other-conversation' WHERE key_ref = ?",
+            "UPDATE data_keys SET personality_agent_id =
+                '0198f0f4-9b72-7000-8000-000000000002'
+             WHERE key_ref = ?",
         )
         .bind(&cross_key_ref)
         .execute(store.pool())
         .await
         .expect("tamper fixture");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(store.pool())
+            .await
+            .expect("restore fixture foreign keys");
 
         let replacement = reasoning_record(&store, "message-2", 9).await;
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5940,10 +6167,10 @@ mod tests {
         let error = applier
             .apply("mutation-1")
             .await
-            .expect_err("cross-conversation id must fail closed");
+            .expect_err("cross-personality-agent id must fail closed");
         let message = format!("{error:#}");
         assert!(
-            message.contains("belongs to a different conversation"),
+            message.contains("belongs to another personality agent"),
             "{message}"
         );
 
@@ -5952,7 +6179,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .unwrap();
-        assert_eq!(count, 1, "cross-conversation row must not be deleted");
+        assert_eq!(count, 1, "cross-personality-agent row must not be deleted");
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
             .bind(replacement.id())
@@ -5992,7 +6219,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -6057,14 +6284,14 @@ mod tests {
             target.insert_committed(&store).await.unwrap();
 
             let mutation_key = store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key");
             let wrong_key_ref = if purpose == DataKeyPurpose::Mutation {
                 mutation_key.key_ref.clone()
             } else {
                 store
-                    .conversation_key(purpose)
+                    .private_key(purpose)
                     .await
                     .expect("load hostile wrong-purpose key")
                     .key_ref
@@ -6147,7 +6374,7 @@ mod tests {
             let applier = ProviderContextMutationApplier::new(&store);
             let prepared = ProviderContextMutationBuilder::new(
                 store
-                    .conversation_key(DataKeyPurpose::Mutation)
+                    .private_key(DataKeyPurpose::Mutation)
                     .await
                     .expect("mint mutation key"),
                 store.scope().clone(),
@@ -6242,7 +6469,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let prepared = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -6343,13 +6570,6 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_message(&store, "message-2", 8).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-2:8".to_owned(),
-            })
-            .await
-            .unwrap();
         let item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-2".to_owned(),
@@ -6371,6 +6591,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let mut row_identity = item.clone();
         row_identity.retention_owner = ProviderContextAnchor {
             message_id: "message-1".to_owned(),
@@ -6426,13 +6650,6 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let wrong_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "different-message:9".to_owned(),
-            })
-            .await
-            .unwrap();
         let item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -6454,11 +6671,18 @@ mod tests {
                 },
             },
         };
+        let mut wrong_item = item.clone();
+        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
+            &mut wrong_item.payload
+        {
+            coverage.context_fingerprint = "different-fingerprint".to_owned();
+        }
+        let wrong_key = store
+            .provider_context_item_key(&wrong_item, Some((0, u64::from(wrong_item.ordinal))))
+            .await
+            .unwrap();
         let correct_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
             .await
             .unwrap();
         let mut record = EncryptedProviderContextRecord::encrypt(
@@ -6505,13 +6729,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
         let item = reasoning_item("message-1", 7);
         let record_id = provider_context_record_id(&item);
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
+        let key = store.provider_context_item_key(&item, None).await.unwrap();
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
             &item.provider_origin.provider_instance_id,
@@ -6645,14 +6863,6 @@ mod tests {
         seed_message(&store, "message-1", 1).await.unwrap();
         seed_message(&store, "message-2", 2).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:1".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -6674,6 +6884,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let later = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -6706,10 +6920,7 @@ mod tests {
             },
         };
         let second_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-2:2".to_owned(),
-            })
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
             .await
             .unwrap();
         let earlier_reasoning = EncryptedProviderContextRecord::encrypt(
@@ -6767,14 +6978,6 @@ mod tests {
         seed_message(&store, "message-2", 2).await.unwrap();
 
         // Native compaction covering seq 1; suffix begins at seq 2.
-        let compaction_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-2:2".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let compaction_item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-2".to_owned(),
@@ -6796,6 +6999,13 @@ mod tests {
                 },
             },
         };
+        let compaction_key = store
+            .provider_context_item_key(
+                &compaction_item,
+                Some((0, u64::from(compaction_item.ordinal))),
+            )
+            .await
+            .unwrap();
         let compaction = EncryptedProviderContextRecord::encrypt(
             &compaction_item,
             "provider-instance-1",
@@ -6867,7 +7077,7 @@ mod tests {
         record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -6952,7 +7162,7 @@ mod tests {
         record2.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -7041,7 +7251,7 @@ mod tests {
         let applier = ProviderContextMutationApplier::new(&store);
         let intent = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             store.scope().clone(),
@@ -7114,14 +7324,6 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -7143,6 +7345,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let mut record = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -7186,14 +7392,6 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -7215,6 +7413,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let mut record = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -7258,16 +7460,9 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut item = reasoning_item("message-1", 7);
         let origin = reasoning_origin();
+        let key = store.provider_context_item_key(&item, None).await.unwrap();
         let mut record = EncryptedProviderContextRecord::encrypt(
             &item,
             &origin.provider_instance_id,
@@ -7299,7 +7494,7 @@ mod tests {
         .expect_err("hydration must reject encrypted reasoning without a wire_item_index");
         let message = format!("{error:#}");
         assert!(
-            message.contains("encrypted reasoning must have a wire_item_index"),
+            message.contains("reasoning retention anchor requires a wire item index"),
             "{message}"
         );
     }
@@ -7309,16 +7504,9 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:7".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let mut item = reasoning_item("message-1", 7);
         let origin = reasoning_origin();
+        let key = store.provider_context_item_key(&item, None).await.unwrap();
         let mut record = EncryptedProviderContextRecord::encrypt(
             &item,
             &origin.provider_instance_id,
@@ -7447,10 +7635,7 @@ mod tests {
             .expect("current-main V1 footprint");
         assert_eq!(footprint.eviction_tokens(), 24);
         let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-legacy:7".to_owned(),
-            })
+            .provider_context_item_key(&item, None)
             .await
             .expect("provider-context key");
         EncryptedProviderContextRecord::encrypt(
@@ -7597,7 +7782,7 @@ mod tests {
 
         let record = reasoning_record(&store, "message-1", 7).await;
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let plaintext = reasoning_item("message-1", 7);
@@ -7620,14 +7805,6 @@ mod tests {
         let store = store().await;
         seed_message(&store, "message-1", 1).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-1:1".to_owned(),
-            })
-            .await
-            .unwrap();
-
         let item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: "message-1".to_owned(),
@@ -7649,6 +7826,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let first = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -7674,13 +7855,17 @@ mod tests {
                 context_fingerprint: "fp-2".to_owned(),
             },
         };
+        let second_key = store
+            .provider_context_item_key(&second_item, Some((0, u64::from(second_item.ordinal))))
+            .await
+            .unwrap();
         let second = EncryptedProviderContextRecord::encrypt(
             &second_item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
             dummy_footprint(),
-            &key,
+            &second_key,
             store.scope(),
         )
         .expect("encrypt second window");
@@ -7724,7 +7909,7 @@ mod tests {
         let a_id = a.id().to_owned();
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7738,7 +7923,7 @@ mod tests {
         let b_id = b.id().to_owned();
         let intent_b = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7754,7 +7939,7 @@ mod tests {
 
         let invalidate = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope,
@@ -7810,7 +7995,7 @@ mod tests {
         let a_id = a.id().to_owned();
         let intent_a = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope.clone(),
@@ -7828,7 +8013,7 @@ mod tests {
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
         let intent_b = ProviderContextMutationBuilder::new(
             store
-                .conversation_key(DataKeyPurpose::Mutation)
+                .private_key(DataKeyPurpose::Mutation)
                 .await
                 .expect("mint mutation key"),
             scope,
@@ -7974,14 +8159,6 @@ mod tests {
         seed_message(&store, "message-1", 1).await.unwrap();
         seed_message(&store, "message-3", 3).await.unwrap();
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: "message-3:3".to_owned(),
-            })
-            .await
-            .unwrap();
-
         // Persisted messages at seq 1 and 3 (gaps are legal), but coverage claims seq 5.
         let item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
@@ -8004,6 +8181,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&item, Some((0, u64::from(item.ordinal))))
+            .await
+            .unwrap();
         let compaction = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -8115,7 +8296,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_shared_key() {
+    async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_sibling_keys() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_owner_event_evidence(&store, &[("message-1", 7)])
@@ -8125,7 +8306,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Two reasoning records for the same anchor share a data key.
+        // Two reasoning records for the same owner have distinct retention keys.
         let a = reasoning_record_with(&store, "message-1", 7, 0, 0).await;
         let a_id = a.id().to_owned();
         let b = reasoning_record_with(&store, "message-1", 7, 0, 1).await;
@@ -8133,11 +8314,11 @@ mod tests {
         a.insert_committed(&store).await.unwrap();
         b.insert_committed(&store).await.unwrap();
 
-        // Replace invalidates pc-a and inserts pc-c. All three share the anchor key.
+        // Replace invalidates pc-a and inserts pc-c under its own retention key.
         let c = reasoning_record_with(&store, "message-1", 7, 0, 2).await;
         let c_id = c.id().to_owned();
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -8239,11 +8420,21 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 2, "remaining rows must survive");
 
-        // The shared anchor key stays active because pc-b and pc-c still use it.
-        let state = data_key_state(&store, &a.key_ref)
-            .await
-            .expect("key exists");
-        assert_eq!(state, "active", "shared anchor key must stay active");
+        assert_eq!(
+            data_key_state(&store, &a.key_ref).await.as_deref(),
+            Some("destroyed"),
+            "invalidated item key must be destroyed"
+        );
+        assert_eq!(
+            data_key_state(&store, &b.key_ref).await.as_deref(),
+            Some("active"),
+            "surviving sibling key must stay active"
+        );
+        assert_eq!(
+            data_key_state(&store, &c.key_ref).await.as_deref(),
+            Some("active"),
+            "replacement item key must stay active"
+        );
 
         // The internal test seam in `invalidate_ids` asserted the row's
         // ciphertext was overwritten with zeros before the DELETE executed.
@@ -8325,7 +8516,7 @@ mod tests {
         let new_id = new_record.id().to_owned();
 
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -8361,7 +8552,7 @@ mod tests {
         // A duplicate replace intent with the same (gen, ord, id) is already
         // satisfied and must not re-add the footprint.
         let mutation_key_2 = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mint second mutation key");
         let prepared_2 = ProviderContextMutationBuilder::new(
@@ -8397,19 +8588,8 @@ mod tests {
         store: &Store,
         item: &ProviderContextItem,
     ) -> EncryptedProviderContextRecord {
-        let origin_message = item
-            .origin_message
-            .as_ref()
-            .expect("reasoning item must have an anchor");
-        let anchor = ProviderContextKeyAnchor {
-            conversation_id: store.scope().conversation_id.clone(),
-            anchor_id: format!(
-                "{}:{}",
-                origin_message.message_id, origin_message.message_seq
-            ),
-        };
         let key = store
-            .provider_context_key(&anchor)
+            .provider_context_item_key(item, None)
             .await
             .expect("mint reasoning anchor key");
         EncryptedProviderContextRecord::encrypt(

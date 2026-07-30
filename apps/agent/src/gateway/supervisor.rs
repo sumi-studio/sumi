@@ -18,21 +18,25 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
-use crate::runtime::contracts::ProcessGeneration;
+use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration};
 
 use super::{
     CommandAck, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
     OutboundFrame, OversizedFrameError,
 };
 
+pub mod post_commit;
 pub mod seams;
 pub mod session;
 
@@ -77,19 +81,36 @@ impl ConnectionEpoch {
 #[derive(Clone)]
 pub struct GatewayCredential {
     token: String,
+    personality_agent_id: PersonalityAgentId,
+    generation: ProcessGeneration,
     delivery_authorization: DeliveryAuthorization,
 }
 
 impl GatewayCredential {
-    pub fn new(token: impl Into<String>, delivery_authorization: DeliveryAuthorization) -> Self {
+    pub fn new(
+        token: impl Into<String>,
+        personality_agent_id: PersonalityAgentId,
+        generation: ProcessGeneration,
+        delivery_authorization: DeliveryAuthorization,
+    ) -> Self {
         Self {
             token: token.into(),
+            personality_agent_id,
+            generation,
             delivery_authorization,
         }
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
+    }
+
+    pub const fn generation(&self) -> ProcessGeneration {
+        self.generation
     }
 
     pub const fn delivery_authorization(&self) -> DeliveryAuthorization {
@@ -101,6 +122,8 @@ impl fmt::Debug for GatewayCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayCredential")
             .field("token", &"[REDACTED]")
+            .field("personality_agent_id", &self.personality_agent_id)
+            .field("generation", &self.generation)
             .field("delivery_authorization", &self.delivery_authorization)
             .finish()
     }
@@ -131,7 +154,7 @@ impl Drop for GatewayCredential {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
-    pub agent_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     #[serde(with = "lossless_generation")]
     pub generation: ProcessGeneration,
     #[serde(with = "lossless_u64")]
@@ -146,6 +169,7 @@ pub struct AgentHello {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiHello {
+    pub personality_agent_id: PersonalityAgentId,
     #[serde(with = "lossless_generation")]
     pub accepted_generation: ProcessGeneration,
     #[serde(with = "lossless_u64")]
@@ -303,11 +327,12 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         Ok(self.clone())
     }
 
-    /// Optional T17 capability consumed by `SessionGateway`.
+    /// Optional composite T26/T17 capability consumed by `SessionGateway`.
     ///
-    /// Sources without an EventWriter/DeliveryPump leave this absent. A
-    /// production Session event is fatal if it reaches an adapter without this
-    /// capability; ACK-only supervisor users do not require it.
+    /// Sources without an EventWriter/post-commit dispatcher/DeliveryPump leave
+    /// this absent. A production Session event is fatal if it reaches an
+    /// adapter without this capability; ACK-only supervisor users do not
+    /// require it.
     fn session_event_sink(&self) -> Option<session::SessionEventSink> {
         None
     }
@@ -326,6 +351,13 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Invalidate the exact delivery epoch and close every source-owned
+    /// failure-report producer for it before returning `Ok(())`.
+    ///
+    /// The corresponding [`DeliveryEpochRuntime`] task may own one final
+    /// producer until it is joined. This producer-closing contract lets the
+    /// supervisor invalidate, join, and then drain the failure receiver
+    /// without racing a late source-owned terminal report.
     async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
         Ok(())
     }
@@ -356,6 +388,20 @@ pub(crate) enum DeliveryEpochFailure {
     Fatal(String),
 }
 
+enum DeliveryTaskTerminal {
+    AlreadyObserved,
+    Clean,
+    Cancelled,
+    Panicked(String),
+    JoinError(String),
+}
+
+struct DeliveryEpochSettlement {
+    task_terminal: DeliveryTaskTerminal,
+    first_fatal: Option<String>,
+    first_reconnect: Option<String>,
+}
+
 enum DeliveryEpochCompletion {
     /// The delivery pump itself reported a recoverable channel failure.
     Reported(DeliveryEpochFailure),
@@ -368,7 +414,7 @@ enum DeliveryEpochCompletion {
 }
 
 impl DeliveryEpochCompletion {
-    fn into_supervisor_error(self) -> Option<SupervisorError> {
+    fn into_supervisor_error(self, later_report_queued: bool) -> Option<SupervisorError> {
         match self {
             Self::Reported(DeliveryEpochFailure::Reconnect(reason)) => {
                 Some(SupervisorError::EstablishedReconnect {
@@ -379,9 +425,11 @@ impl DeliveryEpochCompletion {
             Self::Reported(DeliveryEpochFailure::Fatal(reason)) => Some(SupervisorError::Fatal(
                 anyhow!("delivery epoch failed permanently: {reason}"),
             )),
+            Self::FailureChannelClosed if later_report_queued => None,
             Self::FailureChannelClosed => Some(SupervisorError::Fatal(anyhow!(
                 "delivery epoch failure channel closed without a terminal signal"
             ))),
+            Self::Task(Ok(())) if later_report_queued => None,
             Self::Task(Ok(())) => Some(SupervisorError::Fatal(anyhow!(
                 "delivery epoch task ended without a terminal signal"
             ))),
@@ -444,6 +492,42 @@ impl DeliveryEpochRuntime {
             None => Ok(()),
         }
     }
+
+    /// Join the retained task and fully drain terminal reports after exact
+    /// source invalidation has closed every non-task-owned producer.
+    async fn settle_after_invalidation(mut self) -> DeliveryEpochSettlement {
+        let task_terminal = match self.task.take() {
+            None => DeliveryTaskTerminal::AlreadyObserved,
+            Some(task) => match task.await {
+                Ok(()) => DeliveryTaskTerminal::Clean,
+                Err(join_err) if join_err.is_panic() => {
+                    DeliveryTaskTerminal::Panicked(join_err.to_string())
+                }
+                Err(join_err) if join_err.is_cancelled() => DeliveryTaskTerminal::Cancelled,
+                Err(join_err) => DeliveryTaskTerminal::JoinError(join_err.to_string()),
+            },
+        };
+        let mut first_fatal = None;
+        let mut first_reconnect = None;
+        loop {
+            match self.failure_rx.try_recv() {
+                Ok(DeliveryEpochFailure::Fatal(reason)) => {
+                    first_fatal.get_or_insert(reason);
+                }
+                Ok(DeliveryEpochFailure::Reconnect(reason)) => {
+                    first_reconnect.get_or_insert(reason);
+                }
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        DeliveryEpochSettlement {
+            task_terminal,
+            first_fatal,
+            first_reconnect,
+        }
+    }
 }
 
 /// `HydrationReady` is a per-generation latched state. T17 will drive the
@@ -455,7 +539,7 @@ pub trait HydrationLatch: Clone + Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupervisorConfig {
-    pub agent_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub generation: ProcessGeneration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
@@ -469,25 +553,6 @@ pub struct SupervisorConfig {
     pub connect_timeout: Duration,
 }
 
-impl Default for SupervisorConfig {
-    fn default() -> Self {
-        Self {
-            agent_id: String::new(),
-            generation: ProcessGeneration::MIN,
-            initial_backoff: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(30),
-            send_timeout: Duration::from_secs(30),
-            event_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            command_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            catch_up_page_size: NonZeroUsize::new(64).expect("64 is nonzero"),
-            max_reconnect_attempts: None,
-            max_auth_attempts: Some(3),
-            hello_timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(30),
-        }
-    }
-}
-
 /// Sender returned by `SupervisorHandle::events`.
 ///
 /// Direct frames are tagged with the public `online` value observed at
@@ -499,6 +564,12 @@ impl Default for SupervisorConfig {
 pub struct EventSender {
     tx: mpsc::Sender<(DeliveryEpoch, bool, OutboundFrame)>,
     online: watch::Receiver<bool>,
+}
+
+enum DeliveryPumpSendOutcome {
+    Sent,
+    Cancelled,
+    Closed,
 }
 
 impl EventSender {
@@ -554,6 +625,30 @@ impl EventSender {
             .await
     }
 
+    /// Resolve cancellation before obtaining a bounded-lane permit. Once a
+    /// permit is obtained, enqueue and the caller's durable fence completion
+    /// are synchronous with no cancellation point between them.
+    async fn send_from_delivery_pump_owned(
+        &self,
+        (epoch, frame): (DeliveryEpoch, OutboundFrame),
+        cancel: &CancellationToken,
+    ) -> DeliveryPumpSendOutcome {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return DeliveryPumpSendOutcome::Cancelled,
+            permit = self.tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return DeliveryPumpSendOutcome::Closed,
+            }
+        };
+        let pump_admitted_online = matches!(
+            &frame,
+            OutboundFrame::Event { envelope } if envelope.seq.is_none()
+        );
+        permit.send((epoch, pump_admitted_online, frame));
+        DeliveryPumpSendOutcome::Sent
+    }
+
     async fn send_with_admission(
         &self,
         epoch: DeliveryEpoch,
@@ -586,29 +681,207 @@ struct SupervisorLifecycle {
     task: Option<JoinHandle<Result<()>>>,
 }
 
+pub(super) const OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await an owned runtime task without moving its `JoinHandle` out before the
+/// await. Cancelling this future leaves the task in its lifecycle owner; only a
+/// resolved join transfers the terminal outcome and clears ownership.
+pub(super) async fn join_owned_runtime_task(
+    task: &mut Option<JoinHandle<Result<()>>>,
+    owner: &'static str,
+) -> Result<()> {
+    let joined = task
+        .as_mut()
+        .with_context(|| format!("{owner} task was already joined"))?
+        .await;
+    task.take()
+        .expect("owned runtime task remains present until its join resolves");
+    match joined {
+        Ok(result) => result,
+        Err(error) => {
+            let classification = if error.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            Err(anyhow::Error::new(error).context(format!("{owner} task {classification}")))
+        }
+    }
+}
+
+pub(super) fn fail_stop_teardown_deadline(owner: &'static str, timeout: Duration) -> ! {
+    tracing::error!(
+        owner,
+        timeout_millis = timeout.as_millis(),
+        "owned runtime teardown deadline elapsed"
+    );
+    std::process::abort();
+}
+
+pub(super) fn settle_finished_or_fail_stop_runtime_task(
+    task: &mut Option<JoinHandle<Result<()>>>,
+    owner: &'static str,
+) {
+    let Some(handle) = task.take() else {
+        return;
+    };
+    if handle.is_finished() {
+        match handle.now_or_never() {
+            Some(Ok(Ok(()))) => return,
+            Some(Ok(Err(error))) => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task failure");
+            }
+            Some(Err(error)) if error.is_panic() => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task panic");
+            }
+            Some(Err(error)) => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task cancellation");
+            }
+            None => {
+                tracing::error!(
+                    owner,
+                    "finished runtime task was not ready when synchronously joined"
+                );
+            }
+        }
+        std::process::abort();
+    }
+
+    // Drop cannot asynchronously settle this owner. Continuing would detach
+    // cleanup from the runtime root, so make the ownership failure explicit.
+    tracing::error!(owner, "runtime task owner dropped before a retained join");
+    std::process::abort();
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorTermination {
+    Completed,
+    Failed(String),
+    Panicked(String),
+    Cancelled(String),
+}
+
+impl fmt::Display for SupervisorTermination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => write!(formatter, "connection supervisor completed unexpectedly"),
+            Self::Failed(reason) => write!(formatter, "connection supervisor failed: {reason}"),
+            Self::Panicked(reason) => write!(formatter, "connection supervisor panicked: {reason}"),
+            Self::Cancelled(reason) => {
+                write!(
+                    formatter,
+                    "connection supervisor task was cancelled: {reason}"
+                )
+            }
+        }
+    }
+}
+
+pub(crate) struct SupervisorRuntime {
+    lifecycle: SupervisorLifecycle,
+    completed: Option<Result<()>>,
+}
+
+impl SupervisorRuntime {
+    fn new(lifecycle: SupervisorLifecycle) -> Self {
+        Self {
+            lifecycle,
+            completed: None,
+        }
+    }
+
+    /// Begin planned supervisor shutdown without relinquishing task ownership.
+    ///
+    /// Cancellation is idempotent and synchronous. The retained owner must
+    /// still call [`Self::cancel_and_join`] after dependent runtime teardown so
+    /// the supervisor can finish its per-epoch cleanup without detaching.
+    pub(crate) fn request_shutdown(&self) {
+        self.lifecycle.cancel.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_observer_for_test(&self) -> tokio::task::AbortHandle {
+        self.lifecycle
+            .task
+            .as_ref()
+            .expect("live supervisor test owner retains its task")
+            .abort_handle()
+    }
+
+    pub(crate) async fn termination(&mut self) -> Result<SupervisorTermination> {
+        let joined = self
+            .lifecycle
+            .task
+            .as_mut()
+            .context("connection supervisor completion was already observed")?
+            .await;
+        self.lifecycle.task.take();
+        let (termination, result) = match joined {
+            Ok(Ok(())) => (SupervisorTermination::Completed, Ok(())),
+            Ok(Err(error)) => (SupervisorTermination::Failed(error.to_string()), Err(error)),
+            Err(join_error) if join_error.is_panic() => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Panicked(reason.clone()),
+                    Err(anyhow!("connection supervisor task panicked: {reason}")),
+                )
+            }
+            Err(join_error) => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Cancelled(reason.clone()),
+                    Err(anyhow!(
+                        "connection supervisor task was cancelled: {reason}"
+                    )),
+                )
+            }
+        };
+        self.completed = Some(result);
+        Ok(termination)
+    }
+
+    pub(crate) async fn cancel_and_join(&mut self) -> Result<()> {
+        self.request_shutdown();
+        match self.completed.take() {
+            Some(result) => result,
+            None => self.lifecycle.join().await,
+        }
+    }
+}
+
 impl SupervisorHandle {
     pub fn abort(&self) {
         self.lifecycle.cancel.cancel();
     }
 
     pub async fn join(mut self) -> Result<()> {
-        let task = self
-            .lifecycle
-            .task
-            .take()
-            .context("supervisor task was already consumed")?;
-        task.await?
+        self.lifecycle.join().await
+    }
+}
+
+impl SupervisorLifecycle {
+    async fn join(&mut self) -> Result<()> {
+        self.join_with_timeout(OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn join_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        match time::timeout(
+            timeout,
+            join_owned_runtime_task(&mut self.task, "connection supervisor owner"),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => fail_stop_teardown_deadline("connection supervisor owner", timeout),
+        }
     }
 }
 
 impl Drop for SupervisorLifecycle {
     fn drop(&mut self) {
         self.cancel.cancel();
-        // Dropping a JoinHandle detaches the task. Keep the cancelled
-        // supervisor alive long enough to join both connection halves and
-        // invalidate the installed T17 delivery epoch. Aborting this task here
-        // would cancel the cleanup future and leave the dead epoch mapped.
-        self.task.take();
+        settle_finished_or_fail_stop_runtime_task(&mut self.task, "connection supervisor owner");
     }
 }
 
@@ -637,7 +910,12 @@ where
     cancel: CancellationToken,
     /// Test-only notification fired when `send_validated` is about to block on
     /// a full command channel.
+    #[cfg(test)]
     command_send_blocked_notify: Option<Arc<Notify>>,
+    /// Deterministic both-ready settlement seam: wait until the reader future
+    /// has returned before polling the epoch select.
+    #[cfg(test)]
+    wait_for_reader_before_epoch_select: bool,
 }
 
 impl<C, P, S, L> ConnectionSupervisor<C, P, S, L>
@@ -667,12 +945,22 @@ where
             current_epoch,
             online: Arc::new(online_tx),
             cancel: CancellationToken::new(),
+            #[cfg(test)]
             command_send_blocked_notify: None,
+            #[cfg(test)]
+            wait_for_reader_before_epoch_select: false,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_command_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
         self.command_send_blocked_notify = Some(notify);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_reader_ready_before_epoch_select(mut self) -> Self {
+        self.wait_for_reader_before_epoch_select = true;
         self
     }
 
@@ -825,6 +1113,17 @@ where
                 reason: format!("failed to obtain credential: {e}"),
             })?,
         };
+        if credential.personality_agent_id() != &config.personality_agent_id
+            || credential.generation() != config.generation
+        {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "gateway credential scope mismatch: expected ({}, {}), got ({}, {})",
+                config.personality_agent_id,
+                config.generation,
+                credential.personality_agent_id(),
+                credential.generation(),
+            )));
+        }
         let delivery_authorization = credential.delivery_authorization();
 
         let mut gateway = tokio::select! {
@@ -940,20 +1239,41 @@ where
         self.current_epoch.send_replace(Some(delivery_epoch));
         let _ = delivery_ready_tx.send(Ok(()));
 
+        #[cfg(test)]
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
-        let mut reader_handle = tokio::spawn(reader_task(
+        let reader_run = reader_task(
             reader,
             commands_tx,
             self.latch.clone(),
             api_hello,
+            config.personality_agent_id.clone(),
             epoch_token.child_token(),
+            #[cfg(test)]
             command_send_blocked_notify,
-        ));
+        );
+        #[cfg(test)]
+        let reader_completed = Arc::new(Notify::new());
+        #[cfg(test)]
+        let task_reader_completed = reader_completed.clone();
+        #[cfg(not(test))]
+        let mut reader_handle = tokio::spawn(reader_run);
+        #[cfg(test)]
+        let mut reader_handle = tokio::spawn(async move {
+            let result = reader_run.await;
+            task_reader_completed.notify_one();
+            result
+        });
+        #[cfg(test)]
+        if self.wait_for_reader_before_epoch_select {
+            reader_completed.notified().await;
+        }
 
         let mut delivery_completion = None;
+        let mut planned_shutdown = false;
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                planned_shutdown = true;
                 epoch_token.cancel();
                 let _ = self.online.send(false);
                 let reader_result = reader_handle.await;
@@ -1014,40 +1334,90 @@ where
             }
         };
 
-        let delivery_join_error = if let Some(runtime) = delivery_runtime {
-            match runtime.join().await {
-                Ok(()) => None,
-                Err(join_err) if join_err.is_panic() => Some(SupervisorError::Fatal(anyhow!(
-                    "delivery epoch task panicked: {join_err}"
-                ))),
-                Err(join_err) if !join_err.is_cancelled() => Some(SupervisorError::Fatal(anyhow!(
-                    "delivery epoch task join error: {join_err}"
-                ))),
-                Err(_) => None,
-            }
+        // Exact invalidation closes every source-owned failure producer. Join
+        // the retained runtime task next, then fully drain its receiver. This
+        // ordering prevents every select branch (root, reader, writer, or
+        // delivery) from erasing a terminal report that was queued while two
+        // branches were simultaneously ready.
+        let invalidation_error = source
+            .invalidate_delivery_epoch(delivery_epoch)
+            .await
+            .err()
+            .map(|error| {
+                error.context(format!(
+                    "failed to invalidate T17 delivery epoch {}",
+                    delivery_epoch.as_u64()
+                ))
+            });
+        let settlement = if let Some(runtime) = delivery_runtime {
+            runtime.settle_after_invalidation().await
         } else {
-            None
+            DeliveryEpochSettlement {
+                task_terminal: DeliveryTaskTerminal::AlreadyObserved,
+                first_fatal: None,
+                first_reconnect: None,
+            }
+        };
+        let DeliveryEpochSettlement {
+            task_terminal,
+            first_fatal,
+            first_reconnect,
+        } = settlement;
+        let task_fatal = match task_terminal {
+            DeliveryTaskTerminal::Panicked(reason) => {
+                Some(anyhow!("delivery epoch task panicked: {reason}"))
+            }
+            DeliveryTaskTerminal::JoinError(reason) => {
+                Some(anyhow!("delivery epoch task join error: {reason}"))
+            }
+            DeliveryTaskTerminal::AlreadyObserved
+            | DeliveryTaskTerminal::Clean
+            | DeliveryTaskTerminal::Cancelled => None,
+        };
+        let queued_fatal =
+            first_fatal.map(|reason| anyhow!("delivery epoch failed permanently: {reason}"));
+        let (result_fatal, branch_result) = match result {
+            Err(SupervisorError::Fatal(error)) => (Some(error), Ok(())),
+            result => (None, result),
+        };
+        let delivery_branch = delivery_completion.is_some();
+        let later_report_queued = queued_fatal.is_some() || first_reconnect.is_some();
+        let completion_error = delivery_completion
+            .and_then(|completion| completion.into_supervisor_error(later_report_queued));
+        let (completion_fatal, completion_nonfatal) = match completion_error {
+            Some(SupervisorError::Fatal(error)) => (Some(error), None),
+            error => (None, error),
         };
 
-        if let Err(error) = source.invalidate_delivery_epoch(delivery_epoch).await {
-            return Err(SupervisorError::Fatal(error.context(format!(
-                "failed to invalidate T17 delivery epoch {}",
-                delivery_epoch.as_u64()
-            ))));
-        }
-        if let Some(error) = delivery_join_error {
-            return Err(error);
-        }
-        if matches!(&result, Err(SupervisorError::Fatal(_))) {
-            return result;
-        }
-        if let Some(completion) = delivery_completion
-            && let Some(error) = completion.into_supervisor_error()
-        {
-            return Err(error);
+        let mut fatal = invalidation_error;
+        fatal = combine_epoch_fatal(fatal, task_fatal, "delivery task settlement also failed");
+        fatal = combine_epoch_fatal(fatal, result_fatal, "epoch branch also failed");
+        fatal = combine_epoch_fatal(
+            fatal,
+            completion_fatal,
+            "observed delivery completion also failed",
+        );
+        fatal = combine_epoch_fatal(fatal, queued_fatal, "queued delivery report also failed");
+        if let Some(error) = fatal {
+            return Err(SupervisorError::Fatal(error));
         }
 
-        if let Err(SupervisorError::EstablishedReconnect { .. }) = &result {
+        if planned_shutdown {
+            return branch_result;
+        }
+        if delivery_branch {
+            if let Some(error) = completion_nonfatal {
+                return Err(error);
+            }
+            if let Some(reason) = first_reconnect {
+                return Err(SupervisorError::EstablishedReconnect {
+                    reason: format!("delivery epoch failed: {reason}"),
+                    healthy: false,
+                });
+            }
+        }
+
+        if let Err(SupervisorError::EstablishedReconnect { .. }) = &branch_result {
             tracing::debug!(
                 connection_epoch = connection_epoch.as_u64(),
                 delivery_epoch = delivery_epoch.as_u64(),
@@ -1055,7 +1425,7 @@ where
             );
         }
 
-        result
+        branch_result
     }
 
     fn inspect_epoch_results<F>(
@@ -1190,7 +1560,7 @@ async fn build_agent_hello<S: DurableSource>(
                 reason: format!("command cursor unavailable: {e}"),
             })?;
     Ok(AgentHello {
-        agent_id: config.agent_id.clone(),
+        personality_agent_id: config.personality_agent_id.clone(),
         generation: config.generation,
         last_sent_event_seq: event_cursor.last_sent,
         last_received_command_seq: command_cursor.received,
@@ -1203,6 +1573,13 @@ async fn validate_hello<S: DurableSource>(
     agent: &AgentHello,
     api: &ApiHello,
 ) -> Result<(), SupervisorError> {
+    if api.personality_agent_id != agent.personality_agent_id {
+        return Err(SupervisorError::Fatal(anyhow!(
+            "personality-agent claim mismatch: api={}, agent={}",
+            api.personality_agent_id,
+            agent.personality_agent_id
+        )));
+    }
     if api.accepted_generation != agent.generation {
         return Err(SupervisorError::Fatal(anyhow!(
             "generation claim mismatch: api={}, agent={}",
@@ -1271,6 +1648,21 @@ enum SupervisorError {
     Fatal(anyhow::Error),
     Reconnect { reason: String },
     EstablishedReconnect { reason: String, healthy: bool },
+}
+
+fn combine_epoch_fatal(
+    primary: Option<anyhow::Error>,
+    secondary: Option<anyhow::Error>,
+    secondary_label: &'static str,
+) -> Option<anyhow::Error> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (Some(primary), Some(secondary)) => {
+            Some(anyhow!("{primary:#}; {secondary_label}: {secondary:#}"))
+        }
+    }
 }
 
 /// A permanent inconsistency in the local durable replay source.
@@ -1938,8 +2330,9 @@ async fn reader_task<R, L>(
     mut command_tx: mpsc::Sender<InboundCommand>,
     latch: L,
     api_hello: ApiHello,
+    personality_agent_id: PersonalityAgentId,
     token: CancellationToken,
-    command_send_blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] command_send_blocked_notify: Option<Arc<Notify>>,
 ) -> Result<(), ReaderError>
 where
     R: GatewayReader + 'static,
@@ -1997,7 +2390,16 @@ where
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
-                        next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                        next_expected = send_validated(
+                            cmd,
+                            &personality_agent_id,
+                            next_expected,
+                            &mut command_tx,
+                            &token,
+                            #[cfg(test)]
+                            command_send_blocked_notify.clone(),
+                        )
+                        .await?;
                     }
                     if terminal_after_pending {
                         break 'task Err(ReaderError::Terminal);
@@ -2010,7 +2412,16 @@ where
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
-                                next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                                next_expected = send_validated(
+                                    cmd,
+                                    &personality_agent_id,
+                                    next_expected,
+                                    &mut command_tx,
+                                    &token,
+                                    #[cfg(test)]
+                                    command_send_blocked_notify.clone(),
+                                )
+                                .await?;
                             } else if pending.len() >= MAX_PENDING_BEFORE_READY {
                                 break 'task Err(ReaderError::Fatal(anyhow!(
                                     "hydration hold limit exceeded: {} commands received before Ready",
@@ -2051,20 +2462,38 @@ where
 
 async fn send_validated(
     cmd: InboundCommand,
+    expected_personality_agent_id: &PersonalityAgentId,
     next_expected: u64,
     command_tx: &mut mpsc::Sender<InboundCommand>,
     token: &CancellationToken,
-    blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] blocked_notify: Option<Arc<Notify>>,
 ) -> Result<u64> {
+    if cmd.personality_agent_id() != expected_personality_agent_id {
+        bail!(
+            "command target mismatch: expected {}, got {}",
+            expected_personality_agent_id,
+            cmd.personality_agent_id()
+        );
+    }
+    if cmd.provenance().personality_agent_id() != expected_personality_agent_id {
+        bail!(
+            "command provenance target mismatch: expected {}, got {}",
+            expected_personality_agent_id,
+            cmd.provenance().personality_agent_id()
+        );
+    }
     let seq = inbound_command_seq(&cmd);
     if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
-    if !token.is_cancelled()
-        && let Some(notify) = blocked_notify.as_ref()
-        && command_tx.capacity() == 0
+    #[cfg(test)]
     {
-        notify.notify_one();
+        if !token.is_cancelled()
+            && let Some(notify) = blocked_notify.as_ref()
+            && command_tx.capacity() == 0
+        {
+            notify.notify_one();
+        }
     }
     tokio::select! {
         biased;
@@ -2164,15 +2593,19 @@ impl HydrationLatch for WatchHydrationLatch {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{BootstrapFinishRuntimeFixture, bootstrap_finish_runtime_fixture};
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
     use sha2::{Digest, Sha256};
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc, oneshot, watch};
 
     use super::*;
     use crate::agent::{
@@ -2191,11 +2624,254 @@ mod tests {
         StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
         ValidatedToolArguments,
     };
-    use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
-    use crate::store::{
-        DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationOutcome, Store,
-        insert_test_durable_event, user_message_id,
+    use crate::runtime::contracts::{
+        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease,
     };
+    use crate::store::{
+        DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
+        EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome,
+        PostCommitEpochCapability, Store, insert_test_durable_event, user_message_id,
+    };
+
+    fn test_supervisor_runtime<F>(cancel: CancellationToken, run: F) -> SupervisorRuntime
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(run)),
+        })
+    }
+
+    async fn observed_supervisor_termination(
+        runtime: &mut SupervisorRuntime,
+    ) -> SupervisorTermination {
+        tokio::time::timeout(Duration::from_secs(1), runtime.termination())
+            .await
+            .expect("supervisor termination must be observable")
+            .expect("supervisor lifecycle join remains valid")
+    }
+
+    #[tokio::test]
+    async fn supervisor_error_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            Err(anyhow!("injected supervisor failure"))
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Failed(reason)
+                if reason.contains("injected supervisor failure")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its task error");
+        assert!(error.to_string().contains("injected supervisor failure"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_panic_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            panic!("injected supervisor panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Panicked(reason)
+                if reason.contains("injected supervisor panic")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its panic");
+        assert!(error.to_string().contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_supervisor_exit_is_observable_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async { Ok(()) });
+
+        assert_eq!(
+            observed_supervisor_termination(&mut runtime).await,
+            SupervisorTermination::Completed
+        );
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("completed supervisor owner task must still be joined");
+    }
+
+    #[tokio::test]
+    async fn planned_supervisor_shutdown_cancels_and_joins_cleanly() {
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let run_finished = finished.clone();
+        let mut runtime = test_supervisor_runtime(cancel, async move {
+            run_cancel.cancelled().await;
+            run_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        runtime.request_shutdown();
+        runtime.request_shutdown();
+        assert!(
+            runtime.lifecycle.task.is_some(),
+            "requesting shutdown must retain the supervisor JoinHandle"
+        );
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("planned shutdown must join cleanly");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "join must await the supervisor's cancellation cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_supervisor_teardown_retains_task_for_a_later_join() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let cleanup_entered = Arc::new(Notify::new());
+        let task_cleanup_entered = cleanup_entered.clone();
+        let release_cleanup = Arc::new(Notify::new());
+        let task_release_cleanup = release_cleanup.clone();
+        let mut runtime = SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(async move {
+                task_cancel.cancelled().await;
+                task_cleanup_entered.notify_one();
+                task_release_cleanup.notified().await;
+                Ok(())
+            })),
+        });
+
+        let mut join = Box::pin(runtime.cancel_and_join());
+        let mut entered = Box::pin(cleanup_entered.notified());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut join => {
+                    panic!("supervisor teardown resolved before cleanup blocked: {result:?}")
+                }
+                _ = &mut entered => {}
+            }
+        })
+        .await
+        .expect("teardown must cancel the live supervisor");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut join)
+                .await
+                .is_err(),
+            "teardown must retain and await the supervisor through cleanup"
+        );
+        drop(join);
+        assert!(
+            runtime.lifecycle.task.is_some(),
+            "cancelling teardown must leave the JoinHandle in its live owner"
+        );
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), runtime.cancel_and_join())
+            .await
+            .expect("a later retained join must finish after supervisor cleanup")
+            .expect("retained supervisor cleanup succeeds");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for the owned supervisor deadline fail-stop"]
+    async fn hung_supervisor_cleanup_deadline_child() {
+        if std::env::var("SUMI_HUNG_SUPERVISOR_DEADLINE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let mut runtime = test_supervisor_runtime(cancel, async move {
+            task_cancel.cancelled().await;
+            std::future::pending::<Result<()>>().await
+        });
+        runtime.lifecycle.cancel.cancel();
+        runtime
+            .lifecycle
+            .join_with_timeout(Duration::from_millis(25))
+            .await
+            .expect("a hung supervisor teardown must fail-stop before returning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_supervisor_cleanup_deadline_fail_stops_the_runtime_root() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("gateway::supervisor::tests::hung_supervisor_cleanup_deadline_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_HUNG_SUPERVISOR_DEADLINE_CHILD", "1")
+                .output()
+                .expect("run hung supervisor deadline child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "deadline must abort instead of detaching the runtime owner:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for unsettled supervisor owner Drop"]
+    async fn unsettled_supervisor_owner_drop_child() {
+        if std::env::var("SUMI_UNSETTLED_SUPERVISOR_DROP_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let runtime = test_supervisor_runtime(cancel, async move {
+            task_cancel.cancelled().await;
+            std::future::pending::<Result<()>>().await
+        });
+        drop(runtime);
+        panic!("dropping an unsettled supervisor owner must fail-stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_shutdown_cannot_detach_an_unsettled_supervisor_owner() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("gateway::supervisor::tests::unsettled_supervisor_owner_drop_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_UNSETTLED_SUPERVISOR_DROP_CHILD", "1")
+                .output()
+                .expect("run unsettled supervisor owner child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "runtime owner Drop must abort instead of spawning a detachable reaper:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     struct TestDigestFactory;
 
@@ -2308,6 +2984,117 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum BothReadyDeliveryOutcome {
+        FatalBeforeRootCancellation,
+        FatalBeforeReaderCompletion,
+        FatalAndPanicBeforeRootCancellation,
+        ReconnectBeforeRootCancellation,
+        CleanAfterRootCancellation,
+    }
+
+    #[derive(Clone)]
+    struct BothReadyDeliverySource {
+        outcome: BothReadyDeliveryOutcome,
+        installs: Arc<AtomicU64>,
+        invalidations: Arc<AtomicU64>,
+        install_entered: Arc<Notify>,
+        task_settled: Arc<Notify>,
+        trigger_report: Arc<Notify>,
+        release_install: Arc<Notify>,
+    }
+
+    impl BothReadyDeliverySource {
+        fn new(outcome: BothReadyDeliveryOutcome) -> Self {
+            Self {
+                outcome,
+                installs: Arc::new(AtomicU64::new(0)),
+                invalidations: Arc::new(AtomicU64::new(0)),
+                install_entered: Arc::new(Notify::new()),
+                task_settled: Arc::new(Notify::new()),
+                trigger_report: Arc::new(Notify::new()),
+                release_install: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for BothReadyDeliverySource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            Ok(EventCursors::default())
+        }
+
+        async fn events_after(&self, _after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            Ok(Vec::new())
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(CommandCursors::default())
+        }
+
+        async fn install_delivery_epoch(
+            &self,
+            _epoch: DeliveryEpoch,
+            _catch_up_from_seq: u64,
+            _sink: EventSender,
+            cancel: CancellationToken,
+        ) -> Result<Option<DeliveryEpochRuntime>> {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+            let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+            let outcome = self.outcome;
+            let trigger_report = self.trigger_report.clone();
+            let task_settled = self.task_settled.clone();
+            let task = tokio::spawn(async move {
+                match outcome {
+                    BothReadyDeliveryOutcome::FatalBeforeRootCancellation
+                    | BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Fatal(
+                                "fatal queued before supervisor settlement".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                    }
+                    BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Reconnect(
+                                "recoverable report queued before planned shutdown".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                    }
+                    BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Fatal(
+                                "fatal queued alongside delivery task panic".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                        task_settled.notify_one();
+                        panic!("delivery task panicked before planned root cancellation");
+                    }
+                    BothReadyDeliveryOutcome::CleanAfterRootCancellation => {
+                        cancel.cancelled().await;
+                    }
+                }
+                if !matches!(
+                    outcome,
+                    BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation
+                ) {
+                    task_settled.notify_one();
+                }
+            });
+            self.install_entered.notify_one();
+            self.release_install.notified().await;
+            Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+        }
+
+        async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     #[derive(Clone)]
     struct StaticHydrationLatch(HydrationReady);
 
@@ -2375,7 +3162,22 @@ mod tests {
             let n = self.counter.fetch_add(1, Ordering::SeqCst);
             let token = format!("{}-{}", self.prefix, n);
             self.tokens.lock().unwrap().push(token.clone());
-            Ok(GatewayCredential::new(token, self.delivery_authorization))
+            Ok(GatewayCredential::new(
+                token,
+                crate::gateway::test_personality_agent_id(),
+                ProcessGeneration::from_wire(7).unwrap(),
+                self.delivery_authorization,
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedCredentialProvider(GatewayCredential);
+
+    #[async_trait]
+    impl CredentialProvider for FixedCredentialProvider {
+        async fn fresh_credential(&mut self) -> Result<GatewayCredential> {
+            Ok(self.0.clone())
         }
     }
 
@@ -2406,6 +3208,8 @@ mod tests {
             let attempt = self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(GatewayCredential::new(
                 format!("sequenced-token-{attempt}"),
+                crate::gateway::test_personality_agent_id(),
+                ProcessGeneration::from_wire(7).unwrap(),
                 authorization,
             ))
         }
@@ -2596,6 +3400,7 @@ mod tests {
             }
             let accepted_generation = self.hello_generation.unwrap_or(hello.generation);
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
                 next_command_seq: self
@@ -2636,6 +3441,7 @@ mod tests {
             hello: AgentHello,
         ) -> std::result::Result<ApiHello, HelloError> {
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: self.next_command_seq,
@@ -2704,7 +3510,7 @@ mod tests {
 
     fn make_config() -> SupervisorConfig {
         SupervisorConfig {
-            agent_id: "test-agent".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
@@ -2719,6 +3525,82 @@ mod tests {
         }
     }
 
+    async fn run_both_ready_delivery_outcome(
+        outcome: BothReadyDeliveryOutcome,
+    ) -> (
+        Result<()>,
+        BothReadyDeliverySource,
+        Arc<AtomicU64>,
+        Arc<Mutex<Vec<AgentHello>>>,
+    ) {
+        let source = BothReadyDeliverySource::new(outcome);
+        let credentials = CountingCredentialProvider::new("both-ready");
+        let connect_attempts = credentials.counter.clone();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let commands = match outcome {
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                VecDeque::from([Err(anyhow::Error::new(GatewayClosed))])
+            }
+            _ => VecDeque::new(),
+        };
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(commands))]),
+            ),
+            credentials,
+            source.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "both-ready-delivery".to_owned(),
+            }),
+            make_config(),
+        );
+        let supervisor = if matches!(
+            outcome,
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion
+        ) {
+            supervisor.with_reader_ready_before_epoch_select()
+        } else {
+            supervisor
+        };
+        let handle = supervisor.start();
+
+        tokio::time::timeout(Duration::from_secs(1), source.install_entered.notified())
+            .await
+            .expect("delivery install must reach the pre-select barrier");
+        match outcome {
+            BothReadyDeliveryOutcome::FatalBeforeRootCancellation
+            | BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation
+            | BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation => {
+                source.trigger_report.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("delivery report must be queued before root cancellation");
+                handle.abort();
+                source.release_install.notify_one();
+            }
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                source.trigger_report.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("fatal delivery report must be queued before reader completion");
+                source.release_install.notify_one();
+            }
+            BothReadyDeliveryOutcome::CleanAfterRootCancellation => {
+                handle.abort();
+                source.release_install.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("delivery task must exit cleanly from root cancellation");
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("both-ready supervisor settlement must remain bounded");
+        (result, source, connect_attempts, sent_hellos)
+    }
+
     async fn wait_for_t17_idle(adapter: &seams::T17StoreAdapter) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.active_delivery_epoch().await.is_some() {
@@ -2729,11 +3611,52 @@ mod tests {
         .expect("T17 delivery epoch cleanup must finish");
     }
 
+    fn bind_test_post_commit_dispatcher(
+        store: Arc<Store>,
+        adapter: &seams::T17StoreAdapter,
+        start_after_seq: u64,
+    ) -> (
+        seams::T17StoreAdapter,
+        post_commit::OrderedPostCommitDispatcher,
+    ) {
+        let dispatcher = post_commit::OrderedPostCommitDispatcher::start(
+            store,
+            adapter.clone(),
+            start_after_seq,
+            CancellationToken::new(),
+        )
+        .expect("start one test post-commit dispatcher");
+        let bound = adapter
+            .bind_post_commit_dispatcher(dispatcher.client())
+            .expect("bind the dispatcher proof to Session delivery");
+        (bound, dispatcher)
+    }
+
+    async fn close_test_post_commit_writer(
+        store: &Arc<Store>,
+        dispatcher: &post_commit::OrderedPostCommitDispatcher,
+    ) -> EventWriterQuiescence {
+        EventWriter::new(store.clone())
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await
+            .expect("close the test EventWriter admission boundary")
+    }
+
+    fn test_maintenance_batch(kind: &str) -> EventBatch {
+        EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance(kind).unwrap()),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        }
+    }
+
     fn event_frame(seq: u64) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(seq),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "agent_start"}),
             },
         }
@@ -2741,6 +3664,40 @@ mod tests {
 
     fn valid_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
+            seq,
+            command_id: CommandId::parse(command_id).unwrap(),
+            command: Command::Abort {},
+        })
+    }
+
+    fn valid_command_json(seq: u64, command_id: &str, command: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "seq": seq,
+            "command_id": command_id,
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": command,
+        }))
+        .expect("serialize authenticated command fixture")
+    }
+
+    fn valid_command_for(
+        seq: u64,
+        command_id: &str,
+        personality_agent_id: PersonalityAgentId,
+        tenant_id: &str,
+        principal_id: &str,
+    ) -> InboundCommand {
+        InboundCommand::Valid(CommandEnvelope {
+            provenance: DirectChatProvenanceV1::new(
+                tenant_id,
+                personality_agent_id.clone(),
+                principal_id,
+            )
+            .expect("valid direct-chat provenance"),
+            personality_agent_id,
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
             command: Command::Abort {},
@@ -2751,6 +3708,8 @@ mod tests {
         InboundCommand::Invalid {
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command: crate::gateway::RejectedCommandPayload::DiscardedOversized,
             payload_digest: Some(crate::gateway::KeyedCommandDigest::new("test-key", [0; 32])),
@@ -2758,6 +3717,38 @@ mod tests {
     }
 
     // Tests
+
+    #[tokio::test]
+    async fn credential_scope_mismatch_is_fatal_before_connect() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = MockConnector::new(sent_hellos, VecDeque::new());
+        let credentials = FixedCredentialProvider(GatewayCredential::new(
+            "wrong-scope-token",
+            PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd").unwrap(),
+            ProcessGeneration::from_wire(7).unwrap(),
+            DeliveryAuthorization::Raw,
+        ));
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let handle = supervisor.start();
+        let error = handle
+            .join()
+            .await
+            .expect_err("credential target mismatch must terminate the supervisor");
+
+        assert!(
+            error
+                .to_string()
+                .contains("gateway credential scope mismatch"),
+            "unexpected supervisor error: {error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn fresh_credential_per_attempt() {
@@ -2983,6 +3974,7 @@ mod tests {
 
             async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
                 self.invalidations.fetch_add(1, Ordering::SeqCst);
+                self.failure_tx.lock().unwrap().take();
                 Ok(())
             }
         }
@@ -3019,6 +4011,180 @@ mod tests {
         assert!(format!("{error:#}").contains("delivery epoch task panicked"));
         assert_eq!(installs.load(Ordering::SeqCst), 1);
         assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_delivery_task_exit_is_fatal_without_root_cancellation() {
+        #[derive(Clone)]
+        struct CleanExitDeliverySource {
+            installs: Arc<AtomicU64>,
+            invalidations: Arc<AtomicU64>,
+            failure_tx: Arc<Mutex<Option<mpsc::UnboundedSender<DeliveryEpochFailure>>>>,
+        }
+
+        #[async_trait]
+        impl DurableSource for CleanExitDeliverySource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors::default())
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(CommandCursors::default())
+            }
+
+            async fn install_delivery_epoch(
+                &self,
+                _epoch: DeliveryEpoch,
+                _catch_up_from_seq: u64,
+                _sink: EventSender,
+                _cancel: CancellationToken,
+            ) -> Result<Option<DeliveryEpochRuntime>> {
+                self.installs.fetch_add(1, Ordering::SeqCst);
+                let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+                *self.failure_tx.lock().unwrap() = Some(failure_tx);
+                let task = tokio::spawn(async {});
+                Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+            }
+
+            async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+                self.failure_tx.lock().unwrap().take();
+                Ok(())
+            }
+        }
+
+        let source = CleanExitDeliverySource {
+            installs: Arc::new(AtomicU64::new(0)),
+            invalidations: Arc::new(AtomicU64::new(0)),
+            failure_tx: Arc::new(Mutex::new(None)),
+        };
+        let installs = source.installs.clone();
+        let invalidations = source.invalidations.clone();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let credentials = CountingCredentialProvider::new("token");
+        let connect_attempts = credentials.counter.clone();
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            ),
+            credentials,
+            source,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "unexpected-clean-delivery-exit".to_owned(),
+            }),
+            make_config(),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("clean delivery task exit must terminate the supervisor")
+            .expect_err("clean delivery task exit must remain fatal");
+
+        assert!(
+            format!("{error:#}").contains("delivery epoch task ended without a terminal signal")
+        );
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_preserves_a_fatal_report_queued_before_root_cancellation() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::FatalBeforeRootCancellation)
+                .await;
+
+        let error = result.expect_err("a preexisting permanent delivery failure must stay fatal");
+        assert!(
+            format!("{error:#}").contains("fatal queued before supervisor settlement"),
+            "queued fatal provenance must survive planned settlement: {error:#}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_combines_a_ready_task_panic_and_queued_fatal() {
+        let (result, source, connect_attempts, sent_hellos) = run_both_ready_delivery_outcome(
+            BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation,
+        )
+        .await;
+
+        let error = result.expect_err("a preexisting delivery task panic must stay fatal");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("delivery task panicked before planned root cancellation"),
+            "delivery task panic provenance must survive planned settlement: {error}"
+        );
+        assert!(
+            error.contains("fatal queued alongside delivery task panic"),
+            "queued fatal must still be drained after task panic: {error}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reader_completion_preserves_an_already_queued_delivery_fatal() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::FatalBeforeReaderCompletion)
+                .await;
+
+        let error = result.expect_err("reader completion must not erase a queued delivery fatal");
+        assert!(
+            format!("{error:#}").contains("fatal queued before supervisor settlement"),
+            "queued delivery fatal provenance must survive reader cleanup: {error:#}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_suppresses_a_queued_reconnect_without_reconnecting() {
+        let (result, source, connect_attempts, sent_hellos) = run_both_ready_delivery_outcome(
+            BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation,
+        )
+        .await;
+
+        result.expect("planned shutdown must suppress a queued recoverable report");
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connect_attempts.load(Ordering::SeqCst),
+            1,
+            "root cancellation must prevent reconnect"
+        );
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_accepts_delivery_task_clean_exit_caused_by_root_cancellation() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::CleanAfterRootCancellation)
+                .await;
+
+        result.expect("root-cancellation-induced delivery exit must be planned success");
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
         assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(sent_hellos.lock().unwrap().len(), 1);
     }
@@ -3640,6 +4806,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Rejected,
                 reject_reason: Some("oversized".to_owned()),
             },
@@ -3668,6 +4835,7 @@ mod tests {
         drop(rx);
         let result = send_validated(
             valid_command(1, "00000000-0000-4000-8000-000000000001"),
+            &crate::gateway::test_personality_agent_id(),
             1,
             &mut tx,
             &CancellationToken::new(),
@@ -3683,6 +4851,7 @@ mod tests {
         let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
         let error = send_validated(
             valid_command(u64::MAX, "00000000-0000-4000-8000-000000000001"),
+            &crate::gateway::test_personality_agent_id(),
             u64::MAX,
             &mut tx,
             &CancellationToken::new(),
@@ -3692,6 +4861,89 @@ mod tests {
         .expect_err("maximum command sequence must exhaust the cursor");
         assert!(error.is::<DurableReplayInvariantError>());
         assert_eq!(inbound_command_seq(&rx.recv().await.unwrap()), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn send_validated_rejects_a_different_personality_before_forwarding() {
+        let expected = crate::gateway::test_personality_agent_id();
+        let different = PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd").unwrap();
+        let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
+
+        let error = send_validated(
+            valid_command_for(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                different,
+                "tenant-a",
+                "human-a",
+            ),
+            &expected,
+            1,
+            &mut tx,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("a different personality must be rejected before admission");
+
+        assert!(error.to_string().contains("command target mismatch"));
+        assert!(
+            rx.try_recv().is_err(),
+            "mismatched command must not reach Store"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_validated_keeps_one_runtime_identity_across_tenant_contexts() {
+        let personality_agent_id = crate::gateway::test_personality_agent_id();
+        let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(2);
+        let cancel = CancellationToken::new();
+
+        let next = send_validated(
+            valid_command_for(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                personality_agent_id.clone(),
+                "tenant-a",
+                "human-a",
+            ),
+            &personality_agent_id,
+            1,
+            &mut tx,
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+        let next = send_validated(
+            valid_command_for(
+                2,
+                "00000000-0000-4000-8000-000000000002",
+                personality_agent_id.clone(),
+                "tenant-b",
+                "human-b",
+            ),
+            &personality_agent_id,
+            next,
+            &mut tx,
+            &cancel,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next, 3);
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.personality_agent_id(), second.personality_agent_id());
+        assert_ne!(
+            first.provenance().tenant_id(),
+            second.provenance().tenant_id()
+        );
+        assert_ne!(
+            first.provenance().actor().principal_id(),
+            second.provenance().actor().principal_id()
+        );
     }
 
     #[tokio::test]
@@ -3710,6 +4962,7 @@ mod tests {
             ack: CommandAck {
                 seq: 0,
                 command_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -3732,6 +4985,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -3739,7 +4993,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "delta"}),
             },
         };
@@ -4027,8 +5281,11 @@ mod tests {
         use std::io::Cursor;
 
         let generation = ProcessGeneration::from_wire(7).unwrap();
-        let input = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#
-            .to_vec();
+        let input = valid_command_json(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+            serde_json::json!({"type": "abort"}),
+        );
         let gateway = InjectedStdioGateway::new(
             tokio::io::BufReader::new(Cursor::new(input)),
             tokio::io::sink(),
@@ -4497,6 +5754,7 @@ mod tests {
         assert_eq!(agent.last_received_command_seq, 5);
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4581,6 +5839,7 @@ mod tests {
         // applied+1 command, even though the local applied cursor has since
         // moved to 7.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4592,6 +5851,7 @@ mod tests {
         // The API may start at an already-applied command when its terminal ACK
         // was lost; the durable consumer will re-ACK it without reapplying it.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 5,
@@ -4601,6 +5861,7 @@ mod tests {
             .expect("locally terminal command must remain replayable");
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 0,
@@ -4624,7 +5885,7 @@ mod tests {
         // Generation boundaries: 0, JSON-safe max, JSON-safe max + 1, i64::MAX.
         for gen_value in [0, json_safe, over_json_safe, i64_max] {
             let agent = AgentHello {
-                agent_id: "a".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 generation: ProcessGeneration::from_wire(gen_value).unwrap(),
                 last_sent_event_seq: 0,
                 last_received_command_seq: 0,
@@ -4642,6 +5903,7 @@ mod tests {
         // Seq boundaries: 0, JSON-safe max, JSON-safe max + 1, u64::MAX.
         for seq in [0, json_safe, over_json_safe, u64_max] {
             let api = ApiHello {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 accepted_generation: ProcessGeneration::from_wire(0).unwrap(),
                 last_received_event_seq: seq,
                 next_command_seq: seq,
@@ -4654,7 +5916,7 @@ mod tests {
 
         // i64::MAX and u64::MAX together in one hello.
         let agent_i64_max = AgentHello {
-            agent_id: "a".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(i64_max).unwrap(),
             last_sent_event_seq: u64_max,
             last_received_command_seq: u64_max,
@@ -4667,39 +5929,37 @@ mod tests {
 
         // Generation beyond i64::MAX is rejected on the wire.
         let agent_json = format!(
-            r#"{{"agent_id":"a","generation":"{over_i64}","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"{over_i64}","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
         );
         assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
 
         let api_json = format!(
-            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
 
         // u64 overflow is rejected.
         let agent_overflow = format!(
-            r#"{{"agent_id":"a","generation":"0","last_sent_event_seq":"{over_u64}","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"0","last_sent_event_seq":"{over_u64}","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
         );
         assert!(serde_json::from_str::<AgentHello>(&agent_overflow).is_err());
 
         let api_overflow = format!(
-            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
+            r#"{{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_overflow).is_err());
 
         // Old numeric encodings are no longer accepted; the wire uses strings.
-        let agent_numeric = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
+        let agent_numeric = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_numeric).is_err());
-        let api_numeric =
-            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+        let api_numeric = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_numeric).is_err());
     }
 
     #[test]
     fn hello_dto_rejects_malformed_unknown_and_trailing_data() {
-        let agent_base = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
-        let api_base =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let agent_base = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
+        let api_base = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
 
         assert!(serde_json::from_str::<AgentHello>(agent_base).is_ok());
         assert!(serde_json::from_str::<ApiHello>(api_base).is_ok());
@@ -4747,17 +6007,17 @@ mod tests {
         }
 
         // Unknown fields continue to be rejected.
-        let agent_unknown = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
+        let agent_unknown = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
 
-        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let api_unknown = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
 
         // Trailing data after a valid object must also be rejected.
-        let agent_trailing = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
+        let agent_trailing = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
 
-        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
+        let api_trailing = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
@@ -4802,13 +6062,14 @@ mod tests {
         }
 
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: 0,
             last_applied_command_seq: 0,
         };
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -4844,13 +6105,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_hello_rejects_personality_mismatch_before_cursor_state() {
+        let agent = AgentHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 0,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 0,
+        };
+        let api = ApiHello {
+            personality_agent_id: PersonalityAgentId::parse("018f3f8d-7b2c-7a10-8f9e-123456789abd")
+                .unwrap(),
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+        };
+
+        let result = validate_hello(
+            &MockDurableSource::new(CommandCursors::default()),
+            &agent,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(SupervisorError::Fatal(ref error))
+                    if error.to_string().contains("personality-agent claim mismatch")
+            ),
+            "wrong personality must be fatal before trusting peer cursors: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_hello_command_cursor_cannot_skip_nonterminal_prefix() {
         let cursor = CommandCursors {
             received: 10,
             applied: 5,
         };
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
@@ -4883,6 +6177,7 @@ mod tests {
         // A locally terminal command remains a valid replay point when the API
         // did not durably record its terminal ACK.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
@@ -4893,6 +6188,7 @@ mod tests {
 
         // Exactly applied+1 is the normal catch-up boundary and is allowed.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 6,
@@ -4903,6 +6199,7 @@ mod tests {
 
         // A cursor after applied+1 skips a locally nonterminal command.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
@@ -4914,6 +6211,7 @@ mod tests {
         );
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
@@ -4926,6 +6224,7 @@ mod tests {
 
         // Ahead of received+1 is also fatal.
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 12,
@@ -4938,6 +6237,7 @@ mod tests {
         );
 
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 0,
@@ -4994,6 +6294,7 @@ mod tests {
                 hello: AgentHello,
             ) -> std::result::Result<ApiHello, HelloError> {
                 Ok(ApiHello {
+                    personality_agent_id: hello.personality_agent_id.clone(),
                     accepted_generation: hello.generation,
                     last_received_event_seq: 0,
                     next_command_seq: self.terminal_seq,
@@ -5095,6 +6396,7 @@ mod tests {
                         ack: CommandAck {
                             seq: terminal_seq,
                             command_id,
+                            personality_agent_id: crate::gateway::test_personality_agent_id(),
                             status: terminal_status,
                             reject_reason,
                         },
@@ -5136,13 +6438,14 @@ mod tests {
             applied: u64::MAX,
         };
         let agent = AgentHello {
-            agent_id: "test".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
             last_applied_command_seq: cursor.applied,
         };
         let api = ApiHello {
+            personality_agent_id: agent.personality_agent_id.clone(),
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: u64::MAX,
@@ -5295,8 +6598,13 @@ mod tests {
         let (latch_tx, latch_rx) = watch::channel(HydrationState::NotReady);
         let (second_tx, second_rx) = oneshot::channel();
 
-        let first =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"#.to_vec();
+        let first = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"#,
+            crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
+                .expect("serialize direct-chat provenance fixture"),
+        )
+        .into_bytes();
         let second = br#""type":"user_message","text":"hi","attachments":[]}}"#.to_vec();
 
         let buf = ChunkedBuf {
@@ -5430,7 +6738,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
             },
         };
@@ -5442,6 +6750,7 @@ mod tests {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -5563,7 +6872,7 @@ mod tests {
             pump.install_supervised_epoch(epoch, failure_tx.clone());
             *self.pump.lock().unwrap() = Some(pump);
 
-            let conversation_id = "conversation-1".to_owned();
+            let personality_agent_id = crate::gateway::test_personality_agent_id();
             let task = tokio::spawn(async move {
                 loop {
                     let frame = tokio::select! {
@@ -5592,7 +6901,7 @@ mod tests {
                     let outbound = OutboundFrame::Event {
                         envelope: Envelope {
                             seq,
-                            conversation_id: conversation_id.clone(),
+                            personality_agent_id: personality_agent_id.clone(),
                             event,
                         },
                     };
@@ -5850,7 +7159,7 @@ mod tests {
             OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: "conversation-1".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "message_update"}),
                 },
             },
@@ -5926,6 +7235,7 @@ mod tests {
                 ack: CommandAck {
                     seq: 1,
                     command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     status: CommandAckStatus::Applied,
                     reject_reason: None,
                 },
@@ -6092,6 +7402,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -6104,7 +7415,7 @@ mod tests {
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
             },
         };
@@ -6281,16 +7592,23 @@ mod tests {
             online.changed().await.unwrap();
         }
 
-        let sent_frames = sent.lock().unwrap();
-        let seqs: Vec<_> = sent_frames
-            .iter()
-            .filter_map(|f| outbound_frame_event_seq(f).ok())
-            .collect();
-        assert_eq!(
-            seqs,
-            vec![1, 2],
-            "racing durable commit 2 must be included before Online without gaps or duplicates"
-        );
+        {
+            let sent_frames = sent.lock().unwrap();
+            let seqs: Vec<_> = sent_frames
+                .iter()
+                .filter_map(|f| outbound_frame_event_seq(f).ok())
+                .collect();
+            assert_eq!(
+                seqs,
+                vec![1, 2],
+                "racing durable commit 2 must be included before Online without gaps or duplicates"
+            );
+        }
+        handle.abort();
+        handle
+            .join()
+            .await
+            .expect("cursor recheck supervisor joins explicitly");
     }
 
     #[tokio::test]
@@ -6790,6 +8108,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -6904,7 +8223,7 @@ mod tests {
 
     #[test]
     fn agent_hello_rejects_unknown_fields() {
-        let json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
+        let json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(
             serde_json::from_str::<AgentHello>(json).is_err(),
             "AgentHello must reject unknown fields"
@@ -6913,7 +8232,7 @@ mod tests {
 
     #[test]
     fn api_hello_rejects_unknown_fields() {
-        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(
             serde_json::from_str::<ApiHello>(json).is_err(),
             "ApiHello must reject unknown fields"
@@ -6922,11 +8241,10 @@ mod tests {
 
     #[test]
     fn hello_dto_deserialization_still_accepts_known_fields() {
-        let agent_json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
+        let agent_json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
 
-        let api_json =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let api_json = r#"{"personality_agent_id":"018f3f8d-7b2c-7a10-8f9e-123456789abc","accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 
@@ -7037,6 +8355,7 @@ mod tests {
         let (online, mut online_rx) = watch::channel(false);
         let token = CancellationToken::new();
         let api_hello = ApiHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -7131,6 +8450,7 @@ mod tests {
         let (online, online_rx) = watch::channel(false);
         let token = CancellationToken::new();
         let api_hello = ApiHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
@@ -7481,7 +8801,12 @@ mod tests {
                 .unwrap(),
         );
         let generation = ProcessGeneration::from_wire(7).unwrap();
-        let lease = ProcessGenerationLease::new(generation, "lease-t17-t24").unwrap();
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "lease-t17-t24",
+        )
+        .unwrap();
         let fence = GenerationRecoveryFence::new(&lease, "fence-t17-t24").unwrap();
         let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
             HydrationOutcome::Complete(state) => state.receipt,
@@ -7495,7 +8820,18 @@ mod tests {
 
         let adapter = seams::T17StoreAdapter::new(store.clone());
         let (hydration_tx, hydration_rx) = watch::channel(None);
-        let latch = seams::T17HydrationLatch::new(hydration_rx);
+        let rpc_identity = crate::runtime::contracts::RpcIdentity::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            crate::runtime::contracts::RpcBootNonce::new("t17-t24-boot").unwrap(),
+        );
+        let authority = crate::runtime::authority::RuntimeEpochAuthority::new(
+            rpc_identity,
+            lease.clone(),
+            fence.clone(),
+        )
+        .unwrap();
+        let latch = seams::T17HydrationLatch::new(hydration_rx, authority);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
@@ -7568,7 +8904,11 @@ mod tests {
         insert_test_durable_event(&store, 10, &crate::agent::AgentEvent::TurnStart)
             .await
             .unwrap();
-        adapter.on_durable_committed(10).await.unwrap();
+        let post_commit_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+        adapter
+            .admit_ordered_commit(&post_commit_epoch, 10)
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -7611,55 +8951,221 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_active_handle_finishes_t17_epoch_cleanup_with_or_without_prior_abort() {
-        async fn assert_cleanup(abort_before_drop: bool) {
-            let store_name = if abort_before_drop {
-                "t17-t24-abort-without-join-cleanup"
-            } else {
-                "t17-t24-handle-drop-cleanup"
-            };
-            let store = Arc::new(Store::session_test_store(store_name).await.unwrap());
-            let adapter = seams::T17StoreAdapter::new(store);
-            let connector = MockConnector::new(
-                Arc::new(Mutex::new(Vec::new())),
-                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
-            );
-            let supervisor = ConnectionSupervisor::new(
-                connector,
-                CountingCredentialProvider::new("token"),
-                adapter.clone(),
-                StaticHydrationLatch(HydrationReady {
-                    generation: ProcessGeneration::from_wire(7).unwrap(),
-                    receipt_identity: "handle-drop-ready".to_owned(),
-                }),
-                make_config(),
-            );
-            let handle = supervisor.start();
+    async fn abort_and_join_finishes_t17_epoch_cleanup() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-explicit-handle-cleanup")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store);
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "handle-join-ready".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while adapter.active_delivery_epoch().await.is_none() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.active_delivery_epoch().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real T17 delivery epoch must be installed before teardown");
+        assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
+
+        handle.abort();
+        handle
+            .join()
+            .await
+            .expect("explicit supervisor teardown joins cleanup");
+
+        assert_eq!(
+            adapter.delivery_epoch_lifecycle_counts(),
+            (1, 1),
+            "explicit join must invalidate the real T17 epoch exactly once"
+        );
+    }
+
+    pub(crate) struct BootstrapFinishRuntimeFixture {
+        pub(crate) post_commit: post_commit::ProductionPostCommitRuntime,
+        pub(crate) supervisor_runtime: SupervisorRuntime,
+        pub(crate) gateway: session::SessionGateway,
+        pub(crate) observer: BootstrapFinishRuntimeObserver,
+    }
+
+    pub(crate) struct BootstrapFinishRuntimeObserver {
+        store: Arc<Store>,
+        adapter: seams::T17StoreAdapter,
+        hook: seams::DurableAdmissionHook,
+        supervisor_task: tokio::task::AbortHandle,
+        connect_attempts: Arc<AtomicU64>,
+        sent_hellos: Arc<Mutex<Vec<AgentHello>>>,
+    }
+
+    impl BootstrapFinishRuntimeObserver {
+        pub(crate) async fn hold_post_commit_until_supervisor_settles(&self) {
+            let barrier = tokio::time::timeout(
+                Duration::from_secs(1),
+                self.hook.post_commit_delivery_cancelled.notified(),
+            )
+            .await;
+            if barrier.is_err() {
+                self.hook
+                    .allow_post_commit_delivery_cancel_return
+                    .notify_one();
+                panic!("production post-commit teardown must reach its cancellation barrier");
+            }
+
+            let settled = tokio::time::timeout(Duration::from_secs(1), async {
+                while !self.supervisor_task.is_finished() {
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .expect("real T17 delivery epoch must be installed before handle drop");
-            assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
-
-            if abort_before_drop {
-                handle.abort();
-            }
-            drop(handle);
-
-            wait_for_t17_idle(&adapter).await;
-            assert_eq!(
-                adapter.delivery_epoch_lifecycle_counts(),
-                (1, 1),
-                "handle drop must install and invalidate the real T17 epoch exactly once"
-            );
+            .await;
+            self.hook
+                .allow_post_commit_delivery_cancel_return
+                .notify_one();
+            settled.expect("supervisor must settle while post-commit teardown remains retained");
         }
 
-        assert_cleanup(false).await;
-        assert_cleanup(true).await;
+        pub(crate) async fn assert_finished_contract(&self) {
+            assert_eq!(
+                self.adapter.active_delivery_epoch().await,
+                None,
+                "supervisor cleanup must clear the active T17 epoch"
+            );
+            assert_eq!(
+                self.adapter.delivery_epoch_lifecycle_counts(),
+                (1, 1),
+                "runtime finish must install and invalidate exactly once"
+            );
+            assert_eq!(
+                self.connect_attempts.load(Ordering::SeqCst),
+                1,
+                "planned shutdown must not reconnect"
+            );
+            assert_eq!(self.sent_hellos.lock().unwrap().len(), 1);
+            let durable_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(self.store.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                durable_count, 1,
+                "the committed durable event must remain in Store after shutdown"
+            );
+            assert_eq!(
+                self.adapter.durable_fence_count(),
+                0,
+                "orderly shutdown must leave no detached durable admission"
+            );
+            assert!(
+                self.supervisor_task.is_finished(),
+                "finish_runtime must retain the supervisor through terminal cleanup"
+            );
+        }
+    }
+
+    pub(crate) async fn bootstrap_finish_runtime_fixture() -> BootstrapFinishRuntimeFixture {
+        let store = Arc::new(
+            Store::session_test_store("runtime-finish-supervisor-first")
+                .await
+                .unwrap(),
+        );
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "lease-runtime-finish",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "fence-runtime-finish").unwrap();
+        let rpc_identity = crate::runtime::contracts::RpcIdentity::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            crate::runtime::contracts::RpcBootNonce::new("runtime-finish-boot").unwrap(),
+        );
+        let authority = crate::runtime::authority::RuntimeEpochAuthority::new(
+            rpc_identity,
+            lease.clone(),
+            fence.clone(),
+        )
+        .unwrap();
+        let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => state.receipt,
+            other => panic!("empty Store must hydrate completely: {other:?}"),
+        };
+        let (post_commit, adapter) =
+            post_commit::ProductionPostCommitRuntime::start(store.clone(), &authority)
+                .await
+                .unwrap();
+        let adapter = adapter
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook {
+            pause_after_post_commit_delivery_cancel: true,
+            ..seams::DurableAdmissionHook::default()
+        };
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let credentials = CountingCredentialProvider::new("token");
+        let connect_attempts = credentials.counter.clone();
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            ),
+            credentials,
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation,
+                receipt_identity: receipt.stable_id(),
+            }),
+            make_config(),
+        );
+        let (gateway, supervisor_runtime) =
+            session::SessionGateway::from_supervisor(supervisor.start());
+        let supervisor_task = supervisor_runtime.task_observer_for_test();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.active_delivery_epoch().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real T17 DeliveryPump must install before runtime finish");
+        assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
+
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("runtime-finish-durable"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+
+        BootstrapFinishRuntimeFixture {
+            post_commit,
+            supervisor_runtime,
+            gateway,
+            observer: BootstrapFinishRuntimeObserver {
+                store,
+                adapter,
+                hook,
+                supervisor_task,
+                connect_attempts,
+                sent_hellos,
+            },
+        }
     }
 
     #[tokio::test]
@@ -7679,7 +9185,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        store.publish_test_committed_event_receipt(&[1]).unwrap();
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 1);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = MockGateway::new(VecDeque::new());
@@ -7701,7 +9210,8 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (_session_reader, mut session_writer) = session_gateway.split();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !*online.borrow() {
@@ -7720,11 +9230,12 @@ mod tests {
         )
         .await
         .unwrap();
+        store.publish_test_committed_event_receipt(&[2]).unwrap();
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: Some(2),
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     // This Session-carried payload is intentionally raw and
                     // different from the committed row. The adapter must
                     // discard it and make T17 re-read seq=2.
@@ -7740,7 +9251,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
                         tool_call_id: "tool-1".to_owned(),
                         partial: serde_json::json!({"stdout": raw_secret}),
@@ -7770,7 +9281,17 @@ mod tests {
         .expect("projection-only durable frames must be forwarded");
 
         drop(session_writer);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("projection-only supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        // This projection-focused fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("projection-only fixture joins its dispatcher explicitly");
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -7806,7 +9327,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let raw_secret = "sk-raw-epoch-secret-value";
         let raw_sent = Arc::new(Mutex::new(Vec::new()));
         let redacted_sent = Arc::new(Mutex::new(Vec::new()));
@@ -7844,7 +9367,8 @@ mod tests {
         let handle = supervisor.start();
         let mut online = handle.online.clone();
         let mut epochs = handle.epochs.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (_session_reader, mut session_writer) = session_gateway.split();
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -7865,11 +9389,12 @@ mod tests {
         )
         .await
         .unwrap();
+        store.publish_test_committed_event_receipt(&[1]).unwrap();
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: Some(1),
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::json!({
                         "type": "error",
                         "message": format!("untrusted Session copy {raw_secret}")
@@ -7886,7 +9411,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: store.scope().conversation_id.clone(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
                         tool_call_id: "raw-backlog-tool".to_owned(),
                         partial: serde_json::json!({"stdout": raw_secret}),
@@ -7921,7 +9446,17 @@ mod tests {
         .expect("redaction-only reconnect must catch up the durable event");
 
         drop(session_writer);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("authorization rollover supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        // This projection-focused fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("authorization rollover fixture joins its dispatcher explicitly");
 
         assert!(
             serde_json::to_string(&*raw_sent.lock().unwrap())
@@ -7965,7 +9500,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = MockGateway::new(VecDeque::new());
         gateway.writer.sent = sent.clone();
@@ -7989,18 +9526,20 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (mut session_reader, mut session_writer) = session_gateway.split();
 
         for seq in 1..=80 {
             insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)
                 .await
                 .unwrap();
+            store.publish_test_committed_event_receipt(&[seq]).unwrap();
             session_writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
                         seq: Some(seq),
-                        conversation_id: store.scope().conversation_id.clone(),
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
                         event: serde_json::json!({
                             "type": "error",
                             "message": "untrusted Session payload must be ignored"
@@ -8048,7 +9587,17 @@ mod tests {
 
         drop(session_writer);
         drop(session_reader);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("bounded replay supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        // This bounded-replay fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("bounded replay fixture joins its dispatcher explicitly");
 
         let delivered: Vec<_> = sent
             .lock()
@@ -8064,6 +9613,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_post_commit_dispatcher_fences_n_plus_one_and_ack_in_exact_lane_order() {
+        const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+        let store = Arc::new(
+            Store::session_test_store("t26-exact-post-commit-order")
+                .await
+                .unwrap(),
+        );
+        let base_adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook::default();
+        base_adapter.set_durable_admission_hook(Some(hook.clone()));
+
+        let epoch = DeliveryEpoch::for_test("t26-exact-order");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (_online_tx, online) = watch::channel(true);
+        let (_epochs_tx, epochs) = watch::channel(Some(epoch));
+        let events = EventSender {
+            tx: event_tx,
+            online: online.clone(),
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = base_adapter
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("T17 adapter installs one delivery epoch");
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
+
+        let (_command_tx, commands) = mpsc::channel(1);
+        let gateway = session::SessionGateway::from(SupervisorHandle {
+            commands,
+            events: events.clone(),
+            epochs,
+            online,
+            session_events: adapter.session_event_sink(),
+            lifecycle: SupervisorLifecycle {
+                cancel: pump_cancel.clone(),
+                task: None,
+            },
+        });
+        let (_reader, mut session_writer) = gateway.split();
+        let event_writer = EventWriter::new(store.clone());
+
+        assert_eq!(
+            event_writer
+                .apply(test_maintenance_batch("memory-maintenance"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("N must enter the single dispatcher first");
+
+        assert_eq!(
+            event_writer
+                .apply(test_maintenance_batch("session-output"))
+                .await
+                .unwrap(),
+            vec![2]
+        );
+        let personality_agent_id = store.scope().personality_agent_id.clone();
+        let write = tokio::spawn(async move {
+            session_writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(2),
+                        personality_agent_id: personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "memory_maintenance",
+                            "kind": "untrusted-session-copy"
+                        }),
+                    },
+                })
+                .await?;
+            session_writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: 1,
+                        command_id: COMMAND_ID.to_owned(),
+                        personality_agent_id,
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "Session must await the same N+1 dispatcher proof before its ACK"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "holding N admission must keep N+1 and the ACK out of T24"
+        );
+
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("N registers its completion fence");
+        hook.allow_delivery.notify_one();
+        let first = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("N reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&first.2).unwrap(), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("N+1 starts only after N admission completes");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the terminal ACK cannot overtake held N+1"
+        );
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("N+1 registers its completion fence");
+        hook.allow_delivery.notify_one();
+
+        let second = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("N+1 reaches T24")
+            .expect("T24 lane remains open");
+        let third = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("ACK reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&second.2).unwrap(), 2);
+        assert!(matches!(third.2, OutboundFrame::CommandAck { .. }));
+        assert_eq!(first.0, epoch);
+        assert_eq!(second.0, epoch);
+        assert_eq!(third.0, epoch);
+        tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("Session writer completes after ordered admission")
+            .expect("Session writer task")
+            .expect("durable frame and ACK send");
+
+        base_adapter.set_durable_admission_hook(None);
+        let quiescence = close_test_post_commit_writer(&store, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("delivery forwarder terminates")
+            .expect("delivery forwarder joins");
+    }
+
+    #[tokio::test]
     async fn durable_fence_registration_is_atomic_with_epoch_invalidation() {
         const COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
         let store = Arc::new(
@@ -8071,18 +9773,15 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
-            .await
-            .unwrap();
-        let adapter = seams::T17StoreAdapter::new(store.clone())
+        let base_adapter = seams::T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
         let hook = seams::DurableAdmissionHook::default();
-        adapter.set_durable_admission_hook(Some(hook.clone()));
+        base_adapter.set_durable_admission_hook(Some(hook.clone()));
 
         let epoch = DeliveryEpoch::for_test("atomic-admission-old");
         let replacement = DeliveryEpoch::for_test("atomic-admission-replacement");
-        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
         let (online_tx, online) = watch::channel(true);
         let (epochs_tx, epochs) = watch::channel(Some(epoch));
         let events = EventSender {
@@ -8090,15 +9789,25 @@ mod tests {
             online: online.clone(),
         };
         let pump_cancel = CancellationToken::new();
-        let runtime = adapter
-            .install_delivery_epoch(epoch, 1, events.clone(), pump_cancel.child_token())
+        let runtime = base_adapter
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
             .await
             .unwrap()
             .expect("T17 adapter installs a forwarder runtime");
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
+        let dispatcher_client = dispatcher.client();
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("atomic-admission"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
         let (_command_tx, commands) = mpsc::channel(1);
         let gateway = session::SessionGateway::from(SupervisorHandle {
             commands,
-            events,
+            events: events.clone(),
             epochs,
             online,
             session_events: adapter.session_event_sink(),
@@ -8108,28 +9817,7 @@ mod tests {
             },
         });
         let (_reader, mut writer) = gateway.split();
-        let conversation_id = store.scope().conversation_id.clone();
-        let write = tokio::spawn(async move {
-            writer
-                .send(OutboundFrame::Event {
-                    envelope: Envelope {
-                        seq: Some(1),
-                        conversation_id,
-                        event: serde_json::json!({"type": "agent_start"}),
-                    },
-                })
-                .await?;
-            writer
-                .send(OutboundFrame::CommandAck {
-                    ack: CommandAck {
-                        seq: 1,
-                        command_id: COMMAND_ID.to_owned(),
-                        status: CommandAckStatus::Applied,
-                        reject_reason: None,
-                    },
-                })
-                .await
-        });
+        let personality_agent_id = store.scope().personality_agent_id.clone();
 
         tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
             .await
@@ -8163,23 +9851,102 @@ mod tests {
         online_tx.send_replace(false);
         epochs_tx.send_replace(None);
         hook.allow_delivery.notify_one();
-        tokio::task::yield_now().await;
-        assert!(
-            !write.is_finished(),
-            "EpochLost must become Deferred and fence the later ACK"
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                dispatcher_client.admission_for(&personality_agent_id, 1)
+            )
+            .await
+            .expect("old-epoch admission resolves after invalidation")
+            .expect("old-epoch loss is reconnectable"),
+            session::DurableEventAdmission::Deferred {
+                after_epoch: Some(epoch)
+            }
         );
         assert!(
             event_rx.try_recv().is_err(),
-            "the invalidated pump must not emit the stale durable row or ACK"
+            "the invalidated pump must not emit stale N"
         );
 
-        epochs_tx.send_replace(Some(replacement));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), event_rx.recv())
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("session-after-epoch-loss"))
                 .await
-                .is_err(),
-            "replacement catch-up must complete before the ACK progresses"
+                .unwrap(),
+            vec![2]
         );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                dispatcher_client.admission_for(&personality_agent_id, 2)
+            )
+            .await
+            .expect("offline N+1 admission resolves")
+            .expect("offline admission remains reconnectable"),
+            session::DurableEventAdmission::Deferred {
+                after_epoch: Some(epoch)
+            }
+        );
+        let write = tokio::spawn(async move {
+            writer
+                .send(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(2),
+                        personality_agent_id: personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "memory_maintenance",
+                            "kind": "untrusted-session-copy"
+                        }),
+                    },
+                })
+                .await?;
+            writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: 1,
+                        command_id: COMMAND_ID.to_owned(),
+                        personality_agent_id,
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !write.is_finished(),
+            "the deferred N/N+1 barrier must hold the terminal ACK offline"
+        );
+
+        let replacement_runtime = adapter
+            .install_delivery_epoch(replacement, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("replacement T17 epoch installs");
+        epochs_tx.send_replace(Some(replacement));
+        let catch_up = adapter.events_after(0, 16).await.unwrap();
+        assert_eq!(
+            catch_up
+                .iter()
+                .map(outbound_frame_event_seq)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            vec![1, 2]
+        );
+        for frame in catch_up {
+            events.send((replacement, frame)).await.unwrap();
+        }
+        let replay_n = event_rx.recv().await.unwrap();
+        let replay_n_plus_one = event_rx.recv().await.unwrap();
+        assert_eq!(outbound_frame_event_seq(&replay_n.2).unwrap(), 1);
+        assert_eq!(outbound_frame_event_seq(&replay_n_plus_one.2).unwrap(), 2);
+        assert_eq!(replay_n.0, replacement);
+        assert_eq!(replay_n_plus_one.0, replacement);
+        assert!(
+            !write.is_finished() && event_rx.try_recv().is_err(),
+            "replacement catch-up must finish before exactly one ACK is admitted"
+        );
+        adapter.mark_delivery_online(replacement).await.unwrap();
         online_tx.send_replace(true);
         let (ack_epoch, _, frame) = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
@@ -8194,11 +9961,143 @@ mod tests {
             .expect("durable callback and ACK complete");
 
         adapter.set_durable_admission_hook(None);
+        let quiescence = close_test_post_commit_writer(&store, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
+        adapter
+            .invalidate_delivery_epoch(replacement)
+            .await
+            .unwrap();
         pump_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), runtime.join())
             .await
             .expect("invalidated forwarder must terminate")
             .expect("forwarder task joins");
+        tokio::time::timeout(Duration::from_secs(1), replacement_runtime.join())
+            .await
+            .expect("replacement forwarder must terminate")
+            .expect("replacement forwarder joins");
+    }
+
+    #[tokio::test]
+    async fn emergency_post_commit_invalidation_resolves_never_drained_t17_admission() {
+        let store = Arc::new(
+            Store::session_test_store("t26-emergency-fence-cleanup")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook::default();
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+        let epoch = DeliveryEpoch::for_test("emergency-fence-cleanup");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = adapter
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("delivery epoch installs");
+        let mut dispatcher = post_commit::OrderedPostCommitDispatcher::start(
+            store.clone(),
+            adapter.clone(),
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        events
+            .send((
+                epoch,
+                OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: None,
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "error",
+                            "message": "lane blocker"
+                        }),
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("emergency-fence"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("dispatcher reserves the delivery epoch");
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.registered.notified())
+            .await
+            .expect("dispatcher owns a completion fence");
+        assert_eq!(adapter.durable_fence_count(), 1);
+        hook.allow_delivery.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.enqueued.notified())
+            .await
+            .expect("durable frame reaches T17 while the external lane stays full");
+
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("emergency invalidation joins the dispatcher");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.durable_fence_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("emergency teardown force-resolves the T17 fence");
+        let blocker = event_rx
+            .try_recv()
+            .expect("the pre-existing external lane blocker remains queued");
+        assert!(matches!(
+            blocker.2,
+            OutboundFrame::Event {
+                envelope: Envelope { seq: None, .. }
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the cancelled durable frame never reaches the external lane"
+        );
+        let receiver = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(receiver) = store.claim_post_commit_receiver() {
+                    break receiver;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dispatcher drop releases the exclusive receiver claim");
+        drop(receiver);
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("writer-after-emergency"))
+                .await
+                .unwrap(),
+            vec![2],
+            "dispatcher cancellation cannot strand EventWriter's gate"
+        );
+
+        adapter.set_durable_admission_hook(None);
+        adapter.invalidate_delivery_epoch(epoch).await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("forwarder terminates")
+            .expect("forwarder joins");
     }
 
     #[tokio::test]
@@ -8245,8 +10144,9 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
+        let post_commit_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
         let error = adapter
-            .on_durable_committed(1)
+            .admit_ordered_commit(&post_commit_epoch, 1)
             .await
             .expect_err("invalid durable projection must fail synchronously");
         assert!(
@@ -8486,9 +10386,10 @@ mod tests {
                 async move { RunCompletion::Completed(core) }
             }
         });
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
         let session = Session::start(
             store,
-            session::SessionGateway::from(handle),
+            gateway,
             RunCore::fixture_with_unapproved_tools(),
             worker,
             ProcessGeneration::from_wire(7).unwrap(),
@@ -8550,6 +10451,10 @@ mod tests {
 
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("ACK replay supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
     }
 
@@ -8560,12 +10465,17 @@ mod tests {
         let store = Store::session_test_store("active-session-reconnect")
             .await
             .unwrap();
-        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let store_arc = Arc::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let first_sent = Arc::new(Mutex::new(Vec::new()));
         let second_sent = Arc::new(Mutex::new(Vec::new()));
 
         let user_command = InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {
@@ -8597,7 +10507,7 @@ mod tests {
         let handle = supervisor.start();
         let mut online = handle.online.clone();
         let mut epochs = handle.epochs.clone();
-        let gateway = session::SessionGateway::from(handle);
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
 
         let starts = Arc::new(AtomicU64::new(0));
         let started = Arc::new(Notify::new());
@@ -8622,7 +10532,10 @@ mod tests {
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });
-                    let message_id = user_message_id(&initial.envelope().command_id);
+                    let message_id = user_message_id(
+                        &initial.envelope().personality_agent_id,
+                        &initial.envelope().command_id,
+                    );
                     for event in [
                         AgentEvent::AgentStart,
                         AgentEvent::TurnStart,
@@ -8731,7 +10644,13 @@ mod tests {
             .await
             .expect_err("test cleanup aborts the otherwise idle Session");
         assert!(error.is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("reconnect supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[tokio::test]
@@ -8743,11 +10662,16 @@ mod tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let store_arc = Arc::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer_blocked = Arc::new(Notify::new());
         let writer_release = Arc::new(Notify::new());
         let command = InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {
@@ -8793,7 +10717,10 @@ mod tests {
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });
-                    let message_id = user_message_id(&initial.envelope().command_id);
+                    let message_id = user_message_id(
+                        &initial.envelope().personality_agent_id,
+                        &initial.envelope().command_id,
+                    );
                     for event in [
                         AgentEvent::AgentStart,
                         AgentEvent::TurnStart,
@@ -8890,9 +10817,10 @@ mod tests {
                 }
             }
         });
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
         let session = Session::start(
             store,
-            session::SessionGateway::from(handle),
+            gateway,
             RunCore::fixture_with_unapproved_tools(),
             worker,
             ProcessGeneration::from_wire(7).unwrap(),
@@ -8953,7 +10881,13 @@ mod tests {
         writer_release.notify_one();
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("blocked-pump supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[derive(Clone)]
@@ -9002,6 +10936,7 @@ mod tests {
         ) -> std::result::Result<ApiHello, HelloError> {
             self.sent_hellos.lock().unwrap().push(hello.clone());
             Ok(ApiHello {
+                personality_agent_id: hello.personality_agent_id.clone(),
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),

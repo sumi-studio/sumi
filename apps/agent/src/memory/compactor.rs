@@ -2434,17 +2434,28 @@ mod tests {
         UserMessage, ValidatedToolArguments,
     };
     use crate::runtime::contracts::{
-        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
         ApplicationKind, DataKeyPurpose, EncryptedProviderContextRecord, HydrationOutcome,
         InjectedCommand, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryJobKind, MemoryJobRecord, MemoryLayer, ProviderContextKeyAnchor,
-        ProviderContextMutationApplier, ProviderContextMutationBuilder, RunPhase, Store,
-        TranscriptRecord, provider_context_record_id,
+        MemoryJobKind, MemoryJobRecord, MemoryLayer, ProviderContextMutationApplier,
+        ProviderContextMutationBuilder, RunPhase, Store, TranscriptRecord,
+        provider_context_record_id,
     };
     use crate::tools::{ToolRegistryBuilder, WorkspacePaths};
     use tokio_util::sync::CancellationToken;
+
+    const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
+    fn provenance(store: &Store) -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new(
+            "tenant-1",
+            store.scope().personality_agent_id.clone(),
+            "human-1",
+        )
+        .expect("canonical direct-chat provenance")
+    }
 
     fn timestamp() -> DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -3171,7 +3182,7 @@ mod tests {
 
     async fn test_store() -> Arc<Store> {
         Arc::new(
-            Store::session_test_store("compactor-test")
+            Store::session_test_store(PERSONALITY_AGENT_ID)
                 .await
                 .expect("open test store"),
         )
@@ -3201,6 +3212,8 @@ mod tests {
         let envelope = CommandEnvelope {
             seq: command_seq,
             command_id: CommandId::parse(command_id).expect("fixture command id"),
+            personality_agent_id: store.scope().personality_agent_id.clone(),
+            provenance: provenance(store),
             command: Command::UserMessage {
                 text: user_text.to_owned(),
                 attachments: Vec::new(),
@@ -3227,7 +3240,8 @@ mod tests {
             .await
             .expect("classify fixture command");
 
-        let user_id = crate::store::user_message_id(command_id);
+        let user_id =
+            crate::store::user_message_id(&store.scope().personality_agent_id, command_id);
         let received_at: String =
             sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
                 .bind(command_id)
@@ -3314,6 +3328,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     command_seq,
                     CommandId::parse(command_id).expect("fixture command id"),
+                    provenance(store),
                 )],
             })
             .await
@@ -3534,7 +3549,7 @@ mod tests {
             .await
             .expect("initialize fixture EventWriter checkpoint");
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("transcript key");
         let redactor = store.redactor();
@@ -5018,13 +5033,6 @@ mod tests {
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!("{message_id}:{message_seq}"),
-            })
-            .await
-            .expect("provider context key");
         let item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: message_id.clone(),
@@ -5047,6 +5055,10 @@ mod tests {
                 }),
             },
         };
+        let key = store
+            .provider_context_item_key(&item, None)
+            .await
+            .expect("provider context key");
         let record_id = provider_context_record_id(&item);
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
@@ -5217,8 +5229,12 @@ mod tests {
             .expect("complete speculative shelf");
 
         let generation = ProcessGeneration::from_wire(41).expect("fixture generation");
-        let lease =
-            ProcessGenerationLease::new(generation, "idle-memory-lease").expect("fixture lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "idle-memory-lease",
+        )
+        .expect("fixture lease");
         let fence = GenerationRecoveryFence::new(&lease, "idle-memory-fence")
             .expect("fixture recovery fence");
         let hydrated = match store
@@ -5415,6 +5431,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq: 2,
                 command_id: CommandId::parse(pending_command_id).expect("pending command id"),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
+                provenance: provenance(&store),
                 command: Command::UserMessage {
                     text: "pending logical suffix".to_owned(),
                     attachments: Vec::new(),
@@ -5722,14 +5740,6 @@ mod tests {
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!("{message_id}:{message_seq}"),
-            })
-            .await
-            .expect("provider context key");
-
         let covered_item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: message_id.clone(),
@@ -5747,8 +5757,12 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&covered_item, Some((1, 1)))
+            .await
+            .expect("provider context key");
         let covered_record_id = provider_context_record_id(&covered_item);
-        let covered = EncryptedProviderContextRecord::encrypt(
+        let covered = EncryptedProviderContextRecord::encrypt_native_window(
             &covered_item,
             "test-instance",
             ApiProtocol::OpenAiResponses,
@@ -5756,10 +5770,12 @@ mod tests {
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
             &key,
             store.scope(),
+            1,
+            1,
         )
         .expect("encrypt covered");
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mutation key");
         let applier = ProviderContextMutationApplier::new(&store);
@@ -5780,7 +5796,7 @@ mod tests {
         // insert. Promotion must terminalize and scrub it together with the
         // already-applied mutation copy.
         let mutation_key = store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .expect("mutation key for retry");
         let retry = ProviderContextMutationBuilder::new(
@@ -5823,13 +5839,6 @@ mod tests {
             insert_authenticated_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
         let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
         let unrelated_message_seq = 200u64;
-        let unrelated_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
-            })
-            .await
-            .expect("unrelated provider context key");
         let uncovered_item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: unrelated_message_id.clone(),
@@ -5847,6 +5856,13 @@ mod tests {
                 },
             },
         };
+        let unrelated_key = store
+            .provider_context_item_key(
+                &uncovered_item,
+                Some((0, u64::from(uncovered_item.ordinal))),
+            )
+            .await
+            .expect("unrelated provider context key");
         let uncovered_record_id = provider_context_record_id(&uncovered_item);
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,
@@ -5979,14 +5995,6 @@ mod tests {
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
-        let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!("{message_id}:{message_seq}"),
-            })
-            .await
-            .expect("provider context key");
-
         let covered_item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: message_id.clone(),
@@ -6004,6 +6012,10 @@ mod tests {
                 },
             },
         };
+        let key = store
+            .provider_context_item_key(&covered_item, Some((0, u64::from(covered_item.ordinal))))
+            .await
+            .expect("provider context key");
         let covered_record_id = provider_context_record_id(&covered_item);
         let covered = EncryptedProviderContextRecord::encrypt(
             &covered_item,
@@ -6044,13 +6056,6 @@ mod tests {
             insert_authenticated_l0_batch_with_seq(&store, 2, &[unrelated_assistant]).await;
         let unrelated_message_id = format!("{unrelated_source_id}-msg-0");
         let unrelated_message_seq = 200u64;
-        let unrelated_key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id: format!("{unrelated_message_id}:{unrelated_message_seq}"),
-            })
-            .await
-            .expect("unrelated provider context key");
         let uncovered_item = ProviderContextItem {
             retention_owner: ProviderContextAnchor {
                 message_id: unrelated_message_id.clone(),
@@ -6068,6 +6073,13 @@ mod tests {
                 },
             },
         };
+        let unrelated_key = store
+            .provider_context_item_key(
+                &uncovered_item,
+                Some((0, u64::from(uncovered_item.ordinal))),
+            )
+            .await
+            .expect("unrelated provider context key");
         let uncovered_record_id = provider_context_record_id(&uncovered_item);
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,

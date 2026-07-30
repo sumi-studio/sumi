@@ -21,7 +21,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/conversations/{conversation_id}/commands": {
+    "/direct-chat/commands": {
         parameters: {
             query?: never;
             header?: never;
@@ -31,23 +31,22 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Create a user command in a conversation
-         * @description Admits a user_message command from the web client. The caller is
-         *     authenticated by the signed HttpOnly `sumi_session` browser cookie; agent
-         *     bearer tokens are not accepted. The request is validated for UTF-8 JSON
-         *     shape, empty attachments, and a 1 MiB wire-size limit before any
-         *     command_id or seq is allocated. Rejections are returned as typed 4xx
-         *     responses with no command_id/seq, so they cannot create a sequence gap
-         *     in the durable command log.
+         * Create a direct-chat user command
+         * @description Admits content from the authenticated direct-chat browser session. The
+         *     signed HttpOnly `sumi_session` cookie supplies the target personality
+         *     agent and human provenance; neither is accepted from the browser body.
+         *     The request Origin must exactly match the configured browser origin
+         *     allowlist. Origin rejection occurs before session or body processing;
+         *     all rejections occur before command_id or seq allocation.
          */
-        post: operations["createUserCommand"];
+        post: operations["createDirectChatCommand"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/conversations/{conversation_id}/ws": {
+    "/direct-chat/ws": {
         parameters: {
             query?: never;
             header?: never;
@@ -116,17 +115,36 @@ export interface components {
              * @description canonical lower-case hyphenated UUID
              */
             command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            provenance: components["schemas"]["DirectChatProvenanceV1"];
             command: components["schemas"]["Command"];
         };
+        /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
+        PersonalityAgentId: string;
+        DirectChatProvenanceV1: {
+            /** @constant */
+            version: 1;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @constant */
+                kind: "human";
+                principal_id: components["schemas"]["PrincipalId"];
+            };
+            source: {
+                /** @constant */
+                surface: "direct_chat";
+            };
+        };
         AgentHello: {
-            /** @description agent identity from the short-lived credential claim */
-            agent_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             generation: components["schemas"]["ProcessGeneration"];
             last_sent_event_seq: components["schemas"]["CanonicalDecimalU64"];
             last_received_command_seq: components["schemas"]["CanonicalDecimalU64"];
             last_applied_command_seq: components["schemas"]["CanonicalDecimalU64"];
         };
         ApiHello: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             accepted_generation: components["schemas"]["ProcessGeneration"];
             last_received_event_seq: components["schemas"]["CanonicalDecimalU64"];
             next_command_seq: components["schemas"]["CanonicalDecimalU64"];
@@ -141,10 +159,41 @@ export interface components {
             ack: components["schemas"]["CommandAck"];
         };
         BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
-        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"];
+        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
+        DirectChatUserMessageCommand: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            attachments: components["schemas"]["Attachment"][];
+        };
+        DirectChatCommandReceipt: {
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        DirectChatCommandRejectedResponse: {
+            /** @constant */
+            error: "invalid_command";
+            idempotency_key?: string;
+            /** @enum {string} */
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        };
+        DirectChatCommandIdempotencyConflictResponse: {
+            /** @constant */
+            error: "idempotency_conflict";
+            idempotency_key: string;
+            /** @constant */
+            reject_reason: "idempotency_conflict";
+        };
         /** @description placeholder for v1; no attachments are accepted yet */
         Attachment: {
             [key: string]: unknown;
+        };
+        BrowserHello: {
+            /** @constant */
+            type: "hello";
+            last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
         /** @description any JSON value */
         AnyJSON: {
@@ -179,11 +228,6 @@ export interface components {
             type: "approval_decision";
             request_id: string;
             decision: components["schemas"]["ApprovalDecision"];
-        };
-        BrowserHello: {
-            /** @constant */
-            type: "hello";
-            last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
         BrowserCommandFrame: {
             /** @constant */
@@ -420,11 +464,6 @@ export interface components {
             error_message: string;
         };
         DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"];
-        DurableEnvelope: {
-            conversation_id: string;
-            event: components["schemas"]["DurableAgentEvent"];
-            seq: components["schemas"]["JsonSafeInteger"];
-        };
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {
@@ -513,31 +552,57 @@ export interface components {
             message: string;
         };
         VolatileAgentEvent: components["schemas"]["MessageUpdateEvent"] | components["schemas"]["ToolExecutionUpdateEvent"] | components["schemas"]["ErrorEvent"];
-        VolatileEnvelope: {
-            conversation_id: string;
+        BrowserEventEnvelope: {
+            seq: components["schemas"]["JsonSafeInteger"];
+            event: components["schemas"]["DurableAgentEvent"];
+        } | {
             event: components["schemas"]["VolatileAgentEvent"];
         };
-        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
         BrowserEventFrame: {
             /** @constant */
             type: "event";
-            envelope: components["schemas"]["Envelope"];
+            envelope: components["schemas"]["BrowserEventEnvelope"];
         };
         BrowserCommandAcceptedFrame: {
             /** @constant */
             type: "command_accepted";
-            envelope: components["schemas"]["CommandEnvelope"];
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
         };
         BrowserCommandRejectedFrame: {
             /** @constant */
             type: "command_rejected";
+            idempotency_key: string;
             /** @enum {string} */
-            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable";
         };
+        DirectChatStatusFrame: {
+            /** @constant */
+            type: "direct_chat_status";
+            /** @enum {string} */
+            status: "ready" | "unavailable";
+        };
+        /** @description opaque ASCII tenant identity */
+        TenantId: string;
+        /** @description opaque ASCII principal identity */
+        PrincipalId: string;
+        DurableEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["DurableAgentEvent"];
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        VolatileEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["VolatileAgentEvent"];
+        };
+        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
         CommandAck: {
             seq: components["schemas"]["JsonSafeInteger"];
             /** Format: uuid */
             command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             /** @enum {string} */
             status: "received" | "applied" | "superseded" | "rejected";
             /** @enum {string} */
@@ -575,33 +640,28 @@ export interface operations {
             };
         };
     };
-    createUserCommand: {
+    createDirectChatCommand: {
         parameters: {
             query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
+            header: {
+                "Idempotency-Key": string;
             };
+            path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": {
-                    /** @enum {string} */
-                    type: "user_message";
-                    text: string;
-                    attachments: unknown[];
-                };
+                "application/json": components["schemas"]["DirectChatUserMessageCommand"];
             };
         };
         responses: {
-            /** @description Command accepted and allocated a durable seq and command_id */
+            /** @description Target-free command receipt */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CommandEnvelope"];
+                    "application/json": components["schemas"]["DirectChatCommandReceipt"];
                 };
             };
             /** @description Command rejected before seq/command_id allocation */
@@ -610,12 +670,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        error: "invalid_command";
-                        /** @enum {string} */
-                        reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
-                    };
+                    "application/json": components["schemas"]["DirectChatCommandRejectedResponse"];
                 };
             };
             /** @description Missing or invalid browser session cookie */
@@ -625,15 +680,29 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Origin not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Idempotency key was already used for different content */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
+                };
+            };
         };
     };
     browserWebSocket: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                conversation_id: string;
-            };
+            path?: never;
             cookie?: never;
         };
         /** @description The first WebSocket frame (BrowserHello) */

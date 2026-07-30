@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::runtime::contracts::{
-    GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+    GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
 };
 
 use super::Store;
@@ -52,6 +52,7 @@ pub(crate) struct PhysicalRecoveryIntentRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HydrationReceiptIdentity {
+    pub personality_agent_id: PersonalityAgentId,
     pub lease_id: String,
     pub generation: ProcessGeneration,
     pub fence_id: String,
@@ -65,7 +66,8 @@ impl HydrationReceiptIdentity {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
         }
-        field(&mut hasher, b"sumi-hydration-receipt/v1");
+        field(&mut hasher, b"sumi-hydration-receipt/v2");
+        field(&mut hasher, self.personality_agent_id.as_str().as_bytes());
         field(&mut hasher, self.lease_id.as_bytes());
         hasher.update(self.generation.as_i64().to_be_bytes());
         field(&mut hasher, self.fence_id.as_bytes());
@@ -100,8 +102,12 @@ impl PhysicalRecoveryReceipt {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
         }
-        field(&mut hasher, b"sumi-physical-recovery-receipt/v1");
+        field(&mut hasher, b"sumi-physical-recovery-receipt/v2");
         field(&mut hasher, self.receipt_id.as_bytes());
+        field(
+            &mut hasher,
+            self.lease.personality_agent_id().as_str().as_bytes(),
+        );
         field(&mut hasher, self.lease.lease_id().as_bytes());
         hasher.update(self.lease.generation().as_i64().to_be_bytes());
         field(&mut hasher, self.fence.fence_id().as_bytes());
@@ -181,7 +187,11 @@ impl PhysicalRecoveryReceipt {
     ) -> Result<()> {
         self.validate()?;
         lease
-            .validate_exact(self.lease.generation(), self.lease.lease_id())
+            .validate_exact(
+                self.lease.personality_agent_id(),
+                self.lease.generation(),
+                self.lease.lease_id(),
+            )
             .map_err(|error| {
                 anyhow::anyhow!("physical recovery receipt lease mismatch: {error}")
             })?;
@@ -189,6 +199,19 @@ impl PhysicalRecoveryReceipt {
             .validate_exact(lease, self.fence.fence_id())
             .map_err(|error| {
                 anyhow::anyhow!("physical recovery receipt fence mismatch: {error}")
+            })?;
+        Ok(())
+    }
+
+    fn validate_store_scope(&self, store: &Store) -> Result<()> {
+        self.lease
+            .validate_exact(
+                &store.scope().personality_agent_id,
+                self.lease.generation(),
+                self.lease.lease_id(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("physical recovery receipt Store PAID mismatch: {error}")
             })?;
         Ok(())
     }
@@ -218,11 +241,12 @@ impl<'a> PhysicalRecoveryApplier<'a> {
     #[cfg(test)]
     async fn apply(&self, receipt: &PhysicalRecoveryReceipt) -> Result<ApplyReceiptOutcome> {
         receipt.validate()?;
+        receipt.validate_store_scope(self.store)?;
 
         let mut transaction = self.store.pool().begin().await?;
 
         let existing = sqlx::query(
-            "SELECT receipt_digest, lease_id, generation, fence_id, intent_count,
+            "SELECT receipt_digest, personality_agent_id, lease_id, generation, fence_id, intent_count,
                     logical_suffix_first_seq, logical_suffix_last_seq, applied_at
              FROM physical_recovery_receipt_applications
              WHERE receipt_id = ?",
@@ -234,6 +258,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
 
         if let Some(row) = existing {
             let digest: String = row.try_get("receipt_digest")?;
+            let personality_agent_id: String = row.try_get("personality_agent_id")?;
             let lease_id: String = row.try_get("lease_id")?;
             let stored_generation: i64 = row.try_get("generation")?;
             let fence_id: String = row.try_get("fence_id")?;
@@ -243,6 +268,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             let applied_at: String = row.try_get("applied_at")?;
 
             let matches = digest == receipt.digest
+                && personality_agent_id == receipt.lease.personality_agent_id().as_str()
                 && lease_id == receipt.lease.lease_id()
                 && stored_generation == receipt.lease.generation().as_i64()
                 && fence_id == receipt.fence.fence_id()
@@ -346,12 +372,14 @@ impl<'a> PhysicalRecoveryApplier<'a> {
 
         sqlx::query(
             "INSERT INTO physical_recovery_receipt_applications(
-                receipt_id, receipt_digest, lease_id, fence_id, generation, intent_count,
+                receipt_id, receipt_digest, personality_agent_id, lease_id, fence_id,
+                generation, intent_count,
                 logical_suffix_first_seq, logical_suffix_last_seq, applied_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&receipt.receipt_id)
         .bind(&receipt.digest)
+        .bind(receipt.lease.personality_agent_id().as_str())
         .bind(receipt.lease.lease_id())
         .bind(receipt.fence.fence_id())
         .bind(receipt.lease.generation().as_i64())
@@ -418,9 +446,10 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         fence: &GenerationRecoveryFence,
     ) -> Result<ApplyReceiptOutcome> {
         receipt.validate_for(lease, fence)?;
+        receipt.validate_store_scope(self.store)?;
 
         let existing = sqlx::query(
-            "SELECT receipt_digest, lease_id, generation, fence_id, intent_count,
+            "SELECT receipt_digest, personality_agent_id, lease_id, generation, fence_id, intent_count,
                     logical_suffix_first_seq, logical_suffix_last_seq, applied_at
              FROM physical_recovery_receipt_applications
              WHERE receipt_id = ?",
@@ -500,6 +529,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         row: sqlx::sqlite::SqliteRow,
     ) -> Result<()> {
         let digest: String = row.try_get("receipt_digest")?;
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
         let lease_id: String = row.try_get("lease_id")?;
         let generation: i64 = row.try_get("generation")?;
         let fence_id: String = row.try_get("fence_id")?;
@@ -507,6 +537,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         let first: i64 = row.try_get("logical_suffix_first_seq")?;
         let last: i64 = row.try_get("logical_suffix_last_seq")?;
         if digest != receipt.digest
+            || personality_agent_id != receipt.lease.personality_agent_id().as_str()
             || lease_id != receipt.lease.lease_id()
             || generation != receipt.lease.generation().as_i64()
             || fence_id != receipt.fence.fence_id()
@@ -552,12 +583,13 @@ impl<'a> PhysicalRecoveryApplier<'a> {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO physical_recovery_receipt_applications(
-                receipt_id, receipt_digest, lease_id, fence_id, generation, intent_count,
+                receipt_id, receipt_digest, personality_agent_id, lease_id, fence_id, generation, intent_count,
                 logical_suffix_first_seq, logical_suffix_last_seq, applied_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&receipt.receipt_id)
         .bind(&receipt.digest)
+        .bind(receipt.lease.personality_agent_id().as_str())
         .bind(receipt.lease.lease_id())
         .bind(receipt.fence.fence_id())
         .bind(receipt.lease.generation().as_i64())
@@ -830,6 +862,7 @@ mod tests {
 
     fn test_lease(generation: u64) -> ProcessGenerationLease {
         ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             ProcessGeneration::from_wire(generation).expect("valid generation"),
             "lease-1",
         )
@@ -843,9 +876,7 @@ mod tests {
     async fn test_store() -> Arc<Store> {
         Store::in_memory(
             AgentScope {
-                tenant_id: "tenant-1".to_owned(),
-                agent_id: "agent-1".to_owned(),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             },
             Arc::new(TestKeyProvider {
                 key: WrappingKey::new("test-wrap-v1", [0x53; DATA_KEY_BYTES]),
@@ -863,7 +894,7 @@ mod tests {
         let terminal_seq = 12u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
@@ -980,6 +1011,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_paid_receipt_is_rejected_before_ledger_or_tool_state_access() {
+        let store = test_store().await;
+        let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
+        let wrong_lease = ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
+            ProcessGeneration::from_wire(1).unwrap(),
+            "lease-1",
+        )
+        .unwrap();
+        let wrong_fence = test_fence(&wrong_lease);
+        let receipt = receipt(&wrong_lease, &wrong_fence, first, last, &tool_call_id, 12);
+
+        let error = PhysicalRecoveryApplier::new(&store)
+            .apply(&receipt)
+            .await
+            .expect_err("cross-PAID receipt must fail closed");
+        assert!(format!("{error:#}").contains("Store PAID mismatch"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id = ?"
+            )
+            .bind(&tool_call_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            "running"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_conflicting_receipt_id_with_different_digest() {
         let store = test_store().await;
         let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
@@ -1087,12 +1157,30 @@ mod tests {
         assert_eq!(
             state.receipt,
             HydrationReceiptIdentity {
+                personality_agent_id: lease.personality_agent_id().clone(),
                 lease_id: lease.lease_id().to_owned(),
                 generation: lease.generation(),
                 fence_id: fence.fence_id().to_owned(),
                 intent_count: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn hydration_rejects_cross_paid_lease_before_store_validation() {
+        let store = test_store().await;
+        let lease = ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
+            ProcessGeneration::from_wire(1).unwrap(),
+            "lease-1",
+        )
+        .unwrap();
+        let fence = test_fence(&lease);
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("cross-PAID hydration authority must fail closed");
+        assert!(format!("{error:#}").contains("Store PAID"));
     }
 
     #[tokio::test]
@@ -1103,7 +1191,7 @@ mod tests {
         let terminal_seq = 13u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
@@ -1196,7 +1284,7 @@ mod tests {
         let terminal_seq = 12u64;
 
         let key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 

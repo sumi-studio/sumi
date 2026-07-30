@@ -1,6 +1,7 @@
 mod agent;
 mod apiclient;
 mod approval;
+mod bootstrap;
 mod config;
 mod gateway;
 mod memory;
@@ -12,7 +13,7 @@ mod tools;
 
 use std::{env, io, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use gateway::stdio::{InvalidCommand, StdioGateway};
 use gateway::{
     CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
@@ -36,8 +37,28 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(
     agent::run_canonical_live_responses_roundtrip(spec, api_key).await;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut arguments = env::args();
+    let _program = arguments.next();
+    let mode = arguments.next();
+    if arguments.next().is_some() {
+        anyhow::bail!("sumi-agent accepts at most one mode argument");
+    }
+    if mode.as_deref() == Some("--supervisor-allocate") {
+        let config = runtime::supervisor_allocator::SupervisorAllocatorConfig::from_process_env()?;
+        let metadata = runtime::supervisor_allocator::allocate(&config)?;
+        println!("{}", serde_json::to_string(&metadata)?);
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to construct Tokio runtime")?;
+    runtime.block_on(async_main(mode))
+}
+
+async fn async_main(mode: Option<String>) -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_writer(io::stderr)
@@ -46,7 +67,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sumi_agent=info")),
         )
         .init();
-    match env::args().nth(1).as_deref() {
+    match mode.as_deref() {
         Some("--tool-executor") => {
             tracing::warn!(
                 service = "tool-executor",
@@ -54,6 +75,14 @@ async fn main() -> Result<()> {
                 "starting service mode"
             );
             return tools::executor::run_tool_executor_mode().await;
+        }
+        Some("--tool-executor-socket") => {
+            tracing::warn!(
+                service = "tool-executor-socket",
+                trust = "low-trust-local",
+                "starting service mode"
+            );
+            return tools::executor::run_tool_executor_socket_mode().await;
         }
         Some("--artifact-broker") => {
             tracing::warn!(
@@ -63,16 +92,22 @@ async fn main() -> Result<()> {
             );
             return tools::executor::run_artifact_broker_mode().await;
         }
-        _ => {}
+        Some("--low-trust") => {
+            tracing::warn!(
+                service = "agent",
+                trust = "low-trust-stdio",
+                "starting explicit stdio mode"
+            );
+        }
+        Some(other) => anyhow::bail!("unknown sumi-agent mode {other}"),
+        None => return bootstrap::run_production().await,
     }
     let config = config::Config::load().await?;
 
     let model_spec = config.model_spec()?;
-    let conversation_id = config.conversation_id.clone();
+    let personality_agent_id = config.personality_agent_id.clone();
     let scope = AgentScope {
-        tenant_id: env::var("SUMI_TENANT_ID").unwrap_or_else(|_| "local-tenant".to_owned()),
-        agent_id: env::var("SUMI_AGENT_ID").unwrap_or_else(|_| "local-agent".to_owned()),
-        conversation_id: conversation_id.clone(),
+        personality_agent_id: personality_agent_id.clone(),
     };
     let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
         "SUMI_AGENT_WRAPPING_KEY",
@@ -86,7 +121,7 @@ async fn main() -> Result<()> {
         DataKeyPurpose::Event,
         DataKeyPurpose::Transcript,
     ] {
-        store.conversation_key(purpose).await?;
+        store.private_key(purpose).await?;
     }
     let event_writer = EventWriter::new(store.clone());
     event_writer.initialize_recovery_checkpoint().await?;
@@ -108,7 +143,7 @@ async fn main() -> Result<()> {
         StdioGateway::new(command_digest_factory).split();
 
     tracing::info!(
-        conversation_id,
+        personality_agent_id = %personality_agent_id,
         workspace = %config.workspace.display(),
         database_path = %config.database_path.display(),
         model_preset = ?config.model.preset,
@@ -129,7 +164,7 @@ async fn main() -> Result<()> {
                     .send(OutboundFrame::Event {
                         envelope: Envelope {
                             seq: None,
-                            conversation_id: conversation_id.clone(),
+                            personality_agent_id: personality_agent_id.clone(),
                             event: serde_json::json!({
                                 "type": "error",
                                 "message": "invalid command envelope",
@@ -141,6 +176,14 @@ async fn main() -> Result<()> {
             }
             Err(error) => return Err(error),
         };
+
+        if inbound.personality_agent_id() != &personality_agent_id
+            || inbound.provenance().personality_agent_id() != &personality_agent_id
+        {
+            anyhow::bail!(
+                "stdio command target/provenance does not match configured personality_agent_id"
+            );
+        }
 
         let receipt_ack = admission.receive(&event_writer, &inbound).await?;
         if receipt_ack.status != CommandAckStatus::Received {

@@ -14,15 +14,15 @@ use crate::provider::{
     model::{MaxTokensField, ThinkingFormat},
     types::ApiProtocol,
 };
+use crate::runtime::contracts::PersonalityAgentId;
 
-const DEFAULT_CONVERSATION_ID: &str = "default";
 const DEFAULT_STATE_DIR: &str = "/var/lib/sumi";
 const DEFAULT_MODEL_PRESET: &str = "opencode-go";
 const DEFAULT_SYSTEM_PROMPT: &str = crate::prompts::SYSTEM_PROMPT;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub conversation_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub workspace: PathBuf,
     pub database_path: PathBuf,
     pub system_prompt: String,
@@ -74,7 +74,7 @@ pub struct CompatConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
-    conversation_id: Option<String>,
+    personality_agent_id: Option<PersonalityAgentId>,
     workspace: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     system_prompt: Option<String>,
@@ -84,7 +84,7 @@ struct FileConfig {
 
 #[derive(Debug, Default)]
 struct EnvOverrides {
-    conversation_id: Option<String>,
+    personality_agent_id: Option<PersonalityAgentId>,
     workspace: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     system_prompt: Option<String>,
@@ -112,7 +112,7 @@ impl Config {
             None => None,
         };
         let file = file.unwrap_or_default();
-        let overrides = EnvOverrides::from_env();
+        let overrides = EnvOverrides::from_env()?;
         let config_dir = config_path.as_deref().and_then(Path::parent);
         let system_prompt = resolve_system_prompt(&file, &overrides, config_dir).await?;
 
@@ -265,10 +265,14 @@ impl Config {
         }
 
         Ok(Self {
-            conversation_id: overrides
-                .conversation_id
-                .or(file.conversation_id)
-                .unwrap_or_else(|| DEFAULT_CONVERSATION_ID.to_owned()),
+            personality_agent_id: overrides
+                .personality_agent_id
+                .or(file.personality_agent_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "personality_agent_id is required in config or SUMI_PERSONALITY_AGENT_ID"
+                    )
+                })?,
             workspace,
             database_path,
             system_prompt: overrides
@@ -407,9 +411,19 @@ async fn resolve_system_prompt(
 }
 
 impl EnvOverrides {
-    fn from_env() -> Self {
-        Self {
-            conversation_id: env::var("SUMI_CONVERSATION_ID").ok(),
+    fn from_env() -> Result<Self> {
+        let personality_agent_id = match env::var("SUMI_PERSONALITY_AGENT_ID") {
+            Ok(value) => Some(
+                PersonalityAgentId::parse(&value)
+                    .context("SUMI_PERSONALITY_AGENT_ID must be a canonical UUIDv7")?,
+            ),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                bail!("SUMI_PERSONALITY_AGENT_ID must be valid UTF-8")
+            }
+        };
+        Ok(Self {
+            personality_agent_id,
             workspace: env::var_os("SUMI_WORKSPACE").map(PathBuf::from),
             state_dir: env::var_os("SUMI_STATE_DIR").map(PathBuf::from),
             system_prompt: env::var("SUMI_SYSTEM_PROMPT").ok(),
@@ -418,7 +432,7 @@ impl EnvOverrides {
             model_id: env::var("SUMI_MODEL_ID").ok(),
             model_base_url: env::var("SUMI_MODEL_BASE_URL").ok(),
             model_api_key_env: env::var("SUMI_MODEL_API_KEY_ENV").ok(),
-        }
+        })
     }
 }
 
@@ -433,6 +447,20 @@ async fn load_file(path: &Path) -> Result<FileConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000002";
+
+    fn paid() -> PersonalityAgentId {
+        PersonalityAgentId::parse(PERSONALITY_AGENT_ID).expect("canonical personality-agent ID")
+    }
+
+    fn identity_overrides() -> EnvOverrides {
+        EnvOverrides {
+            personality_agent_id: Some(paid()),
+            ..EnvOverrides::default()
+        }
+    }
 
     struct FixtureRoot(PathBuf);
 
@@ -463,7 +491,7 @@ mod tests {
     fn parses_toml_and_derives_database_path_from_state_dir() {
         let file: FileConfig = toml::from_str(
             r#"
-conversation_id = "conversation-1"
+personality_agent_id = "0198f0f4-9b72-7000-8000-000000000001"
 workspace = "/workspace"
 state_dir = "/state"
 system_prompt = "Be useful."
@@ -479,7 +507,7 @@ api_key_env = "EXAMPLE_API_KEY"
 
         let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
 
-        assert_eq!(config.conversation_id, "conversation-1");
+        assert_eq!(config.personality_agent_id, paid());
         assert_eq!(config.workspace, PathBuf::from("/workspace"));
         assert_eq!(config.database_path, PathBuf::from("/state/agent.db"));
         assert_eq!(config.system_prompt, "Be useful.");
@@ -496,9 +524,47 @@ api_key_env = "EXAMPLE_API_KEY"
     }
 
     #[test]
+    fn personality_agent_identity_is_required_without_a_default() {
+        let error = Config::resolve(FileConfig::default(), EnvOverrides::default())
+            .expect_err("missing personality-agent identity must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "personality_agent_id is required in config or SUMI_PERSONALITY_AGENT_ID"
+        );
+    }
+
+    #[test]
+    fn config_rejects_legacy_and_noncanonical_personality_agent_identity() {
+        let legacy = toml::from_str::<FileConfig>(
+            r#"
+conversation_id = "0198f0f4-9b72-7000-8000-000000000001"
+"#,
+        )
+        .expect_err("legacy identity key must not remain an alias");
+        assert!(
+            legacy
+                .to_string()
+                .contains("unknown field `conversation_id`")
+        );
+
+        for value in [
+            "conversation-1",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "0198F0F4-9B72-7000-8000-000000000001",
+        ] {
+            let source = format!("personality_agent_id = {value:?}");
+            assert!(
+                toml::from_str::<FileConfig>(&source).is_err(),
+                "accepted noncanonical personality-agent identity {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn embedded_system_prompt_is_the_default() {
         let config =
-            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+            Config::resolve(FileConfig::default(), identity_overrides()).expect("resolved");
 
         assert_eq!(config.system_prompt, crate::prompts::SYSTEM_PROMPT);
         assert!(!config.system_prompt.trim().is_empty());
@@ -568,7 +634,7 @@ api_key_env = "EXAMPLE_API_KEY"
     fn environment_values_override_file_values() {
         let file: FileConfig = toml::from_str(
             r#"
-conversation_id = "from-file"
+personality_agent_id = "0198f0f4-9b72-7000-8000-000000000001"
 workspace = "/file-workspace"
 state_dir = "/file-state"
 
@@ -578,7 +644,10 @@ id = "file-model"
         )
         .expect("valid config");
         let overrides = EnvOverrides {
-            conversation_id: Some("from-env".to_owned()),
+            personality_agent_id: Some(
+                PersonalityAgentId::parse(OTHER_PERSONALITY_AGENT_ID)
+                    .expect("canonical personality-agent ID"),
+            ),
             workspace: Some(PathBuf::from("/env-workspace")),
             state_dir: Some(PathBuf::from("/env-state")),
             model_id: Some("env-model".to_owned()),
@@ -587,7 +656,10 @@ id = "file-model"
 
         let config = Config::resolve(file, overrides).expect("resolved config");
 
-        assert_eq!(config.conversation_id, "from-env");
+        assert_eq!(
+            config.personality_agent_id.as_str(),
+            OTHER_PERSONALITY_AGENT_ID
+        );
         assert_eq!(config.workspace, PathBuf::from("/env-workspace"));
         assert_eq!(config.database_path, PathBuf::from("/env-state/agent.db"));
         assert_eq!(config.model.id.as_deref(), Some("env-model"));
@@ -602,7 +674,7 @@ workspace = "/workspace/customer-data"
         )
         .expect("valid config");
 
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved config");
 
         assert_eq!(
             config.database_path,
@@ -618,7 +690,7 @@ workspace = "/workspace/customer-data"
 
         let config = Config::resolve_from(
             paths_config("workspace", "private/state"),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect("non-overlapping relative paths");
@@ -639,7 +711,7 @@ workspace = "/workspace/customer-data"
 
         let error = Config::resolve_from(
             paths_config(&workspace, workspace.join("nope/../../alias")),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect_err("unresolved parent traversal must fail closed");
@@ -658,7 +730,7 @@ workspace = "/workspace/customer-data"
 
         let config = Config::resolve_from(
             paths_config(&workspace, state.join("..").join("state")),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect("existing parent traversal should canonicalize");
@@ -679,7 +751,7 @@ workspace = "/workspace/customer-data"
         ] {
             let error = Config::resolve_from(
                 paths_config(workspace_path, state_path),
-                EnvOverrides::default(),
+                identity_overrides(),
                 &root.0,
             )
             .expect_err("workspace/state overlap must fail closed");
@@ -694,7 +766,7 @@ workspace = "/workspace/customer-data"
 
         let error = Config::resolve_from(
             paths_config("./workspace", "workspace/private/state"),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect_err("relative overlap must fail closed");
@@ -717,7 +789,7 @@ workspace = "/workspace/customer-data"
 
         let error = Config::resolve_from(
             paths_config(&workspace, alias.join("agent-state")),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect_err("symlinked overlap must fail closed");
@@ -745,7 +817,7 @@ workspace = "/workspace/customer-data"
 
         let config = Config::resolve_from(
             paths_config(&workspace, &state),
-            EnvOverrides::default(),
+            identity_overrides(),
             &root.0,
         )
         .expect("sibling workspace and state trees are isolated");
@@ -799,7 +871,7 @@ supports_required_tool_choice = false
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -823,7 +895,7 @@ supports_required_tool_choice = true
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -848,7 +920,7 @@ supports_required_tool_choice = true
                 },
                 ..FileConfig::default()
             };
-            let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
+            let config = Config::resolve(file, identity_overrides()).expect("resolved config");
 
             let error = config
                 .model_spec()
@@ -881,7 +953,7 @@ zai_tool_stream = false
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -907,7 +979,7 @@ id = "glm-5.2"
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -939,7 +1011,7 @@ zai_tool_stream = false
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -960,7 +1032,7 @@ max_output_tokens = 8000
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -979,7 +1051,7 @@ default_output_tokens = 16000
 "#,
         )
         .expect("valid config");
-        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+        let config = Config::resolve(file, identity_overrides()).expect("resolved");
 
         let error = config
             .model_spec()
@@ -995,7 +1067,7 @@ default_output_tokens = 16000
     #[test]
     fn default_model_uses_opencode_go_kimi_k2_7_code() {
         let config =
-            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+            Config::resolve(FileConfig::default(), identity_overrides()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
@@ -1019,7 +1091,7 @@ default_output_tokens = 16000
             "not-a-url",
         ] {
             let config = Config {
-                conversation_id: "test".to_owned(),
+                personality_agent_id: paid(),
                 workspace: PathBuf::from("/workspace"),
                 database_path: PathBuf::from("/workspace/agent.db"),
                 system_prompt: String::new(),
@@ -1036,7 +1108,7 @@ default_output_tokens = 16000
     #[test]
     fn zero_context_window_is_rejected() {
         let mut config =
-            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+            Config::resolve(FileConfig::default(), identity_overrides()).expect("resolved");
         config.model.context_window = Some(0);
 
         let error = config

@@ -35,7 +35,9 @@ use crate::{
             ToolResultMessage, Usage,
         },
     },
-    runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
+    runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease, RpcIdentity,
+    },
     store::{HydratedRunState, HydrationOutcome, Store},
     tools::executor::ArtifactBrokerClient,
     tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
@@ -379,6 +381,18 @@ impl InjectedRunDriver {
 
 #[async_trait]
 impl RunDriver for InjectedRunDriver {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        if identity.generation() != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {}",
+                self.executor_generation,
+                identity.generation()
+            );
+        }
+        self.registry.validate_executor_identity(identity)?;
+        Ok(())
+    }
+
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         if generation != self.executor_generation {
             bail!(
@@ -620,6 +634,7 @@ fn validate_hydrated_authority(
         bail!("hydrated memory fence does not match the independently supplied authority");
     }
     if hydrated.receipt.intent_count != 0
+        || hydrated.receipt.personality_agent_id != *expected_lease.personality_agent_id()
         || hydrated.receipt.generation != expected_lease.generation()
         || hydrated.receipt.lease_id != expected_lease.lease_id()
         || hydrated.receipt.fence_id != expected_fence.fence_id()
@@ -735,6 +750,9 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
     use crate::{
         agent::{RunCore, SequentialRunWorker, Session, SessionResult},
         gateway::InjectedStdioGateway,
@@ -759,6 +777,23 @@ mod tests {
 
     fn generation(raw: u64) -> ProcessGeneration {
         ProcessGeneration::from_wire(raw).expect("valid test generation")
+    }
+
+    fn json_lines_user_command(text: &str) -> Vec<u8> {
+        let mut command = serde_json::to_vec(&json!({
+            "seq": 1,
+            "command_id": "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": {
+                "type": "user_message",
+                "text": text,
+                "attachments": [],
+            },
+        }))
+        .expect("serialize authenticated JSON-lines command fixture");
+        command.push(b'\n');
+        command
     }
 
     fn expected_tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
@@ -963,11 +998,11 @@ mod tests {
     }
 
     #[test]
-    fn construction_binds_remote_registry_to_executor_generation() {
+    fn construction_binds_remote_registry_to_complete_executor_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity");
         let client = Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
-            RpcIdentity::from_wire(7, "boot-nonce").expect("identity"),
-            "conversation-1",
+            identity.clone(),
         ));
         let registry = remote_executor_registry(client).expect("remote registry");
         let prompt = PromptContext {
@@ -1007,6 +1042,25 @@ mod tests {
         )
         .expect("matching remote generation");
         assert_eq!(driver.executor_generation(), generation(7));
+        driver
+            .validate_runtime_identity(&identity)
+            .expect("complete executor identity matches");
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(OTHER_PAID, 7, "boot-nonce")
+                        .expect("wrong-PAID identity"),
+                )
+                .is_err()
+        );
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(PAID, 7, "stale-boot-nonce")
+                        .expect("wrong-nonce identity"),
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1017,8 +1071,12 @@ mod tests {
                 .expect("store"),
         );
         let generation = generation(7);
-        let hydrated_lease =
-            ProcessGenerationLease::new(generation, "hydrated-lease").expect("hydrated lease");
+        let hydrated_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "hydrated-lease",
+        )
+        .expect("hydrated lease");
         let hydrated_fence = GenerationRecoveryFence::new(&hydrated_lease, "hydrated-fence")
             .expect("hydrated fence");
         let hydrated = match store
@@ -1060,8 +1118,12 @@ mod tests {
                 .expect("clean Sumi binding has no ready maintenance")
         );
 
-        let stale_lease = ProcessGenerationLease::new(generation, "same-generation-stale-lease")
-            .expect("stale lease");
+        let stale_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "same-generation-stale-lease",
+        )
+        .expect("stale lease");
         let stale_lease_fence =
             GenerationRecoveryFence::new(&stale_lease, hydrated_fence.fence_id())
                 .expect("stale lease fence");
@@ -1096,8 +1158,12 @@ mod tests {
                 .expect("store"),
         );
         let generation = generation(9);
-        let lease =
-            ProcessGenerationLease::new(generation, "overflow-lease").expect("fixture lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "overflow-lease",
+        )
+        .expect("fixture lease");
         let fence = GenerationRecoveryFence::new(&lease, "overflow-fence").expect("fixture fence");
         let hydrated = match store
             .hydrate(&lease, &fence)
@@ -1881,7 +1947,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"fail\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("fail"))
+            .await
+            .expect("command");
         let mut lines = BufReader::new(event_read).lines();
         let mut frames = Vec::new();
         loop {
@@ -2070,9 +2139,7 @@ mod tests {
         let session_task = tokio::spawn(session.run());
 
         command_write
-            .write_all(
-                b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"run\",\"attachments\":[]}}\n",
-            )
+            .write_all(&json_lines_user_command("run"))
             .await
             .expect("command");
         let mut lines = BufReader::new(event_read).lines();
@@ -2210,7 +2277,10 @@ mod tests {
         );
         assert_eq!(
             start_ids[0],
-            user_message_id("018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a")
+            user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            )
         );
         assert_eq!(
             message_ends[2].pointer("/envelope/event/message/content"),
@@ -2520,7 +2590,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold"))
+            .await
+            .expect("command");
         started_rx.await.expect("provider started");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)
@@ -2640,7 +2713,10 @@ mod tests {
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold tool\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold tool"))
+            .await
+            .expect("command");
         entered_rx.await.expect("tool entered");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)

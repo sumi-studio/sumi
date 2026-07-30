@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,10 +13,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// BrowserServer is the browser-facing half of the T28 WebSocket boundary. It
-// never accepts an agent bearer token: a signed HttpOnly user-session cookie
-// authorizes exactly one conversation and all command/event traffic stays on
-// that conversation's API-side durable logs.
+// BrowserServer is the browser-facing direct-chat WebSocket boundary. It never
+// accepts an agent bearer token or public target: the signed HttpOnly session
+// supplies the target and authenticated provenance.
 type BrowserServer struct {
 	Sessions UserSessionVerifier
 	Appender CommandAppender
@@ -55,18 +55,173 @@ type browserCommandFrame struct {
 }
 
 type browserEventFrame struct {
-	Type     string   `json:"type"`
-	Envelope Envelope `json:"envelope"`
+	Type     string               `json:"type"`
+	Envelope browserEventEnvelope `json:"envelope"`
 }
 
 type browserCommandAcceptedFrame struct {
-	Type     string          `json:"type"`
-	Envelope CommandEnvelope `json:"envelope"`
+	Type           string `json:"type"`
+	IdempotencyKey string `json:"idempotency_key"`
+	CommandID      string `json:"command_id"`
+	Seq            uint64 `json:"seq"`
 }
 
 type browserCommandRejectedFrame struct {
-	Type         string       `json:"type"`
-	RejectReason RejectReason `json:"reject_reason"`
+	Type           string       `json:"type"`
+	IdempotencyKey string       `json:"idempotency_key"`
+	RejectReason   RejectReason `json:"reject_reason"`
+}
+
+type browserCommandReceipt struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	CommandID      string `json:"command_id"`
+	Seq            uint64 `json:"seq"`
+}
+
+type browserEventEnvelope struct {
+	Seq   *uint64         `json:"seq,omitempty"`
+	Event json.RawMessage `json:"event"`
+}
+
+type directChatStatusFrame struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+}
+
+func (f *browserEventFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event frame: %w", err)
+	}
+	type wire struct {
+		Type     string                `json:"type"`
+		Envelope *browserEventEnvelope `json:"envelope"`
+	}
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Type != "event" || decoded.Envelope == nil {
+		return errors.New("browser event frame type must be event")
+	}
+	*f = browserEventFrame{Type: decoded.Type, Envelope: *decoded.Envelope}
+	return nil
+}
+
+func (e *browserEventEnvelope) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event envelope: %w", err)
+	}
+	type rawEnvelope struct {
+		Seq   json.RawMessage `json:"seq"`
+		Event json.RawMessage `json:"event"`
+	}
+	var raw rawEnvelope
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
+		return errors.New("browser event envelope requires a valid event")
+	}
+	if err := validateEvent(raw.Event); err != nil {
+		return err
+	}
+	volatile := volatileEventTypes[eventType(raw.Event)]
+	var parsedSeq *uint64
+	switch {
+	case raw.Seq == nil:
+		if !volatile {
+			return errors.New("durable browser event requires seq")
+		}
+	case bytes.Equal(bytes.TrimSpace(raw.Seq), []byte("null")):
+		return errors.New("browser event seq must not be null")
+	default:
+		var seq uint64
+		if err := json.Unmarshal(raw.Seq, &seq); err != nil {
+			return fmt.Errorf("browser event seq: %w", err)
+		}
+		if seq > maxJSONSafeInteger {
+			return errors.New("browser event seq exceeds JSON-safe integer range")
+		}
+		if volatile {
+			return errors.New("volatile browser event must not have seq")
+		}
+		parsedSeq = &seq
+	}
+	*e = browserEventEnvelope{Seq: parsedSeq, Event: raw.Event}
+	return nil
+}
+
+func (f *browserCommandAcceptedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command accepted frame: %w", err)
+	}
+	type wire browserCommandAcceptedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandAcceptedFrame(decoded)
+	if value.Type != "command_accepted" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!canonicalUUIDRegexp.MatchString(value.CommandID) ||
+		value.Seq > maxJSONSafeInteger {
+		return errors.New("invalid browser command accepted frame")
+	}
+	*f = value
+	return nil
+}
+
+func (f *browserCommandRejectedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command rejected frame: %w", err)
+	}
+	type wire browserCommandRejectedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandRejectedFrame(decoded)
+	if value.Type != "command_rejected" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!validBrowserRejectReason(value.RejectReason) {
+		return errors.New("invalid browser command rejected frame")
+	}
+	*f = value
+	return nil
+}
+
+func (f *directChatStatusFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("direct chat status frame: %w", err)
+	}
+	type wire directChatStatusFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := directChatStatusFrame(decoded)
+	if value.Type != "direct_chat_status" || (value.Status != "ready" && value.Status != "unavailable") {
+		return errors.New("invalid direct chat status frame")
+	}
+	*f = value
+	return nil
+}
+
+func validBrowserRejectReason(reason RejectReason) bool {
+	switch reason {
+	case RejectUnknownCommand,
+		RejectSchemaViolation,
+		RejectAttachmentsNotEmpty,
+		RejectOversized,
+		RejectNotAllowed,
+		RejectIdempotencyConflict,
+		RejectUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 type browserCommandHead struct {
@@ -88,17 +243,17 @@ func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, ev
 	return s
 }
 
-func (s *BrowserServer) checkCommandState(conversationID string, head browserCommandHead) (RejectReason, bool) {
+func (s *BrowserServer) checkCommandState(personalityAgentID string, head browserCommandHead) (RejectReason, bool) {
 	if s.Events == nil {
 		return "", false
 	}
 	switch head.Type {
 	case "abort":
-		if !s.Events.IsRunInFlight(conversationID) {
+		if !s.Events.IsRunInFlight(personalityAgentID) {
 			return RejectNotAllowed, true
 		}
 	case "approval_decision":
-		if !s.Events.IsApprovalPending(conversationID, head.RequestID) {
+		if !s.Events.IsApprovalPending(personalityAgentID, head.RequestID) {
 			return RejectNotAllowed, true
 		}
 	}
@@ -106,29 +261,15 @@ func (s *BrowserServer) checkCommandState(conversationID string, head browserCom
 }
 
 func (s *BrowserServer) checkOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return false
-	}
-	for _, allowed := range s.AllowedOrigins {
-		if origin == allowed {
-			return true
-		}
-	}
-	return false
+	return browserOriginAllowed(r, s.AllowedOrigins)
 }
 
-// ServeHTTP implements GET /conversations/{conversation_id}/ws. Browser
+// ServeHTTP implements targetless GET /direct-chat/ws. Browser
 // authentication happens before upgrade so a rejected session cannot consume a
 // WebSocket or leak whether an agent connection exists.
 func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.Sessions == nil || s.Appender == nil || s.Events == nil {
 		http.Error(w, "browser websocket not configured", http.StatusServiceUnavailable)
-		return
-	}
-	conversationID := r.PathValue("conversation_id")
-	if conversationID == "" {
-		http.Error(w, "missing conversation_id", http.StatusBadRequest)
 		return
 	}
 	cookie, err := r.Cookie(BrowserSessionCookie)
@@ -139,10 +280,6 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	claims, err := s.Sessions.VerifySession(r.Context(), cookie.Value)
 	if err != nil {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
-		return
-	}
-	if claims.ConversationID != conversationID {
-		http.Error(w, "conversation authorization failed", http.StatusForbidden)
 		return
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
@@ -212,8 +349,8 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		return err
 	}
 
-	if err := s.Events.EnsureConversationStateRebuilt(ctx, claims.ConversationID); err != nil {
-		return fmt.Errorf("rebuild conversation state: %w", err)
+	if err := s.Events.EnsureAgentSessionStateRebuilt(ctx, claims.PersonalityAgentID); err != nil {
+		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
 
 	// Install pong handler before first read and schedule the initial
@@ -249,7 +386,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}()
 	}
 
-	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.ConversationID)
+	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.PersonalityAgentID)
 	defer unsubscribe()
 	var writeMu sync.Mutex
 	write := func(frame any) error {
@@ -260,10 +397,17 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 		return conn.WriteJSON(frame)
 	}
+	ready, err := s.Events.IsPersonalityAgentReady(ctx, claims.PersonalityAgentID)
+	if err != nil {
+		return fmt.Errorf("read direct-chat readiness: %w", err)
+	}
+	if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+		return err
+	}
 
 	writerErr := make(chan error, 1)
 	go func() {
-		err := s.browserEventPump(ctx, claims.ConversationID, hello.LastEventSeq, volatile, write)
+		err := s.browserEventPump(ctx, claims.PersonalityAgentID, hello.LastEventSeq, ready, volatile, write)
 		writerErr <- err
 		if err != nil && !errors.Is(err, context.Canceled) {
 			cancel()
@@ -283,12 +427,12 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	return writerResult
 }
 
-func (s *BrowserServer) browserEventPump(ctx context.Context, conversationID string, lastConsumed uint64, volatile <-chan Envelope, write func(any) error) error {
+func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID string, lastConsumed uint64, ready bool, volatile <-chan Envelope, write func(any) error) error {
 	next := lastConsumed
 	ticker := time.NewTicker(s.Events.pollInterval())
 	defer ticker.Stop()
 	for {
-		durable, err := s.Events.EventCatchUp(ctx, conversationID, next)
+		durable, err := s.Events.EventCatchUp(ctx, personalityAgentID, next)
 		if err != nil {
 			return fmt.Errorf("browser durable event catch-up: %w", err)
 		}
@@ -296,7 +440,14 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, conversationID str
 			if envelope.Seq == nil {
 				return errors.New("durable replay returned a volatile event")
 			}
-			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
+			if envelope.PersonalityAgentID != personalityAgentID {
+				return errors.New("browser event target mismatch")
+			}
+			projected, err := projectBrowserEvent(envelope)
+			if err != nil {
+				return fmt.Errorf("project durable browser event: %w", err)
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
 			next = *envelope.Seq
@@ -306,12 +457,29 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, conversationID str
 			if !ok {
 				return errors.New("browser volatile event queue exhausted")
 			}
-			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
+			if envelope.PersonalityAgentID != personalityAgentID {
+				return errors.New("browser volatile event target mismatch")
+			}
+			projected, err := projectBrowserEvent(envelope)
+			if err != nil {
+				return fmt.Errorf("project volatile browser event: %w", err)
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			current, err := s.Events.IsPersonalityAgentReady(ctx, personalityAgentID)
+			if err != nil {
+				return fmt.Errorf("poll direct-chat readiness: %w", err)
+			}
+			if current != ready {
+				ready = current
+				if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
@@ -333,41 +501,75 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 		}
 		reason, err := validateBrowserCommand(frame.Command)
 		if err != nil {
-			if writeErr := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: reason}); writeErr != nil {
+			if writeErr := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: reason}); writeErr != nil {
 				return writeErr
-			}
-			continue
-		}
-		if len(frame.IdempotencyKey) > MaxIdempotencyKeyBytes {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectOversized}); err != nil {
-				return err
 			}
 			continue
 		}
 		var head browserCommandHead
 		if err := json.Unmarshal(frame.Command, &head); err != nil {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectSchemaViolation}); err != nil {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: RejectSchemaViolation}); err != nil {
 				return err
 			}
 			continue
 		}
-		if reason, reject := s.checkCommandState(claims.ConversationID, head); reject {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: reason}); err != nil {
+		if reason, reject := s.checkCommandState(claims.PersonalityAgentID, head); reject {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: reason}); err != nil {
 				return err
 			}
 			continue
 		}
-		envelope, err := s.Appender.Append(ctx, claims.ConversationID, frame.IdempotencyKey, frame.Command)
+		envelope, err := s.Appender.Append(ctx, directChatProvenance(claims), frame.IdempotencyKey, frame.Command)
 		if err != nil {
+			if errors.Is(err, errBrowserRuntimeUnavailable) {
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectUnavailable,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
 			if isIdempotencyConflict(err) {
-				return err
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectIdempotencyConflict,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
 			}
 			return fmt.Errorf("append browser command: %w", err)
 		}
-		if err := write(browserCommandAcceptedFrame{Type: "command_accepted", Envelope: envelope}); err != nil {
+		if err := write(browserCommandAcceptedFrame{
+			Type:           "command_accepted",
+			IdempotencyKey: frame.IdempotencyKey,
+			CommandID:      envelope.CommandID,
+			Seq:            envelope.Seq,
+		}); err != nil {
 			return err
 		}
 	}
+}
+
+func projectBrowserEvent(envelope Envelope) (browserEventEnvelope, error) {
+	if err := ValidatePersonalityAgentID(envelope.PersonalityAgentID); err != nil {
+		return browserEventEnvelope{}, err
+	}
+	event, err := projectEventArtifactReferences(envelope.Event, envelope.PersonalityAgentID)
+	if err != nil {
+		return browserEventEnvelope{}, err
+	}
+	return browserEventEnvelope{Seq: envelope.Seq, Event: event}, nil
+}
+
+func readinessStatus(ready bool) string {
+	if ready {
+		return "ready"
+	}
+	return "unavailable"
 }
 
 func decodeBrowserHello(raw []byte) (browserHello, error) {
@@ -386,7 +588,11 @@ func decodeBrowserCommand(raw []byte) (browserCommandFrame, error) {
 		return browserCommandFrame{}, fmt.Errorf("browser command: %w", err)
 	}
 	var frame browserCommandFrame
-	if err := unmarshalStrict(raw, &frame); err != nil || frame.Type != "command" || len(frame.Command) == 0 {
+	if err := unmarshalStrict(raw, &frame); err != nil ||
+		frame.Type != "command" ||
+		frame.IdempotencyKey == "" ||
+		len(frame.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		len(frame.Command) == 0 {
 		return browserCommandFrame{}, errors.New("invalid browser command frame")
 	}
 	if len(frame.Command) > MaxUserCommandBytes {

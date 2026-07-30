@@ -143,8 +143,8 @@ UI 要件というよりアーキテクチャ制約。最初から効かせる�
 
 #### WebSocket と認証境界
 
-- 画面ごとに `GET /conversations/{conversation_id}/ws` を1本だけ常時接続し、送信・durable event replay・live-only delta を同じ接続で扱う。再接続時は最後に消費した durable event seq を hello で送り、API はその次から catch-up する。volatile delta は replay しない。
-- この接続は `sumi_session` HttpOnly cookie の別署名 session (`tenant_id`、`user_id`、`conversation_id`、expiry、`sumi:web:conversation` audience) だけを受け入れる。agent の short-lived bearer token、`agent_id`、`ProcessGeneration` は browser へ渡さない。
+- direct chat 画面は targetless な `GET /direct-chat/ws` を1本だけ常時接続し、送信・durable event replay・live-only delta を同じ接続で扱う。URL、browser command、browser eventへ内部の宛先identityを含めない。再接続時は最後に消費した durable event seq を hello で送り、API はその次から catch-up する。volatile delta は replay しない。
+- この接続は `sumi_session` HttpOnly cookie の別署名 session (`tenant_id`、`user_id`、内部targetの`personality_agent_id`、expiry、`sumi:web:direct-chat` audience) だけを受け入れる。APIが検証済みsessionから宛先とdirect-chat provenanceを構成する。agent の short-lived bearer token、`PersonalityAgentId`、`ProcessGeneration`、provenance はbrowserへ渡さない。
 - API は `SUMI_BROWSER_SESSION_SECRET`（base64 HMAC key）、任意の `SUMI_BROWSER_SESSION_AUDIENCE`、および browser origin allowlist `SUMI_BROWSER_WS_ALLOWED_ORIGINS` を必要とする。session の発行/login は control plane/account の責務であり、この接続境界では実装しない。
 
 ### C. 権限リクエストフロー

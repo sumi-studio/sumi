@@ -15,6 +15,10 @@ import (
 const defaultAgentAudience = "sumi:agent:events"
 const maxSignedTokenBytes = 8 * 1024
 
+// DefaultAgentAudience returns the strict audience used by agent bearer
+// credentials when production/local wiring does not override it.
+func DefaultAgentAudience() string { return defaultAgentAudience }
+
 // HMACTokenVerifier validates short-lived agent tokens signed with HMAC-SHA256.
 // It is a T28 production wiring point for the API-side token verification seam.
 type HMACTokenVerifier struct {
@@ -23,17 +27,16 @@ type HMACTokenVerifier struct {
 }
 
 type tokenClaims struct {
-	TenantID       string `json:"tenant_id"`
-	AgentID        string `json:"agent_id"`
-	ConversationID string `json:"conversation_id"`
-	Generation     uint64 `json:"generation"`
-	Exp            int64  `json:"exp"`
-	Aud            string `json:"aud"`
+	TenantID           string `json:"tenant_id"`
+	PersonalityAgentID string `json:"personality_agent_id"`
+	Generation         uint64 `json:"generation"`
+	Exp                int64  `json:"exp"`
+	Aud                string `json:"aud"`
 }
 
 // NewHMACTokenVerifier returns a verifier that checks HS256 tokens carrying the
-// claims described by contracts/agent-events.yaml: tenant_id, agent_id,
-// conversation_id, generation, exp and aud. The secret must be at least 32
+// claims described by contracts/agent-events.yaml: tenant_id,
+// personality_agent_id, generation, exp and aud. The secret must be at least 32
 // bytes. If audience is empty, the default "sumi:agent:events" is required.
 func NewHMACTokenVerifier(secret []byte, audience string) (*HMACTokenVerifier, error) {
 	if len(secret) < 32 {
@@ -108,8 +111,11 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	if err := unmarshalStrict(claimsBytes, &tc); err != nil {
 		return TokenClaims{}, fmt.Errorf("parse token claims: %w", err)
 	}
-	if tc.TenantID == "" || tc.AgentID == "" || tc.ConversationID == "" {
+	if !provenanceIDRegexp.MatchString(tc.TenantID) || tc.PersonalityAgentID == "" {
 		return TokenClaims{}, errors.New("token missing required identity claims")
+	}
+	if err := ValidatePersonalityAgentID(tc.PersonalityAgentID); err != nil {
+		return TokenClaims{}, fmt.Errorf("token personality_agent_id: %w", err)
 	}
 	if tc.Generation > maxProcessGeneration {
 		return TokenClaims{}, fmt.Errorf("token generation %d exceeds process generation range", tc.Generation)
@@ -125,10 +131,9 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	}
 
 	return TokenClaims{
-		TenantID:       tc.TenantID,
-		AgentID:        tc.AgentID,
-		ConversationID: tc.ConversationID,
-		Generation:     tc.Generation,
+		TenantID:           tc.TenantID,
+		PersonalityAgentID: tc.PersonalityAgentID,
+		Generation:         tc.Generation,
 	}, nil
 }
 

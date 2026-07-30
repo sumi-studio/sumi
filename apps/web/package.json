@@ -7,8 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check-types": "tsc -b --noEmit",
-    "test": "tsx --test scripts/conversation-socket.test.mjs",
-    "test:unit": "tsx --test scripts/conversation-socket.test.mjs",
+    "test": "tsx --test scripts/direct-chat-socket.test.mjs",
+    "test:unit": "tsx --test scripts/direct-chat-socket.test.mjs",
     "test:e2e": "playwright test",
     "preview": "vite preview"
   },

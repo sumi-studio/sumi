@@ -41,7 +41,7 @@ use crate::{
             ToolCall, ToolResultMessage, UserContent, UserMessage,
         },
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{ProcessGeneration, RpcIdentity},
     store::user_message_id,
     tools::ToolError,
 };
@@ -129,7 +129,16 @@ pub(crate) struct ProviderCallAttempt {
 /// unit fixtures can remain transport- and credential-free.
 #[async_trait]
 pub(crate) trait RunDriver: Send + Sync + 'static {
+    /// Fail closed unless the driver can prove that its immutable executor
+    /// client is bound to the exact authenticated runtime identity.
+    fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "run driver is not bound to a production executor RPC identity"
+        ))
+    }
+
     /// Fail closed before Session creates keys, recovery state, or a worker.
+    /// This narrower check exists for unhydrated test fixtures only.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
     /// T21 idle maintenance must return true only after its durable transition
@@ -256,6 +265,10 @@ impl SequentialRunWorker {
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        self.driver.validate_runtime_identity(identity)
+    }
+
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         self.driver.validate_executor_generation(generation)
     }
@@ -317,6 +330,11 @@ struct Runner {
     /// Run-wide cancellation token. Dropping the runner cancels all child
     /// operations, including in-flight reviewer calls and tool executions.
     cancel: CancellationToken,
+    /// A successful MessageEnd receipt means the authoritative life log is
+    /// ahead of RunCore until every terminal side effect and replay-state
+    /// retention step succeeds. A failure in this interval must discard the
+    /// core and force hydration instead of returning stale recoverable state.
+    durable_terminal_pending: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -369,6 +387,7 @@ impl Runner {
             .unwrap_or_else(|| watch::channel(WorkerPhase::Active).0);
         let context = std::mem::take(&mut core.runtime_context);
         let provider_context = std::mem::take(&mut core.provider_context);
+        let cancel = core.runtime_shutdown.child_token();
         Self {
             core,
             driver,
@@ -389,7 +408,8 @@ impl Runner {
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
-            cancel: CancellationToken::new(),
+            cancel,
+            durable_terminal_pending: false,
         }
     }
 
@@ -405,7 +425,17 @@ impl Runner {
         self.core.provider_context = std::mem::take(&mut self.provider_context);
         self.core.mark_mutated();
         match result {
-            Ok(()) => RunCompletion::Completed(std::mem::take(&mut self.core)),
+            Ok(()) if !self.durable_terminal_pending => {
+                RunCompletion::Completed(std::mem::take(&mut self.core))
+            }
+            Ok(()) => RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(
+                    "run completed with an unreconciled durable assistant terminal".to_owned(),
+                ),
+            },
+            Err(failure) if self.durable_terminal_pending => {
+                RunCompletion::RehydrationRequired { failure }
+            }
             Err(failure) => RunCompletion::Failed {
                 core: std::mem::take(&mut self.core),
                 failure,
@@ -581,6 +611,7 @@ impl Runner {
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
                         let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                        self.durable_terminal_pending = true;
                         if let Some(ratio_bits) = receipt.calibration_ratio_bits {
                             self.driver
                                 .install_committed_calibration(ratio_bits)
@@ -596,6 +627,7 @@ impl Runner {
                             .await
                             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                         self.retain_committed(receipt, &message)?;
+                        self.durable_terminal_pending = false;
                         self.close_turn(message, Vec::new()).await?;
                         if !self.advance_followup().await? {
                             break;
@@ -614,6 +646,7 @@ impl Runner {
                         .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
                     let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                    self.durable_terminal_pending = true;
                     if let Some(ratio_bits) = receipt.calibration_ratio_bits {
                         self.driver
                             .install_committed_calibration(ratio_bits)
@@ -666,6 +699,7 @@ impl Runner {
                         self.retain_tool_results(&rejected_receipts, &rejected_results)?;
                         self.retain_tool_results(&executable_receipts, &executable_results)?;
                     }
+                    self.durable_terminal_pending = false;
                     self.emit(AgentEvent::TurnEnd {
                         message: Some(Box::new(message)),
                         tool_results: executable_results,
@@ -741,7 +775,7 @@ impl Runner {
                 WorkerFailure::Error("RunCore has no attempt cancellation registry".to_owned())
             })?
             .clone();
-        let cancel = CancellationToken::new();
+        let cancel = self.cancel.child_token();
         let _guard = attempt_cancellation
             .register(cancel.clone())
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -803,10 +837,17 @@ impl Runner {
         let mut message_started = false;
         let mut rejected_results = Vec::new();
         let mut cancellation_observed = false;
+        let runtime_cancel = self.cancel.clone();
+        let mut runtime_shutdown_observed = false;
 
         loop {
             tokio::select! {
                 biased;
+                _ = runtime_cancel.cancelled(), if !runtime_shutdown_observed => {
+                    runtime_shutdown_observed = true;
+                    self.abort_requested = true;
+                    cancel.cancel();
+                }
                 control = self.controls.recv() => {
                     let Some(control) = control else {
                         return Err(WorkerFailure::Cancelled);
@@ -1665,8 +1706,13 @@ impl Runner {
             review_cancel.clone(),
         );
         tokio::pin!(request);
+        let runtime_cancel = self.cancel.clone();
         let outcome = loop {
             tokio::select! {
+                _ = runtime_cancel.cancelled() => {
+                    review_cancel.cancel();
+                    return Err(WorkerFailure::Cancelled);
+                }
                 outcome = &mut request => {
                     break outcome.map_err(|error| {
                         WorkerFailure::Error(format!("approval start failed: {error}"))
@@ -1726,8 +1772,15 @@ impl Runner {
         receiver: &mut oneshot::Receiver<WaiterResult>,
     ) -> Result<ApprovalWaitOutcome, WorkerFailure> {
         use crate::gateway::Command;
+        let runtime_cancel = self.cancel.clone();
         loop {
             tokio::select! {
+                _ = runtime_cancel.cancelled() => {
+                    if let Some(broker) = self.core.approval.as_ref() {
+                        broker.cancel(&request_id);
+                    }
+                    return Err(WorkerFailure::Cancelled);
+                }
                 result = &mut *receiver => {
                     return match result {
                         Ok(WaiterResult::Resolved(_)) => Err(WorkerFailure::Error(
@@ -1911,6 +1964,14 @@ impl Runner {
         let result = loop {
             let update = tokio::select! {
                 biased;
+                _ = self.cancel.cancelled() => {
+                    cancel.cancel();
+                    // Keep ownership of the driver future until it observes
+                    // cancellation and runs its process/reaper teardown. The
+                    // Session owns the outer bounded abort fallback.
+                    let _ = future.await;
+                    return Err(ExecuteToolError::Cancelled);
+                }
                 result = &mut future => break result,
                 update = updates_rx.recv() => update,
                 control = self.controls.recv() => {
@@ -2144,7 +2205,10 @@ impl Runner {
             content: vec![UserContent::Text { text: text.clone() }],
             timestamp: command.received_at(),
         });
-        let message_id = user_message_id(&command.envelope().command_id);
+        let message_id = user_message_id(
+            &command.envelope().personality_agent_id,
+            &command.envelope().command_id,
+        );
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -2177,7 +2241,10 @@ impl Runner {
         for command in &injectables {
             let message = super::steer::build_user_message(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-            let message_id = crate::store::user_message_id(&command.envelope().command_id);
+            let message_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
             self.emit(AgentEvent::MessageStart {
                 message_id: message_id.clone(),
                 message: Box::new(message.clone()),
@@ -2546,16 +2613,21 @@ impl Runner {
         if self.claim_pending_user()? {
             return Ok(true);
         }
-        let cancel = CancellationToken::new();
+        let cancel = self.cancel.child_token();
         let driver = self.driver.clone();
         let retry = driver.wait_retry(delay, &cancel);
         tokio::pin!(retry);
         let mut collected = false;
         const COLLECT_GRACE: Duration = Duration::from_millis(50);
         let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let runtime_cancel = self.cancel.clone();
         loop {
             let control = tokio::select! {
                 biased;
+                _ = runtime_cancel.cancelled() => {
+                    cancel.cancel();
+                    return Err(WorkerFailure::Cancelled);
+                }
                 control = self.controls.recv() => {
                     let Some(control) = control else {
                         return Err(WorkerFailure::Cancelled);
