@@ -1377,6 +1377,252 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
 }
 
 #[test]
+fn exact_runtime_secret_loader_rejects_invalid_files_without_exposing_values() {
+    struct LoaderCase {
+        label: &'static str,
+        path: PathBuf,
+        expected_diagnostic: &'static str,
+        secret_fragments: Vec<&'static [u8]>,
+        run_as_runtime: bool,
+    }
+
+    fn loader_harness() -> String {
+        let entrypoint = read_deploy("container-entrypoint");
+        let start = entrypoint
+            .find("load_runtime_secret() {")
+            .expect("exact runtime secret loader");
+        let tail = &entrypoint[start..];
+        let end = tail
+            .find("\n}\n\n# Docker services")
+            .expect("runtime secret loader terminator")
+            + "\n}\n".len();
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+fail() {{
+  printf '[sumi-entrypoint] %s\n' "$*" >&2
+  exit 64
+}}
+{}
+load_runtime_secret TEST_RUNTIME_SECRET "$1"
+printf 'RUNTIME_EXECUTED\n' >&2
+exit 99
+"#,
+            &tail[..end]
+        )
+    }
+
+    fn chown_runtime(path: &std::path::Path) -> bool {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        unsafe { libc::chown(path.as_ptr(), 10001, 10001) == 0 }
+    }
+
+    fn write_exact_runtime_file(path: &std::path::Path, bytes: &[u8], mode: u32, euid: u32) {
+        std::fs::write(path, bytes).unwrap();
+        if euid == 0 {
+            assert!(chown_runtime(path), "cannot chown exact runtime secret");
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn run_loader(harness: &std::path::Path, case: &LoaderCase) -> Output {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg(harness)
+            .arg(&case.path)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        if case.run_as_runtime {
+            command.gid(10001).uid(10001);
+        }
+        command.output().unwrap()
+    }
+
+    let root = std::env::temp_dir().join(format!("secret-loader-{}", Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = root.join("loader-harness");
+    std::fs::write(&harness, loader_harness()).unwrap();
+    std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut cases = Vec::new();
+
+    let symlink_target = root.join("symlink-target");
+    std::fs::write(&symlink_target, b"symlink-secret-must-not-escape").unwrap();
+    let symlink = root.join("symlink-secret");
+    std::os::unix::fs::symlink(&symlink_target, &symlink).unwrap();
+    cases.push(LoaderCase {
+        label: "symlink",
+        path: symlink,
+        expected_diagnostic: "runtime secret must be a regular non-symlink",
+        secret_fragments: vec![b"symlink-secret-must-not-escape"],
+        run_as_runtime: false,
+    });
+
+    let nonregular = root.join("nonregular-secret");
+    std::fs::create_dir(&nonregular).unwrap();
+    cases.push(LoaderCase {
+        label: "nonregular",
+        path: nonregular,
+        expected_diagnostic: "runtime secret must be a regular non-symlink",
+        secret_fragments: vec![],
+        run_as_runtime: false,
+    });
+
+    let euid = unsafe { libc::geteuid() };
+    if euid != 10001 {
+        let wrong_owner = root.join("wrong-owner-secret");
+        std::fs::write(&wrong_owner, b"owner-secret-must-not-escape").unwrap();
+        std::fs::set_permissions(&wrong_owner, std::fs::Permissions::from_mode(0o400)).unwrap();
+        cases.push(LoaderCase {
+            label: "owner",
+            path: wrong_owner,
+            expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
+            secret_fragments: vec![b"owner-secret-must-not-escape"],
+            run_as_runtime: false,
+        });
+    } else {
+        eprintln!(
+            "HOST_UNAVAILABLE: owner-mismatch secret case requires chown authority when tests \
+             already run as uid 10001"
+        );
+    }
+
+    let exact_runtime_owner_available = if euid == 10001 {
+        true
+    } else if euid == 0 {
+        let probe = root.join("chown-probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        let available = chown_runtime(&probe);
+        let _ = std::fs::remove_file(probe);
+        available
+    } else {
+        false
+    };
+    if exact_runtime_owner_available {
+        let run_as_runtime = euid == 0;
+
+        let wrong_mode = root.join("wrong-mode-secret");
+        write_exact_runtime_file(&wrong_mode, b"mode-secret-must-not-escape", 0o600, euid);
+        cases.push(LoaderCase {
+            label: "mode",
+            path: wrong_mode,
+            expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
+            secret_fragments: vec![b"mode-secret-must-not-escape"],
+            run_as_runtime,
+        });
+
+        let linked = root.join("linked-secret");
+        write_exact_runtime_file(&linked, b"linked-secret-must-not-escape", 0o400, euid);
+        std::fs::hard_link(&linked, root.join("linked-secret-alias")).unwrap();
+        cases.push(LoaderCase {
+            label: "link-count",
+            path: linked,
+            expected_diagnostic: "runtime secret has invalid owner, mode, or link count",
+            secret_fragments: vec![b"linked-secret-must-not-escape"],
+            run_as_runtime,
+        });
+
+        let empty = root.join("empty-secret");
+        write_exact_runtime_file(&empty, b"", 0o400, euid);
+        cases.push(LoaderCase {
+            label: "empty",
+            path: empty,
+            expected_diagnostic: "runtime secret must not be empty",
+            secret_fragments: vec![],
+            run_as_runtime,
+        });
+
+        let nul = root.join("nul-secret");
+        write_exact_runtime_file(&nul, b"nul-secret-prefix\0nul-secret-suffix", 0o400, euid);
+        cases.push(LoaderCase {
+            label: "NUL",
+            path: nul,
+            expected_diagnostic: "runtime secret byte length changed during parsing",
+            secret_fragments: vec![b"nul-secret-prefix", b"nul-secret-suffix"],
+            run_as_runtime,
+        });
+
+        let carriage_return = root.join("cr-secret");
+        write_exact_runtime_file(
+            &carriage_return,
+            b"cr-secret-prefix\rcr-secret-suffix",
+            0o400,
+            euid,
+        );
+        cases.push(LoaderCase {
+            label: "CR",
+            path: carriage_return,
+            expected_diagnostic: "runtime secret must not contain newline or carriage return",
+            secret_fragments: vec![b"cr-secret-prefix", b"cr-secret-suffix"],
+            run_as_runtime,
+        });
+
+        let line_feed = root.join("lf-secret");
+        write_exact_runtime_file(
+            &line_feed,
+            b"lf-secret-prefix\nlf-secret-suffix",
+            0o400,
+            euid,
+        );
+        cases.push(LoaderCase {
+            label: "LF",
+            path: line_feed,
+            expected_diagnostic: "runtime secret must not contain newline or carriage return",
+            secret_fragments: vec![b"lf-secret-prefix", b"lf-secret-suffix"],
+            run_as_runtime,
+        });
+    } else {
+        eprintln!(
+            "HOST_UNAVAILABLE: mode/link-count/empty/NUL/CR/LF cases require uid 10001 or \
+             root chown/setuid authority; symlink/nonregular/owner cases still ran"
+        );
+    }
+
+    let results = cases
+        .iter()
+        .map(|case| (case, run_loader(&harness, case)))
+        .collect::<Vec<_>>();
+    let cleanup = std::fs::remove_dir_all(&root);
+
+    for (case, output) in results {
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{} secret reached the runtime continuation: {}",
+            case.label,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let combined = [output.stdout, output.stderr].concat();
+        assert!(
+            !combined
+                .windows(b"RUNTIME_EXECUTED".len())
+                .any(|window| window == b"RUNTIME_EXECUTED"),
+            "{} secret executed the runtime continuation",
+            case.label
+        );
+        assert!(
+            String::from_utf8_lossy(&combined).contains(case.expected_diagnostic),
+            "{} secret failed for the wrong reason: {}",
+            case.label,
+            String::from_utf8_lossy(&combined)
+        );
+        for fragment in &case.secret_fragments {
+            assert!(
+                !combined
+                    .windows(fragment.len())
+                    .any(|window| window == *fragment),
+                "{} secret value escaped in diagnostics",
+                case.label
+            );
+        }
+    }
+    assert!(cleanup.is_ok(), "secret-loader fixture survived cleanup");
+}
+
+#[test]
 fn executor_deployment_is_broker_blind_and_read_only() {
     let compose = compose();
     let executor = service(&compose, "executor");
@@ -2158,7 +2404,7 @@ fn read_only_supervisor_actions_do_not_require_the_host_mutation_lock() {
 
 #[test]
 fn followed_logs_do_not_block_an_exclusive_stop() {
-    let Some(fixture) = HostTrustFixture::new() else {
+    let Some(mut fixture) = HostTrustFixture::new() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("logs-stop-{}", Uuid::now_v7().simple()));
@@ -2214,36 +2460,74 @@ esac
     let mut stop = Command::new(deploy_dir().join("supervisor"));
     stop.arg("stop")
         .env("PATH", format!("{}:{inherited_path}", bin.display()))
-        .env("SUMI_FAKE_MARKERS", &markers);
+        .env("SUMI_FAKE_MARKERS", &markers)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(root.join("stop.stderr")).unwrap(),
+        ));
     launch_runtime_env(&mut stop, &fixture);
-    let stop_output = stop.output().unwrap();
+    let mut stop = stop.spawn().unwrap();
+    let stop_deadline = Instant::now() + Duration::from_secs(5);
+    let mut stop_status = None;
+    while !markers.join("stop-completed").exists() && Instant::now() < stop_deadline {
+        if let Some(status) = stop.try_wait().unwrap() {
+            stop_status = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stop_completed_before_logs_release = markers.join("stop-completed").exists();
 
-    std::fs::write(markers.join("release-logs"), b"").unwrap();
+    // Release and join both children before making assertions. This keeps the
+    // regression path bounded even if stop blocks behind a mistakenly held
+    // logs lock instead of failing its nonblocking acquisition.
+    let release_result = std::fs::write(markers.join("release-logs"), b"");
     let logs_status = wait_for_child_exit(&mut logs, Duration::from_secs(5));
     if logs_status.is_none() {
         let _ = logs.kill();
         let _ = logs.wait();
     }
+    if stop_status.is_none() {
+        stop_status = wait_for_child_exit(&mut stop, Duration::from_secs(5));
+    }
+    if stop_status.is_none() {
+        let _ = stop.kill();
+        let _ = stop.wait();
+    }
+    let stop_stderr = std::fs::read(root.join("stop.stderr")).unwrap_or_default();
+    let fixture_cleanup = fixture.cleanup();
+    let temp_cleanup = std::fs::remove_dir_all(&root);
 
+    assert!(release_result.is_ok(), "could not release followed logs");
     assert!(
         logs_started,
         "followed logs did not reach the fake Docker stream"
     );
     assert!(
-        stop_output.status.success(),
-        "stop could not acquire the mutation lock while logs followed output: {}",
-        String::from_utf8_lossy(&stop_output.stderr)
+        stop_completed_before_logs_release,
+        "stop did not reach Docker while logs remained active: {}",
+        String::from_utf8_lossy(&stop_stderr)
     );
-    assert!(
-        markers.join("stop-completed").exists(),
-        "stop did not reach Docker while logs remained active"
+    assert_eq!(
+        stop_status.and_then(|status| status.code()),
+        Some(0),
+        "stop did not terminate successfully: {}",
+        String::from_utf8_lossy(&stop_stderr)
     );
     assert_eq!(
         logs_status.and_then(|status| status.code()),
         Some(0),
         "followed logs did not terminate after its fake stream was released"
     );
-    let _ = std::fs::remove_dir_all(root);
+    assert!(
+        fixture_cleanup.is_ok(),
+        "host trust cleanup failed: {:?}",
+        fixture_cleanup.err()
+    );
+    assert!(
+        temp_cleanup.is_ok(),
+        "temporary concurrency fixture survived"
+    );
 }
 
 #[test]
