@@ -174,6 +174,8 @@ type connectionLeaseState struct {
 	needsResign bool
 }
 
+var errBrowserRuntimeUnavailable = errors.New("browser runtime is unavailable")
+
 const (
 	connectionLeaseStateVersion  = uint64(1)
 	maxConnectionLeaseStateBytes = 4096
@@ -465,6 +467,58 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, personalityAgentI
 		return err
 	}
 	return verifyRuntimeGeneration(state, generation)
+}
+
+// Append admits one browser command only while the authoritative PAID runtime
+// is exactly Ready. The shared runtime lock is held from the Ready observation
+// through the durable command append, so startup, shutdown, rollover, and lease
+// transitions cannot create a readiness TOCTOU. The unavailable error reveals
+// no target, generation, or lifecycle reason to the browser transport.
+func (g *DurableGateway) Append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return CommandEnvelope{}, err
+	}
+	if err := provenance.Validate(); err != nil {
+		return CommandEnvelope{}, fmt.Errorf("validate browser command provenance: %w", err)
+	}
+	for {
+		lock, err := g.openRuntimeLock(provenance.PersonalityAgentID)
+		if err != nil {
+			return CommandEnvelope{}, err
+		}
+		if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
+			_ = lock.Close()
+			return CommandEnvelope{}, fmt.Errorf("lock browser command admission: %w", err)
+		}
+		state, stateErr := g.state(ctx, provenance.PersonalityAgentID)
+		switch {
+		case stateErr != nil:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+			return CommandEnvelope{}, stateErr
+		case state.needsResign:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+			if err := g.resignIntegrityStates(ctx, provenance.PersonalityAgentID); err != nil {
+				return CommandEnvelope{}, err
+			}
+			continue
+		case !state.present || state.HydrationReceiptIdentity == nil:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+			return CommandEnvelope{}, errBrowserRuntimeUnavailable
+		}
+
+		envelope, appendErr := g.commands.Append(ctx, provenance, idempotencyKey, command)
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+		return envelope, appendErr
+	}
 }
 
 // ClaimConnectionLease is the file-backed PAID-global ownership boundary.

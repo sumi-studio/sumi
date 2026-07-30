@@ -84,6 +84,31 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
 }
 
+func setReadyRouterState(t *testing.T, personalityAgentID string) {
+	t.Helper()
+	commandDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
+	store, err := agentevents.OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := agentevents.OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	receipt := "router-test-ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func postAuthorized(t *testing.T, serverURL, personalityAgentID string, body []byte) *http.Response {
 	t.Helper()
 	token := signTestToken(t, testTokenSecret, testTokenClaims{
@@ -184,7 +209,7 @@ func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {
 
 func TestNewRouter_RegistersCommandRouteWithBrowserSession(t *testing.T) {
 	setSessionSecret(t)
-	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	setReadyRouterState(t, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	mux, err := newRouter()
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +234,45 @@ func TestNewRouter_RegistersCommandRouteWithBrowserSession(t *testing.T) {
 	}
 	if env.CommandID == "" {
 		t.Fatal("expected command_id")
+	}
+}
+
+func TestNewRouter_CommandRouteRejectsUnavailableWithoutDurableAppend(t *testing.T) {
+	setSessionSecret(t)
+	commandDir := t.TempDir()
+	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
+	mux, err := newRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	body := []byte(`{"type":"user_message","text":"not ready","attachments":[]}`)
+	resp := postWithSessionCookie(t, server.URL, personalityAgentID, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+	var rejection struct {
+		Error        string `json:"error"`
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rejection); err != nil {
+		t.Fatal(err)
+	}
+	if rejection.Error != "unavailable" || rejection.RejectReason != "unavailable" {
+		t.Fatalf("unexpected unavailable rejection: %+v", rejection)
+	}
+
+	observer, err := agentevents.OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	if hasCommands, err := observer.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("unavailable HTTP command reached durable log: hasCommands=%v err=%v", hasCommands, err)
 	}
 }
 
@@ -254,7 +318,7 @@ func TestNewRouter_CommandRouteRejectsOversized(t *testing.T) {
 
 func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	setSessionSecret(t)
-	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	setReadyRouterState(t, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	mux, err := newRouter()
 	if err != nil {
 		t.Fatal(err)

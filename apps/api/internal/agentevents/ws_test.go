@@ -646,7 +646,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	browserServer := NewBrowserServer(sessions, store, gateway)
+	browserServer := NewBrowserServer(sessions, gateway, gateway)
 	browserServer.AllowedOrigins = []string{"https://web.example"}
 	browserMux := http.NewServeMux()
 	browserMux.Handle("GET /direct-chat/ws", browserServer)
@@ -873,6 +873,23 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 		t.Fatal(err)
 	}
 	assertDirectChatStatus(t, browser, "unavailable")
+	if err := browser.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "shutdown-command",
+		Command:        json.RawMessage(`{"type":"user_message","text":"too late","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var shutdownRejection browserCommandRejectedFrame
+	if err := conn2Wait(browser, &shutdownRejection, testDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if shutdownRejection.RejectReason != RejectUnavailable {
+		t.Fatalf("shutdown browser command rejection = %+v", shutdownRejection)
+	}
+	if _, found, err := store.GetCommand(context.Background(), testPersonalityAgentID, command.Seq+1); err != nil || found {
+		t.Fatalf("shutdown browser command reached durable log: found=%v err=%v", found, err)
+	}
 	select {
 	case err := <-postCommandRead:
 		if err == nil {
@@ -1417,20 +1434,39 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 	firstServer.SideEffectTimeout = 50 * time.Millisecond
 	firstServer.GenerationPollInterval = 5 * time.Millisecond
 	secondServer.GenerationPollInterval = 5 * time.Millisecond
-	firstHTTP := startTestServer(t, firstServer)
-	defer firstHTTP.Close()
-	secondHTTP := startTestServer(t, secondServer)
-	defer secondHTTP.Close()
+	firstHTTP, firstHandlerDone := startTrackedTestServer(t, firstServer)
+	secondHTTP, secondHandlerDone := startTrackedTestServer(t, secondServer)
 	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
 
-	first, _, err := dialTestWS(t, firstHTTP, headers)
+	var first, second *websocket.Conn
+	t.Cleanup(func() {
+		waiters := make(map[string]<-chan struct{}, 2)
+		if first != nil {
+			_ = first.Close()
+			waiters["first"] = firstHandlerDone
+		}
+		if second != nil {
+			_ = second.Close()
+			waiters["second"] = secondHandlerDone
+		}
+		firstHTTP.Close()
+		secondHTTP.Close()
+		for name, done := range waiters {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s hijacked websocket handler did not settle", name)
+			}
+		}
+	})
+
+	first, _, err = dialTestWS(t, firstHTTP, headers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Close()
 	writeTestAgentHello(t, first, 7)
 	var hello ApiHello
-	if err := conn2Wait(first, &hello, time.Second); err != nil {
+	if err := conn2Wait(first, &hello, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	seq := uint64(1)
@@ -1462,11 +1498,10 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 		t.Fatal("old Server sink did not receive a bounded context deadline")
 	}
 
-	second, _, err := dialTestWS(t, secondHTTP, headers)
+	second, _, err = dialTestWS(t, secondHTTP, headers)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer second.Close()
 	writeTestAgentHello(t, second, 7)
 	if err := conn2Wait(second, &hello, 5*time.Second); err != nil {
 		t.Fatalf("cross-Server reconnect did not drain bounded sink: %v", err)
@@ -2540,6 +2575,18 @@ func startTestServer(t *testing.T, srv *Server) *httptest.Server {
 	server.Start()
 	srv.AllowedOrigins = []string{server.URL}
 	return server
+}
+
+func startTrackedTestServer(t *testing.T, srv *Server) (*httptest.Server, <-chan struct{}) {
+	t.Helper()
+	done := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { done <- struct{}{} }()
+		srv.ServeHTTP(w, r)
+	}))
+	server.Start()
+	srv.AllowedOrigins = []string{server.URL}
+	return server, done
 }
 
 func dialTestWS(t *testing.T, server *httptest.Server, headers map[string][]string) (*websocket.Conn, *http.Response, error) {

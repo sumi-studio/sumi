@@ -524,6 +524,149 @@ func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *
 	}
 }
 
+func TestBrowserCommandAdmissionFencesNotReadyAcrossGateways(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	provenance := testDirectChatProvenance(personalityAgentID)
+	command := json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)
+
+	if err := first.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Append(context.Background(), provenance, "startup-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway startup NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("startup NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Append(context.Background(), provenance, "shutdown-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway shutdown NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("shutdown NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
+func TestBrowserCommandAdmissionSerializesGenerationRolloverWithDurableAppend(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.acquireIdempotencyGuard(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	guardHeld := true
+	defer func() {
+		if guardHeld {
+			store.releaseIdempotencyGuard()
+		}
+	}()
+
+	appendDone := make(chan error, 1)
+	go func() {
+		_, err := first.Append(
+			context.Background(),
+			testDirectChatProvenance(personalityAgentID),
+			"before-rollover",
+			json.RawMessage(`{"type":"user_message","text":"before","attachments":[]}`),
+		)
+		appendDone <- err
+	}()
+
+	// Append acquires the authoritative shared PAID lock before waiting on the
+	// command store. Observe that lock directly so the ordering is deterministic.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lock, err := second.openRuntimeLock(personalityAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		switch {
+		case errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
+			_ = lock.Close()
+			goto appendHoldsRuntimeLock
+		case err == nil:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+		default:
+			_ = lock.Close()
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser append did not acquire the shared PAID runtime lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+appendHoldsRuntimeLock:
+	rolloverDone := make(chan error, 1)
+	go func() {
+		rolloverDone <- second.PublishRuntimeState(personalityAgentID, 8, nil)
+	}()
+	select {
+	case err := <-rolloverDone:
+		t.Fatalf("generation rollover bypassed admitted browser append: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	store.releaseIdempotencyGuard()
+	guardHeld = false
+	if err := <-appendDone; err != nil {
+		t.Fatalf("Ready command append failed: %v", err)
+	}
+	if err := <-rolloverDone; err != nil {
+		t.Fatalf("generation rollover failed: %v", err)
+	}
+	if _, err := second.Append(
+		context.Background(),
+		testDirectChatProvenance(personalityAgentID),
+		"after-rollover",
+		json.RawMessage(`{"type":"user_message","text":"after","attachments":[]}`),
+	); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("post-rollover NotReady command was admitted: %v", err)
+	}
+	if _, found, err := store.GetCommand(context.Background(), personalityAgentID, 2); err != nil || found {
+		t.Fatalf("post-rollover command reached durable seq 2: found=%v err=%v", found, err)
+	}
+}
+
 func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
 	store, err := OpenCommandStore(t.TempDir())
 	if err != nil {

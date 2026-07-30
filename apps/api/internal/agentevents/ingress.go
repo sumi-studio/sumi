@@ -32,6 +32,7 @@ const (
 	RejectOversized           RejectReason = "oversized"
 	RejectNotAllowed          RejectReason = "not_allowed"
 	RejectIdempotencyConflict RejectReason = "idempotency_conflict"
+	RejectUnavailable         RejectReason = "unavailable"
 )
 
 // CommandAppender is the durable command log entry point owned by the T28 API
@@ -120,6 +121,20 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	env, err := h.Appender.Append(r.Context(), directChatProvenance(claims), idempotencyKey, raw)
 	if err != nil {
+		if errors.Is(err, errBrowserRuntimeUnavailable) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error          string       `json:"error"`
+				IdempotencyKey string       `json:"idempotency_key"`
+				RejectReason   RejectReason `json:"reject_reason"`
+			}{
+				Error:          "unavailable",
+				IdempotencyKey: idempotencyKey,
+				RejectReason:   RejectUnavailable,
+			})
+			return
+		}
 		// Idempotency conflicts are exposed as 409 so callers cannot
 		// accidentally mint a second command by retrying with a mutated body.
 		if isIdempotencyConflict(err) {
