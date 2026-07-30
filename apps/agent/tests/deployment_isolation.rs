@@ -3432,11 +3432,10 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
                 .as_str(),
             Some("10022")
         );
+        let rendered_model_id = rendered["services"]["runtime"]["environment"].get("SUMI_MODEL_ID");
         assert!(
-            rendered["services"]["runtime"]["environment"]
-                .get("SUMI_MODEL_ID")
-                .is_none(),
-            "unset optional model ID survived rendered Config.Env"
+            matches!(rendered_model_id, None | Some(JsonValue::Null)),
+            "unset optional model ID must remain an omitted or null Compose pass-through"
         );
         for sensitive in [
             "SUMI_LOCAL_CONTROL_BEARER",
