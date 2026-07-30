@@ -761,7 +761,8 @@ export interface BrowserCommandRejectedFrame {
     | "attachments_not_empty"
     | "oversized"
     | "not_allowed"
-    | "idempotency_conflict";
+    | "idempotency_conflict"
+    | "unavailable";
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

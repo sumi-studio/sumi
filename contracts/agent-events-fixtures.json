@@ -614,5 +614,13 @@
       "idempotency_key": "00000000-0000-4000-8000-000000000003",
       "reject_reason": "idempotency_conflict"
     }
+  },
+  "browser_command_rejected_unavailable": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "idempotency_key": "00000000-0000-4000-8000-000000000004",
+      "reject_reason": "unavailable"
+    }
   }
 }

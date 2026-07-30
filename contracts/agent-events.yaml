@@ -838,7 +838,7 @@ $defs:
         maxLength: 1024
       reject_reason:
         type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict]
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable]
 
   DirectChatStatusFrame:
     type: object

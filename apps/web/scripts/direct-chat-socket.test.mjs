@@ -103,15 +103,16 @@ test("retries an uncertain command with its original key and stops after accepta
   socket.close();
 });
 
-test("a terminal idempotency conflict clears its pending key without reconnect resend", () => {
+test("a terminal unavailable rejection clears its pending key without closing or reconnect resend", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
-  socket.sendCommand({ type: "abort" }, "conflicting-key");
-  first.receive({ type: "command_rejected", idempotency_key: "conflicting-key", reject_reason: "idempotency_conflict" });
+  socket.sendCommand({ type: "abort" }, "unavailable-key");
+  first.receive({ type: "command_rejected", idempotency_key: "unavailable-key", reject_reason: "unavailable" });
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  assert.equal(first.readyState, FakeWebSocket.OPEN);
   first.close();
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
