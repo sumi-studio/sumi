@@ -22,6 +22,7 @@
     "@sumi/sdui": "workspace:*",
     "@sumi/ui": "workspace:*",
     "@tanstack/react-router": "^1.170.18",
+    "@tanstack/react-virtual": "^3.14.9",
     "firebase": "^12.16.0",
     "gen-interface-jp": "^0.7.0",
     "lucide-react": "^1.24.0",
