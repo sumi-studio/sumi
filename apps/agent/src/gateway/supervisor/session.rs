@@ -550,6 +550,8 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: CancellationToken::new(),
                 task: None,
+                runtime: tokio::runtime::Handle::current(),
+                fallback_reaped: None,
             },
         };
         (
@@ -1031,6 +1033,8 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: cancel.clone(),
                 task: Some(task),
+                runtime: tokio::runtime::Handle::current(),
+                fallback_reaped: None,
             },
         };
         let (gateway, runtime) = SessionGateway::from_supervisor(handle);
@@ -1069,6 +1073,8 @@ mod tests {
         gateway.lifecycle = Some(SupervisorLifecycle {
             cancel: cancel.clone(),
             task: Some(task),
+            runtime: tokio::runtime::Handle::current(),
+            fallback_reaped: None,
         });
 
         let (reader, writer) = gateway.split();

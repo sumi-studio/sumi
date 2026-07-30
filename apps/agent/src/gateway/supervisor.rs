@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -617,7 +617,12 @@ pub struct SupervisorHandle {
 struct SupervisorLifecycle {
     cancel: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
+    runtime: tokio::runtime::Handle,
+    #[cfg(test)]
+    fallback_reaped: Option<oneshot::Sender<()>>,
 }
+
+static SUPERVISOR_FALLBACK_REAPERS: OnceLock<StdMutex<Vec<JoinHandle<()>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SupervisorTermination {
@@ -721,11 +726,42 @@ impl SupervisorLifecycle {
 impl Drop for SupervisorLifecycle {
     fn drop(&mut self) {
         self.cancel.cancel();
-        // Dropping a JoinHandle detaches the task. Keep the cancelled
-        // supervisor alive long enough to join both connection halves and
-        // invalidate the installed T17 delivery epoch. Aborting this task here
-        // would cancel the cleanup future and leave the dead epoch mapped.
-        self.task.take();
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        #[cfg(test)]
+        let fallback_reaped = self.fallback_reaped.take();
+
+        // Drop cannot await, and aborting the supervisor would skip its T17
+        // epoch invalidation. Transfer the still-owned JoinHandle to a retained
+        // reaper on the same runtime. Explicit `join`/`cancel_and_join` remain
+        // the primary path; this is only the unwind/forgotten-owner backstop.
+        let reaper = self.runtime.spawn(async move {
+            match task.await {
+                Ok(Ok(())) => {
+                    tracing::debug!("fallback supervisor reaper joined cleanly");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "fallback supervisor reaper joined a failed task");
+                }
+                Err(error) if error.is_panic() => {
+                    tracing::error!(%error, "fallback supervisor reaper joined a panicked task");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "fallback supervisor reaper joined a cancelled task");
+                }
+            }
+            #[cfg(test)]
+            if let Some(fallback_reaped) = fallback_reaped {
+                let _ = fallback_reaped.send(());
+            }
+        });
+        let reapers = SUPERVISOR_FALLBACK_REAPERS.get_or_init(|| StdMutex::new(Vec::new()));
+        let mut reapers = reapers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reapers.retain(|reaper| !reaper.is_finished());
+        reapers.push(reaper);
     }
 }
 
@@ -803,6 +839,7 @@ where
         let online_rx = self.online.subscribe();
         let session_events = self.source.session_event_sink();
         let cancel = self.cancel.clone();
+        let runtime = tokio::runtime::Handle::current();
         let events = EventSender {
             tx: events_tx,
             online: online_rx.clone(),
@@ -817,6 +854,9 @@ where
             lifecycle: SupervisorLifecycle {
                 cancel,
                 task: Some(task),
+                runtime,
+                #[cfg(test)]
+                fallback_reaped: None,
             },
         }
     }
@@ -2325,7 +2365,7 @@ mod tests {
 
     use anyhow::{Result, anyhow};
     use sha2::{Digest, Sha256};
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc, oneshot, watch};
 
     use super::*;
     use crate::agent::{
@@ -2360,6 +2400,8 @@ mod tests {
         SupervisorRuntime::new(SupervisorLifecycle {
             cancel,
             task: Some(tokio::spawn(run)),
+            runtime: tokio::runtime::Handle::current(),
+            fallback_reaped: None,
         })
     }
 
@@ -2449,6 +2491,44 @@ mod tests {
             finished.load(Ordering::SeqCst),
             "join must await the supervisor's cancellation cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_runtime_transfers_live_supervisor_to_a_joining_reaper() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let cleanup_entered = Arc::new(Notify::new());
+        let task_cleanup_entered = cleanup_entered.clone();
+        let release_cleanup = Arc::new(Notify::new());
+        let task_release_cleanup = release_cleanup.clone();
+        let (reaped_tx, mut reaped_rx) = oneshot::channel();
+        let runtime = SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(async move {
+                task_cancel.cancelled().await;
+                task_cleanup_entered.notify_one();
+                task_release_cleanup.notified().await;
+                Ok(())
+            })),
+            runtime: tokio::runtime::Handle::current(),
+            fallback_reaped: Some(reaped_tx),
+        });
+
+        drop(runtime);
+        tokio::time::timeout(Duration::from_secs(1), cleanup_entered.notified())
+            .await
+            .expect("fallback Drop must cancel the live supervisor");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut reaped_rx)
+                .await
+                .is_err(),
+            "reaper must retain and await the supervisor through cleanup"
+        );
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), reaped_rx)
+            .await
+            .expect("fallback reaper must finish after supervisor cleanup")
+            .expect("fallback reaper completion observer remains");
     }
 
     struct TestDigestFactory;
@@ -8672,6 +8752,8 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: pump_cancel.clone(),
                 task: None,
+                runtime: tokio::runtime::Handle::current(),
+                fallback_reaped: None,
             },
         });
         let (_reader, mut session_writer) = gateway.split();
@@ -8833,6 +8915,8 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: pump_cancel.clone(),
                 task: None,
+                runtime: tokio::runtime::Handle::current(),
+                fallback_reaped: None,
             },
         });
         let (_reader, mut writer) = gateway.split();

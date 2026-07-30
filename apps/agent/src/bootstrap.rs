@@ -369,6 +369,7 @@ fn artifact_broker_client(context: &BootstrapContext) -> ArtifactBrokerClient {
 
 const CONTROL_PLANE_RECONCILIATION_ATTEMPTS: usize = 4;
 const CONTROL_PLANE_RECONCILIATION_DELAY: Duration = Duration::from_millis(100);
+const SESSION_START_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -407,6 +408,75 @@ enum PreReadyRuntimeExit {
 enum OwnedPreReadyWait<T> {
     Completed(T),
     Exit(PreReadyRuntimeExit),
+}
+
+enum SessionStartArbitration<T, Exit> {
+    Started(Result<T>),
+    RuntimeExit { exit: Exit, startup: Result<T> },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Session startup was cancelled and joined after a required runtime exit; sole RunCore ownership was not recovered"
+)]
+struct SessionStartCancelled;
+
+async fn arbitrate_session_start<T, Exit>(
+    mut task: tokio::task::JoinHandle<Result<T>>,
+    runtime_exit: impl std::future::Future<Output = Exit>,
+    shutdown: &CancellationToken,
+) -> SessionStartArbitration<T, Exit> {
+    tokio::pin!(runtime_exit);
+    tokio::select! {
+        biased;
+        exit = &mut runtime_exit => {
+            // No Session exists yet to observe `shutdown`. Close the local
+            // admission lineage synchronously, then cancel and join the task
+            // that owns the sole RunCore before any runtime owner is released.
+            shutdown.cancel();
+            task.abort();
+            let joined = match tokio::time::timeout(
+                SESSION_START_ABORT_JOIN_TIMEOUT,
+                &mut task,
+            )
+            .await
+            {
+                Ok(joined) => joined,
+                Err(_) => {
+                    // Returning would drop the JoinHandle and detach a task
+                    // that may still own RunCore. A process fail-stop is the
+                    // only bounded outcome that cannot create two owners.
+                    tracing::error!(
+                        timeout_millis = SESSION_START_ABORT_JOIN_TIMEOUT.as_millis(),
+                        "cancelled Session startup did not join within its ownership bound"
+                    );
+                    std::process::abort();
+                }
+            };
+            SessionStartArbitration::RuntimeExit {
+                exit,
+                startup: classify_session_start_join(joined),
+            }
+        }
+        joined = &mut task => {
+            SessionStartArbitration::Started(classify_session_start_join(joined))
+        }
+    }
+}
+
+fn classify_session_start_join<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
+    match joined {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Err(anyhow::Error::new(SessionStartCancelled)),
+        Err(error) if error.is_panic() => Err(anyhow!(
+            "exact hydrated Session startup task panicked: {error}"
+        )),
+        Err(error) => Err(anyhow!(
+            "exact hydrated Session startup task failed to join: {error}"
+        )),
+    }
 }
 
 async fn wait_pre_ready_or_signal<T>(
@@ -938,10 +1008,10 @@ async fn run_after_not_ready(
     let mut supervisor_online = supervisor_handle.online.clone();
     let (gateway, mut supervisor_runtime) = SessionGateway::from_supervisor(supervisor_handle);
 
-    // Session construction owns the sole RunCore in a retained task. A signal
-    // can stop admission immediately without cancelling and dropping that
-    // in-flight ownership transfer.
-    let mut session_start = tokio::spawn(async move {
+    // Session construction owns the sole RunCore in a retained task. Runtime
+    // failure closes local admission first, then aborts and joins this exact
+    // owner before emergency teardown can release adjacent runtime owners.
+    let session_start = tokio::spawn(async move {
         Session::start_hydrated(
             store.as_ref().clone(),
             gateway,
@@ -952,55 +1022,49 @@ async fn run_after_not_ready(
         .await
         .context("start exact hydrated Session")
     });
-    let session = tokio::select! {
-        biased;
-        exit = wait_required_runtime_exit(
+    let session = match arbitrate_session_start(
+        session_start,
+        wait_required_runtime_exit(
             &mut signal,
             &mut dependency_failure,
             &mut post_commit_failure,
             &mut supervisor_runtime,
-        ) => {
-            let started = (&mut session_start)
-                .await
-                .context("join exact hydrated Session startup task");
-            return match started {
-                Ok(Ok(session)) => {
-                    teardown_owned_pre_ready_runtime(
-                        publisher,
-                        session,
-                        post_commit,
-                        supervisor_runtime,
-                        shutdown,
-                        exit,
-                    )
-                    .await
-                }
-                Ok(Err(start_error)) | Err(start_error) => {
-                    teardown_failed_session_start(
-                        publisher,
-                        post_commit,
-                        supervisor_runtime,
-                        shutdown,
-                        exit,
-                        start_error,
-                    )
-                    .await
-                }
-            };
+        ),
+        &shutdown,
+    )
+    .await
+    {
+        SessionStartArbitration::Started(Ok(session)) => session,
+        SessionStartArbitration::Started(Err(start_error)) => {
+            return finish_runtime(Err(start_error), post_commit, supervisor_runtime, true).await;
         }
-        started = &mut session_start => {
-            match started.context("join exact hydrated Session startup task") {
-                Ok(Ok(session)) => session,
-                Ok(Err(start_error)) | Err(start_error) => {
-                    return finish_runtime(
-                        Err(start_error),
-                        post_commit,
-                        supervisor_runtime,
-                        true,
-                    )
-                    .await;
-                }
-            }
+        SessionStartArbitration::RuntimeExit {
+            exit,
+            startup: Ok(session),
+        } => {
+            return teardown_owned_pre_ready_runtime(
+                publisher,
+                session,
+                post_commit,
+                supervisor_runtime,
+                shutdown,
+                exit,
+            )
+            .await;
+        }
+        SessionStartArbitration::RuntimeExit {
+            exit,
+            startup: Err(start_error),
+        } => {
+            return teardown_failed_session_start(
+                publisher,
+                post_commit,
+                supervisor_runtime,
+                shutdown,
+                exit,
+                start_error,
+            )
+            .await;
         }
     };
 
@@ -1716,11 +1780,24 @@ fn install_shutdown_signal() -> Result<BoxFuture<'static, Result<()>>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+
+    use tokio::sync::{Notify, oneshot, watch};
 
     use super::*;
+    use crate::gateway::local_control::{
+        LocalCredentialIssueRequest, LocalCredentialIssueResponse, LocalRuntimePublicationReason,
+        LocalRuntimePublicationState, LocalRuntimeStateAck, LocalRuntimeStatePublication,
+    };
+    use crate::gateway::local_runtime::{LocalControlPlane, LocalReadyProof, local_ready_gate};
+    use crate::gateway::stdio::InjectedStdioGateway;
+    use crate::provider::ModelSpec;
+    use crate::runtime::contracts::RpcIdentity;
+    use crate::store::HydrationReceiptIdentity;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
 
@@ -1778,6 +1855,149 @@ mod tests {
 
     fn parse(map: &HashMap<String, OsString>) -> Result<BootstrapContext> {
         BootstrapContext::from_source(|name| map.get(name).cloned())
+    }
+
+    fn startup_probe_worker(identity: RpcIdentity) -> Arc<dyn RunWorker> {
+        let registry = remote_executor_registry(Arc::new(ExecutorClient::new(
+            "/tmp/sumi-unused-startup-probe.sock",
+            identity.clone(),
+        )))
+        .expect("startup probe remote registry");
+        let prompt = PromptContext {
+            system_prompt: "bootstrap startup ownership probe".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+            replay_provenance: None,
+        };
+        let driver = InjectedRunDriver::new(
+            ModelSpec::preset("kimi-k3").expect("startup probe model"),
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("startup probe workspace")),
+            Some(identity.generation()),
+        )
+        .expect("identity-bound startup probe driver");
+        Arc::new(SequentialRunWorker::new(Arc::new(driver)))
+    }
+
+    #[derive(Default)]
+    struct ControlledPublicationState {
+        revision: u64,
+        attempts: Vec<LocalRuntimeStatePublication>,
+        committed: BTreeMap<String, LocalRuntimeStatePublication>,
+        acks: BTreeMap<String, LocalRuntimeStateAck>,
+    }
+
+    struct ControlledReadyPlane {
+        authority: RuntimeEpochAuthority,
+        state: Mutex<ControlledPublicationState>,
+        first_ready_committed: Notify,
+    }
+
+    impl ControlledReadyPlane {
+        fn new(authority: RuntimeEpochAuthority) -> Self {
+            Self {
+                authority,
+                state: Mutex::new(ControlledPublicationState::default()),
+                first_ready_committed: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LocalControlPlane for ControlledReadyPlane {
+        async fn issue_gateway_credential(
+            &self,
+            _request: LocalCredentialIssueRequest,
+        ) -> Result<LocalCredentialIssueResponse> {
+            Err(anyhow!(
+                "controlled Ready plane does not issue Gateway credentials"
+            ))
+        }
+
+        async fn publish_runtime_state(
+            &self,
+            publication: LocalRuntimeStatePublication,
+        ) -> LocalPublicationResult<LocalRuntimeStateAck> {
+            if publication.personality_agent_id != self.authority.personality_agent_id().as_str()
+                || publication.generation != self.authority.generation().as_u64()
+                || publication.rpc_boot_nonce != self.authority.nonce().as_str()
+            {
+                return Err(LocalPublicationError::terminal(anyhow!(
+                    "controlled Ready plane rejected stale runtime identity"
+                )));
+            }
+
+            let (ack, block_first_ready_response) = {
+                let mut state = self.state.lock().unwrap();
+                state.attempts.push(publication.clone());
+                if let Some(ack) = state.acks.get(&publication.publication_id).cloned() {
+                    if state.committed.get(&publication.publication_id) != Some(&publication) {
+                        return Err(LocalPublicationError::terminal(anyhow!(
+                            "controlled Ready plane rejected duplicate-different publication"
+                        )));
+                    }
+                    return Ok(ack);
+                }
+                if publication.expected_revision != (state.revision > 0).then_some(state.revision) {
+                    return Err(LocalPublicationError::terminal(anyhow!(
+                        "controlled Ready plane rejected stale CAS revision"
+                    )));
+                }
+                state.revision += 1;
+                let ack = LocalRuntimeStateAck {
+                    publication_id: publication.publication_id.clone(),
+                    personality_agent_id: publication.personality_agent_id.clone(),
+                    generation: publication.generation,
+                    rpc_boot_nonce: publication.rpc_boot_nonce.clone(),
+                    revision: state.revision,
+                    state: publication.state,
+                    hydration_receipt_identity: publication.hydration_receipt_identity.clone(),
+                };
+                state
+                    .committed
+                    .insert(publication.publication_id.clone(), publication.clone());
+                state
+                    .acks
+                    .insert(publication.publication_id.clone(), ack.clone());
+                (
+                    ack,
+                    publication.state == LocalRuntimePublicationState::Ready,
+                )
+            };
+            if block_first_ready_response {
+                self.first_ready_committed.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(ack)
+        }
+    }
+
+    async fn local_ready_proof(authority: &RuntimeEpochAuthority) -> LocalReadyProof {
+        let receipt = HydrationReceiptIdentity {
+            personality_agent_id: authority.personality_agent_id().clone(),
+            lease_id: authority.lease().lease_id().to_owned(),
+            generation: authority.generation(),
+            fence_id: authority.fence().fence_id().to_owned(),
+            intent_count: 0,
+        };
+        let (_hydration_tx, hydration_rx) = watch::channel(Some(receipt));
+        let (controller, latch) = local_ready_gate(
+            authority.clone(),
+            hydration_rx,
+            [LocalRuntimeComponent::Session],
+        )
+        .expect("one-component Ready gate");
+        controller
+            .mark_ready(authority.rpc_identity(), LocalRuntimeComponent::Session)
+            .expect("mark exact Session Ready");
+        latch
+            .wait_for_proof(authority.generation())
+            .await
+            .expect("mint exact local Ready proof")
     }
 
     struct UnavailableShutdownPublisher {
@@ -2213,69 +2433,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_during_lost_ready_ack_reconciles_before_shutdown() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
-        let committed_tx = Arc::new(Mutex::new(Some(committed_tx)));
-        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            committed_rx.await.expect("first Ready committed");
-            signal_tx.send(()).expect("signal observer remains");
-        });
-        let mut signal: BoxFuture<'static, Result<()>> =
-            Box::pin(async move { signal_rx.await.context("test signal sender dropped") });
+    async fn real_ready_publisher_retains_exact_pending_cas_across_runtime_exit_cancellation() {
+        let authority = parse(&valid_env()).expect("runtime context").authority;
+        let control = Arc::new(ControlledReadyPlane::new(authority.clone()));
+        let publisher = LocalRuntimePublisher::new(authority.clone(), control.clone());
+        let proof = local_ready_proof(&authority).await;
         let shutdown = CancellationToken::new();
-        let outcome = publish_ready_reconciling(
-            {
-                let attempts = attempts.clone();
-                let order = order.clone();
-                move || {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                    let order = order.clone();
-                    let committed_tx = committed_tx.clone();
+
+        publisher
+            .publish_not_ready()
+            .await
+            .expect("startup NotReady establishes revision one");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            publish_ready_reconciling(
+                || publisher.publish_ready(&proof),
+                {
+                    let control = control.clone();
                     async move {
-                        if attempt == 0 {
-                            order.lock().unwrap().push("ready_committed_ack_lost");
-                            committed_tx
-                                .lock()
-                                .unwrap()
-                                .take()
-                                .expect("one commit signal")
-                                .send(())
-                                .expect("signal task remains");
-                            std::future::pending::<LocalPublicationResult<()>>().await
-                        } else {
-                            order.lock().unwrap().push("ready_reconciled");
-                            Ok(())
-                        }
+                        control.first_ready_committed.notified().await;
+                        PreReadyRuntimeExit::Dependency(Err(anyhow!(
+                            "injected dependency failure after Ready commit"
+                        )))
                     }
-                }
-            },
-            signal.as_mut(),
-            &shutdown,
+                },
+                &shutdown,
+            ),
         )
         .await
+        .expect("cancelled Ready publication must reconcile without hanging")
         .unwrap_or_else(|failure| {
             panic!(
-                "second attempt must reconcile the retained Ready publication: {:#}",
+                "real publisher must reconcile its retained publication: {:#}",
                 failure.control
             )
         });
+
         assert!(matches!(
             outcome,
-            ReadyReconciliationOutcome::InterruptedAfterReconciliation(Ok(()))
+            ReadyReconciliationOutcome::InterruptedAfterReconciliation(
+                PreReadyRuntimeExit::Dependency(Err(_))
+            )
         ));
         assert!(shutdown.is_cancelled());
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        order.lock().unwrap().push("shutdown_not_ready");
+        publisher
+            .publish_shutdown_not_ready()
+            .await
+            .expect("shutdown advances from reconciled Ready");
+
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.attempts.len(), 4);
         assert_eq!(
-            order.lock().unwrap().as_slice(),
-            [
-                "ready_committed_ack_lost",
-                "ready_reconciled",
-                "shutdown_not_ready"
-            ]
+            state.attempts[1], state.attempts[2],
+            "publisher must retry the identical publication_id, payload, and expected revision"
+        );
+        assert_eq!(state.attempts[1].state, LocalRuntimePublicationState::Ready);
+        assert_eq!(state.attempts[1].expected_revision, Some(1));
+        assert_eq!(
+            state.attempts[3].reason,
+            LocalRuntimePublicationReason::Shutdown
+        );
+        assert_eq!(state.attempts[3].expected_revision, Some(2));
+        assert_eq!(
+            state.committed.len(),
+            3,
+            "startup, exact Ready, and shutdown commit once each"
         );
     }
 
@@ -2363,6 +2585,109 @@ mod tests {
             cancelled_before_release,
             "local cancellation must precede blocked control-plane I/O"
         );
+    }
+
+    #[tokio::test]
+    async fn required_runtime_exit_aborts_and_joins_real_store_blocked_session_start() {
+        let context = parse(&valid_env()).expect("runtime context");
+        let store = Store::session_test_store(PAID)
+            .await
+            .expect("startup test Store");
+        let hydrated = match store
+            .hydrate(context.authority.lease(), context.authority.fence())
+            .await
+            .expect("hydrate startup test Store")
+        {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("empty startup test Store must hydrate completely: {other:?}"),
+        };
+        let approval = Arc::new(ApprovalBroker::headless(
+            Policy::new("/workspace"),
+            SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        ));
+        let (core, start_authority) =
+            SessionStartAuthority::from_hydrated(context.authority.clone(), &hydrated, approval)
+                .expect("bind exact hydrated Session authority");
+        let worker = startup_probe_worker(context.authority.rpc_identity().clone());
+        let gateway = InjectedStdioGateway::new(
+            tokio::io::BufReader::new(tokio::io::empty()),
+            tokio::io::sink(),
+            store
+                .command_digest_factory()
+                .await
+                .expect("startup probe command digest"),
+        );
+
+        // The Store pool has one managed connection. Retaining it reproduces
+        // the production startup wait in private-key/checkpoint I/O after all
+        // synchronous authority validation has succeeded.
+        let held_connection = store
+            .pool()
+            .acquire()
+            .await
+            .expect("hold sole Store connection");
+        let (startup_pending_tx, startup_pending_rx) = oneshot::channel();
+        let start = tokio::spawn(async move {
+            let mut startup = Box::pin(Session::start_hydrated(
+                store,
+                gateway,
+                core,
+                worker,
+                start_authority,
+            ));
+            let mut completed = None;
+            std::future::poll_fn(|context| match startup.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    completed = Some(result);
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            let _ = startup_pending_tx.send(completed.is_none());
+            match completed {
+                Some(result) => result,
+                None => startup.await,
+            }
+        });
+        let shutdown = CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            arbitrate_session_start(
+                start,
+                async move {
+                    assert!(
+                        startup_pending_rx
+                            .await
+                            .expect("startup first-poll observer remains"),
+                        "exact hydrated startup must reach pending Store I/O"
+                    );
+                    "dependency"
+                },
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("blocked exact Session startup must be cancelled and joined");
+
+        match outcome {
+            SessionStartArbitration::RuntimeExit { exit, startup } => {
+                assert_eq!(exit, "dependency");
+                let error = match startup {
+                    Ok(_) => panic!("Store-blocked Session startup must not complete"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.downcast_ref::<SessionStartCancelled>().is_some(),
+                    "joined cancellation must classify sole RunCore ownership loss: {error:#}"
+                );
+            }
+            SessionStartArbitration::Started(_) => {
+                panic!("held Store connection must keep production Session startup blocked")
+            }
+        }
+        assert!(shutdown.is_cancelled());
+        drop(held_connection);
     }
 
     #[tokio::test]
