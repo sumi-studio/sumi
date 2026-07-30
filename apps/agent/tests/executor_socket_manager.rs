@@ -292,30 +292,32 @@ async fn health_is_exact_role_bound_and_side_effect_free() {
 #[tokio::test]
 async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
     let mut fixture = Fixture::new().await;
+    let sentinel = fixture.workspace.join("sentinel.txt");
+    std::fs::write(&sentinel, "original").unwrap();
     fixture.start(NONCE).await;
 
     let operations = [
         json!({
             "type": "bash",
-            "command": "touch must-not-exist",
+            "command": "printf mutated > sentinel.txt",
             "execution_id": "forbidden-bash",
         }),
         json!({
             "type": "write_file",
-            "path": "must-not-exist.txt",
-            "content": "forbidden",
+            "path": "sentinel.txt",
+            "content": "mutated",
             "execution_id": "forbidden-write",
         }),
         json!({
             "type": "edit_file",
-            "path": "must-not-exist.txt",
-            "old_string": "old",
-            "new_string": "new",
+            "path": "sentinel.txt",
+            "old_string": "original",
+            "new_string": "mutated",
             "execution_id": "forbidden-edit",
         }),
         json!({
             "type": "remove_file",
-            "path": "must-not-exist.txt",
+            "path": "sentinel.txt",
             "execution_id": "forbidden-remove",
         }),
         json!({
@@ -359,8 +361,7 @@ async fn production_socket_rejects_every_non_read_tool_without_side_effects() {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["result"]["Err"]["code"], "protocol");
     }
-    assert!(!fixture.workspace.join("must-not-exist").exists());
-    assert!(!fixture.workspace.join("must-not-exist.txt").exists());
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "original");
 }
 
 #[tokio::test]

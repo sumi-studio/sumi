@@ -60,7 +60,7 @@ pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegis
     let identity = client.identity().clone();
     let mut builder = ToolRegistryBuilder::default();
     builder.register(Arc::new(RemoteTool {
-        kind: RemoteToolKind::ReadFile,
+        kind: RemoteToolKind::WorkspaceReadFile,
         client,
     }))?;
     Ok(builder.build_for_executor_identity(identity))
@@ -94,8 +94,9 @@ fn broad_test_registry_from_invoker(
     Ok(builder.build())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteToolKind {
+    WorkspaceReadFile,
     ReadFile,
     WriteFile,
     EditFile,
@@ -115,6 +116,10 @@ struct RemoteTool {
 impl Tool for RemoteTool {
     fn def(&self) -> ToolDefinition {
         match self.kind {
+            RemoteToolKind::WorkspaceReadFile => definition::<WorkspaceReadFileArgs>(
+                "read_file",
+                "Read UTF-8 text from a workspace path. Artifact handles are not accepted.",
+            ),
             RemoteToolKind::ReadFile => definition::<ReadFileArgs>(
                 "read_file",
                 "Read UTF-8 text from a workspace path or artifact handle.",
@@ -148,7 +153,8 @@ impl Tool for RemoteTool {
 
     fn risk(&self) -> ToolRisk {
         match self.kind {
-            RemoteToolKind::ReadFile
+            RemoteToolKind::WorkspaceReadFile
+            | RemoteToolKind::ReadFile
             | RemoteToolKind::ListDir
             | RemoteToolKind::Glob
             | RemoteToolKind::Grep => ToolRisk::ReadOnly,
@@ -171,7 +177,7 @@ impl Tool for RemoteTool {
             } => Some(ReadContext {
                 request_offset: *offset,
                 rpc_limit: *limit,
-                artifact: path.starts_with("artifact://"),
+                artifact: self.kind == RemoteToolKind::ReadFile && path.starts_with("artifact://"),
             }),
             _ => None,
         };
@@ -190,6 +196,20 @@ impl RemoteToolKind {
         execution_id: String,
     ) -> Result<ExecutorOperation, ToolError> {
         Ok(match self {
+            Self::WorkspaceReadFile => {
+                let args: WorkspaceReadFileArgs = decode(args)?;
+                if args.path.starts_with("artifact://") {
+                    return Err(ToolError::InvalidPath(
+                        "production read_file accepts workspace paths only".to_owned(),
+                    ));
+                }
+                ExecutorOperation::ReadFile {
+                    path: args.path,
+                    offset: args.offset,
+                    limit: args.limit,
+                    execution_id,
+                }
+            }
             Self::ReadFile => {
                 let args: ReadFileArgs = decode(args)?;
                 let limit = if args.path.starts_with("artifact://") {
@@ -254,7 +274,7 @@ impl RemoteToolKind {
         read_context: Option<ReadContext>,
     ) -> Result<ToolOutput, ToolError> {
         match (self, response) {
-            (Self::ReadFile, ExecutorResponse::ReadFile { result }) => {
+            (Self::WorkspaceReadFile | Self::ReadFile, ExecutorResponse::ReadFile { result }) => {
                 let content = render_bounded_output(&result, RetainedOutput::Head, None, &[]);
                 Ok(text_output(content, to_value(result)?))
             }
@@ -570,6 +590,20 @@ where
         ));
     }
     Ok(limit)
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceReadFileArgs {
+    /// A workspace path. `artifact://` handles are not accepted.
+    #[schemars(length(min = 1))]
+    path: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "default_read_limit")]
+    #[serde(deserialize_with = "deserialize_read_limit")]
+    #[schemars(range(min = 1, max = 51200))]
+    limit: usize,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1523,6 +1557,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file"]
         );
+        let definition = registry.definitions().into_iter().next().unwrap();
+        assert_eq!(
+            definition.description,
+            "Read UTF-8 text from a workspace path. Artifact handles are not accepted."
+        );
+        assert_eq!(
+            definition.parameters["properties"]["path"]["description"],
+            "A workspace path. `artifact://` handles are not accepted."
+        );
         for forbidden in [
             "bash",
             "write_file",
@@ -1537,6 +1580,42 @@ mod tests {
                 "{forbidden} leaked into the production registry"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn production_artifact_read_is_rejected_before_endpoint_interaction() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-workspace-read-only-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry =
+            remote_executor_registry(Arc::new(ExecutorClient::new(&socket, identity))).unwrap();
+
+        let error = run(
+            &registry,
+            "read_file",
+            "flow",
+            "artifact-call",
+            json!({
+                "path":
+                    "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/forbidden"
+            }),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidPath(_)));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "production artifact input contacted the executor endpoint"
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
