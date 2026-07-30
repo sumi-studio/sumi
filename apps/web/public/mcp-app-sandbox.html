@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      This source artifact is deliberately inert. A dedicated HTTPS sandbox
+      deployment must replace the marker below and serve an equivalent CSP as
+      an HTTP response header. The app host must configure the same marker in
+      VITE_MCP_APP_SANDBOX_DEPLOYMENT_ID.
+    -->
+    <meta
+      name="sumi-mcp-sandbox-deployment"
+      content="__SUMI_MCP_SANDBOX_DEPLOYMENT__"
+    />
+    <title>MCP App sandbox</title>
+    <style>
+      html,
+      body,
+      iframe {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        border: 0;
+        background: transparent;
+      }
+
+      body {
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      (() => {
+        "use strict";
+
+        const SANDBOX_READY = "ui/notifications/sandbox-proxy-ready";
+        const RESOURCE_READY = "ui/notifications/sandbox-resource-ready";
+        const MAX_HTML_BYTES = 512 * 1024;
+        const MAX_MESSAGE_BYTES = 256 * 1024;
+        const MAX_CSP_ORIGINS = 16;
+        const DEPLOYMENT_PATTERN = /^[a-f0-9]{64}$/;
+        const encoder = new TextEncoder();
+        let view = null;
+        let loaded = false;
+
+        const deploymentMarker = document
+          .querySelector('meta[name="sumi-mcp-sandbox-deployment"]')
+          ?.getAttribute("content");
+        const query = new URLSearchParams(location.search);
+        const deploymentId = query.get("deploymentId");
+        const parentOrigin = exactHttpsOrigin(query.get("hostOrigin"));
+        const referrerOrigin = exactHttpsOrigin(document.referrer);
+
+        if (
+          !window.isSecureContext ||
+          window.parent === window ||
+          !("credentialless" in HTMLIFrameElement.prototype) ||
+          !DEPLOYMENT_PATTERN.test(deploymentMarker || "") ||
+          deploymentMarker !== deploymentId ||
+          !parentOrigin ||
+          referrerOrigin !== parentOrigin
+        ) {
+          document.body.textContent = "MCP App sandbox unavailable.";
+          return;
+        }
+
+        function exactHttpsOrigin(value) {
+          if (!value) return null;
+          try {
+            const url = new URL(value);
+            return url.protocol === "https:" &&
+              url.username === "" &&
+              url.password === ""
+              ? url.origin
+              : null;
+          } catch {
+            return null;
+          }
+        }
+
+        function isJsonRpcMessage(value) {
+          return (
+            value !== null &&
+            typeof value === "object" &&
+            !Array.isArray(value) &&
+            value.jsonrpc === "2.0" &&
+            (typeof value.method === "string" ||
+              Object.hasOwn(value, "result") ||
+              Object.hasOwn(value, "error"))
+          );
+        }
+
+        function isBoundedMessage(value) {
+          try {
+            return encoder.encode(JSON.stringify(value)).byteLength <=
+              MAX_MESSAGE_BYTES;
+          } catch {
+            return false;
+          }
+        }
+
+        function cspSources(value, allowWebSocket, allowWildcard) {
+          if (value === undefined) return [];
+          if (!Array.isArray(value) || value.length > MAX_CSP_ORIGINS) {
+            return null;
+          }
+          const sources = [];
+          for (const item of value) {
+            if (typeof item !== "string") return null;
+            try {
+              const url = new URL(item);
+              const wildcard = url.hostname.startsWith("*.");
+              if (
+                !(
+                  (url.protocol === "https:" ||
+                    (allowWebSocket && url.protocol === "wss:")) &&
+                  url.username === "" &&
+                  url.password === "" &&
+                  url.pathname === "/" &&
+                  url.search === "" &&
+                  url.hash === "" &&
+                  (!wildcard ||
+                    (allowWildcard &&
+                      url.hostname.length > 3 &&
+                      !url.hostname.slice(2).includes("*"))) &&
+                  item === url.origin
+                )
+              ) {
+                return null;
+              }
+              sources.push(item);
+            } catch {
+              return null;
+            }
+          }
+          return sources;
+        }
+
+        function createPolicy(csp) {
+          if (
+            csp === null ||
+            typeof csp !== "object" ||
+            Array.isArray(csp)
+          ) {
+            return null;
+          }
+          const allowedKeys = new Set([
+            "connectDomains",
+            "resourceDomains",
+            "frameDomains",
+            "baseUriDomains",
+          ]);
+          if (Object.keys(csp).some((key) => !allowedKeys.has(key))) {
+            return null;
+          }
+          const connect = cspSources(csp.connectDomains, true, false);
+          const resources = cspSources(csp.resourceDomains, false, true);
+          const frames = cspSources(csp.frameDomains, false, false);
+          const bases = cspSources(csp.baseUriDomains, false, false);
+          if (!connect || !resources || !frames || !bases) return null;
+          return [
+            "default-src 'none'",
+            `script-src 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `style-src 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `img-src data: ${resources.join(" ")}`.trim(),
+            `font-src ${resources.length ? resources.join(" ") : "'none'"}`,
+            `media-src data: ${resources.join(" ")}`.trim(),
+            `connect-src ${connect.length ? connect.join(" ") : "'none'"}`,
+            `frame-src ${frames.length ? frames.join(" ") : "'none'"}`,
+            `base-uri ${bases.length ? bases.join(" ") : "'none'"}`,
+            "object-src 'none'",
+            "form-action 'none'",
+          ].join("; ");
+        }
+
+        function withPolicy(html, csp) {
+          const policy = createPolicy(csp || {});
+          if (!policy) return null;
+          const documentNode = new DOMParser().parseFromString(
+            html,
+            "text/html",
+          );
+          documentNode
+            .querySelectorAll('meta[http-equiv="Content-Security-Policy"]')
+            .forEach((node) => node.remove());
+          const meta = documentNode.createElement("meta");
+          meta.httpEquiv = "Content-Security-Policy";
+          meta.content = policy;
+          documentNode.head.prepend(meta);
+          return `<!doctype html>${documentNode.documentElement.outerHTML}`;
+        }
+
+        function loadResource(params) {
+          if (
+            loaded ||
+            params === null ||
+            typeof params !== "object" ||
+            Array.isArray(params) ||
+            Object.keys(params).some(
+              (key) => !["html", "sandbox", "csp"].includes(key),
+            ) ||
+            typeof params.html !== "string" ||
+            encoder.encode(params.html).byteLength > MAX_HTML_BYTES ||
+            params.sandbox !== "allow-scripts"
+          ) {
+            return;
+          }
+          const securedHtml = withPolicy(params.html, params.csp);
+          if (!securedHtml) return;
+
+          loaded = true;
+          view = document.createElement("iframe");
+          view.title = "MCP App";
+          view.sandbox = "allow-scripts";
+          view.allow =
+            "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'";
+          view.referrerPolicy = "no-referrer";
+          view.credentialless = true;
+          view.srcdoc = securedHtml;
+          document.body.replaceChildren(view);
+        }
+
+        window.addEventListener("message", (event) => {
+          if (!isBoundedMessage(event.data) || !isJsonRpcMessage(event.data)) {
+            return;
+          }
+          if (
+            event.source === window.parent &&
+            event.origin === parentOrigin
+          ) {
+            if (event.data.method === RESOURCE_READY) {
+              loadResource(event.data.params);
+            } else if (view) {
+              view.contentWindow?.postMessage(event.data, "*");
+            }
+            return;
+          }
+          if (
+            event.source === view?.contentWindow &&
+            event.origin === "null" &&
+            !String(event.data.method || "").startsWith(
+              "ui/notifications/sandbox-",
+            )
+          ) {
+            window.parent.postMessage(event.data, parentOrigin);
+          }
+        });
+
+        window.parent.postMessage(
+          { jsonrpc: "2.0", method: SANDBOX_READY, params: {} },
+          parentOrigin,
+        );
+      })();
+    </script>
+  </body>
+</html>
