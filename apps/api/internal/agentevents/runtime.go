@@ -255,6 +255,10 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, personalityAgentI
 	if err != nil {
 		return err
 	}
+	return verifyRuntimeGeneration(state, generation)
+}
+
+func verifyRuntimeGeneration(state runtimeState, generation uint64) error {
 	if !state.present {
 		return errors.New("durable runtime state is absent")
 	}
@@ -414,18 +418,20 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	if ack.PersonalityAgentID != claims.PersonalityAgentID {
 		return errors.New("command ACK target does not match token claim")
 	}
-	cmd, found, err := g.commands.GetCommand(ctx, claims.PersonalityAgentID, ack.Seq)
-	if err != nil {
-		return fmt.Errorf("load acknowledged command: %w", err)
-	}
-	if !found || cmd.CommandID != ack.CommandID || cmd.PersonalityAgentID != ack.PersonalityAgentID {
-		return fmt.Errorf(
-			"ack does not match durable command log: seq=%d command_id=%q",
-			ack.Seq,
-			ack.CommandID,
-		)
-	}
-	return g.appendCommandAck(ctx, claims.PersonalityAgentID, ack)
+	return g.withCurrentGeneration(ctx, claims, func() error {
+		cmd, found, err := g.commands.GetCommand(ctx, claims.PersonalityAgentID, ack.Seq)
+		if err != nil {
+			return fmt.Errorf("load acknowledged command: %w", err)
+		}
+		if !found || cmd.CommandID != ack.CommandID || cmd.PersonalityAgentID != ack.PersonalityAgentID {
+			return fmt.Errorf(
+				"ack does not match durable command log: seq=%d command_id=%q",
+				ack.Seq,
+				ack.CommandID,
+			)
+		}
+		return g.appendCommandAck(ctx, claims.PersonalityAgentID, ack)
+	})
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -442,22 +448,56 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 			claims.PersonalityAgentID,
 		)
 	}
-	if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
+	return g.withCurrentGeneration(ctx, claims, func() error {
+		if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
+			g.mu.Lock()
+			g.publishVolatileLocked(claims.PersonalityAgentID, envelope)
+			g.mu.Unlock()
+			return nil
+		}
 		g.mu.Lock()
-		g.publishVolatileLocked(claims.PersonalityAgentID, envelope)
-		g.mu.Unlock()
+		defer g.mu.Unlock()
+		if err := g.appendDurableEventLocked(
+			claims.PersonalityAgentID,
+			durableEventRecord{Seq: *envelope.Seq, Event: envelope},
+		); err != nil {
+			return err
+		}
+		g.updateAgentSessionStateLocked(claims.PersonalityAgentID, envelope.Event)
 		return nil
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if err := g.appendDurableEventLocked(
-		claims.PersonalityAgentID,
-		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
-	); err != nil {
+	})
+}
+
+// withCurrentGeneration serializes the authoritative generation check and the
+// complete synchronous side effect with runtime-state publication for this
+// personality agent. A rollover that has committed therefore excludes all
+// subsequent work from the prior generation, while a side effect already
+// admitted must finish before that rollover can commit.
+func (g *DurableGateway) withCurrentGeneration(
+	ctx context.Context,
+	claims TokenClaims,
+	call func() error,
+) error {
+	lock, err := openLocalControlLock(g.localControlLockPath(claims.PersonalityAgentID))
+	if err != nil {
 		return err
 	}
-	g.updateAgentSessionStateLocked(claims.PersonalityAgentID, envelope.Event)
-	return nil
+	defer lock.Close()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
+		return fmt.Errorf("lock runtime generation for side effect: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state, err := g.state(ctx, claims.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	if err := verifyRuntimeGeneration(state, claims.Generation); err != nil {
+		return err
+	}
+	return call()
 }
 
 // EventCatchUp returns the durable event suffix after lastConsumedSeq. It
@@ -1314,6 +1354,15 @@ func (g *DurableGateway) publishRuntimeState(personalityAgentID string, state ru
 	if state.Generation > maxProcessGeneration {
 		return fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
+	lock, err := openLocalControlLock(g.localControlLockPath(personalityAgentID))
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := flockContext(context.Background(), lock.Fd(), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock runtime state publication: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err

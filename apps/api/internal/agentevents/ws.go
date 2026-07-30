@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"strings"
@@ -116,28 +117,50 @@ type Server struct {
 	// writer goroutine. It must be shorter than PongWait.
 	PingInterval time.Duration
 
+	// GenerationPollInterval bounds how long an otherwise-idle connection can
+	// remain open after its ProcessGeneration is rolled over.
+	GenerationPollInterval time.Duration
+
 	// AllowedOrigins lists the exact origins allowed to open a WebSocket.
 	// An empty list is fail-closed (no origin is accepted). Wildcards are not
 	// supported: every accepted origin must be named explicitly.
 	AllowedOrigins []string
 
 	upgrader websocket.Upgrader
+
+	connectionsMu sync.Mutex
+	connections   map[string]*agentConnectionEpoch
+	nextEpoch     uint64
+	epochGates    [64]sync.Mutex
 }
+
+type agentConnectionEpoch struct {
+	id                     uint64
+	personalityAgentID     string
+	claims                 TokenClaims
+	conn                   *websocket.Conn
+	cancel                 context.CancelFunc
+	generationWatchStopped chan struct{}
+}
+
+var errConnectionEpochRevoked = errors.New("agent websocket connection epoch revoked")
 
 // NewServer returns a Server with the required seams. Missing seams leave the
 // handler fail-closed.
 func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es EventSink, hl HydrationLatch) *Server {
 	s := &Server{
-		Token:        tv,
-		Generation:   gv,
-		Commands:     cs,
-		Events:       es,
-		Latch:        hl,
-		HelloTimeout: 30 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		MaxReadLimit: 4 * 1024 * 1024,
-		PongWait:     60 * time.Second,
-		PingInterval: 54 * time.Second,
+		Token:                  tv,
+		Generation:             gv,
+		Commands:               cs,
+		Events:                 es,
+		Latch:                  hl,
+		HelloTimeout:           30 * time.Second,
+		WriteTimeout:           10 * time.Second,
+		MaxReadLimit:           4 * 1024 * 1024,
+		PongWait:               60 * time.Second,
+		PingInterval:           54 * time.Second,
+		GenerationPollInterval: 250 * time.Millisecond,
+		connections:            make(map[string]*agentConnectionEpoch),
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 	return s
@@ -249,6 +272,14 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("verify generation: %w", err)
 	}
 
+	epoch := s.installConnectionEpoch(conn, claims, cancel)
+	defer s.removeConnectionEpoch(epoch)
+	go s.watchGeneration(ctx, epoch)
+	defer func() {
+		cancel()
+		<-epoch.generationWatchStopped
+	}()
+
 	if err := s.Latch.WaitFor(helloCtx, claims, hello.Generation); err != nil {
 		return fmt.Errorf("hydration wait: %w", err)
 	}
@@ -316,7 +347,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextSeq,
 	}
-	if err := s.writeJSON(conn, apiHello); err != nil {
+	if err := s.writeJSONForEpoch(epoch, apiHello); err != nil {
 		return fmt.Errorf("write api hello: %w", err)
 	}
 
@@ -337,7 +368,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("command catch-up: %w", err)
 	}
 	for _, cmd := range commands {
-		if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
+		if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
 			return fmt.Errorf("send catch-up command: %w", err)
 		}
 		nextSeq = cmd.Seq + 1
@@ -363,13 +394,13 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 
 	go func() {
 		defer wg.Done()
-		errCh <- s.readPump(ctx, conn, claims)
+		errCh <- s.readPump(ctx, epoch)
 		stopPumps()
 	}()
 
 	go func() {
 		defer wg.Done()
-		errCh <- s.writePump(ctx, conn, claims, live, liveErr)
+		errCh <- s.writePump(ctx, epoch, live, liveErr)
 		stopPumps()
 	}()
 
@@ -388,7 +419,8 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	return ctx.Err()
 }
 
-func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims TokenClaims) error {
+func (s *Server) readPump(ctx context.Context, epoch *agentConnectionEpoch) error {
+	conn, claims := epoch.conn, epoch.claims
 	if s.PongWait > 0 {
 		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
 			return fmt.Errorf("set initial pong read deadline: %w", err)
@@ -419,18 +451,22 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 			if frame.Envelope.PersonalityAgentID != claims.PersonalityAgentID {
 				return errors.New("event personality_agent_id claim mismatch")
 			}
-			if err := s.Events.Receive(ctx, claims, *frame.Envelope); err != nil {
+			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
+				return s.Events.Receive(ctx, claims, *frame.Envelope)
+			}); err != nil {
 				return err
 			}
 		case "command_ack":
-			if err := s.Commands.ApplyAck(ctx, claims, *frame.Ack); err != nil {
+			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
+				return s.Commands.ApplyAck(ctx, claims, *frame.Ack)
+			}); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, claims TokenClaims, live <-chan CommandEnvelope, liveErr <-chan error) error {
+func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, live <-chan CommandEnvelope, liveErr <-chan error) error {
 	if s.PingInterval <= 0 {
 		for {
 			select {
@@ -440,7 +476,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, claims Tok
 				if !ok {
 					return sourceCloseError(liveErr)
 				}
-				if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
+				if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
 					return err
 				}
 			case err, ok := <-liveErr:
@@ -464,7 +500,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, claims Tok
 			if !ok {
 				return sourceCloseError(liveErr)
 			}
-			if err := s.sendCommandEnvelope(conn, claims, cmd); err != nil {
+			if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
 				return err
 			}
 		case err, ok := <-liveErr:
@@ -475,7 +511,9 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, claims Tok
 				return err
 			}
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline()); err != nil {
+			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
+				return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
+			}); err != nil {
 				return err
 			}
 		}
@@ -494,21 +532,23 @@ func sourceCloseError(liveErr <-chan error) error {
 	return errors.New("command source closed")
 }
 
-func (s *Server) sendCommandEnvelope(conn *websocket.Conn, claims TokenClaims, cmd CommandEnvelope) error {
+func (s *Server) sendCommandEnvelope(epoch *agentConnectionEpoch, cmd CommandEnvelope) error {
 	if err := cmd.Validate(); err != nil {
 		return fmt.Errorf("invalid command envelope: %w", err)
 	}
-	if cmd.PersonalityAgentID != claims.PersonalityAgentID {
+	if cmd.PersonalityAgentID != epoch.claims.PersonalityAgentID {
 		return errors.New("command envelope target does not match token claim")
 	}
-	return s.writeJSON(conn, cmd)
+	return s.writeJSONForEpoch(epoch, cmd)
 }
 
-func (s *Server) writeJSON(conn *websocket.Conn, value any) error {
-	if err := conn.SetWriteDeadline(s.writeDeadline()); err != nil {
-		return fmt.Errorf("set write deadline: %w", err)
-	}
-	return conn.WriteJSON(value)
+func (s *Server) writeJSONForEpoch(epoch *agentConnectionEpoch, value any) error {
+	return s.withCurrentConnectionEpoch(context.Background(), epoch, func() error {
+		if err := epoch.conn.SetWriteDeadline(s.writeDeadline()); err != nil {
+			return fmt.Errorf("set write deadline: %w", err)
+		}
+		return epoch.conn.WriteJSON(value)
+	})
 }
 
 func (s *Server) writeDeadline() time.Time {
@@ -517,6 +557,123 @@ func (s *Server) writeDeadline() time.Time {
 		timeout = 10 * time.Second
 	}
 	return time.Now().Add(timeout)
+}
+
+func (s *Server) generationPollInterval() time.Duration {
+	if s.GenerationPollInterval > 0 {
+		return s.GenerationPollInterval
+	}
+	return 250 * time.Millisecond
+}
+
+func (s *Server) epochGate(personalityAgentID string) *sync.Mutex {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(personalityAgentID))
+	return &s.epochGates[hash.Sum32()%uint32(len(s.epochGates))]
+}
+
+func (s *Server) installConnectionEpoch(
+	conn *websocket.Conn,
+	claims TokenClaims,
+	cancel context.CancelFunc,
+) *agentConnectionEpoch {
+	epoch := &agentConnectionEpoch{
+		personalityAgentID:     claims.PersonalityAgentID,
+		claims:                 claims,
+		conn:                   conn,
+		cancel:                 cancel,
+		generationWatchStopped: make(chan struct{}),
+	}
+	gate := s.epochGate(claims.PersonalityAgentID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	s.connectionsMu.Lock()
+	if s.connections == nil {
+		s.connections = make(map[string]*agentConnectionEpoch)
+	}
+	s.nextEpoch++
+	epoch.id = s.nextEpoch
+	previous := s.connections[claims.PersonalityAgentID]
+	s.connections[claims.PersonalityAgentID] = epoch
+	s.connectionsMu.Unlock()
+
+	if previous != nil {
+		previous.cancel()
+		_ = previous.conn.Close()
+	}
+	return epoch
+}
+
+func (s *Server) removeConnectionEpoch(epoch *agentConnectionEpoch) {
+	gate := s.epochGate(epoch.personalityAgentID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	s.connectionsMu.Lock()
+	if s.connections[epoch.personalityAgentID] == epoch {
+		delete(s.connections, epoch.personalityAgentID)
+	}
+	s.connectionsMu.Unlock()
+}
+
+func (s *Server) revokeConnectionEpoch(epoch *agentConnectionEpoch) {
+	gate := s.epochGate(epoch.personalityAgentID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	s.connectionsMu.Lock()
+	current := s.connections[epoch.personalityAgentID] == epoch
+	if current {
+		delete(s.connections, epoch.personalityAgentID)
+	}
+	s.connectionsMu.Unlock()
+	if current {
+		epoch.cancel()
+		_ = epoch.conn.Close()
+	}
+}
+
+func (s *Server) withCurrentConnectionEpoch(
+	ctx context.Context,
+	epoch *agentConnectionEpoch,
+	call func() error,
+) error {
+	gate := s.epochGate(epoch.personalityAgentID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.connectionsMu.Lock()
+	current := s.connections[epoch.personalityAgentID] == epoch
+	s.connectionsMu.Unlock()
+	if !current {
+		return errConnectionEpochRevoked
+	}
+	return call()
+}
+
+func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoch) {
+	defer close(epoch.generationWatchStopped)
+	ticker := time.NewTicker(s.generationPollInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.Generation.VerifyGeneration(
+				ctx,
+				epoch.personalityAgentID,
+				epoch.claims.Generation,
+			); err != nil {
+				s.revokeConnectionEpoch(epoch)
+				return
+			}
+		}
+	}
 }
 
 func bearerToken(header string) (string, bool) {

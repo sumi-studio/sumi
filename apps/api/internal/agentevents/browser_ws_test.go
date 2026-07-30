@@ -185,6 +185,9 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	defer httpServer.Close()
 	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})
 	claims := TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}
+	if err := gateway.PublishRuntimeState(claims.PersonalityAgentID, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatal(err)
@@ -291,6 +294,9 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := TokenClaims{TenantID: "tenant", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "abort"}); !reject {
 		t.Fatal("expected abort to be rejected when no run is in flight")
@@ -336,6 +342,9 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{

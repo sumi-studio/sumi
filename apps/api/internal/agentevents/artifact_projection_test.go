@@ -320,6 +320,9 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 	assertDirectChatStatus(t, conn, "unavailable")
 
 	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: artifactOwner, Generation: 1}
+	if err := gateway.PublishRuntimeState(artifactOwner, claims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:                &seq,
