@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -211,43 +212,24 @@ func TestDurableGatewayRolloverCommitSerializesWithAdmittedSideEffect(t *testing
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	stale := currentRuntimeClaims(t, gateway, personalityAgentID)
-	seq := uint64(1)
-	event := Envelope{
-		Seq:                &seq,
-		PersonalityAgentID: personalityAgentID,
-		Event:              json.RawMessage(`{"type":"agent_start"}`),
-	}
-
-	// Hold the event-log cache mutex so Receive can acquire the shared runtime
-	// generation lock but cannot commit its event yet.
-	gateway.mu.Lock()
-	receiveDone := make(chan error, 1)
+	sideEffectEntered := make(chan struct{})
+	releaseSideEffect := make(chan struct{})
+	sideEffectDone := make(chan error, 1)
 	go func() {
-		receiveDone <- gateway.Receive(context.Background(), stale, event)
+		sideEffectDone <- gateway.withCurrentGeneration(
+			context.Background(),
+			stale,
+			func() error {
+				close(sideEffectEntered)
+				<-releaseSideEffect
+				return nil
+			},
+		)
 	}()
-
-	probe, err := openLocalControlLock(gateway.localControlLockPath(personalityAgentID))
-	if err != nil {
-		gateway.mu.Unlock()
-		t.Fatal(err)
-	}
-	defer probe.Close()
-	deadline := time.Now().Add(time.Second)
-	for {
-		err = syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			break
-		}
-		if err != nil {
-			gateway.mu.Unlock()
-			t.Fatalf("probe runtime generation lock: %v", err)
-		}
-		_ = syscall.Flock(int(probe.Fd()), syscall.LOCK_UN)
-		if time.Now().After(deadline) {
-			gateway.mu.Unlock()
-			t.Fatal("side effect did not acquire shared runtime generation lock")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-sideEffectEntered:
+	case <-time.After(time.Second):
+		t.Fatal("side effect did not enter generation boundary")
 	}
 
 	publishDone := make(chan error, 1)
@@ -256,29 +238,187 @@ func TestDurableGatewayRolloverCommitSerializesWithAdmittedSideEffect(t *testing
 	}()
 	select {
 	case err := <-publishDone:
-		gateway.mu.Unlock()
 		t.Fatalf("rollover committed across admitted side effect: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	gateway.mu.Unlock()
-	if err := <-receiveDone; err != nil {
+	close(releaseSideEffect)
+	if err := <-sideEffectDone; err != nil {
 		t.Fatalf("admitted side effect failed: %v", err)
 	}
 	if err := <-publishDone; err != nil {
 		t.Fatalf("rollover failed after admitted side effect: %v", err)
 	}
 
-	seq = 2
-	event.Seq = &seq
-	if err := gateway.Receive(context.Background(), stale, event); err == nil {
-		t.Fatal("old generation event committed after rollover")
+	called := false
+	if err := gateway.withCurrentGeneration(context.Background(), stale, func() error {
+		called = true
+		return nil
+	}); err == nil || called {
+		t.Fatalf("old generation side effect admitted after rollover: called=%v err=%v", called, err)
 	}
-	current := stale
-	current.Generation++
-	last, err := gateway.LastReceivedEventSeq(context.Background(), current)
-	if err != nil || last != 1 {
-		t.Fatalf("rollover ordering changed durable cursor: last=%d err=%v", last, err)
+}
+
+func TestConnectionLeaseRolloverSerializesWithCommandDelivery(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	lease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryEntered := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- gateway.WithConnectionLease(
+			context.Background(),
+			claims,
+			lease,
+			func() error {
+				close(deliveryEntered)
+				<-releaseDelivery
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-deliveryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("command delivery did not enter authoritative lease boundary")
+	}
+
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- gateway.PublishRuntimeState(
+			claims.PersonalityAgentID,
+			claims.Generation+1,
+			nil,
+		)
+	}()
+	select {
+	case err := <-publishDone:
+		t.Fatalf("rollover committed during command delivery: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseDelivery)
+	if err := <-deliveryDone; err != nil {
+		t.Fatalf("admitted command delivery failed: %v", err)
+	}
+	if err := <-publishDone; err != nil {
+		t.Fatalf("rollover after command delivery failed: %v", err)
+	}
+
+	called := false
+	err = gateway.WithConnectionLease(context.Background(), claims, lease, func() error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("old command delivery admitted after rollover: called=%v err=%v", called, err)
+	}
+}
+
+func TestConnectionLeaseLockIsIsolatedPerPersonalityAgent(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	first := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	second := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-9abc-0123456789ac")
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- gateway.WithConnectionLease(
+			context.Background(),
+			first,
+			firstLease,
+			func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first PAID lease boundary did not enter")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := gateway.ClaimConnectionLease(context.Background(), second)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second PAID lease claim failed: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first PAID lease operation stalled a different PAID")
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	key := deriveLocalControlIntegrityKey([]byte("connection-lease-integrity-secret-32-bytes"))
+	if err := gateway.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	record := connectionLeaseState{
+		Version:    connectionLeaseStateVersion,
+		Generation: 7,
+		Sequence:   1,
+		LeaseID:    base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, connectionLeaseIDBytes)),
+		Active:     true,
+	}
+	if err := gateway.writeConnectionLeaseState(personalityAgentID, record); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(personalityAgentID)) {
+		t.Fatal("connection lease content leaked personality agent identity")
+	}
+	if !bytes.Contains(raw, []byte(`"integrity"`)) {
+		t.Fatal("local-control-owned connection lease was not integrity protected")
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("signed connection lease did not verify: %v", err)
+	}
+	reopened, err := OpenDurableGateway(gateway.dir, gateway.commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("gateway without local-control integrity key accepted signed connection lease")
+	}
+	if err := reopened.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("gateway with matching key rejected shared signed lease: %v", err)
+	}
+
+	tampered := bytes.Replace(raw, []byte(`"sequence":1`), []byte(`"sequence":2`), 1)
+	if bytes.Equal(tampered, raw) {
+		t.Fatal("test did not alter signed connection lease")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("tampered connection lease passed local-control integrity verification")
 	}
 }
 
@@ -1442,7 +1582,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	inner := uint64(2)
-	err := gateway.appendDurableEventLocked(personalityAgentID, durableEventRecord{
+	err := gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
 			Seq:                &inner,
@@ -1457,7 +1597,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 		t.Fatalf("expected seq mismatch error, got %v", err)
 	}
 
-	err = gateway.appendDurableEventLocked(personalityAgentID, durableEventRecord{
+	err = gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
 			Seq:                nil,

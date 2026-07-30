@@ -2,6 +2,7 @@ package agentevents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,8 +18,10 @@ import (
 const testPersonalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 
 type fakeGenerationVerifier struct {
-	mu     sync.Mutex
-	latest uint64
+	mu            sync.Mutex
+	latest        uint64
+	leaseSequence uint64
+	lease         ConnectionLease
 }
 
 func (f *fakeGenerationVerifier) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
@@ -34,6 +37,79 @@ func (f *fakeGenerationVerifier) setLatest(latest uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.latest = latest
+}
+
+func (f *fakeGenerationVerifier) ClaimConnectionLease(ctx context.Context, claims TokenClaims) (ConnectionLease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return ConnectionLease{}, err
+	}
+	if claims.Generation != f.latest {
+		return ConnectionLease{}, fmt.Errorf("stale generation: got %d, want %d", claims.Generation, f.latest)
+	}
+	f.leaseSequence++
+	f.lease = ConnectionLease{
+		Generation: claims.Generation,
+		Sequence:   f.leaseSequence,
+		ID:         fmt.Sprintf("fake-lease-%d", f.leaseSequence),
+	}
+	return f.lease, nil
+}
+
+func (f *fakeGenerationVerifier) ValidateConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.validateLeaseLocked(ctx, claims, lease)
+}
+
+func (f *fakeGenerationVerifier) WithConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+	call func() error,
+) error {
+	f.mu.Lock()
+	if err := f.validateLeaseLocked(ctx, claims, lease); err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	f.mu.Unlock()
+	return call()
+}
+
+func (f *fakeGenerationVerifier) ReleaseConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.lease == lease {
+		f.lease = ConnectionLease{}
+	}
+	return nil
+}
+
+func (f *fakeGenerationVerifier) validateLeaseLocked(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if claims.Generation != f.latest || f.lease != lease || lease.ID == "" {
+		return errConnectionEpochRevoked
+	}
+	return nil
 }
 
 type fakeCommandSource struct {
@@ -587,7 +663,7 @@ func TestWebSocketSameGenerationReconnectRevokesFirstAndNewEpochWorks(t *testing
 	active := len(srv.connections)
 	current := srv.connections[testPersonalityAgentID]
 	srv.connectionsMu.Unlock()
-	if active != 1 || current == nil || current.id == 0 {
+	if active != 1 || current == nil || current.lease.Sequence == 0 {
 		t.Fatalf("connection registry did not retain exactly the replacement epoch: active=%d", active)
 	}
 }
@@ -630,7 +706,328 @@ func TestWebSocketGenerationRolloverClosesIdleConnection(t *testing.T) {
 	}
 }
 
-func TestWebSocketReplacementSerializesAgainstOldEpochSideEffect(t *testing.T) {
+func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := "ready-7"
+	if err := firstGateway.PublishRuntimeState(testPersonalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	tv := &fakeTokenVerifier{}
+	firstServer := NewServer(tv, firstGateway, firstGateway, firstGateway, firstGateway)
+	secondServer := NewServer(tv, secondGateway, secondGateway, secondGateway, secondGateway)
+	firstServer.GenerationPollInterval = 5 * time.Millisecond
+	secondServer.GenerationPollInterval = 5 * time.Millisecond
+	firstHTTP := startTestServer(t, firstServer)
+	defer firstHTTP.Close()
+	secondHTTP := startTestServer(t, secondServer)
+	defer secondHTTP.Close()
+	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
+
+	first, _, err := dialTestWS(t, firstHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	writeTestAgentHello(t, first, 7)
+	var hello ApiHello
+	if err := conn2Wait(first, &hello, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	firstServer.connectionsMu.Lock()
+	firstEpoch := firstServer.connections[testPersonalityAgentID]
+	firstServer.connectionsMu.Unlock()
+	if firstEpoch == nil {
+		t.Fatal("first Server did not install its shared lease")
+	}
+
+	second, _, err := dialTestWS(t, secondHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	writeTestAgentHello(t, second, 7)
+	if err := conn2Wait(second, &hello, time.Second); err != nil {
+		t.Fatalf("second Server did not acquire same-generation lease: %v", err)
+	}
+
+	if err := firstGateway.ValidateConnectionLease(
+		context.Background(),
+		firstEpoch.claims,
+		firstEpoch.lease,
+	); !errors.Is(err, errConnectionEpochRevoked) {
+		t.Fatalf("first Server lease remained authoritative: %v", err)
+	}
+	seq := uint64(1)
+	err = firstGateway.Receive(
+		contextWithConnectionLease(context.Background(), firstEpoch.lease),
+		firstEpoch.claims,
+		Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	)
+	if !errors.Is(err, errConnectionEpochRevoked) {
+		t.Fatalf("revoked cross-Server event admission was not fenced: %v", err)
+	}
+	if err := second.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		last, err := firstGateway.LastReceivedEventSeq(context.Background(), firstEpoch.claims)
+		if err == nil && last == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("current cross-Server epoch did not persist event: last=%d err=%v", last, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	first.SetReadDeadline(time.Now().Add(time.Second))
+	if err := first.ReadJSON(&hello); err == nil {
+		t.Fatal("revoked connection on first Server remained open")
+	}
+	_ = first.Close()
+	_ = second.Close()
+	deadline = time.Now().Add(time.Second)
+	for {
+		firstServer.connectionsMu.Lock()
+		firstActive := len(firstServer.connections)
+		firstServer.connectionsMu.Unlock()
+		secondServer.connectionsMu.Lock()
+		secondActive := len(secondServer.connections)
+		secondServer.connectionsMu.Unlock()
+		leaseState, leaseErr := firstGateway.connectionLeaseState(testPersonalityAgentID)
+		if firstActive == 0 && secondActive == 0 &&
+			leaseErr == nil && leaseState.present && !leaseState.Active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"shared lease cleanup did not settle: first=%d second=%d lease=%+v err=%v",
+				firstActive,
+				secondActive,
+				leaseState,
+				leaseErr,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := "ready-7"
+	if err := firstGateway.PublishRuntimeState(testPersonalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	blockedEvents := &blockingEventSink{
+		fakeEventSink: &fakeEventSink{},
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	tv := &fakeTokenVerifier{}
+	firstServer := NewServer(tv, firstGateway, firstGateway, blockedEvents, firstGateway)
+	secondServer := NewServer(tv, secondGateway, secondGateway, secondGateway, secondGateway)
+	firstServer.SideEffectTimeout = 50 * time.Millisecond
+	firstServer.GenerationPollInterval = 5 * time.Millisecond
+	secondServer.GenerationPollInterval = 5 * time.Millisecond
+	firstHTTP := startTestServer(t, firstServer)
+	defer firstHTTP.Close()
+	secondHTTP := startTestServer(t, secondServer)
+	defer secondHTTP.Close()
+	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
+
+	first, _, err := dialTestWS(t, firstHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	writeTestAgentHello(t, first, 7)
+	var hello ApiHello
+	if err := conn2Wait(first, &hello, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := first.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blockedEvents.entered:
+	case <-time.After(time.Second):
+		t.Fatal("old Server sink did not enter the shared lease boundary")
+	}
+
+	started := time.Now()
+	second, _, err := dialTestWS(t, secondHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	writeTestAgentHello(t, second, 7)
+	if err := conn2Wait(second, &hello, time.Second); err != nil {
+		t.Fatalf("cross-Server reconnect did not drain bounded sink: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cross-Server reconnect exceeded bounded sink drain: %v", elapsed)
+	}
+	blockedEvents.fakeEventSink.mu.Lock()
+	received := len(blockedEvents.fakeEventSink.envelopes)
+	blockedEvents.fakeEventSink.mu.Unlock()
+	if received != 0 {
+		t.Fatalf("timed-out old sink committed %d events", received)
+	}
+	close(blockedEvents.release)
+
+	_ = first.Close()
+	_ = second.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		firstServer.connectionsMu.Lock()
+		firstActive := len(firstServer.connections)
+		firstServer.connectionsMu.Unlock()
+		secondServer.connectionsMu.Lock()
+		secondActive := len(secondServer.connections)
+		secondServer.connectionsMu.Unlock()
+		leaseState, leaseErr := firstGateway.connectionLeaseState(testPersonalityAgentID)
+		if firstActive == 0 && secondActive == 0 &&
+			leaseErr == nil && leaseState.present && !leaseState.Active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"bounded sink test cleanup did not settle: first=%d second=%d lease=%+v err=%v",
+				firstActive,
+				secondActive,
+				leaseState,
+				leaseErr,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestConnectionLeaseDelayedOldInstallerCannotEvictNewGeneration(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	oldClaims := currentRuntimeClaims(t, gateway, testPersonalityAgentID)
+	oldLease, err := gateway.ClaimConnectionLease(context.Background(), oldClaims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newClaims := oldClaims
+	newClaims.Generation++
+	if err := gateway.PublishRuntimeState(testPersonalityAgentID, newClaims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
+	newLease, err := gateway.ClaimConnectionLease(context.Background(), newClaims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(&fakeTokenVerifier{}, gateway, gateway, gateway, gateway)
+	newCtx, newCancel := context.WithCancel(context.Background())
+	defer newCancel()
+	newEpoch, err := srv.installConnectionEpoch(
+		newCtx,
+		&websocket.Conn{},
+		newClaims,
+		newLease,
+		newCancel,
+	)
+	if err != nil {
+		t.Fatalf("install new generation: %v", err)
+	}
+
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	if _, err := srv.installConnectionEpoch(
+		oldCtx,
+		&websocket.Conn{},
+		oldClaims,
+		oldLease,
+		oldCancel,
+	); err == nil {
+		t.Fatal("delayed old generation installer displaced the new epoch")
+	}
+	srv.connectionsMu.Lock()
+	current := srv.connections[testPersonalityAgentID]
+	srv.connectionsMu.Unlock()
+	if current != newEpoch {
+		t.Fatal("failed old install changed the local current epoch")
+	}
+	srv.removeConnectionEpoch(newEpoch)
+	if err := gateway.ReleaseConnectionLease(context.Background(), newClaims, newLease); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnectionLeaseLowerGenerationDoesNotCancelLocalCurrent(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	currentCtx, currentCancel := context.WithCancel(context.Background())
+	defer currentCancel()
+	srv.connections[testPersonalityAgentID] = &agentConnectionEpoch{
+		personalityAgentID: testPersonalityAgentID,
+		claims: TokenClaims{
+			PersonalityAgentID: testPersonalityAgentID,
+			Generation:         8,
+		},
+		conn:   &websocket.Conn{},
+		cancel: currentCancel,
+	}
+	srv.cancelLocalPredecessor(TokenClaims{
+		PersonalityAgentID: testPersonalityAgentID,
+		Generation:         7,
+	})
+	select {
+	case <-currentCtx.Done():
+		t.Fatal("lower generation canceled the newer local epoch")
+	default:
+	}
+}
+
+func TestWebSocketReplacementCancelsOldEpochSinkWithoutWaiting(t *testing.T) {
 	tv := &fakeTokenVerifier{}
 	gv := &fakeGenerationVerifier{latest: 7}
 	cs := newFakeCommandSource()
@@ -694,20 +1091,14 @@ func TestWebSocketReplacementSerializesAgainstOldEpochSideEffect(t *testing.T) {
 	}()
 	select {
 	case err := <-secondHello:
-		t.Fatalf("replacement installed before the admitted old side effect completed: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(events.release)
-	select {
-	case err := <-secondHello:
 		if err != nil {
-			t.Fatalf("replacement API hello after side effect completion: %v", err)
+			t.Fatalf("replacement API hello while old sink awaited cancellation: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("replacement did not install after old side effect completed")
+		t.Fatal("replacement waited on an old sink that was waiting for context cancellation")
 	}
-	waitForFakeSideEffects(t, events.fakeEventSink, cs, 1, 0)
+	waitForFakeSideEffects(t, events.fakeEventSink, cs, 0, 0)
+	close(events.release)
 
 	// Once the replacement hello is visible, the first epoch is no longer
 	// current. Frames attempted through it cannot reach either synchronous sink.
@@ -728,7 +1119,7 @@ func TestWebSocketReplacementSerializesAgainstOldEpochSideEffect(t *testing.T) {
 		},
 	})
 	time.Sleep(50 * time.Millisecond)
-	waitForFakeSideEffects(t, events.fakeEventSink, cs, 1, 0)
+	waitForFakeSideEffects(t, events.fakeEventSink, cs, 0, 0)
 }
 
 func TestWebSocketRejectsEventForAnotherPersonalityAgent(t *testing.T) {

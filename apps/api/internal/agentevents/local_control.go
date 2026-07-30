@@ -946,7 +946,7 @@ func (g *DurableGateway) updateLocalControlRuntimeState(
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock local control registry: %w", err)
 	}
 	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()

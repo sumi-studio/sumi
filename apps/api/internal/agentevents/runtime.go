@@ -9,7 +9,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -143,6 +147,22 @@ type runtimeState struct {
 	present      bool
 }
 
+type connectionLeaseState struct {
+	Version    uint64                      `json:"version"`
+	Generation uint64                      `json:"generation"`
+	Sequence   uint64                      `json:"sequence"`
+	LeaseID    string                      `json:"lease_id,omitempty"`
+	Active     bool                        `json:"active"`
+	Integrity  *localControlStateIntegrity `json:"integrity,omitempty"`
+	present    bool
+}
+
+const (
+	connectionLeaseStateVersion  = uint64(1)
+	maxConnectionLeaseStateBytes = 4096
+	connectionLeaseIDBytes       = 32
+)
+
 type durableEventRecord struct {
 	Seq   uint64   `json:"seq"`
 	Event Envelope `json:"event"`
@@ -256,6 +276,171 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, personalityAgentI
 		return err
 	}
 	return verifyRuntimeGeneration(state, generation)
+}
+
+// ClaimConnectionLease is the file-backed PAID-global ownership boundary.
+// Every API replica serving agent WebSockets must point at the same
+// POSIX-flock-coherent runtime directory; a per-replica directory cannot
+// provide cross-process single ownership.
+func (g *DurableGateway) ClaimConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+) (ConnectionLease, error) {
+	if err := ctx.Err(); err != nil {
+		return ConnectionLease{}, err
+	}
+	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
+		return ConnectionLease{}, err
+	}
+	lock, err := openLocalControlLock(g.localControlLockPath(claims.PersonalityAgentID))
+	if err != nil {
+		return ConnectionLease{}, err
+	}
+	defer lock.Close()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_EX); err != nil {
+		return ConnectionLease{}, fmt.Errorf("lock connection lease claim: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+
+	state, err := g.state(ctx, claims.PersonalityAgentID)
+	if err != nil {
+		return ConnectionLease{}, err
+	}
+	if err := verifyRuntimeGeneration(state, claims.Generation); err != nil {
+		return ConnectionLease{}, err
+	}
+	previous, err := g.connectionLeaseState(claims.PersonalityAgentID)
+	if err != nil {
+		return ConnectionLease{}, err
+	}
+	if previous.Sequence >= maxJSONSafeInteger {
+		return ConnectionLease{}, errors.New("connection lease sequence exhausted")
+	}
+	leaseIDRaw := make([]byte, connectionLeaseIDBytes)
+	if _, err := rand.Read(leaseIDRaw); err != nil {
+		return ConnectionLease{}, fmt.Errorf("generate connection lease identity: %w", err)
+	}
+	lease := ConnectionLease{
+		Generation: claims.Generation,
+		Sequence:   previous.Sequence + 1,
+		ID:         base64.RawURLEncoding.EncodeToString(leaseIDRaw),
+	}
+	record := connectionLeaseState{
+		Version:    connectionLeaseStateVersion,
+		Generation: lease.Generation,
+		Sequence:   lease.Sequence,
+		LeaseID:    lease.ID,
+		Active:     true,
+	}
+	if err := g.writeConnectionLeaseState(claims.PersonalityAgentID, record); err != nil {
+		return ConnectionLease{}, err
+	}
+	return lease, nil
+}
+
+func (g *DurableGateway) ValidateConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	return g.WithConnectionLease(ctx, claims, lease, func() error { return nil })
+}
+
+func (g *DurableGateway) WithConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+	call func() error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
+		return err
+	}
+	if lease.Generation != claims.Generation {
+		return errConnectionEpochRevoked
+	}
+	lock, err := openLocalControlLock(g.localControlLockPath(claims.PersonalityAgentID))
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
+		return fmt.Errorf("lock connection lease validation: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	if err := g.validateConnectionLeaseLocked(ctx, claims, lease); err != nil {
+		return err
+	}
+	return call()
+}
+
+func (g *DurableGateway) ReleaseConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
+		return err
+	}
+	if lease.Generation != claims.Generation {
+		return errConnectionEpochRevoked
+	}
+	lock, err := openLocalControlLock(g.localControlLockPath(claims.PersonalityAgentID))
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock connection lease release: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	record, err := g.connectionLeaseState(claims.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	if !connectionLeaseMatches(record, lease) {
+		return nil
+	}
+	record.Active = false
+	record.LeaseID = ""
+	return g.writeConnectionLeaseState(claims.PersonalityAgentID, record)
+}
+
+func (g *DurableGateway) validateConnectionLeaseLocked(
+	ctx context.Context,
+	claims TokenClaims,
+	lease ConnectionLease,
+) error {
+	state, err := g.state(ctx, claims.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	if err := verifyRuntimeGeneration(state, claims.Generation); err != nil {
+		return err
+	}
+	record, err := g.connectionLeaseState(claims.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	if !connectionLeaseMatches(record, lease) ||
+		lease.Generation != claims.Generation {
+		return errConnectionEpochRevoked
+	}
+	return nil
+}
+
+func connectionLeaseMatches(record connectionLeaseState, lease ConnectionLease) bool {
+	return record.present &&
+		record.Active &&
+		record.Generation == lease.Generation &&
+		record.Sequence == lease.Sequence &&
+		record.LeaseID == lease.ID &&
+		lease.ID != ""
 }
 
 func verifyRuntimeGeneration(state runtimeState, generation uint64) error {
@@ -418,20 +603,24 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	if ack.PersonalityAgentID != claims.PersonalityAgentID {
 		return errors.New("command ACK target does not match token claim")
 	}
-	return g.withCurrentGeneration(ctx, claims, func() error {
-		cmd, found, err := g.commands.GetCommand(ctx, claims.PersonalityAgentID, ack.Seq)
-		if err != nil {
-			return fmt.Errorf("load acknowledged command: %w", err)
-		}
-		if !found || cmd.CommandID != ack.CommandID || cmd.PersonalityAgentID != ack.PersonalityAgentID {
-			return fmt.Errorf(
-				"ack does not match durable command log: seq=%d command_id=%q",
-				ack.Seq,
-				ack.CommandID,
-			)
-		}
-		return g.appendCommandAck(ctx, claims.PersonalityAgentID, ack)
-	})
+	cmd, found, err := g.commands.GetCommand(ctx, claims.PersonalityAgentID, ack.Seq)
+	if err != nil {
+		return fmt.Errorf("load acknowledged command: %w", err)
+	}
+	if !found || cmd.CommandID != ack.CommandID || cmd.PersonalityAgentID != ack.PersonalityAgentID {
+		return fmt.Errorf(
+			"ack does not match durable command log: seq=%d command_id=%q",
+			ack.Seq,
+			ack.CommandID,
+		)
+	}
+	// Reject an already-stale caller before opening (and potentially creating)
+	// its ACK log. appendCommandAck repeats this fence after acquiring the ACK
+	// and cache locks, which closes the check-to-commit race.
+	if err := g.withCurrentGeneration(ctx, claims, func() error { return nil }); err != nil {
+		return err
+	}
+	return g.appendCommandAck(ctx, claims, ack)
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -448,16 +637,17 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 			claims.PersonalityAgentID,
 		)
 	}
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return err
+	}
+	defer g.mu.Unlock()
 	return g.withCurrentGeneration(ctx, claims, func() error {
 		if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
-			g.mu.Lock()
 			g.publishVolatileLocked(claims.PersonalityAgentID, envelope)
-			g.mu.Unlock()
 			return nil
 		}
-		g.mu.Lock()
-		defer g.mu.Unlock()
 		if err := g.appendDurableEventLocked(
+			ctx,
 			claims.PersonalityAgentID,
 			durableEventRecord{Seq: *envelope.Seq, Event: envelope},
 		); err != nil {
@@ -497,6 +687,17 @@ func (g *DurableGateway) withCurrentGeneration(
 	if err := verifyRuntimeGeneration(state, claims.Generation); err != nil {
 		return err
 	}
+	record, err := g.connectionLeaseState(claims.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	if record.Active {
+		lease, ok := connectionLeaseFromContext(ctx)
+		if !ok || !connectionLeaseMatches(record, lease) ||
+			lease.Generation != claims.Generation {
+			return errConnectionEpochRevoked
+		}
+	}
 	return call()
 }
 
@@ -522,7 +723,7 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID st
 		return nil, err
 	}
 	defer file.Close()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_SH); err != nil {
 		return nil, fmt.Errorf("lock durable event log for browser replay: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
@@ -615,7 +816,9 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	g.mu.Lock()
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return 0, err
+	}
 	defer g.mu.Unlock()
 	st := g.stateFor(claims.PersonalityAgentID)
 	path := g.eventPath(claims.PersonalityAgentID)
@@ -627,7 +830,7 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 		return 0, err
 	}
 	defer file.Close()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		return 0, fmt.Errorf("lock durable event log for read: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
@@ -742,7 +945,156 @@ func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (
 	return state, nil
 }
 
-func (g *DurableGateway) appendDurableEventLocked(personalityAgentID string, record durableEventRecord) error {
+// connectionLeaseState reads the lease record while the caller holds the
+// PAID runtime lock. The record contains only an opaque random lease identity,
+// generation, and monotonic sequence; tenant/user identity is never persisted.
+func (g *DurableGateway) connectionLeaseState(personalityAgentID string) (connectionLeaseState, error) {
+	path := g.connectionLeasePath(personalityAgentID)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return connectionLeaseState{}, nil
+	}
+	if err != nil {
+		return connectionLeaseState{}, fmt.Errorf("open connection lease state: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return connectionLeaseState{}, fmt.Errorf("inspect connection lease state: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return connectionLeaseState{}, errors.New("invalid connection lease state")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxConnectionLeaseStateBytes+1))
+	if err != nil {
+		return connectionLeaseState{}, fmt.Errorf("read connection lease state: %w", err)
+	}
+	if len(raw) > maxConnectionLeaseStateBytes {
+		return connectionLeaseState{}, errors.New("connection lease state exceeds maximum allowed size")
+	}
+	if err := checkDuplicateKeys(raw); err != nil {
+		return connectionLeaseState{}, fmt.Errorf("decode connection lease state: %w", err)
+	}
+	var record connectionLeaseState
+	if err := unmarshalStrict(raw, &record); err != nil {
+		return connectionLeaseState{}, fmt.Errorf("decode connection lease state: %w", err)
+	}
+	if record.Version != connectionLeaseStateVersion ||
+		record.Generation > maxProcessGeneration ||
+		record.Sequence == 0 ||
+		record.Sequence > maxJSONSafeInteger {
+		return connectionLeaseState{}, errors.New("invalid connection lease state")
+	}
+	if record.Active {
+		decoded, err := base64.RawURLEncoding.DecodeString(record.LeaseID)
+		if err != nil || len(decoded) != connectionLeaseIDBytes {
+			return connectionLeaseState{}, errors.New("invalid connection lease identity")
+		}
+	} else if record.LeaseID != "" {
+		return connectionLeaseState{}, errors.New("inactive connection lease must not retain identity")
+	}
+	if err := g.verifyConnectionLeaseIntegrity(personalityAgentID, record); err != nil {
+		return connectionLeaseState{}, err
+	}
+	record.present = true
+	return record, nil
+}
+
+func (g *DurableGateway) writeConnectionLeaseState(
+	personalityAgentID string,
+	record connectionLeaseState,
+) error {
+	if err := g.signConnectionLeaseState(personalityAgentID, &record); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("encode connection lease state: %w", err)
+	}
+	if err := writeFileAtomic(g.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
+		return fmt.Errorf("persist connection lease state: %w", err)
+	}
+	return nil
+}
+
+func (g *DurableGateway) signConnectionLeaseState(
+	personalityAgentID string,
+	record *connectionLeaseState,
+) error {
+	if !g.localControlOwns(personalityAgentID) {
+		record.Integrity = nil
+		return nil
+	}
+	key, ok := g.localControlIntegrityKeySnapshot()
+	if !ok {
+		return errors.New("local control connection lease integrity key is unavailable")
+	}
+	mac, err := connectionLeaseStateMAC(key, personalityAgentID, *record)
+	if err != nil {
+		return err
+	}
+	record.Integrity = &localControlStateIntegrity{
+		Version: localControlIntegrityVersion,
+		MAC:     hex.EncodeToString(mac),
+	}
+	return nil
+}
+
+func (g *DurableGateway) verifyConnectionLeaseIntegrity(
+	personalityAgentID string,
+	record connectionLeaseState,
+) error {
+	if record.Integrity == nil {
+		if g.localControlOwns(personalityAgentID) {
+			return errors.New("local control connection lease integrity is missing")
+		}
+		return nil
+	}
+	key, ok := g.localControlIntegrityKeySnapshot()
+	if !ok {
+		return errors.New("local control connection lease integrity key is unavailable")
+	}
+	if record.Integrity.Version != localControlIntegrityVersion {
+		return errors.New("invalid local control connection lease integrity version")
+	}
+	actual, err := hex.DecodeString(record.Integrity.MAC)
+	if err != nil || len(actual) != sha256.Size {
+		return errors.New("invalid local control connection lease integrity")
+	}
+	expected, err := connectionLeaseStateMAC(key, personalityAgentID, record)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(actual, expected) {
+		return errors.New("invalid local control connection lease integrity")
+	}
+	return nil
+}
+
+func connectionLeaseStateMAC(
+	key []byte,
+	personalityAgentID string,
+	record connectionLeaseState,
+) ([]byte, error) {
+	record.Integrity = nil
+	record.present = false
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encode connection lease integrity payload: %w", err)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("sumi-connection-lease-state/v1\x00"))
+	_, _ = mac.Write([]byte(personalityAgentID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(raw)
+	return mac.Sum(nil), nil
+}
+
+func (g *DurableGateway) appendDurableEventLocked(
+	ctx context.Context,
+	personalityAgentID string,
+	record durableEventRecord,
+) error {
 	st := g.stateFor(personalityAgentID)
 	path := g.eventPath(personalityAgentID)
 	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -750,7 +1102,7 @@ func (g *DurableGateway) appendDurableEventLocked(personalityAgentID string, rec
 		return err
 	}
 	defer file.Close()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock durable event log for append: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
@@ -904,8 +1256,12 @@ func (g *DurableGateway) IsApprovalPending(personalityAgentID, requestID string)
 	return g.pendingApprovals[personalityAgentID] != nil && g.pendingApprovals[personalityAgentID][requestID]
 }
 
-func (g *DurableGateway) appendCommandAck(ctx context.Context, personalityAgentID string, ack CommandAck) error {
-	path := g.ackPath(personalityAgentID)
+func (g *DurableGateway) appendCommandAck(
+	ctx context.Context,
+	claims TokenClaims,
+	ack CommandAck,
+) error {
+	path := g.ackPath(claims.PersonalityAgentID)
 	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -921,74 +1277,76 @@ func (g *DurableGateway) appendCommandAck(ctx context.Context, personalityAgentI
 		return err
 	}
 	defer g.mu.Unlock()
-	st := g.stateFor(personalityAgentID)
+	return g.withCurrentGeneration(ctx, claims, func() error {
+		st := g.stateFor(claims.PersonalityAgentID)
 
-	if err := g.refreshAckTailLocked(file, st); err != nil {
-		return err
-	}
+		if err := g.refreshAckTailLocked(file, st); err != nil {
+			return err
+		}
 
-	previous, ok := st.acks[ack.Seq]
-	if !ok {
-		previous, ok, err = findAckLocked(file, ack.Seq)
+		previous, ok := st.acks[ack.Seq]
+		if !ok {
+			previous, ok, err = findAckLocked(file, ack.Seq)
+			if err != nil {
+				return err
+			}
+		}
+		if ok {
+			if previous.Seq != ack.Seq || previous.CommandID != ack.CommandID {
+				return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
+			}
+			if previous.Status == ack.Status && stringPointerEqual(previous.RejectReason, ack.RejectReason) {
+				return nil
+			}
+			if previous.Status != "received" {
+				return fmt.Errorf(
+					"command ack is already terminal: seq=%d command_id=%q status=%q",
+					ack.Seq,
+					ack.CommandID,
+					previous.Status,
+				)
+			}
+			if ack.Status == "received" {
+				return fmt.Errorf("conflicting duplicate received ack")
+			}
+		}
+
+		line, err := json.Marshal(ack)
 		if err != nil {
 			return err
 		}
-	}
-	if ok {
-		if previous.Seq != ack.Seq || previous.CommandID != ack.CommandID {
-			return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
-		}
-		if previous.Status == ack.Status && stringPointerEqual(previous.RejectReason, ack.RejectReason) {
-			return nil
-		}
-		if previous.Status != "received" {
-			return fmt.Errorf(
-				"command ack is already terminal: seq=%d command_id=%q status=%q",
-				ack.Seq,
-				ack.CommandID,
-				previous.Status,
-			)
-		}
-		if ack.Status == "received" {
-			return fmt.Errorf("conflicting duplicate received ack")
-		}
-	}
+		data := append(line, '\n')
 
-	line, err := json.Marshal(ack)
-	if err != nil {
-		return err
-	}
-	data := append(line, '\n')
+		preWriteOffset, err := file.Seek(0, io.SeekEnd)
+		if err != nil {
+			return err
+		}
+		written, writeErr := file.Write(data)
+		if writeErr != nil || written != len(data) {
+			var opErr error
+			if writeErr != nil {
+				opErr = fmt.Errorf("write durable ack log: %w", writeErr)
+			} else {
+				opErr = fmt.Errorf("short write to durable ack log: wrote %d of %d bytes", written, len(data))
+			}
+			if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+				return rbErr
+			}
+			return opErr
+		}
+		if syncErr := file.Sync(); syncErr != nil {
+			opErr := fmt.Errorf("sync durable ack log: %w", syncErr)
+			if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+				return rbErr
+			}
+			return opErr
+		}
 
-	preWriteOffset, err := file.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-	written, writeErr := file.Write(data)
-	if writeErr != nil || written != len(data) {
-		var opErr error
-		if writeErr != nil {
-			opErr = fmt.Errorf("write durable ack log: %w", writeErr)
-		} else {
-			opErr = fmt.Errorf("short write to durable ack log: wrote %d of %d bytes", written, len(data))
-		}
-		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
-			return rbErr
-		}
-		return opErr
-	}
-	if syncErr := file.Sync(); syncErr != nil {
-		opErr := fmt.Errorf("sync durable ack log: %w", syncErr)
-		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
-			return rbErr
-		}
-		return opErr
-	}
-
-	g.rememberAckLocked(st, ack)
-	st.ackSize = preWriteOffset + int64(len(data))
-	st.ackCRC = updateCRC(st.ackCRC, data)
-	return nil
+		g.rememberAckLocked(st, ack)
+		st.ackSize = preWriteOffset + int64(len(data))
+		st.ackCRC = updateCRC(st.ackCRC, data)
+		return nil
+	})
 }
 
 func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *personalityAgentLogState) error {
@@ -1456,6 +1814,10 @@ func stringPointerEqual(left, right *string) bool {
 
 func (g *DurableGateway) statePath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "runtime-"+safeFileID(personalityAgentID)+".json")
+}
+
+func (g *DurableGateway) connectionLeasePath(personalityAgentID string) string {
+	return filepath.Join(g.dir, "connection-"+safeFileID(personalityAgentID)+".json")
 }
 func (g *DurableGateway) eventPath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "events-"+safeFileID(personalityAgentID)+".jsonl")

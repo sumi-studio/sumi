@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -39,6 +41,41 @@ func localControlAuthorization(
 		RPCBootNonce:          nonce,
 		Audience:              localControlTestAudience,
 		DeliveryAuthorization: LocalDeliveryRaw,
+	}
+}
+
+func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	lock, err := openLocalControlLock(gateway.localControlLockPath(localControlTestPAID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	called := false
+	started := time.Now()
+	err = gateway.updateLocalControlRuntimeState(
+		ctx,
+		localControlTestPAID,
+		func(*runtimeState) (bool, error) {
+			called = true
+			return false, nil
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked local-control lock ignored cancellation: %v", err)
+	}
+	if called {
+		t.Fatal("local-control update ran after its lock wait was canceled")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("canceled local-control lock wait returned too slowly: %v", elapsed)
 	}
 }
 

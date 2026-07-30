@@ -12,7 +12,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net/http"
 	"strings"
@@ -44,6 +43,40 @@ type GenerationVerifier interface {
 	VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error
 }
 
+// ConnectionLease is an opaque, PAID-global claim to the one active agent
+// WebSocket. Sequence is monotonic and lets a delayed local installer prove it
+// cannot displace a newer claim.
+type ConnectionLease struct {
+	Generation uint64
+	Sequence   uint64
+	ID         string
+}
+
+// ConnectionLeaseAuthority atomically claims and fences the single active
+// agent connection across Server instances and API processes.
+type ConnectionLeaseAuthority interface {
+	ClaimConnectionLease(ctx context.Context, claims TokenClaims) (ConnectionLease, error)
+	ValidateConnectionLease(ctx context.Context, claims TokenClaims, lease ConnectionLease) error
+	WithConnectionLease(
+		ctx context.Context,
+		claims TokenClaims,
+		lease ConnectionLease,
+		call func() error,
+	) error
+	ReleaseConnectionLease(ctx context.Context, claims TokenClaims, lease ConnectionLease) error
+}
+
+type connectionLeaseContextKey struct{}
+
+func contextWithConnectionLease(ctx context.Context, lease ConnectionLease) context.Context {
+	return context.WithValue(ctx, connectionLeaseContextKey{}, lease)
+}
+
+func connectionLeaseFromContext(ctx context.Context) (ConnectionLease, bool) {
+	lease, ok := ctx.Value(connectionLeaseContextKey{}).(ConnectionLease)
+	return lease, ok
+}
+
 // CommandSource is the durable command log. It is authoritative for seq numbers
 // and retransmission. Production wiring belongs to T17.
 type CommandSource interface {
@@ -69,12 +102,16 @@ type CommandSource interface {
 	// channel carries source failures; it is closed after the commands channel.
 	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error)
 	// ApplyAck records a terminal command acknowledgement.
+	// Implementations must honor ctx cancellation; Server supplies an
+	// independent SideEffectTimeout while holding the authoritative lease.
 	ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error
 }
 
 // EventSink receives durable outbound event envelopes from the agent.
 // Production wiring belongs to T17.
 type EventSink interface {
+	// Receive must honor ctx cancellation; Server supplies an independent
+	// SideEffectTimeout while holding the authoritative lease.
 	Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error
 	// LastReceivedEventSeq returns the durable consumed prefix for this API
 	// identity. It must not be inferred from an agent-provided hello cursor.
@@ -96,6 +133,7 @@ type Server struct {
 	Commands   CommandSource
 	Events     EventSink
 	Latch      HydrationLatch
+	Leases     ConnectionLeaseAuthority
 
 	// HelloTimeout bounds the initial exchange. Catch-up and live reads use
 	// context cancellation from the underlying connection.
@@ -121,6 +159,12 @@ type Server struct {
 	// remain open after its ProcessGeneration is rolled over.
 	GenerationPollInterval time.Duration
 
+	// SideEffectTimeout bounds the authoritative lease interval around each
+	// synchronous ACK/event sink call. It independently guarantees that a sink
+	// waiting on context cancellation cannot indefinitely block reconnect or
+	// generation rollover from acquiring the exclusive PAID lease lock.
+	SideEffectTimeout time.Duration
+
 	// AllowedOrigins lists the exact origins allowed to open a WebSocket.
 	// An empty list is fail-closed (no origin is accepted). Wildcards are not
 	// supported: every accepted origin must be named explicitly.
@@ -130,14 +174,14 @@ type Server struct {
 
 	connectionsMu sync.Mutex
 	connections   map[string]*agentConnectionEpoch
-	nextEpoch     uint64
-	epochGates    [64]sync.Mutex
+	attempts      map[string]uint64
+	nextAttempt   uint64
 }
 
 type agentConnectionEpoch struct {
-	id                     uint64
 	personalityAgentID     string
 	claims                 TokenClaims
+	lease                  ConnectionLease
 	conn                   *websocket.Conn
 	cancel                 context.CancelFunc
 	generationWatchStopped chan struct{}
@@ -148,19 +192,23 @@ var errConnectionEpochRevoked = errors.New("agent websocket connection epoch rev
 // NewServer returns a Server with the required seams. Missing seams leave the
 // handler fail-closed.
 func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es EventSink, hl HydrationLatch) *Server {
+	leases, _ := gv.(ConnectionLeaseAuthority)
 	s := &Server{
 		Token:                  tv,
 		Generation:             gv,
 		Commands:               cs,
 		Events:                 es,
 		Latch:                  hl,
+		Leases:                 leases,
 		HelloTimeout:           30 * time.Second,
 		WriteTimeout:           10 * time.Second,
 		MaxReadLimit:           4 * 1024 * 1024,
 		PongWait:               60 * time.Second,
 		PingInterval:           54 * time.Second,
 		GenerationPollInterval: 250 * time.Millisecond,
+		SideEffectTimeout:      10 * time.Second,
 		connections:            make(map[string]*agentConnectionEpoch),
+		attempts:               make(map[string]uint64),
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 	return s
@@ -268,17 +316,11 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if hello.LastAppliedCommandSeq > hello.LastReceivedCommandSeq {
 		return fmt.Errorf("last applied command seq %d exceeds last received %d", hello.LastAppliedCommandSeq, hello.LastReceivedCommandSeq)
 	}
-	if err := s.Generation.VerifyGeneration(helloCtx, claims.PersonalityAgentID, hello.Generation); err != nil {
-		return fmt.Errorf("verify generation: %w", err)
+	if s.Leases == nil {
+		return errors.New("connection lease authority is not configured")
 	}
-
-	epoch := s.installConnectionEpoch(conn, claims, cancel)
-	defer s.removeConnectionEpoch(epoch)
-	go s.watchGeneration(ctx, epoch)
-	defer func() {
-		cancel()
-		<-epoch.generationWatchStopped
-	}()
+	attempt := s.newConnectionAttempt()
+	defer s.removeConnectionAttempt(claims.PersonalityAgentID, attempt)
 
 	if err := s.Latch.WaitFor(helloCtx, claims, hello.Generation); err != nil {
 		return fmt.Errorf("hydration wait: %w", err)
@@ -347,7 +389,36 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextSeq,
 	}
-	if err := s.writeJSONForEpoch(epoch, apiHello); err != nil {
+	if err := s.Generation.VerifyGeneration(
+		helloCtx,
+		claims.PersonalityAgentID,
+		claims.Generation,
+	); err != nil {
+		return fmt.Errorf("verify generation before lease claim: %w", err)
+	}
+	if !s.activateConnectionAttempt(claims.PersonalityAgentID, attempt) {
+		return errConnectionEpochRevoked
+	}
+	s.cancelLocalPredecessor(claims)
+	lease, err := s.Leases.ClaimConnectionLease(helloCtx, claims)
+	if err != nil {
+		return fmt.Errorf("claim connection lease: %w", err)
+	}
+	epoch, err := s.installConnectionEpoch(ctx, conn, claims, lease, cancel)
+	if err != nil {
+		_ = s.Leases.ReleaseConnectionLease(context.Background(), claims, lease)
+		return fmt.Errorf("install connection lease: %w", err)
+	}
+	go s.watchGeneration(ctx, epoch)
+	defer func() {
+		cancel()
+		<-epoch.generationWatchStopped
+		s.removeConnectionEpoch(epoch)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), s.writeTimeout())
+		defer releaseCancel()
+		_ = s.Leases.ReleaseConnectionLease(releaseCtx, claims, lease)
+	}()
+	if err := s.writeJSONForEpoch(ctx, epoch, apiHello); err != nil {
 		return fmt.Errorf("write api hello: %w", err)
 	}
 
@@ -368,7 +439,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("command catch-up: %w", err)
 	}
 	for _, cmd := range commands {
-		if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
+		if err := s.sendCommandEnvelope(ctx, epoch, cmd); err != nil {
 			return fmt.Errorf("send catch-up command: %w", err)
 		}
 		nextSeq = cmd.Seq + 1
@@ -451,14 +522,22 @@ func (s *Server) readPump(ctx context.Context, epoch *agentConnectionEpoch) erro
 			if frame.Envelope.PersonalityAgentID != claims.PersonalityAgentID {
 				return errors.New("event personality_agent_id claim mismatch")
 			}
-			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
-				return s.Events.Receive(ctx, claims, *frame.Envelope)
+			if err := s.withSideEffectLease(ctx, epoch, func(effectCtx context.Context) error {
+				return s.Events.Receive(
+					contextWithConnectionLease(effectCtx, epoch.lease),
+					claims,
+					*frame.Envelope,
+				)
 			}); err != nil {
 				return err
 			}
 		case "command_ack":
-			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
-				return s.Commands.ApplyAck(ctx, claims, *frame.Ack)
+			if err := s.withSideEffectLease(ctx, epoch, func(effectCtx context.Context) error {
+				return s.Commands.ApplyAck(
+					contextWithConnectionLease(effectCtx, epoch.lease),
+					claims,
+					*frame.Ack,
+				)
 			}); err != nil {
 				return err
 			}
@@ -476,7 +555,7 @@ func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, liv
 				if !ok {
 					return sourceCloseError(liveErr)
 				}
-				if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
+				if err := s.sendCommandEnvelope(ctx, epoch, cmd); err != nil {
 					return err
 				}
 			case err, ok := <-liveErr:
@@ -500,7 +579,7 @@ func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, liv
 			if !ok {
 				return sourceCloseError(liveErr)
 			}
-			if err := s.sendCommandEnvelope(epoch, cmd); err != nil {
+			if err := s.sendCommandEnvelope(ctx, epoch, cmd); err != nil {
 				return err
 			}
 		case err, ok := <-liveErr:
@@ -511,7 +590,7 @@ func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, liv
 				return err
 			}
 		case <-ticker.C:
-			if err := s.withCurrentConnectionEpoch(ctx, epoch, func() error {
+			if err := s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
 				return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
 			}); err != nil {
 				return err
@@ -532,18 +611,26 @@ func sourceCloseError(liveErr <-chan error) error {
 	return errors.New("command source closed")
 }
 
-func (s *Server) sendCommandEnvelope(epoch *agentConnectionEpoch, cmd CommandEnvelope) error {
+func (s *Server) sendCommandEnvelope(
+	ctx context.Context,
+	epoch *agentConnectionEpoch,
+	cmd CommandEnvelope,
+) error {
 	if err := cmd.Validate(); err != nil {
 		return fmt.Errorf("invalid command envelope: %w", err)
 	}
 	if cmd.PersonalityAgentID != epoch.claims.PersonalityAgentID {
 		return errors.New("command envelope target does not match token claim")
 	}
-	return s.writeJSONForEpoch(epoch, cmd)
+	return s.writeJSONForEpoch(ctx, epoch, cmd)
 }
 
-func (s *Server) writeJSONForEpoch(epoch *agentConnectionEpoch, value any) error {
-	return s.withCurrentConnectionEpoch(context.Background(), epoch, func() error {
+func (s *Server) writeJSONForEpoch(
+	ctx context.Context,
+	epoch *agentConnectionEpoch,
+	value any,
+) error {
+	return s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
 		if err := epoch.conn.SetWriteDeadline(s.writeDeadline()); err != nil {
 			return fmt.Errorf("set write deadline: %w", err)
 		}
@@ -552,11 +639,14 @@ func (s *Server) writeJSONForEpoch(epoch *agentConnectionEpoch, value any) error
 }
 
 func (s *Server) writeDeadline() time.Time {
-	timeout := s.WriteTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+	return time.Now().Add(s.writeTimeout())
+}
+
+func (s *Server) writeTimeout() time.Duration {
+	if s.WriteTimeout > 0 {
+		return s.WriteTimeout
 	}
-	return time.Now().Add(timeout)
+	return 10 * time.Second
 }
 
 func (s *Server) generationPollInterval() time.Duration {
@@ -566,35 +656,98 @@ func (s *Server) generationPollInterval() time.Duration {
 	return 250 * time.Millisecond
 }
 
-func (s *Server) epochGate(personalityAgentID string) *sync.Mutex {
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(personalityAgentID))
-	return &s.epochGates[hash.Sum32()%uint32(len(s.epochGates))]
+func (s *Server) sideEffectTimeout() time.Duration {
+	if s.SideEffectTimeout > 0 {
+		return s.SideEffectTimeout
+	}
+	return 10 * time.Second
+}
+
+func (s *Server) withSideEffectLease(
+	ctx context.Context,
+	epoch *agentConnectionEpoch,
+	call func(context.Context) error,
+) error {
+	effectCtx, cancel := context.WithTimeout(ctx, s.sideEffectTimeout())
+	defer cancel()
+	return s.Leases.WithConnectionLease(
+		effectCtx,
+		epoch.claims,
+		epoch.lease,
+		func() error { return call(effectCtx) },
+	)
+}
+
+func (s *Server) cancelLocalPredecessor(claims TokenClaims) {
+	s.connectionsMu.Lock()
+	previous := s.connections[claims.PersonalityAgentID]
+	canCancel := previous != nil && previous.claims.Generation <= claims.Generation
+	s.connectionsMu.Unlock()
+	if canCancel {
+		previous.cancel()
+		_ = previous.conn.Close()
+	}
+}
+
+func (s *Server) newConnectionAttempt() uint64 {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	s.nextAttempt++
+	return s.nextAttempt
+}
+
+func (s *Server) activateConnectionAttempt(personalityAgentID string, attempt uint64) bool {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	if s.attempts == nil {
+		s.attempts = make(map[string]uint64)
+	}
+	if s.attempts[personalityAgentID] >= attempt {
+		return false
+	}
+	s.attempts[personalityAgentID] = attempt
+	return true
+}
+
+func (s *Server) removeConnectionAttempt(personalityAgentID string, attempt uint64) {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	if s.attempts[personalityAgentID] == attempt {
+		delete(s.attempts, personalityAgentID)
+	}
 }
 
 func (s *Server) installConnectionEpoch(
+	ctx context.Context,
 	conn *websocket.Conn,
 	claims TokenClaims,
+	lease ConnectionLease,
 	cancel context.CancelFunc,
-) *agentConnectionEpoch {
+) (*agentConnectionEpoch, error) {
 	epoch := &agentConnectionEpoch{
 		personalityAgentID:     claims.PersonalityAgentID,
 		claims:                 claims,
+		lease:                  lease,
 		conn:                   conn,
 		cancel:                 cancel,
 		generationWatchStopped: make(chan struct{}),
 	}
-	gate := s.epochGate(claims.PersonalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
+	if err := s.Leases.ValidateConnectionLease(ctx, claims, lease); err != nil {
+		return nil, err
+	}
 
 	s.connectionsMu.Lock()
 	if s.connections == nil {
 		s.connections = make(map[string]*agentConnectionEpoch)
 	}
-	s.nextEpoch++
-	epoch.id = s.nextEpoch
 	previous := s.connections[claims.PersonalityAgentID]
+	if previous != nil &&
+		(previous.lease.Generation > lease.Generation ||
+			(previous.lease.Generation == lease.Generation &&
+				previous.lease.Sequence >= lease.Sequence)) {
+		s.connectionsMu.Unlock()
+		return nil, errConnectionEpochRevoked
+	}
 	s.connections[claims.PersonalityAgentID] = epoch
 	s.connectionsMu.Unlock()
 
@@ -602,14 +755,10 @@ func (s *Server) installConnectionEpoch(
 		previous.cancel()
 		_ = previous.conn.Close()
 	}
-	return epoch
+	return epoch, nil
 }
 
 func (s *Server) removeConnectionEpoch(epoch *agentConnectionEpoch) {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
 	s.connectionsMu.Lock()
 	if s.connections[epoch.personalityAgentID] == epoch {
 		delete(s.connections, epoch.personalityAgentID)
@@ -618,10 +767,6 @@ func (s *Server) removeConnectionEpoch(epoch *agentConnectionEpoch) {
 }
 
 func (s *Server) revokeConnectionEpoch(epoch *agentConnectionEpoch) {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
 	s.connectionsMu.Lock()
 	current := s.connections[epoch.personalityAgentID] == epoch
 	if current {
@@ -634,27 +779,6 @@ func (s *Server) revokeConnectionEpoch(epoch *agentConnectionEpoch) {
 	}
 }
 
-func (s *Server) withCurrentConnectionEpoch(
-	ctx context.Context,
-	epoch *agentConnectionEpoch,
-	call func() error,
-) error {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.connectionsMu.Lock()
-	current := s.connections[epoch.personalityAgentID] == epoch
-	s.connectionsMu.Unlock()
-	if !current {
-		return errConnectionEpochRevoked
-	}
-	return call()
-}
-
 func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoch) {
 	defer close(epoch.generationWatchStopped)
 	ticker := time.NewTicker(s.generationPollInterval())
@@ -664,10 +788,10 @@ func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoc
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.Generation.VerifyGeneration(
+			if err := s.Leases.ValidateConnectionLease(
 				ctx,
-				epoch.personalityAgentID,
-				epoch.claims.Generation,
+				epoch.claims,
+				epoch.lease,
 			); err != nil {
 				s.revokeConnectionEpoch(epoch)
 				return
