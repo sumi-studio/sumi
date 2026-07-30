@@ -40,6 +40,7 @@ impl Fixture {
         let executor_socket = root.join("executor.sock");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let broker = spawn_broker(&artifacts, &broker_socket, NONCE);
         wait_for_socket(&broker_socket).await;
         Self {
@@ -68,6 +69,13 @@ impl Fixture {
         executor.kill().await.expect("kill executor");
         executor.wait().await.expect("wait executor");
         self.start_executor(nonce).await;
+    }
+
+    async fn restart_broker(&mut self, nonce: &str) {
+        self.broker.kill().await.expect("kill broker");
+        self.broker.wait().await.expect("wait broker");
+        self.broker = spawn_broker(&self.root.join("artifacts"), &self.broker_socket, nonce);
+        wait_for_socket(&self.broker_socket).await;
     }
 }
 
@@ -156,11 +164,17 @@ fn read_file_request(nonce: &str, request_id: &str, execution_id: &str, path: &s
     )
 }
 
-async fn exchange(socket: &Path, value: &Value) -> Vec<Value> {
-    let mut stream = UnixStream::connect(socket).await.expect("connect executor");
+fn health_request(nonce: &str, request_id: &str) -> Value {
+    request(nonce, request_id, json!({"type": "health"}))
+}
+
+async fn write_request(stream: &mut UnixStream, value: &Value) {
     let mut bytes = serde_json::to_vec(value).unwrap();
     bytes.push(b'\n');
     stream.write_all(&bytes).await.expect("write request");
+}
+
+async fn read_connection(mut stream: UnixStream) -> Vec<Value> {
     stream.shutdown().await.expect("shutdown request half");
     let mut lines = BufReader::new(stream).lines();
     let mut frames = Vec::new();
@@ -170,8 +184,89 @@ async fn exchange(socket: &Path, value: &Value) -> Vec<Value> {
         }
     })
     .await
-    .expect("executor exchange timed out");
+    .expect("executor connection did not close");
     frames
+}
+
+async fn exchange(socket: &Path, value: &Value) -> Vec<Value> {
+    let mut stream = UnixStream::connect(socket).await.expect("connect executor");
+    write_request(&mut stream, value).await;
+    read_connection(stream).await
+}
+
+async fn broker_exchange(socket: &Path, value: &Value) -> Value {
+    let frames = exchange(socket, value).await;
+    assert_eq!(frames.len(), 1, "broker emitted unexpected frames");
+    frames.into_iter().next().unwrap()
+}
+
+async fn start_running_bashes(
+    fixture: &Fixture,
+    label: &str,
+    count: usize,
+) -> (Vec<UnixStream>, Vec<i32>) {
+    let mut streams = Vec::with_capacity(count);
+    let mut pids = Vec::with_capacity(count);
+    for index in 0..count {
+        let pid_name = format!("{label}-{index}.pid");
+        let mut stream = UnixStream::connect(&fixture.executor_socket)
+            .await
+            .expect("connect running bash");
+        write_request(
+            &mut stream,
+            &request(
+                NONCE,
+                &format!("request-{label}-{index}"),
+                json!({
+                    "type": "bash",
+                    "command": format!("printf '%s' \"$$\" > {pid_name}; sleep 60"),
+                    "execution_id": format!("execution-{label}-{index}"),
+                }),
+            ),
+        )
+        .await;
+        pids.push(wait_for_pid(&fixture.workspace.join(pid_name)).await);
+        streams.push(stream);
+    }
+    (streams, pids)
+}
+
+async fn cancel_until_accepted(
+    socket: &Path,
+    execution_id: &str,
+    request_prefix: &str,
+) -> Vec<Value> {
+    timeout(Duration::from_secs(5), async {
+        for attempt in 0u64.. {
+            let frames = exchange(
+                socket,
+                &request(
+                    NONCE,
+                    &format!("{request_prefix}-{attempt}"),
+                    json!({
+                        "type": "cancel",
+                        "execution_id": execution_id,
+                    }),
+                ),
+            )
+            .await;
+            if frames.iter().any(|frame| {
+                frame["result"]["Ok"]["type"] == Value::String("cancel_accepted".to_owned())
+            }) {
+                return frames;
+            }
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["result"]["Err"]["code"] == "protocol"),
+                "unexpected pre-registration cancel response: {frames:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        unreachable!()
+    })
+    .await
+    .expect("execution was never registered for cancellation")
 }
 
 fn terminal_content(frames: &[Value]) -> &str {
@@ -323,6 +418,103 @@ async fn manager_restart_rotates_nonce_and_rebinds_stale_socket() {
 }
 
 #[tokio::test]
+async fn broker_crash_restart_rebinds_its_stale_socket() {
+    let mut fixture = Fixture::new().await;
+    let first = broker_exchange(
+        &fixture.broker_socket,
+        &request(
+            NONCE,
+            "broker-before-crash",
+            json!({
+                "type": "begin_tool_output",
+                "execution_id": "broker-before-crash",
+                "content": [97],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(first["result"]["Ok"]["offset"], 1);
+
+    fixture.restart_broker(NONCE).await;
+    let restarted = broker_exchange(
+        &fixture.broker_socket,
+        &request(
+            NONCE,
+            "broker-after-crash",
+            json!({
+                "type": "begin_tool_output",
+                "execution_id": "broker-after-crash",
+                "content": [98],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(restarted["result"]["Ok"]["offset"], 1);
+}
+
+#[tokio::test]
+async fn health_is_authenticated_single_exchange_and_does_not_consume_uniqueness() {
+    let mut fixture = Fixture::new().await;
+    std::fs::write(fixture.workspace.join("source.txt"), "healthy").unwrap();
+    fixture.start_executor(NONCE).await;
+
+    let health = health_request(NONCE, "reused-health-request");
+    for _ in 0..16 {
+        let frames = exchange(&fixture.executor_socket, &health).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["result"]["Ok"]["type"], "healthy");
+    }
+
+    // Health bypasses the manager uniqueness ledger, so its request identity
+    // remains available to an ordinary execution.
+    let ordinary = read_file_request(
+        NONCE,
+        "reused-health-request",
+        "execution-after-health",
+        "source.txt",
+    );
+    assert_eq!(
+        terminal_content(&exchange(&fixture.executor_socket, &ordinary).await),
+        "healthy"
+    );
+
+    // A socket session is closed after its one primary Health exchange. A
+    // buffered second request must not execute.
+    let mut stream = UnixStream::connect(&fixture.executor_socket).await.unwrap();
+    write_request(
+        &mut stream,
+        &health_request(NONCE, "health-close-after-one"),
+    )
+    .await;
+    write_request(
+        &mut stream,
+        &request(
+            NONCE,
+            "health-buffered-write",
+            json!({
+                "type": "write_file",
+                "path": "must-not-exist.txt",
+                "content": "unexpected",
+                "execution_id": "health-buffered-write",
+            }),
+        ),
+    )
+    .await;
+    let frames = read_connection(stream).await;
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["result"]["Ok"]["type"], "healthy");
+    assert!(!fixture.workspace.join("must-not-exist.txt").exists());
+
+    let mut wrong_identity = health_request("wrong-nonce", "wrong-health");
+    wrong_identity["nonce"] = json!("wrong-nonce");
+    assert!(
+        exchange(&fixture.executor_socket, &wrong_identity)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn concurrent_stale_socket_starters_leave_one_live_owner() {
     let mut fixture = Fixture::new().await;
     std::fs::write(fixture.workspace.join("source.txt"), "owned").unwrap();
@@ -464,6 +656,177 @@ async fn disconnect_and_explicit_cancel_reap_children_without_poisoning_manager(
         terminal_content(&exchange(&fixture.executor_socket, &read).await),
         "still-live"
     );
+}
+
+#[tokio::test]
+async fn queued_bash_same_session_cancel_never_spawns_the_command() {
+    let mut fixture = Fixture::new().await;
+    fixture.start_executor(NONCE).await;
+    let (running, pids) = start_running_bashes(&fixture, "same-session-running", 8).await;
+
+    let marker = fixture.workspace.join("same-session-queued.started");
+    let mut queued = UnixStream::connect(&fixture.executor_socket).await.unwrap();
+    write_request(
+        &mut queued,
+        &request(
+            NONCE,
+            "request-same-session-queued",
+            json!({
+                "type": "bash",
+                "command": "touch same-session-queued.started; sleep 60",
+                "execution_id": "execution-same-session-queued",
+            }),
+        ),
+    )
+    .await;
+    write_request(
+        &mut queued,
+        &request(
+            NONCE,
+            "request-same-session-cancel",
+            json!({
+                "type": "cancel",
+                "execution_id": "execution-same-session-queued",
+            }),
+        ),
+    )
+    .await;
+    let frames = read_connection(queued).await;
+    assert!(frames.iter().any(|frame| {
+        frame["request_id"] == "request-same-session-cancel"
+            && frame["result"]["Ok"]["type"] == "cancel_accepted"
+    }));
+    assert!(frames.iter().any(|frame| {
+        frame["request_id"] == "request-same-session-queued"
+            && frame["result"]["Ok"]["result"]["cancelled"] == true
+    }));
+    assert!(
+        !marker.exists(),
+        "queued command spawned before cancellation"
+    );
+
+    drop(running);
+    for pid in pids {
+        wait_for_process_group_gone(pid).await;
+    }
+}
+
+#[tokio::test]
+async fn queued_bash_cross_connection_cancel_never_spawns_the_command() {
+    let mut fixture = Fixture::new().await;
+    fixture.start_executor(NONCE).await;
+    let (running, pids) = start_running_bashes(&fixture, "cross-session-running", 8).await;
+
+    let marker = fixture.workspace.join("cross-session-queued.started");
+    let mut queued = UnixStream::connect(&fixture.executor_socket).await.unwrap();
+    write_request(
+        &mut queued,
+        &request(
+            NONCE,
+            "request-cross-session-queued",
+            json!({
+                "type": "bash",
+                "command": "touch cross-session-queued.started; sleep 60",
+                "execution_id": "execution-cross-session-queued",
+            }),
+        ),
+    )
+    .await;
+    let cancel = cancel_until_accepted(
+        &fixture.executor_socket,
+        "execution-cross-session-queued",
+        "request-cross-session-cancel",
+    )
+    .await;
+    assert!(
+        cancel
+            .iter()
+            .any(|frame| { frame["result"]["Ok"]["type"] == "cancel_accepted" })
+    );
+    let frames = read_connection(queued).await;
+    assert!(frames.iter().any(|frame| {
+        frame["request_id"] == "request-cross-session-queued"
+            && frame["result"]["Ok"]["result"]["cancelled"] == true
+    }));
+    assert!(
+        !marker.exists(),
+        "queued command spawned before cancellation"
+    );
+
+    drop(running);
+    for pid in pids {
+        wait_for_process_group_gone(pid).await;
+    }
+}
+
+#[tokio::test]
+async fn independent_cancel_bypasses_a_full_ordinary_connection_pool() {
+    let mut fixture = Fixture::new().await;
+    fixture.start_executor(NONCE).await;
+    let (running, pids) = start_running_bashes(&fixture, "pool-running", 8).await;
+
+    let mut queued = Vec::new();
+    for index in 0..24 {
+        let mut stream = UnixStream::connect(&fixture.executor_socket).await.unwrap();
+        write_request(
+            &mut stream,
+            &request(
+                NONCE,
+                &format!("request-pool-queued-{index}"),
+                json!({
+                    "type": "bash",
+                    "command": format!(
+                        "printf '%s' \"$$\" > pool-queued-{index}.pid; sleep 60"
+                    ),
+                    "execution_id": format!("execution-pool-queued-{index}"),
+                }),
+            ),
+        )
+        .await;
+        queued.push(stream);
+    }
+    // Give all local sessions time to cross the initial-frame tier and occupy
+    // the 32-slot ordinary pool (8 admitted operations plus 24 pending).
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    for index in 0..24 {
+        assert!(
+            !fixture
+                .workspace
+                .join(format!("pool-queued-{index}.pid"))
+                .exists(),
+            "queued operation {index} started while all permits were occupied"
+        );
+    }
+
+    let cancel = exchange(
+        &fixture.executor_socket,
+        &request(
+            NONCE,
+            "request-pool-independent-cancel",
+            json!({
+                "type": "cancel",
+                "execution_id": "execution-pool-running-0",
+            }),
+        ),
+    )
+    .await;
+    assert!(cancel.iter().any(|frame| {
+        frame["request_id"] == "request-pool-independent-cancel"
+            && frame["result"]["Ok"]["type"] == "cancel_accepted"
+    }));
+
+    drop(queued);
+    drop(running);
+    for pid in pids {
+        wait_for_process_group_gone(pid).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for index in 0..24 {
+        let path = fixture.workspace.join(format!("pool-queued-{index}.pid"));
+        if let Ok(pid) = std::fs::read_to_string(path) {
+            wait_for_process_group_gone(pid.trim().parse().unwrap()).await;
+        }
+    }
 }
 
 #[tokio::test]

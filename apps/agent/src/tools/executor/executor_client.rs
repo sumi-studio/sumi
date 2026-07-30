@@ -19,7 +19,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::protocol::parse_artifact_handle;
+use super::manager::RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE;
+use super::protocol::{RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, parse_artifact_handle};
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
     RpcOperationValidation, RpcRequest, decode_rpc_frame,
@@ -32,6 +33,26 @@ use crate::tools::{
 };
 
 const MAX_EXECUTOR_UPDATES: usize = 65_536;
+const GENERATION_ROLLOVER_REQUIRED_MESSAGE: &str = "executor generation rollover required";
+const REPLAY_OUTCOME_UNAVAILABLE_MESSAGE: &str = "executor replay outcome is no longer retained";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutorErrorClassification {
+    GenerationRolloverRequired,
+    ReplayOutcomeUnavailable,
+}
+
+pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassification> {
+    match error {
+        ToolError::Rpc(message) if message == GENERATION_ROLLOVER_REQUIRED_MESSAGE => {
+            Some(ExecutorErrorClassification::GenerationRolloverRequired)
+        }
+        ToolError::Rpc(message) if message == REPLAY_OUTCOME_UNAVAILABLE_MESSAGE => {
+            Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Deadlines {
@@ -91,6 +112,22 @@ impl ExecutorClient {
 
     pub(crate) const fn identity(&self) -> &RpcIdentity {
         &self.identity
+    }
+
+    pub async fn health(&self) -> Result<(), ToolError> {
+        match self
+            .execute(
+                ExecutorOperation::Health {},
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await?
+        {
+            ExecutorResponse::Healthy {} => Ok(()),
+            _ => Err(ToolError::Protocol(
+                "executor health returned a non-health response".to_owned(),
+            )),
+        }
     }
 
     pub async fn execute(
@@ -439,6 +476,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
 
 fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
+        ExecutorOperation::Health {} => "",
         ExecutorOperation::ReadFile { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
@@ -458,6 +496,7 @@ fn validate_response_for_personality_agent(
 ) -> Result<(), ToolError> {
     validate_operation_for_personality_agent(operation, personality_agent_id)?;
     let valid = match (operation, response) {
+        (ExecutorOperation::Health {}, ExecutorResponse::Healthy {}) => true,
         (
             ExecutorOperation::ReadFile { path, limit, .. },
             ExecutorResponse::ReadFile { result },
@@ -608,6 +647,12 @@ fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
             | ExecutorOperation::RemoveFile { .. }
     );
     match (error.code.as_str(), error.resource_limit) {
+        (RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, None) => {
+            ToolError::Rpc(GENERATION_ROLLOVER_REQUIRED_MESSAGE.to_owned())
+        }
+        (RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE, None) => {
+            ToolError::Rpc(REPLAY_OUTCOME_UNAVAILABLE_MESSAGE.to_owned())
+        }
         ("resource_limit", Some(limit)) => ToolError::ResourceLimit(limit),
         ("cancelled", None) if !mutating => ToolError::Cancelled,
         ("invalid_arguments", None) => ToolError::InvalidArguments,
@@ -1024,6 +1069,63 @@ mod tests {
         );
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_authenticates_real_service_and_rejects_untrusted_endpoints() {
+        let root = temp_root("health-real");
+        let (socket, service) = spawn_real_service(&root, 1);
+        ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .health()
+            .await
+            .expect("healthy executor");
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        for mode in ["wrong-identity", "rogue", "stalled"] {
+            let root = temp_root(&format!("health-{mode}"));
+            let socket = root.join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let request = read_request(&mut BufReader::new(read)).await;
+                match mode {
+                    "wrong-identity" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"wrong",
+                                "request_id":request["request_id"],
+                                "result":{"Ok":{"type":"healthy"}}
+                            }),
+                        )
+                        .await;
+                    }
+                    "rogue" => write.write_all(b"not-json\n").await.unwrap(),
+                    "stalled" => tokio::time::sleep(Duration::from_secs(1)).await,
+                    _ => unreachable!(),
+                }
+            });
+            let mut deadlines = test_deadlines();
+            deadlines.frame = Duration::from_millis(80);
+            deadlines.overall = Duration::from_millis(250);
+            let error = ExecutorClient::new(&socket, identity())
+                .with_deadlines(deadlines)
+                .health()
+                .await
+                .expect_err("untrusted health endpoint");
+            assert!(
+                matches!(error, ToolError::RpcIndeterminate(_)),
+                "{mode}: {error:?}"
+            );
+            server.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1726,6 +1828,40 @@ mod tests {
             ),
             ToolError::Protocol(_)
         ));
+    }
+
+    #[test]
+    fn executor_control_errors_have_stable_external_classification() {
+        let mutation = write_operation("control-mapping", "note.txt", "content");
+        let rollover = map_rpc_error(
+            &mutation,
+            RpcError {
+                code: RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE.to_owned(),
+                resource_limit: None,
+            },
+        );
+        assert_eq!(
+            classify_executor_error(&rollover),
+            Some(ExecutorErrorClassification::GenerationRolloverRequired)
+        );
+        assert!(matches!(rollover, ToolError::Rpc(_)));
+
+        let replay_unavailable = map_rpc_error(
+            &mutation,
+            RpcError {
+                code: RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE.to_owned(),
+                resource_limit: None,
+            },
+        );
+        assert_eq!(
+            classify_executor_error(&replay_unavailable),
+            Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
+        );
+        assert!(matches!(replay_unavailable, ToolError::Rpc(_)));
+        assert_eq!(
+            classify_executor_error(&ToolError::Rpc("different".to_owned())),
+            None
+        );
     }
 
     #[test]

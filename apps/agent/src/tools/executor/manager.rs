@@ -10,15 +10,24 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE;
+use super::protocol::rpc_id_digest;
 use super::{ExecutorResponse, RpcError, RpcLifecycleTracker};
 use crate::tools::ToolError;
 
 const RETAINED_OUTCOME_CAPACITY: usize = 256;
+const RETAINED_OUTCOME_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
+pub(super) const RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE: &str = "rpc_replay_outcome_unavailable";
 
 #[derive(Clone, Debug, PartialEq)]
 struct RetainedOutcome {
     request_id: String,
     result: Result<ExecutorResponse, RpcError>,
+    encoded_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CompletedExecutionReceipt {
+    request_id_digest: [u8; 32],
 }
 
 struct ActiveExecution {
@@ -31,8 +40,15 @@ struct ActiveExecution {
 struct ManagerRegistry {
     lifecycle: RpcLifecycleTracker,
     active: HashMap<String, ActiveExecution>,
+    completed_execution_receipts: HashMap<[u8; 32], CompletedExecutionReceipt>,
     retained_outcomes: HashMap<String, RetainedOutcome>,
     retained_order: VecDeque<String>,
+    retained_outcome_bytes: usize,
+}
+
+pub(super) enum ExecutionRegistration {
+    Pending(PendingExecution),
+    Replay(Result<ExecutorResponse, RpcError>),
 }
 
 /// Result of admitting a manager-wide cancel request.
@@ -93,44 +109,69 @@ impl ExecutorManager {
         execution_id: String,
         cancel: Option<CancellationToken>,
     ) -> Result<ExecutionLease, ToolError> {
-        // Waiting operations remain bounded by the listener's connection
-        // semaphore. Cancellation requests bypass this admission queue.
-        let permit = self
-            .admission
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ToolError::Protocol("executor admission is closed".to_owned()))?;
-        {
-            let mut registry = self.lock_registry()?;
-            registry
-                .lifecycle
-                .begin_execution(&request_id, &execution_id)?;
-            if registry
-                .active
-                .insert(
-                    execution_id.clone(),
-                    ActiveExecution {
-                        request_id: request_id.clone(),
-                        cancel: cancel.clone(),
-                        cancel_waiters: Vec::new(),
-                    },
-                )
-                .is_some()
-            {
+        let ExecutionRegistration::Pending(mut pending) =
+            self.register_execution(request_id, execution_id, cancel)?
+        else {
+            return Err(ToolError::Protocol(
+                "executor replay requires the replay-aware service path".to_owned(),
+            ));
+        };
+        let Some(permit) = pending.wait_for_admission().await? else {
+            return Err(ToolError::Cancelled);
+        };
+        pending.promote(permit)
+    }
+
+    pub(super) fn register_execution(
+        self: &Arc<Self>,
+        request_id: String,
+        execution_id: String,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ExecutionRegistration, ToolError> {
+        let mut registry = self.lock_registry()?;
+        let execution_digest = rpc_id_digest(&execution_id);
+        if let Some(receipt) = registry.completed_execution_receipts.get(&execution_digest) {
+            if receipt.request_id_digest != rpc_id_digest(&request_id) {
                 return Err(ToolError::Protocol(
-                    "executor active registry admitted a duplicate execution_id".to_owned(),
+                    "RPC execution_id must be unique".to_owned(),
                 ));
             }
+            return match registry.retained_outcomes.get(&execution_id) {
+                Some(outcome) if outcome.request_id == request_id => {
+                    Ok(ExecutionRegistration::Replay(outcome.result.clone()))
+                }
+                _ => Err(ToolError::Protocol(
+                    RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE.to_owned(),
+                )),
+            };
         }
-        Ok(ExecutionLease {
+        registry
+            .lifecycle
+            .begin_execution(&request_id, &execution_id)?;
+        if registry
+            .active
+            .insert(
+                execution_id.clone(),
+                ActiveExecution {
+                    request_id: request_id.clone(),
+                    cancel: cancel.clone(),
+                    cancel_waiters: Vec::new(),
+                },
+            )
+            .is_some()
+        {
+            return Err(ToolError::Protocol(
+                "executor active registry admitted a duplicate execution_id".to_owned(),
+            ));
+        }
+        drop(registry);
+        Ok(ExecutionRegistration::Pending(PendingExecution {
             manager: self.clone(),
             request_id,
             execution_id,
             cancel,
-            _permit: permit,
-            terminal: false,
-        })
+            registered: true,
+        }))
     }
 
     pub(super) fn reject_request(&self, request_id: &str) -> Result<(), ToolError> {
@@ -220,12 +261,14 @@ impl ExecutorManager {
                 .active
                 .remove(execution_id)
                 .expect("active execution was checked under the same lock");
+            remember_execution_receipt(&mut registry, request_id, execution_id);
             retain_outcome(
                 &mut registry,
                 execution_id.to_owned(),
                 RetainedOutcome {
                     request_id: request_id.to_owned(),
                     result: result.clone(),
+                    encoded_bytes: 0,
                 },
             );
             active.cancel_waiters
@@ -251,6 +294,7 @@ impl ExecutorManager {
                 cancel.cancel();
             }
             registry.lifecycle.accept_terminal(request_id)?;
+            remember_execution_receipt(&mut registry, request_id, execution_id);
             let terminal = Err(RpcError {
                 code: "rpc_indeterminate".to_owned(),
                 resource_limit: None,
@@ -261,6 +305,7 @@ impl ExecutorManager {
                 RetainedOutcome {
                     request_id: request_id.to_owned(),
                     result: terminal.clone(),
+                    encoded_bytes: 0,
                 },
             );
             for waiter in active.cancel_waiters {
@@ -311,21 +356,161 @@ impl ExecutorManager {
             .map(|registry| registry.lifecycle.tracked_identity_count())
             .unwrap_or(usize::MAX)
     }
+
+    #[cfg(test)]
+    fn retained_outcome_bytes(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|registry| registry.retained_outcome_bytes)
+            .unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    fn retained_outcome_count(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|registry| registry.retained_outcomes.len())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 fn retain_outcome(registry: &mut ManagerRegistry, execution_id: String, outcome: RetainedOutcome) {
+    let Ok(encoded) = serde_json::to_vec(&outcome.result) else {
+        tracing::error!(execution_id, "failed to encode retained executor outcome");
+        return;
+    };
+    if encoded.len() > RETAINED_OUTCOME_BYTE_CAPACITY {
+        return;
+    }
+    let Ok(result) = serde_json::from_slice(&encoded) else {
+        tracing::error!(
+            execution_id,
+            "failed to normalize retained executor outcome"
+        );
+        return;
+    };
+    let outcome = RetainedOutcome {
+        request_id: outcome.request_id,
+        result,
+        encoded_bytes: encoded.len(),
+    };
     if registry.retained_outcomes.contains_key(&execution_id) {
         registry
             .retained_order
             .retain(|known| known != &execution_id);
+        if let Some(previous) = registry.retained_outcomes.remove(&execution_id) {
+            registry.retained_outcome_bytes = registry
+                .retained_outcome_bytes
+                .saturating_sub(previous.encoded_bytes);
+        }
     }
+    registry.retained_outcome_bytes = registry
+        .retained_outcome_bytes
+        .saturating_add(outcome.encoded_bytes);
     registry
         .retained_outcomes
         .insert(execution_id.clone(), outcome);
     registry.retained_order.push_back(execution_id);
-    while registry.retained_order.len() > RETAINED_OUTCOME_CAPACITY {
-        if let Some(expired) = registry.retained_order.pop_front() {
-            registry.retained_outcomes.remove(&expired);
+    while registry.retained_order.len() > RETAINED_OUTCOME_CAPACITY
+        || registry.retained_outcome_bytes > RETAINED_OUTCOME_BYTE_CAPACITY
+    {
+        if let Some(expired) = registry.retained_order.pop_front()
+            && let Some(outcome) = registry.retained_outcomes.remove(&expired)
+        {
+            registry.retained_outcome_bytes = registry
+                .retained_outcome_bytes
+                .saturating_sub(outcome.encoded_bytes);
+        }
+    }
+}
+
+fn remember_execution_receipt(
+    registry: &mut ManagerRegistry,
+    request_id: &str,
+    execution_id: &str,
+) {
+    registry.completed_execution_receipts.insert(
+        rpc_id_digest(execution_id),
+        CompletedExecutionReceipt {
+            request_id_digest: rpc_id_digest(request_id),
+        },
+    );
+}
+
+pub(super) struct PendingExecution {
+    manager: Arc<ExecutorManager>,
+    request_id: String,
+    execution_id: String,
+    cancel: Option<CancellationToken>,
+    registered: bool,
+}
+
+impl PendingExecution {
+    pub(super) async fn wait_for_admission(
+        &self,
+    ) -> Result<Option<OwnedSemaphorePermit>, ToolError> {
+        let admission = self.manager.admission.clone().acquire_owned();
+        if let Some(cancel) = &self.cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Ok(None),
+                permit = admission => {
+                    let permit = permit.map_err(|_| {
+                        ToolError::Protocol("executor admission is closed".to_owned())
+                    })?;
+                    if cancel.is_cancelled() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(permit))
+                    }
+                }
+            }
+        } else {
+            admission
+                .await
+                .map(Some)
+                .map_err(|_| ToolError::Protocol("executor admission is closed".to_owned()))
+        }
+    }
+
+    pub(super) fn promote(
+        &mut self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ExecutionLease, ToolError> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolError::Cancelled);
+        }
+        self.registered = false;
+        Ok(ExecutionLease {
+            manager: self.manager.clone(),
+            request_id: self.request_id.clone(),
+            execution_id: self.execution_id.clone(),
+            cancel: self.cancel.clone(),
+            _permit: permit,
+            terminal: false,
+        })
+    }
+
+    pub(super) fn complete(
+        &mut self,
+        result: Result<ExecutorResponse, RpcError>,
+    ) -> Result<(), ToolError> {
+        self.manager
+            .complete_execution(&self.request_id, &self.execution_id, result)?;
+        self.registered = false;
+        Ok(())
+    }
+}
+
+impl Drop for PendingExecution {
+    fn drop(&mut self) {
+        if self.registered {
+            self.manager
+                .abandon_execution(&self.request_id, &self.execution_id);
         }
     }
 }
@@ -542,5 +727,103 @@ mod tests {
         );
         assert_eq!(manager.tracked_identity_count(), 5);
         assert!(manager.tracked_identity_count() <= 4 + 1);
+    }
+
+    #[tokio::test]
+    async fn pending_execution_cancels_before_admission_without_starting_work() {
+        let manager = ExecutorManager::new(1);
+        let mut running = manager
+            .begin_execution(
+                "request-running".to_owned(),
+                "execution-running".to_owned(),
+                None,
+            )
+            .await
+            .expect("occupy operation permit");
+        let cancel = CancellationToken::new();
+        let ExecutionRegistration::Pending(mut pending) = manager
+            .register_execution(
+                "request-pending".to_owned(),
+                "execution-pending".to_owned(),
+                Some(cancel.clone()),
+            )
+            .expect("register pending execution")
+        else {
+            panic!("new execution unexpectedly replayed");
+        };
+        let CancelDecision::Accepted(completed) = manager
+            .cancel_execution("request-cancel-pending", "execution-pending")
+            .expect("cancel registered pending execution")
+        else {
+            panic!("pending execution was not cancellable");
+        };
+        assert!(cancel.is_cancelled());
+        assert!(
+            pending
+                .wait_for_admission()
+                .await
+                .expect("wait for cancelled admission")
+                .is_none()
+        );
+        let mut side_effects = 0;
+        if pending
+            .wait_for_admission()
+            .await
+            .expect("repeat cancelled admission")
+            .is_some()
+        {
+            side_effects += 1;
+        }
+        let terminal = Ok(ExecutorResponse::CancelAccepted {});
+        pending
+            .complete(terminal.clone())
+            .expect("complete pending");
+        assert_eq!(completed.await.expect("cancel waiter"), terminal);
+        assert_eq!(side_effects, 0);
+        running
+            .complete(Ok(ExecutorResponse::CancelAccepted {}))
+            .expect("release running permit");
+    }
+
+    #[tokio::test]
+    async fn retained_outcomes_are_bounded_by_count_and_encoded_bytes() {
+        let manager = ExecutorManager::new(1);
+        for index in 0..256 {
+            let mut lease = manager
+                .begin_execution(
+                    format!("request-large-{index}"),
+                    format!("execution-large-{index}"),
+                    None,
+                )
+                .await
+                .expect("admit large outcome");
+            lease
+                .complete(Ok(ExecutorResponse::Listed {
+                    entries: vec!["x".repeat(16 * 1024)],
+                }))
+                .expect("complete large outcome");
+        }
+        assert!(manager.retained_outcome_count() < RETAINED_OUTCOME_CAPACITY);
+        assert!(manager.retained_outcome_bytes() <= RETAINED_OUTCOME_BYTE_CAPACITY);
+
+        assert!(matches!(
+            manager.register_execution(
+                "request-large-0".to_owned(),
+                "execution-large-0".to_owned(),
+                None,
+            ),
+            Err(ToolError::Protocol(code)) if code == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE
+        ));
+        assert!(matches!(
+            manager
+                .register_execution(
+                    "request-large-255".to_owned(),
+                    "execution-large-255".to_owned(),
+                    None,
+                )
+                .expect("latest exact outcome remains replayable"),
+            ExecutionRegistration::Replay(Ok(ExecutorResponse::Listed { .. }))
+        ));
+        assert_eq!(manager.active_count(), 0);
     }
 }

@@ -6,7 +6,7 @@ use std::{
     future::{Future, poll_fn},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
@@ -31,7 +31,10 @@ use super::{
     ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse, ExecutorOperation,
     ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
     RpcRequest, decode_rpc_line, encode_rpc_frame,
-    manager::{CancelDecision, ExecutionLease, ExecutorManager},
+    manager::{
+        CancelDecision, ExecutionLease, ExecutionRegistration, ExecutorManager, PendingExecution,
+        RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE,
+    },
     protocol::RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE,
     resolve_input,
 };
@@ -40,6 +43,7 @@ use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
     fs::WorkspaceFs,
+    truncate::{TruncationOptions, truncate_tail},
 };
 
 const UPDATE_CHANNEL_CAPACITY: usize = 32;
@@ -55,6 +59,7 @@ const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
 const EXECUTOR_CANCEL_SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
 const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
+const EXECUTOR_CONTROL_CONNECTION_CAPACITY: usize = 32;
 const EXECUTOR_OPERATION_CAPACITY: usize = 8;
 const EXECUTOR_INITIAL_FRAME_DEADLINE: Duration = Duration::from_secs(1);
 const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(135);
@@ -65,6 +70,7 @@ type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
 struct OwnedUnixListener {
     listener: UnixListener,
+    _parent_directory: File,
     // The stable adjacent inode is intentionally retained for the complete
     // listener lifetime. Cooperating starters may inspect it but never unlink
     // it, avoiding a lock-file replacement race during handoff.
@@ -136,6 +142,7 @@ async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
 /// Bind without stealing a live endpoint. Only a connection-refused path that
 /// is itself a Unix socket is eligible for stale-socket cleanup.
 async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListener> {
+    let parent_directory = acquire_trusted_socket_parent(path, label)?;
     let ownership_lock = acquire_socket_ownership(path, label)?;
     match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
         Ok(Ok(_)) => {
@@ -175,13 +182,102 @@ async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListene
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind {label} socket {}", path.display()))?;
     // Executor/runtime and broker/executor run under separate service UIDs.
-    // A supervisor-owned setgid IPC directory supplies the shared group.
+    // Deployment supplies a listener-UID-owned, non-peer-writable IPC
+    // subdirectory whose group permits the authenticated peer to traverse it.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
         .with_context(|| format!("failed to restrict {label} socket {}", path.display()))?;
+    validate_trusted_socket_parent(&parent_directory, path, label)?;
     Ok(OwnedUnixListener {
         listener,
+        _parent_directory: parent_directory,
         _ownership_lock: ownership_lock,
     })
+}
+
+fn acquire_trusted_socket_parent(path: &Path, label: &str) -> Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no parent directory"))?;
+    validate_socket_parent_path(parent, label)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(parent)
+        .with_context(|| {
+            format!(
+                "failed to securely open {label} socket parent {}",
+                parent.display()
+            )
+        })?;
+    validate_trusted_socket_parent(&directory, path, label)?;
+    Ok(directory)
+}
+
+fn validate_trusted_socket_parent(directory: &File, path: &Path, label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no parent directory"))?;
+    validate_socket_parent_path(parent, label)?;
+    let descriptor = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} socket parent descriptor"))?;
+    let pathname = std::fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "failed to inspect {label} socket parent {}",
+            parent.display()
+        )
+    })?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !descriptor.file_type().is_dir()
+        || descriptor.uid() != effective_uid
+        || descriptor.nlink() == 0
+        || descriptor.mode() & 0o300 != 0o300
+        || descriptor.mode() & 0o022 != 0
+        || pathname.file_type().is_symlink()
+        || !pathname.file_type().is_dir()
+        || pathname.dev() != descriptor.dev()
+        || pathname.ino() != descriptor.ino()
+    {
+        bail!(
+            "{label} socket parent {} is not a stable uid-owned non-peer-writable directory",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_socket_parent_path(parent: &Path, label: &str) -> Result<()> {
+    if !parent.is_absolute() {
+        bail!("{label} socket parent {} is not absolute", parent.display());
+    }
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => {
+                prefix.push(component.as_os_str());
+                let metadata = std::fs::symlink_metadata(&prefix).with_context(|| {
+                    format!(
+                        "failed to inspect {label} socket parent component {}",
+                        prefix.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "{label} socket parent component {} is a symlink",
+                        prefix.display()
+                    );
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                bail!(
+                    "{label} socket parent {} is not a normalized absolute Unix path",
+                    parent.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn acquire_socket_ownership(path: &Path, label: &str) -> Result<File> {
@@ -716,7 +812,8 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         .context("artifact broker socket is not ready")?;
     let listener = bind_unix_listener(&executor_socket, "executor").await?;
     let handshakes = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
-    let connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
+    let ordinary_connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
+    let control_connections = Arc::new(Semaphore::new(EXECUTOR_CONTROL_CONNECTION_CAPACITY));
     let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
 
     loop {
@@ -737,7 +834,8 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         let workspace = workspace.clone();
         let broker_socket = broker_socket.clone();
         let manager = manager.clone();
-        let connections = connections.clone();
+        let ordinary_connections = ordinary_connections.clone();
+        let control_connections = control_connections.clone();
         tokio::spawn(async move {
             let (read, write) = stream.into_split();
             let mut read = BufReader::new(read);
@@ -754,13 +852,31 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                         return;
                     }
                 };
-            if let Err(error) = decode_executor_request(&first_line, &identity) {
-                tracing::warn!(%error, "executor socket rejected unauthenticated initial frame");
-                return;
-            }
+            let decoded = match decode_executor_request(&first_line, &identity) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!(%error, "executor socket rejected unauthenticated initial frame");
+                    return;
+                }
+            };
+            let control = matches!(
+                decoded,
+                Ok(RpcRequest {
+                    operation: ExecutorOperation::Cancel { .. } | ExecutorOperation::Health {},
+                    ..
+                })
+            );
             drop(handshake_permit);
-            let Ok(connection_permit) = connections.try_acquire_owned() else {
-                tracing::warn!("executor authenticated connection capacity reached");
+            let permit = if control {
+                control_connections.try_acquire_owned()
+            } else {
+                ordinary_connections.try_acquire_owned()
+            };
+            let Ok(connection_permit) = permit else {
+                tracing::warn!(
+                    control,
+                    "executor authenticated connection capacity reached"
+                );
                 return;
             };
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
@@ -799,14 +915,13 @@ pub async fn run_artifact_broker_mode() -> Result<()> {
     let root = required_path("SUMI_ARTIFACT_ROOT")?;
     let socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let broker = Arc::new(ArtifactBroker::open(&root).context("failed to open artifact root")?);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind artifact broker socket {}", socket.display()))?;
+    let listener = bind_unix_listener(&socket, "artifact broker").await?;
     let lifecycle = Arc::new(Mutex::new(RpcLifecycleTracker::default()));
     let permits = Arc::new(Semaphore::new(BROKER_CONNECTION_CAPACITY));
     let blocking_work = BlockingWorkRegistry::new(BROKER_BLOCKING_WORK_CAPACITY);
     let identity = Arc::new(identity);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = listener.listener.accept().await?;
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             tracing::warn!("artifact broker connection capacity reached");
             drop(stream);
@@ -1057,21 +1172,27 @@ where
             }
         };
         match request.operation {
+            ExecutorOperation::Health {} => {
+                writer
+                    .terminal(
+                        &identity,
+                        request.request_id,
+                        Ok(ExecutorResponse::Healthy {}),
+                    )
+                    .await?;
+            }
             ExecutorOperation::Bash {
                 command,
                 execution_id,
             } => {
                 let cancel = CancellationToken::new();
-                let mut execution = match manager
-                    .begin_execution(
-                        request.request_id.clone(),
-                        execution_id.clone(),
-                        Some(cancel),
-                    )
-                    .await
-                {
-                    Ok(execution) => execution,
-                    Err(error) if is_boot_uniqueness_exhausted(&error) => {
+                let registration = match manager.register_execution(
+                    request.request_id.clone(),
+                    execution_id.clone(),
+                    Some(cancel),
+                ) {
+                    Ok(registration) => registration,
+                    Err(error) if is_typed_admission_error(&error) => {
                         writer
                             .terminal(&identity, request.request_id, Err(rpc_error(error)))
                             .await?;
@@ -1081,6 +1202,50 @@ where
                         continue;
                     }
                     Err(error) => return Err(error.into()),
+                };
+                let mut execution = match registration {
+                    ExecutionRegistration::Replay(result) => {
+                        writer
+                            .terminal(&identity, request.request_id, result)
+                            .await?;
+                        if close_after_primary {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    ExecutionRegistration::Pending(mut pending) => {
+                        match admit_pending_bash(
+                            &mut pending,
+                            &mut read,
+                            &identity,
+                            &manager,
+                            &execution_id,
+                        )
+                        .await?
+                        {
+                            PendingBashAdmission::Admitted(permit) => pending.promote(permit)?,
+                            PendingBashAdmission::Cancelled(cancel_request_id) => {
+                                let result = cancelled_before_spawn_response();
+                                pending.complete(result.clone())?;
+                                if let Some(cancel_request_id) = cancel_request_id {
+                                    writer
+                                        .terminal(
+                                            &identity,
+                                            cancel_request_id,
+                                            Ok(ExecutorResponse::CancelAccepted {}),
+                                        )
+                                        .await?;
+                                }
+                                writer
+                                    .terminal(&identity, request.request_id, result)
+                                    .await?;
+                                if close_after_primary {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 };
                 run_bash_request(
                     &mut read,
@@ -1120,12 +1285,13 @@ where
             }
             operation => {
                 let execution_id = operation_execution_id(&operation).to_owned();
-                let mut execution = match manager
-                    .begin_execution(request.request_id.clone(), execution_id, None)
-                    .await
-                {
-                    Ok(execution) => execution,
-                    Err(error) if is_boot_uniqueness_exhausted(&error) => {
+                let registration = match manager.register_execution(
+                    request.request_id.clone(),
+                    execution_id,
+                    None,
+                ) {
+                    Ok(registration) => registration,
+                    Err(error) if is_typed_admission_error(&error) => {
                         writer
                             .terminal(&identity, request.request_id, Err(rpc_error(error)))
                             .await?;
@@ -1135,6 +1301,25 @@ where
                         continue;
                     }
                     Err(error) => return Err(error.into()),
+                };
+                let mut execution = match registration {
+                    ExecutionRegistration::Replay(result) => {
+                        writer
+                            .terminal(&identity, request.request_id, result)
+                            .await?;
+                        if close_after_primary {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    ExecutionRegistration::Pending(mut pending) => {
+                        let permit = pending.wait_for_admission().await?.ok_or_else(|| {
+                            ToolError::Protocol(
+                                "non-cancellable executor operation lost admission".to_owned(),
+                            )
+                        })?;
+                        pending.promote(permit)?
+                    }
                 };
                 let result = execute_non_bash(&fs, &broker, operation)
                     .await
@@ -1149,6 +1334,54 @@ where
             return Ok(());
         }
     }
+}
+
+enum PendingBashAdmission {
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    Cancelled(Option<String>),
+}
+
+async fn admit_pending_bash<R>(
+    pending: &mut PendingExecution,
+    read: &mut R,
+    identity: &RpcIdentity,
+    manager: &ExecutorManager,
+    execution_id: &str,
+) -> Result<PendingBashAdmission, ToolError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    tokio::select! {
+        biased;
+        next = read_frame(read) => {
+            match classify_active_control(Some(next), identity, execution_id, manager) {
+                ActiveControl::Cancel(request_id) => {
+                    Ok(PendingBashAdmission::Cancelled(Some(request_id)))
+                }
+                ActiveControl::Fatal { error, .. } => Err(error),
+            }
+        }
+        admission = pending.wait_for_admission() => {
+            Ok(match admission? {
+                Some(permit) => PendingBashAdmission::Admitted(permit),
+                None => PendingBashAdmission::Cancelled(None),
+            })
+        }
+    }
+}
+
+fn cancelled_before_spawn_response() -> Result<ExecutorResponse, RpcError> {
+    Ok(ExecutorResponse::Bash {
+        result: BashExecutionResult {
+            output: String::new(),
+            truncation: truncate_tail("", TruncationOptions::default()),
+            artifact_handle: None,
+            observed_bytes: 0,
+            exit_code: None,
+            cancelled: true,
+            resource_limit: None,
+        },
+    })
 }
 
 async fn settle_manager_cancel(
@@ -1679,9 +1912,11 @@ async fn execute_non_bash(
                 })
             }
         }
-        ExecutorOperation::Bash { .. } | ExecutorOperation::Cancel { .. } => Err(
-            ToolError::Protocol("operation belongs to executor control loop".to_owned()),
-        ),
+        ExecutorOperation::Health {}
+        | ExecutorOperation::Bash { .. }
+        | ExecutorOperation::Cancel { .. } => Err(ToolError::Protocol(
+            "operation belongs to executor control loop".to_owned(),
+        )),
     }
 }
 
@@ -1696,6 +1931,9 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
         | ExecutorOperation::Grep { execution_id, .. }
         | ExecutorOperation::Bash { execution_id, .. }
         | ExecutorOperation::Cancel { execution_id } => execution_id,
+        ExecutorOperation::Health {} => {
+            unreachable!("health requests do not carry execution identities")
+        }
     }
 }
 
@@ -1824,6 +2062,9 @@ fn rpc_error(error: ToolError) -> RpcError {
         ToolError::Protocol(message) if message == RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE => {
             bounded_error(RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE)
         }
+        ToolError::Protocol(message) if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE => {
+            bounded_error(RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE)
+        }
         ToolError::Protocol(_) => bounded_error("protocol"),
     }
 }
@@ -1833,6 +2074,14 @@ fn is_boot_uniqueness_exhausted(error: &ToolError) -> bool {
         error,
         ToolError::Protocol(message) if message == RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE
     )
+}
+
+fn is_typed_admission_error(error: &ToolError) -> bool {
+    is_boot_uniqueness_exhausted(error)
+        || matches!(
+            error,
+            ToolError::Protocol(message) if message == RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE
+        )
 }
 
 fn bounded_error(code: &str) -> RpcError {
@@ -1930,6 +2179,8 @@ mod tests {
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir(&root).expect("create socket lock test directory");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict socket lock test directory");
 
         let symlink_socket = root.join("symlink.sock");
         drop(
@@ -1976,6 +2227,50 @@ mod tests {
                 .expect("second stale socket remains")
                 .file_type()
                 .is_socket()
+        );
+
+        let unsafe_parent = root.join("unsafe-parent");
+        std::fs::create_dir(&unsafe_parent).expect("create unsafe parent");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777))
+            .expect("make parent peer-writable");
+        let unsafe_socket = unsafe_parent.join("executor.sock");
+        drop(
+            std::os::unix::net::UnixListener::bind(&unsafe_socket)
+                .expect("bind stale unsafe-parent socket"),
+        );
+        assert!(
+            bind_unix_listener(&unsafe_socket, "test").await.is_err(),
+            "a peer-writable socket parent must fail closed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&unsafe_socket)
+                .expect("unsafe-parent stale socket remains")
+                .file_type()
+                .is_socket()
+        );
+
+        let trusted_parent = root.join("trusted-parent");
+        std::fs::create_dir(&trusted_parent).expect("create trusted parent");
+        std::fs::set_permissions(&trusted_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict trusted parent");
+        let linked_parent = root.join("linked-parent");
+        symlink(&trusted_parent, &linked_parent).expect("install parent symlink");
+        let linked_socket = linked_parent.join("executor.sock");
+        assert!(
+            bind_unix_listener(&linked_socket, "test").await.is_err(),
+            "a symlinked socket parent must fail closed"
+        );
+
+        let nested_parent = trusted_parent.join("nested");
+        std::fs::create_dir(&nested_parent).expect("create nested trusted parent");
+        let ancestor_link = root.join("ancestor-link");
+        symlink(&trusted_parent, &ancestor_link).expect("install parent-component symlink");
+        let ancestor_linked_socket = ancestor_link.join("nested/executor.sock");
+        assert!(
+            bind_unix_listener(&ancestor_linked_socket, "test")
+                .await
+                .is_err(),
+            "a symlinked ancestor of the socket parent must fail closed"
         );
 
         std::fs::remove_dir_all(root).expect("remove socket lock test directory");

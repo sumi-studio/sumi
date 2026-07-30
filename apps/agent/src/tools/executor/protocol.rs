@@ -105,6 +105,7 @@ impl RpcError {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorOperation {
+    Health {},
     ReadFile {
         path: String,
         offset: u64,
@@ -151,6 +152,7 @@ pub enum ExecutorOperation {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorResponse {
+    Healthy {},
     ReadFile { result: TruncationResult },
     Written {},
     Edited {},
@@ -218,6 +220,7 @@ pub trait RpcOperationValidation {
 impl RpcOperationValidation for ExecutorOperation {
     fn validate(&self) -> Result<(), ToolError> {
         match self {
+            Self::Health {} => Ok(()),
             Self::ReadFile {
                 path,
                 limit,
@@ -792,7 +795,7 @@ fn validate_artifact_handle_component(value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn rpc_id_digest(value: &str) -> RpcIdDigest {
+pub(super) fn rpc_id_digest(value: &str) -> RpcIdDigest {
     Sha256::digest(value.as_bytes()).into()
 }
 

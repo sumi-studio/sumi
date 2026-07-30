@@ -15,7 +15,7 @@ mod service;
 pub use artifact_broker::{ArtifactBroker, ArtifactGrepMatch, ArtifactResponse};
 pub use client::ArtifactBrokerClient;
 #[allow(unused_imports)]
-pub use executor_client::ExecutorClient;
+pub use executor_client::{ExecutorClient, ExecutorErrorClassification, classify_executor_error};
 #[allow(unused_imports)]
 pub use protocol::{
     ArtifactOperation, ExecutorOperation, ExecutorResponse, InputRoute, MAX_ATTACHMENT_CHUNK_BYTES,
