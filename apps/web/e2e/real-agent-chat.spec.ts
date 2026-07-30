@@ -106,6 +106,7 @@ test("Chrome direct chat reaches the real production agent for two contextual tu
   });
 
   const stack = await startRealAgentStack(build);
+  let primaryError: Error | undefined;
   try {
     await stack.installSession(context);
     const cookies = await context.cookies(stack.apiURL);
@@ -169,11 +170,24 @@ test("Chrome direct chat reaches the real production agent for two contextual tu
       assistantMessageEndSequence.get(firstProviderResponse) ?? 0,
     );
   } catch (error) {
-    throw new Error(
+    primaryError = new Error(
       `${error instanceof Error ? error.message : String(error)}\n\nDirect-chat frame diagnostics (types and sequences only):\n${directChatDiagnostics.join("\n")}\n\nRedacted child diagnostics:\n${stack.diagnostics()}`,
       { cause: error },
     );
-  } finally {
-    await stack.stop();
   }
+  let cleanupError: Error | undefined;
+  try {
+    await stack.stop();
+  } catch (error) {
+    cleanupError = error instanceof Error ? error : new Error(String(error));
+  }
+  if (primaryError && cleanupError) {
+    throw new AggregateError(
+      [primaryError, cleanupError],
+      primaryError.message,
+      { cause: primaryError },
+    );
+  }
+  if (primaryError) throw primaryError;
+  if (cleanupError) throw cleanupError;
 });

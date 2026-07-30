@@ -20,6 +20,7 @@ const agentDirectory = resolve(repositoryRoot, "apps/agent");
 const webDirectory = resolve(repositoryRoot, "apps/web");
 const maxChildLogCharacters = 64 * 1024;
 const processStopTimeoutMilliseconds = 8_000;
+const browserSessionAudience = "sumi:web:direct-chat";
 
 export const firstUserMessage = "real browser turn one";
 export const secondUserMessage = "real browser turn two";
@@ -110,7 +111,7 @@ export class LoopbackChatProvider {
       const turn = this.requests.length;
       if (turn === 1) {
         if (
-          !hasExactConversationSuffix(messages, [
+          !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
           ])
         ) {
@@ -122,7 +123,7 @@ export class LoopbackChatProvider {
       }
       if (turn === 2) {
         if (
-          !hasExactConversationSuffix(messages, [
+          !hasExactConversation(messages, [
             { role: "user", text: firstUserMessage },
             { role: "assistant", text: firstProviderResponse },
             { role: "user", text: secondUserMessage },
@@ -281,7 +282,11 @@ export async function startRealAgentStack(
     try {
       return await startRealAgentStackOnce(build);
     } catch (error) {
-      if (attempt === maxAddressBindAttempts || !isAddressInUse(error)) {
+      if (
+        error instanceof StartupCleanupError ||
+        attempt === maxAddressBindAttempts ||
+        !isAddressInUse(error)
+      ) {
         throw error;
       }
     }
@@ -358,6 +363,7 @@ async function startRealAgentStackOnce(
           env: {
             ...process.env,
             SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
+            SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
             SUMI_E2E_SESSION_TENANT_ID: tenantID,
             SUMI_E2E_SESSION_USER_ID: userID,
             SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
@@ -386,6 +392,7 @@ async function startRealAgentStackOnce(
         SUMI_AGENT_RUNTIME_STATE_DIR: paths.gatewayState,
         SUMI_AGENT_TOKEN_SECRET: agentTokenSecret,
         SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
+        SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
         SUMI_BROWSER_WS_ALLOWED_ORIGINS: webURL,
         SUMI_LOCAL_CONTROL_ENABLED: "1",
         SUMI_LOCAL_CONTROL_BEARER: localControlBearer,
@@ -495,12 +502,41 @@ async function startRealAgentStackOnce(
       children,
     });
   } catch (error) {
+    const cleanupErrors: Error[] = [];
     for (const child of [...children].reverse()) {
-      await child.stop().catch(() => undefined);
+      try {
+        await child.stop();
+      } catch (cleanupError) {
+        cleanupErrors.push(toError(cleanupError));
+      }
     }
-    await provider.stop().catch(() => undefined);
-    await rm(runtimeDirectory, { recursive: true, force: true });
+    try {
+      await provider.stop();
+    } catch (cleanupError) {
+      cleanupErrors.push(toError(cleanupError));
+    }
+    try {
+      await rm(runtimeDirectory, { recursive: true, force: true });
+    } catch (cleanupError) {
+      cleanupErrors.push(toError(cleanupError));
+    }
+    if (cleanupErrors.length > 0) {
+      throw new StartupCleanupError(toError(error), cleanupErrors);
+    }
     throw error;
+  }
+}
+
+class StartupCleanupError extends AggregateError {
+  constructor(startupError: Error, cleanupErrors: Error[]) {
+    super(
+      [startupError, ...cleanupErrors],
+      `${startupError.message}; startup cleanup failed: ${cleanupErrors
+        .map((error) => error.message)
+        .join("; ")}`,
+      { cause: startupError },
+    );
+    this.name = "StartupCleanupError";
   }
 }
 
@@ -790,7 +826,7 @@ async function readBoundedJSON(
   return parsed;
 }
 
-function hasExactConversationSuffix(
+function hasExactConversation(
   messages: unknown[],
   expected: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
 ): boolean {
@@ -803,11 +839,11 @@ function hasExactConversationSuffix(
     }
     return [{ role: message.role, text: messageText(message.content) }];
   });
-  if (conversation.length < expected.length) return false;
-  const suffix = conversation.slice(-expected.length);
+  if (conversation.length !== expected.length) return false;
   return expected.every(
     (entry, index) =>
-      suffix[index]?.role === entry.role && suffix[index]?.text === entry.text,
+      conversation[index]?.role === entry.role &&
+      conversation[index]?.text === entry.text,
   );
 }
 
