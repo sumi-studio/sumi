@@ -1453,6 +1453,7 @@ mod tests {
             "steered",
             "turn_start",
             "message_start",
+            "command_disposition",
             "message_end",
         ];
         let matched = events.windows(expected_sequence.len()).any(|window| {
@@ -1460,7 +1461,7 @@ mod tests {
         });
         assert!(
             matched,
-            "agent_events should contain the exact §6.3.1 sequence: {events:?}"
+            "agent_events should contain the exact §6.3.1 sequence with its authoritative disposition: {events:?}"
         );
     }
 

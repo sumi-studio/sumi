@@ -1326,7 +1326,10 @@ mod tests {
         writer: &EventWriter,
         minimum_event_count: usize,
     ) -> usize {
-        let cycle_count = minimum_event_count.div_ceil(2);
+        // Each cycle persists AgentStart, AgentEnd, and the authoritative
+        // dispositions for both the user command and its abort.
+        const EVENTS_PER_CYCLE: usize = 4;
+        let cycle_count = minimum_event_count.div_ceil(EVENTS_PER_CYCLE);
         let mut next_seq = u64::try_from(
             sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(seq),0) FROM inbound_commands")
                 .fetch_one(store.pool())
@@ -1395,7 +1398,7 @@ mod tests {
                 .expect("close valid history run");
             next_seq = next_seq.saturating_add(1);
         }
-        cycle_count * 2
+        cycle_count * EVENTS_PER_CYCLE
     }
 
     #[tokio::test]

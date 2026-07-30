@@ -1994,6 +1994,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ]
         );
         assert!(
@@ -2207,6 +2208,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ],
             "user_message -> public event sequence changed: {event_types:?}"
         );
@@ -2239,6 +2241,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ],
             "durable event sequence changed: {durable_types:?}"
         );
