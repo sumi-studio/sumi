@@ -12,7 +12,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net/http"
 	"strings"
@@ -237,17 +236,6 @@ func (e *SideEffectCancellationContractError) Unwrap() []error {
 	}
 	return []error{e.ContextErr, e.AdapterErr}
 }
-
-type agentConnectionEpoch struct {
-	id                     uint64
-	personalityAgentID     string
-	claims                 TokenClaims
-	conn                   *websocket.Conn
-	cancel                 context.CancelFunc
-	generationWatchStopped chan struct{}
-}
-
-var errConnectionEpochRevoked = errors.New("agent websocket connection epoch revoked")
 
 // NewServer returns a Server with the required seams. Missing seams leave the
 // handler fail-closed.
@@ -947,123 +935,6 @@ func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoc
 				continue
 			}
 			if observation.TerminalNotReady || epoch.readyObserved.Load() {
-				s.revokeConnectionEpoch(epoch)
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) generationPollInterval() time.Duration {
-	if s.GenerationPollInterval > 0 {
-		return s.GenerationPollInterval
-	}
-	return 250 * time.Millisecond
-}
-
-func (s *Server) epochGate(personalityAgentID string) *sync.Mutex {
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(personalityAgentID))
-	return &s.epochGates[hash.Sum32()%uint32(len(s.epochGates))]
-}
-
-func (s *Server) installConnectionEpoch(
-	conn *websocket.Conn,
-	claims TokenClaims,
-	cancel context.CancelFunc,
-) *agentConnectionEpoch {
-	epoch := &agentConnectionEpoch{
-		personalityAgentID:     claims.PersonalityAgentID,
-		claims:                 claims,
-		conn:                   conn,
-		cancel:                 cancel,
-		generationWatchStopped: make(chan struct{}),
-	}
-	gate := s.epochGate(claims.PersonalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	s.connectionsMu.Lock()
-	if s.connections == nil {
-		s.connections = make(map[string]*agentConnectionEpoch)
-	}
-	s.nextEpoch++
-	epoch.id = s.nextEpoch
-	previous := s.connections[claims.PersonalityAgentID]
-	s.connections[claims.PersonalityAgentID] = epoch
-	s.connectionsMu.Unlock()
-
-	if previous != nil {
-		previous.cancel()
-		_ = previous.conn.Close()
-	}
-	return epoch
-}
-
-func (s *Server) removeConnectionEpoch(epoch *agentConnectionEpoch) {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	s.connectionsMu.Lock()
-	if s.connections[epoch.personalityAgentID] == epoch {
-		delete(s.connections, epoch.personalityAgentID)
-	}
-	s.connectionsMu.Unlock()
-}
-
-func (s *Server) revokeConnectionEpoch(epoch *agentConnectionEpoch) {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	s.connectionsMu.Lock()
-	current := s.connections[epoch.personalityAgentID] == epoch
-	if current {
-		delete(s.connections, epoch.personalityAgentID)
-	}
-	s.connectionsMu.Unlock()
-	if current {
-		epoch.cancel()
-		_ = epoch.conn.Close()
-	}
-}
-
-func (s *Server) withCurrentConnectionEpoch(
-	ctx context.Context,
-	epoch *agentConnectionEpoch,
-	call func() error,
-) error {
-	gate := s.epochGate(epoch.personalityAgentID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.connectionsMu.Lock()
-	current := s.connections[epoch.personalityAgentID] == epoch
-	s.connectionsMu.Unlock()
-	if !current {
-		return errConnectionEpochRevoked
-	}
-	return call()
-}
-
-func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoch) {
-	defer close(epoch.generationWatchStopped)
-	ticker := time.NewTicker(s.generationPollInterval())
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := s.Generation.VerifyGeneration(
-				ctx,
-				epoch.personalityAgentID,
-				epoch.claims.Generation,
-			); err != nil {
 				s.revokeConnectionEpoch(epoch)
 				return
 			}
