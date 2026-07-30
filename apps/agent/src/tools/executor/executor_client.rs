@@ -115,13 +115,28 @@ impl ExecutorClient {
     }
 
     pub async fn health(&self) -> Result<(), ToolError> {
+        self.health_with_cancellation(CancellationToken::new(), self.deadlines.overall)
+            .await
+    }
+
+    /// Run one authenticated Health exchange on a fresh Unix connection.
+    ///
+    /// Health has no execution identity, so cancellation is prompt only before
+    /// request emission. After emission the short `overall` bound closes the
+    /// connection without manufacturing an invalid empty Cancel operation.
+    pub async fn health_with_cancellation(
+        &self,
+        cancel: CancellationToken,
+        overall: Duration,
+    ) -> Result<(), ToolError> {
         match self
-            .execute(
+            .execute_with_overall(
                 ExecutorOperation::Health {
                     service_role: ExecutorServiceRole::ToolExecutor,
                 },
-                CancellationToken::new(),
+                cancel,
                 Arc::new(|_| {}),
+                overall,
             )
             .await?
         {
@@ -140,6 +155,17 @@ impl ExecutorClient {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
+        self.execute_with_overall(operation, cancel, on_update, self.deadlines.overall)
+            .await
+    }
+
+    async fn execute_with_overall(
+        &self,
+        operation: ExecutorOperation,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        overall: Duration,
+    ) -> Result<ExecutorResponse, ToolError> {
         operation.validate()?;
         validate_operation_for_personality_agent(&operation, self.identity.personality_agent_id())?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
@@ -153,7 +179,7 @@ impl ExecutorClient {
 
         let request_emitted = Arc::new(AtomicBool::new(false));
         let execution = self.execute_inner(operation, cancel, on_update, request_emitted.clone());
-        match timeout(self.deadlines.overall, execution).await {
+        match timeout(overall, execution).await {
             Ok(result) => result,
             Err(_) if request_emitted.load(Ordering::Acquire) => {
                 Err(indeterminate("executor overall exchange deadline elapsed"))
@@ -1133,7 +1159,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
 
         for mode in [
-            "wrong-identity",
+            "wrong-paid",
+            "wrong-generation",
+            "wrong-nonce",
+            "wrong-role",
             "malformed",
             "stalled",
             "eof",
@@ -1150,18 +1179,34 @@ mod tests {
                 let (read, mut write) = stream.into_split();
                 let request = read_request(&mut BufReader::new(read)).await;
                 match mode {
-                    "wrong-identity" => {
+                    "wrong-paid" | "wrong-generation" | "wrong-nonce" | "wrong-role" => {
+                        let personality_agent_id = if mode == "wrong-paid" {
+                            "0198f0f4-9b72-7000-8000-000000000002"
+                        } else {
+                            PAID
+                        };
+                        let generation = if mode == "wrong-generation" { 8 } else { 7 };
+                        let nonce = if mode == "wrong-nonce" {
+                            "wrong"
+                        } else {
+                            "boot-nonce"
+                        };
+                        let service_role = if mode == "wrong-role" {
+                            "artifact_broker"
+                        } else {
+                            "tool_executor"
+                        };
                         write_json_line(
                             &mut write,
                             json!({
                                 "type":"terminal",
-                                "personality_agent_id":PAID,
-                                "generation":7,
-                                "nonce":"wrong",
+                                "personality_agent_id":personality_agent_id,
+                                "generation":generation,
+                                "nonce":nonce,
                                 "request_id":request["request_id"],
                                 "result":{"Ok":{
                                     "type":"healthy",
-                                    "service_role":"tool_executor"
+                                    "service_role":service_role
                                 }}
                             }),
                         )
@@ -1314,6 +1359,36 @@ mod tests {
                 service_role: ExecutorServiceRole::ToolExecutor,
             }
         );
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_health_deadline_closes_the_probe_without_sending_cancel() {
+        let root = temp_root("health-short-deadline");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let request = read_request(&mut read).await;
+            assert_eq!(request["operation"]["type"], "health");
+            let mut trailing = String::new();
+            let count = timeout(Duration::from_millis(250), read.read_line(&mut trailing))
+                .await
+                .expect("short Health deadline must close its Unix connection")
+                .expect("read Health connection close");
+            assert_eq!(count, 0, "deadline must close without a Cancel frame");
+            assert!(trailing.is_empty());
+        });
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .health_with_cancellation(CancellationToken::new(), Duration::from_millis(40))
+            .await
+            .expect_err("stalled Health must obey its short probe deadline");
+        assert!(matches!(error, ToolError::RpcIndeterminate(_)));
         server.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
