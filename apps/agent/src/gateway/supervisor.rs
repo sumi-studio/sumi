@@ -21,7 +21,9 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -831,6 +833,7 @@ where
     cancel: CancellationToken,
     /// Test-only notification fired when `send_validated` is about to block on
     /// a full command channel.
+    #[cfg(test)]
     command_send_blocked_notify: Option<Arc<Notify>>,
 }
 
@@ -861,10 +864,12 @@ where
             current_epoch,
             online: Arc::new(online_tx),
             cancel: CancellationToken::new(),
+            #[cfg(test)]
             command_send_blocked_notify: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_command_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
         self.command_send_blocked_notify = Some(notify);
         self
@@ -1145,6 +1150,7 @@ where
         self.current_epoch.send_replace(Some(delivery_epoch));
         let _ = delivery_ready_tx.send(Ok(()));
 
+        #[cfg(test)]
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
         let mut reader_handle = tokio::spawn(reader_task(
             reader,
@@ -1153,6 +1159,7 @@ where
             api_hello,
             config.personality_agent_id.clone(),
             epoch_token.child_token(),
+            #[cfg(test)]
             command_send_blocked_notify,
         ));
 
@@ -2153,7 +2160,7 @@ async fn reader_task<R, L>(
     api_hello: ApiHello,
     personality_agent_id: PersonalityAgentId,
     token: CancellationToken,
-    command_send_blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] command_send_blocked_notify: Option<Arc<Notify>>,
 ) -> Result<(), ReaderError>
 where
     R: GatewayReader + 'static,
@@ -2211,7 +2218,16 @@ where
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
-                        next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                        next_expected = send_validated(
+                            cmd,
+                            &personality_agent_id,
+                            next_expected,
+                            &mut command_tx,
+                            &token,
+                            #[cfg(test)]
+                            command_send_blocked_notify.clone(),
+                        )
+                        .await?;
                     }
                     if terminal_after_pending {
                         break 'task Err(ReaderError::Terminal);
@@ -2224,7 +2240,16 @@ where
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
-                                next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                                next_expected = send_validated(
+                                    cmd,
+                                    &personality_agent_id,
+                                    next_expected,
+                                    &mut command_tx,
+                                    &token,
+                                    #[cfg(test)]
+                                    command_send_blocked_notify.clone(),
+                                )
+                                .await?;
                             } else if pending.len() >= MAX_PENDING_BEFORE_READY {
                                 break 'task Err(ReaderError::Fatal(anyhow!(
                                     "hydration hold limit exceeded: {} commands received before Ready",
@@ -2269,7 +2294,7 @@ async fn send_validated(
     next_expected: u64,
     command_tx: &mut mpsc::Sender<InboundCommand>,
     token: &CancellationToken,
-    blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] blocked_notify: Option<Arc<Notify>>,
 ) -> Result<u64> {
     if cmd.personality_agent_id() != expected_personality_agent_id {
         bail!(
@@ -2289,11 +2314,14 @@ async fn send_validated(
     if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
-    if !token.is_cancelled()
-        && let Some(notify) = blocked_notify.as_ref()
-        && command_tx.capacity() == 0
+    #[cfg(test)]
     {
-        notify.notify_one();
+        if !token.is_cancelled()
+            && let Some(notify) = blocked_notify.as_ref()
+            && command_tx.capacity() == 0
+        {
+            notify.notify_one();
+        }
     }
     tokio::select! {
         biased;

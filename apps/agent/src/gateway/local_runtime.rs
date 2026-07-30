@@ -340,12 +340,31 @@ impl LocalControlHttpClient {
             .join(PUBLISH_RUNTIME_STATE_PATH)
             .context("join local control endpoint URL")
             .map_err(LocalPublicationError::terminal)?;
-        let response = self
-            .http
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => (
+                build_unix_http_client(&endpoint.path).map_err(LocalPublicationError::terminal)?,
+                Some(endpoint),
+            ),
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let mut request = http
             .post(url)
             .bearer_auth(self.credential.token.as_str())
-            .json(publication)
-            .send()
+            .json(publication);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request
+            .build()
+            .context("build local control publication request")
+            .map_err(LocalPublicationError::terminal)?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint
+                .revalidate()
+                .map_err(LocalPublicationError::terminal)?;
+        }
+        let response = http
+            .execute(request)
             .await
             .context("local control publication request failed")
             .map_err(LocalPublicationError::indeterminate)?;
@@ -2425,7 +2444,7 @@ mod tests {
             SystemTime::now() + Duration::from_secs(30),
         )
         .unwrap();
-        let client = LoopbackHttpControlClient::new(
+        let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected.clone(),
             credential,
@@ -2478,7 +2497,7 @@ mod tests {
             SystemTime::now() + Duration::from_secs(30),
         )
         .unwrap();
-        let client = LoopbackHttpControlClient::new(
+        let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected.clone(),
             credential,

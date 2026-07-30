@@ -2270,9 +2270,12 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_invalidation_joins_a_pool_blocked_t17_delivery_read() {
-        let mut fixture =
-            PoolBlockedAdmissionFixture::start("post-commit-drop-pool-blocked-t17").await;
-        let connection = fixture.block_delivery_on_store_connection().await;
+        let mut fixture = PendingAdmissionFixture::start(
+            "post-commit-drop-pool-blocked-t17",
+            PendingDeliveryPhase::StoreRead,
+        )
+        .await;
+        let blocker = fixture.block_delivery_at_phase().await;
 
         fixture
             .dispatcher
@@ -2285,7 +2288,7 @@ mod tests {
         assert_eq!(fixture.adapter.durable_fence_count(), 0);
         fixture.assert_no_old_epoch_delivery();
 
-        drop(connection);
+        blocker.release();
         fixture.finish().await;
     }
 

@@ -37,8 +37,8 @@ use crate::{
         local_runtime::{
             FIRST_BROWSER_VERTICAL_COMPONENTS, LocalControlCredential, LocalControlHttpClient,
             LocalControlReadyPublisher as LocalRuntimePublisher, LocalCredentialProvider,
-            LocalPublicationError, LocalPublicationResult, LocalReadyPublisher,
-            LocalRuntimeComponent, first_browser_vertical_ready_gate,
+            LocalPublicationResult, LocalReadyPublisher, LocalRuntimeComponent,
+            first_browser_vertical_ready_gate,
         },
         supervisor::{
             ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig, SupervisorRuntime,
@@ -55,7 +55,7 @@ use crate::{
     },
     tools::{
         WorkspacePaths,
-        executor::{ArtifactBrokerClient, ExecutorClient, remote_executor_registry},
+        executor::{ExecutorClient, remote_executor_registry},
     },
 };
 
@@ -66,7 +66,6 @@ struct BootstrapContext {
     authority: RuntimeEpochAuthority,
     state_dir: PathBuf,
     executor_socket: PathBuf,
-    artifact_broker_socket: PathBuf,
     gateway_url: String,
     allow_insecure_loopback_gateway: bool,
     local_control_endpoint: LocalControlEndpoint,
@@ -106,8 +105,6 @@ impl BootstrapContext {
 
         let state_dir = required_absolute_path(&mut get, "SUMI_STATE_DIR")?;
         let executor_socket = required_absolute_path(&mut get, "SUMI_EXECUTOR_SOCKET")?;
-        let artifact_broker_socket =
-            required_absolute_path(&mut get, "SUMI_ARTIFACT_BROKER_SOCKET")?;
         let gateway_url = required_value(&mut get, "SUMI_GATEWAY_URL")?;
         let local_control_endpoint = local_control_endpoint_from_env(&mut get)?;
         let local_control_bearer = required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER")?;
@@ -135,7 +132,6 @@ impl BootstrapContext {
             authority: allocation.into_authority(),
             state_dir,
             executor_socket,
-            artifact_broker_socket,
             gateway_url,
             allow_insecure_loopback_gateway,
             local_control_endpoint,
@@ -347,24 +343,16 @@ trait AuthenticatedDependencyMonitor: Send {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "authenticated runtime dependency monitoring is unavailable; executor and artifact broker Health streams must bind the exact RpcIdentity before Ready"
+    "authenticated runtime dependency monitoring is unavailable; executor Health must bind the exact RpcIdentity before Ready"
 )]
 struct AuthenticatedDependencyMonitoringUnavailable;
 
 fn authenticated_dependency_monitor(
     _executor: Arc<ExecutorClient>,
-    _broker: ArtifactBrokerClient,
 ) -> Result<Box<dyn AuthenticatedDependencyMonitor>> {
     Err(anyhow::Error::new(
         AuthenticatedDependencyMonitoringUnavailable,
     ))
-}
-
-fn artifact_broker_client(context: &BootstrapContext) -> ArtifactBrokerClient {
-    ArtifactBrokerClient::new(
-        &context.artifact_broker_socket,
-        context.authority.rpc_identity().clone(),
-    )
 }
 
 const CONTROL_PLANE_RECONCILIATION_ATTEMPTS: usize = 4;
@@ -829,7 +817,6 @@ async fn run_after_not_ready(
     let shutdown = CancellationToken::new();
     let preparation = async {
         validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
-        validate_trusted_ipc_socket_parent(&context.artifact_broker_socket, "artifact broker")?;
         let config = Config::load().await.context("load production config")?;
         if config.personality_agent_id != *context.authority.personality_agent_id() {
             bail!("config PAID does not match the supervisor runtime allocation");
@@ -890,7 +877,6 @@ async fn run_after_not_ready(
             &ExecutorHealthApiUnavailable,
         )
         .await?;
-        let artifact_broker = artifact_broker_client(context);
         let registry = remote_executor_registry(executor_client.clone())
             .context("build exact remote executor registry")?;
         let prompt = PromptContext {
@@ -910,7 +896,6 @@ async fn run_after_not_ready(
             Some(context.authority.generation()),
         )
         .context("compose real provider RunDriver")?
-        .with_broker(artifact_broker)
         .with_hydrated_memory(
             store.clone(),
             context.authority.lease(),
@@ -919,8 +904,7 @@ async fn run_after_not_ready(
         )
         .context("install authenticated memory/provider context")?;
         let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
-        let dependency_monitor =
-            authenticated_dependency_monitor(executor_client, artifact_broker_client(context))?;
+        let dependency_monitor = authenticated_dependency_monitor(executor_client)?;
 
         let command_digest_factory = store.command_digest_factory().await?;
         let connector = if context.allow_insecure_loopback_gateway {
@@ -1820,10 +1804,6 @@ mod tests {
                 "/tmp/sumi-executor.sock".into(),
             ),
             (
-                "SUMI_ARTIFACT_BROKER_SOCKET".to_owned(),
-                "/tmp/sumi-artifact-broker.sock".into(),
-            ),
-            (
                 "SUMI_GATEWAY_URL".to_owned(),
                 "wss://gateway.example.test/agent".into(),
             ),
@@ -2233,7 +2213,6 @@ mod tests {
             "SUMI_GENERATION_RECOVERY_FENCE_ID",
             "SUMI_STATE_DIR",
             "SUMI_EXECUTOR_SOCKET",
-            "SUMI_ARTIFACT_BROKER_SOCKET",
             "SUMI_GATEWAY_URL",
             "SUMI_LOCAL_CONTROL_UNIX_SOCKET",
             "SUMI_LOCAL_CONTROL_SERVER_UID",
@@ -2871,7 +2850,7 @@ mod tests {
             &context.executor_socket,
             context.authority.rpc_identity().clone(),
         ));
-        let error = authenticated_dependency_monitor(executor, artifact_broker_client(&context))
+        let error = authenticated_dependency_monitor(executor)
             .err()
             .expect("missing Health API must prevent Ready");
         assert!(
