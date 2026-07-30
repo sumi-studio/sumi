@@ -47,4 +47,13 @@ describe("browser auth origin boundary", () => {
       }),
     ).toBe(true);
   });
+
+  it("rejects a path-prefixed API base that the auth routes cannot honor", () => {
+    expect(
+      hasAllowedAuthOrigin({
+        apiBaseURL: "https://app.sumi.example/api",
+        pageOrigin: "https://app.sumi.example",
+      }),
+    ).toBe(false);
+  });
 });

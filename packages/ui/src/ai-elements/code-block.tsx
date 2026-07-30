@@ -109,13 +109,20 @@ function getHighlighter(language: HighlightLanguage): Promise<CoreHighlighter> {
     languageLoaders[language](),
     import("shiki/themes/github-light.mjs").then((module) => module.default),
     import("shiki/themes/github-dark.mjs").then((module) => module.default),
-  ]).then(([languageDefinition, lightTheme, darkTheme]) =>
-    createHighlighterCore({
-      engine: createJavaScriptRegexEngine(),
-      langs: [languageDefinition],
-      themes: [lightTheme, darkTheme],
-    }),
-  );
+  ])
+    .then(([languageDefinition, lightTheme, darkTheme]) =>
+      createHighlighterCore({
+        engine: createJavaScriptRegexEngine(),
+        langs: [languageDefinition],
+        themes: [lightTheme, darkTheme],
+      }),
+    )
+    .catch((error: unknown) => {
+      if (highlighterCache.get(language) === highlighter) {
+        highlighterCache.delete(language);
+      }
+      throw error;
+    });
   highlighterCache.set(language, highlighter);
   return highlighter;
 }

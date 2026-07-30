@@ -45,6 +45,10 @@ export type AdmitPrivateOutboxResult =
     }
   | { kind: "missing" }
   | {
+      kind: "persistence_failed";
+      entry: Extract<PrivateOutboxEntry, { state: "admitted" }>;
+    }
+  | {
       kind: "already_recoverable";
       entry: Extract<PrivateOutboxEntry, { state: "recoverable" }>;
     }
@@ -97,17 +101,13 @@ export class PrivateOutbox {
     ) {
       return false;
     }
-    this.entriesValue = [
+    const next = [
       ...this.entriesValue,
       { state: "pending", idempotencyKey, text },
-    ];
-    if (this.persist()) return true;
+    ] satisfies PrivateOutboxEntry[];
     // A pending command must be durable before its composer can be cleared:
     // an in-memory-only row disappears on reload and cannot safely be retried.
-    this.entriesValue = this.entriesValue.filter(
-      (entry) => entry.idempotencyKey !== idempotencyKey,
-    );
-    return false;
+    return this.commit(next);
   }
 
   admit(
@@ -146,7 +146,9 @@ export class PrivateOutbox {
       commandId,
       commandSeq,
     };
-    this.replace(index, admitted);
+    if (!this.replace(index, admitted)) {
+      return { kind: "persistence_failed", entry: admitted };
+    }
     return { kind: "admitted", entry: admitted };
   }
 
@@ -198,16 +200,13 @@ export class PrivateOutbox {
       (entry) => entry.idempotencyKey !== idempotencyKey,
     );
     if (next.length === this.entriesValue.length) return false;
-    this.entriesValue = next;
-    this.persist();
-    return true;
+    return this.commit(next);
   }
 
   consumeRecoverable(idempotencyKey: string): string | undefined {
     const entry = this.findByIdempotencyKey(idempotencyKey);
     if (entry?.state !== "recoverable") return undefined;
-    this.removeByIdempotencyKey(idempotencyKey);
-    return entry.text;
+    return this.removeByIdempotencyKey(idempotencyKey) ? entry.text : undefined;
   }
 
   clear(): void {
@@ -238,15 +237,27 @@ export class PrivateOutbox {
           }
         : {}),
     };
-    this.replace(index, recoverable);
-    return recoverable;
+    return this.replace(index, recoverable) ? recoverable : undefined;
   }
 
-  private replace(index: number, entry: PrivateOutboxEntry) {
-    this.entriesValue = this.entriesValue.map((candidate, candidateIndex) =>
-      candidateIndex === index ? entry : candidate,
+  private replace(index: number, entry: PrivateOutboxEntry): boolean {
+    return this.commit(
+      this.entriesValue.map((candidate, candidateIndex) =>
+        candidateIndex === index ? entry : candidate,
+      ),
     );
-    this.persist();
+  }
+
+  private commit(next: PrivateOutboxEntry[]): boolean {
+    const previous = this.entriesValue;
+    this.entriesValue = next;
+    if (this.persist()) return true;
+    // The in-memory projection must never claim a transition that its
+    // session-private durability boundary rejected. Callers can then keep the
+    // user-visible state recoverable instead of reintroducing a stale row on
+    // reload.
+    this.entriesValue = previous;
+    return false;
   }
 
   private load(): PrivateOutboxEntry[] {

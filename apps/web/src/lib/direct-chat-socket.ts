@@ -823,6 +823,15 @@ export function resolveDirectChatURL({
   const pageURL = new URL(pageOrigin);
   const configuredBase = apiBaseURL?.trim();
   const apiURL = configuredBase ? new URL(configuredBase, pageURL) : pageURL;
+  if (
+    apiURL.pathname !== "/" ||
+    apiURL.search ||
+    apiURL.hash ||
+    apiURL.username ||
+    apiURL.password
+  ) {
+    throw new Error("direct chat API base URL must contain only an origin");
+  }
   // Authentication cookies and the WebSocket upgrade are one same-origin
   // browser contract. A cross-origin fixture is permitted only when the
   // explicit preissued mode bypasses browser session authentication.

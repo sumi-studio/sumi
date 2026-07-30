@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AuthAPIError,
+  authRequestTimeoutMilliseconds,
   establishSumiSession,
   exchangeFirebaseIDToken,
   getSumiSession,
@@ -11,6 +12,7 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("Sumi browser session client", () => {
@@ -167,6 +169,48 @@ describe("Sumi browser session client", () => {
         }),
       }),
     ]);
+  });
+
+  it("bounds every authentication request with a fresh timeout signal", async () => {
+    const signals = Array.from(
+      { length: 5 },
+      () => new AbortController().signal,
+    );
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation(
+        () => signals.shift() ?? new AbortController().signal,
+      );
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "i".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ authenticated: false }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ csrf_token: "j".repeat(43) }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await exchangeFirebaseIDToken("firebase-id-token");
+    await getSumiSession();
+    await logoutSumiSession();
+
+    expect(timeout).toHaveBeenCalledTimes(5);
+    expect(timeout).toHaveBeenCalledWith(authRequestTimeoutMilliseconds);
+    expect(
+      fetchMock.mock.calls.every(
+        ([, init]) => init?.signal instanceof AbortSignal,
+      ),
+    ).toBe(true);
   });
 
   it("rejects a session response with an oversized declared body", async () => {

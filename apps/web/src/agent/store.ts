@@ -12,7 +12,7 @@ import type {
   ConversationModel,
   RecoverableDraft,
 } from "./model";
-import { PrivateOutbox } from "./private-outbox";
+import { PrivateOutbox, type PrivateOutboxEntry } from "./private-outbox";
 import {
   type AgentSession,
   createAgentSession,
@@ -73,6 +73,10 @@ export function createConversationStore({
   let ready: DirectChatReadyState = "unknown";
   let started = false;
   const approvalSubmissionLatches = new Set<string>();
+  const undurableAdmissions = new Map<
+    string,
+    Extract<PrivateOutboxEntry, { state: "admitted" }>
+  >();
 
   // Pending rows restored from a prior page are intentionally not replayed:
   // the user never saw a durable admission and an automatic retry could
@@ -139,30 +143,43 @@ export function createConversationStore({
         { type: "command_disposition" }
       >,
     ) => {
-      const entry = outbox.findByCommand(
+      const correlationKey = commandCorrelationKey(
         disposition.command_id,
         disposition.command_seq,
       );
+      const undurableEntry = undurableAdmissions.get(correlationKey);
+      const entry =
+        outbox.findByCommand(disposition.command_id, disposition.command_seq) ??
+        undurableEntry;
       if (!entry) return;
       if (disposition.status === "applied") {
         const canonicalMessageId = userMessageIdFromCommandId(
           disposition.command_id,
         );
         if (isCanonicalUserMessage(session.conversation, canonicalMessageId)) {
-          outbox.removeByIdempotencyKey(entry.idempotencyKey);
+          if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
+            undurableAdmissions.delete(correlationKey);
+          }
           removeOptimistic(entry.idempotencyKey);
         } else {
           ensureOptimistic(entry, "admitted");
         }
         return;
       }
-      outbox.recoverByCommand(
-        disposition.command_id,
-        disposition.command_seq,
+      const reason =
         disposition.status === "superseded"
           ? "superseded"
-          : (disposition.reject_reason ?? "rejected"),
-      );
+          : (disposition.reject_reason ?? "rejected");
+      const recovered = undurableEntry
+        ? outbox.recoverByIdempotencyKey(entry.idempotencyKey, reason)
+        : outbox.recoverByCommand(
+            disposition.command_id,
+            disposition.command_seq,
+            reason,
+          );
+      if (recovered) {
+        undurableAdmissions.delete(correlationKey);
+      }
       removeOptimistic(entry.idempotencyKey);
     };
 
@@ -171,6 +188,13 @@ export function createConversationStore({
         if (entry.state !== "admitted") continue;
         if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
         outbox.removeByIdempotencyKey(entry.idempotencyKey);
+        removeOptimistic(entry.idempotencyKey);
+      }
+      for (const [correlationKey, entry] of undurableAdmissions) {
+        if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
+        if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
+          undurableAdmissions.delete(correlationKey);
+        }
         removeOptimistic(entry.idempotencyKey);
       }
     };
@@ -223,10 +247,30 @@ export function createConversationStore({
           );
           if (admitted.kind === "missing") return;
           if (admitted.kind === "already_recoverable") return;
+          if (admitted.kind === "persistence_failed") {
+            const correlationKey = commandCorrelationKey(
+              frame.command_id,
+              frame.seq,
+            );
+            undurableAdmissions.set(correlationKey, admitted.entry);
+            ensureOptimistic(admitted.entry, "admitted");
+            if (frame.disposition) {
+              applyDisposition(frame.disposition);
+            }
+            publish(
+              undurableAdmissions.has(correlationKey)
+                ? "Command admission could not be saved for recovery"
+                : null,
+            );
+            return;
+          }
           if (admitted.kind === "conflict") {
             publish("Command admission could not be reconciled");
             return;
           }
+          undurableAdmissions.delete(
+            commandCorrelationKey(frame.command_id, frame.seq),
+          );
           if (
             isCanonicalUserMessage(session.conversation, canonicalMessageId)
           ) {
@@ -294,6 +338,7 @@ export function createConversationStore({
           transport.close();
         }
         outbox.clear();
+        undurableAdmissions.clear();
         session = createAgentSession();
         connection = "closed";
         ready = "unknown";
@@ -386,6 +431,10 @@ export function createConversationStore({
       },
     };
   });
+}
+
+function commandCorrelationKey(commandId: string, commandSeq: number): string {
+  return `${commandId}:${commandSeq}`;
 }
 
 function findOptimistic(

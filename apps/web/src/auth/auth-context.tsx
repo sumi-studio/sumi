@@ -63,6 +63,15 @@ export function hasAllowedAuthOrigin({
     const pageURL = new URL(pageOrigin);
     const configuredBase = apiBaseURL?.trim();
     const apiURL = configuredBase ? new URL(configuredBase, pageURL) : pageURL;
+    if (
+      apiURL.pathname !== "/" ||
+      apiURL.search ||
+      apiURL.hash ||
+      apiURL.username ||
+      apiURL.password
+    ) {
+      return false;
+    }
     return apiURL.origin === pageURL.origin || authMode === "preissued";
   } catch {
     return false;

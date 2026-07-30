@@ -206,6 +206,55 @@ test("storage denial refuses an undurable pending command", () => {
   assert.deepEqual(outbox.entries(), []);
 });
 
+test("failed transition persistence rolls memory back to the durable row", () => {
+  const storage = new FailableMemoryStorage();
+  const outbox = new PrivateOutbox(storage);
+  assert.equal(outbox.putPending("key", "hello"), true);
+
+  storage.failMutations = true;
+  assert.deepEqual(outbox.admit("key", CommandId, 1), {
+    kind: "persistence_failed",
+    entry: {
+      state: "admitted",
+      idempotencyKey: "key",
+      text: "hello",
+      commandId: CommandId,
+      commandSeq: 1,
+    },
+  });
+  assert.deepEqual(outbox.entries(), [
+    { state: "pending", idempotencyKey: "key", text: "hello" },
+  ]);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), outbox.entries());
+
+  assert.equal(outbox.recoverByIdempotencyKey("key", "unavailable"), undefined);
+  assert.deepEqual(outbox.entries(), [
+    { state: "pending", idempotencyKey: "key", text: "hello" },
+  ]);
+});
+
+test("failed removal is not consumed or cleared in memory", () => {
+  const storage = new FailableMemoryStorage();
+  const outbox = new PrivateOutbox(storage);
+  assert.equal(outbox.putPending("key", "hello"), true);
+  assert.equal(
+    outbox.recoverByIdempotencyKey("key", "unavailable")?.state,
+    "recoverable",
+  );
+
+  storage.failMutations = true;
+  assert.equal(outbox.removeByIdempotencyKey("key"), false);
+  assert.equal(outbox.consumeRecoverable("key"), undefined);
+  assert.deepEqual(outbox.recoverableDrafts(), [
+    {
+      idempotencyKey: "key",
+      text: "hello",
+      reason: "unavailable",
+    },
+  ]);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), outbox.entries());
+});
+
 class MemoryStorage implements PrivateOutboxStorage {
   private readonly values = new Map<string, string>();
 
@@ -223,5 +272,19 @@ class MemoryStorage implements PrivateOutboxStorage {
 
   value(key: string) {
     return this.values.get(key);
+  }
+}
+
+class FailableMemoryStorage extends MemoryStorage {
+  failMutations = false;
+
+  override setItem(key: string, value: string) {
+    if (this.failMutations) throw new Error("storage denied");
+    super.setItem(key, value);
+  }
+
+  override removeItem(key: string) {
+    if (this.failMutations) throw new Error("storage denied");
+    super.removeItem(key);
   }
 }

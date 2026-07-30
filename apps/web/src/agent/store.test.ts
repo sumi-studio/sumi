@@ -582,6 +582,78 @@ test("durable outbox failure keeps the composer content unsent", () => {
   );
 });
 
+test("admission persistence failure remains provisional and is surfaced", () => {
+  let stored: string | null = null;
+  let failMutations = false;
+  const storage: PrivateOutboxStorage = {
+    getItem: () => stored,
+    setItem(_key, value) {
+      if (failMutations) throw new Error("session storage denied");
+      stored = value;
+    },
+    removeItem() {
+      if (failMutations) throw new Error("session storage denied");
+      stored = null;
+    },
+  };
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox(storage);
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "undurable-admission",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("keep provisional"), true);
+
+  failMutations = true;
+  transport.emit(accepted("undurable-admission", CommandId, 1));
+
+  assert.equal(
+    store.getState().lastError,
+    "Command admission could not be saved for recovery",
+  );
+  assert.equal(
+    store.getState().conversation.entries["optimistic:undurable-admission"]
+      ?.kind,
+    "user",
+  );
+  const optimistic =
+    store.getState().conversation.entries["optimistic:undurable-admission"];
+  if (optimistic?.kind === "user") {
+    assert.equal(optimistic.delivery, "admitted");
+  }
+  assert.deepEqual(outbox.entries(), [
+    {
+      state: "pending",
+      idempotencyKey: "undurable-admission",
+      text: "keep provisional",
+    },
+  ]);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), outbox.entries());
+
+  failMutations = false;
+  const messageId = userMessageIdFromCommandId(CommandId);
+  transport.emit({
+    type: "event",
+    envelope: {
+      seq: 2,
+      event: {
+        type: "message_end",
+        message_id: messageId,
+        message: userMessage("keep provisional"),
+      },
+    },
+  });
+  assert.equal(
+    store.getState().conversation.entries["optimistic:undurable-admission"],
+    undefined,
+  );
+  assert.equal(store.getState().conversation.entries[messageId]?.kind, "user");
+  assert.deepEqual(outbox.entries(), []);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), []);
+});
+
 test("approval decision is synchronously latched until durable resolution", () => {
   const transport = new FakeTransport();
   const store = createConversationStore({

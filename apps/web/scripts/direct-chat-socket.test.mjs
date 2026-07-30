@@ -4,6 +4,7 @@ import {
   DirectChatSocket,
   isDirectChatCommand,
   parseDirectChatServerFrame,
+  resolveDirectChatURL,
 } from "../src/lib/direct-chat-socket.ts";
 import { DirectChatTimeline } from "../src/lib/direct-chat-timeline.ts";
 
@@ -90,6 +91,17 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { source: "project-policy" } } }), true);
   assert.equal(isDirectChatCommand({ type: "approval_decision", request_id: "request-1", decision: { type: "approve_always", rule: { scope: [{ personalityAgentId: "literal-data", paid: true }] } } }), true);
   socket.close();
+});
+
+test("rejects a path-prefixed API base instead of silently discarding it", () => {
+  assert.throws(
+    () =>
+      resolveDirectChatURL({
+        apiBaseURL: "http://browser.test/api",
+        pageOrigin: "http://browser.test",
+      }),
+    /must contain only an origin/,
+  );
 });
 
 test("retries an uncertain command with its original key and stops after acceptance", () => {

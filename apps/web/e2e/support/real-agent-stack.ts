@@ -79,7 +79,6 @@ export class LoopbackChatProvider {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    this.requestCount++;
     try {
       if (request.method !== "POST" || request.url !== "/chat/completions") {
         respondJSON(response, 404, { error: "not_found" });
@@ -101,6 +100,7 @@ export class LoopbackChatProvider {
         respondJSON(response, 415, { error: "application_json_required" });
         return;
       }
+      this.requestCount++;
       const raw = await readBoundedJSON(request);
       const messages = Array.isArray(raw.messages) ? raw.messages : undefined;
       if (!messages || raw.stream !== true || raw.model !== "kimi-k2.7-code") {

@@ -14,12 +14,13 @@ fixture and is not the product entrypoint.
 - Google and/or GitHub enabled under Firebase Authentication → Sign-in method
 - a real model-provider credential for a preset supported by `apps/agent`
 
-The repository already contains the public `sumi-studio` Firebase web
-configuration. It is an identifier, not a server credential. Analytics is not
-initialized. If a different Firebase project is used, set all four
-`VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`,
-`VITE_FIREBASE_PROJECT_ID`, and `VITE_FIREBASE_APP_ID` values in the local env
-file. The launcher rejects a web project that differs from the Admin project.
+The Vite development build has a public `sumi-studio` Firebase web
+configuration fallback. It is an identifier, not a server credential, and is
+never selected implicitly by a production build. Analytics is not initialized.
+Production builds, or local development against a different Firebase project,
+must set all four `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`,
+`VITE_FIREBASE_PROJECT_ID`, and `VITE_FIREBASE_APP_ID` values. The launcher
+rejects a web project that differs from the Admin project.
 
 For Google login, enable the Google provider. For GitHub login, configure its
 OAuth client ID and secret in Firebase and register the callback URL shown by

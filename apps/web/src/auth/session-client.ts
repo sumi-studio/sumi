@@ -1,5 +1,6 @@
 const maxAuthResponseBytes = 4_096;
 const csrfTokenPattern = /^[A-Za-z0-9_-]{43}$/;
+export const authRequestTimeoutMilliseconds = 15_000;
 
 export interface SumiSessionUser {
   id: string;
@@ -46,6 +47,7 @@ async function fetchCSRFToken(): Promise<string> {
     credentials: "include",
     cache: "no-store",
     headers: { Accept: "application/json" },
+    signal: authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);
@@ -76,6 +78,7 @@ export async function exchangeFirebaseIDToken(idToken: string): Promise<void> {
       "X-CSRF-Token": csrfToken,
     },
     body: JSON.stringify({ id_token: idToken }),
+    signal: authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);
@@ -117,6 +120,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
     credentials: "include",
     cache: "no-store",
     headers: { Accept: "application/json" },
+    signal: authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);
@@ -149,6 +153,7 @@ export async function logoutSumiSession(): Promise<void> {
       Accept: "application/json",
       "X-CSRF-Token": csrfToken,
     },
+    signal: authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);
@@ -157,6 +162,10 @@ export async function logoutSumiSession(): Promise<void> {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function authRequestSignal(): AbortSignal {
+  return AbortSignal.timeout(authRequestTimeoutMilliseconds);
 }
 
 async function authAPIError(response: Response): Promise<AuthAPIError> {

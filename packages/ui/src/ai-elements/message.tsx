@@ -297,9 +297,13 @@ export function MessageMetadata({
     "opacity-0 transition-opacity duration-150 group-focus-within/message:opacity-100 group-hover/message:opacity-100";
 
   const copy = async () => {
-    await navigator.clipboard.writeText(copyText);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(copyText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Permission denial or an unavailable clipboard leaves the UI unchanged.
+    }
   };
 
   const time = timestamp ? (
