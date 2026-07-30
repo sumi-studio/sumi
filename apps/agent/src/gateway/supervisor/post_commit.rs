@@ -14,6 +14,7 @@ use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
 };
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -21,15 +22,18 @@ use super::DeliveryEpoch;
 use super::session::DurableEventAdmission;
 use crate::{
     runtime::contracts::PersonalityAgentId,
-    store::{PostCommitReceiver, Store},
+    store::{PostCommitEpochCapability, PostCommitReceiver, Store},
 };
 
 const DEFAULT_DISPATCH_PAGE_SIZE: usize = 64;
 
 #[async_trait]
 pub(crate) trait PostCommitAdmissionTarget: Send + Sync + 'static {
+    fn bind_post_commit_epoch(&self, epoch: &PostCommitEpochCapability) -> Result<()>;
+
     async fn admit_committed(
         &self,
+        epoch: &PostCommitEpochCapability,
         personality_agent_id: &PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission>;
@@ -55,6 +59,7 @@ enum DispatchState {
 #[derive(Clone)]
 pub(crate) struct PostCommitDispatcherClient {
     personality_agent_id: PersonalityAgentId,
+    epoch: PostCommitEpochCapability,
     progress: watch::Receiver<DispatchState>,
 }
 
@@ -72,6 +77,10 @@ impl PostCommitDispatcherClient {
         &self.personality_agent_id
     }
 
+    pub(crate) fn epoch(&self) -> &PostCommitEpochCapability {
+        &self.epoch
+    }
+
     pub(crate) async fn admission_for(
         &self,
         personality_agent_id: &PersonalityAgentId,
@@ -86,9 +95,11 @@ impl PostCommitDispatcherClient {
         if seq == 0 {
             bail!("post-commit admission sequence must be positive");
         }
+        self.epoch.ensure_active()?;
 
         let mut progress = self.progress.clone();
         loop {
+            self.epoch.ensure_active()?;
             let state = progress.borrow().clone();
             match state {
                 DispatchState::Running {
@@ -106,10 +117,15 @@ impl PostCommitDispatcherClient {
                 }
                 DispatchState::Running { .. } => {}
             }
-            progress
-                .changed()
-                .await
-                .context("post-commit dispatcher progress channel closed")?;
+            tokio::select! {
+                biased;
+                _ = self.epoch.cancelled() => {
+                    bail!("post-commit runtime epoch invalidated before seq {seq} was admitted");
+                }
+                changed = progress.changed() => {
+                    changed.context("post-commit dispatcher progress channel closed")?;
+                }
+            }
         }
     }
 }
@@ -118,7 +134,7 @@ impl PostCommitDispatcherClient {
 pub(crate) struct OrderedPostCommitDispatcher {
     store: Arc<Store>,
     client: PostCommitDispatcherClient,
-    stop: CancellationToken,
+    epoch: PostCommitEpochCapability,
     drain_through: watch::Sender<Option<u64>>,
     task: Option<JoinHandle<Result<()>>>,
 }
@@ -139,6 +155,7 @@ impl OrderedPostCommitDispatcher {
     /// start. Crash-recovery tests may pass an earlier authenticated remote
     /// cursor; the dispatcher then scans the retained durable rows without
     /// re-executing their producers.
+    #[cfg(test)]
     pub(crate) fn start<T>(
         store: Arc<Store>,
         target: T,
@@ -148,20 +165,38 @@ impl OrderedPostCommitDispatcher {
     where
         T: PostCommitAdmissionTarget,
     {
-        Self::start_with_page_size(
+        Self::start_bound_with_page_size(
             store,
             target,
             start_after_seq,
-            cancel,
+            PostCommitEpochCapability::unbound_test(cancel),
             DEFAULT_DISPATCH_PAGE_SIZE,
         )
     }
 
-    fn start_with_page_size<T>(
+    pub(crate) fn start_bound<T>(
         store: Arc<Store>,
         target: T,
         start_after_seq: u64,
-        cancel: CancellationToken,
+        epoch: PostCommitEpochCapability,
+    ) -> Result<Self>
+    where
+        T: PostCommitAdmissionTarget,
+    {
+        Self::start_bound_with_page_size(
+            store,
+            target,
+            start_after_seq,
+            epoch,
+            DEFAULT_DISPATCH_PAGE_SIZE,
+        )
+    }
+
+    fn start_bound_with_page_size<T>(
+        store: Arc<Store>,
+        target: T,
+        start_after_seq: u64,
+        epoch: PostCommitEpochCapability,
         page_size: usize,
     ) -> Result<Self>
     where
@@ -170,6 +205,8 @@ impl OrderedPostCommitDispatcher {
         if page_size == 0 {
             bail!("post-commit dispatcher page size must be positive");
         }
+        store.validate_post_commit_epoch(&epoch)?;
+        target.bind_post_commit_epoch(&epoch)?;
         let receiver = store.claim_post_commit_receiver()?;
         let published_through = receiver.published_through()?;
         if start_after_seq > published_through {
@@ -183,20 +220,19 @@ impl OrderedPostCommitDispatcher {
             admission: DurableEventAdmission::Deferred { after_epoch: None },
         };
         let (progress_tx, progress_rx) = watch::channel(initial);
-        let stop = cancel.child_token();
-        let task_stop = stop.clone();
         let (drain_through_tx, drain_through_rx) = watch::channel(None);
         let task_personality_agent_id = personality_agent_id.clone();
         let task_store = store.clone();
+        let task_epoch = epoch.clone();
         let task = tokio::spawn(async move {
             run_dispatcher(
                 task_store,
                 Arc::new(target),
                 receiver,
+                task_epoch,
                 task_personality_agent_id,
                 start_after_seq,
                 page_size,
-                task_stop,
                 drain_through_rx,
                 progress_tx,
             )
@@ -206,9 +242,10 @@ impl OrderedPostCommitDispatcher {
             store,
             client: PostCommitDispatcherClient {
                 personality_agent_id,
+                epoch: epoch.clone(),
                 progress: progress_rx,
             },
-            stop,
+            epoch,
             drain_through: drain_through_tx,
             task: Some(task),
         })
@@ -218,19 +255,22 @@ impl OrderedPostCommitDispatcher {
         self.client.clone()
     }
 
-    /// Stop after admitting every event that was durable when shutdown began.
+    /// Stop after admitting every event committed before the drain capture.
     ///
-    /// Commits after the captured high-water belong to the next runtime. Drop
-    /// remains the emergency cancellation path; orderly T26 teardown must use
-    /// this drain so an accepted commit cannot be abandoned behind shutdown.
+    /// The caller must quiesce every EventWriter producer first. Capture takes
+    /// EventWriter's gate, so a transaction already committed cannot remain
+    /// unpublished on the other side of this boundary. Drop remains the
+    /// emergency cancellation path.
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        let through = self.store.post_commit_published_through()?;
+        let through = self.store.capture_post_commit_drain_through().await?;
         self.drain_through.send_replace(Some(through));
         let task = self
             .task
             .take()
             .expect("post-commit dispatcher task is owned until shutdown");
-        flatten_join(task.await).context("post-commit dispatcher shutdown")
+        let result = flatten_join(task.await).context("post-commit dispatcher shutdown");
+        self.epoch.invalidate();
+        result
     }
 }
 
@@ -238,7 +278,7 @@ impl Drop for OrderedPostCommitDispatcher {
     fn drop(&mut self) {
         // An un-awaited owner drop cannot leave the exclusive Store receiver
         // or an in-flight T17 fence alive indefinitely.
-        self.stop.cancel();
+        self.epoch.invalidate();
     }
 }
 
@@ -251,10 +291,10 @@ async fn run_dispatcher(
     store: Arc<Store>,
     target: Arc<dyn PostCommitAdmissionTarget>,
     receiver: PostCommitReceiver,
+    epoch: PostCommitEpochCapability,
     personality_agent_id: PersonalityAgentId,
     start_after_seq: u64,
     page_size: usize,
-    stop: CancellationToken,
     mut drain_through: watch::Receiver<Option<u64>>,
     progress: watch::Sender<DispatchState>,
 ) -> Result<()> {
@@ -268,27 +308,23 @@ async fn run_dispatcher(
             return Ok(());
         }
 
-        let published_through = receiver.published_through().map_err(|error| {
-            publish_failure(&progress, processed_through, &error);
-            error
+        let published_through = receiver.published_through().inspect_err(|error| {
+            publish_failure(&progress, processed_through, error);
         })?;
         if published_through <= processed_through {
             tokio::select! {
                 biased;
-                _ = stop.cancelled() => {
-                    progress.send_replace(DispatchState::Stopped { processed_through });
-                    return Ok(());
+                _ = epoch.cancelled() => {
+                    return Err(cancellation_failure(&progress, processed_through));
                 }
                 changed = drain_through.changed() => {
                     if changed.is_err() {
-                        progress.send_replace(DispatchState::Stopped { processed_through });
-                        return Ok(());
+                        return Err(cancellation_failure(&progress, processed_through));
                     }
                 }
-                result = receiver.wait_for_advance(processed_through, &stop) => {
-                    result.map_err(|error| {
-                        publish_failure(&progress, processed_through, &error);
-                        error
+                result = receiver.wait_for_advance(processed_through, epoch.owner_cancellation()) => {
+                    result.inspect_err(|error| {
+                        publish_failure(&progress, processed_through, error);
                     })?;
                 }
             }
@@ -301,13 +337,21 @@ async fn run_dispatcher(
             .unwrap_or(published_through);
 
         'dispatch: while processed_through < dispatch_through {
-            let page = store
-                .committed_event_sequences(processed_through, dispatch_through, page_size)
-                .await
-                .map_err(|error| {
-                    publish_failure(&progress, processed_through, &error);
-                    error
-                })?;
+            let page = tokio::select! {
+                biased;
+                _ = epoch.cancelled() => {
+                    return Err(cancellation_failure(&progress, processed_through));
+                }
+                result = store.committed_event_sequences(
+                    processed_through,
+                    dispatch_through,
+                    page_size,
+                ) => {
+                    result.inspect_err(|error| {
+                        publish_failure(&progress, processed_through, error);
+                    })?
+                }
+            };
             if page.is_empty() {
                 let error = anyhow!(
                     "durable post-commit FIFO ended after seq {processed_through} before dispatch high-water {dispatch_through}"
@@ -333,19 +377,29 @@ async fn run_dispatcher(
                     return Err(error);
                 }
 
-                let admission = tokio::select! {
+                let admission_guard = tokio::select! {
                     biased;
-                    _ = stop.cancelled() => {
-                        progress.send_replace(DispatchState::Stopped { processed_through });
-                        return Ok(());
+                    _ = epoch.cancelled() => {
+                        return Err(cancellation_failure(&progress, processed_through));
                     }
-                    result = target.admit_committed(&personality_agent_id, seq) => {
-                        result.map_err(|error| {
-                            publish_failure(&progress, processed_through, &error);
-                            error
+                    guard = epoch.claim_admission() => {
+                        guard.inspect_err(|error| {
+                            publish_failure(&progress, processed_through, error);
                         })?
                     }
                 };
+                let admission = tokio::select! {
+                    biased;
+                    _ = epoch.cancelled() => {
+                        return Err(cancellation_failure(&progress, processed_through));
+                    }
+                    result = target.admit_committed(&epoch, &personality_agent_id, seq) => {
+                        result.inspect_err(|error| {
+                            publish_failure(&progress, processed_through, error);
+                        })?
+                    }
+                };
+                drop(admission_guard);
                 cumulative_admission = combine_admission(cumulative_admission, admission);
                 processed_through = seq;
                 progress.send_replace(DispatchState::Running {
@@ -355,6 +409,15 @@ async fn run_dispatcher(
             }
         }
     }
+}
+
+fn cancellation_failure(
+    progress: &watch::Sender<DispatchState>,
+    processed_through: u64,
+) -> anyhow::Error {
+    let error = anyhow!("post-commit runtime epoch invalidated before orderly drain completed");
+    publish_failure(progress, processed_through, &error);
+    error
 }
 
 fn publish_failure(
@@ -409,7 +472,16 @@ mod tests {
     use super::*;
     use crate::{
         gateway::test_personality_agent_id,
-        store::{DurableEvent, EventBatch, EventWrite, EventWriter},
+        runtime::{
+            authority::RuntimeEpochAuthority,
+            contracts::{
+                GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease, RpcIdentity,
+            },
+        },
+        store::{
+            DurableEvent, EventBatch, EventWrite, EventWriter, HydrationOutcome,
+            PostCommitPublishHook,
+        },
     };
 
     #[derive(Clone)]
@@ -422,8 +494,13 @@ mod tests {
 
     #[async_trait]
     impl PostCommitAdmissionTarget for RecordingTarget {
+        fn bind_post_commit_epoch(&self, _epoch: &PostCommitEpochCapability) -> Result<()> {
+            Ok(())
+        }
+
         async fn admit_committed(
             &self,
+            _epoch: &PostCommitEpochCapability,
             _personality_agent_id: &PersonalityAgentId,
             seq: u64,
         ) -> Result<DurableEventAdmission> {
@@ -443,8 +520,13 @@ mod tests {
 
     #[async_trait]
     impl PostCommitAdmissionTarget for ImmediateTarget {
+        fn bind_post_commit_epoch(&self, _epoch: &PostCommitEpochCapability) -> Result<()> {
+            Ok(())
+        }
+
         async fn admit_committed(
             &self,
+            _epoch: &PostCommitEpochCapability,
             _personality_agent_id: &PersonalityAgentId,
             seq: u64,
         ) -> Result<DurableEventAdmission> {
@@ -458,12 +540,44 @@ mod tests {
 
     #[async_trait]
     impl PostCommitAdmissionTarget for FailingTarget {
+        fn bind_post_commit_epoch(&self, _epoch: &PostCommitEpochCapability) -> Result<()> {
+            Ok(())
+        }
+
         async fn admit_committed(
             &self,
+            _epoch: &PostCommitEpochCapability,
             _personality_agent_id: &PersonalityAgentId,
             seq: u64,
         ) -> Result<DurableEventAdmission> {
             bail!("injected permanent dispatcher failure at seq {seq}")
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapabilityTarget {
+        epoch: PostCommitEpochCapability,
+        calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl PostCommitAdmissionTarget for CapabilityTarget {
+        fn bind_post_commit_epoch(&self, epoch: &PostCommitEpochCapability) -> Result<()> {
+            if !self.epoch.same_instance(epoch) {
+                bail!("injected target runtime epoch mismatch");
+            }
+            self.epoch.ensure_active()
+        }
+
+        async fn admit_committed(
+            &self,
+            epoch: &PostCommitEpochCapability,
+            _personality_agent_id: &PersonalityAgentId,
+            seq: u64,
+        ) -> Result<DurableEventAdmission> {
+            self.bind_post_commit_epoch(epoch)?;
+            self.calls.lock().unwrap().push(seq);
+            Ok(DurableEventAdmission::Deferred { after_epoch: None })
         }
     }
 
@@ -592,6 +706,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_capture_waits_for_commit_to_publish_barrier() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-publication-barrier")
+                .await
+                .unwrap(),
+        );
+        let target = ImmediateTarget::default();
+        let calls = target.calls.clone();
+        let dispatcher =
+            OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
+                .unwrap();
+        let writer = EventWriter::new(store.clone());
+        let hook = PostCommitPublishHook::default();
+        writer
+            .set_post_commit_publish_hook(Some(hook.clone()))
+            .await;
+        let write =
+            tokio::spawn(
+                async move { writer.apply(maintenance("commit-before-publication")).await },
+            );
+        hook.committed.notified().await;
+
+        let shutdown = tokio::spawn(dispatcher.shutdown());
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "drain capture must serialize behind COMMIT-to-publication"
+        );
+
+        hook.allow_publication.notify_one();
+        assert_eq!(write.await.unwrap().unwrap(), vec![1]);
+        shutdown.await.unwrap().unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_shutdown_cannot_report_an_unreached_high_water_as_drained() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-cancel-before-shutdown")
+                .await
+                .unwrap(),
+        );
+        let target = ImmediateTarget::default();
+        let calls = target.calls.clone();
+        let cancel = CancellationToken::new();
+        let dispatcher =
+            OrderedPostCommitDispatcher::start(store.clone(), target, 0, cancel.clone()).unwrap();
+        cancel.cancel();
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(maintenance("committed-after-cancel"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+
+        let error = dispatcher.shutdown().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("before orderly drain completed"),
+            "{error:#}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cancelled dispatcher must not claim the captured sequence"
+        );
+    }
+
+    #[tokio::test]
     async fn permanent_dispatcher_failure_does_not_strand_the_event_writer_gate() {
         let store = Arc::new(
             Store::session_test_store("post-commit-failure")
@@ -689,6 +871,185 @@ mod tests {
         tokio::fs::remove_dir_all(root)
             .await
             .expect("remove restart fixture");
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_a_pool_blocked_page_read_and_releases_the_receiver_claim() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-drop-pool-read")
+                .await
+                .unwrap(),
+        );
+        let dispatcher = OrderedPostCommitDispatcher::start(
+            store.clone(),
+            ImmediateTarget::default(),
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let connection = store.pool().acquire().await.unwrap();
+        store.publish_test_committed_event_receipt(&[1]);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(dispatcher);
+        let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(receiver) = store.claim_post_commit_receiver() {
+                    break receiver;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receiver claim is released while the SQLite pool remains occupied");
+        drop(receiver);
+        drop(connection);
+    }
+
+    fn runtime_authority(
+        personality_agent_id: &PersonalityAgentId,
+        generation: u64,
+        suffix: &str,
+    ) -> (
+        RuntimeEpochAuthority,
+        ProcessGenerationLease,
+        GenerationRecoveryFence,
+    ) {
+        let generation = ProcessGeneration::from_wire(generation).unwrap();
+        let rpc = RpcIdentity::from_wire(
+            personality_agent_id.as_str(),
+            generation.as_u64(),
+            format!("nonce-{suffix}"),
+        )
+        .unwrap();
+        let lease = ProcessGenerationLease::new(
+            personality_agent_id.clone(),
+            generation,
+            format!("lease-{suffix}"),
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, format!("fence-{suffix}")).unwrap();
+        (
+            RuntimeEpochAuthority::new(rpc, lease.clone(), fence.clone()).unwrap(),
+            lease,
+            fence,
+        )
+    }
+
+    #[tokio::test]
+    async fn hydration_rollover_invalidates_the_old_dispatcher_before_target_side_effects() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-runtime-rollover")
+                .await
+                .unwrap(),
+        );
+        let paid = store.scope().personality_agent_id.clone();
+        let (old_authority, old_lease, old_fence) = runtime_authority(&paid, 7, "old");
+        assert!(matches!(
+            store.hydrate(&old_lease, &old_fence).await.unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+        let old_epoch = store
+            .issue_post_commit_epoch(old_authority.clone(), CancellationToken::new())
+            .unwrap();
+        let rival_rpc = RpcIdentity::from_wire(paid.as_str(), 7, "nonce-rival-process").unwrap();
+        let rival_authority =
+            RuntimeEpochAuthority::new(rival_rpc, old_lease.clone(), old_fence.clone()).unwrap();
+        assert!(
+            store
+                .issue_post_commit_epoch(rival_authority, CancellationToken::new())
+                .is_err(),
+            "one Store hydration may issue only one exact boot capability"
+        );
+        let other_store = Arc::new(Store::session_test_store(paid.as_str()).await.unwrap());
+        assert!(matches!(
+            other_store.hydrate(&old_lease, &old_fence).await.unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+        assert!(
+            OrderedPostCommitDispatcher::start_bound(
+                other_store,
+                CapabilityTarget {
+                    epoch: old_epoch.clone(),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                },
+                0,
+                old_epoch.clone(),
+            )
+            .is_err(),
+            "a capability issued by another Store hydration must fail before dispatcher start"
+        );
+        let old_calls = Arc::new(Mutex::new(Vec::new()));
+        let old = OrderedPostCommitDispatcher::start_bound(
+            store.clone(),
+            CapabilityTarget {
+                epoch: old_epoch.clone(),
+                calls: old_calls.clone(),
+            },
+            0,
+            old_epoch.clone(),
+        )
+        .unwrap();
+
+        let (new_authority, new_lease, new_fence) = runtime_authority(&paid, 8, "new");
+        let admission_guard = old_epoch.claim_admission().await.unwrap();
+        let rollover = {
+            let store = store.clone();
+            let new_lease = new_lease.clone();
+            let new_fence = new_fence.clone();
+            tokio::spawn(async move { store.hydrate(&new_lease, &new_fence).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !old_epoch.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rollover invalidates the old capability");
+        assert!(
+            !rollover.is_finished(),
+            "hydration rollover must wait for the old admission gate"
+        );
+        drop(admission_guard);
+        assert!(matches!(
+            rollover.await.unwrap().unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+        assert!(old_epoch.is_cancelled());
+        assert!(
+            store
+                .issue_post_commit_epoch(old_authority, CancellationToken::new())
+                .is_err(),
+            "the Store must reject authority from its previous hydration"
+        );
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(maintenance("after-rollover"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        assert!(old.client().admission_for(&paid, 1).await.is_err());
+        assert!(old.shutdown().await.is_err());
+        assert!(old_calls.lock().unwrap().is_empty());
+
+        let new_epoch = store
+            .issue_post_commit_epoch(new_authority, CancellationToken::new())
+            .unwrap();
+        let new_calls = Arc::new(Mutex::new(Vec::new()));
+        let new = OrderedPostCommitDispatcher::start_bound(
+            store.clone(),
+            CapabilityTarget {
+                epoch: new_epoch.clone(),
+                calls: new_calls.clone(),
+            },
+            0,
+            new_epoch,
+        )
+        .unwrap();
+        new.client().admission_for(&paid, 1).await.unwrap();
+        assert_eq!(*new_calls.lock().unwrap(), vec![1]);
+        new.shutdown().await.unwrap();
     }
 
     #[test]

@@ -48,6 +48,7 @@ use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
     PublicMessage, StopReason, validate_native_suffix_for_hydration,
 };
+use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{
     GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
 };
@@ -63,13 +64,15 @@ pub(crate) use self::delivery::{
     DurableDeliveryOutcome, current_event_head_seq, raw_events_after,
 };
 #[cfg(test)]
-pub(crate) use self::event_writer::seed_provider_context_owner_event_evidence;
+pub(crate) use self::event_writer::{
+    PostCommitPublishHook, seed_provider_context_owner_event_evidence,
+};
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
-pub(crate) use self::post_commit::PostCommitReceiver;
+pub(crate) use self::post_commit::{PostCommitEpochCapability, PostCommitReceiver};
 #[cfg(test)]
 pub(crate) use self::provider_context::{
     EncryptedProviderContextRecord, provider_context_record_id,
@@ -745,6 +748,10 @@ impl Store {
             });
         }
 
+        self.post_commit_feed
+            .record_hydrated_epoch(lease, fence)
+            .await
+            .context("failed to bind post-commit feed to completed Store hydration")?;
         Ok(HydrationOutcome::Complete(HydratedRunState {
             scope: self.scope.clone(),
             lease: lease.clone(),
@@ -2088,7 +2095,41 @@ impl Store {
         self.post_commit_feed.claim()
     }
 
-    pub(crate) fn post_commit_published_through(&self) -> Result<u64> {
+    /// Issue the one shared dispatcher/client/target capability only after the
+    /// exact runtime authority has completed Store hydration.
+    #[allow(
+        dead_code,
+        reason = "T26 production bootstrap composition is a follow-up"
+    )]
+    pub(crate) fn issue_post_commit_epoch(
+        &self,
+        authority: RuntimeEpochAuthority,
+        runtime_invalidated: tokio_util::sync::CancellationToken,
+    ) -> Result<PostCommitEpochCapability> {
+        self.post_commit_feed
+            .issue_epoch_capability(authority, runtime_invalidated)
+    }
+
+    pub(crate) fn validate_post_commit_epoch(
+        &self,
+        capability: &PostCommitEpochCapability,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if capability.is_unbound_test() {
+            return capability.ensure_active();
+        }
+        self.post_commit_feed.validate_epoch_capability(capability)
+    }
+
+    /// Capture an orderly drain boundary under EventWriter's single-writer
+    /// gate. Every transaction committed before this lock acquisition has
+    /// therefore completed its post-COMMIT feed publication.
+    ///
+    /// The runtime must quiesce all EventWriter producers before calling this
+    /// boundary. Commits started after capture are intentionally not owned by
+    /// the draining dispatcher.
+    pub(crate) async fn capture_post_commit_drain_through(&self) -> Result<u64> {
+        let _writer = self.event_writer_state.lock().await;
         self.post_commit_feed.published_through()
     }
 

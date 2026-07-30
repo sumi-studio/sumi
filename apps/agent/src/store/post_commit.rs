@@ -8,14 +8,165 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
+
+use crate::runtime::{
+    authority::RuntimeEpochAuthority,
+    contracts::{GenerationRecoveryFence, ProcessGenerationLease},
+};
+
+#[derive(Clone, Debug)]
+struct HydratedEpoch {
+    lease: ProcessGenerationLease,
+    fence: GenerationRecoveryFence,
+    lifecycle: Arc<EpochLifecycle>,
+    #[allow(
+        dead_code,
+        reason = "used once T26 production bootstrap issues its epoch"
+    )]
+    issued: Option<PostCommitEpochCapability>,
+}
+
+#[derive(Debug)]
+struct EpochLifecycle {
+    invalidated: CancellationToken,
+    admission_gate: Arc<AsyncMutex<()>>,
+}
+
+impl EpochLifecycle {
+    fn new() -> Self {
+        Self {
+            invalidated: CancellationToken::new(),
+            admission_gate: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    async fn invalidate_and_wait(&self) {
+        self.invalidated.cancel();
+        let _drained = self.admission_gate.clone().lock_owned().await;
+    }
+}
+
+#[derive(Debug)]
+struct EpochCapabilityInner {
+    authority: Option<RuntimeEpochAuthority>,
+    hydration_lifecycle: Arc<EpochLifecycle>,
+    runtime_invalidated: CancellationToken,
+    owner_invalidated: CancellationToken,
+}
+
+/// Exact, shared runtime-epoch capability for post-COMMIT dispatch.
+///
+/// Clones retain pointer identity and the same three lifecycle invalidations:
+/// Store hydration rollover, the owning runtime cancellation, and dispatcher
+/// teardown. It is therefore not a copyable PAID/generation value witness.
+///
+/// This capability is process-local. Cross-process exclusion for two `Store`
+/// instances opened on the same SQLite file remains a supervisor/bootstrap
+/// obligation: the old process must stop and join before the new runtime is
+/// made Ready.
+#[derive(Clone, Debug)]
+pub(crate) struct PostCommitEpochCapability {
+    inner: Arc<EpochCapabilityInner>,
+}
+
+impl PostCommitEpochCapability {
+    #[allow(
+        dead_code,
+        reason = "used once T26 production bootstrap issues its epoch"
+    )]
+    fn bound(
+        authority: RuntimeEpochAuthority,
+        hydration_lifecycle: Arc<EpochLifecycle>,
+        runtime_invalidated: CancellationToken,
+    ) -> Self {
+        Self {
+            inner: Arc::new(EpochCapabilityInner {
+                authority: Some(authority),
+                hydration_lifecycle,
+                runtime_invalidated,
+                owner_invalidated: CancellationToken::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unbound_test(runtime_invalidated: CancellationToken) -> Self {
+        Self {
+            inner: Arc::new(EpochCapabilityInner {
+                authority: None,
+                hydration_lifecycle: Arc::new(EpochLifecycle::new()),
+                runtime_invalidated,
+                owner_invalidated: CancellationToken::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn authority(&self) -> Result<&RuntimeEpochAuthority> {
+        self.inner
+            .authority
+            .as_ref()
+            .ok_or_else(|| anyhow!("test-only post-commit epoch has no runtime authority"))
+    }
+
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn is_unbound_test(&self) -> bool {
+        self.inner.authority.is_none()
+    }
+
+    pub(crate) fn ensure_active(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("post-commit runtime epoch capability is invalidated");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.hydration_lifecycle.invalidated.is_cancelled()
+            || self.inner.runtime_invalidated.is_cancelled()
+            || self.inner.owner_invalidated.is_cancelled()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        tokio::select! {
+            _ = self.inner.hydration_lifecycle.invalidated.cancelled() => {}
+            _ = self.inner.runtime_invalidated.cancelled() => {}
+            _ = self.inner.owner_invalidated.cancelled() => {}
+        }
+    }
+
+    /// Serialize admission side effects with Store hydration rollover.
+    pub(crate) async fn claim_admission(&self) -> Result<OwnedMutexGuard<()>> {
+        let guard = self
+            .inner
+            .hydration_lifecycle
+            .admission_gate
+            .clone()
+            .lock_owned()
+            .await;
+        self.ensure_active()?;
+        Ok(guard)
+    }
+
+    pub(crate) fn owner_cancellation(&self) -> &CancellationToken {
+        &self.inner.owner_invalidated
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.inner.owner_invalidated.cancel();
+    }
+}
 
 #[derive(Debug)]
 struct FeedState {
     published_through: u64,
     dispatcher_claimed: bool,
     invariant_failure: Option<String>,
+    hydrated_epoch: Option<HydratedEpoch>,
 }
 
 #[derive(Debug)]
@@ -39,6 +190,7 @@ impl PostCommitFeed {
                     published_through: initial_event_head,
                     dispatcher_claimed: false,
                     invariant_failure: None,
+                    hydrated_epoch: None,
                 }),
                 changed: Notify::new(),
             }),
@@ -115,6 +267,103 @@ impl PostCommitFeed {
 
     pub(super) fn published_through(&self) -> Result<u64> {
         self.snapshot()
+    }
+
+    pub(super) async fn record_hydrated_epoch(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<()> {
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid hydrated post-commit epoch: {error}"))?;
+        let previous = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .hydrated_epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch.lease == *lease && epoch.fence == *fence)
+            {
+                return Ok(());
+            }
+            state.hydrated_epoch.take()
+        };
+        if let Some(previous) = previous {
+            previous.lifecycle.invalidate_and_wait().await;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.hydrated_epoch.is_some() {
+            bail!("concurrent Store hydration attempted to replace the post-commit runtime epoch");
+        }
+        state.hydrated_epoch = Some(HydratedEpoch {
+            lease: lease.clone(),
+            fence: fence.clone(),
+            lifecycle: Arc::new(EpochLifecycle::new()),
+            issued: None,
+        });
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used once T26 production bootstrap issues its epoch"
+    )]
+    pub(super) fn issue_epoch_capability(
+        &self,
+        authority: RuntimeEpochAuthority,
+        runtime_invalidated: CancellationToken,
+    ) -> Result<PostCommitEpochCapability> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hydrated = state
+            .hydrated_epoch
+            .as_mut()
+            .ok_or_else(|| anyhow!("post-commit runtime epoch requested before Store hydration"))?;
+        if authority.lease() != &hydrated.lease || authority.fence() != &hydrated.fence {
+            bail!("post-commit runtime authority does not match the Store hydration lease/fence");
+        }
+        if hydrated.issued.is_some() {
+            bail!("post-commit runtime epoch capability was already issued for this hydration");
+        }
+        let capability = PostCommitEpochCapability::bound(
+            authority,
+            hydrated.lifecycle.clone(),
+            runtime_invalidated,
+        );
+        hydrated.issued = Some(capability.clone());
+        Ok(capability)
+    }
+
+    pub(super) fn validate_epoch_capability(
+        &self,
+        capability: &PostCommitEpochCapability,
+    ) -> Result<()> {
+        capability.ensure_active()?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let issued = state
+            .hydrated_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.issued.as_ref())
+            .ok_or_else(|| anyhow!("Store has no issued post-commit runtime epoch capability"))?;
+        if !issued.same_instance(capability) {
+            bail!("post-commit runtime epoch capability belongs to another Store hydration");
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> Result<u64> {

@@ -26,8 +26,8 @@ use crate::gateway::Envelope;
 use crate::runtime::contracts::ProcessGeneration;
 use crate::store::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
-    DurableDeliveryOutcome, HydrationReceiptIdentity, Store, current_event_head_seq,
-    raw_events_after,
+    DurableDeliveryOutcome, HydrationReceiptIdentity, PostCommitEpochCapability, Store,
+    current_event_head_seq, raw_events_after,
 };
 
 #[derive(Debug)]
@@ -146,6 +146,7 @@ pub struct T17StoreAdapter {
     authorization: Option<DeliveryAuthorization>,
     pump: Arc<tokio::sync::Mutex<Option<DeliveryPump>>>,
     durable_fences: DurableFences,
+    post_commit_epoch: Option<PostCommitEpochCapability>,
     post_commit_dispatcher: Option<PostCommitDispatcherClient>,
     #[cfg(test)]
     replay_page_lengths: Arc<Mutex<Vec<usize>>>,
@@ -172,6 +173,7 @@ impl T17StoreAdapter {
             authorization: None,
             pump: Arc::new(tokio::sync::Mutex::new(None)),
             durable_fences: Arc::new(Mutex::new(HashMap::new())),
+            post_commit_epoch: None,
             post_commit_dispatcher: None,
             #[cfg(test)]
             replay_page_lengths: Arc::new(Mutex::new(Vec::new())),
@@ -182,6 +184,26 @@ impl T17StoreAdapter {
             #[cfg(test)]
             durable_admission_hook: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Bind the exact Store-hydrated runtime epoch before this adapter can be
+    /// used as a production post-COMMIT admission target.
+    pub(crate) fn bind_post_commit_epoch(&self, epoch: PostCommitEpochCapability) -> Result<Self> {
+        self.store.validate_post_commit_epoch(&epoch)?;
+        let authority = epoch.authority()?;
+        if authority.personality_agent_id() != self.store.scope().personality_agent_id() {
+            bail!(
+                "post-commit runtime epoch personality-agent mismatch: expected {}, got {}",
+                self.store.scope().personality_agent_id,
+                authority.personality_agent_id()
+            );
+        }
+        if self.post_commit_epoch.is_some() {
+            bail!("T17 Store adapter already has a post-commit runtime epoch");
+        }
+        let mut bound = self.clone();
+        bound.post_commit_epoch = Some(epoch);
+        Ok(bound)
     }
 
     /// Bind the one T26 dispatcher proof client used by Session.
@@ -201,6 +223,13 @@ impl T17StoreAdapter {
         }
         if self.post_commit_dispatcher.is_some() {
             bail!("T17 Store adapter already has a post-commit dispatcher");
+        }
+        match self.post_commit_epoch.as_ref() {
+            Some(epoch) if epoch.same_instance(dispatcher.epoch()) => {}
+            None if dispatcher.epoch().is_unbound_test() => {}
+            _ => bail!(
+                "post-commit dispatcher client is not bound to this T17 adapter runtime epoch"
+            ),
         }
         let mut bound = self.clone();
         bound.post_commit_dispatcher = Some(dispatcher);
@@ -522,11 +551,21 @@ impl SessionEventDelivery for T17StoreAdapter {
 
 #[async_trait]
 impl PostCommitAdmissionTarget for T17StoreAdapter {
+    fn bind_post_commit_epoch(&self, epoch: &PostCommitEpochCapability) -> Result<()> {
+        match self.post_commit_epoch.as_ref() {
+            Some(bound) if bound.same_instance(epoch) => bound.ensure_active(),
+            None if epoch.is_unbound_test() => Ok(()),
+            _ => bail!("T17 admission target is not bound to the dispatcher runtime epoch"),
+        }
+    }
+
     async fn admit_committed(
         &self,
+        epoch: &PostCommitEpochCapability,
         personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission> {
+        <Self as PostCommitAdmissionTarget>::bind_post_commit_epoch(self, epoch)?;
         if personality_agent_id != &self.store.scope().personality_agent_id {
             bail!(
                 "post-commit dispatcher targets personality agent {personality_agent_id}, but T17 owns {}",

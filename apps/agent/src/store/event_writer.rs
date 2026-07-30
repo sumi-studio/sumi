@@ -1657,6 +1657,15 @@ impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
 #[derive(Default)]
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
+    #[cfg(test)]
+    post_commit_publish_hook: Option<PostCommitPublishHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct PostCommitPublishHook {
+    pub(crate) committed: Arc<tokio::sync::Notify>,
+    pub(crate) allow_publication: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -1760,6 +1769,11 @@ impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
         let gate = store.event_writer_state();
         Self { store, gate }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_post_commit_publish_hook(&self, hook: Option<PostCommitPublishHook>) {
+        self.gate.lock().await.post_commit_publish_hook = hook;
     }
 
     /// Build the fixed Invalidate target set for an authenticated Error
@@ -3001,6 +3015,11 @@ impl EventWriter {
         });
         if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
+        }
+        #[cfg(test)]
+        if let Some(hook) = state.post_commit_publish_hook.take() {
+            hook.committed.notify_one();
+            hook.allow_publication.notified().await;
         }
         // COMMIT is the durability boundary. Publication is an O(1) wake
         // high-water over the canonical `agent_events` FIFO and never awaits
@@ -25193,8 +25212,16 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::gateway::supervisor::post_commit::PostCommitAdmissionTarget for RecordingTarget {
+            fn bind_post_commit_epoch(
+                &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
+            ) -> Result<()> {
+                Ok(())
+            }
+
             async fn admit_committed(
                 &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
                 _personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
                 seq: u64,
             ) -> Result<crate::gateway::supervisor::session::DurableEventAdmission> {
