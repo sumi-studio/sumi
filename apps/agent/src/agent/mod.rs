@@ -26,6 +26,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -116,6 +117,7 @@ const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// This is not provider retry backoff; it only prevents one stalled local task
 /// from blocking the Session event lane indefinitely.
 const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -272,6 +274,10 @@ pub(crate) struct RunCore {
     /// Session reserves the token around `bind_hard_steer` so the provider is
     /// only cancelled after the durable step-zero commit succeeds.
     attempt_cancellation: Option<Arc<AttemptCancellation>>,
+    /// One Session-owned runtime shutdown lineage. Each worker receives a
+    /// child token, and every externally backed phase derives from that child.
+    /// This is runtime-only state and is never used as durable replay proof.
+    runtime_shutdown: CancellationToken,
     approval: Option<Arc<ApprovalBroker>>,
     #[cfg(test)]
     fixture_bypass_approval: bool,
@@ -290,6 +296,7 @@ impl RunCore {
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
+            runtime_shutdown: CancellationToken::new(),
             approval: None,
             #[cfg(test)]
             fixture_bypass_approval: false,
@@ -779,6 +786,12 @@ pub(crate) enum SessionResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLoopExit {
+    GatewayClosed,
+    ShutdownRequested,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SessionFailure {
     #[error("session startup is recovery-gated by T17-owned suffix: {steps:?}")]
@@ -791,6 +804,8 @@ pub(crate) enum SessionFailure {
     CompletionChannelClosed,
     #[error("run worker event channel closed")]
     EventChannelClosed,
+    #[error("runtime shutdown exceeded its bounded grace period; active RunCore ownership is lost")]
+    RuntimeShutdownOwnershipLost,
     #[error("gateway closed while a run owned RunCore")]
     GatewayClosedDuringRun,
     #[error("gateway {operation} failed: {source}")]
@@ -843,6 +858,12 @@ pub(crate) struct Session<G: Gateway> {
     /// a post-receipt worker failure can leave it behind. Neither state is a
     /// recoverable life-log snapshot.
     durable_core_invalidated: bool,
+    /// The root of the cancellation lineage installed by `run` or
+    /// `run_until_cancelled`. Workers receive children, so completing one run
+    /// cannot cancel a later run or the Session itself.
+    runtime_shutdown: CancellationToken,
+    #[cfg(test)]
+    active_take_observer: Option<oneshot::Sender<bool>>,
 }
 
 impl<G: Gateway + 'static> Session<G> {
@@ -982,14 +1003,58 @@ impl<G: Gateway + 'static> Session<G> {
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             maintenance_ready_pending: false,
             durable_core_invalidated: false,
+            runtime_shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            active_take_observer: None,
         })
     }
 
     pub(crate) async fn run(mut self) -> SessionResult {
-        match self.run_until_exit().await {
-            Ok(()) => {
+        let shutdown = CancellationToken::new();
+        self.runtime_shutdown = shutdown.clone();
+        match self.run_until_exit(&shutdown).await {
+            Ok(SessionLoopExit::GatewayClosed) => {
                 // Gateway EOF is terminal. Do not wait for an arbitrary
                 // transport send to finish after the reader has closed.
+                self.abort_writer().await;
+                SessionResult::Completed(
+                    self.core
+                        .take()
+                        .expect("clean idle exit retains the unique RunCore"),
+                )
+            }
+            Ok(SessionLoopExit::ShutdownRequested) => {
+                unreachable!("the private run token is never cancelled")
+            }
+            Err(failure) => {
+                if self.active.is_some() {
+                    self.shutdown_active().await;
+                }
+                self.abort_writer().await;
+                let ownership = if self.durable_core_invalidated {
+                    self.core.take();
+                    RunOwnership::Lost
+                } else {
+                    self.core.take().map_or(RunOwnership::Lost, |core| {
+                        RunOwnership::Recovered(Box::new(core))
+                    })
+                };
+                SessionResult::Failed { failure, ownership }
+            }
+        }
+    }
+
+    /// Install shutdown as an input to the Session event loop. No outer
+    /// `select!` cancels `run_until_exit`, so mutation-heavy admission,
+    /// persistence, completion, and ownership-transfer handlers always run to
+    /// a boundary before shutdown is observed.
+    pub(crate) async fn run_until_cancelled(
+        mut self,
+        shutdown: CancellationToken,
+    ) -> SessionResult {
+        self.runtime_shutdown = shutdown.clone();
+        match self.run_until_exit(&shutdown).await {
+            Ok(SessionLoopExit::GatewayClosed) => {
                 self.abort_writer().await;
                 SessionResult::Completed(
                     self.core
@@ -1012,6 +1077,30 @@ impl<G: Gateway + 'static> Session<G> {
                 };
                 SessionResult::Failed { failure, ownership }
             }
+            Ok(SessionLoopExit::ShutdownRequested) => {
+                if self.active.is_some() {
+                    if let Err(failure) = self.shutdown_active_gracefully().await {
+                        self.abort_writer().await;
+                        let ownership = if self.durable_core_invalidated {
+                            self.core.take();
+                            RunOwnership::Lost
+                        } else {
+                            self.core.take().map_or(RunOwnership::Lost, |core| {
+                                RunOwnership::Recovered(Box::new(core))
+                            })
+                        };
+                        return SessionResult::Failed { failure, ownership };
+                    }
+                }
+                self.abort_writer().await;
+                match self.core.take() {
+                    Some(core) => SessionResult::Completed(core),
+                    None => SessionResult::Failed {
+                        failure: SessionFailure::RuntimeShutdownOwnershipLost,
+                        ownership: RunOwnership::Lost,
+                    },
+                }
+            }
         }
     }
 
@@ -1025,26 +1114,34 @@ impl<G: Gateway + 'static> Session<G> {
         Ok(())
     }
 
-    async fn run_until_exit(&mut self) -> Result<(), SessionFailure> {
+    async fn run_until_exit(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<SessionLoopExit, SessionFailure> {
         loop {
             if self.active.is_none() {
                 self.apply_idle_memory_maintenance().await?;
                 enum IdleSelected {
+                    Shutdown,
                     Command(Result<InboundCommand>),
                     Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
                 }
                 let selected = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => IdleSelected::Shutdown,
                     command = self.gateway_reader.next_command() => IdleSelected::Command(command),
                     writer = &mut self.writer_done => IdleSelected::Writer(writer),
                 };
                 let inbound = match selected {
+                    IdleSelected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                     IdleSelected::Command(Ok(inbound)) => inbound,
                     IdleSelected::Command(Err(error))
                         if error.downcast_ref::<GatewayClosed>().is_some() =>
                     {
                         // Preserve a writer failure that won the race with
                         // EOF without waiting for a transport still in send.
-                        return self.gateway_closed_result(false);
+                        self.gateway_closed_result(false)?;
+                        return Ok(SessionLoopExit::GatewayClosed);
                     }
                     IdleSelected::Command(Err(error)) => {
                         return Err(gateway_failure("receive", error));
@@ -1057,6 +1154,7 @@ impl<G: Gateway + 'static> Session<G> {
 
             #[allow(clippy::large_enum_variant)]
             enum Selected {
+                Shutdown,
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
                 Event(Option<RunOutput>),
@@ -1068,6 +1166,7 @@ impl<G: Gateway + 'static> Session<G> {
                 tokio::select! {
                     biased;
                     completion = &mut active.completion_rx => Selected::Completion(completion),
+                    _ = shutdown.cancelled() => Selected::Shutdown,
                     command = self.gateway_reader.next_command() => Selected::Command(command),
                     event = active.events_rx.recv() => Selected::Event(event),
                     writer = &mut self.writer_done => Selected::Writer(writer),
@@ -1075,12 +1174,14 @@ impl<G: Gateway + 'static> Session<G> {
             };
 
             match selected {
+                Selected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                 Selected::Completion(completion) => self.finish_run(completion).await?,
                 Selected::Command(Ok(inbound)) => self.admit_and_route(inbound).await?,
                 Selected::Command(Err(error))
                     if error.downcast_ref::<GatewayClosed>().is_some() =>
                 {
-                    return self.gateway_closed_result(true);
+                    self.gateway_closed_result(true)?;
+                    return Ok(SessionLoopExit::GatewayClosed);
                 }
                 Selected::Command(Err(error)) => {
                     return Err(gateway_failure("receive", error));
@@ -1838,6 +1939,7 @@ impl<G: Gateway + 'static> Session<G> {
         core.worker_phase = Some(phase_tx);
         let attempt_cancellation = Arc::new(AttemptCancellation::default());
         core.attempt_cancellation = Some(attempt_cancellation.clone());
+        core.runtime_shutdown = self.runtime_shutdown.child_token();
         let approval = core.approval.clone();
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
@@ -1868,17 +1970,37 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         completion: std::result::Result<RunCompletion, oneshot::error::RecvError>,
     ) -> std::result::Result<(), SessionFailure> {
-        let mut active = self.active.take().expect("completion requires active run");
+        self.finish_run_with_route(completion, true).await
+    }
+
+    async fn finish_run_with_route(
+        &mut self,
+        completion: std::result::Result<RunCompletion, oneshot::error::RecvError>,
+        route_after_completion: bool,
+    ) -> std::result::Result<(), SessionFailure> {
+        // Keep ActiveRun installed in Session across every await. Once it is
+        // taken below there are no cancellation points before the returned
+        // RunCore is installed, so cancelling this handler cannot orphan the
+        // unique owner.
+        let join_result = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("completion requires active run");
+            (&mut active.join).await
+        };
         let completion = match completion {
             Ok(completion) => completion,
             Err(_) => {
-                return match (&mut active.join).await {
+                self.active.take();
+                return match join_result {
                     Err(error) => Err(worker_join_failure(error)),
                     Ok(()) => Err(SessionFailure::CompletionChannelClosed),
                 };
             }
         };
-        if let Err(error) = (&mut active.join).await {
+        if let Err(error) = join_result {
+            self.active.take();
             return Err(worker_join_failure(error));
         }
         let (core, worker_failure) = match completion {
@@ -1889,19 +2011,41 @@ impl<G: Gateway + 'static> Session<G> {
                 (None, Some(failure))
             }
         };
-        let delivery_failure = self.drain_disconnected_outputs(&mut active, true).await?;
+        // Install the returned owner before draining durable outputs. If this
+        // handler future is cancelled by a test harness after worker join,
+        // Session still owns both the returned core and the attached output
+        // lane and can resume settlement.
+        self.core = core;
+        let delivery_failure = match self.drain_active_outputs(route_after_completion).await {
+            Ok(failure) => failure,
+            Err(error) => {
+                // The joined worker cannot be awaited twice. The durable
+                // invalidation flag prevents the returned-but-ahead core from
+                // being reported as recovered.
+                self.active.take();
+                return Err(error);
+            }
+        };
         // A completed RunCore includes every output already produced by the
         // worker. Do not expose it until the disconnected bounded event lane
         // has been drained into SQLite, even when Gateway delivery was lost.
-        self.core = core;
+        self.active.take();
+        #[cfg(test)]
+        if let Some(observer) = self.active_take_observer.take() {
+            let _ = observer.send(self.core.is_some());
+        }
         if let Some(failure) = delivery_failure {
             return Err(failure);
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
             None => {
-                self.apply_idle_memory_maintenance().await?;
-                self.route_deferred_after_run().await
+                if route_after_completion {
+                    self.apply_idle_memory_maintenance().await?;
+                    self.route_deferred_after_run().await
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -1980,51 +2124,166 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn shutdown_active(&mut self) {
-        let Some(mut active) = self.active.take() else {
+        if self.active.is_none() {
             return;
-        };
+        }
         tokio::task::yield_now().await;
-        match active.completion_rx.try_recv() {
+        let completion = self
+            .active
+            .as_mut()
+            .expect("active run checked above")
+            .completion_rx
+            .try_recv();
+        match completion {
             Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. }) => {
-                if (&mut active.join).await.is_err() {
+                let join_result = {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    (&mut active.join).await
+                };
+                if join_result.is_err() {
+                    self.active.take();
                     return;
                 }
                 // The caller already holds the primary Session failure. Commit
                 // the suffix, but do not re-enter a failed Gateway during shutdown.
-                match self.drain_disconnected_outputs(&mut active, false).await {
-                    Ok(_) => self.core = Some(core),
-                    Err(_) => self.durable_core_invalidated = true,
+                match self.drain_active_outputs(false).await {
+                    Ok(_) => {
+                        self.active.take();
+                        self.core = Some(core);
+                    }
+                    Err(_) => {
+                        self.active.take();
+                        self.durable_core_invalidated = true;
+                    }
                 }
             }
             Ok(RunCompletion::RehydrationRequired { .. }) => {
-                if (&mut active.join).await.is_err() {
+                let join_result = {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    (&mut active.join).await
+                };
+                if join_result.is_err() {
+                    self.active.take();
                     return;
                 }
                 self.durable_core_invalidated = true;
-                let _ = self.drain_disconnected_outputs(&mut active, false).await;
+                let _ = self.drain_active_outputs(false).await;
+                self.active.take();
             }
             Err(oneshot::error::TryRecvError::Closed) => {
-                let _ = (&mut active.join).await;
+                {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    let _ = (&mut active.join).await;
+                }
+                self.active.take();
             }
             Err(oneshot::error::TryRecvError::Empty) => {
-                active.join.abort();
-                let _ = (&mut active.join).await;
+                {
+                    let active = self.active.as_mut().expect("active run checked above");
+                    active.join.abort();
+                    let _ = (&mut active.join).await;
+                }
+                self.active.take();
             }
         }
     }
 
-    async fn drain_disconnected_outputs(
+    async fn shutdown_active_gracefully(&mut self) -> Result<(), SessionFailure> {
+        if self.active.is_none() {
+            return Ok(());
+        }
+        self.runtime_shutdown.cancel();
+        if let Some(approval) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.approval.as_ref())
+        {
+            approval.cancel_all();
+        }
+        let deadline = tokio::time::Instant::now() + RUNTIME_SHUTDOWN_GRACE;
+        match tokio::time::timeout_at(deadline, self.settle_active_shutdown()).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The grace period is absolute: it includes Store commits,
+                // worker settlement, output draining, and every other await in
+                // the graceful path. Cancellation of any of those operations
+                // makes the durable/worker boundary indeterminate, so abort
+                // the retained worker and report ownership loss.
+                if let Some(active) = self.active.as_mut() {
+                    active.join.abort();
+                }
+                self.active.take();
+                self.core.take();
+                self.durable_core_invalidated = true;
+                Err(SessionFailure::RuntimeShutdownOwnershipLost)
+            }
+        }
+    }
+
+    async fn settle_active_shutdown(&mut self) -> Result<(), SessionFailure> {
+        let mut events_open = true;
+        loop {
+            enum ShutdownSelected {
+                Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
+                Event(Option<RunOutput>),
+            }
+            let selected = {
+                let active = self.active.as_mut().expect("active run checked above");
+                tokio::select! {
+                    biased;
+                    completion = &mut active.completion_rx => {
+                        ShutdownSelected::Completion(completion)
+                    }
+                    event = active.events_rx.recv(), if events_open => {
+                        ShutdownSelected::Event(event)
+                    }
+                }
+            };
+            match selected {
+                ShutdownSelected::Completion(completion) => {
+                    return match self.finish_run_with_route(completion, false).await {
+                        Err(SessionFailure::Worker(WorkerFailure::Cancelled))
+                            if self.core.is_some() =>
+                        {
+                            Ok(())
+                        }
+                        result => result,
+                    };
+                }
+                ShutdownSelected::Event(Some(output)) => {
+                    self.persist_shutdown_event(output).await?;
+                }
+                ShutdownSelected::Event(None) => {
+                    // Completion publication immediately follows sender drop.
+                    // Disable the now-always-ready branch so the bounded
+                    // deadline remains observable.
+                    events_open = false;
+                }
+            }
+        }
+    }
+
+    async fn drain_active_outputs(
         &mut self,
-        active: &mut ActiveRun,
         deliver: bool,
     ) -> Result<Option<SessionFailure>, SessionFailure> {
         let mut delivery_failure = None;
-        while let Ok(output) = active.events_rx.try_recv() {
-            let committed = match active.bridge.commit(&self.writer, output).await {
-                Ok(committed) => committed,
-                Err(error) => {
-                    self.durable_core_invalidated = true;
-                    return Err(error.into());
+        loop {
+            let output = {
+                let active = self.active.as_mut().expect("drain requires active run");
+                active.events_rx.try_recv()
+            };
+            let Ok(output) = output else {
+                break;
+            };
+            let committed = {
+                let active = self.active.as_mut().expect("drain requires active run");
+                match active.bridge.commit(&self.writer, output).await {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        self.durable_core_invalidated = true;
+                        return Err(error.into());
+                    }
                 }
             };
             let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
@@ -2035,19 +2294,54 @@ impl<G: Gateway + 'static> Session<G> {
             if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
-            active.finish_committed_approval_resolutions(&outputs);
+            self.active
+                .as_mut()
+                .expect("drain retains active run")
+                .finish_committed_approval_resolutions(&outputs);
             if deliver && delivery_failure.is_none() {
+                let command_id = self
+                    .active
+                    .as_ref()
+                    .expect("drain retains active run")
+                    .bridge
+                    .command_id()
+                    .to_owned();
                 delivery_failure = self
-                    .send_committed(
-                        outputs,
-                        Some(active.bridge.command_id().to_owned()),
-                        terminal_command_ids,
-                    )
+                    .send_committed(outputs, Some(command_id), terminal_command_ids)
                     .await
                     .err();
             }
         }
         Ok(delivery_failure)
+    }
+
+    async fn persist_shutdown_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        let committed = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("shutdown event requires active run");
+            match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            }
+        };
+        let (outputs, tool_start_barrier, retry_wait_commit_barrier, _) =
+            committed.resolve_message_receipts();
+        if let Some(barrier) = tool_start_barrier {
+            barrier.committed();
+        }
+        if let Some(barrier) = retry_wait_commit_barrier {
+            barrier.committed();
+        }
+        self.active
+            .as_mut()
+            .expect("shutdown event retains active run")
+            .finish_committed_approval_resolutions(&outputs);
+        Ok(())
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {

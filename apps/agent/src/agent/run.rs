@@ -387,6 +387,7 @@ impl Runner {
             .unwrap_or_else(|| watch::channel(WorkerPhase::Active).0);
         let context = std::mem::take(&mut core.runtime_context);
         let provider_context = std::mem::take(&mut core.provider_context);
+        let cancel = core.runtime_shutdown.child_token();
         Self {
             core,
             driver,
@@ -407,7 +408,7 @@ impl Runner {
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
-            cancel: CancellationToken::new(),
+            cancel,
             durable_terminal_pending: false,
         }
     }
@@ -774,7 +775,7 @@ impl Runner {
                 WorkerFailure::Error("RunCore has no attempt cancellation registry".to_owned())
             })?
             .clone();
-        let cancel = CancellationToken::new();
+        let cancel = self.cancel.child_token();
         let _guard = attempt_cancellation
             .register(cancel.clone())
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -836,10 +837,17 @@ impl Runner {
         let mut message_started = false;
         let mut rejected_results = Vec::new();
         let mut cancellation_observed = false;
+        let runtime_cancel = self.cancel.clone();
+        let mut runtime_shutdown_observed = false;
 
         loop {
             tokio::select! {
                 biased;
+                _ = runtime_cancel.cancelled(), if !runtime_shutdown_observed => {
+                    runtime_shutdown_observed = true;
+                    self.abort_requested = true;
+                    cancel.cancel();
+                }
                 control = self.controls.recv() => {
                     let Some(control) = control else {
                         return Err(WorkerFailure::Cancelled);
@@ -1698,8 +1706,13 @@ impl Runner {
             review_cancel.clone(),
         );
         tokio::pin!(request);
+        let runtime_cancel = self.cancel.clone();
         let outcome = loop {
             tokio::select! {
+                _ = runtime_cancel.cancelled() => {
+                    review_cancel.cancel();
+                    return Err(WorkerFailure::Cancelled);
+                }
                 outcome = &mut request => {
                     break outcome.map_err(|error| {
                         WorkerFailure::Error(format!("approval start failed: {error}"))
@@ -1759,8 +1772,15 @@ impl Runner {
         receiver: &mut oneshot::Receiver<WaiterResult>,
     ) -> Result<ApprovalWaitOutcome, WorkerFailure> {
         use crate::gateway::Command;
+        let runtime_cancel = self.cancel.clone();
         loop {
             tokio::select! {
+                _ = runtime_cancel.cancelled() => {
+                    if let Some(broker) = self.core.approval.as_ref() {
+                        broker.cancel(&request_id);
+                    }
+                    return Err(WorkerFailure::Cancelled);
+                }
                 result = &mut *receiver => {
                     return match result {
                         Ok(WaiterResult::Resolved(_)) => Err(WorkerFailure::Error(
@@ -1944,6 +1964,14 @@ impl Runner {
         let result = loop {
             let update = tokio::select! {
                 biased;
+                _ = self.cancel.cancelled() => {
+                    cancel.cancel();
+                    // Keep ownership of the driver future until it observes
+                    // cancellation and runs its process/reaper teardown. The
+                    // Session owns the outer bounded abort fallback.
+                    let _ = future.await;
+                    return Err(ExecuteToolError::Cancelled);
+                }
                 result = &mut future => break result,
                 update = updates_rx.recv() => update,
                 control = self.controls.recv() => {
@@ -2585,16 +2613,21 @@ impl Runner {
         if self.claim_pending_user()? {
             return Ok(true);
         }
-        let cancel = CancellationToken::new();
+        let cancel = self.cancel.child_token();
         let driver = self.driver.clone();
         let retry = driver.wait_retry(delay, &cancel);
         tokio::pin!(retry);
         let mut collected = false;
         const COLLECT_GRACE: Duration = Duration::from_millis(50);
         let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let runtime_cancel = self.cancel.clone();
         loop {
             let control = tokio::select! {
                 biased;
+                _ = runtime_cancel.cancelled() => {
+                    cancel.cancel();
+                    return Err(WorkerFailure::Cancelled);
+                }
                 control = self.controls.recv() => {
                     let Some(control) = control else {
                         return Err(WorkerFailure::Cancelled);

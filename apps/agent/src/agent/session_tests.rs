@@ -4358,7 +4358,7 @@ async fn aborting_session_drops_blocked_writer_and_active_worker() {
 }
 
 #[tokio::test]
-async fn cancelling_shutdown_active_aborts_the_taken_worker() {
+async fn cancelling_shutdown_active_before_settlement_retains_worker_ownership() {
     let (gateway, _commands, _frames) = gateway();
     let worker_entered = Arc::new(Notify::new());
     let worker_dropped = Arc::new(Notify::new());
@@ -4394,10 +4394,147 @@ async fn cancelling_shutdown_active_aborts_the_taken_worker() {
     ));
     drop(shutdown);
 
-    assert!(session.active.is_none(), "shutdown took the active run");
+    assert!(
+        session.active.is_some(),
+        "a cancelled shutdown handler must leave ActiveRun owned by Session"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            worker_dropped.notified()
+        )
+        .await
+        .is_err(),
+        "worker must remain owned until Session resumes shutdown"
+    );
+    session.shutdown_active().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), worker_dropped.notified())
         .await
-        .expect("cancellation during shutdown aborts the taken worker");
+        .expect("resumed shutdown aborts the still-owned worker");
+}
+
+#[tokio::test]
+async fn runtime_shutdown_cancels_active_attempt_and_joins_returned_core() {
+    let (gateway, commands, _frames) = gateway();
+    let attempt_entered = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let attempt_entered = attempt_entered.clone();
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let attempt_entered = attempt_entered.clone();
+            async move {
+                let runtime_shutdown = core.runtime_shutdown.clone();
+                attempt_entered.notify_one();
+                runtime_shutdown.cancelled().await;
+                drop(events);
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = session(gateway, worker).await;
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+
+    commands.send(user(1)).await.expect("start active run");
+    tokio::time::timeout(Duration::from_secs(2), attempt_entered.notified())
+        .await
+        .expect("worker registered cancellation");
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("graceful shutdown timeout")
+        .expect("Session task join");
+    assert!(
+        matches!(result, SessionResult::Completed(_)),
+        "runtime shutdown must recover ownership: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_shutdown_deadline_covers_blocked_store_persistence() {
+    let store = Store::session_test_store("runtime-shutdown-blocked-store")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, _frames) = gateway();
+    let worker_entered = Arc::new(Notify::new());
+    let event_sent = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let worker_entered = worker_entered.clone();
+        let event_sent = event_sent.clone();
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let worker_entered = worker_entered.clone();
+            let event_sent = event_sent.clone();
+            async move {
+                worker_entered.notify_one();
+                core.runtime_shutdown.cancelled().await;
+                events
+                    .send(AgentEvent::AgentStart)
+                    .await
+                    .expect("shutdown event receiver remains");
+                event_sent.notify_one();
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+
+    commands.send(user(1)).await.expect("start active run");
+    worker_entered.notified().await;
+    let store_guard = pool.acquire().await.expect("reserve sole Store connection");
+    tokio::time::pause();
+    shutdown.cancel();
+    event_sent.notified().await;
+
+    let (failure, ownership) = failed(task.await.expect("Session join"));
+    assert!(matches!(
+        failure,
+        SessionFailure::RuntimeShutdownOwnershipLost
+    ));
+    assert!(matches!(ownership, RunOwnership::Lost));
+    drop(store_guard);
+}
+
+#[tokio::test]
+async fn completion_installs_core_before_active_take_hook() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let mut session = session(gateway, worker).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let (observed_tx, observed_rx) = oneshot::channel();
+    session.active_take_observer = Some(observed_tx);
+
+    finish_active(&mut session).await;
+
+    assert!(
+        observed_rx.await.expect("active-take hook"),
+        "the unique RunCore must already be installed when ActiveRun is taken"
+    );
+    assert!(session.active.is_none());
+    assert!(session.core.is_some());
 }
 
 #[test]

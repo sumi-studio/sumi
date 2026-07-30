@@ -106,6 +106,41 @@ impl fmt::Debug for LocalControlCredential {
 
 /// Injectable local-control seam. Unit tests use an in-memory fake; production
 /// bootstrap uses `LocalControlHttpClient::new_unix`.
+///
+/// The error boundary is transport-independent so the evolving Unix client
+/// can preserve the same contract: local validation and explicit peer
+/// rejections are terminal, while send/response/ACK loss is indeterminate and
+/// must retain the exact CAS publication for reconciliation.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LocalPublicationError {
+    #[error("local runtime-state publication failed terminal validation or was rejected: {source}")]
+    Terminal {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("local runtime-state publication outcome is indeterminate: {source}")]
+    Indeterminate {
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl LocalPublicationError {
+    pub(crate) fn terminal(source: anyhow::Error) -> Self {
+        Self::Terminal { source }
+    }
+
+    pub(crate) fn indeterminate(source: anyhow::Error) -> Self {
+        Self::Indeterminate { source }
+    }
+
+    pub(crate) const fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::Indeterminate { .. })
+    }
+}
+
+pub(crate) type LocalPublicationResult<T> = std::result::Result<T, LocalPublicationError>;
+
 #[async_trait]
 pub(crate) trait LocalControlPlane: Send + Sync + 'static {
     async fn issue_gateway_credential(
@@ -116,7 +151,7 @@ pub(crate) trait LocalControlPlane: Send + Sync + 'static {
     async fn publish_runtime_state(
         &self,
         publication: LocalRuntimeStatePublication,
-    ) -> Result<LocalRuntimeStateAck>;
+    ) -> LocalPublicationResult<LocalRuntimeStateAck>;
 }
 
 /// Authenticated HTTP client for the Go-owned local-control plane.
@@ -292,6 +327,89 @@ impl LocalControlHttpClient {
         }
         serde_json::from_slice(body.as_slice()).context("decode strict local control response")
     }
+
+    async fn post_runtime_state(
+        &self,
+        publication: &LocalRuntimeStatePublication,
+    ) -> LocalPublicationResult<LocalRuntimeStateAck> {
+        self.credential
+            .validate_at(&self.authority, SystemTime::now())
+            .map_err(LocalPublicationError::terminal)?;
+        let url = self
+            .base_url
+            .join(PUBLISH_RUNTIME_STATE_PATH)
+            .context("join local control endpoint URL")
+            .map_err(LocalPublicationError::terminal)?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => (
+                build_unix_http_client(&endpoint.path).map_err(LocalPublicationError::terminal)?,
+                Some(endpoint),
+            ),
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
+        let mut request = http
+            .post(url)
+            .bearer_auth(self.credential.token.as_str())
+            .json(publication);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request
+            .build()
+            .context("build local control publication request")
+            .map_err(LocalPublicationError::terminal)?;
+        if let Some(endpoint) = unix_endpoint {
+            endpoint
+                .revalidate()
+                .map_err(LocalPublicationError::terminal)?;
+        }
+        let response = http
+            .execute(request)
+            .await
+            .context("local control publication request failed")
+            .map_err(LocalPublicationError::indeterminate)?;
+        if let Some(error) = publication_http_status_error(response.status()) {
+            return Err(error);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LOCAL_CONTROL_RESPONSE_BYTES as u64)
+        {
+            return Err(LocalPublicationError::indeterminate(anyhow::anyhow!(
+                "local control publication response exceeds bounded size"
+            )));
+        }
+        let mut body = Zeroizing::new(Vec::new());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .context("read local control publication response")
+                .map_err(LocalPublicationError::indeterminate)?;
+            if body.len().saturating_add(chunk.len()) > MAX_LOCAL_CONTROL_RESPONSE_BYTES {
+                return Err(LocalPublicationError::indeterminate(anyhow::anyhow!(
+                    "local control publication response exceeds bounded size"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(body.as_slice())
+            .context("decode strict local control publication response")
+            .map_err(LocalPublicationError::indeterminate)
+    }
+}
+
+fn publication_http_status_error(status: reqwest::StatusCode) -> Option<LocalPublicationError> {
+    if status.is_success() {
+        return None;
+    }
+    if status.is_client_error() || status.is_redirection() {
+        return Some(LocalPublicationError::terminal(anyhow::anyhow!(
+            "local control publication was rejected with status {status}"
+        )));
+    }
+    Some(LocalPublicationError::indeterminate(anyhow::anyhow!(
+        "local control publication acknowledgement failed with status {status}"
+    )))
 }
 
 #[async_trait]
@@ -316,21 +434,22 @@ impl LocalControlPlane for LocalControlHttpClient {
     async fn publish_runtime_state(
         &self,
         publication: LocalRuntimeStatePublication,
-    ) -> Result<LocalRuntimeStateAck> {
+    ) -> LocalPublicationResult<LocalRuntimeStateAck> {
         validate_wire_epoch(
             &self.authority,
             &publication.personality_agent_id,
             publication.generation,
             &publication.rpc_boot_nonce,
             "local runtime-state publication",
-        )?;
+        )
+        .map_err(LocalPublicationError::terminal)?;
         validate_publication_payload(
             publication.state,
             publication.hydration_receipt_identity.as_deref(),
             publication.reason,
-        )?;
-        self.post_json(PUBLISH_RUNTIME_STATE_PATH, &publication)
-            .await
+        )
+        .map_err(LocalPublicationError::terminal)?;
+        self.post_runtime_state(&publication).await
     }
 }
 
@@ -831,9 +950,9 @@ impl LocalReadyLatch {
 
 #[async_trait]
 pub(crate) trait LocalReadyPublisher: Send + Sync + 'static {
-    async fn publish_not_ready(&self) -> Result<()>;
-    async fn publish_ready(&self, proof: &LocalReadyProof) -> Result<()>;
-    async fn publish_shutdown_not_ready(&self) -> Result<()>;
+    async fn publish_not_ready(&self) -> LocalPublicationResult<()>;
+    async fn publish_ready(&self, proof: &LocalReadyProof) -> LocalPublicationResult<()>;
+    async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -880,7 +999,7 @@ impl LocalControlReadyPublisher {
         state: LocalRuntimePublicationState,
         receipt_identity: Option<String>,
         reason: LocalRuntimePublicationReason,
-    ) -> Result<()> {
+    ) -> LocalPublicationResult<()> {
         let mut machine = self.machine.lock().await;
         let desired = (state, receipt_identity.as_deref(), reason);
         let request = match machine.pending.as_ref() {
@@ -893,14 +1012,20 @@ impl LocalControlReadyPublisher {
             {
                 pending.clone()
             }
-            Some(_) => bail!("a different local runtime-state transition is already pending"),
+            Some(_) => {
+                return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                    "a different local runtime-state transition is already pending"
+                )));
+            }
             None => {
                 if !publication_transition_required(
                     &machine.phase,
                     state,
                     receipt_identity.as_deref(),
                     reason,
-                )? {
+                )
+                .map_err(LocalPublicationError::terminal)?
+                {
                     return Ok(());
                 }
                 let request = LocalRuntimeStatePublication {
@@ -918,8 +1043,20 @@ impl LocalControlReadyPublisher {
             }
         };
 
-        let ack = self.control.publish_runtime_state(request.clone()).await?;
-        validate_publication_ack(&self.authority, &request, &ack)?;
+        let ack = match self.control.publish_runtime_state(request.clone()).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                if !error.is_indeterminate() {
+                    // A terminal preflight/auth/validation/rejection outcome
+                    // is known not to require same-CAS reconciliation. Only
+                    // ambiguous transport/ACK outcomes retain the request.
+                    machine.pending = None;
+                }
+                return Err(error);
+            }
+        };
+        validate_publication_ack(&self.authority, &request, &ack)
+            .map_err(LocalPublicationError::indeterminate)?;
         machine.revision = Some(ack.revision);
         machine.pending = None;
         machine.phase = match (state, reason) {
@@ -939,7 +1076,7 @@ impl LocalControlReadyPublisher {
 
 #[async_trait]
 impl LocalReadyPublisher for LocalControlReadyPublisher {
-    async fn publish_not_ready(&self) -> Result<()> {
+    async fn publish_not_ready(&self) -> LocalPublicationResult<()> {
         self.publish(
             LocalRuntimePublicationState::NotReady,
             None,
@@ -948,16 +1085,21 @@ impl LocalReadyPublisher for LocalControlReadyPublisher {
         .await
     }
 
-    async fn publish_ready(&self, proof: &LocalReadyProof) -> Result<()> {
+    async fn publish_ready(&self, proof: &LocalReadyProof) -> LocalPublicationResult<()> {
         if proof.authority != self.authority {
-            bail!("local Ready proof belongs to a different runtime epoch");
+            return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                "local Ready proof belongs to a different runtime epoch"
+            )));
         }
-        validate_exact_hydration_receipt(&self.authority, &proof.receipt)?;
+        validate_exact_hydration_receipt(&self.authority, &proof.receipt)
+            .map_err(LocalPublicationError::terminal)?;
         let receipt_identity = proof.receipt.stable_id();
         if proof.ready.generation != self.authority.generation()
             || proof.ready.receipt_identity != receipt_identity
         {
-            bail!("local Ready proof hydration identity mismatch");
+            return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                "local Ready proof hydration identity mismatch"
+            )));
         }
         self.publish(
             LocalRuntimePublicationState::Ready,
@@ -967,7 +1109,7 @@ impl LocalReadyPublisher for LocalControlReadyPublisher {
         .await
     }
 
-    async fn publish_shutdown_not_ready(&self) -> Result<()> {
+    async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()> {
         self.publish(
             LocalRuntimePublicationState::NotReady,
             None,
@@ -1112,6 +1254,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::runtime::contracts::{
@@ -1268,12 +1411,14 @@ mod tests {
         async fn publish_runtime_state(
             &self,
             publication: LocalRuntimeStatePublication,
-        ) -> Result<LocalRuntimeStateAck> {
+        ) -> LocalPublicationResult<LocalRuntimeStateAck> {
             if publication.personality_agent_id != self.expected.personality_agent_id().as_str()
                 || publication.generation != self.expected.generation().as_u64()
                 || publication.rpc_boot_nonce != self.expected.nonce().as_str()
             {
-                bail!("fake local registry rejected stale runtime epoch");
+                return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                    "fake local registry rejected stale runtime epoch"
+                )));
             }
             let mut state = self.state.lock().unwrap();
             state.publication_attempts.push(publication.clone());
@@ -1287,12 +1432,16 @@ mod tests {
                     .iter()
                     .any(|committed| committed == &publication)
                 {
-                    bail!("fake local registry rejected duplicate-different publication");
+                    return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                        "fake local registry rejected duplicate-different publication"
+                    )));
                 }
                 return Ok(ack);
             }
             if publication.expected_revision != (state.revision > 0).then_some(state.revision) {
-                bail!("fake local registry rejected stale CAS revision");
+                return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                    "fake local registry rejected stale CAS revision"
+                )));
             }
             match publication.state {
                 LocalRuntimePublicationState::NotReady => {
@@ -1302,13 +1451,16 @@ mod tests {
                     let receipt = publication
                         .hydration_receipt_identity
                         .clone()
-                        .context("fake Ready requires receipt")?;
+                        .context("fake Ready requires receipt")
+                        .map_err(LocalPublicationError::terminal)?;
                     if state
                         .receipt
                         .as_ref()
                         .is_some_and(|current| current != &receipt)
                     {
-                        bail!("fake local registry rejected duplicate-different Ready");
+                        return Err(LocalPublicationError::terminal(anyhow::anyhow!(
+                            "fake local registry rejected duplicate-different Ready"
+                        )));
                     }
                     state.receipt = Some(receipt);
                 }
@@ -1329,7 +1481,9 @@ mod tests {
                 .insert(publication.publication_id, ack.clone());
             if state.drop_next_publication_ack {
                 state.drop_next_publication_ack = false;
-                bail!("simulated response loss after registry commit");
+                return Err(LocalPublicationError::indeterminate(anyhow::anyhow!(
+                    "simulated response loss after registry commit"
+                )));
             }
             Ok(ack)
         }
@@ -1585,6 +1739,7 @@ mod tests {
             .publish_ready(&other_proof)
             .await
             .expect_err("same PAID/generation with another boot nonce must fail closed");
+        assert!(!error.is_indeterminate());
         assert!(error.to_string().contains("different runtime epoch"));
     }
 
@@ -1594,7 +1749,11 @@ mod tests {
         let control = Arc::new(FakeControlPlane::new(expected.clone()));
         control.state.lock().unwrap().drop_next_publication_ack = true;
         let publisher = LocalControlReadyPublisher::new(expected.clone(), control.clone());
-        assert!(publisher.publish_not_ready().await.is_err());
+        let error = publisher
+            .publish_not_ready()
+            .await
+            .expect_err("lost ACK leaves the publication indeterminate");
+        assert!(error.is_indeterminate());
         assert!(
             publisher
                 .publish_shutdown_not_ready()
@@ -1618,6 +1777,53 @@ mod tests {
         let stale = authority_with(PAID, 8, "boot-stale");
         let stale_publisher = LocalControlReadyPublisher::new(stale, control);
         assert!(stale_publisher.publish_not_ready().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn signal_after_ready_commit_ack_loss_reconciles_same_cas_before_shutdown() {
+        let expected = authority();
+        let control = Arc::new(FakeControlPlane::new(expected.clone()));
+        let publisher = LocalControlReadyPublisher::new(expected.clone(), control.clone());
+        let proof = ready_proof(&expected).await;
+        let shutdown = CancellationToken::new();
+
+        publisher.publish_not_ready().await.unwrap();
+        control.state.lock().unwrap().drop_next_publication_ack = true;
+        let error = publisher
+            .publish_ready(&proof)
+            .await
+            .expect_err("committed Ready ACK is lost");
+        assert!(error.is_indeterminate());
+        assert!(error.to_string().contains("response loss"));
+        assert!(
+            control.state.lock().unwrap().receipt.is_some(),
+            "the registry committed Ready even though its ACK was lost"
+        );
+        shutdown.cancel();
+        assert!(shutdown.is_cancelled(), "test signal is now observed");
+        publisher
+            .publish_ready(&proof)
+            .await
+            .expect("retry must reconcile the retained Ready publication");
+        publisher.publish_shutdown_not_ready().await.unwrap();
+
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.publications.len(), 3);
+        assert_eq!(state.publication_attempts.len(), 4);
+        let first_ready = &state.publication_attempts[1];
+        let retried_ready = &state.publication_attempts[2];
+        assert_eq!(first_ready, retried_ready);
+        assert_eq!(first_ready.expected_revision, Some(1));
+        assert_eq!(retried_ready.expected_revision, Some(1));
+        assert_eq!(
+            state.publication_attempts[3].expected_revision,
+            Some(2),
+            "shutdown must advance from the reconciled Ready revision"
+        );
+        assert_eq!(
+            state.publication_attempts[3].reason,
+            LocalRuntimePublicationReason::Shutdown
+        );
     }
 
     #[test]
@@ -1818,14 +2024,12 @@ mod tests {
             hydration_receipt_identity: None,
             reason: LocalRuntimePublicationReason::Startup,
         };
-        assert!(
-            client
-                .publish_runtime_state(publication)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("runtime epoch mismatch")
-        );
+        let error = client
+            .publish_runtime_state(publication)
+            .await
+            .expect_err("cross-epoch publication must fail before transport");
+        assert!(!error.is_indeterminate());
+        assert!(error.to_string().contains("runtime epoch mismatch"));
     }
 
     async fn read_unix_http_request(
@@ -2214,6 +2418,108 @@ mod tests {
         };
         state.publications.lock().unwrap().push(publication);
         Ok(Json(ack))
+    }
+
+    #[tokio::test]
+    async fn loopback_publication_auth_rejection_is_terminal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture_state = HttpFixtureState {
+            publications: Arc::new(StdMutex::new(Vec::new())),
+            expected_authorization: "Bearer a-different-control-secret".to_owned(),
+        };
+        let app = Router::new()
+            .route(
+                &format!("/{PUBLISH_RUNTIME_STATE_PATH}"),
+                post(publish_http_fixture),
+            )
+            .with_state(fixture_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected.clone(),
+            credential,
+        )
+        .unwrap();
+        let publication = LocalRuntimeStatePublication {
+            publication_id: Uuid::now_v7().hyphenated().to_string(),
+            personality_agent_id: expected.personality_agent_id().as_str().to_owned(),
+            generation: expected.generation().as_u64(),
+            rpc_boot_nonce: expected.nonce().as_str().to_owned(),
+            expected_revision: None,
+            state: LocalRuntimePublicationState::NotReady,
+            hydration_receipt_identity: None,
+            reason: LocalRuntimePublicationReason::Startup,
+        };
+
+        let error = client
+            .publish_runtime_state(publication)
+            .await
+            .expect_err("HTTP auth rejection must be terminal");
+        assert!(!error.is_indeterminate());
+        assert!(error.to_string().contains("401"));
+        assert!(fixture_state.publications.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn publication_http_status_distinguishes_rejection_from_ack_indeterminacy() {
+        let rejection = publication_http_status_error(reqwest::StatusCode::UNAUTHORIZED)
+            .expect("401 is a publication rejection");
+        assert!(!rejection.is_indeterminate());
+
+        let server_failure =
+            publication_http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .expect("500 leaves publication acknowledgement indeterminate");
+        assert!(server_failure.is_indeterminate());
+
+        assert!(publication_http_status_error(reqwest::StatusCode::OK).is_none());
+    }
+
+    #[tokio::test]
+    async fn loopback_publication_transport_failure_is_indeterminate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected.clone(),
+            credential,
+        )
+        .unwrap();
+        let publication = LocalRuntimeStatePublication {
+            publication_id: Uuid::now_v7().hyphenated().to_string(),
+            personality_agent_id: expected.personality_agent_id().as_str().to_owned(),
+            generation: expected.generation().as_u64(),
+            rpc_boot_nonce: expected.nonce().as_str().to_owned(),
+            expected_revision: None,
+            state: LocalRuntimePublicationState::NotReady,
+            hydration_receipt_identity: None,
+            reason: LocalRuntimePublicationReason::Startup,
+        };
+
+        let error = client
+            .publish_runtime_state(publication)
+            .await
+            .expect_err("transport loss cannot determine commit state");
+        assert!(error.is_indeterminate());
+        assert!(error.to_string().contains("request failed"));
     }
 
     #[tokio::test]

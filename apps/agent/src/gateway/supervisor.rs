@@ -18,9 +18,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -619,29 +622,189 @@ struct SupervisorLifecycle {
     task: Option<JoinHandle<Result<()>>>,
 }
 
+pub(super) const OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await an owned runtime task without moving its `JoinHandle` out before the
+/// await. Cancelling this future leaves the task in its lifecycle owner; only a
+/// resolved join transfers the terminal outcome and clears ownership.
+pub(super) async fn join_owned_runtime_task(
+    task: &mut Option<JoinHandle<Result<()>>>,
+    owner: &'static str,
+) -> Result<()> {
+    let joined = task
+        .as_mut()
+        .with_context(|| format!("{owner} task was already joined"))?
+        .await;
+    task.take()
+        .expect("owned runtime task remains present until its join resolves");
+    match joined {
+        Ok(result) => result,
+        Err(error) => {
+            let classification = if error.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            Err(anyhow::Error::new(error).context(format!("{owner} task {classification}")))
+        }
+    }
+}
+
+pub(super) fn fail_stop_teardown_deadline(owner: &'static str, timeout: Duration) -> ! {
+    tracing::error!(
+        owner,
+        timeout_millis = timeout.as_millis(),
+        "owned runtime teardown deadline elapsed"
+    );
+    std::process::abort();
+}
+
+pub(super) fn settle_finished_or_fail_stop_runtime_task(
+    task: &mut Option<JoinHandle<Result<()>>>,
+    owner: &'static str,
+) {
+    let Some(handle) = task.take() else {
+        return;
+    };
+    if handle.is_finished() {
+        match handle.now_or_never() {
+            Some(Ok(Ok(()))) => return,
+            Some(Ok(Err(error))) => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task failure");
+            }
+            Some(Err(error)) if error.is_panic() => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task panic");
+            }
+            Some(Err(error)) => {
+                tracing::error!(owner, %error, "runtime task owner dropped after task cancellation");
+            }
+            None => {
+                tracing::error!(
+                    owner,
+                    "finished runtime task was not ready when synchronously joined"
+                );
+            }
+        }
+        std::process::abort();
+    }
+
+    // Drop cannot asynchronously settle this owner. Continuing would detach
+    // cleanup from the runtime root, so make the ownership failure explicit.
+    tracing::error!(owner, "runtime task owner dropped before a retained join");
+    std::process::abort();
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorTermination {
+    Completed,
+    Failed(String),
+    Panicked(String),
+    Cancelled(String),
+}
+
+impl fmt::Display for SupervisorTermination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => write!(formatter, "connection supervisor completed unexpectedly"),
+            Self::Failed(reason) => write!(formatter, "connection supervisor failed: {reason}"),
+            Self::Panicked(reason) => write!(formatter, "connection supervisor panicked: {reason}"),
+            Self::Cancelled(reason) => {
+                write!(
+                    formatter,
+                    "connection supervisor task was cancelled: {reason}"
+                )
+            }
+        }
+    }
+}
+
+pub(crate) struct SupervisorRuntime {
+    lifecycle: SupervisorLifecycle,
+    completed: Option<Result<()>>,
+}
+
+impl SupervisorRuntime {
+    fn new(lifecycle: SupervisorLifecycle) -> Self {
+        Self {
+            lifecycle,
+            completed: None,
+        }
+    }
+
+    pub(crate) async fn termination(&mut self) -> Result<SupervisorTermination> {
+        let joined = self
+            .lifecycle
+            .task
+            .as_mut()
+            .context("connection supervisor completion was already observed")?
+            .await;
+        self.lifecycle.task.take();
+        let (termination, result) = match joined {
+            Ok(Ok(())) => (SupervisorTermination::Completed, Ok(())),
+            Ok(Err(error)) => (SupervisorTermination::Failed(error.to_string()), Err(error)),
+            Err(join_error) if join_error.is_panic() => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Panicked(reason.clone()),
+                    Err(anyhow!("connection supervisor task panicked: {reason}")),
+                )
+            }
+            Err(join_error) => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Cancelled(reason.clone()),
+                    Err(anyhow!(
+                        "connection supervisor task was cancelled: {reason}"
+                    )),
+                )
+            }
+        };
+        self.completed = Some(result);
+        Ok(termination)
+    }
+
+    pub(crate) async fn cancel_and_join(&mut self) -> Result<()> {
+        self.lifecycle.cancel.cancel();
+        match self.completed.take() {
+            Some(result) => result,
+            None => self.lifecycle.join().await,
+        }
+    }
+}
+
 impl SupervisorHandle {
     pub fn abort(&self) {
         self.lifecycle.cancel.cancel();
     }
 
     pub async fn join(mut self) -> Result<()> {
-        let task = self
-            .lifecycle
-            .task
-            .take()
-            .context("supervisor task was already consumed")?;
-        task.await?
+        self.lifecycle.join().await
+    }
+}
+
+impl SupervisorLifecycle {
+    async fn join(&mut self) -> Result<()> {
+        self.join_with_timeout(OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn join_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        match time::timeout(
+            timeout,
+            join_owned_runtime_task(&mut self.task, "connection supervisor owner"),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => fail_stop_teardown_deadline("connection supervisor owner", timeout),
+        }
     }
 }
 
 impl Drop for SupervisorLifecycle {
     fn drop(&mut self) {
         self.cancel.cancel();
-        // Dropping a JoinHandle detaches the task. Keep the cancelled
-        // supervisor alive long enough to join both connection halves and
-        // invalidate the installed T17 delivery epoch. Aborting this task here
-        // would cancel the cleanup future and leave the dead epoch mapped.
-        self.task.take();
+        settle_finished_or_fail_stop_runtime_task(&mut self.task, "connection supervisor owner");
     }
 }
 
@@ -670,6 +833,7 @@ where
     cancel: CancellationToken,
     /// Test-only notification fired when `send_validated` is about to block on
     /// a full command channel.
+    #[cfg(test)]
     command_send_blocked_notify: Option<Arc<Notify>>,
 }
 
@@ -700,10 +864,12 @@ where
             current_epoch,
             online: Arc::new(online_tx),
             cancel: CancellationToken::new(),
+            #[cfg(test)]
             command_send_blocked_notify: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_command_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
         self.command_send_blocked_notify = Some(notify);
         self
@@ -984,6 +1150,7 @@ where
         self.current_epoch.send_replace(Some(delivery_epoch));
         let _ = delivery_ready_tx.send(Ok(()));
 
+        #[cfg(test)]
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
         let mut reader_handle = tokio::spawn(reader_task(
             reader,
@@ -992,6 +1159,7 @@ where
             api_hello,
             config.personality_agent_id.clone(),
             epoch_token.child_token(),
+            #[cfg(test)]
             command_send_blocked_notify,
         ));
 
@@ -1992,7 +2160,7 @@ async fn reader_task<R, L>(
     api_hello: ApiHello,
     personality_agent_id: PersonalityAgentId,
     token: CancellationToken,
-    command_send_blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] command_send_blocked_notify: Option<Arc<Notify>>,
 ) -> Result<(), ReaderError>
 where
     R: GatewayReader + 'static,
@@ -2050,7 +2218,16 @@ where
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
-                        next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                        next_expected = send_validated(
+                            cmd,
+                            &personality_agent_id,
+                            next_expected,
+                            &mut command_tx,
+                            &token,
+                            #[cfg(test)]
+                            command_send_blocked_notify.clone(),
+                        )
+                        .await?;
                     }
                     if terminal_after_pending {
                         break 'task Err(ReaderError::Terminal);
@@ -2063,7 +2240,16 @@ where
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
-                                next_expected = send_validated(cmd, &personality_agent_id, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                                next_expected = send_validated(
+                                    cmd,
+                                    &personality_agent_id,
+                                    next_expected,
+                                    &mut command_tx,
+                                    &token,
+                                    #[cfg(test)]
+                                    command_send_blocked_notify.clone(),
+                                )
+                                .await?;
                             } else if pending.len() >= MAX_PENDING_BEFORE_READY {
                                 break 'task Err(ReaderError::Fatal(anyhow!(
                                     "hydration hold limit exceeded: {} commands received before Ready",
@@ -2108,7 +2294,7 @@ async fn send_validated(
     next_expected: u64,
     command_tx: &mut mpsc::Sender<InboundCommand>,
     token: &CancellationToken,
-    blocked_notify: Option<Arc<Notify>>,
+    #[cfg(test)] blocked_notify: Option<Arc<Notify>>,
 ) -> Result<u64> {
     if cmd.personality_agent_id() != expected_personality_agent_id {
         bail!(
@@ -2128,11 +2314,14 @@ async fn send_validated(
     if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
-    if !token.is_cancelled()
-        && let Some(notify) = blocked_notify.as_ref()
-        && command_tx.capacity() == 0
+    #[cfg(test)]
     {
-        notify.notify_one();
+        if !token.is_cancelled()
+            && let Some(notify) = blocked_notify.as_ref()
+            && command_tx.capacity() == 0
+        {
+            notify.notify_one();
+        }
     }
     tokio::select! {
         biased;
@@ -2234,13 +2423,14 @@ impl HydrationLatch for WatchHydrationLatch {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
     use sha2::{Digest, Sha256};
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc, oneshot, watch};
 
     use super::*;
     use crate::agent::{
@@ -2267,6 +2457,240 @@ mod tests {
         EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome,
         PostCommitEpochCapability, Store, insert_test_durable_event, user_message_id,
     };
+
+    fn test_supervisor_runtime<F>(cancel: CancellationToken, run: F) -> SupervisorRuntime
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(run)),
+        })
+    }
+
+    async fn observed_supervisor_termination(
+        runtime: &mut SupervisorRuntime,
+    ) -> SupervisorTermination {
+        tokio::time::timeout(Duration::from_secs(1), runtime.termination())
+            .await
+            .expect("supervisor termination must be observable")
+            .expect("supervisor lifecycle join remains valid")
+    }
+
+    #[tokio::test]
+    async fn supervisor_error_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            Err(anyhow!("injected supervisor failure"))
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Failed(reason)
+                if reason.contains("injected supervisor failure")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its task error");
+        assert!(error.to_string().contains("injected supervisor failure"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_panic_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            panic!("injected supervisor panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Panicked(reason)
+                if reason.contains("injected supervisor panic")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its panic");
+        assert!(error.to_string().contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_supervisor_exit_is_observable_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async { Ok(()) });
+
+        assert_eq!(
+            observed_supervisor_termination(&mut runtime).await,
+            SupervisorTermination::Completed
+        );
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("completed supervisor owner task must still be joined");
+    }
+
+    #[tokio::test]
+    async fn planned_supervisor_shutdown_cancels_and_joins_cleanly() {
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let run_finished = finished.clone();
+        let mut runtime = test_supervisor_runtime(cancel, async move {
+            run_cancel.cancelled().await;
+            run_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("planned shutdown must join cleanly");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "join must await the supervisor's cancellation cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_supervisor_teardown_retains_task_for_a_later_join() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let cleanup_entered = Arc::new(Notify::new());
+        let task_cleanup_entered = cleanup_entered.clone();
+        let release_cleanup = Arc::new(Notify::new());
+        let task_release_cleanup = release_cleanup.clone();
+        let mut runtime = SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(async move {
+                task_cancel.cancelled().await;
+                task_cleanup_entered.notify_one();
+                task_release_cleanup.notified().await;
+                Ok(())
+            })),
+        });
+
+        let mut join = Box::pin(runtime.cancel_and_join());
+        let mut entered = Box::pin(cleanup_entered.notified());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut join => {
+                    panic!("supervisor teardown resolved before cleanup blocked: {result:?}")
+                }
+                _ = &mut entered => {}
+            }
+        })
+        .await
+        .expect("teardown must cancel the live supervisor");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut join)
+                .await
+                .is_err(),
+            "teardown must retain and await the supervisor through cleanup"
+        );
+        drop(join);
+        assert!(
+            runtime.lifecycle.task.is_some(),
+            "cancelling teardown must leave the JoinHandle in its live owner"
+        );
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), runtime.cancel_and_join())
+            .await
+            .expect("a later retained join must finish after supervisor cleanup")
+            .expect("retained supervisor cleanup succeeds");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for the owned supervisor deadline fail-stop"]
+    async fn hung_supervisor_cleanup_deadline_child() {
+        if std::env::var("SUMI_HUNG_SUPERVISOR_DEADLINE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let mut runtime = test_supervisor_runtime(cancel, async move {
+            task_cancel.cancelled().await;
+            std::future::pending::<Result<()>>().await
+        });
+        runtime.lifecycle.cancel.cancel();
+        runtime
+            .lifecycle
+            .join_with_timeout(Duration::from_millis(25))
+            .await
+            .expect("a hung supervisor teardown must fail-stop before returning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_supervisor_cleanup_deadline_fail_stops_the_runtime_root() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("gateway::supervisor::tests::hung_supervisor_cleanup_deadline_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_HUNG_SUPERVISOR_DEADLINE_CHILD", "1")
+                .output()
+                .expect("run hung supervisor deadline child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "deadline must abort instead of detaching the runtime owner:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for unsettled supervisor owner Drop"]
+    async fn unsettled_supervisor_owner_drop_child() {
+        if std::env::var("SUMI_UNSETTLED_SUPERVISOR_DROP_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let runtime = test_supervisor_runtime(cancel, async move {
+            task_cancel.cancelled().await;
+            std::future::pending::<Result<()>>().await
+        });
+        drop(runtime);
+        panic!("dropping an unsettled supervisor owner must fail-stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_shutdown_cannot_detach_an_unsettled_supervisor_owner() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("gateway::supervisor::tests::unsettled_supervisor_owner_drop_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_UNSETTLED_SUPERVISOR_DROP_CHILD", "1")
+                .output()
+                .expect("run unsettled supervisor owner child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "runtime owner Drop must abort instead of spawning a detachable reaper:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     struct TestDigestFactory;
 
@@ -6625,16 +7049,23 @@ mod tests {
             online.changed().await.unwrap();
         }
 
-        let sent_frames = sent.lock().unwrap();
-        let seqs: Vec<_> = sent_frames
-            .iter()
-            .filter_map(|f| outbound_frame_event_seq(f).ok())
-            .collect();
-        assert_eq!(
-            seqs,
-            vec![1, 2],
-            "racing durable commit 2 must be included before Online without gaps or duplicates"
-        );
+        {
+            let sent_frames = sent.lock().unwrap();
+            let seqs: Vec<_> = sent_frames
+                .iter()
+                .filter_map(|f| outbound_frame_event_seq(f).ok())
+                .collect();
+            assert_eq!(
+                seqs,
+                vec![1, 2],
+                "racing durable commit 2 must be included before Online without gaps or duplicates"
+            );
+        }
+        handle.abort();
+        handle
+            .join()
+            .await
+            .expect("cursor recheck supervisor joins explicitly");
     }
 
     #[tokio::test]
@@ -7977,55 +8408,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_active_handle_finishes_t17_epoch_cleanup_with_or_without_prior_abort() {
-        async fn assert_cleanup(abort_before_drop: bool) {
-            let store_name = if abort_before_drop {
-                "t17-t24-abort-without-join-cleanup"
-            } else {
-                "t17-t24-handle-drop-cleanup"
-            };
-            let store = Arc::new(Store::session_test_store(store_name).await.unwrap());
-            let adapter = seams::T17StoreAdapter::new(store);
-            let connector = MockConnector::new(
-                Arc::new(Mutex::new(Vec::new())),
-                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
-            );
-            let supervisor = ConnectionSupervisor::new(
-                connector,
-                CountingCredentialProvider::new("token"),
-                adapter.clone(),
-                StaticHydrationLatch(HydrationReady {
-                    generation: ProcessGeneration::from_wire(7).unwrap(),
-                    receipt_identity: "handle-drop-ready".to_owned(),
-                }),
-                make_config(),
-            );
-            let handle = supervisor.start();
+    async fn abort_and_join_finishes_t17_epoch_cleanup() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-explicit-handle-cleanup")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store);
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "handle-join-ready".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while adapter.active_delivery_epoch().await.is_none() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("real T17 delivery epoch must be installed before handle drop");
-            assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
-
-            if abort_before_drop {
-                handle.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.active_delivery_epoch().await.is_none() {
+                tokio::task::yield_now().await;
             }
-            drop(handle);
+        })
+        .await
+        .expect("real T17 delivery epoch must be installed before teardown");
+        assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
 
-            wait_for_t17_idle(&adapter).await;
-            assert_eq!(
-                adapter.delivery_epoch_lifecycle_counts(),
-                (1, 1),
-                "handle drop must install and invalidate the real T17 epoch exactly once"
-            );
-        }
+        handle.abort();
+        handle
+            .join()
+            .await
+            .expect("explicit supervisor teardown joins cleanup");
 
-        assert_cleanup(false).await;
-        assert_cleanup(true).await;
+        assert_eq!(
+            adapter.delivery_epoch_lifecycle_counts(),
+            (1, 1),
+            "explicit join must invalidate the real T17 epoch exactly once"
+        );
     }
 
     #[tokio::test]
@@ -8047,7 +8472,7 @@ mod tests {
         .unwrap();
         store.publish_test_committed_event_receipt(&[1]).unwrap();
         let base_adapter = seams::T17StoreAdapter::new(store.clone());
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 1);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -8070,7 +8495,8 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (_session_reader, mut session_writer) = session_gateway.split();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !*online.borrow() {
@@ -8140,10 +8566,17 @@ mod tests {
         .expect("projection-only durable frames must be forwarded");
 
         drop(session_writer);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("projection-only supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
         // This projection-focused fixture inserts encrypted rows directly and
         // intentionally has no authenticated EventWriter head to quiesce.
-        drop(dispatcher);
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("projection-only fixture joins its dispatcher explicitly");
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -8180,7 +8613,7 @@ mod tests {
                 .unwrap(),
         );
         let base_adapter = seams::T17StoreAdapter::new(store.clone());
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let raw_secret = "sk-raw-epoch-secret-value";
         let raw_sent = Arc::new(Mutex::new(Vec::new()));
@@ -8219,7 +8652,8 @@ mod tests {
         let handle = supervisor.start();
         let mut online = handle.online.clone();
         let mut epochs = handle.epochs.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (_session_reader, mut session_writer) = session_gateway.split();
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -8297,10 +8731,17 @@ mod tests {
         .expect("redaction-only reconnect must catch up the durable event");
 
         drop(session_writer);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("authorization rollover supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
         // This projection-focused fixture inserts encrypted rows directly and
         // intentionally has no authenticated EventWriter head to quiesce.
-        drop(dispatcher);
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("authorization rollover fixture joins its dispatcher explicitly");
 
         assert!(
             serde_json::to_string(&*raw_sent.lock().unwrap())
@@ -8345,7 +8786,7 @@ mod tests {
                 .unwrap(),
         );
         let base_adapter = seams::T17StoreAdapter::new(store.clone());
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = MockGateway::new(VecDeque::new());
@@ -8370,7 +8811,8 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
-        let session_gateway = session::SessionGateway::from(handle);
+        let (session_gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(handle);
         let (mut session_reader, mut session_writer) = session_gateway.split();
 
         for seq in 1..=80 {
@@ -8430,10 +8872,17 @@ mod tests {
 
         drop(session_writer);
         drop(session_reader);
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("bounded replay supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
         // This bounded-replay fixture inserts encrypted rows directly and
         // intentionally has no authenticated EventWriter head to quiesce.
-        drop(dispatcher);
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("bounded replay fixture joins its dispatcher explicitly");
 
         let delivered: Vec<_> = sent
             .lock()
@@ -8476,7 +8925,7 @@ mod tests {
             .await
             .unwrap()
             .expect("T17 adapter installs one delivery epoch");
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
 
         let (_command_tx, commands) = mpsc::channel(1);
@@ -8630,7 +9079,7 @@ mod tests {
             .await
             .unwrap()
             .expect("T17 adapter installs a forwarder runtime");
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 0);
         let dispatcher_client = dispatcher.client();
         assert_eq!(
@@ -8815,7 +9264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emergency_post_commit_dispatcher_drop_resolves_never_drained_t17_admission() {
+    async fn emergency_post_commit_invalidation_resolves_never_drained_t17_admission() {
         let store = Arc::new(
             Store::session_test_store("t26-emergency-fence-cleanup")
                 .await
@@ -8839,7 +9288,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery epoch installs");
-        let dispatcher = post_commit::OrderedPostCommitDispatcher::start(
+        let mut dispatcher = post_commit::OrderedPostCommitDispatcher::start(
             store.clone(),
             adapter.clone(),
             0,
@@ -8883,14 +9332,17 @@ mod tests {
             .await
             .expect("durable frame reaches T17 while the external lane stays full");
 
-        drop(dispatcher);
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("emergency invalidation joins the dispatcher");
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.durable_fence_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("owner drop force-resolves the T17 fence");
+        .expect("emergency teardown force-resolves the T17 fence");
         let blocker = event_rx
             .try_recv()
             .expect("the pre-existing external lane blocker remains queued");
@@ -9219,9 +9671,10 @@ mod tests {
                 async move { RunCompletion::Completed(core) }
             }
         });
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
         let session = Session::start(
             store,
-            session::SessionGateway::from(handle),
+            gateway,
             RunCore::fixture_with_unapproved_tools(),
             worker,
             ProcessGeneration::from_wire(7).unwrap(),
@@ -9283,6 +9736,10 @@ mod tests {
 
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("ACK replay supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
     }
 
@@ -9295,7 +9752,7 @@ mod tests {
             .unwrap();
         let store_arc = Arc::new(store.clone());
         let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let first_sent = Arc::new(Mutex::new(Vec::new()));
@@ -9335,7 +9792,7 @@ mod tests {
         let handle = supervisor.start();
         let mut online = handle.online.clone();
         let mut epochs = handle.epochs.clone();
-        let gateway = session::SessionGateway::from(handle);
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
 
         let starts = Arc::new(AtomicU64::new(0));
         let started = Arc::new(Notify::new());
@@ -9472,6 +9929,10 @@ mod tests {
             .await
             .expect_err("test cleanup aborts the otherwise idle Session");
         assert!(error.is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("reconnect supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
         let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
         dispatcher.shutdown(quiescence).await.unwrap();
@@ -9488,7 +9949,7 @@ mod tests {
         let pool = store.pool().clone();
         let store_arc = Arc::new(store.clone());
         let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
-        let (adapter, dispatcher) =
+        let (adapter, mut dispatcher) =
             bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer_blocked = Arc::new(Notify::new());
@@ -9641,9 +10102,10 @@ mod tests {
                 }
             }
         });
+        let (gateway, mut supervisor_runtime) = session::SessionGateway::from_supervisor(handle);
         let session = Session::start(
             store,
-            session::SessionGateway::from(handle),
+            gateway,
             RunCore::fixture_with_unapproved_tools(),
             worker,
             ProcessGeneration::from_wire(7).unwrap(),
@@ -9704,6 +10166,10 @@ mod tests {
         writer_release.notify_one();
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("blocked-pump supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
         let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
         dispatcher.shutdown(quiescence).await.unwrap();

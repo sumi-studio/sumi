@@ -2104,12 +2104,18 @@ impl Store {
         self.post_commit_feed.claim()
     }
 
+    /// Authenticated EventWriter high-water for this exact Store-local epoch.
+    /// Production bootstrap captures it before starting any runtime producer.
+    pub(crate) fn post_commit_published_through(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<u64> {
+        self.validate_post_commit_epoch(epoch)?;
+        self.post_commit_feed.published_through()
+    }
+
     /// Issue the one shared dispatcher/client/target capability only after the
     /// exact runtime authority has completed Store hydration.
-    #[allow(
-        dead_code,
-        reason = "T26 production bootstrap composition is a follow-up"
-    )]
     pub(crate) fn issue_post_commit_epoch(
         &self,
         authority: RuntimeEpochAuthority,
