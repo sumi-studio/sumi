@@ -19,7 +19,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -334,25 +334,141 @@ async fn hydrate_to_fixed_point(
     }
 }
 
-/// A monitor is constructed before Ready and completes only when an already
-/// authenticated dependency becomes unavailable. Merely probing a socket inode
-/// is not sufficient because it cannot bind PAID/generation/boot nonce.
-trait AuthenticatedDependencyMonitor: Send {
-    fn failure(self: Box<Self>) -> BoxFuture<'static, Result<()>>;
+const EXECUTOR_STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+const EXECUTOR_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const EXECUTOR_HEALTH_RETRY_DELAY: Duration = Duration::from_millis(100);
+const EXECUTOR_HEALTH_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+const DEPENDENCY_MONITOR_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct ExecutorHealthPolicy {
+    startup_timeout: Duration,
+    probe_timeout: Duration,
+    retry_delay: Duration,
+    monitor_interval: Duration,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "authenticated runtime dependency monitoring is unavailable; executor Health must bind the exact RpcIdentity before Ready"
-)]
-struct AuthenticatedDependencyMonitoringUnavailable;
+impl ExecutorHealthPolicy {
+    const PRODUCTION: Self = Self {
+        startup_timeout: EXECUTOR_STARTUP_HEALTH_TIMEOUT,
+        probe_timeout: EXECUTOR_HEALTH_PROBE_TIMEOUT,
+        retry_delay: EXECUTOR_HEALTH_RETRY_DELAY,
+        monitor_interval: EXECUTOR_HEALTH_MONITOR_INTERVAL,
+    };
+}
+
+/// The owner retains the monitor task until every teardown path explicitly
+/// cancels and joins it. Runtime select sites borrow the termination signal;
+/// they never consume or detach the task owner.
+#[async_trait]
+trait AuthenticatedDependencyMonitor: Send {
+    async fn termination(&mut self) -> Result<()>;
+    async fn cancel_and_join(self: Box<Self>) -> Result<()>;
+}
+
+#[derive(Clone, Debug)]
+struct DependencyMonitorFailure {
+    description: String,
+}
+
+struct ExecutorDependencyMonitor {
+    cancel: CancellationToken,
+    termination: watch::Receiver<Option<DependencyMonitorFailure>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ExecutorDependencyMonitor {
+    async fn cancel_and_join_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.cancel.cancel();
+        let mut task = self
+            .task
+            .take()
+            .expect("executor dependency monitor is joined exactly once");
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow!("executor dependency monitor task failed: {error}")),
+            Err(_) => {
+                tracing::error!(
+                    timeout_millis = timeout.as_millis(),
+                    "executor dependency monitor did not join within its ownership bound"
+                );
+                std::process::abort();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl AuthenticatedDependencyMonitor for ExecutorDependencyMonitor {
+    async fn termination(&mut self) -> Result<()> {
+        loop {
+            if let Some(failure) = self.termination.borrow().clone() {
+                bail!(failure.description);
+            }
+            self.termination
+                .changed()
+                .await
+                .context("executor dependency monitor ended without a terminal result")?;
+        }
+    }
+
+    async fn cancel_and_join(mut self: Box<Self>) -> Result<()> {
+        self.cancel_and_join_with_timeout(DEPENDENCY_MONITOR_JOIN_TIMEOUT)
+            .await
+    }
+}
+
+impl Drop for ExecutorDependencyMonitor {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if self.task.is_some() {
+            tracing::error!(
+                "unsettled executor dependency monitor owner would detach its JoinHandle"
+            );
+            std::process::abort();
+        }
+    }
+}
 
 fn authenticated_dependency_monitor(
-    _executor: Arc<ExecutorClient>,
+    executor: Arc<ExecutorClient>,
+    authority: &RuntimeEpochAuthority,
+    policy: ExecutorHealthPolicy,
 ) -> Result<Box<dyn AuthenticatedDependencyMonitor>> {
-    Err(anyhow::Error::new(
-        AuthenticatedDependencyMonitoringUnavailable,
-    ))
+    authority
+        .validate_rpc_identity(executor.identity())
+        .context("executor monitor identity differs from runtime authority")?;
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let (termination_tx, termination) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        loop {
+            let health = executor
+                .health_with_cancellation(task_cancel.clone(), policy.probe_timeout)
+                .await;
+            if task_cancel.is_cancelled() {
+                return;
+            }
+            if let Err(error) = health {
+                termination_tx.send_replace(Some(DependencyMonitorFailure {
+                    description: format!(
+                        "authenticated executor Health failed for the exact runtime identity: {error}"
+                    ),
+                }));
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => return,
+                _ = tokio::time::sleep(policy.monitor_interval) => {}
+            }
+        }
+    });
+    Ok(Box::new(ExecutorDependencyMonitor {
+        cancel,
+        termination,
+        task: Some(task),
+    }))
 }
 
 const CONTROL_PLANE_RECONCILIATION_ATTEMPTS: usize = 4;
@@ -482,7 +598,7 @@ async fn wait_pre_ready_or_signal<T>(
 async fn wait_owned_pre_ready<T>(
     operation: impl std::future::Future<Output = T>,
     signal: &mut BoxFuture<'static, Result<()>>,
-    dependency: &mut BoxFuture<'static, Result<()>>,
+    dependency: &mut dyn AuthenticatedDependencyMonitor,
     post_commit: &mut BoxFuture<'static, Result<()>>,
     supervisor: &mut SupervisorRuntime,
 ) -> OwnedPreReadyWait<T> {
@@ -498,14 +614,14 @@ async fn wait_owned_pre_ready<T>(
 
 async fn wait_required_runtime_exit(
     signal: &mut BoxFuture<'static, Result<()>>,
-    dependency: &mut BoxFuture<'static, Result<()>>,
+    dependency: &mut dyn AuthenticatedDependencyMonitor,
     post_commit: &mut BoxFuture<'static, Result<()>>,
     supervisor: &mut SupervisorRuntime,
 ) -> PreReadyRuntimeExit {
     tokio::select! {
         biased;
         observed = signal.as_mut() => PreReadyRuntimeExit::Signal(observed),
-        observed = dependency.as_mut() => PreReadyRuntimeExit::Dependency(observed),
+        observed = dependency.termination() => PreReadyRuntimeExit::Dependency(observed),
         observed = post_commit.as_mut() => PreReadyRuntimeExit::PostCommit(observed),
         observed = supervisor.termination() => PreReadyRuntimeExit::Supervisor(observed),
     }
@@ -874,7 +990,7 @@ async fn run_after_not_ready(
         wait_for_authenticated_executor_ready(
             &executor_client,
             &context.authority,
-            &ExecutorHealthApiUnavailable,
+            ExecutorHealthPolicy::PRODUCTION,
         )
         .await?;
         let registry = remote_executor_registry(executor_client.clone())
@@ -904,8 +1020,6 @@ async fn run_after_not_ready(
         )
         .context("install authenticated memory/provider context")?;
         let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
-        let dependency_monitor = authenticated_dependency_monitor(executor_client)?;
-
         let command_digest_factory = store.command_digest_factory().await?;
         let connector = if context.allow_insecure_loopback_gateway {
             tracing::warn!(
@@ -939,7 +1053,7 @@ async fn run_after_not_ready(
             store,
             hydrated,
             worker,
-            dependency_monitor,
+            executor_client,
             connector,
             credentials,
             hydration_tx,
@@ -953,7 +1067,7 @@ async fn run_after_not_ready(
         store,
         hydrated,
         worker,
-        dependency_monitor,
+        executor_client,
         connector,
         credentials,
         hydration_tx,
@@ -973,14 +1087,35 @@ async fn run_after_not_ready(
     // This is the only production post-COMMIT composition seam. It mints one
     // Store-local authenticated epoch and starts its receiver before Session
     // can admit any command or create an EventWriter commit.
+    let mut dependency_monitor = authenticated_dependency_monitor(
+        executor_client,
+        &context.authority,
+        ExecutorHealthPolicy::PRODUCTION,
+    )?;
     let (post_commit, store_adapter) =
-        ProductionPostCommitRuntime::start(store.clone(), &context.authority).await?;
+        match ProductionPostCommitRuntime::start(store.clone(), &context.authority).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let control_result =
+                    publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+                let monitor_result = dependency_monitor.cancel_and_join().await;
+                let primary = combine_results(
+                    Err(error),
+                    control_result,
+                    "post-commit startup failure shutdown NotReady",
+                );
+                return combine_results(
+                    primary,
+                    monitor_result,
+                    "executor dependency monitor teardown",
+                );
+            }
+        };
     let post_commit_client = post_commit.client();
     let mut post_commit_failure: BoxFuture<'static, Result<()>> = Box::pin({
         let client = post_commit_client.clone();
         async move { client.termination().await }
     });
-    let mut dependency_failure = dependency_monitor.failure();
     let supervisor = ConnectionSupervisor::new(
         connector,
         credentials,
@@ -1010,7 +1145,7 @@ async fn run_after_not_ready(
         session_start,
         wait_required_runtime_exit(
             &mut signal,
-            &mut dependency_failure,
+            dependency_monitor.as_mut(),
             &mut post_commit_failure,
             &mut supervisor_runtime,
         ),
@@ -1020,7 +1155,20 @@ async fn run_after_not_ready(
     {
         SessionStartArbitration::Started(Ok(session)) => session,
         SessionStartArbitration::Started(Err(start_error)) => {
-            return finish_runtime(Err(start_error), post_commit, supervisor_runtime, true).await;
+            let control_result =
+                publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+            let monitor_result = dependency_monitor.cancel_and_join().await;
+            let primary = combine_results(
+                Err(start_error),
+                control_result,
+                "Session startup failure shutdown NotReady",
+            );
+            let primary = combine_results(
+                primary,
+                monitor_result,
+                "executor dependency monitor teardown",
+            );
+            return finish_runtime(primary, post_commit, supervisor_runtime, true).await;
         }
         SessionStartArbitration::RuntimeExit {
             exit,
@@ -1029,6 +1177,7 @@ async fn run_after_not_ready(
             return teardown_owned_pre_ready_runtime(
                 publisher,
                 session,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1042,6 +1191,7 @@ async fn run_after_not_ready(
         } => {
             return teardown_failed_session_start(
                 publisher,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1057,7 +1207,9 @@ async fn run_after_not_ready(
         LocalRuntimeComponent::Session,
     ) {
         return teardown_pre_ready_operation_failure(
+            publisher,
             session,
+            dependency_monitor,
             post_commit,
             supervisor_runtime,
             shutdown,
@@ -1069,7 +1221,7 @@ async fn run_after_not_ready(
     let ready_proof = match wait_owned_pre_ready(
         ready_latch.wait_for_proof(context.authority.generation()),
         &mut signal,
-        &mut dependency_failure,
+        dependency_monitor.as_mut(),
         &mut post_commit_failure,
         &mut supervisor_runtime,
     )
@@ -1079,7 +1231,9 @@ async fn run_after_not_ready(
             Ok(proof) => proof,
             Err(error) => {
                 return teardown_pre_ready_operation_failure(
+                    publisher,
                     session,
+                    dependency_monitor,
                     post_commit,
                     supervisor_runtime,
                     shutdown,
@@ -1092,6 +1246,7 @@ async fn run_after_not_ready(
             return teardown_owned_pre_ready_runtime(
                 publisher,
                 session,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1103,7 +1258,7 @@ async fn run_after_not_ready(
     match wait_owned_pre_ready(
         wait_for_supervisor_online(&mut supervisor_online),
         &mut signal,
-        &mut dependency_failure,
+        dependency_monitor.as_mut(),
         &mut post_commit_failure,
         &mut supervisor_runtime,
     )
@@ -1112,7 +1267,9 @@ async fn run_after_not_ready(
         OwnedPreReadyWait::Completed(Ok(())) => {}
         OwnedPreReadyWait::Completed(Err(error)) => {
             return teardown_pre_ready_operation_failure(
+                publisher,
                 session,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1124,6 +1281,7 @@ async fn run_after_not_ready(
             return teardown_owned_pre_ready_runtime(
                 publisher,
                 session,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1137,7 +1295,7 @@ async fn run_after_not_ready(
         || publisher.publish_ready(&ready_proof),
         wait_required_runtime_exit(
             &mut signal,
-            &mut dependency_failure,
+            dependency_monitor.as_mut(),
             &mut post_commit_failure,
             &mut supervisor_runtime,
         ),
@@ -1156,6 +1314,7 @@ async fn run_after_not_ready(
             return teardown_owned_pre_ready_runtime(
                 publisher,
                 session,
+                dependency_monitor,
                 post_commit,
                 supervisor_runtime,
                 shutdown,
@@ -1173,6 +1332,7 @@ async fn run_after_not_ready(
                 &control,
                 "Ready could not be reconciled",
             );
+            let monitor_result = dependency_monitor.cancel_and_join().await;
             let report =
                 SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
             let mut primary =
@@ -1194,6 +1354,11 @@ async fn run_after_not_ready(
             } else {
                 false
             };
+            primary = combine_results(
+                primary,
+                monitor_result,
+                "executor dependency monitor teardown",
+            );
             return finish_runtime(primary, post_commit, supervisor_runtime, emergency).await;
         }
     }
@@ -1203,7 +1368,7 @@ async fn run_after_not_ready(
         publisher,
         session,
         signal,
-        dependency_failure,
+        dependency_monitor,
         post_commit_failure,
         post_commit,
         supervisor_runtime,
@@ -1437,35 +1602,47 @@ async fn finish_runtime(
 }
 
 async fn teardown_pre_ready_operation_failure(
+    publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
+    dependency: Box<dyn AuthenticatedDependencyMonitor>,
     post_commit: ProductionPostCommitRuntime,
     supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
     failure: anyhow::Error,
 ) -> Result<()> {
-    shutdown.cancel();
+    let control_result = publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+    let monitor_result = dependency.cancel_and_join().await;
     let report =
         SessionTerminationReport::from_result(session.run_until_cancelled(shutdown.clone()).await);
+    let primary = combine_results(Err(failure), control_result, "pre-Ready shutdown NotReady");
     let primary = combine_results(
-        Err(failure),
-        report.into_result(),
-        "pre-Ready Session shutdown",
+        primary,
+        monitor_result,
+        "executor dependency monitor teardown",
     );
+    let primary = combine_results(primary, report.into_result(), "pre-Ready Session shutdown");
     finish_runtime(primary, post_commit, supervisor, false).await
 }
 
 async fn teardown_owned_pre_ready_runtime(
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
+    dependency: Box<dyn AuthenticatedDependencyMonitor>,
     post_commit: ProductionPostCommitRuntime,
     supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
     exit: PreReadyRuntimeExit,
 ) -> Result<()> {
     let control_result = publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+    let monitor_result = dependency.cancel_and_join().await;
     let report =
         SessionTerminationReport::from_result(session.run_until_cancelled(shutdown.clone()).await);
     let (primary, emergency) = runtime_exit_result(exit, control_result, report);
+    let primary = combine_results(
+        primary,
+        monitor_result,
+        "executor dependency monitor teardown",
+    );
     finish_runtime(primary, post_commit, supervisor, emergency).await
 }
 
@@ -1535,6 +1712,7 @@ fn runtime_exit_result(
 
 async fn teardown_failed_session_start(
     publisher: &LocalRuntimePublisher,
+    dependency: Box<dyn AuthenticatedDependencyMonitor>,
     post_commit: ProductionPostCommitRuntime,
     supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
@@ -1542,12 +1720,18 @@ async fn teardown_failed_session_start(
     start_error: anyhow::Error,
 ) -> Result<()> {
     let control_result = publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+    let monitor_result = dependency.cancel_and_join().await;
     let report = SessionTerminationReport {
         status: "startup failed",
         ownership: SessionOwnershipReport::Lost,
         failure: Some(start_error.to_string()),
     };
     let (primary, _) = runtime_exit_result(exit, control_result, report);
+    let primary = combine_results(
+        primary,
+        monitor_result,
+        "executor dependency monitor teardown",
+    );
     // Session never began admitting commands, so no orderly producer proof
     // exists. Invalidate rather than mint quiescence on its behalf.
     finish_runtime(primary, post_commit, supervisor, true).await
@@ -1558,7 +1742,7 @@ async fn supervise_ready_session(
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
     mut signal: BoxFuture<'static, Result<()>>,
-    mut dependency_failure: BoxFuture<'static, Result<()>>,
+    mut dependency: Box<dyn AuthenticatedDependencyMonitor>,
     mut post_commit_failure: BoxFuture<'static, Result<()>>,
     post_commit: ProductionPostCommitRuntime,
     mut supervisor: SupervisorRuntime,
@@ -1576,7 +1760,7 @@ async fn supervise_ready_session(
         biased;
         exit = wait_required_runtime_exit(
             &mut signal,
-            &mut dependency_failure,
+            dependency.as_mut(),
             &mut post_commit_failure,
             &mut supervisor,
         ) => {
@@ -1586,7 +1770,9 @@ async fn supervise_ready_session(
     };
     match exit {
         Exit::Session(result) => {
+            shutdown.cancel();
             let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            let monitor_result = dependency.cancel_and_join().await;
             let report = SessionTerminationReport::from_result(result);
             if let Err(control) = control_result.as_ref() {
                 stop_for_control_failure(
@@ -1607,6 +1793,11 @@ async fn supervise_ready_session(
                     "unexpected Session shutdown control-plane transition",
                 ),
             };
+            let primary = combine_results(
+                primary,
+                monitor_result,
+                "executor dependency monitor teardown",
+            );
             finish_runtime(primary, post_commit, supervisor, false).await
         }
         Exit::Runtime(exit) => {
@@ -1615,6 +1806,7 @@ async fn supervise_ready_session(
             // completes or local generation fencing escalates.
             let control_result =
                 publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+            let monitor_result = dependency.cancel_and_join().await;
             if let Err(control) = control_result.as_ref() {
                 stop_for_control_failure(
                     authority,
@@ -1625,6 +1817,11 @@ async fn supervise_ready_session(
             }
             let report = SessionTerminationReport::from_result((&mut session_run).await);
             let (primary, emergency) = runtime_exit_result(exit, control_result, report);
+            let primary = combine_results(
+                primary,
+                monitor_result,
+                "executor dependency monitor teardown",
+            );
             finish_runtime(primary, post_commit, supervisor, emergency).await
         }
     }
@@ -1696,46 +1893,42 @@ fn supervisor_config(authority: &RuntimeEpochAuthority) -> SupervisorConfig {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "authenticated executor readiness is unavailable; an exact RpcIdentity Health/Hello round-trip is required before Ready"
-)]
-struct AuthenticatedExecutorReadinessUnavailable;
-
-#[async_trait]
-trait AuthenticatedExecutorHealthApi: Send + Sync {
-    async fn ready(&self, client: &ExecutorClient, authority: &RuntimeEpochAuthority)
-    -> Result<()>;
-}
-
-struct ExecutorHealthApiUnavailable;
-
-#[async_trait]
-impl AuthenticatedExecutorHealthApi for ExecutorHealthApiUnavailable {
-    async fn ready(
-        &self,
-        _client: &ExecutorClient,
-        _authority: &RuntimeEpochAuthority,
-    ) -> Result<()> {
-        Err(anyhow::Error::new(
-            AuthenticatedExecutorReadinessUnavailable,
-        ))
-    }
-}
-
-/// Narrow adapter point for the executor-owned Health API. The coordinated
-/// executor commit implements this without changing bootstrap ownership.
-/// Constructing a typed client or probing an inode is intentionally
-/// insufficient in the standalone branch.
 async fn wait_for_authenticated_executor_ready(
     client: &ExecutorClient,
     authority: &RuntimeEpochAuthority,
-    health: &dyn AuthenticatedExecutorHealthApi,
+    policy: ExecutorHealthPolicy,
 ) -> Result<()> {
     authority
         .validate_rpc_identity(client.identity())
         .context("executor Health client identity differs from runtime authority")?;
-    health.ready(client, authority).await
+    let deadline = tokio::time::Instant::now() + policy.startup_timeout;
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "executor did not pass authenticated Health within {:?}: {}",
+                policy.startup_timeout,
+                last_error.map_or_else(
+                    || "no Health probe completed".to_owned(),
+                    |error: crate::tools::ToolError| error.to_string()
+                )
+            );
+        }
+        let probe_timeout = policy.probe_timeout.min(remaining);
+        match client
+            .health_with_cancellation(CancellationToken::new(), probe_timeout)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
+        tokio::time::sleep(policy.retry_delay.min(remaining)).await;
+    }
 }
 
 fn install_shutdown_signal() -> Result<BoxFuture<'static, Result<()>>> {
@@ -1770,7 +1963,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
 
-    use tokio::sync::{Notify, oneshot, watch};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+        sync::{Notify, oneshot, watch},
+        task::JoinHandle,
+    };
 
     use super::*;
     use crate::gateway::local_control::{
@@ -1784,6 +1982,58 @@ mod tests {
     use crate::store::HydrationReceiptIdentity;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
+    fn test_health_policy() -> ExecutorHealthPolicy {
+        ExecutorHealthPolicy {
+            startup_timeout: Duration::from_millis(250),
+            probe_timeout: Duration::from_millis(80),
+            retry_delay: Duration::from_millis(10),
+            monitor_interval: Duration::from_millis(20),
+        }
+    }
+
+    fn spawn_executor_health_service(
+        identity: RpcIdentity,
+        connections: usize,
+    ) -> (PathBuf, JoinHandle<()>, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-bootstrap-executor-health-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create executor Health fixture root");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).expect("bind executor Health fixture");
+        let task = tokio::spawn(async move {
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().await.expect("accept Health client");
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                read.read_line(&mut line)
+                    .await
+                    .expect("read Health request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("decode Health request");
+                assert_eq!(request["operation"]["type"], "health");
+                let response = serde_json::json!({
+                    "type": "terminal",
+                    "personality_agent_id": identity.personality_agent_id().to_string(),
+                    "generation": identity.generation().to_wire(),
+                    "nonce": identity.nonce().as_str(),
+                    "request_id": request["request_id"],
+                    "result": {"Ok": {
+                        "type": "healthy",
+                        "service_role": "tool_executor"
+                    }}
+                });
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("write Health terminal");
+            }
+        });
+        (socket, task, root)
+    }
 
     fn valid_env() -> HashMap<String, OsString> {
         HashMap::from([
@@ -2325,7 +2575,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_socket_parent_uses_trusted_ipc_contract() {
+    fn executor_socket_parent_uses_trusted_ipc_contract() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -2335,14 +2585,14 @@ mod tests {
         std::fs::create_dir(&root).expect("create isolated socket parent");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("restrict isolated socket parent");
-        let socket = root.join("broker.sock");
-        validate_trusted_ipc_socket_parent(&socket, "artifact broker")
+        let socket = root.join("executor.sock");
+        validate_trusted_ipc_socket_parent(&socket, "executor")
             .expect("uid-owned non-peer-writable parent");
 
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770))
             .expect("make fixture peer-writable");
         assert!(
-            validate_trusted_ipc_socket_parent(&socket, "artifact broker")
+            validate_trusted_ipc_socket_parent(&socket, "executor")
                 .unwrap_err()
                 .to_string()
                 .contains("non-peer-writable")
@@ -2361,16 +2611,36 @@ mod tests {
         let error = wait_for_authenticated_executor_ready(
             &client,
             &context.authority,
-            &ExecutorHealthApiUnavailable,
+            test_health_policy(),
         )
         .await
         .expect_err("an unprobed client must remain NotReady");
-        assert!(
-            error
-                .downcast_ref::<AuthenticatedExecutorReadinessUnavailable>()
-                .is_some()
-        );
-        assert!(error.to_string().contains("exact RpcIdentity Health/Hello"));
+        assert!(error.to_string().contains("authenticated Health"));
+        assert!(error.to_string().contains("connection"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_health_succeeds_only_for_the_exact_runtime_identity() {
+        let context = parse(&valid_env()).expect("runtime context");
+        let (socket, service, root) =
+            spawn_executor_health_service(context.authority.rpc_identity().clone(), 1);
+        let client = ExecutorClient::new(&socket, context.authority.rpc_identity().clone());
+        wait_for_authenticated_executor_ready(&client, &context.authority, test_health_policy())
+            .await
+            .expect("exact Health must establish executor readiness");
+        service.await.expect("join executor Health service");
+        std::fs::remove_dir_all(root).expect("remove Health fixture");
+
+        let wrong = RpcIdentity::from_wire(PAID, 7, "wrong-boot").expect("wrong identity");
+        let wrong_client = ExecutorClient::new("/tmp/unused-executor.sock", wrong);
+        let error = wait_for_authenticated_executor_ready(
+            &wrong_client,
+            &context.authority,
+            test_health_policy(),
+        )
+        .await
+        .expect_err("authority mismatch must fail before socket I/O");
+        assert!(error.to_string().contains("identity differs"));
     }
 
     #[tokio::test]
@@ -2843,20 +3113,118 @@ mod tests {
         assert!(error.to_string().contains("without a selected shutdown"));
     }
 
-    #[test]
-    fn dependency_monitor_is_fail_closed_until_authenticated_health_exists() {
+    #[tokio::test]
+    async fn dependency_monitor_uses_fresh_health_and_is_explicitly_joined() {
         let context = parse(&valid_env()).unwrap();
+        let (socket, service, root) =
+            spawn_executor_health_service(context.authority.rpc_identity().clone(), 1);
         let executor = Arc::new(ExecutorClient::new(
-            &context.executor_socket,
+            &socket,
             context.authority.rpc_identity().clone(),
         ));
-        let error = authenticated_dependency_monitor(executor)
-            .err()
-            .expect("missing Health API must prevent Ready");
+        let mut monitor =
+            authenticated_dependency_monitor(executor, &context.authority, test_health_policy())
+                .expect("construct retained exact-identity monitor");
+        service
+            .await
+            .expect("the immediate fresh Health must complete");
+        let error = tokio::time::timeout(Duration::from_secs(1), monitor.termination())
+            .await
+            .expect("the next fresh connection failure is bounded")
+            .expect_err("socket loss must terminate the required dependency");
         assert!(
             error
-                .downcast_ref::<AuthenticatedDependencyMonitoringUnavailable>()
-                .is_some()
+                .to_string()
+                .contains("authenticated executor Health failed")
+        );
+        monitor
+            .cancel_and_join()
+            .await
+            .expect("failed monitor task is still explicitly joined");
+        std::fs::remove_dir_all(root).expect("remove monitor fixture");
+    }
+
+    fn blocked_dependency_monitor_owner() -> ExecutorDependencyMonitor {
+        let cancel = CancellationToken::new();
+        let (termination_tx, termination) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            let _termination_owner = termination_tx;
+            std::future::pending::<()>().await;
+        });
+        ExecutorDependencyMonitor {
+            cancel,
+            termination,
+            task: Some(task),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for unsettled dependency monitor owner Drop"]
+    async fn unsettled_dependency_monitor_drop_child() {
+        if std::env::var("SUMI_UNSETTLED_DEPENDENCY_MONITOR_DROP_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        drop(blocked_dependency_monitor_owner());
+        panic!("unsettled dependency monitor Drop must fail-stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_monitor_drop_cannot_detach_its_join_handle() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("bootstrap::tests::unsettled_dependency_monitor_drop_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_UNSETTLED_DEPENDENCY_MONITOR_DROP_CHILD", "1")
+                .output()
+                .expect("run unsettled dependency monitor owner child");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "unsettled monitor Drop must abort instead of detaching:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for dependency monitor join deadline"]
+    async fn hung_dependency_monitor_join_child() {
+        if std::env::var("SUMI_HUNG_DEPENDENCY_MONITOR_JOIN_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        blocked_dependency_monitor_owner()
+            .cancel_and_join_with_timeout(Duration::from_millis(25))
+            .await
+            .expect("hung dependency monitor join must fail-stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_monitor_join_deadline_fail_stops_without_detaching() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("bootstrap::tests::hung_dependency_monitor_join_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_HUNG_DEPENDENCY_MONITOR_JOIN_CHILD", "1")
+                .output()
+                .expect("run hung dependency monitor join child");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "join deadline must abort instead of detaching:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
