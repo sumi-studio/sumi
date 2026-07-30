@@ -30,7 +30,7 @@ func run(ctx context.Context, output io.Writer) error {
 	if err != nil {
 		return errors.New("SUMI_BROWSER_SESSION_SECRET must be standard base64")
 	}
-	issuer, err := agentevents.NewHMACUserSessionVerifier(
+	issuer, err := agentevents.NewHMACBrowserSessionIssuer(
 		secret,
 		os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE"),
 	)

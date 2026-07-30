@@ -294,7 +294,7 @@ func TestArtifactProjectionRejectsCrossOwnerAndInternalBrowserReferences(t *test
 
 func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}

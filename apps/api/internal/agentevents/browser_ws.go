@@ -400,9 +400,9 @@ func (s *BrowserServer) browserConnections(shutdown bool) []*websocket.Conn {
 	return connections
 }
 
-// CloseBrowserSession terminates only live sockets authorized by the matching
-// process-local session. RevokeSession prevents a concurrent post-upgrade
-// registration from escaping this close barrier.
+// CloseBrowserSession eagerly terminates matching sockets in this process.
+// Shared AuthorizeSession leases around every data write and command append
+// provide the cross-process revocation barrier.
 func (s *BrowserServer) CloseBrowserSession(sessionID string) {
 	if !validBrowserSessionID(sessionID) {
 		return
@@ -514,7 +514,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.PersonalityAgentID)
 	defer unsubscribe()
 	var writeMu sync.Mutex
-	writeUnlocked := func(frame any) error {
+	writeSocketUnlocked := func(frame any) error {
 		if s.beforeWrite != nil {
 			s.beforeWrite()
 		}
@@ -529,6 +529,11 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 			return err
 		}
 		return conn.WriteJSON(frame)
+	}
+	writeUnlocked := func(frame any) error {
+		return s.Sessions.AuthorizeSession(ctx, claims, func() error {
+			return writeSocketUnlocked(frame)
+		})
 	}
 	withExclusiveWrite := func(operation func(func(any) error) error) error {
 		writeMu.Lock()

@@ -216,11 +216,6 @@ func newApplicationFromEnv() (*application, error) {
 	if err != nil && !errors.Is(err, errTokenSecretMissing) {
 		return nil, fmt.Errorf("agent token verifier: %w", err)
 	}
-	sv, browserOrigins, err := browserSessionConfigFromEnv()
-	if err != nil {
-		return nil, fmt.Errorf("browser session configuration: %w", err)
-	}
-
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
@@ -238,6 +233,11 @@ func newApplicationFromEnv() (*application, error) {
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
+	}
+	sv, browserOrigins, err := browserSessionConfigFromEnv(runtime)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("browser session configuration: %w", err)
 	}
 
 	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)
@@ -1486,7 +1486,9 @@ func browserAllowedOriginsFromEnv() []string {
 	return originsFromEnv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")
 }
 
-func browserSessionConfigFromEnv() (*agentevents.HMACUserSessionVerifier, []string, error) {
+func browserSessionConfigFromEnv(
+	revocations agentevents.BrowserSessionRevocationStore,
+) (*agentevents.HMACUserSessionVerifier, []string, error) {
 	secretConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_SECRET")) != ""
 	audienceConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")) != ""
 	originsConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")) != ""
@@ -1501,7 +1503,7 @@ func browserSessionConfigFromEnv() (*agentevents.HMACUserSessionVerifier, []stri
 	if len(origins) == 0 {
 		return nil, nil, errors.New("SUMI_BROWSER_WS_ALLOWED_ORIGINS must contain at least one exact origin")
 	}
-	sessions, err := browserSessionVerifierFromEnv()
+	sessions, err := browserSessionVerifierFromEnv(revocations)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1677,7 +1679,9 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 // browserSessionVerifierFromEnv is deliberately separate from the agent token
 // verifier. Browser sessions are HttpOnly cookies scoped to users and their
 // server-bound personality agents; agent bearer tokens never enter this route.
-func browserSessionVerifierFromEnv() (*agentevents.HMACUserSessionVerifier, error) {
+func browserSessionVerifierFromEnv(
+	revocations agentevents.BrowserSessionRevocationStore,
+) (*agentevents.HMACUserSessionVerifier, error) {
 	b64 := os.Getenv("SUMI_BROWSER_SESSION_SECRET")
 	if b64 == "" {
 		return nil, errBrowserSessionSecretMissing
@@ -1687,5 +1691,5 @@ func browserSessionVerifierFromEnv() (*agentevents.HMACUserSessionVerifier, erro
 		return nil, err
 	}
 	audience := os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")
-	return agentevents.NewHMACUserSessionVerifier(secret, audience)
+	return agentevents.NewHMACUserSessionVerifier(secret, audience, revocations)
 }

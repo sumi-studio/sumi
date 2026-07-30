@@ -55,6 +55,9 @@ type DurableGateway struct {
 	// durable replay. Zero values use conservative defaults.
 	MaxPersonalityAgentTails int
 	MaxAckTail               int
+	// MaxBrowserSessionRevocations bounds the durable browser-session denylist.
+	// Zero uses maxRevokedSessions.
+	MaxBrowserSessionRevocations int
 
 	tails map[string]*personalityAgentLogState
 	// browserSubscribers carry volatile frames only. Durable replay always
@@ -64,6 +67,7 @@ type DurableGateway struct {
 	nextBrowserSubscriber uint64
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
+	writeAtomic           func(string, []byte, os.FileMode) error
 
 	// stateMu protects run-in-flight and pending-approval state derived from
 	// durable events. Readers also take mu first so they cannot observe the
@@ -267,22 +271,24 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		return nil, err
 	}
 	return &DurableGateway{
-		dir:                      abs,
-		commands:                 commands,
-		runtimeDir:               runtimeDir,
-		runtimeDirIdentity:       identity,
-		runtimeLockIDs:           make(map[string]durableFileIdentity),
-		PollInterval:             50 * time.Millisecond,
-		MaxPersonalityAgentTails: 128,
-		MaxAckTail:               256,
-		tails:                    make(map[string]*personalityAgentLogState),
-		browserSubscribers:       make(map[string]map[uint64]chan Envelope),
-		stateRebuilt:             make(map[string]bool),
-		runInFlight:              make(map[string]bool),
-		pendingApprovals:         make(map[string]map[string]bool),
+		dir:                          abs,
+		commands:                     commands,
+		runtimeDir:                   runtimeDir,
+		runtimeDirIdentity:           identity,
+		runtimeLockIDs:               make(map[string]durableFileIdentity),
+		PollInterval:                 50 * time.Millisecond,
+		MaxPersonalityAgentTails:     128,
+		MaxAckTail:                   256,
+		MaxBrowserSessionRevocations: maxRevokedSessions,
+		tails:                        make(map[string]*personalityAgentLogState),
+		browserSubscribers:           make(map[string]map[uint64]chan Envelope),
+		stateRebuilt:                 make(map[string]bool),
+		runInFlight:                  make(map[string]bool),
+		pendingApprovals:             make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
+		writeAtomic: writeFileAtomic,
 	}, nil
 }
 

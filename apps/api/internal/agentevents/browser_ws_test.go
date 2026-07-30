@@ -63,7 +63,7 @@ func (a dispositionBeforeAppendReturn) Append(
 
 func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T
 		PersonalityAgentID: personalityAgentID,
 		Generation:         generation,
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 			defer store.Close()
 			defer gateway.runtimeDir.Close()
 
-			sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+			sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -517,7 +517,7 @@ func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 	if err := gateway.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +582,7 @@ func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 
 func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessions(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +634,7 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 
 func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +683,7 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,6 +774,103 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 	}
 }
 
+func TestBrowserSessionRevocationStopsOutboundFramesAcrossGateways(t *testing.T) {
+	tmp := t.TempDir()
+	store, firstGateway, err := openGatewayAt(
+		t,
+		filepath.Join(tmp, "commands"),
+		filepath.Join(tmp, "runtime"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	secondGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := firstGateway.PublishRuntimeState(
+		personalityAgentID,
+		1,
+		&receipt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstSessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedSession, err := firstSessions.IssueSession(
+		context.Background(),
+		UserSessionClaims{
+			TenantID:           "tenant-1",
+			UserID:             "user-1",
+			PersonalityAgentID: personalityAgentID,
+		},
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(secondSessions, secondGateway, secondGateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	conn := dialBrowserWS(
+		t,
+		httpServer,
+		signedSession,
+		personalityAgentID,
+	)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	if _, err := firstSessions.RevokeSession(
+		context.Background(),
+		signedSession,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	seq := uint64(1)
+	if err := firstGateway.Receive(context.Background(), TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         1,
+	}, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	waitForBrowserConnectionStats(
+		t,
+		browser,
+		BrowserConnectionStats{Active: 0, Accepted: 1},
+	)
+}
+
 func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
@@ -781,7 +878,7 @@ func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
 	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +928,7 @@ func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1003,7 +1100,7 @@ func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *te
 		t.Fatal(err)
 	}
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1040,7 +1137,7 @@ func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *te
 
 func TestBrowserServerCommandStateGuards(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1128,7 +1225,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	}
 	defer store.Close()
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1213,7 +1310,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	}
 	defer store.Close()
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}

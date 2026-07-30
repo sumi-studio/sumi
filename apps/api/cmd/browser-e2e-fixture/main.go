@@ -38,7 +38,11 @@ func main() {
 	if err := gateway.PublishRuntimeState("018f47a2-9b3c-7def-8abc-0123456789ab", 1, &receipt); err != nil {
 		log.Fatal(err)
 	}
-	browserSessions, err := agentevents.NewHMACUserSessionVerifier(secret, "")
+	browserSessions, err := agentevents.NewHMACUserSessionVerifier(
+		secret,
+		"",
+		gateway,
+	)
 	if err != nil {
 		log.Fatal(err)
 	}

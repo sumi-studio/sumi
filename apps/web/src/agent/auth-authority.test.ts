@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bindDirectChatAuthority } from "./auth-authority";
+import {
+  bindDirectChatAuthority,
+  clearDirectChatAuthority,
+} from "./auth-authority";
 
 const authorityMocks = vi.hoisted(() => ({
   resetAuthority: vi.fn(() => true),
@@ -19,6 +22,7 @@ const authorityBindingStorageKey = "sumi.direct-chat.authority-binding-v1";
 const legacyAuthorityIdentityStorageKey = "sumi.direct-chat.authority-user";
 
 afterEach(() => {
+  clearDirectChatAuthority();
   globalThis.sessionStorage.clear();
   vi.clearAllMocks();
 });
@@ -56,5 +60,25 @@ describe("direct-chat authority binding", () => {
     expect(globalThis.sessionStorage.getItem(authorityBindingStorageKey)).toBe(
       authorityBindingB,
     );
+  });
+
+  it("propagates reset failure while storage-key cleanup remains best effort", () => {
+    globalThis.sessionStorage.setItem(
+      authorityBindingStorageKey,
+      authorityBindingA,
+    );
+    globalThis.sessionStorage.setItem(
+      legacyAuthorityIdentityStorageKey,
+      "legacy-user",
+    );
+    authorityMocks.resetAuthority.mockReturnValueOnce(false);
+
+    expect(clearDirectChatAuthority()).toBe(false);
+    expect(
+      globalThis.sessionStorage.getItem(authorityBindingStorageKey),
+    ).toBeNull();
+    expect(
+      globalThis.sessionStorage.getItem(legacyAuthorityIdentityStorageKey),
+    ).toBeNull();
   });
 });

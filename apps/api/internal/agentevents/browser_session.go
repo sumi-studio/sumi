@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -33,6 +32,8 @@ const (
 var (
 	errBrowserSessionMissing   = errors.New("browser session cookie is missing")
 	errBrowserSessionDuplicate = errors.New("duplicate browser session cookies")
+	errBrowserSessionRevoked   = errors.New("browser session revoked")
+	errBrowserSessionRetired   = errors.New("browser session already retired")
 	errRevocationCapacity      = errors.New("browser session revocation capacity exhausted")
 )
 
@@ -60,14 +61,42 @@ type UserSessionVerifier interface {
 }
 
 type HMACUserSessionVerifier struct {
-	secret   []byte
-	audience string
-	now      func() time.Time
-	random   io.Reader
+	secret      []byte
+	audience    string
+	now         func() time.Time
+	random      io.Reader
+	revocations BrowserSessionRevocationStore
+}
 
-	lifecycleMu sync.RWMutex
-	revoked     map[string]int64
-	maxRevoked  int
+// BrowserSessionRevocationStore is the shared durability and serialization
+// boundary for browser-session admission and logout. Implementations must make
+// a successful RevokeBrowserSession visible across API processes and restarts.
+type BrowserSessionRevocationStore interface {
+	CheckBrowserSession(
+		ctx context.Context,
+		sessionID string,
+		expiresAt time.Time,
+		now time.Time,
+	) error
+	AuthorizeBrowserSession(
+		ctx context.Context,
+		sessionID string,
+		expiresAt time.Time,
+		now time.Time,
+		operation func() error,
+	) error
+	RevokeBrowserSession(
+		ctx context.Context,
+		sessionID string,
+		expiresAt time.Time,
+		now time.Time,
+	) error
+	RetireBrowserSession(
+		ctx context.Context,
+		sessionID string,
+		expiresAt time.Time,
+		now time.Time,
+	) error
 }
 
 // BrowserSessionIssuer creates the same short-lived signed session consumed by
@@ -77,21 +106,34 @@ type BrowserSessionIssuer interface {
 	IssueSession(ctx context.Context, claims UserSessionClaims, ttl time.Duration) (string, error)
 }
 
+type hmacBrowserSessionIssuer struct {
+	signer *HMACUserSessionVerifier
+}
+
+func (i hmacBrowserSessionIssuer) IssueSession(
+	ctx context.Context,
+	claims UserSessionClaims,
+	ttl time.Duration,
+) (string, error) {
+	return i.signer.IssueSession(ctx, claims, ttl)
+}
+
 // UserSessionAuthorizer serializes command admission against logout.
 type UserSessionAuthorizer interface {
 	UserSessionVerifier
 	AuthorizeSession(ctx context.Context, claims UserSessionClaims, operation func() error) error
 }
 
-// BrowserSessionLifecycle owns issuance and process-local revocation in
-// addition to command admission. Revocations are retained until signed expiry
-// in a deliberately bounded in-memory set. A deployment with multiple API
-// processes must replace this process-local authority with a shared store and
-// connection fan-out before claiming cross-process immediate logout.
+// BrowserSessionLifecycle owns issuance and shared durable revocation in
+// addition to command admission.
 type BrowserSessionLifecycle interface {
 	UserSessionAuthorizer
 	BrowserSessionIssuer
 	RevokeSession(ctx context.Context, signedCookie string) (UserSessionClaims, error)
+	RetireSessionForRotation(
+		ctx context.Context,
+		signedCookie string,
+	) (UserSessionClaims, bool, error)
 }
 
 type userSessionWireClaims struct {
@@ -104,7 +146,40 @@ type userSessionWireClaims struct {
 	SID                string `json:"sid"`
 }
 
-func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessionVerifier, error) {
+func NewHMACUserSessionVerifier(
+	secret []byte,
+	audience string,
+	revocations BrowserSessionRevocationStore,
+) (*HMACUserSessionVerifier, error) {
+	if revocations == nil {
+		return nil, errors.New("browser session revocation store is required")
+	}
+	verifier, err := newHMACBrowserSessionSigner(secret, audience)
+	if err != nil {
+		return nil, err
+	}
+	verifier.revocations = revocations
+	return verifier, nil
+}
+
+// NewHMACBrowserSessionIssuer constructs an issuance-only signer for tooling
+// that never accepts browser cookies. Verification always requires the shared
+// revocation store constructor above.
+func NewHMACBrowserSessionIssuer(
+	secret []byte,
+	audience string,
+) (BrowserSessionIssuer, error) {
+	signer, err := newHMACBrowserSessionSigner(secret, audience)
+	if err != nil {
+		return nil, err
+	}
+	return hmacBrowserSessionIssuer{signer: signer}, nil
+}
+
+func newHMACBrowserSessionSigner(
+	secret []byte,
+	audience string,
+) (*HMACUserSessionVerifier, error) {
 	if len(secret) < 32 {
 		return nil, errors.New("browser session HMAC secret must be at least 32 bytes")
 	}
@@ -112,12 +187,10 @@ func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessio
 		audience = defaultBrowserAudience
 	}
 	return &HMACUserSessionVerifier{
-		secret:     append([]byte(nil), secret...),
-		audience:   audience,
-		now:        time.Now,
-		random:     rand.Reader,
-		revoked:    make(map[string]int64),
-		maxRevoked: maxRevokedSessions,
+		secret:   append([]byte(nil), secret...),
+		audience: audience,
+		now:      time.Now,
+		random:   rand.Reader,
 	}, nil
 }
 
@@ -180,10 +253,13 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 	if err != nil {
 		return UserSessionClaims{}, err
 	}
-	v.lifecycleMu.RLock()
-	defer v.lifecycleMu.RUnlock()
-	if _, revoked := v.revoked[claims.sessionID]; revoked {
-		return UserSessionClaims{}, errors.New("browser session revoked")
+	if err := v.revocations.CheckBrowserSession(
+		ctx,
+		claims.sessionID,
+		claims.expiresAt,
+		v.now(),
+	); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("check browser session revocation: %w", err)
 	}
 	return claims, nil
 }
@@ -330,9 +406,10 @@ func browserSessionOperationContext(
 	return context.WithDeadline(parent, claims.expiresAt)
 }
 
-// AuthorizeSession holds a read lease across a security-sensitive operation.
-// Logout takes the write lease, so its successful response is a barrier after
-// which no command from that session can be appended.
+// AuthorizeSession holds a shared durable admission lease across a
+// security-sensitive operation. Logout takes the exclusive lease, so its
+// successful response is a cross-process barrier after which no command from
+// that session can be appended.
 func (v *HMACUserSessionVerifier) AuthorizeSession(
 	ctx context.Context,
 	claims UserSessionClaims,
@@ -346,23 +423,27 @@ func (v *HMACUserSessionVerifier) AuthorizeSession(
 		return ctx.Err()
 	default:
 	}
-	v.lifecycleMu.RLock()
-	defer v.lifecycleMu.RUnlock()
 	if claims.sessionID == "" || !validBrowserSessionID(claims.sessionID) {
 		return errors.New("browser session has invalid lifecycle claims")
-	}
-	if _, revoked := v.revoked[claims.sessionID]; revoked {
-		return errors.New("browser session revoked")
 	}
 	if !v.now().Before(claims.expiresAt) {
 		return errors.New("browser session expired")
 	}
-	return operation()
+	if err := v.revocations.AuthorizeBrowserSession(
+		ctx,
+		claims.sessionID,
+		claims.expiresAt,
+		v.now(),
+		operation,
+	); err != nil {
+		return fmt.Errorf("authorize browser session: %w", err)
+	}
+	return nil
 }
 
 // RevokeSession invalidates one signed browser session until its expiration.
-// Revocations are process-local and time-bounded; callers must treat a full
-// revocation set as an unavailable logout rather than evicting a live entry.
+// Revocations are durable, shared, and time-bounded; callers must treat a full
+// or unavailable revocation store as an unavailable logout.
 func (v *HMACUserSessionVerifier) RevokeSession(
 	ctx context.Context,
 	signedCookie string,
@@ -371,23 +452,48 @@ func (v *HMACUserSessionVerifier) RevokeSession(
 	if err != nil {
 		return UserSessionClaims{}, err
 	}
-	v.lifecycleMu.Lock()
-	defer v.lifecycleMu.Unlock()
-	now := v.now().Unix()
-	if now >= claims.expiresAt.Unix() {
+	now := v.now()
+	if !now.Before(claims.expiresAt) {
 		return UserSessionClaims{}, errors.New("browser session expired")
 	}
-	for sessionID, exp := range v.revoked {
-		if now >= exp {
-			delete(v.revoked, sessionID)
-		}
+	if err := v.revocations.RevokeBrowserSession(
+		ctx,
+		claims.sessionID,
+		claims.expiresAt,
+		now,
+	); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("revoke browser session: %w", err)
 	}
-	if _, exists := v.revoked[claims.sessionID]; exists {
-		return claims, nil
-	}
-	if len(v.revoked) >= v.maxRevoked {
-		return UserSessionClaims{}, errRevocationCapacity
-	}
-	v.revoked[claims.sessionID] = claims.expiresAt.Unix()
 	return claims, nil
+}
+
+// RetireSessionForRotation atomically consumes one still-valid signed session
+// as a replacement credential. Unlike logout revocation, replay is an error:
+// exactly one API process may retire the old cookie and mint its successor.
+// The boolean reports whether the cookie itself was valid and unexpired.
+func (v *HMACUserSessionVerifier) RetireSessionForRotation(
+	ctx context.Context,
+	signedCookie string,
+) (UserSessionClaims, bool, error) {
+	claims, err := v.verifySignedSession(ctx, signedCookie)
+	if err != nil {
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return UserSessionClaims{}, false, err
+		}
+		return UserSessionClaims{}, false, nil
+	}
+	now := v.now()
+	if err := v.revocations.RetireBrowserSession(
+		ctx,
+		claims.sessionID,
+		claims.expiresAt,
+		now,
+	); err != nil {
+		return claims, true, fmt.Errorf(
+			"retire browser session for rotation: %w",
+			err,
+		)
+	}
+	return claims, true, nil
 }

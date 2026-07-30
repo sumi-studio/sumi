@@ -119,6 +119,22 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
 }
 
+func testBrowserSessionRevocationStore(
+	t *testing.T,
+) agentevents.BrowserSessionRevocationStore {
+	t.Helper()
+	store, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	gateway, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gateway
+}
+
 func setReadyRouterState(t *testing.T, personalityAgentID string) {
 	t.Helper()
 	commandDir := t.TempDir()
@@ -239,7 +255,9 @@ func TestBrowserSessionConfigurationRejectsEveryPartialGroup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clearBrowserConfiguration(t)
 			t.Setenv(tc.env, tc.value)
-			if _, _, err := browserSessionConfigFromEnv(); err == nil {
+			if _, _, err := browserSessionConfigFromEnv(
+				testBrowserSessionRevocationStore(t),
+			); err == nil {
 				t.Fatal("partial browser-session configuration did not fail startup")
 			}
 		})
@@ -250,7 +268,9 @@ func TestBrowserSessionConfigurationRejectsEveryPartialGroup(t *testing.T) {
 		t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
 		t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
 		t.Setenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS", testBrowserOrigin)
-		sessions, origins, err := browserSessionConfigFromEnv()
+		sessions, origins, err := browserSessionConfigFromEnv(
+			testBrowserSessionRevocationStore(t),
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -296,7 +316,11 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 		_ = store.Close()
 		t.Fatal(err)
 	}
-	sessions, err := agentevents.NewHMACUserSessionVerifier(testSessionSecret, "")
+	sessions, err := agentevents.NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		testBrowserSessionRevocationStore(t),
+	)
 	if err != nil {
 		_ = store.Close()
 		t.Fatal(err)
@@ -393,7 +417,11 @@ func TestBrowserAuthPartialConfigurationFailsClosed(t *testing.T) {
 	t.Setenv("SUMI_AUTH_TENANT_ID", "")
 	t.Setenv("SUMI_AUTH_USER_ID", "")
 	t.Setenv("SUMI_AUTH_PERSONALITY_AGENT_ID", "")
-	sessions, err := agentevents.NewHMACUserSessionVerifier(testSessionSecret, "")
+	sessions, err := agentevents.NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		testBrowserSessionRevocationStore(t),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

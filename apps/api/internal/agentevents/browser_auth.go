@@ -220,26 +220,18 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	if existing, cookieErr := uniqueBrowserSessionCookie(r); cookieErr == nil {
-		previous, verifyErr := s.Sessions.VerifySession(r.Context(), existing.Value)
-		if verifyErr == nil {
-			revoked, revokeErr := s.Sessions.RevokeSession(r.Context(), existing.Value)
-			if revokeErr != nil {
-				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-				return
-			}
-			if revoked.sessionID != previous.sessionID {
-				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-				return
-			}
-			if s.Connections != nil {
-				s.Connections.CloseBrowserSession(revoked.sessionID)
-			}
-		} else if _, revokeErr := s.Sessions.RevokeSession(r.Context(), existing.Value); revokeErr == nil {
-			// A still-signed, unexpired cookie which no longer verifies is a
-			// retired lifecycle credential. A concurrent/replayed exchange
-			// must not mint a second replacement from it.
+		retired, valid, retireErr := s.Sessions.RetireSessionForRotation(
+			r.Context(),
+			existing.Value,
+		)
+		if retireErr != nil {
 			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 			return
+		}
+		if valid {
+			if s.Connections != nil {
+				s.Connections.CloseBrowserSession(retired.sessionID)
+			}
 		}
 	}
 	ttl := s.SessionTTL

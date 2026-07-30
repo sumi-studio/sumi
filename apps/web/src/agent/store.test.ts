@@ -768,6 +768,95 @@ test("admission persistence failure remains provisional and is surfaced", () => 
   assert.deepEqual(new PrivateOutbox(storage).entries(), []);
 });
 
+test("canonical evidence clears an undurable optimistic row even when outbox cleanup fails", () => {
+  let stored: string | null = null;
+  let failMutations = false;
+  const storage: PrivateOutboxStorage = {
+    getItem: () => stored,
+    setItem(_key, value) {
+      if (failMutations) throw new Error("session storage denied");
+      stored = value;
+    },
+    removeItem() {
+      if (failMutations) throw new Error("session storage denied");
+      stored = null;
+    },
+  };
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox(storage);
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "undurable-canonical",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("canonical evidence"), true);
+
+  failMutations = true;
+  transport.emit(accepted("undurable-canonical", CommandId, 1));
+  transport.emit(canonicalFrame(1, CommandId, "canonical evidence"));
+
+  assert.equal(
+    store.getState().conversation.entries["optimistic:undurable-canonical"],
+    undefined,
+  );
+  assert.equal(
+    store.getState().conversation.entries[userMessageIdFromCommandId(CommandId)]
+      ?.kind,
+    "user",
+  );
+  assert.equal(
+    store.getState().lastError,
+    "Canonical message arrived, but local recovery state could not be cleared",
+  );
+  assert.equal(
+    outbox.findByIdempotencyKey("undurable-canonical")?.state,
+    "pending",
+  );
+});
+
+test("terminal disposition clears an undurable optimistic row while reporting recovery failure", () => {
+  let stored: string | null = null;
+  let failMutations = false;
+  const storage: PrivateOutboxStorage = {
+    getItem: () => stored,
+    setItem(_key, value) {
+      if (failMutations) throw new Error("session storage denied");
+      stored = value;
+    },
+    removeItem() {
+      if (failMutations) throw new Error("session storage denied");
+      stored = null;
+    },
+  };
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox(storage);
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "undurable-disposition",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("terminal evidence"), true);
+
+  failMutations = true;
+  transport.emit(accepted("undurable-disposition", CommandId, 1));
+  transport.emit(disposition(1, CommandId, 1, "rejected", "not_allowed"));
+
+  assert.equal(
+    store.getState().conversation.entries["optimistic:undurable-disposition"],
+    undefined,
+  );
+  assert.equal(
+    store.getState().lastError,
+    "Command outcome could not be saved for local recovery",
+  );
+  assert.equal(
+    outbox.findByIdempotencyKey("undurable-disposition")?.state,
+    "pending",
+  );
+});
+
 test("failed local cleanup keeps the optimistic recovery row until retry succeeds", () => {
   let stored: string | null = null;
   let failMutations = false;

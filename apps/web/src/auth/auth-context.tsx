@@ -173,14 +173,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const nextSession = await getSumiSession();
       if (!isCurrentGeneration(generation)) return "checking";
       serverSession.current = nextSession;
-      const nextState = nextSession.authenticated
+      let nextState: AuthSessionState = nextSession.authenticated
         ? "authenticated"
         : "unauthenticated";
       flushSync(() => {
         if (nextSession.authenticated) {
           bindDirectChatAuthority(nextSession.authorityBindingId);
-        } else {
-          clearDirectChatAuthority();
+        } else if (!clearDirectChatAuthority()) {
+          nextState = "unavailable";
         }
         setSession(nextSession);
         setSessionState(nextState);
@@ -238,12 +238,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             error instanceof SumiSessionCompensationFailedError) &&
           isCurrentGeneration(generation)
         ) {
+          let authorityCleared = true;
           flushSync(() => {
-            clearDirectChatAuthority();
+            authorityCleared = clearDirectChatAuthority();
             serverSession.current = { authenticated: false };
             setSession({ authenticated: false });
             setSessionState(
-              error instanceof SumiSessionCompensatedError
+              authorityCleared && error instanceof SumiSessionCompensatedError
                 ? "unauthenticated"
                 : "unavailable",
             );
@@ -283,18 +284,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       );
       throw error;
     }
+    let authorityCleared = true;
     if (isCurrentGeneration(generation)) {
       // Server logout is the authority transition. Commit it before touching
       // optional Firebase/emulator display-state cleanup, which may throw
       // synchronously during setup.
       flushSync(() => {
-        clearDirectChatAuthority();
+        authorityCleared = clearDirectChatAuthority();
         serverSession.current = { authenticated: false };
         setSession({ authenticated: false });
-        setSessionState("unauthenticated");
+        setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
       });
     }
     await signOutFirebaseBestEffort();
+    if (!authorityCleared) {
+      throw new Error("Direct-chat private state could not be cleared");
+    }
   }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
 
   const user = useMemo<AuthUser | null>(() => {

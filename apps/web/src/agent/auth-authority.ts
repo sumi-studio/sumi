@@ -32,15 +32,16 @@ export function bindDirectChatAuthority(authorityBindingID: string): void {
   }
 }
 
-export function clearDirectChatAuthority(): void {
-  resetDirectChatAuthority();
+export function clearDirectChatAuthority(): boolean {
+  const cleared = resetDirectChatAuthority();
   currentBindingID = null;
   try {
     globalThis.sessionStorage.removeItem(authorityBindingStorageKey);
     globalThis.sessionStorage.removeItem(legacyAuthorityIdentityStorageKey);
   } catch {
-    // The in-memory reset already ended the active authority.
+    // Storage-key cleanup is best effort; the reset result remains authoritative.
   }
+  return cleared;
 }
 
 function readCurrentBindingID(): string | null {

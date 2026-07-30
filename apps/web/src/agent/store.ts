@@ -166,8 +166,10 @@ export function createConversationStore({
         );
         if (isCanonicalUserMessage(session.conversation, canonicalMessageId)) {
           const cleared = outbox.removeByIdempotencyKey(entry.idempotencyKey);
-          if (cleared) {
+          if (undurableEntry) {
             undurableAdmissions.delete(correlationKey);
+            removeOptimistic(entry.idempotencyKey);
+          } else if (cleared) {
             removeOptimistic(entry.idempotencyKey);
           }
           return cleared
@@ -193,8 +195,10 @@ export function createConversationStore({
             disposition.command_seq,
             reason,
           );
-      if (recovered) {
+      if (undurableEntry) {
         undurableAdmissions.delete(correlationKey);
+        removeOptimistic(entry.idempotencyKey);
+      } else if (recovered) {
         removeOptimistic(entry.idempotencyKey);
       }
       return recovered
@@ -224,10 +228,10 @@ export function createConversationStore({
       for (const [correlationKey, entry] of undurableAdmissions) {
         if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
         matched = true;
-        if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
-          undurableAdmissions.delete(correlationKey);
-          removeOptimistic(entry.idempotencyKey);
-        } else {
+        const cleared = outbox.removeByIdempotencyKey(entry.idempotencyKey);
+        undurableAdmissions.delete(correlationKey);
+        removeOptimistic(entry.idempotencyKey);
+        if (!cleared) {
           error =
             "Canonical message arrived, but local recovery state could not be cleared";
         }

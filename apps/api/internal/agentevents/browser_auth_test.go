@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,30 @@ type fakeFirebaseVerifier struct {
 	identity FirebaseIdentity
 	err      error
 	calls    int
+}
+
+type barrierFirebaseVerifier struct {
+	mu    sync.Mutex
+	count int
+	ready chan struct{}
+}
+
+func (f *barrierFirebaseVerifier) VerifyIDToken(
+	ctx context.Context,
+	_ string,
+) (FirebaseIdentity, error) {
+	f.mu.Lock()
+	f.count++
+	if f.count == 2 {
+		close(f.ready)
+	}
+	f.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return FirebaseIdentity{}, ctx.Err()
+	case <-f.ready:
+		return FirebaseIdentity{UID: "firebase-user"}, nil
+	}
 }
 
 func (f *fakeFirebaseVerifier) VerifyIDToken(
@@ -55,7 +80,7 @@ func newTestBrowserAuthServer(
 	bindings *fakeBindingResolver,
 ) (*BrowserAuthServer, *HMACUserSessionVerifier) {
 	t.Helper()
-	sessions, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,6 +539,143 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	}
 }
 
+func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
+	commandDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	store, err := OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSessions, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSessions, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	oldSession, err := firstSessions.IssueSession(
+		context.Background(),
+		claims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firebase := &barrierFirebaseVerifier{ready: make(chan struct{})}
+	servers := make([]*BrowserAuthServer, 2)
+	for index, sessions := range []browserSessionManager{
+		firstSessions,
+		secondSessions,
+	} {
+		servers[index], err = NewBrowserAuthServer(
+			firebase,
+			&fakeBindingResolver{claims: claims},
+			sessions,
+			[]string{browserAuthTestOrigin},
+			true,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorders := make([]*httptest.ResponseRecorder, 2)
+	requests := make([]*http.Request, 2)
+	for index, server := range servers {
+		csrf, csrfCookie := obtainCSRF(t, server)
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/auth/session",
+			strings.NewReader(`{"id_token":"replacement"}`),
+		)
+		request.Header.Set("Origin", browserAuthTestOrigin)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-CSRF-Token", csrf)
+		request.AddCookie(csrfCookie)
+		request.AddCookie(&http.Cookie{
+			Name:  BrowserSessionCookie,
+			Value: oldSession,
+		})
+		requests[index] = request
+		recorders[index] = httptest.NewRecorder()
+	}
+
+	var wait sync.WaitGroup
+	for index := range servers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			servers[index].serveSessionExchange(recorders[index], requests[index])
+		}()
+	}
+	wait.Wait()
+
+	successes := 0
+	failures := 0
+	var replacement string
+	for _, recorder := range recorders {
+		switch recorder.Code {
+		case http.StatusNoContent:
+			successes++
+			cookies := recorder.Result().Cookies()
+			if len(cookies) != 1 {
+				t.Fatalf("successful replacement cookies = %+v", cookies)
+			}
+			replacement = cookies[0].Value
+		case http.StatusServiceUnavailable:
+			failures++
+			if len(recorder.Result().Cookies()) != 0 {
+				t.Fatal("replayed replacement published a cookie")
+			}
+		default:
+			t.Fatalf("replacement status = %d", recorder.Code)
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("replacement outcomes: successes=%d failures=%d", successes, failures)
+	}
+	if _, err := secondSessions.VerifySession(
+		context.Background(),
+		replacement,
+	); err != nil {
+		t.Fatalf("winning replacement is invalid: %v", err)
+	}
+	if _, err := firstSessions.VerifySession(
+		context.Background(),
+		oldSession,
+	); !errors.Is(err, errBrowserSessionRevoked) {
+		t.Fatalf("old replacement credential = %v, want revoked", err)
+	}
+	if _, err := firstSessions.RevokeSession(
+		context.Background(),
+		oldSession,
+	); err != nil {
+		t.Fatalf("logout-style replay must remain idempotent: %v", err)
+	}
+}
+
 func TestBrowserAuthReplacementFailsClosedWhenOldSessionCannotBeRetired(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{claims: UserSessionClaims{
@@ -522,7 +684,7 @@ func TestBrowserAuthReplacementFailsClosedWhenOldSessionCannotBeRetired(t *testi
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
-	sessions.maxRevoked = 0
+	sessions.revocations.(*testBrowserSessionRevocationStore).max = 0
 	first, err := sessions.IssueSession(context.Background(), bindings.claims, time.Minute)
 	if err != nil {
 		t.Fatal(err)

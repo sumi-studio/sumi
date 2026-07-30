@@ -7,12 +7,121 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
+
+type testBrowserSessionRevocationStore struct {
+	mu        sync.RWMutex
+	entries   map[string]int64
+	max       int
+	checkErr  error
+	revokeErr error
+}
+
+func newTestBrowserSessionRevocationStore() *testBrowserSessionRevocationStore {
+	return &testBrowserSessionRevocationStore{
+		entries: make(map[string]int64),
+		max:     maxRevokedSessions,
+	}
+}
+
+func (s *testBrowserSessionRevocationStore) CheckBrowserSession(
+	_ context.Context,
+	sessionID string,
+	expiresAt time.Time,
+	now time.Time,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.checkErr != nil {
+		return s.checkErr
+	}
+	if revokedUntil, revoked := s.entries[sessionID]; revoked {
+		if revokedUntil != expiresAt.Unix() {
+			return errors.New("browser session revocation expiry changed")
+		}
+		if now.Unix() < revokedUntil {
+			return errBrowserSessionRevoked
+		}
+	}
+	return nil
+}
+
+func (s *testBrowserSessionRevocationStore) AuthorizeBrowserSession(
+	_ context.Context,
+	sessionID string,
+	expiresAt time.Time,
+	now time.Time,
+	operation func() error,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.checkErr != nil {
+		return s.checkErr
+	}
+	if revokedUntil, revoked := s.entries[sessionID]; revoked {
+		if revokedUntil != expiresAt.Unix() {
+			return errors.New("browser session revocation expiry changed")
+		}
+		if now.Unix() < revokedUntil {
+			return errBrowserSessionRevoked
+		}
+	}
+	return operation()
+}
+
+func (s *testBrowserSessionRevocationStore) RevokeBrowserSession(
+	_ context.Context,
+	sessionID string,
+	expiresAt time.Time,
+	now time.Time,
+) error {
+	return s.persist(sessionID, expiresAt, now, true)
+}
+
+func (s *testBrowserSessionRevocationStore) RetireBrowserSession(
+	_ context.Context,
+	sessionID string,
+	expiresAt time.Time,
+	now time.Time,
+) error {
+	return s.persist(sessionID, expiresAt, now, false)
+}
+
+func (s *testBrowserSessionRevocationStore) persist(
+	sessionID string,
+	expiresAt time.Time,
+	now time.Time,
+	idempotent bool,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	for revokedSessionID, revokedUntil := range s.entries {
+		if now.Unix() >= revokedUntil {
+			delete(s.entries, revokedSessionID)
+		}
+	}
+	if _, exists := s.entries[sessionID]; exists {
+		if idempotent {
+			return nil
+		}
+		return errBrowserSessionRetired
+	}
+	if len(s.entries) >= s.max {
+		return errRevocationCapacity
+	}
+	s.entries[sessionID] = expiresAt.Unix()
+	return nil
+}
 
 type testSessionClaims struct {
 	TenantID           string `json:"tenant_id"`
@@ -47,7 +156,7 @@ func signRawTestSession(t *testing.T, secret []byte, claims testSessionClaims) s
 }
 
 func TestHMACUserSessionVerifierRequiresBoundedLifecycleClaims(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +201,7 @@ func TestHMACUserSessionVerifierRequiresBoundedLifecycleClaims(t *testing.T) {
 }
 
 func TestHMACUserSessionVerifierRevocationIsAnAdmissionBarrier(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,13 +259,18 @@ func TestHMACUserSessionVerifierRevocationIsAnAdmissionBarrier(t *testing.T) {
 }
 
 func TestHMACUserSessionVerifierBoundsAndReclaimsRevocations(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	revocations := newTestBrowserSessionRevocationStore()
+	v, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		revocations,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
 	v.now = func() time.Time { return now }
-	v.maxRevoked = 1
+	revocations.max = 1
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
 		UserID:             "user-1",
@@ -182,8 +296,143 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRevocations(t *testing.T) {
 	}
 }
 
+func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T) {
+	commandDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	store, err := OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := first.IssueSession(context.Background(), UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.VerifySession(context.Background(), session); err != nil {
+		t.Fatalf("second manager rejected live session: %v", err)
+	}
+	if _, err := first.RevokeSession(context.Background(), session); err != nil {
+		t.Fatalf("revoke session: %v", err)
+	}
+	if _, err := second.VerifySession(context.Background(), session); !errors.Is(
+		err,
+		errBrowserSessionRevoked,
+	) {
+		t.Fatalf("shared manager verify = %v, want revoked", err)
+	}
+	if err := firstGateway.runtimeDir.Close(); err != nil {
+		t.Fatalf("close first gateway runtime directory: %v", err)
+	}
+
+	restartedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		restartedGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.VerifySession(context.Background(), session); !errors.Is(
+		err,
+		errBrowserSessionRevoked,
+	) {
+		t.Fatalf("restarted manager verify = %v, want revoked", err)
+	}
+}
+
+func TestDurableBrowserSessionRevocationFailuresFailClosed(t *testing.T) {
+	commandDir := t.TempDir()
+	runtimeDir := t.TempDir()
+	store, err := OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		gateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	first, err := verifier.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway.writeAtomic = func(string, []byte, os.FileMode) error {
+		return errors.New("injected revocation write failure")
+	}
+	if _, err := verifier.RevokeSession(context.Background(), first); err == nil {
+		t.Fatal("revocation write failure was reported as success")
+	}
+
+	gateway.writeAtomic = writeFileAtomic
+	gateway.MaxBrowserSessionRevocations = 1
+	if _, err := verifier.RevokeSession(context.Background(), first); err != nil {
+		t.Fatalf("revoke first session: %v", err)
+	}
+	second, err := verifier.IssueSession(context.Background(), claims, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.RevokeSession(context.Background(), second); !errors.Is(
+		err,
+		errRevocationCapacity,
+	) {
+		t.Fatalf("capacity failure = %v, want %v", err, errRevocationCapacity)
+	}
+
+	gateway.writeAtomic = func(string, []byte, os.FileMode) error {
+		return errors.New("not used")
+	}
+	if err := os.Chmod(gateway.browserSessionRevocationPath(), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.VerifySession(context.Background(), second); err == nil {
+		t.Fatal("revocation-store read failure accepted a signed cookie")
+	}
+}
+
 func TestHMACUserSessionVerifierAcceptsValidSession(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -206,7 +455,7 @@ func TestHMACUserSessionVerifierAcceptsValidSession(t *testing.T) {
 }
 
 func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -236,7 +485,7 @@ func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
 
 func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -322,6 +571,7 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 	rotated, err := NewHMACUserSessionVerifier(
 		[]byte("rotated-browser-session-secret-32-bytes!"),
 		"",
+		newTestBrowserSessionRevocationStore(),
 	)
 	if err != nil {
 		t.Fatalf("new rotated verifier: %v", err)
@@ -334,7 +584,11 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 }
 
 func TestHMACUserSessionVerifierRejectsWrongAudience(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "sumi:web:conversation")
+	v, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"sumi:web:conversation",
+		newTestBrowserSessionRevocationStore(),
+	)
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -353,7 +607,7 @@ func TestHMACUserSessionVerifierRejectsWrongAudience(t *testing.T) {
 }
 
 func TestHMACUserSessionVerifierRejectsDuplicateKeysUnknownFieldsAndWrongTyp(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -403,7 +657,7 @@ func TestHMACUserSessionVerifierRejectsDuplicateKeysUnknownFieldsAndWrongTyp(t *
 }
 
 func TestHMACUserSessionVerifierRejectsTamperedSignature(t *testing.T) {
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}
@@ -425,7 +679,7 @@ func TestHMACUserSessionVerifierRejectsTamperedSignature(t *testing.T) {
 func TestHMACUserSessionVerifierRejectsPaddedInput(t *testing.T) {
 	// browser sessions use raw base64url; padded signatures should be trimmed
 	// defensively before HMAC comparison.
-	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatalf("new verifier: %v", err)
 	}

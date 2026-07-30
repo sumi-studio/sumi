@@ -24,7 +24,7 @@ const authMocks = vi.hoisted(() => ({
   signInWithPopup: vi.fn(),
   getIdToken: vi.fn(),
   bindDirectChatAuthority: vi.fn(),
-  clearDirectChatAuthority: vi.fn(),
+  clearDirectChatAuthority: vi.fn(() => true),
 }));
 
 vi.mock("./session-client", async (importOriginal) => ({
@@ -143,6 +143,54 @@ describe("logout authority transition", () => {
       );
     });
     expect(authMocks.clearDirectChatAuthority).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when server logout succeeds but private authority reset fails", async () => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a" },
+    });
+    authMocks.logoutSumiSession.mockResolvedValue(undefined);
+    authMocks.clearDirectChatAuthority.mockReturnValueOnce(false);
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "logout" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unavailable",
+      );
+      expect(screen.getByTestId("user-id")).toHaveTextContent("none");
+    });
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not publish an unauthenticated refresh when private reset fails", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.clearDirectChatAuthority.mockReturnValueOnce(false);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unavailable",
+      );
+    });
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
   });
 
   it("binds the new identity before publishing a successful sign-in", async () => {
