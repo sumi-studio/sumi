@@ -27,6 +27,7 @@ var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
 var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
 
 const testLocalControlPAID = "0198f0f4-9b72-7000-8000-000000000001"
+const testBrowserOrigin = "https://web.example"
 
 type testTokenClaims struct {
 	TenantID           string `json:"tenant_id"`
@@ -90,6 +91,7 @@ func setSessionSecret(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
 	t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
+	t.Setenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS", testBrowserOrigin)
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
 }
 
@@ -134,6 +136,7 @@ func postAuthorized(t *testing.T, serverURL, personalityAgentID string, body []b
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "test-key")
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Origin", testBrowserOrigin)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -156,6 +159,7 @@ func postWithSessionCookie(t *testing.T, serverURL, personalityAgentID string, b
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "test-key")
+	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: session})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -343,6 +347,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Origin", testBrowserOrigin)
 	req1.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
 		UserID:             "user-1",
@@ -373,6 +378,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Origin", testBrowserOrigin)
 	req2.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
 		UserID:             "user-1",

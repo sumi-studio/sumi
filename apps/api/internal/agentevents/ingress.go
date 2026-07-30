@@ -52,23 +52,28 @@ type CommandAppender interface {
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
-// It authenticates the caller via the signed HttpOnly browser session cookie,
-// derives the target and provenance exclusively from that session, then rejects oversized payloads, non-empty
-// attachments, and malformed commands before calling CommandAppender.Append.
+// It first requires an exact allow-listed browser Origin, authenticates the
+// caller via the signed HttpOnly browser session cookie, derives the target and
+// provenance exclusively from that session, then rejects oversized payloads,
+// non-empty attachments, and malformed commands before calling
+// CommandAppender.Append.
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
 type UserCommandIngress struct {
-	Appender CommandAppender
-	Sessions UserSessionVerifier
-	MaxBytes int64
+	Appender       CommandAppender
+	Sessions       UserSessionVerifier
+	MaxBytes       int64
+	AllowedOrigins []string
 }
 
 var errCommandAppenderRequired = errors.New("CommandAppender is required")
 
 // NewUserCommandIngress returns an ingress handler wired to the given appender.
 // It fail-closes: a nil appender returns an error so cmd/server cannot expose
-// the route with an unbacked log. A nil Sessions verifier causes every request
-// to be rejected with 401 until a production UserSessionVerifier is wired.
+// the route with an unbacked log. AllowedOrigins defaults to an empty,
+// fail-closed allowlist. Once an origin is accepted, a nil Sessions verifier
+// causes the request to be rejected with 401 until a production
+// UserSessionVerifier is wired.
 func NewUserCommandIngress(appender CommandAppender, sessions UserSessionVerifier) (*UserCommandIngress, error) {
 	if appender == nil {
 		return nil, errCommandAppenderRequired
@@ -79,6 +84,11 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionVerifie
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !browserOriginAllowed(r, h.AllowedOrigins) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
 

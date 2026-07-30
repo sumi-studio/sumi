@@ -21,6 +21,8 @@ import (
 
 var testIngressSecret = []byte("test-ingress-session-secret-32!")
 
+const testBrowserOrigin = "https://web.example"
+
 type fakeCommandAppender struct {
 	mu      sync.Mutex
 	calls   []appendCall
@@ -168,6 +170,7 @@ func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	if err != nil {
 		t.Fatalf("new ingress: %v", err)
 	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	return ingress, appender
 }
 
@@ -179,6 +182,7 @@ func postWithSessionCookie(t *testing.T, url string, body []byte, personalityAge
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "test-key")
+	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession(personalityAgentID)})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -195,6 +199,7 @@ func postWithAuthorization(t *testing.T, url string, body []byte) *http.Response
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer agent-token")
+	req.Header.Set("Origin", testBrowserOrigin)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -238,6 +243,54 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	if env.CommandID == "" {
 		t.Fatal("expected non-empty command_id")
 	}
+}
+
+func TestUserCommandIngress_BrowserOriginPolicyPrecedesSessionAndBody(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	body := `{"type":"user_message","text":"hi","attachments":[]}`
+
+	for _, tc := range []struct {
+		name       string
+		origin     string
+		wantStatus int
+	}{
+		{name: "allowed", origin: testBrowserOrigin, wantStatus: http.StatusUnauthorized},
+		{name: "disallowed", origin: "https://evil.example", wantStatus: http.StatusForbidden},
+		{name: "missing", wantStatus: http.StatusForbidden},
+		{name: "not exact", origin: testBrowserOrigin + ".evil.example", wantStatus: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands", strings.NewReader(body))
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			recorder := httptest.NewRecorder()
+
+			ingress.ServeHTTP(recorder, req)
+
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("got status %d, want %d", recorder.Code, tc.wantStatus)
+			}
+			if appender.callCount() != 0 {
+				t.Fatalf("origin/session rejection appended %d commands", appender.callCount())
+			}
+		})
+	}
+
+	t.Run("duplicated header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands", strings.NewReader(body))
+		req.Header["Origin"] = []string{testBrowserOrigin, testBrowserOrigin}
+		recorder := httptest.NewRecorder()
+
+		ingress.ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("got status %d, want %d", recorder.Code, http.StatusForbidden)
+		}
+		if appender.callCount() != 0 {
+			t.Fatalf("ambiguous origin appended %d commands", appender.callCount())
+		}
+	})
 }
 
 func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) {
@@ -377,6 +430,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 func TestUserCommandIngressRequiresNonemptyIdempotencyKey(t *testing.T) {
 	ingress, appender := newTestIngress(t)
 	req := httptest.NewRequest(http.MethodPost, "/direct-chat/commands", strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`))
+	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	recorder := httptest.NewRecorder()
 	ingress.ServeHTTP(recorder, req)
@@ -416,6 +470,7 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 		nil,
 	)
 	req.SetPathValue("personality_agent_id", "018f47a2-9b3c-7def-8abc-0123456789ab")
+	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	req.Body = errorReadCloser{}
 	recorder := httptest.NewRecorder()
@@ -462,6 +517,7 @@ func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -485,6 +541,7 @@ func TestUserCommandIngress_AgentBearerTokenCannotInjectUserCommand(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -508,6 +565,7 @@ func TestUserCommandIngress_TargetComesOnlyFromVerifiedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)
@@ -566,6 +624,7 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("018f47a2-9b3c-7def-8abc-0123456789ab")})
 	req.Header.Set("Idempotency-Key", strings.Repeat("x", MaxIdempotencyKeyBytes+1))
 

@@ -62,6 +62,7 @@ func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
 	mux := http.NewServeMux()
 	mux.Handle("POST /direct-chat/commands", ingress)
 	server := httptest.NewServer(mux)

@@ -261,16 +261,7 @@ func (s *BrowserServer) checkCommandState(personalityAgentID string, head browse
 }
 
 func (s *BrowserServer) checkOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return false
-	}
-	for _, allowed := range s.AllowedOrigins {
-		if origin == allowed {
-			return true
-		}
-	}
-	return false
+	return browserOriginAllowed(r, s.AllowedOrigins)
 }
 
 // ServeHTTP implements targetless GET /direct-chat/ws. Browser

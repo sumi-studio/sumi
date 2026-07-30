@@ -267,17 +267,11 @@ func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es Eve
 // deliberate non-browser path must remain available without weakening browser
 // CSRF protection.
 func (s *Server) checkOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+	if len(r.Header.Values("Origin")) == 0 {
 		_, ok := bearerToken(r.Header.Get("Authorization"))
 		return ok
 	}
-	for _, allowed := range s.AllowedOrigins {
-		if allowed == origin {
-			return true
-		}
-	}
-	return false
+	return browserOriginAllowed(r, s.AllowedOrigins)
 }
 
 // NewServerWithTokenVerifier returns a Server that uses the supplied real

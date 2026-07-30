@@ -99,9 +99,12 @@ if (
   !idempotencyParameter?.required ||
   idempotencyParameter.schema?.minLength !== 1 ||
   idempotencyParameter.schema?.maxLength !== 1024 ||
+  directChatPost?.responses?.["403"] === undefined ||
   directChatPost?.responses?.["409"] === undefined
 ) {
-  console.error("Direct-chat HTTP admission must require Idempotency-Key (1..1024) and expose 409.");
+  console.error(
+    "Direct-chat HTTP admission must require Idempotency-Key (1..1024) and expose Origin rejection (403) and idempotency conflict (409).",
+  );
   failed = true;
 }
 

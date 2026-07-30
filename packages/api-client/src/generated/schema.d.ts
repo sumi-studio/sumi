@@ -35,7 +35,9 @@ export interface paths {
          * @description Admits content from the authenticated direct-chat browser session. The
          *     signed HttpOnly `sumi_session` cookie supplies the target personality
          *     agent and human provenance; neither is accepted from the browser body.
-         *     Rejections occur before command_id or seq allocation.
+         *     The request Origin must exactly match the configured browser origin
+         *     allowlist. Origin rejection occurs before session or body processing;
+         *     all rejections occur before command_id or seq allocation.
          */
         post: operations["createDirectChatCommand"];
         delete?: never;
@@ -673,6 +675,13 @@ export interface operations {
             };
             /** @description Missing or invalid browser session cookie */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Origin not allowed */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

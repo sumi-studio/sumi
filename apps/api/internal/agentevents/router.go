@@ -11,8 +11,10 @@ import (
 // wiring as cmd/server without copying route registration.
 //
 // A nil TokenVerifier makes /agent/ws fail-closed. A nil UserSessionVerifier
-// makes the browser command and WebSocket routes fail-closed. /health is not
-// registered by this helper so callers can attach their own health handler.
+// makes the browser command and WebSocket routes fail-closed. browserOrigins
+// is the single exact-origin allowlist for both direct-chat browser routes and
+// is fail-closed when empty. /health is not registered by this helper so
+// callers can attach their own health handler.
 func NewProductionMux(
 	store *CommandStore,
 	runtime *DurableGateway,
@@ -36,6 +38,7 @@ func NewProductionMux(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("user command ingress: %w", err)
 	}
+	ingress.AllowedOrigins = browserOrigins
 	mux.Handle("POST /direct-chat/commands", ingress)
 
 	browser := NewBrowserServer(sv, runtime, runtime)
