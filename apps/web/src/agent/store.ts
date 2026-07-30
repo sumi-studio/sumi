@@ -47,7 +47,7 @@ export interface ConversationState {
   recoverableDrafts: RecoverableDraft[];
   connect: () => void;
   disconnect: () => void;
-  resetAuthority: () => void;
+  resetAuthority: () => boolean;
   sendMessage: (text: string) => boolean;
   restoreDraft: (idempotencyKey: string) => string | undefined;
   discardDraft: (idempotencyKey: string) => boolean;
@@ -62,6 +62,11 @@ export interface ConversationStoreDependencies {
   reducerId?: () => string;
 }
 
+type PrivateReconciliation =
+  | { kind: "unmatched" }
+  | { kind: "reconciled" }
+  | { kind: "error"; message: string };
+
 export function createConversationStore({
   transport,
   outbox = new PrivateOutbox(),
@@ -72,6 +77,7 @@ export function createConversationStore({
   let connection: DirectChatConnectionState = "connecting";
   let ready: DirectChatReadyState = "unknown";
   let started = false;
+  let privateStateQuarantined = false;
   const approvalSubmissionLatches = new Set<string>();
   const undurableAdmissions = new Map<
     string,
@@ -101,7 +107,9 @@ export function createConversationStore({
         connection,
         ready,
         lastError: lastError === undefined ? state.lastError : lastError,
-        recoverableDrafts: outbox.recoverableDrafts(),
+        recoverableDrafts: privateStateQuarantined
+          ? []
+          : outbox.recoverableDrafts(),
       }));
     };
 
@@ -142,7 +150,7 @@ export function createConversationStore({
         BrowserEventEnvelope["event"],
         { type: "command_disposition" }
       >,
-    ) => {
+    ): PrivateReconciliation => {
       const correlationKey = commandCorrelationKey(
         disposition.command_id,
         disposition.command_seq,
@@ -151,20 +159,28 @@ export function createConversationStore({
       const entry =
         outbox.findByCommand(disposition.command_id, disposition.command_seq) ??
         undurableEntry;
-      if (!entry) return;
+      if (!entry) return { kind: "unmatched" };
       if (disposition.status === "applied") {
         const canonicalMessageId = userMessageIdFromCommandId(
           disposition.command_id,
         );
         if (isCanonicalUserMessage(session.conversation, canonicalMessageId)) {
-          if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
+          const cleared = outbox.removeByIdempotencyKey(entry.idempotencyKey);
+          if (cleared) {
             undurableAdmissions.delete(correlationKey);
+            removeOptimistic(entry.idempotencyKey);
           }
-          removeOptimistic(entry.idempotencyKey);
+          return cleared
+            ? { kind: "reconciled" }
+            : {
+                kind: "error",
+                message:
+                  "Message was applied, but local recovery state could not be cleared",
+              };
         } else {
           ensureOptimistic(entry, "admitted");
         }
-        return;
+        return { kind: "unmatched" };
       }
       const reason =
         disposition.status === "superseded"
@@ -179,24 +195,45 @@ export function createConversationStore({
           );
       if (recovered) {
         undurableAdmissions.delete(correlationKey);
+        removeOptimistic(entry.idempotencyKey);
       }
-      removeOptimistic(entry.idempotencyKey);
+      return recovered
+        ? { kind: "reconciled" }
+        : {
+            kind: "error",
+            message: "Command outcome could not be saved for local recovery",
+          };
     };
 
-    const reconcileCanonicalMessage = (messageId: string) => {
+    const reconcileCanonicalMessage = (
+      messageId: string,
+    ): PrivateReconciliation => {
+      let matched = false;
+      let error: string | null = null;
       for (const entry of outbox.entries()) {
         if (entry.state !== "admitted") continue;
         if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
-        outbox.removeByIdempotencyKey(entry.idempotencyKey);
-        removeOptimistic(entry.idempotencyKey);
+        matched = true;
+        if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
+          removeOptimistic(entry.idempotencyKey);
+        } else {
+          error =
+            "Canonical message arrived, but local recovery state could not be cleared";
+        }
       }
       for (const [correlationKey, entry] of undurableAdmissions) {
         if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
+        matched = true;
         if (outbox.removeByIdempotencyKey(entry.idempotencyKey)) {
           undurableAdmissions.delete(correlationKey);
+          removeOptimistic(entry.idempotencyKey);
+        } else {
+          error =
+            "Canonical message arrived, but local recovery state could not be cleared";
         }
-        removeOptimistic(entry.idempotencyKey);
       }
+      if (error) return { kind: "error", message: error };
+      return matched ? { kind: "reconciled" } : { kind: "unmatched" };
     };
 
     transport.onConnection((next) => {
@@ -216,22 +253,31 @@ export function createConversationStore({
           id: reducerId,
         });
         session = reduced.session;
+        let reconciliation: PrivateReconciliation = { kind: "unmatched" };
         if (reduced.kind === "applied") {
           if (envelope.event.type === "approval_resolved") {
             approvalSubmissionLatches.delete(envelope.event.request_id);
           }
           if (envelope.event.type === "command_disposition") {
-            applyDisposition(envelope.event);
+            reconciliation = applyDisposition(envelope.event);
           } else if (
             (envelope.event.type === "message_start" ||
               envelope.event.type === "message_end") &&
             envelope.event.message.role === "user"
           ) {
-            reconcileCanonicalMessage(envelope.event.message_id);
+            reconciliation = reconcileCanonicalMessage(
+              envelope.event.message_id,
+            );
           }
         }
         publish(
-          envelope.event.type === "error" ? envelope.event.message : undefined,
+          reconciliation.kind === "error"
+            ? reconciliation.message
+            : reconciliation.kind === "reconciled"
+              ? null
+              : envelope.event.type === "error"
+                ? envelope.event.message
+                : undefined,
         );
         return;
       }
@@ -255,7 +301,11 @@ export function createConversationStore({
             undurableAdmissions.set(correlationKey, admitted.entry);
             ensureOptimistic(admitted.entry, "admitted");
             if (frame.disposition) {
-              applyDisposition(frame.disposition);
+              const reconciliation = applyDisposition(frame.disposition);
+              if (reconciliation.kind === "error") {
+                publish(reconciliation.message);
+                return;
+              }
             }
             publish(
               undurableAdmissions.has(correlationKey)
@@ -274,13 +324,25 @@ export function createConversationStore({
           if (
             isCanonicalUserMessage(session.conversation, canonicalMessageId)
           ) {
-            outbox.removeByIdempotencyKey(frame.idempotency_key);
-            removeOptimistic(frame.idempotency_key);
-            publish(null);
+            const cleared = outbox.removeByIdempotencyKey(
+              frame.idempotency_key,
+            );
+            if (cleared) {
+              removeOptimistic(frame.idempotency_key);
+            }
+            publish(
+              cleared
+                ? null
+                : "Message was admitted, but local recovery state could not be cleared",
+            );
             return;
           }
           if (frame.disposition) {
-            applyDisposition(frame.disposition);
+            const reconciliation = applyDisposition(frame.disposition);
+            if (reconciliation.kind === "error") {
+              publish(reconciliation.message);
+              return;
+            }
           } else {
             ensureOptimistic(admitted.entry, "admitted");
           }
@@ -295,12 +357,23 @@ export function createConversationStore({
         return;
       }
       if (frame.type === "command_rejected") {
-        outbox.recoverByIdempotencyKey(
+        const entry = outbox.findByIdempotencyKey(frame.idempotency_key);
+        if (!entry) {
+          publish(`Command rejected: ${frame.reject_reason}`);
+          return;
+        }
+        const recovered = outbox.recoverByIdempotencyKey(
           frame.idempotency_key,
           frame.reject_reason,
         );
-        removeOptimistic(frame.idempotency_key);
-        publish(`Command rejected: ${frame.reject_reason}`);
+        if (recovered) {
+          removeOptimistic(frame.idempotency_key);
+        }
+        publish(
+          recovered
+            ? `Command rejected: ${frame.reject_reason}`
+            : "Command rejection could not be saved for local recovery",
+        );
       }
     });
 
@@ -316,6 +389,12 @@ export function createConversationStore({
       recoverableDrafts: outbox.recoverableDrafts(),
       connect() {
         if (started) return;
+        if (privateStateQuarantined) {
+          publish(
+            "Private delivery state must be cleared before direct chat can reconnect",
+          );
+          return;
+        }
         started = true;
         connection = "connecting";
         ready = "unknown";
@@ -337,12 +416,19 @@ export function createConversationStore({
         } else {
           transport.close();
         }
-        outbox.clear();
+        const cleared = outbox.clear();
+        privateStateQuarantined = !cleared;
         undurableAdmissions.clear();
+        approvalSubmissionLatches.clear();
         session = createAgentSession();
         connection = "closed";
         ready = "unknown";
-        publish(null);
+        publish(
+          cleared
+            ? null
+            : "Private delivery state could not be cleared; authority switch was blocked",
+        );
+        return cleared;
       },
       sendMessage(text) {
         const normalized = text.trim();
@@ -373,11 +459,13 @@ export function createConversationStore({
         return sent;
       },
       restoreDraft(idempotencyKey) {
+        if (privateStateQuarantined) return undefined;
         const text = outbox.consumeRecoverable(idempotencyKey);
         if (text !== undefined) publish(null);
         return text;
       },
       discardDraft(idempotencyKey) {
+        if (privateStateQuarantined) return false;
         const entry = outbox.findByIdempotencyKey(idempotencyKey);
         if (entry?.state !== "recoverable") return false;
         const removed = outbox.removeByIdempotencyKey(idempotencyKey);

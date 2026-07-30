@@ -451,10 +451,11 @@ cleanup() {
     wait "${pid}" 2>/dev/null || true
   done
   if [[ -n "${RUNTIME_ROOT}" && -d "${RUNTIME_ROOT}" ]]; then
-    local runtime_parent runtime_name
-    runtime_parent="$(dirname -- "${RUNTIME_ROOT}")"
+    local runtime_parent runtime_name temporary_root
+    runtime_parent="$(realpath -m -- "$(dirname -- "${RUNTIME_ROOT}")")"
     runtime_name="$(basename -- "${RUNTIME_ROOT}")"
-    if [[ "${runtime_parent}" == "${TMPDIR:-/tmp}" && "${runtime_name}" == sumi-real-stack.* ]]; then
+    temporary_root="$(realpath -m -- "${TMPDIR:-/tmp}")"
+    if [[ "${runtime_parent}" == "${temporary_root}" && "${runtime_name}" == sumi-real-stack.* ]]; then
       rm -rf -- "${RUNTIME_ROOT}"
     else
       log "refusing to remove unexpected runtime path: ${RUNTIME_ROOT}"

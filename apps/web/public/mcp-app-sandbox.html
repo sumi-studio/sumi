@@ -67,7 +67,6 @@
         const query = new URLSearchParams(location.search);
         const deploymentId = query.get("deploymentId");
         const parentOrigin = exactHttpsOrigin(query.get("hostOrigin"));
-        const referrerOrigin = exactHttpsOrigin(document.referrer);
 
         if (
           !window.isSecureContext ||
@@ -75,8 +74,7 @@
           !("credentialless" in HTMLIFrameElement.prototype) ||
           !DEPLOYMENT_PATTERN.test(deploymentMarker || "") ||
           deploymentMarker !== deploymentId ||
-          !parentOrigin ||
-          referrerOrigin !== parentOrigin
+          !parentOrigin
         ) {
           document.body.textContent = "MCP App sandbox unavailable.";
           return;

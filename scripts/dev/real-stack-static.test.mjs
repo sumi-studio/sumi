@@ -13,7 +13,7 @@ async function source(path) {
   return readFile(resolve(repositoryRoot, path), "utf8");
 }
 
-test("Compose mounts and passes the runtime workspace through env -i", async () => {
+test("Compose gives runtime only the logical executor workspace address", async () => {
   const [compose, entrypoint] = await Promise.all([
     source("deploy/agent/compose.yaml"),
     source("deploy/agent/container-entrypoint"),
@@ -23,7 +23,7 @@ test("Compose mounts and passes the runtime workspace through env -i", async () 
     compose.indexOf("\n  executor:"),
   );
   assert.match(runtime, /SUMI_WORKSPACE: \/workspace/);
-  assert.match(runtime, /- workspace:\/workspace:ro/);
+  assert.doesNotMatch(runtime, /workspace:\/workspace/);
 
   const runtimeEntrypoint = entrypoint.slice(
     entrypoint.indexOf("  runtime)"),
@@ -128,6 +128,14 @@ test("the allocator exception is bounded to one locked disposable generation", a
     /RUNTIME_ROOT="\$\(mktemp -d "\$\{TMPDIR:-\/tmp\}\/sumi-real-stack\.XXXXXXXX"\)"/,
   );
   assert.match(launcher, /SUMI_RPC_GENERATION=0/);
+  assert.match(
+    launcher,
+    /runtime_parent="\$\(realpath -m -- "\$\(dirname -- "\$\{RUNTIME_ROOT\}"\)"\)"/,
+  );
+  assert.match(
+    launcher,
+    /temporary_root="\$\(realpath -m -- "\$\{TMPDIR:-\/tmp\}"\)"/,
+  );
   assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
   assert.match(launcher, /fail "a required Sumi process exited"/);
   assert.doesNotMatch(launcher, /--supervisor-allocate/);

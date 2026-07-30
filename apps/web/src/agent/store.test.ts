@@ -144,6 +144,102 @@ test("authority reset disposes conversation and private delivery state", () => {
   assert.equal(transport.sent.length, sentBeforeReconnect);
 });
 
+test("authority reset releases approval latches from the previous principal", () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+  });
+  const request = approvalRequest("reused-request-id");
+
+  store.getState().connect();
+  transport.emit({
+    type: "event",
+    envelope: { seq: 1, event: { type: "approval_requested", request } },
+  } as unknown as DirectChatServerFrame);
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "approve_once" }),
+    true,
+  );
+
+  store.getState().resetAuthority();
+  store.getState().connect();
+  transport.emit({
+    type: "event",
+    envelope: { seq: 1, event: { type: "approval_requested", request } },
+  } as unknown as DirectChatServerFrame);
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "deny" }),
+    true,
+  );
+  assert.deepEqual(
+    transport.sent.map((entry) => entry.command),
+    [
+      {
+        type: "approval_decision",
+        request_id: request.id,
+        decision: { type: "approve_once" },
+      },
+      {
+        type: "approval_decision",
+        request_id: request.id,
+        decision: { type: "deny" },
+      },
+    ],
+  );
+});
+
+test("authority switch stays blocked and private text quarantined until erasure succeeds", () => {
+  let stored: string | null = null;
+  let failMutations = false;
+  const storage: PrivateOutboxStorage = {
+    getItem: () => stored,
+    setItem(_key, value) {
+      if (failMutations) throw new Error("session storage denied");
+      stored = value;
+    },
+    removeItem() {
+      if (failMutations) throw new Error("session storage denied");
+      stored = null;
+    },
+  };
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox(storage);
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "prior-authority",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("prior authority text"), true);
+
+  failMutations = true;
+  assert.equal(store.getState().resetAuthority(), false);
+  assert.deepEqual(store.getState().conversation.entries, {});
+  assert.deepEqual(store.getState().recoverableDrafts, []);
+  assert.equal(
+    store.getState().lastError,
+    "Private delivery state could not be cleared; authority switch was blocked",
+  );
+  assert.equal(
+    new PrivateOutbox(storage).entries()[0]?.text,
+    "prior authority text",
+  );
+
+  store.getState().connect();
+  assert.equal(store.getState().connection, "closed");
+  assert.equal(
+    store.getState().lastError,
+    "Private delivery state must be cleared before direct chat can reconnect",
+  );
+
+  failMutations = false;
+  assert.equal(store.getState().resetAuthority(), true);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), []);
+  store.getState().connect();
+  assert.equal(store.getState().connection, "connected");
+});
+
 test("replayed disposition before admission is reconciled by its authoritative receipt", () => {
   for (const status of ["applied", "superseded", "rejected"] as const) {
     const transport = new FakeTransport();
@@ -535,6 +631,24 @@ test("immediate rejection removes provisional history and supports restore/disca
   assert.deepEqual(store.getState().recoverableDrafts, []);
 });
 
+test("rejection for a non-message command does not claim recovery persistence failed", () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+  });
+  store.getState().connect();
+
+  transport.emit({
+    type: "command_rejected",
+    idempotency_key: "non-message-command",
+    reject_reason: "not_allowed",
+  });
+
+  assert.equal(store.getState().lastError, "Command rejected: not_allowed");
+  assert.deepEqual(store.getState().recoverableDrafts, []);
+});
+
 test("client queue failure is immediately recoverable and never enters history", () => {
   const transport = new FakeTransport();
   transport.sendResult = false;
@@ -650,6 +764,79 @@ test("admission persistence failure remains provisional and is surfaced", () => 
     undefined,
   );
   assert.equal(store.getState().conversation.entries[messageId]?.kind, "user");
+  assert.deepEqual(outbox.entries(), []);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), []);
+});
+
+test("failed local cleanup keeps the optimistic recovery row until retry succeeds", () => {
+  let stored: string | null = null;
+  let failMutations = false;
+  const storage: PrivateOutboxStorage = {
+    getItem: () => stored,
+    setItem(_key, value) {
+      if (failMutations) throw new Error("session storage denied");
+      stored = value;
+    },
+    removeItem() {
+      if (failMutations) throw new Error("session storage denied");
+      stored = null;
+    },
+  };
+  const transport = new FakeTransport();
+  const outbox = new PrivateOutbox(storage);
+  const store = createConversationStore({
+    transport,
+    outbox,
+    idempotencyKey: () => "cleanup-retry",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("survive cleanup failure"), true);
+  transport.emit(accepted("cleanup-retry", CommandId, 1));
+
+  failMutations = true;
+  transport.emit(canonicalFrame(1, CommandId, "survive cleanup failure"));
+
+  assert.equal(
+    store.getState().lastError,
+    "Canonical message arrived, but local recovery state could not be cleared",
+  );
+  assert.equal(
+    store.getState().conversation.entries["optimistic:cleanup-retry"]?.kind,
+    "user",
+  );
+  assert.equal(
+    store.getState().conversation.entries[userMessageIdFromCommandId(CommandId)]
+      ?.kind,
+    "user",
+  );
+  assert.equal(
+    outbox.findByCommand(CommandId, 1)?.text,
+    "survive cleanup failure",
+  );
+  assert.equal(
+    new PrivateOutbox(storage).findByCommand(CommandId, 1)?.text,
+    "survive cleanup failure",
+  );
+
+  const unrelatedCommandId = "00000000-0000-4000-8000-000000000002";
+  transport.emit(disposition(2, unrelatedCommandId, 99, "applied"));
+  assert.equal(
+    store.getState().lastError,
+    "Canonical message arrived, but local recovery state could not be cleared",
+  );
+  transport.emit(canonicalFrame(3, unrelatedCommandId, "unrelated"));
+  assert.equal(
+    store.getState().lastError,
+    "Canonical message arrived, but local recovery state could not be cleared",
+  );
+
+  failMutations = false;
+  transport.emit(disposition(4, CommandId, 1, "applied"));
+  assert.equal(store.getState().lastError, null);
+  assert.equal(
+    store.getState().conversation.entries["optimistic:cleanup-retry"],
+    undefined,
+  );
   assert.deepEqual(outbox.entries(), []);
   assert.deepEqual(new PrivateOutbox(storage).entries(), []);
 });

@@ -9,14 +9,16 @@ let currentBindingID: string | null | undefined;
  * boundary. This is intentionally separate from reconnect-oriented
  * disconnect(), which preserves replay cursor and pending delivery state.
  */
-export function resetDirectChatAuthority(): void {
-  useConversation.getState().resetAuthority();
+export function resetDirectChatAuthority(): boolean {
+  return useConversation.getState().resetAuthority();
 }
 
 export function bindDirectChatAuthority(authorityBindingID: string): void {
   const previous = readCurrentBindingID();
-  if (previous !== authorityBindingID) {
-    resetDirectChatAuthority();
+  if (previous !== authorityBindingID && !resetDirectChatAuthority()) {
+    throw new Error(
+      "Direct-chat private state could not be cleared for the new authority",
+    );
   }
   currentBindingID = authorityBindingID;
   try {

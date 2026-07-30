@@ -1237,7 +1237,6 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
             "executor-ipc",
             "runtime-identity",
             "state",
-            "workspace",
             "${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock",
         ])
     );
@@ -1250,10 +1249,10 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         string_set(&["artifacts", "broker-identity", "broker-ipc"])
     );
     assert_has_mount(runtime, "executor-ipc:/run/sumi/executor:ro");
-    assert_has_mount(runtime, "workspace:/workspace:ro");
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
     assert_has_mount(executor, "workspace:/workspace:ro");
     assert_has_mount(broker, "broker-ipc:/run/sumi/broker");
+    assert!(!volume_sources(runtime).contains("workspace"));
     assert!(!volume_sources(runtime).contains("broker-ipc"));
     assert!(!volume_sources(runtime).contains("artifacts"));
     assert!(!volume_sources(executor).contains("artifacts"));

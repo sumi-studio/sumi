@@ -258,6 +258,16 @@ test("valid SDUI materializes while adversarial SDUI validation stays inert", ()
     { name: "wide items", node: tooManyItems, accepted: false },
     { name: "wide actions", node: tooManyActions, accepted: false },
     { name: "oversized string", node: oversizedString, accepted: false },
+    {
+      name: "prototype constructor",
+      node: { type: "constructor", props: {} },
+      accepted: true,
+    },
+    {
+      name: "prototype toString",
+      node: { type: "toString", props: {} },
+      accepted: true,
+    },
   ];
 
   for (const { name, node, accepted } of payloads) {

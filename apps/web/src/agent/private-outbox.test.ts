@@ -255,6 +255,28 @@ test("failed removal is not consumed or cleared in memory", () => {
   assert.deepEqual(new PrivateOutbox(storage).entries(), outbox.entries());
 });
 
+test("failed clear preserves both memory and durable private state", () => {
+  const storage = new FailableMemoryStorage();
+  const outbox = new PrivateOutbox(storage);
+  assert.equal(outbox.putPending("key", "prior authority text"), true);
+
+  storage.failMutations = true;
+  assert.equal(outbox.clear(), false);
+  assert.deepEqual(outbox.entries(), [
+    {
+      state: "pending",
+      idempotencyKey: "key",
+      text: "prior authority text",
+    },
+  ]);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), outbox.entries());
+
+  storage.failMutations = false;
+  assert.equal(outbox.clear(), true);
+  assert.deepEqual(outbox.entries(), []);
+  assert.deepEqual(new PrivateOutbox(storage).entries(), []);
+});
+
 class MemoryStorage implements PrivateOutboxStorage {
   private readonly values = new Map<string, string>();
 

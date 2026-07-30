@@ -345,6 +345,8 @@ describe("MCP App sandbox artifact", () => {
 
   it("keeps the deployment policy broad and installs a replacement-resistant resource boundary", () => {
     expect(sandboxHtml).toContain("connect-src https: wss:");
+    expect(sandboxHtml).not.toContain("document.referrer");
+    expect(sandboxHtml).toContain("event.origin === parentOrigin");
     expect(sandboxHtml).toContain("\"default-src 'none'\"");
     expect(sandboxHtml).toContain("createBoundaryDocument(params.csp)");
     expect(sandboxHtml).toContain('["\'self\'", ...frames].join(" ")');

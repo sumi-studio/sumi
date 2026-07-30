@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bindDirectChatAuthority } from "./auth-authority";
 
 const authorityMocks = vi.hoisted(() => ({
-  resetAuthority: vi.fn(),
+  resetAuthority: vi.fn(() => true),
 }));
 
 vi.mock("./store", () => ({
@@ -45,6 +45,14 @@ describe("direct-chat authority binding", () => {
     bindDirectChatAuthority(authorityBindingB);
 
     expect(authorityMocks.resetAuthority).toHaveBeenCalledTimes(1);
+    expect(globalThis.sessionStorage.getItem(authorityBindingStorageKey)).toBe(
+      authorityBindingB,
+    );
+
+    authorityMocks.resetAuthority.mockReturnValueOnce(false);
+    expect(() => bindDirectChatAuthority(authorityBindingA)).toThrow(
+      "Direct-chat private state could not be cleared for the new authority",
+    );
     expect(globalThis.sessionStorage.getItem(authorityBindingStorageKey)).toBe(
       authorityBindingB,
     );

@@ -69,7 +69,7 @@ export type CardType = keyof typeof cardSchemas;
 
 export function parseCatalogSduiNode(value: unknown): SduiNode | null {
   const node = parseSduiNode(value);
-  if (!node || !(node.type in cardSchemas)) {
+  if (!node || !Object.hasOwn(cardSchemas, node.type)) {
     return node;
   }
   const schema = cardSchemas[node.type as CardType];

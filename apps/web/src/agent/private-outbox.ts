@@ -209,13 +209,8 @@ export class PrivateOutbox {
     return this.removeByIdempotencyKey(idempotencyKey) ? entry.text : undefined;
   }
 
-  clear(): void {
-    if (this.entriesValue.length === 0) {
-      this.persist();
-      return;
-    }
-    this.entriesValue = [];
-    this.persist();
+  clear(): boolean {
+    return this.commit([]);
   }
 
   private recover(
