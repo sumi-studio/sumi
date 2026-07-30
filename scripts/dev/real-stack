@@ -59,9 +59,16 @@ done
 
 load_env_file() {
   local file="$1"
-  local line key value
-  [[ -f "${file}" && -r "${file}" ]] ||
-    fail "configuration file is missing or unreadable: ${file}"
+  local line key value mode
+  [[ -f "${file}" && -r "${file}" && ! -L "${file}" ]] ||
+    fail "configuration file must be a readable regular non-symlink: ${file}"
+  mode="$(stat -c '%a' -- "${file}")" ||
+    fail "cannot inspect configuration file permissions: ${file}"
+  mode="${mode: -3}"
+  [[ "${mode}" =~ ^[0-7]{3}$ ]] ||
+    fail "cannot parse configuration file permissions: ${file}"
+  [[ "${mode:1:1}" =~ ^[0-3]$ && "${mode:2:1}" =~ ^[0-3]$ ]] ||
+    fail "configuration file must not be readable by group or other: ${file}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     line="${line%$'\r'}"
     [[ "${line}" =~ ^[[:space:]]*$ || "${line}" =~ ^[[:space:]]*# ]] && continue
@@ -131,6 +138,18 @@ validate_public_listen() {
     fail "SUMI_PUBLIC_LISTEN must not expose an all-interface wildcard"
   [[ "${API_PORT}" != "8081" && "${API_PORT}" != "8082" && "${API_PORT}" != "${WEB_PORT}" ]] ||
     fail "SUMI_PUBLIC_LISTEN collides with a reserved local-stack port"
+  if [[ "${PUBLIC_HOST}" != "127.0.0.1" ]]; then
+    node -e '
+      const octets = process.argv[1].split(".").map(Number);
+      if (
+        octets.length !== 4 ||
+        octets[0] !== 100 ||
+        octets[1] < 64 ||
+        octets[1] > 127
+      ) process.exit(2);
+    ' "${PUBLIC_HOST}" ||
+      fail "SUMI_PUBLIC_LISTEN must use 127.0.0.1 or an assigned Tailnet IPv4 in 100.64.0.0/10"
+  fi
   node -e '
     const { createServer, isIP } = require("node:net");
     const address = process.argv[1];
@@ -201,6 +220,7 @@ validate_firebase_admin_mode() {
     const { isIP } = require("node:net");
     const api = process.argv[1];
     const web = process.argv[2];
+    const publicHost = process.argv[3];
     const match = api.match(/^([0-9.]+):([0-9]{1,5})$/);
     if (!match || isIP(match[1]) !== 4 || match[1] === "0.0.0.0") process.exit(2);
     const port = Number(match[2]);
@@ -213,11 +233,14 @@ validate_firebase_admin_mode() {
         isIP(url.hostname) !== 4 ||
         url.hostname === "0.0.0.0"
       ) process.exit(4);
+      if (publicHost !== "127.0.0.1" && url.hostname !== publicHost) {
+        process.exit(6);
+      }
     } catch {
       process.exit(5);
     }
-  ' "${api_emulator}" "${web_emulator}" ||
-    fail "Firebase Auth emulator endpoints must be exact literal-IPv4 HTTP endpoints"
+  ' "${api_emulator}" "${web_emulator}" "${PUBLIC_HOST}" ||
+    fail "Firebase Auth emulator endpoints must be exact literal-IPv4 HTTP endpoints, and the browser endpoint must use the public Tailnet host"
 }
 
 validate_configuration() {
@@ -441,10 +464,10 @@ cleanup() {
   exit "${status}"
 }
 
-load_env_file "${ENV_FILE}"
-for command in node realpath; do
+for command in node realpath stat; do
   require_command "${command}"
 done
+load_env_file "${ENV_FILE}"
 validate_configuration
 if ((CHECK_ONLY)); then
   log "configuration is valid (Firebase/provider credentials were not printed)"
@@ -531,6 +554,7 @@ log "starting API"
     "SUMI_AGENT_RUNTIME_STATE_DIR=${GATEWAY_STATE_DIR}" \
     "SUMI_AGENT_TOKEN_SECRET=${SUMI_AGENT_TOKEN_SECRET}" \
     "SUMI_BROWSER_SESSION_SECRET=${SUMI_BROWSER_SESSION_SECRET}" \
+    "SUMI_BROWSER_SESSION_AUDIENCE=sumi:web:direct-chat" \
     "SUMI_BROWSER_WS_ALLOWED_ORIGINS=${WEB_ORIGIN}" \
     "SUMI_AUTH_FIREBASE_UID=${SUMI_AUTH_FIREBASE_UID}" \
     "SUMI_AUTH_FIREBASE_TENANT_ID=${SUMI_AUTH_FIREBASE_TENANT_ID:-}" \

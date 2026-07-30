@@ -53,8 +53,11 @@ An already-running Firebase Auth emulator remains an explicit alternative for
 local testing: set both `FIREBASE_AUTH_EMULATOR_HOST=<literal-ip>:<port>` for
 Firebase Admin and
 `VITE_FIREBASE_AUTH_EMULATOR_URL=http://<literal-ip>:<port>` for the browser.
-The launcher validates and passes both endpoints, but does not start or expose
-the emulator. ADC validation is skipped only in this explicit emulator mode.
+For direct Tailnet access, the browser endpoint must use the same Tailnet IP as
+`SUMI_PUBLIC_LISTEN`; `127.0.0.1` would refer to the remote browser's machine,
+not this host. The launcher validates and passes both endpoints, but does not
+start or expose the emulator. ADC validation is skipped only in this explicit
+emulator mode.
 
 Copy the template, then fill the required blanks:
 
@@ -147,8 +150,9 @@ change only the literal bind in `deploy/local/.env.local`:
 SUMI_PUBLIC_LISTEN=<this-host-tailscale-ipv4>:8080
 ```
 
-The launcher verifies that the address is a bindable literal IPv4 address,
-rejects hostnames, `0.0.0.0`, and other wildcard exposure, then derives:
+The launcher verifies that the address is a locally bindable Tailnet IPv4
+inside `100.64.0.0/10`, rejects LAN addresses, hostnames, `0.0.0.0`, and other
+wildcard exposure, then derives:
 
 ```text
 API listen and proxy target  http://<tailscale-ipv4>:8080
