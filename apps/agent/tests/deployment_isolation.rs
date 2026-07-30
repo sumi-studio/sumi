@@ -1,14 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
-    os::unix::net::UnixListener,
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, PermissionsExt},
         unix::process::CommandExt,
     },
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
@@ -115,14 +117,25 @@ fn launch_env(command: &mut Command, paid: &str) {
 fn docker_fixture_host_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("docker")
-            .arg("info")
-            .output()
-            .is_ok_and(|output| output.status.success())
-            && Command::new("docker")
-                .args(["image", "inspect", "debian:bookworm-slim"])
-                .output()
-                .is_ok_and(|output| output.status.success())
+        timeout_available()
+            && bounded_docker_output(
+                deploy_dir().parent().unwrap().parent().unwrap(),
+                10,
+                &["info".into()],
+            )
+            .status
+            .success()
+            && bounded_docker_output(
+                deploy_dir().parent().unwrap().parent().unwrap(),
+                10,
+                &[
+                    "image".into(),
+                    "inspect".into(),
+                    "debian:bookworm-slim".into(),
+                ],
+            )
+            .status
+            .success()
     })
 }
 
@@ -186,26 +199,27 @@ done
 install -d -m 0750 -o "$3" -g "$4" "/host-run/sumi/local-control/$1"
 install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lock"
 "#;
-        let setup = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                "/run:/host-run",
-                "debian:bookworm-slim",
-                "bash",
-                "-c",
-                setup_script,
-                "--",
-                &compact,
-                &project,
-                &server_uid.to_string(),
-                &control_gid.to_string(),
-            ])
-            .output()
-            .unwrap();
+        let setup = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "-v".into(),
+                "/run:/host-run".into(),
+                "debian:bookworm-slim".into(),
+                "bash".into(),
+                "-c".into(),
+                setup_script.into(),
+                "--".into(),
+                compact.clone(),
+                project.clone(),
+                server_uid.to_string(),
+                control_gid.to_string(),
+            ],
+        );
         if !setup.status.success() {
             eprintln!(
                 "HOST_UNAVAILABLE: fixed trust-anchor provisioning failed: {}",
@@ -240,10 +254,8 @@ install -m 0600 -o "$3" -g "$4" /dev/null "/host-run/sumi/supervisor-locks/$2.lo
                 self.control_gid.to_string(),
             );
     }
-}
 
-impl Drop for HostTrustFixture {
-    fn drop(&mut self) {
+    fn cleanup(&mut self) -> Result<(), String> {
         self.listener.take();
         let compact = self.paid.replace('-', "");
         let cleanup_script = r#"
@@ -256,23 +268,64 @@ rmdir /host-run/sumi/local-control 2>/dev/null || true
 rmdir /host-run/sumi/supervisor-locks 2>/dev/null || true
 rmdir /host-run/sumi 2>/dev/null || true
 "#;
-        let _ = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                "/run:/host-run",
-                "debian:bookworm-slim",
-                "bash",
-                "-c",
-                cleanup_script,
-                "--",
-                &compact,
-                &self.project,
-            ])
-            .output();
+        let cleanup = try_bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "-v".into(),
+                "/run:/host-run".into(),
+                "debian:bookworm-slim".into(),
+                "bash".into(),
+                "-c".into(),
+                cleanup_script.into(),
+                "--".into(),
+                compact,
+                self.project.clone(),
+            ],
+        );
+        let mut errors = Vec::new();
+        match cleanup {
+            Ok(cleanup) if cleanup.status.success() => {}
+            Ok(cleanup) => errors.push(format!(
+                "cannot remove exact host trust fixture {}: {}",
+                self.project,
+                String::from_utf8_lossy(&cleanup.stderr)
+            )),
+            Err(error) => errors.push(format!(
+                "cannot run exact host trust fixture cleanup {}: {error}",
+                self.project
+            )),
+        }
+        if self.lock_path.exists() {
+            errors.push(format!(
+                "exact host trust lock survived cleanup: {}",
+                self.lock_path.display()
+            ));
+        }
+        let control_dir = self.control_socket.parent().unwrap();
+        if control_dir.exists() {
+            errors.push(format!(
+                "exact host trust control directory survived cleanup: {}",
+                control_dir.display()
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+}
+
+impl Drop for HostTrustFixture {
+    fn drop(&mut self) {
+        // The acceptance test calls this fallibly and asserts exact fixture
+        // absence. Drop is only an emergency best-effort fallback.
+        let _ = self.cleanup();
     }
 }
 
@@ -281,6 +334,137 @@ fn launch_runtime_env(command: &mut Command, fixture: &HostTrustFixture) {
     command
         .env_remove("SUMI_LOCAL_CONTROL_HOST_ROOT")
         .env_remove("SUMI_SUPERVISOR_LOCK_DIR");
+}
+
+fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture) {
+    let credential = |name: &str| format!("deployment-test-{name}-{}", Uuid::now_v7());
+    command
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("SUMI_CONFIG_FILE", "/dev/null")
+        .env("SUMI_COMPOSE_TIMEOUT", "10")
+        .env("SUMI_PERSONALITY_AGENT_ID", &fixture.paid)
+        .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/deployment-test")
+        .env("SUMI_LOCAL_CONTROL_BEARER", credential("local-control"))
+        .env("SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX", "1900000000")
+        .env("SUMI_AGENT_WRAPPING_KEY", credential("wrapping"))
+        .env("SUMI_AGENT_WRAPPING_KEY_ID", "deployment-test/wrapping")
+        .env("SUMI_APPROVAL_SECRET_DIGEST_KEY", credential("approval"))
+        .env("SUMI_PROVIDER_API_KEY", credential("provider"))
+        .env(
+            "SUMI_LOCAL_CONTROL_SERVER_UID",
+            unsafe { libc::geteuid() }.to_string(),
+        )
+        .env(
+            "SUMI_LOCAL_CONTROL_SOCKET_GID",
+            fixture.control_gid.to_string(),
+        )
+        // Direct `docker compose down` parses the full descriptor too, so it
+        // must receive this fixture-owned bind source even though it will not
+        // start the runtime service.
+        .env(
+            "SUMI_LOCAL_CONTROL_HOST_DIR",
+            fixture.control_socket.parent().unwrap(),
+        );
+    preserve_docker_transport(command);
+}
+
+fn cleanup_owned_compose_resources(fixture: &HostTrustFixture) -> Result<(), String> {
+    // `stop` intentionally keeps project resources for operator status and
+    // cleanup. This test owns only its UUID-derived project, so direct Compose
+    // cleanup is exact-scoped and must be evidenced even after a test panic.
+    let mut cleanup = Command::new("timeout");
+    cleanup
+        .args(["--preserve-status", "60s", "docker", "compose"])
+        .args(["--project-name", &fixture.project, "--file"])
+        .arg(deploy_dir().join("compose.yaml"))
+        .args([
+            "down",
+            "--remove-orphans",
+            "--volumes",
+            "--rmi",
+            "local",
+            "--timeout",
+            "10",
+        ]);
+    launch_owned_acceptance_env(&mut cleanup, fixture);
+
+    let mut errors = Vec::new();
+    match cleanup.output() {
+        Err(error) => errors.push(format!(
+            "cannot run owned Compose resource cleanup: {error}"
+        )),
+        Ok(cleanup) if !cleanup.status.success() => errors.push(format!(
+            "owned Compose resource cleanup failed: {}",
+            String::from_utf8_lossy(&cleanup.stderr)
+        )),
+        Ok(_) => {}
+    }
+
+    let project_label = format!("label=com.docker.compose.project={}", fixture.project);
+    for (kind, args) in [
+        (
+            "containers",
+            vec![
+                "ps".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "networks",
+            vec![
+                "network".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "volumes",
+            vec![
+                "volume".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                project_label.clone(),
+            ],
+        ),
+        (
+            "local images",
+            vec![
+                "image".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("reference={}-*", fixture.project),
+            ],
+        ),
+    ] {
+        let leftovers =
+            try_bounded_docker_output(deploy_dir().parent().unwrap().parent().unwrap(), 20, &args);
+        match leftovers {
+            Err(error) => errors.push(format!("cannot inspect owned Compose {kind}: {error}")),
+            Ok(leftovers) if !leftovers.status.success() => errors.push(format!(
+                "cannot inspect owned Compose {kind}: {}",
+                String::from_utf8_lossy(&leftovers.stderr)
+            )),
+            Ok(leftovers) if !leftovers.stdout.is_empty() => errors.push(format!(
+                "owned Compose {kind} survived cleanup: {}",
+                String::from_utf8_lossy(&leftovers.stdout)
+            )),
+            Ok(_) => {}
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 fn wait_for_child_exit(
@@ -297,6 +481,331 @@ fn wait_for_child_exit(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn try_bounded_docker_output(
+    workdir: &std::path::Path,
+    seconds: u64,
+    args: &[String],
+) -> Result<Output, String> {
+    let mut command = Command::new("timeout");
+    command
+        .arg("--preserve-status")
+        .arg(format!("{seconds}s"))
+        .arg("docker")
+        .args(args)
+        .current_dir(workdir)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
+    preserve_docker_transport(&mut command);
+    command
+        .output()
+        .map_err(|error| format!("run bounded Docker command: {error}"))
+}
+
+fn bounded_docker_output(workdir: &std::path::Path, seconds: u64, args: &[String]) -> Output {
+    try_bounded_docker_output(workdir, seconds, args).expect("run bounded Docker command")
+}
+
+fn preserve_docker_transport(command: &mut Command) {
+    for key in [
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "HOME",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+fn timeout_available() -> bool {
+    Command::new("timeout")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn finish_opt_in_docker_test(body: std::thread::Result<()>, cleanup: Result<(), String>) {
+    match (body, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Ok(()), Err(cleanup)) => panic!("owned Docker cleanup evidence failed: {cleanup}"),
+        (Err(payload), Ok(())) => resume_unwind(payload),
+        (Err(payload), Err(cleanup)) => {
+            let original = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            panic!(
+                "test body failed before cleanup: {original}\nowned Docker cleanup evidence also failed: {cleanup}"
+            );
+        }
+    }
+}
+
+struct OwnedExecutorDockerSmoke {
+    root: PathBuf,
+    image: String,
+    container: String,
+}
+
+impl OwnedExecutorDockerSmoke {
+    fn new() -> Self {
+        let unique = Uuid::now_v7().simple().to_string();
+        let root = std::env::temp_dir().join(format!("sumi-executor-smoke-{unique}"));
+        let image = format!("sumi-executor-smoke-{unique}:latest");
+        let container = format!("sumi-executor-smoke-{unique}");
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        std::fs::create_dir_all(root.join("identity")).unwrap();
+        std::fs::create_dir_all(root.join("executor")).unwrap();
+        Self {
+            root,
+            image,
+            container,
+        }
+    }
+
+    fn docker(&self, seconds: u64, args: Vec<String>) -> Output {
+        bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            seconds,
+            &args,
+        )
+    }
+
+    fn try_docker(&self, seconds: u64, args: Vec<String>) -> Result<Output, String> {
+        try_bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            seconds,
+            &args,
+        )
+    }
+
+    fn cleanup(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let containers = self.try_docker(
+            20,
+            vec![
+                "container".into(),
+                "ls".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("name=^/{}$", self.container),
+            ],
+        );
+        match containers {
+            Err(error) => errors.push(format!(
+                "cannot list exact owned container {}: {error}",
+                self.container
+            )),
+            Ok(containers) if !containers.status.success() => errors.push(format!(
+                "cannot list exact owned container {}: {}",
+                self.container,
+                String::from_utf8_lossy(&containers.stderr)
+            )),
+            Ok(containers) if !containers.stdout.is_empty() => {
+                let remove = self.try_docker(
+                    20,
+                    vec![
+                        "container".into(),
+                        "rm".into(),
+                        "--force".into(),
+                        self.container.clone(),
+                    ],
+                );
+                match remove {
+                    Err(error) => errors.push(format!(
+                        "cannot remove exact owned container {}: {error}",
+                        self.container
+                    )),
+                    Ok(remove) if !remove.status.success() => errors.push(format!(
+                        "cannot remove exact owned container {}: {}",
+                        self.container,
+                        String::from_utf8_lossy(&remove.stderr)
+                    )),
+                    Ok(_) => {}
+                }
+            }
+            Ok(_) => {}
+        }
+
+        if self.root.exists() {
+            // Container setup deliberately gives the fixture to the executor
+            // uid. Reclaim only this UUID-owned mount before local removal.
+            let reclaim = self.try_docker(
+                20,
+                vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--network".into(),
+                    "none".into(),
+                    "-v".into(),
+                    format!("{}:/fixture", self.root.display()),
+                    "debian:bookworm-slim".into(),
+                    "sh".into(),
+                    "-ec".into(),
+                    format!(
+                        "chown -R {}:{} /fixture",
+                        unsafe { libc::geteuid() },
+                        unsafe { libc::getegid() }
+                    ),
+                ],
+            );
+            match reclaim {
+                Err(error) => errors.push(format!(
+                    "cannot reclaim exact owned fixture {}: {error}",
+                    self.root.display()
+                )),
+                Ok(reclaim) if !reclaim.status.success() => errors.push(format!(
+                    "cannot reclaim exact owned fixture {}: {}",
+                    self.root.display(),
+                    String::from_utf8_lossy(&reclaim.stderr)
+                )),
+                Ok(_) => {}
+            }
+            make_tree_removable(&self.root);
+            if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                errors.push(format!(
+                    "cannot remove exact owned fixture {}: {error}",
+                    self.root.display()
+                ));
+            }
+        }
+
+        let images = self.try_docker(
+            20,
+            vec![
+                "image".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("reference={}", self.image),
+            ],
+        );
+        match images {
+            Err(error) => errors.push(format!(
+                "cannot list exact owned image {}: {error}",
+                self.image
+            )),
+            Ok(images) if !images.status.success() => errors.push(format!(
+                "cannot list exact owned image {}: {}",
+                self.image,
+                String::from_utf8_lossy(&images.stderr)
+            )),
+            Ok(images) if !images.stdout.is_empty() => {
+                let remove =
+                    self.try_docker(20, vec!["image".into(), "rm".into(), self.image.clone()]);
+                match remove {
+                    Err(error) => errors.push(format!(
+                        "cannot remove exact owned image {}: {error}",
+                        self.image
+                    )),
+                    Ok(remove) if !remove.status.success() => errors.push(format!(
+                        "cannot remove exact owned image {}: {}",
+                        self.image,
+                        String::from_utf8_lossy(&remove.stderr)
+                    )),
+                    Ok(_) => {}
+                }
+            }
+            Ok(_) => {}
+        }
+
+        let container_left = self.try_docker(
+            20,
+            vec![
+                "container".into(),
+                "ls".into(),
+                "--all".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("name=^/{}$", self.container),
+            ],
+        );
+        match container_left {
+            Err(error) => errors.push(format!(
+                "cannot inspect exact owned container postcondition: {error}"
+            )),
+            Ok(container_left)
+                if !container_left.status.success() || !container_left.stdout.is_empty() =>
+            {
+                errors.push(format!(
+                    "exact owned container survived cleanup: stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&container_left.stdout),
+                    String::from_utf8_lossy(&container_left.stderr)
+                ));
+            }
+            Ok(_) => {}
+        }
+        let image_left = self.try_docker(
+            20,
+            vec![
+                "image".into(),
+                "ls".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("reference={}", self.image),
+            ],
+        );
+        match image_left {
+            Err(error) => errors.push(format!(
+                "cannot inspect exact owned image postcondition: {error}"
+            )),
+            Ok(image_left) if !image_left.status.success() || !image_left.stdout.is_empty() => {
+                errors.push(format!(
+                    "exact owned image survived cleanup: stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&image_left.stdout),
+                    String::from_utf8_lossy(&image_left.stderr)
+                ));
+            }
+            Ok(_) => {}
+        }
+        if self.root.exists() {
+            errors.push(format!(
+                "exact owned fixture root survived cleanup: {}",
+                self.root.display()
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+}
+
+impl Drop for OwnedExecutorDockerSmoke {
+    fn drop(&mut self) {
+        // The test itself calls this fallibly and asserts its postconditions.
+        // Drop is only an emergency best-effort fallback for abrupt unwinding.
+        let _ = self.cleanup();
+    }
+}
+
+fn exchange_executor_socket(socket: &std::path::Path, request: JsonValue) -> JsonValue {
+    let mut stream = UnixStream::connect(socket).expect("connect owned executor socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = serde_json::to_vec(&request).unwrap();
+    request.push(b'\n');
+    stream.write_all(&request).expect("write executor request");
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read executor response");
+    serde_json::from_str(response.trim()).expect("decode executor response")
 }
 
 #[test]
@@ -733,12 +1242,7 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     );
     assert_eq!(
         volume_sources(executor),
-        string_set(&[
-            "broker-ipc",
-            "executor-identity",
-            "executor-ipc",
-            "workspace",
-        ])
+        string_set(&["executor-identity", "executor-ipc", "workspace",])
     );
     assert_eq!(
         volume_sources(broker),
@@ -746,13 +1250,14 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     );
     assert_has_mount(runtime, "executor-ipc:/run/sumi/executor:ro");
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
-    assert_has_mount(executor, "broker-ipc:/run/sumi/broker:ro");
+    assert_has_mount(executor, "workspace:/workspace:ro");
     assert_has_mount(broker, "broker-ipc:/run/sumi/broker");
     assert!(!volume_sources(runtime).contains("broker-ipc"));
     assert!(!volume_sources(runtime).contains("workspace"));
     assert!(!volume_sources(runtime).contains("artifacts"));
     assert!(!volume_sources(executor).contains("artifacts"));
     assert!(!volume_sources(executor).contains("state"));
+    assert!(!volume_sources(executor).contains("broker-ipc"));
     assert!(!volume_sources(broker).contains("workspace"));
     assert!(!volume_sources(broker).contains("state"));
 
@@ -825,6 +1330,69 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
 }
 
 #[test]
+fn executor_deployment_is_broker_blind_and_read_only() {
+    let compose = compose();
+    let executor = service(&compose, "executor");
+    let defaults = &compose["x-long-lived-hardening"];
+
+    assert_eq!(executor["user"].as_str(), Some("10002:10002"));
+    assert_eq!(executor["network_mode"].as_str(), Some("none"));
+    assert_has_mount(executor, "workspace:/workspace:ro");
+    assert_has_mount(executor, "executor-identity:/run/sumi/identity:ro");
+    assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
+    assert!(!volume_sources(executor).contains("broker-ipc"));
+    assert!(!volume_sources(executor).contains("artifacts"));
+
+    let depends_on = executor["depends_on"].as_mapping().unwrap();
+    assert!(depends_on.contains_key("allocator"));
+    assert!(depends_on.contains_key("prepare"));
+    assert!(
+        !depends_on.contains_key("broker"),
+        "the read-only executor must not receive a broker startup dependency"
+    );
+    assert!(executor.get("group_add").is_none());
+    assert!(executor.get("cap_add").is_none());
+    assert!(executor.get("security_opt").is_none());
+    assert!(executor.get("privileged").is_none());
+    assert_eq!(
+        defaults["cap_drop"],
+        Value::Sequence(vec![Value::String("ALL".to_owned())])
+    );
+    assert_eq!(
+        defaults["security_opt"],
+        Value::Sequence(vec![
+            Value::String("no-new-privileges:true".to_owned()),
+            Value::String("seccomp:./seccomp/sidecar.json".to_owned()),
+            Value::String("apparmor:docker-default".to_owned()),
+        ])
+    );
+
+    let entrypoint = read_deploy("container-entrypoint");
+    let executor_branch = entrypoint
+        .split("  executor)")
+        .nth(1)
+        .and_then(|branch| branch.split("\n\n  broker)").next())
+        .expect("executor entrypoint branch");
+    assert!(executor_branch.contains("load_identity executor \"${IDENTITY_FILE}\""));
+    for retained in [
+        "SUMI_PERSONALITY_AGENT_ID=\"${SUMI_PERSONALITY_AGENT_ID}\"",
+        "SUMI_RPC_GENERATION=\"${SUMI_RPC_GENERATION}\"",
+        "SUMI_RPC_NONCE=\"${SUMI_RPC_NONCE}\"",
+        "SUMI_WORKSPACE=/workspace",
+        "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock",
+        "/usr/local/bin/sumi-agent --tool-executor-socket",
+    ] {
+        assert!(
+            executor_branch.contains(retained),
+            "executor lost {retained}"
+        );
+    }
+    assert!(!executor_branch.contains("SUMI_ARTIFACT_BROKER_SOCKET"));
+    assert!(!executor_branch.contains("--artifact-broker"));
+    assert!(!executor_branch.contains("--tool-executor\n"));
+}
+
+#[test]
 fn every_long_lived_role_is_non_root_read_only_and_restricted() {
     let compose = compose();
     let defaults = &compose["x-long-lived-hardening"];
@@ -870,7 +1438,7 @@ fn every_long_lived_role_is_non_root_read_only_and_restricted() {
     assert!(seccomp.is_object());
     let syscalls = seccomp["syscalls"].as_array().unwrap();
     let ordinary = syscalls[0]["names"].as_array().unwrap();
-    for syscall in ["openat2", "close_range", "prctl"] {
+    for syscall in ["openat2", "close_range", "prctl", "rt_sigtimedwait"] {
         assert!(ordinary.iter().any(|name| name.as_str() == Some(syscall)));
     }
     for dormant in ["mount", "umount2", "unshare"] {
@@ -902,6 +1470,363 @@ fn every_long_lived_role_is_non_root_read_only_and_restricted() {
         "executor should inherit docker-default AppArmor until masking is executable"
     );
     assert!(!deploy_dir().join("apparmor/executor").exists());
+}
+
+#[test]
+fn exact_image_executor_smoke_is_opt_in_and_owns_every_docker_artifact() {
+    if std::env::var_os("SUMI_EXECUTOR_DOCKER_SMOKE").is_none() {
+        eprintln!(
+            "NOT_RUN: set SUMI_EXECUTOR_DOCKER_SMOKE=1 to build and exercise the exact \
+             read-only executor image without providers"
+        );
+        return;
+    }
+    if !timeout_available() {
+        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound exact executor smoke");
+        return;
+    }
+    if !bounded_docker_output(
+        deploy_dir().parent().unwrap().parent().unwrap(),
+        10,
+        &["info".into()],
+    )
+    .status
+    .success()
+    {
+        eprintln!("HOST_UNAVAILABLE: Docker daemon cannot run exact executor smoke");
+        return;
+    }
+    let _guard = HOST_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let smoke = OwnedExecutorDockerSmoke::new();
+    let body = catch_unwind(AssertUnwindSafe(|| {
+        let paid = Uuid::now_v7().to_string();
+        let nonce = format!("executor-smoke-{}", Uuid::now_v7());
+
+        let build = smoke.docker(
+            600,
+            vec![
+                "build".into(),
+                "--tag".into(),
+                smoke.image.clone(),
+                "--file".into(),
+                deploy_dir().join("Dockerfile").display().to_string(),
+                ".".into(),
+            ],
+        );
+        assert!(
+            build.status.success(),
+            "exact executor image build failed or exceeded its bound: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        std::fs::write(
+            smoke.root.join("identity/identity.env"),
+            format!(
+                "SUMI_PERSONALITY_AGENT_ID={paid}\nSUMI_RPC_GENERATION=1\nSUMI_RPC_NONCE={nonce}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(smoke.root.join("workspace/note.txt"), "read-file-content\n").unwrap();
+        let fixture_path = format!("{}:/fixture", smoke.root.display());
+        let setup = smoke.docker(
+        30,
+        vec![
+            "run".into(),
+            "--rm".into(),
+            "--network".into(),
+            "none".into(),
+            "--entrypoint".into(),
+            "/bin/sh".into(),
+            "--user".into(),
+            "0:0".into(),
+            "-v".into(),
+            fixture_path.clone(),
+            smoke.image.clone(),
+            "-ec".into(),
+            "chown 10002:10002 /fixture/workspace /fixture/workspace/note.txt /fixture/identity /fixture/identity/identity.env; chmod 0700 /fixture/workspace; chmod 0600 /fixture/workspace/note.txt; chmod 0550 /fixture/identity; chmod 0440 /fixture/identity/identity.env; chown 10002:10020 /fixture/executor; chmod 2710 /fixture/executor".into(),
+        ],
+    );
+        assert!(
+            setup.status.success(),
+            "owned executor fixture setup failed: {}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+
+        let seccomp = format!(
+            "seccomp={}",
+            deploy_dir().join("seccomp/sidecar.json").display()
+        );
+        let start = smoke.docker(
+            30,
+            vec![
+                "run".into(),
+                "--detach".into(),
+                "--name".into(),
+                smoke.container.clone(),
+                "--init".into(),
+                "--network".into(),
+                "none".into(),
+                "--read-only".into(),
+                "--cap-drop".into(),
+                "ALL".into(),
+                "--security-opt".into(),
+                "no-new-privileges:true".into(),
+                "--security-opt".into(),
+                seccomp,
+                "--tmpfs".into(),
+                "/tmp:rw,noexec,nosuid,nodev,size=32m".into(),
+                "--user".into(),
+                "10002:10002".into(),
+                "-v".into(),
+                format!("{}:/workspace:ro", smoke.root.join("workspace").display()),
+                "-v".into(),
+                format!(
+                    "{}:/run/sumi/identity:ro",
+                    smoke.root.join("identity").display()
+                ),
+                "-v".into(),
+                format!(
+                    "{}:/run/sumi/executor",
+                    smoke.root.join("executor").display()
+                ),
+                smoke.image.clone(),
+                "executor".into(),
+            ],
+        );
+        assert!(
+            start.status.success(),
+            "exact executor container failed to start: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        let socket = smoke.root.join("executor/executor.sock");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut socket_ready = false;
+        while Instant::now() < deadline {
+            let ready = smoke.docker(
+                10,
+                vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--network".into(),
+                    "none".into(),
+                    "--entrypoint".into(),
+                    "/bin/sh".into(),
+                    "--user".into(),
+                    "0:0".into(),
+                    "-v".into(),
+                    fixture_path.clone(),
+                    smoke.image.clone(),
+                    "-ec".into(),
+                    "test -S /fixture/executor/executor.sock".into(),
+                ],
+            );
+            if ready.status.success() {
+                socket_ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !socket_ready {
+            let logs = smoke.docker(10, vec!["logs".into(), smoke.container.clone()]);
+            panic!(
+                "executor socket did not become ready in 10s; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&logs.stdout),
+                String::from_utf8_lossy(&logs.stderr),
+            );
+        }
+
+        // The service socket is intentionally runtime-group-only. This fixture is
+        // UUID-owned, so changing just its socket directory to the test gid grants
+        // the host test client traversal without weakening the deployed Compose
+        // contract asserted above.
+        let host_gid = unsafe { libc::getegid() };
+        let client_access = smoke.docker(
+        30,
+        vec![
+            "run".into(),
+            "--rm".into(),
+            "--network".into(),
+            "none".into(),
+            "--entrypoint".into(),
+            "/bin/sh".into(),
+            "--user".into(),
+            "0:0".into(),
+            "-v".into(),
+            fixture_path.clone(),
+            smoke.image.clone(),
+            "-ec".into(),
+            format!(
+                "chgrp {host_gid} /fixture/executor /fixture/executor/executor.sock; chmod 0710 /fixture/executor; chmod 0660 /fixture/executor/executor.sock"
+            ),
+        ],
+    );
+        assert!(client_access.status.success());
+
+        let inspect = smoke.docker(30, vec!["inspect".into(), smoke.container.clone()]);
+        assert!(inspect.status.success());
+        let inspect: JsonValue = serde_json::from_slice(&inspect.stdout).unwrap();
+        let container = &inspect[0];
+        assert_eq!(
+            container["State"]["Running"].as_bool(),
+            Some(true),
+            "executor container stopped before the read-only mount probe: {container}"
+        );
+        let environment = container["Config"]["Env"].as_array().unwrap();
+        assert!(environment.iter().all(|entry| {
+            !entry
+                .as_str()
+                .is_some_and(|entry| entry.starts_with("SUMI_ARTIFACT_BROKER_SOCKET="))
+        }));
+        let mounts = container["Mounts"].as_array().unwrap();
+        assert!(mounts.iter().any(|mount| {
+            mount["Destination"].as_str() == Some("/workspace")
+                && mount["RW"].as_bool() == Some(false)
+        }));
+        assert!(mounts.iter().all(|mount| {
+            mount["Destination"].as_str() != Some("/run/sumi/broker")
+                && mount["Destination"].as_str() != Some("/var/lib/sumi-artifacts")
+        }));
+
+        let health = exchange_executor_socket(
+            &socket,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "health",
+                "operation": {"type": "health", "service_role": "tool_executor"},
+            }),
+        );
+        assert_eq!(health["personality_agent_id"].as_str(), Some(paid.as_str()));
+        assert_eq!(health["generation"].as_u64(), Some(1));
+        assert_eq!(health["nonce"].as_str(), Some(nonce.as_str()));
+        assert_eq!(health["result"]["Ok"]["type"].as_str(), Some("healthy"));
+        assert_eq!(
+            health["result"]["Ok"]["service_role"].as_str(),
+            Some("tool_executor")
+        );
+        let read_file = exchange_executor_socket(
+            &socket,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "read",
+                "operation": {
+                    "type": "read_file", "path": "note.txt", "offset": 0,
+                    "limit": 1024, "execution_id": "read"
+                },
+            }),
+        );
+        assert_eq!(
+            read_file["result"]["Ok"]["result"]["content"].as_str(),
+            Some("read-file-content\n"),
+            "unexpected read_file response: {read_file}"
+        );
+
+        let before_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
+        assert!(before_write.status.success());
+        let before_write: JsonValue = serde_json::from_slice(&before_write.stdout).unwrap();
+        assert_eq!(
+            before_write[0]["State"]["Running"].as_bool(),
+            Some(true),
+            "executor container stopped before write denial probe: {}",
+            before_write[0]
+        );
+        let write = smoke.docker(
+            10,
+            vec![
+                "exec".into(),
+                "--user".into(),
+                "10002:10002".into(),
+                "--env".into(),
+                "LC_ALL=C".into(),
+                smoke.container.clone(),
+                "/usr/bin/touch".into(),
+                "/workspace/must-not-write".into(),
+            ],
+        );
+        let write_output = format!(
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&write.stdout),
+            String::from_utf8_lossy(&write.stderr)
+        );
+        assert!(
+            !write.status.success(),
+            "executor container wrote through its read-only workspace mount: {write_output}"
+        );
+        assert!(
+            write_output.contains("Read-only file system"),
+            "write denial was not the expected read-only-filesystem failure: {write_output}"
+        );
+        let after_write = smoke.docker(10, vec!["inspect".into(), smoke.container.clone()]);
+        assert!(after_write.status.success());
+        let after_write: JsonValue = serde_json::from_slice(&after_write.stdout).unwrap();
+        assert_eq!(
+            after_write[0]["State"]["Running"].as_bool(),
+            Some(true),
+            "executor container stopped during write denial probe: {}",
+            after_write[0]
+        );
+        let host_write_check = smoke.docker(
+            30,
+            vec![
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "none".into(),
+                "--entrypoint".into(),
+                "/bin/sh".into(),
+                "--user".into(),
+                "0:0".into(),
+                "-v".into(),
+                fixture_path,
+                smoke.image.clone(),
+                "-ec".into(),
+                "test ! -e /fixture/workspace/must-not-write".into(),
+            ],
+        );
+        assert!(host_write_check.status.success());
+
+        let health_after = exchange_executor_socket(
+            &socket,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "health-after-write-denial",
+                "operation": {"type": "health", "service_role": "tool_executor"},
+            }),
+        );
+        assert_eq!(
+            health_after["result"]["Ok"]["type"].as_str(),
+            Some("healthy"),
+            "executor Health failed after write denial: {health_after}"
+        );
+        let read_after = exchange_executor_socket(
+            &socket,
+            serde_json::json!({
+                "personality_agent_id": paid,
+                "generation": 1,
+                "nonce": nonce,
+                "request_id": "read-after-write-denial",
+                "operation": {
+                    "type": "read_file", "path": "note.txt", "offset": 0,
+                    "limit": 1024, "execution_id": "read-after-write-denial"
+                },
+            }),
+        );
+        assert_eq!(
+            read_after["result"]["Ok"]["result"]["content"].as_str(),
+            Some("read-file-content\n"),
+            "executor read_file failed after write denial: {read_after}"
+        );
+    }));
+    let cleanup = smoke.cleanup();
+    finish_opt_in_docker_test(body, cleanup);
 }
 
 #[test]
@@ -1793,6 +2718,12 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
     for directory in ["state", "workspace", "artifacts", "executor", "broker"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
+    // The worktree may be mode 0700, which makes a direct bind of this script
+    // non-executable to the non-root container user before the script itself
+    // runs. Exercise the exact artifact through an owned, traversable copy.
+    let entrypoint = root.join("sumi-entrypoint");
+    std::fs::copy(deploy_dir().join("container-entrypoint"), &entrypoint).unwrap();
+    std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.join("executor/executor.sock"), b"stale").unwrap();
     std::fs::write(root.join("broker/broker.sock"), b"stale").unwrap();
 
@@ -1818,10 +2749,7 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
         String::from_utf8_lossy(&setup.stderr)
     );
 
-    let script_mount = format!(
-        "{}:/usr/local/bin/sumi-entrypoint:ro",
-        deploy_dir().join("container-entrypoint").display()
-    );
+    let script_mount = format!("{}:/usr/local/bin/sumi-entrypoint:ro", entrypoint.display());
     let seccomp = format!(
         "seccomp={}",
         deploy_dir().join("seccomp/sidecar.json").display()
@@ -2014,32 +2942,26 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
 
 #[test]
 fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
-    let output = Command::new("docker")
-        .args(["info", "--format", "{{json .SecurityOptions}}"])
-        .output();
-    let security_options = match output {
-        Ok(output) if output.status.success() => String::from_utf8(output.stdout).unwrap(),
-        Ok(output) => {
-            eprintln!(
-                "HOST_UNAVAILABLE: docker daemon cannot be used: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        Err(error) => {
-            eprintln!("HOST_UNAVAILABLE: docker info could not run: {error}");
-            return;
-        }
-    };
-    if !security_options.contains("apparmor") {
+    if !timeout_available() {
+        eprintln!("HOST_UNAVAILABLE: GNU timeout is required to bound Docker acceptance");
+        return;
+    }
+    let output = bounded_docker_output(
+        deploy_dir().parent().unwrap().parent().unwrap(),
+        10,
+        &[
+            "info".into(),
+            "--format".into(),
+            "{{json .SecurityOptions}}".into(),
+        ],
+    );
+    if !output.status.success() {
         eprintln!(
-            "HOST_UNAVAILABLE: Docker is running without AppArmor; structural and supervisor \
-             lifecycle tests ran, but container mount/network/UID behavior remains an explicit \
-             Docker/AppArmor host gate"
+            "HOST_UNAVAILABLE: docker daemon cannot be used: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
         return;
     }
-
     if std::env::var_os("SUMI_DEPLOYMENT_DOCKER_ACCEPTANCE").is_none() {
         eprintln!(
             "NOT_RUN: set SUMI_DEPLOYMENT_DOCKER_ACCEPTANCE=1 on the Docker/AppArmor host; \
@@ -2048,27 +2970,66 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
         return;
     }
 
-    let output = Command::new(deploy_dir().join("supervisor"))
-        .arg("up")
-        .output()
-        .expect("run real Docker/AppArmor deployment acceptance");
-    // Always issue the independent lifecycle teardown before asserting the
-    // launch result. The supervisor's own EXIT/ERR/signal trap handles partial
-    // creation; this final stop also covers a successful launch.
-    let stop = Command::new(deploy_dir().join("supervisor"))
-        .arg("stop")
-        .output()
-        .expect("stop real Docker/AppArmor deployment acceptance");
-    assert!(
-        stop.status.success(),
-        "real deployment cleanup failed: {}",
-        String::from_utf8_lossy(&stop.stderr)
-    );
-    assert!(
-        output.status.success(),
-        "real deployment failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let security_options = String::from_utf8(output.stdout).unwrap();
+    let Some(mut fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let body = catch_unwind(AssertUnwindSafe(|| {
+        if !security_options.contains("apparmor") {
+            eprintln!(
+                "HOST_UNAVAILABLE: Docker is running without AppArmor; direct UUID-scoped \
+                 Compose cleanup was exercised, but container mount/network/UID behavior remains \
+                 an explicit Docker/AppArmor host gate"
+            );
+            return;
+        }
+
+        let expected_project = format!("sumi-{}", fixture.paid.replace('-', ""));
+        assert_eq!(fixture.project, expected_project);
+        let supervisor = deploy_dir().join("supervisor");
+        let mut project_name = Command::new("timeout");
+        project_name
+            .args(["--preserve-status", "30s"])
+            .arg(&supervisor)
+            .arg("project-name");
+        launch_owned_acceptance_env(&mut project_name, &fixture);
+        let project_name = project_name.output().expect("derive owned test project");
+        assert!(project_name.status.success());
+        assert_eq!(
+            String::from_utf8(project_name.stdout).unwrap().trim(),
+            fixture.project,
+            "acceptance cleanup is allowed only for the fixture's UUID-derived project"
+        );
+
+        let mut up = Command::new("timeout");
+        up.args(["--preserve-status", "180s"])
+            .arg(&supervisor)
+            .arg("up");
+        launch_owned_acceptance_env(&mut up, &fixture);
+        let output = up.output().expect("run owned Docker/AppArmor acceptance");
+        // Always issue independent lifecycle teardown before asserting launch.
+        // The outer cleanup below remains mandatory on every exit path.
+        let mut stop = Command::new("timeout");
+        stop.args(["--preserve-status", "60s"])
+            .arg(&supervisor)
+            .arg("stop");
+        launch_owned_acceptance_env(&mut stop, &fixture);
+        let stop = stop
+            .output()
+            .expect("stop owned Docker/AppArmor acceptance");
+        assert!(
+            stop.status.success(),
+            "real deployment cleanup failed: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "real deployment failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }));
+    let cleanup = cleanup_owned_compose_resources(&fixture).and_then(|()| fixture.cleanup());
+    finish_opt_in_docker_test(body, cleanup);
 }
 
 #[test]

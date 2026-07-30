@@ -210,7 +210,6 @@ case "${role}" in
       SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
       SUMI_WORKSPACE=/workspace \
       SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
-      SUMI_ARTIFACT_BROKER_SOCKET=/run/sumi/broker/broker.sock \
       /usr/local/bin/sumi-agent --tool-executor-socket
     ;;
 
