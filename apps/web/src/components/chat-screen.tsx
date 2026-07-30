@@ -157,13 +157,6 @@ function ChatScreenContent() {
                                   : undefined
                               }
                               onApprovalDecision={decideApproval}
-                              onCardAction={(label) => {
-                                if (sendMessage(label)) {
-                                  requestAnimationFrame(() =>
-                                    scrollToEnd({ behavior: "smooth" }),
-                                  );
-                                }
-                              }}
                             />
                           </Suspense>
                         </div>

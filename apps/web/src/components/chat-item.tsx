@@ -17,7 +17,6 @@ interface ChatItemViewProps {
   copyAlwaysVisible?: boolean;
   agentMessageCopyText?: string;
   onApprovalDecision?: (requestId: string, decision: ApprovalDecision) => void;
-  onCardAction?: (label: string) => void;
   onWorkSummaryOpen?: () => void;
   onRichContentReady?: (itemId: string) => void;
 }
@@ -28,7 +27,6 @@ export function ChatItemView({
   copyAlwaysVisible = false,
   agentMessageCopyText,
   onApprovalDecision,
-  onCardAction,
   onWorkSummaryOpen,
   onRichContentReady,
 }: ChatItemViewProps) {
@@ -122,12 +120,7 @@ export function ChatItemView({
     case "card":
       return (
         <div className="py-3">
-          <SduiView
-            node={item.node}
-            onAction={
-              onCardAction ? (_action, label) => onCardAction(label) : undefined
-            }
-          />
+          <SduiView node={item.node} />
         </div>
       );
     case "approval":

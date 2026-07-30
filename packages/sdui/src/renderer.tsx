@@ -87,6 +87,7 @@ function CardButton({
       variant={primary ? "default" : "outline"}
       size="sm"
       onClick={() => onAction?.(action, label)}
+      disabled={!onAction}
       className="rounded-full px-3.5"
     >
       {label}
