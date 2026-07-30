@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -205,13 +207,16 @@ func newApplicationFromEnv() (*application, error) {
 const (
 	localControlSocketMode = 0o660
 	localControlParentMode = 0o750
+	localControlLockMode   = 0o600
 	maxUnixSocketPathBytes = 100
+	maxListenerLockBytes   = 4 * 1024
 )
 
 type localControlListenerConfig struct {
-	unixSocket     string
-	socketGID      int
-	loopbackListen string
+	unixSocket         string
+	socketGID          int
+	personalityAgentID string
+	loopbackListen     string
 }
 
 func localControlListenerFromEnv(enabled bool) (*localControlListenerConfig, error) {
@@ -246,7 +251,15 @@ func localControlListenerFromEnv(enabled bool) (*localControlListenerConfig, err
 	if err := validateUnixSocketPath(socketPath); err != nil {
 		return nil, err
 	}
-	return &localControlListenerConfig{unixSocket: socketPath, socketGID: int(gid)}, nil
+	personalityAgentID := os.Getenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")
+	if personalityAgentID == "" || strings.ContainsAny(personalityAgentID, "\r\n") {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID is invalid for listener ownership")
+	}
+	return &localControlListenerConfig{
+		unixSocket:         socketPath,
+		socketGID:          int(gid),
+		personalityAgentID: personalityAgentID,
+	}, nil
 }
 
 func validateLoopbackListen(address string) error {
@@ -294,7 +307,7 @@ func (c *localControlListenerConfig) listen() (net.Listener, error) {
 	if c.loopbackListen != "" {
 		return net.Listen("tcp", c.loopbackListen)
 	}
-	return listenTrustedUnixSocket(c.unixSocket, c.socketGID)
+	return listenTrustedUnixSocket(c.unixSocket, c.socketGID, c.personalityAgentID)
 }
 
 func (c *localControlListenerConfig) handler(next http.Handler) http.Handler {
@@ -308,9 +321,50 @@ func (c *localControlListenerConfig) handler(next http.Handler) http.Handler {
 	})
 }
 
-func listenTrustedUnixSocket(path string, gid int) (*net.UnixListener, error) {
+type listenerOwnershipLock struct {
+	parentPath string
+	parent     *os.File
+	parentStat syscall.Stat_t
+	lockPath   string
+	lock       *os.File
+	lockStat   syscall.Stat_t
+	socketPath string
+	socketGID  int
+}
+
+type ownedUnixListener struct {
+	listener   *net.UnixListener
+	ownership  *listenerOwnershipLock
+	socketDev  uint64
+	socketIno  uint64
+	closeOnce  sync.Once
+	closeError error
+}
+
+func (l *ownedUnixListener) Accept() (net.Conn, error) {
+	return l.listener.Accept()
+}
+
+func (l *ownedUnixListener) Addr() net.Addr {
+	return l.listener.Addr()
+}
+
+func (l *ownedUnixListener) Close() error {
+	l.closeOnce.Do(func() {
+		listenerErr := l.listener.Close()
+		unlinkErr := l.ownership.unlinkOwnedSocket(l.socketDev, l.socketIno, true)
+		releaseErr := l.ownership.release()
+		l.closeError = errors.Join(listenerErr, unlinkErr, releaseErr)
+	})
+	return l.closeError
+}
+
+func listenTrustedUnixSocket(path string, gid int, personalityAgentID string) (*ownedUnixListener, error) {
 	if err := validateUnixSocketPath(path); err != nil {
 		return nil, err
+	}
+	if personalityAgentID == "" || strings.ContainsAny(personalityAgentID, "\r\n") {
+		return nil, errors.New("local control listener ownership requires one valid personality agent ID")
 	}
 	parent := filepath.Dir(path)
 	parentInfo, err := os.Lstat(parent)
@@ -338,6 +392,22 @@ func listenTrustedUnixSocket(path string, gid int) (*net.UnixListener, error) {
 		return nil, fmt.Errorf("local control socket parent mode must be %04o", localControlParentMode)
 	}
 
+	ownership, err := acquireListenerOwnership(
+		parent,
+		parentInfo,
+		path,
+		gid,
+		personalityAgentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	releaseOwnership := true
+	defer func() {
+		if releaseOwnership {
+			_ = ownership.release()
+		}
+	}()
 	if err := removeTrustedStaleSocket(path, gid); err != nil {
 		return nil, err
 	}
@@ -347,9 +417,32 @@ func listenTrustedUnixSocket(path string, gid int) (*net.UnixListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	listener.SetUnlinkOnClose(true)
-	fail := func(cause error) (*net.UnixListener, error) {
+	listener.SetUnlinkOnClose(false)
+	socketInfo, err := os.Lstat(path)
+	if err != nil {
 		_ = listener.Close()
+		return nil, fmt.Errorf("inspect newly bound local control socket: %w", err)
+	}
+	socketStat, ok := socketInfo.Sys().(*syscall.Stat_t)
+	if !ok || socketInfo.Mode()&os.ModeSocket == 0 {
+		_ = listener.Close()
+		return nil, errors.New("newly bound local control socket metadata is unavailable")
+	}
+	owned := &ownedUnixListener{
+		listener:  listener,
+		ownership: ownership,
+		socketDev: socketStat.Dev,
+		socketIno: socketStat.Ino,
+	}
+	fail := func(cause error) (*ownedUnixListener, error) {
+		listenerErr := listener.Close()
+		unlinkErr := ownership.unlinkOwnedSocket(socketStat.Dev, socketStat.Ino, false)
+		releaseErr := ownership.release()
+		releaseOwnership = false
+		cleanupErr := errors.Join(listenerErr, unlinkErr, releaseErr)
+		if cleanupErr != nil {
+			return nil, errors.Join(cause, fmt.Errorf("clean up failed local control listener: %w", cleanupErr))
+		}
 		return nil, cause
 	}
 	if err := os.Chown(path, os.Geteuid(), gid); err != nil {
@@ -361,7 +454,236 @@ func listenTrustedUnixSocket(path string, gid int) (*net.UnixListener, error) {
 	if err := validateSocketMetadata(path, gid); err != nil {
 		return fail(err)
 	}
-	return listener, nil
+	finalInfo, err := os.Lstat(path)
+	if err != nil {
+		return fail(fmt.Errorf("reinspect configured local control socket: %w", err))
+	}
+	finalStat, ok := finalInfo.Sys().(*syscall.Stat_t)
+	if !ok || finalStat.Dev != socketStat.Dev || finalStat.Ino != socketStat.Ino {
+		return fail(errors.New("local control socket changed during listener setup"))
+	}
+	releaseOwnership = false
+	return owned, nil
+}
+
+func acquireListenerOwnership(
+	parentPath string,
+	parentInfo os.FileInfo,
+	socketPath string,
+	gid int,
+	personalityAgentID string,
+) (*listenerOwnershipLock, error) {
+	parentFD, err := syscall.Open(
+		parentPath,
+		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pin local control socket parent: %w", err)
+	}
+	parent := os.NewFile(uintptr(parentFD), parentPath)
+	failParent := func(cause error) (*listenerOwnershipLock, error) {
+		_ = parent.Close()
+		return nil, cause
+	}
+	var pinnedParent syscall.Stat_t
+	if err := syscall.Fstat(parentFD, &pinnedParent); err != nil {
+		return failParent(fmt.Errorf("inspect pinned local control socket parent: %w", err))
+	}
+	pathParent, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok ||
+		pinnedParent.Dev != pathParent.Dev ||
+		pinnedParent.Ino != pathParent.Ino ||
+		pinnedParent.Nlink != pathParent.Nlink ||
+		pinnedParent.Nlink == 0 ||
+		int(pinnedParent.Uid) != os.Geteuid() ||
+		int(pinnedParent.Gid) != gid ||
+		os.FileMode(pinnedParent.Mode).Perm() != localControlParentMode ||
+		pinnedParent.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return failParent(errors.New("pinned local control socket parent is not trusted"))
+	}
+
+	lockName := filepath.Base(socketPath) + ".owner.lock"
+	lockPath := filepath.Join(parentPath, lockName)
+	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	lockFD, err := syscall.Openat(parentFD, lockName, flags|syscall.O_CREAT|syscall.O_EXCL, localControlLockMode)
+	created := err == nil
+	if errors.Is(err, syscall.EEXIST) {
+		lockFD, err = syscall.Openat(parentFD, lockName, flags, 0)
+	}
+	if err != nil {
+		return failParent(fmt.Errorf("open local control listener ownership lock: %w", err))
+	}
+	lock := os.NewFile(uintptr(lockFD), lockPath)
+	failLock := func(cause error) (*listenerOwnershipLock, error) {
+		_ = lock.Close()
+		_ = parent.Close()
+		return nil, cause
+	}
+	if created {
+		if err := syscall.Fchown(lockFD, os.Geteuid(), gid); err != nil {
+			return failLock(fmt.Errorf("set local control listener lock owner: %w", err))
+		}
+		if err := syscall.Fchmod(lockFD, localControlLockMode); err != nil {
+			return failLock(fmt.Errorf("set local control listener lock mode: %w", err))
+		}
+	}
+	lockStat, err := validatePinnedLock(lock, lockPath, gid)
+	if err != nil {
+		return failLock(err)
+	}
+	if err := syscall.Flock(lockFD, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return failLock(errors.New("local control listener ownership lock is already held"))
+		}
+		return failLock(fmt.Errorf("acquire local control listener ownership lock: %w", err))
+	}
+	failHeldLock := func(cause error) (*listenerOwnershipLock, error) {
+		_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+		return failLock(cause)
+	}
+	revalidatedLock, err := validatePinnedLock(lock, lockPath, gid)
+	if err != nil {
+		return failHeldLock(err)
+	}
+	if lockStat.Dev != revalidatedLock.Dev || lockStat.Ino != revalidatedLock.Ino {
+		return failHeldLock(errors.New("local control listener ownership lock changed during acquisition"))
+	}
+	binding := fmt.Sprintf(
+		"sumi-local-control-listener-v1\nsocket=%s\npersonality_agent_id=%s\n",
+		socketPath,
+		personalityAgentID,
+	)
+	if len(binding) > maxListenerLockBytes {
+		return failHeldLock(errors.New("local control listener ownership binding is too large"))
+	}
+	if _, err := lock.Seek(0, io.SeekStart); err != nil {
+		return failHeldLock(fmt.Errorf("seek local control listener ownership lock: %w", err))
+	}
+	existing, err := io.ReadAll(io.LimitReader(lock, maxListenerLockBytes+1))
+	if err != nil {
+		return failHeldLock(fmt.Errorf("read local control listener ownership lock: %w", err))
+	}
+	if len(existing) > maxListenerLockBytes {
+		return failHeldLock(errors.New("local control listener ownership lock content is oversized"))
+	}
+	if len(existing) == 0 {
+		if err := lock.Truncate(0); err != nil {
+			return failHeldLock(fmt.Errorf("initialize local control listener ownership lock: %w", err))
+		}
+		if _, err := lock.WriteAt([]byte(binding), 0); err != nil {
+			return failHeldLock(fmt.Errorf("write local control listener ownership lock: %w", err))
+		}
+		if err := lock.Sync(); err != nil {
+			return failHeldLock(fmt.Errorf("sync local control listener ownership lock: %w", err))
+		}
+	} else if string(existing) != binding {
+		return failHeldLock(errors.New("local control listener ownership lock is bound to a different socket or personality agent"))
+	}
+
+	return &listenerOwnershipLock{
+		parentPath: parentPath,
+		parent:     parent,
+		parentStat: pinnedParent,
+		lockPath:   lockPath,
+		lock:       lock,
+		lockStat:   revalidatedLock,
+		socketPath: socketPath,
+		socketGID:  gid,
+	}, nil
+}
+
+func validatePinnedLock(lock *os.File, lockPath string, gid int) (syscall.Stat_t, error) {
+	info, err := lock.Stat()
+	if err != nil {
+		return syscall.Stat_t{}, fmt.Errorf("inspect local control listener ownership lock: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok ||
+		!info.Mode().IsRegular() ||
+		info.Mode().Perm() != localControlLockMode ||
+		stat.Nlink != 1 ||
+		int(stat.Uid) != os.Geteuid() ||
+		int(stat.Gid) != gid {
+		return syscall.Stat_t{}, errors.New("local control listener ownership lock metadata is not trusted")
+	}
+	pathInfo, err := os.Lstat(lockPath)
+	if err != nil {
+		return syscall.Stat_t{}, fmt.Errorf("inspect local control listener ownership lock path: %w", err)
+	}
+	pathStat, ok := pathInfo.Sys().(*syscall.Stat_t)
+	if !ok ||
+		pathInfo.Mode()&os.ModeSymlink != 0 ||
+		pathStat.Dev != stat.Dev ||
+		pathStat.Ino != stat.Ino {
+		return syscall.Stat_t{}, errors.New("local control listener ownership lock path is not pinned")
+	}
+	return *stat, nil
+}
+
+func (o *listenerOwnershipLock) validatePinnedState() error {
+	var parentStat syscall.Stat_t
+	if err := syscall.Fstat(int(o.parent.Fd()), &parentStat); err != nil {
+		return fmt.Errorf("reinspect pinned local control socket parent: %w", err)
+	}
+	if parentStat.Dev != o.parentStat.Dev ||
+		parentStat.Ino != o.parentStat.Ino ||
+		parentStat.Nlink != o.parentStat.Nlink ||
+		parentStat.Nlink == 0 ||
+		int(parentStat.Uid) != os.Geteuid() ||
+		int(parentStat.Gid) != o.socketGID ||
+		os.FileMode(parentStat.Mode).Perm() != localControlParentMode {
+		return errors.New("pinned local control socket parent changed")
+	}
+	parentInfo, err := os.Lstat(o.parentPath)
+	if err != nil {
+		return fmt.Errorf("reinspect local control socket parent path: %w", err)
+	}
+	pathParent, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok || pathParent.Dev != parentStat.Dev || pathParent.Ino != parentStat.Ino {
+		return errors.New("local control socket parent path no longer names the pinned directory")
+	}
+	lockStat, err := validatePinnedLock(o.lock, o.lockPath, o.socketGID)
+	if err != nil {
+		return err
+	}
+	if lockStat.Dev != o.lockStat.Dev || lockStat.Ino != o.lockStat.Ino {
+		return errors.New("local control listener ownership lock inode changed")
+	}
+	return nil
+}
+
+func (o *listenerOwnershipLock) unlinkOwnedSocket(dev, ino uint64, requireTrusted bool) error {
+	if err := o.validatePinnedState(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(o.socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect owned local control socket during close: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Dev != dev || stat.Ino != ino || info.Mode()&os.ModeSocket == 0 {
+		return errors.New("refuse to unlink a local control socket path no longer owned by this listener")
+	}
+	if requireTrusted {
+		if _, err := trustedSocketStat(info, o.socketGID); err != nil {
+			return fmt.Errorf("refuse to unlink changed local control socket: %w", err)
+		}
+	}
+	if err := syscall.Unlinkat(int(o.parent.Fd()), filepath.Base(o.socketPath)); err != nil {
+		return fmt.Errorf("unlink owned local control socket: %w", err)
+	}
+	return nil
+}
+
+func (o *listenerOwnershipLock) release() error {
+	unlockErr := syscall.Flock(int(o.lock.Fd()), syscall.LOCK_UN)
+	lockCloseErr := o.lock.Close()
+	parentCloseErr := o.parent.Close()
+	return errors.Join(unlockErr, lockCloseErr, parentCloseErr)
 }
 
 func removeTrustedStaleSocket(path string, gid int) error {

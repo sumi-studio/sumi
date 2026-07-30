@@ -123,14 +123,48 @@ pub(crate) struct LocalControlHttpClient {
     authority: RuntimeEpochAuthority,
     base_url: reqwest::Url,
     credential: Arc<LocalControlCredential>,
-    http: reqwest::Client,
     transport: LocalControlTransport,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 enum LocalControlTransport {
-    Unix,
-    Loopback,
+    Unix(TrustedUnixEndpoint),
+    Loopback(reqwest::Client),
+}
+
+impl fmt::Debug for LocalControlTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix(_) => formatter.write_str("Unix"),
+            Self::Loopback(_) => formatter.write_str("Loopback"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TrustedUnixEndpoint {
+    path: PathBuf,
+    identity: UnixEndpointIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnixEndpointIdentity {
+    parent_dev: u64,
+    parent_ino: u64,
+    parent_nlink: u64,
+    parent_uid: u32,
+    parent_gid: u32,
+    parent_mode: u32,
+    parent_ctime: i64,
+    parent_ctime_nsec: i64,
+    socket_dev: u64,
+    socket_ino: u64,
+    socket_nlink: u64,
+    socket_uid: u32,
+    socket_gid: u32,
+    socket_mode: u32,
+    socket_ctime: i64,
+    socket_ctime_nsec: i64,
 }
 
 impl fmt::Debug for LocalControlHttpClient {
@@ -155,23 +189,14 @@ impl LocalControlHttpClient {
         credential: LocalControlCredential,
     ) -> Result<Self> {
         credential.validate_at(&authority, SystemTime::now())?;
-        let socket_path = validate_unix_socket_path(socket_path.as_ref())?;
+        let endpoint = validate_unix_socket_path(socket_path.as_ref())?;
         let base_url = reqwest::Url::parse("http://local-control.invalid/")
             .context("construct local control endpoint")?;
-        let http = reqwest::Client::builder()
-            .unix_socket(socket_path)
-            .connect_timeout(DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT)
-            .timeout(DEFAULT_LOCAL_CONTROL_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .context("build Unix local control HTTP client")?;
         Ok(Self {
             authority,
             base_url,
             credential: Arc::new(credential),
-            http,
-            transport: LocalControlTransport::Unix,
+            transport: LocalControlTransport::Unix(endpoint),
         })
     }
 
@@ -193,8 +218,7 @@ impl LocalControlHttpClient {
             authority,
             base_url,
             credential: Arc::new(credential),
-            http,
-            transport: LocalControlTransport::Loopback,
+            transport: LocalControlTransport::Loopback(http),
         })
     }
 
@@ -205,16 +229,34 @@ impl LocalControlHttpClient {
     {
         self.credential
             .validate_at(&self.authority, SystemTime::now())?;
+        let (http, unix_endpoint) = match &self.transport {
+            LocalControlTransport::Unix(endpoint) => {
+                (build_unix_http_client(&endpoint.path)?, Some(endpoint))
+            }
+            LocalControlTransport::Loopback(http) => (http.clone(), None),
+        };
         let url = self
             .base_url
             .join(path)
             .context("join local control endpoint URL")?;
-        let response = self
-            .http
+        let mut request = http
             .post(url)
             .bearer_auth(self.credential.token.as_str())
-            .json(body)
-            .send()
+            .json(body);
+        if unix_endpoint.is_some() {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let request = request.build().context("build local control request")?;
+        if let Some(endpoint) = unix_endpoint {
+            // reqwest's sealed Unix connector accepts only a path and does not
+            // expose the connected stream for SO_PEERCRED validation. Recheck
+            // the original identity at the last synchronous point before
+            // execute(); the 0750 parent remains mutable only by its trusted
+            // owner during the remaining connect syscall window.
+            endpoint.revalidate()?;
+        }
+        let response = http
+            .execute(request)
             .await
             .context("local control request failed")?;
         if !response.status().is_success() {
@@ -321,7 +363,20 @@ fn validate_loopback_base_url(value: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-fn validate_unix_socket_path(value: &Path) -> Result<PathBuf> {
+fn build_unix_http_client(path: &Path) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .unix_socket(path)
+        .connect_timeout(DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_LOCAL_CONTROL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .build()
+        .context("build one-request Unix local control HTTP client")
+}
+
+fn validate_unix_socket_path(value: &Path) -> Result<TrustedUnixEndpoint> {
     if !value.is_absolute() {
         bail!("local control Unix socket path must be absolute");
     }
@@ -334,6 +389,24 @@ fn validate_unix_socket_path(value: &Path) -> Result<PathBuf> {
     {
         bail!("local control Unix socket path must be lexically clean");
     }
+    let identity = inspect_unix_socket_identity(value)?;
+    Ok(TrustedUnixEndpoint {
+        path: value.to_path_buf(),
+        identity,
+    })
+}
+
+impl TrustedUnixEndpoint {
+    fn revalidate(&self) -> Result<()> {
+        let current = inspect_unix_socket_identity(&self.path)?;
+        if current != self.identity {
+            bail!("local control Unix socket identity changed after client construction");
+        }
+        Ok(())
+    }
+}
+
+fn inspect_unix_socket_identity(value: &Path) -> Result<UnixEndpointIdentity> {
     let parent = value
         .parent()
         .context("local control Unix socket must have a parent")?;
@@ -371,7 +444,24 @@ fn validate_unix_socket_path(value: &Path) -> Result<PathBuf> {
     if euid != socket_metadata.uid() && !process_has_group(socket_metadata.gid())? {
         bail!("local control Unix socket group is not assigned to this runtime");
     }
-    Ok(value.to_path_buf())
+    Ok(UnixEndpointIdentity {
+        parent_dev: parent_metadata.dev(),
+        parent_ino: parent_metadata.ino(),
+        parent_nlink: parent_metadata.nlink(),
+        parent_uid: parent_metadata.uid(),
+        parent_gid: parent_metadata.gid(),
+        parent_mode: parent_metadata.mode(),
+        parent_ctime: parent_metadata.ctime(),
+        parent_ctime_nsec: parent_metadata.ctime_nsec(),
+        socket_dev: socket_metadata.dev(),
+        socket_ino: socket_metadata.ino(),
+        socket_nlink: socket_metadata.nlink(),
+        socket_uid: socket_metadata.uid(),
+        socket_gid: socket_metadata.gid(),
+        socket_mode: socket_metadata.mode(),
+        socket_ctime: socket_metadata.ctime(),
+        socket_ctime_nsec: socket_metadata.ctime_nsec(),
+    })
 }
 
 fn process_has_group(gid: u32) -> Result<bool> {
@@ -1843,6 +1933,63 @@ mod tests {
         let publisher = LocalControlReadyPublisher::new(expected, control);
         publisher.publish_not_ready().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_client_rejects_socket_replacement_before_sending_bearer_or_body() {
+        let directory = TestSocketDir::new();
+        let socket_path = directory.socket("control.sock");
+        let original = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "replacement-test-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let client =
+            LocalControlHttpClient::new_unix(&socket_path, expected.clone(), credential).unwrap();
+
+        drop(original);
+        let old_inode = directory.socket("old-inode.sock");
+        std::fs::hard_link(&socket_path, &old_inode).unwrap();
+        std::fs::remove_file(&socket_path).unwrap();
+        let replacement = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+        let replacement_observation = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(250), replacement.accept())
+                .await
+                .is_ok()
+        });
+
+        let request = LocalCredentialIssueRequest {
+            request_id: "replacement-request".to_owned(),
+            personality_agent_id: PAID.to_owned(),
+            generation: expected.generation().as_u64(),
+            rpc_boot_nonce: expected.nonce().as_str().to_owned(),
+            audience: LOCAL_AGENT_AUDIENCE.to_owned(),
+        };
+        let error = client.issue_gateway_credential(request).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("identity changed after client construction")
+        );
+        assert!(!format!("{error:#}").contains("replacement-test-secret"));
+        assert!(
+            !replacement_observation.await.unwrap(),
+            "replacement socket received a connection carrying local-control authority"
+        );
     }
 
     #[test]
