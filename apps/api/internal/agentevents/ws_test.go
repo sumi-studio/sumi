@@ -14,6 +14,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const testPersonalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+
 type fakeGenerationVerifier struct {
 	mu     sync.Mutex
 	latest uint64
@@ -163,6 +165,23 @@ func (f *fakeEventSink) LastReceivedEventSeq(ctx context.Context, claims TokenCl
 		}
 	}
 	return last, nil
+}
+
+type blockingEventSink struct {
+	*fakeEventSink
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingEventSink) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
+	s.once.Do(func() { close(s.entered) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return s.fakeEventSink.Receive(ctx, claims, envelope)
+	}
 }
 
 type fakeHydrationLatch struct {
@@ -504,6 +523,212 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 		t.Fatalf("expected ack seq 1, got %d", cs.ackSeq)
 	}
 	cs.mu.Unlock()
+}
+
+func TestWebSocketSameGenerationReconnectRevokesFirstAndNewEpochWorks(t *testing.T) {
+	srv, _, _, cs, es, hl := newTestServer(t)
+	hl.setReady()
+	srv.GenerationPollInterval = 5 * time.Millisecond
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	first, _, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	writeTestAgentHello(t, first, 7)
+	var hello ApiHello
+	if err := conn2Wait(first, &hello, time.Second); err != nil {
+		t.Fatalf("read first API hello: %v", err)
+	}
+
+	second, _, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	writeTestAgentHello(t, second, 7)
+	if err := conn2Wait(second, &hello, time.Second); err != nil {
+		t.Fatalf("read replacement API hello: %v", err)
+	}
+
+	first.SetReadDeadline(time.Now().Add(time.Second))
+	if err := first.ReadJSON(&hello); err == nil {
+		t.Fatal("first same-generation connection remained active after replacement")
+	}
+
+	seq := uint64(1)
+	if err := second.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              []byte(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatalf("write event on current epoch: %v", err)
+	}
+	if err := second.WriteJSON(OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			PersonalityAgentID: testPersonalityAgentID,
+			Seq:                1,
+			CommandID:          "00000000-0000-4000-8000-000000000001",
+			Status:             "received",
+		},
+	}); err != nil {
+		t.Fatalf("write ACK on current epoch: %v", err)
+	}
+	waitForFakeSideEffects(t, es, cs, 1, 1)
+
+	srv.connectionsMu.Lock()
+	active := len(srv.connections)
+	current := srv.connections[testPersonalityAgentID]
+	srv.connectionsMu.Unlock()
+	if active != 1 || current == nil || current.id == 0 {
+		t.Fatalf("connection registry did not retain exactly the replacement epoch: active=%d", active)
+	}
+}
+
+func TestWebSocketGenerationRolloverClosesIdleConnection(t *testing.T) {
+	srv, _, generation, _, _, hl := newTestServer(t)
+	hl.setReady()
+	srv.GenerationPollInterval = 5 * time.Millisecond
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	writeTestAgentHello(t, conn, 7)
+	var hello ApiHello
+	if err := conn2Wait(conn, &hello, time.Second); err != nil {
+		t.Fatalf("read API hello: %v", err)
+	}
+
+	generation.setLatest(8)
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if err := conn.ReadJSON(&hello); err == nil {
+		t.Fatal("idle stale-generation connection remained open")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.connectionsMu.Lock()
+		active := len(srv.connections)
+		srv.connectionsMu.Unlock()
+		if active == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stale epoch remained in registry: active=%d", active)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWebSocketReplacementSerializesAgainstOldEpochSideEffect(t *testing.T) {
+	tv := &fakeTokenVerifier{}
+	gv := &fakeGenerationVerifier{latest: 7}
+	cs := newFakeCommandSource()
+	events := &blockingEventSink{
+		fakeEventSink: &fakeEventSink{},
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	hl := newFakeHydrationLatch()
+	hl.setReady()
+	srv := NewServer(tv, gv, cs, events, hl)
+	server := startTestServer(t, srv)
+	defer server.Close()
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+
+	first, _, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	writeTestAgentHello(t, first, 7)
+	var hello ApiHello
+	if err := conn2Wait(first, &hello, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := first.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              []byte(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events.entered:
+	case <-time.After(time.Second):
+		t.Fatal("old epoch side effect did not enter sink")
+	}
+
+	second, _, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := second.WriteJSON(AgentHello{
+		PersonalityAgentID:     testPersonalityAgentID,
+		Generation:             7,
+		LastSentEventSeq:       1,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write replacement hello: %v", err)
+	}
+	secondHello := make(chan error, 1)
+	go func() {
+		var got ApiHello
+		secondHello <- second.ReadJSON(&got)
+	}()
+	select {
+	case err := <-secondHello:
+		t.Fatalf("replacement installed before the admitted old side effect completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(events.release)
+	select {
+	case err := <-secondHello:
+		if err != nil {
+			t.Fatalf("replacement API hello after side effect completion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not install after old side effect completed")
+	}
+	waitForFakeSideEffects(t, events.fakeEventSink, cs, 1, 0)
+
+	// Once the replacement hello is visible, the first epoch is no longer
+	// current. Frames attempted through it cannot reach either synchronous sink.
+	_ = first.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              []byte(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stale"}}`),
+		},
+	})
+	_ = first.WriteJSON(OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			PersonalityAgentID: testPersonalityAgentID,
+			Seq:                2,
+			CommandID:          "00000000-0000-4000-8000-000000000002",
+			Status:             "applied",
+		},
+	})
+	time.Sleep(50 * time.Millisecond)
+	waitForFakeSideEffects(t, events.fakeEventSink, cs, 1, 0)
 }
 
 func TestWebSocketRejectsEventForAnotherPersonalityAgent(t *testing.T) {
@@ -856,7 +1081,7 @@ func TestWritePumpClosedErrorChannelDoesNotSpinWithoutPing(t *testing.T) {
 	close(liveErr)
 
 	done := make(chan error, 1)
-	go func() { done <- srv.writePump(context.Background(), nil, TokenClaims{}, live, liveErr) }()
+	go func() { done <- srv.writePump(context.Background(), &agentConnectionEpoch{}, live, liveErr) }()
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "command source closed") {
@@ -875,7 +1100,7 @@ func TestWritePumpPreservesSourceErrorAfterCommandsClose(t *testing.T) {
 	close(live)
 	liveErr <- errors.New("durable source failed")
 	close(liveErr)
-	if err := srv.writePump(context.Background(), nil, TokenClaims{}, live, liveErr); err == nil || !strings.Contains(err.Error(), "durable source failed") {
+	if err := srv.writePump(context.Background(), &agentConnectionEpoch{}, live, liveErr); err == nil || !strings.Contains(err.Error(), "durable source failed") {
 		t.Fatalf("expected source error after commands close, got %v", err)
 	}
 }
@@ -1103,4 +1328,48 @@ func conn2Wait(conn *websocket.Conn, v any, timeout time.Duration) error {
 	conn.SetReadDeadline(time.Now().Add(timeout))
 	defer conn.SetReadDeadline(time.Time{})
 	return conn.ReadJSON(v)
+}
+
+func writeTestAgentHello(t testing.TB, conn *websocket.Conn, generation uint64) {
+	t.Helper()
+	if err := conn.WriteJSON(AgentHello{
+		PersonalityAgentID:     testPersonalityAgentID,
+		Generation:             generation,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write agent hello: %v", err)
+	}
+}
+
+func waitForFakeSideEffects(
+	t testing.TB,
+	events *fakeEventSink,
+	commands *fakeCommandSource,
+	eventCount int,
+	ackSeq uint64,
+) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		events.mu.Lock()
+		gotEvents := len(events.envelopes)
+		events.mu.Unlock()
+		commands.mu.Lock()
+		gotAck := commands.ackSeq
+		commands.mu.Unlock()
+		if gotEvents == eventCount && gotAck == ackSeq {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"side effects did not reach expected state: events=%d/%d ack=%d/%d",
+				gotEvents,
+				eventCount,
+				gotAck,
+				ackSeq,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
