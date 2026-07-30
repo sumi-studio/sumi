@@ -1410,6 +1410,48 @@ fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
 }
 
 #[test]
+fn supervisor_requires_explicit_local_control_socket_gid_before_lifecycle_mutation() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("missing-gid-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    let log = root.join("docker.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    std::fs::write(
+        &fake_docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in \"compose version\") exit 0 ;; *) exit 97 ;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let mut command = Command::new(deploy_dir().join("supervisor"));
+    command
+        .arg("up")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log);
+    launch_env(&mut command, &fixture.paid);
+    command
+        .env_remove("SUMI_LOCAL_CONTROL_SOCKET_GID")
+        .env(
+            "SUMI_LOCAL_CONTROL_SERVER_UID",
+            unsafe { libc::geteuid() }.to_string(),
+        )
+        .env_remove("SUMI_LOCAL_CONTROL_HOST_ROOT")
+        .env_remove("SUMI_SUPERVISOR_LOCK_DIR");
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("SUMI_LOCAL_CONTROL_SOCKET_GID is required")
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.trim(), "compose version");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn local_control_path_swap_is_detected_before_validation_succeeds() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
