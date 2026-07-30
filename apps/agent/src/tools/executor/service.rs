@@ -1303,8 +1303,9 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
 /// Serve the production Unix endpoint's deliberately narrow contract.
 ///
 /// This path has no artifact-broker capability and admits only exact-identity
-/// Health plus workspace-dirfd `read_file`. The broader stdio fixture service
-/// remains separate and cannot be reached through production bootstrap.
+/// Health plus workspace-dirfd read and discovery operations. The broader
+/// stdio fixture service remains separate and cannot be reached through
+/// production bootstrap.
 async fn run_critical_executor_service(
     first_line: Vec<u8>,
     (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
@@ -1355,7 +1356,10 @@ async fn run_critical_executor_exchange(
                 )
                 .await?;
         }
-        operation @ ExecutorOperation::ReadFile { .. } => {
+        operation @ (ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::ListDir { .. }
+        | ExecutorOperation::Glob { .. }
+        | ExecutorOperation::Grep { .. }) => {
             let execution_id = operation_execution_id(&operation).to_owned();
             let registration =
                 match manager.register_execution(request.request_id.clone(), execution_id, None) {
@@ -1384,12 +1388,13 @@ async fn run_critical_executor_exchange(
                     pending.promote(permit)?
                 }
             };
-            let result = start_critical_read_file_execution(execution, fs, blocking_fs, operation)
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "critical read_file ownership task stopped");
-                    Err(bounded_error("rpc_indeterminate"))
-                });
+            let result =
+                start_critical_read_discovery_execution(execution, fs, blocking_fs, operation)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, "critical read/discovery ownership task stopped");
+                        Err(bounded_error("rpc_indeterminate"))
+                    });
             writer
                 .terminal(&identity, request.request_id, result)
                 .await?;
@@ -1408,7 +1413,7 @@ async fn run_critical_executor_exchange(
     Ok(())
 }
 
-fn start_critical_read_file_execution(
+fn start_critical_read_discovery_execution(
     mut execution: ExecutionLease,
     fs: Arc<WorkspaceFs>,
     blocking_fs: BlockingFsRegistry,
@@ -1436,13 +1441,61 @@ fn start_critical_read_file_execution(
                 )),
                 Err(error) => Err(error),
             },
+            ExecutorOperation::ListDir { path, .. } => match resolve_input("list_dir", &path) {
+                Ok(InputRoute::Workspace) => {
+                    blocking_fs
+                        .execute(move || {
+                            Ok(ExecutorResponse::Listed {
+                                entries: fs.list_dir(Path::new(&path))?,
+                            })
+                        })
+                        .await
+                }
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact directory listings".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+            ExecutorOperation::Glob { pattern, .. } => match resolve_input("glob", &pattern) {
+                Ok(InputRoute::Workspace) => {
+                    blocking_fs
+                        .execute(move || {
+                            Ok(ExecutorResponse::Globbed {
+                                paths: fs.glob(&pattern)?,
+                            })
+                        })
+                        .await
+                }
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact globs".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+            ExecutorOperation::Grep { path, pattern, .. } => match resolve_input("grep", &path) {
+                Ok(InputRoute::Workspace) => match Regex::new(&pattern) {
+                    Ok(pattern) => {
+                        blocking_fs
+                            .execute(move || {
+                                Ok(ExecutorResponse::Grepped {
+                                    matches: fs.grep(Path::new(&path), &pattern)?,
+                                })
+                            })
+                            .await
+                    }
+                    Err(_) => Err(ToolError::Protocol("invalid grep pattern".to_owned())),
+                },
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact grep".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
             _ => Err(ToolError::Protocol(
-                "critical executor received a non-read operation".to_owned(),
+                "critical executor received an unsupported operation".to_owned(),
             )),
         }
         .map_err(rpc_error);
         if let Err(error) = execution.complete(result.clone()) {
-            tracing::error!(%error, "failed to settle critical read_file ownership");
+            tracing::error!(%error, "failed to settle critical read/discovery ownership");
             return Err(bounded_error("rpc_indeterminate"));
         }
         result
@@ -2877,6 +2930,143 @@ mod tests {
         .expect("read test terminal");
         assert!(!line.is_empty(), "service closed before terminal");
         serde_json::from_str(&line).expect("decode test terminal")
+    }
+
+    fn start_critical_test_session(
+        identity: RpcIdentity,
+        fs: Arc<WorkspaceFs>,
+        manager: Arc<ExecutorManager>,
+        blocking_fs: BlockingFsRegistry,
+        request_id: &str,
+        operation: ExecutorOperation,
+    ) -> (tokio::io::DuplexStream, JoinHandle<Result<()>>) {
+        let request = RpcRequest {
+            personality_agent_id: identity.personality_agent_id().clone(),
+            generation: identity.generation().to_wire(),
+            nonce: identity.nonce().as_str().to_owned(),
+            request_id: request_id.to_owned(),
+            operation,
+        };
+        let line = serde_json::to_vec(&request).expect("encode critical test request");
+        let (client, server) = tokio::io::duplex(MAX_RPC_LINE_BYTES);
+        let (_read, write) = tokio::io::split(server);
+        let task = tokio::spawn(run_critical_executor_service(
+            line,
+            ExecutorWriter::start(write),
+            identity,
+            fs,
+            manager,
+            blocking_fs,
+        ));
+        (client, task)
+    }
+
+    #[tokio::test]
+    async fn critical_endpoint_exposes_only_workspace_read_discovery_operations() {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-critical-read-discovery-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("nested")).expect("create test workspace");
+        std::fs::write(workspace.join("note.txt"), "needle\nother\n")
+            .expect("write workspace fixture");
+        std::fs::write(workspace.join("nested/second.txt"), "another needle\n")
+            .expect("write nested workspace fixture");
+        let fs = Arc::new(WorkspaceFs::open(&workspace).expect("open test workspace"));
+        let identity = test_identity();
+        let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+        let blocking_fs = BlockingFsRegistry::new(2, 4);
+
+        for (request_id, operation, expected_type, expected_count_field) in [
+            (
+                "critical-list",
+                ExecutorOperation::ListDir {
+                    path: ".".to_owned(),
+                    execution_id: "critical-list".to_owned(),
+                },
+                "listed",
+                "entries",
+            ),
+            (
+                "critical-glob",
+                ExecutorOperation::Glob {
+                    pattern: "**/*.txt".to_owned(),
+                    execution_id: "critical-glob".to_owned(),
+                },
+                "globbed",
+                "paths",
+            ),
+            (
+                "critical-grep",
+                ExecutorOperation::Grep {
+                    path: ".".to_owned(),
+                    pattern: "needle".to_owned(),
+                    execution_id: "critical-grep".to_owned(),
+                },
+                "grepped",
+                "matches",
+            ),
+        ] {
+            let (mut client, task) = start_critical_test_session(
+                identity.clone(),
+                fs.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                request_id,
+                operation,
+            );
+            let terminal = read_test_terminal(&mut client).await;
+            assert_eq!(terminal["result"]["Ok"]["type"], expected_type);
+            assert_eq!(
+                terminal["result"]["Ok"][expected_count_field]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            task.await
+                .expect("join critical endpoint")
+                .expect("critical endpoint result");
+        }
+
+        for (request_id, operation) in [
+            (
+                "critical-artifact-grep",
+                ExecutorOperation::Grep {
+                    path: format!("artifact://{PAID}/attachments/forbidden"),
+                    pattern: "needle".to_owned(),
+                    execution_id: "critical-artifact-grep".to_owned(),
+                },
+            ),
+            (
+                "critical-write",
+                ExecutorOperation::WriteFile {
+                    path: "must-not-write.txt".to_owned(),
+                    content: "forbidden".to_owned(),
+                    execution_id: "critical-write".to_owned(),
+                },
+            ),
+        ] {
+            let (mut client, task) = start_critical_test_session(
+                identity.clone(),
+                fs.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                request_id,
+                operation,
+            );
+            let terminal = read_test_terminal(&mut client).await;
+            assert_eq!(terminal["result"]["Err"]["code"], "protocol");
+            task.await
+                .expect("join critical endpoint")
+                .expect("critical endpoint result");
+        }
+        assert!(
+            !workspace.join("must-not-write.txt").exists(),
+            "critical endpoint accepted a mutation"
+        );
+        std::fs::remove_dir_all(root).expect("remove critical endpoint fixture");
     }
 
     #[tokio::test]
