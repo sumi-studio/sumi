@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -39,6 +41,41 @@ func localControlAuthorization(
 		RPCBootNonce:          nonce,
 		Audience:              localControlTestAudience,
 		DeliveryAuthorization: LocalDeliveryRaw,
+	}
+}
+
+func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	lock, err := gateway.openRuntimeLock(localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	called := false
+	started := time.Now()
+	err = gateway.updateLocalControlRuntimeState(
+		ctx,
+		localControlTestPAID,
+		func(*runtimeState) (bool, error) {
+			called = true
+			return false, nil
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked local-control lock ignored cancellation: %v", err)
+	}
+	if called {
+		t.Fatal("local-control update ran after its lock wait was canceled")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("canceled local-control lock wait returned too slowly: %v", elapsed)
 	}
 }
 
@@ -622,6 +659,12 @@ func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
 				state.LocalControl.Integrity = nil
 			},
 		},
+		{
+			name: "integrity key identifier removed",
+			mutate: func(state *runtimeState) {
+				state.LocalControl.Integrity.KeyID = ""
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -696,6 +739,9 @@ func TestLocalControlRejectsPublicStateDirectoryAndSymlinkLock(t *testing.T) {
 		[]LocalRuntimeAuthorization{authorization},
 	)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gateway.localControlLockPath(localControlTestPAID)); err != nil {
 		t.Fatal(err)
 	}
 	target := gateway.localControlLockPath(localControlTestPAID) + ".target"
@@ -974,5 +1020,243 @@ func TestLocalControlIntegrityKeyInstallIsIdempotentAndFencesUnconfiguredReaders
 		t.Fatal("different local control integrity key replaced the installed key")
 	} else if strings.Contains(err.Error(), string(otherSecret)) {
 		t.Fatal("integrity-key conflict exposed secret material")
+	}
+}
+
+func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *testing.T) {
+	runtimeDir := t.TempDir()
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	oldSecret := []byte("old-local-control-rotation-secret-0000000001")
+	currentSecret := []byte("new-local-control-rotation-secret-0000000002")
+	oldControl, err := NewLocalControlServer(
+		oldGateway,
+		oldSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-old-key", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	rotatedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(
+		rotatedGateway,
+		currentSecret,
+		[][]byte{oldSecret},
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("rotation overlap rejected previous-key state: %v", err)
+	}
+	state, err := rotatedGateway.state(context.Background(), localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentKeyID := deriveLocalControlIntegrityKeyID(
+		deriveLocalControlIntegrityKey(currentSecret),
+	)
+	if state.LocalControl == nil ||
+		state.LocalControl.Integrity == nil ||
+		state.LocalControl.Integrity.KeyID != currentKeyID ||
+		state.needsResign {
+		t.Fatalf("previous-key runtime state was not migrated under PAID EX: %+v", state.LocalControl)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServer(
+		currentOnly,
+		currentSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("current-only process rejected migrated runtime state: %v", err)
+	}
+
+	tooManyPrevious := [][]byte{
+		[]byte("previous-local-control-secret-number-000001"),
+		[]byte("previous-local-control-secret-number-000002"),
+		[]byte("previous-local-control-secret-number-000003"),
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(
+		openRuntimeGateway(t),
+		currentSecret,
+		tooManyPrevious,
+		[]LocalRuntimeAuthorization{authorization},
+	); err == nil {
+		t.Fatal("constructor accepted an unbounded previous-key verification set")
+	}
+}
+
+func TestLocalControlIntegrityRotationRepairsPartialStateBeforePreviousKeyRetirement(t *testing.T) {
+	runtimeDir := t.TempDir()
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	oldSecret := []byte("old-local-control-partial-rotation-secret-0001")
+	currentSecret := []byte("new-local-control-partial-rotation-secret-0002")
+	oldControl, err := NewLocalControlServer(
+		oldGateway,
+		oldSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-before-partial-rotation", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	claims := TokenClaims{PersonalityAgentID: localControlTestPAID, Generation: 7}
+	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a process crash after the runtime record was re-signed but before
+	// the companion lease record was repaired.
+	partialGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey := deriveLocalControlIntegrityKey(oldSecret)
+	currentKey := deriveLocalControlIntegrityKey(currentSecret)
+	if err := partialGateway.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey},
+		[]string{localControlTestPAID},
+	); err != nil {
+		t.Fatal(err)
+	}
+	state, err := partialGateway.state(context.Background(), localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.needsResign {
+		t.Fatal("previous-key runtime state was not marked for re-signing")
+	}
+	if err := partialGateway.persistSignedLocalControlRuntimeState(localControlTestPAID, &state); err != nil {
+		t.Fatal(err)
+	}
+	leaseState, err := partialGateway.connectionLeaseState(localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !leaseState.needsResign {
+		t.Fatal("test did not leave the lease on the previous key")
+	}
+
+	restartedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(
+		restartedGateway,
+		currentSecret,
+		[][]byte{oldSecret},
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("restart did not repair the partially rotated state pair: %v", err)
+	}
+	repairedLease, err := restartedGateway.connectionLeaseState(localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentKeyID := deriveLocalControlIntegrityKeyID(currentKey)
+	if repairedLease.Integrity == nil ||
+		repairedLease.Integrity.KeyID != currentKeyID ||
+		repairedLease.needsResign {
+		t.Fatalf("restart did not re-sign the previous-key lease: %+v", repairedLease)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServer(
+		currentOnly,
+		currentSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("current-only restart rejected repaired state: %v", err)
+	}
+	if err := currentOnly.ValidateConnectionLease(context.Background(), claims, lease); err != nil {
+		t.Fatalf("partial-rotation repair changed lease authority: %v", err)
+	}
+}
+
+func TestDurableGatewayObserveDistinguishesStartupFromTerminalNotReady(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	control, err := NewLocalControlServer(
+		gateway,
+		localControlTestSigningSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	claims := TokenClaims{PersonalityAgentID: localControlTestPAID, Generation: 7}
+	observation, err := gateway.Observe(context.Background(), claims, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Ready || observation.TerminalNotReady {
+		t.Fatalf("startup NotReady was not connectable: %+v", observation)
+	}
+
+	if _, err := control.publishRuntimeState(context.Background(), LocalRuntimeStatePublication{
+		PublicationID:      "shutdown-before-ready",
+		PersonalityAgentID: localControlTestPAID,
+		Generation:         7,
+		RPCBootNonce:       "boot-a",
+		ExpectedRevision:   revision(1),
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeShutdown,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observation, err = gateway.Observe(context.Background(), claims, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Ready || !observation.TerminalNotReady {
+		t.Fatalf("shutdown NotReady was not terminal: %+v", observation)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := gateway.WaitFor(waitCtx, claims, 7); !errors.Is(err, errHydrationTerminalNotReady) {
+		t.Fatalf("shutdown NotReady did not terminate hydration wait promptly: %v", err)
 	}
 }

@@ -216,7 +216,8 @@ func validBrowserRejectReason(reason RejectReason) bool {
 		RejectAttachmentsNotEmpty,
 		RejectOversized,
 		RejectNotAllowed,
-		RejectIdempotencyConflict:
+		RejectIdempotencyConflict,
+		RejectUnavailable:
 		return true
 	default:
 		return false
@@ -529,6 +530,16 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 		}
 		envelope, err := s.Appender.Append(ctx, directChatProvenance(claims), frame.IdempotencyKey, frame.Command)
 		if err != nil {
+			if errors.Is(err, errBrowserRuntimeUnavailable) {
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectUnavailable,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
 			if isIdempotencyConflict(err) {
 				if writeErr := write(browserCommandRejectedFrame{
 					Type:           "command_rejected",

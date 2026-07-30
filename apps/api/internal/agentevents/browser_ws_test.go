@@ -27,7 +27,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -133,13 +133,82 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 }
 
+func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	claims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	conn := dialBrowserWS(t, httpServer, signBrowserSession(t, testSecret, claims), personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "unavailable")
+
+	command := browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "unavailable-command",
+		Command:        json.RawMessage(`{"type":"user_message","text":"not yet","attachments":[]}`),
+	}
+	if err := conn.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var rejected browserCommandRejectedFrame
+	if err := conn.ReadJSON(&rejected); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Type != "command_rejected" ||
+		rejected.IdempotencyKey != command.IdempotencyKey ||
+		rejected.RejectReason != RejectUnavailable {
+		t.Fatalf("unexpected unavailable rejection: %+v", rejected)
+	}
+	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("NotReady browser command reached durable log: hasCommands=%v err=%v", hasCommands, err)
+	}
+
+	receipt := "browser-ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	if err := conn.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var accepted browserCommandAcceptedFrame
+	if err := conn.ReadJSON(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Type != "command_accepted" || accepted.IdempotencyKey != command.IdempotencyKey {
+		t.Fatalf("Ready did not admit previously rejected command: %+v", accepted)
+	}
+}
+
 func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessions(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -177,7 +246,7 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -290,7 +359,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := TokenClaims{TenantID: "tenant", PersonalityAgentID: personalityAgentID, Generation: 1}
@@ -378,7 +447,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)
@@ -392,6 +461,11 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDirectChatStatus(t, conn, "unavailable")
+	receipt := "restart-ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
 
 	commands := []json.RawMessage{
 		json.RawMessage(`{"type":"abort"}`),
@@ -458,7 +532,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewBrowserServer(sessions, gateway.commands, gateway)
+	server := NewBrowserServer(sessions, gateway, gateway)
 	server.AllowedOrigins = []string{"https://web.example"}
 	mux := http.NewServeMux()
 	mux.Handle("GET /direct-chat/ws", server)

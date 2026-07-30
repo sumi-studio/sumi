@@ -29,13 +29,16 @@ func NewProductionMux(
 	if store == nil {
 		return nil, nil, nil, fmt.Errorf("user command ingress: %w", errCommandAppenderRequired)
 	}
-	ingress, err := NewUserCommandIngress(store, sv)
+	if runtime == nil {
+		return nil, nil, nil, fmt.Errorf("browser command admission: durable runtime gateway is required")
+	}
+	ingress, err := NewUserCommandIngress(runtime, sv)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("user command ingress: %w", err)
 	}
 	mux.Handle("POST /direct-chat/commands", ingress)
 
-	browser := NewBrowserServer(sv, store, runtime)
+	browser := NewBrowserServer(sv, runtime, runtime)
 	browser.AllowedOrigins = browserOrigins
 	mux.Handle("GET /direct-chat/ws", browser)
 

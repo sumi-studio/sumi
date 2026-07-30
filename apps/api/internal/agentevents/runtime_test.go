@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -211,43 +212,24 @@ func TestDurableGatewayRolloverCommitSerializesWithAdmittedSideEffect(t *testing
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	stale := currentRuntimeClaims(t, gateway, personalityAgentID)
-	seq := uint64(1)
-	event := Envelope{
-		Seq:                &seq,
-		PersonalityAgentID: personalityAgentID,
-		Event:              json.RawMessage(`{"type":"agent_start"}`),
-	}
-
-	// Hold the event-log cache mutex so Receive can acquire the shared runtime
-	// generation lock but cannot commit its event yet.
-	gateway.mu.Lock()
-	receiveDone := make(chan error, 1)
+	sideEffectEntered := make(chan struct{})
+	releaseSideEffect := make(chan struct{})
+	sideEffectDone := make(chan error, 1)
 	go func() {
-		receiveDone <- gateway.Receive(context.Background(), stale, event)
+		sideEffectDone <- gateway.withCurrentGeneration(
+			context.Background(),
+			stale,
+			func() error {
+				close(sideEffectEntered)
+				<-releaseSideEffect
+				return nil
+			},
+		)
 	}()
-
-	probe, err := openLocalControlLock(gateway.localControlLockPath(personalityAgentID))
-	if err != nil {
-		gateway.mu.Unlock()
-		t.Fatal(err)
-	}
-	defer probe.Close()
-	deadline := time.Now().Add(time.Second)
-	for {
-		err = syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			break
-		}
-		if err != nil {
-			gateway.mu.Unlock()
-			t.Fatalf("probe runtime generation lock: %v", err)
-		}
-		_ = syscall.Flock(int(probe.Fd()), syscall.LOCK_UN)
-		if time.Now().After(deadline) {
-			gateway.mu.Unlock()
-			t.Fatal("side effect did not acquire shared runtime generation lock")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-sideEffectEntered:
+	case <-time.After(time.Second):
+		t.Fatal("side effect did not enter generation boundary")
 	}
 
 	publishDone := make(chan error, 1)
@@ -256,29 +238,532 @@ func TestDurableGatewayRolloverCommitSerializesWithAdmittedSideEffect(t *testing
 	}()
 	select {
 	case err := <-publishDone:
-		gateway.mu.Unlock()
 		t.Fatalf("rollover committed across admitted side effect: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	gateway.mu.Unlock()
-	if err := <-receiveDone; err != nil {
+	close(releaseSideEffect)
+	if err := <-sideEffectDone; err != nil {
 		t.Fatalf("admitted side effect failed: %v", err)
 	}
 	if err := <-publishDone; err != nil {
 		t.Fatalf("rollover failed after admitted side effect: %v", err)
 	}
 
-	seq = 2
-	event.Seq = &seq
-	if err := gateway.Receive(context.Background(), stale, event); err == nil {
-		t.Fatal("old generation event committed after rollover")
+	called := false
+	if err := gateway.withCurrentGeneration(context.Background(), stale, func() error {
+		called = true
+		return nil
+	}); err == nil || called {
+		t.Fatalf("old generation side effect admitted after rollover: called=%v err=%v", called, err)
 	}
-	current := stale
-	current.Generation++
-	last, err := gateway.LastReceivedEventSeq(context.Background(), current)
-	if err != nil || last != 1 {
-		t.Fatalf("rollover ordering changed durable cursor: last=%d err=%v", last, err)
+}
+
+func TestConnectionLeaseRolloverSerializesWithCommandDelivery(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	lease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryEntered := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- gateway.WithConnectionLease(
+			context.Background(),
+			claims,
+			lease,
+			func() error {
+				close(deliveryEntered)
+				<-releaseDelivery
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-deliveryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("command delivery did not enter authoritative lease boundary")
+	}
+
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- gateway.PublishRuntimeState(
+			claims.PersonalityAgentID,
+			claims.Generation+1,
+			nil,
+		)
+	}()
+	select {
+	case err := <-publishDone:
+		t.Fatalf("rollover committed during command delivery: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseDelivery)
+	if err := <-deliveryDone; err != nil {
+		t.Fatalf("admitted command delivery failed: %v", err)
+	}
+	if err := <-publishDone; err != nil {
+		t.Fatalf("rollover after command delivery failed: %v", err)
+	}
+
+	called := false
+	err = gateway.WithConnectionLease(context.Background(), claims, lease, func() error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("old command delivery admitted after rollover: called=%v err=%v", called, err)
+	}
+}
+
+func TestConnectionLeaseLockIsIsolatedPerPersonalityAgent(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	first := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
+	second := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-9abc-0123456789ac")
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- gateway.WithConnectionLease(
+			context.Background(),
+			first,
+			firstLease,
+			func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first PAID lease boundary did not enter")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := gateway.ClaimConnectionLease(context.Background(), second)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second PAID lease claim failed: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first PAID lease operation stalled a different PAID")
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableGatewayRejectsMutableDirectoryAndReplacedPinnedLock(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	publicDir := t.TempDir()
+	if err := os.Chmod(publicDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(publicDir, store); err == nil {
+		t.Fatal("gateway accepted a group/world-writable runtime directory")
+	}
+
+	symlinkParent := t.TempDir()
+	symlinkPath := filepath.Join(symlinkParent, "runtime-link")
+	if err := os.Symlink(t.TempDir(), symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(symlinkPath, store); err == nil {
+		t.Fatal("gateway accepted a symlink runtime directory")
+	}
+	realParent := t.TempDir()
+	symlinkedParent := filepath.Join(t.TempDir(), "linked-parent")
+	if err := os.Symlink(realParent, symlinkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(filepath.Join(symlinkedParent, "runtime"), store); err == nil {
+		t.Fatal("gateway accepted a runtime directory beneath a symlink path component")
+	}
+
+	runtimeDir := t.TempDir()
+	gateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, gateway, personalityAgentID)
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := gateway.localControlLockPath(personalityAgentID)
+	displacedLockPath := lockPath + ".displaced"
+	if err := os.Chmod(runtimeDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(lockPath, displacedLockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway claimed through a runtime directory made mutable after open")
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway accepted a replacement for its pinned PAID lock inode")
+	}
+	after, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("refused split-lock claims changed the authoritative lease record")
+	}
+	if err := gateway.ValidateConnectionLease(context.Background(), claims, firstLease); err == nil {
+		t.Fatal("gateway continued through the replaced lock instead of failing closed")
+	}
+}
+
+func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	key := deriveLocalControlIntegrityKey([]byte("connection-lease-integrity-secret-32-bytes"))
+	if err := gateway.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	record := connectionLeaseState{
+		Version:    connectionLeaseStateVersion,
+		Generation: 7,
+		Sequence:   1,
+		LeaseID:    base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, connectionLeaseIDBytes)),
+		Active:     true,
+	}
+	if err := gateway.writeConnectionLeaseState(personalityAgentID, record); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(personalityAgentID)) {
+		t.Fatal("connection lease content leaked personality agent identity")
+	}
+	if !bytes.Contains(raw, []byte(`"integrity"`)) {
+		t.Fatal("local-control-owned connection lease was not integrity protected")
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("signed connection lease did not verify: %v", err)
+	}
+	reopened, err := OpenDurableGateway(gateway.dir, gateway.commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("gateway without local-control integrity key accepted signed connection lease")
+	}
+	if err := reopened.installLocalControlIntegrityKey(key, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.connectionLeaseState(personalityAgentID); err != nil {
+		t.Fatalf("gateway with matching key rejected shared signed lease: %v", err)
+	}
+
+	var missingKeyID connectionLeaseState
+	if err := unmarshalStrict(raw, &missingKeyID); err != nil {
+		t.Fatal(err)
+	}
+	if missingKeyID.Integrity == nil {
+		t.Fatal("signed connection lease did not contain integrity metadata")
+	}
+	missingKeyID.Integrity.KeyID = ""
+	tampered, err := json.Marshal(missingKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("connection lease without an integrity key identifier was accepted")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tampered = bytes.Replace(raw, []byte(`"sequence":1`), []byte(`"sequence":2`), 1)
+	if bytes.Equal(tampered, raw) {
+		t.Fatal("test did not alter signed connection lease")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("tampered connection lease passed local-control integrity verification")
+	}
+}
+
+func TestBrowserCommandAdmissionFencesNotReadyAcrossGateways(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	provenance := testDirectChatProvenance(personalityAgentID)
+	command := json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)
+
+	if err := first.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Append(context.Background(), provenance, "startup-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway startup NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("startup NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Append(context.Background(), provenance, "shutdown-blocked", command); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("cross-gateway shutdown NotReady admission error = %v", err)
+	}
+	if hasCommands, err := store.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("shutdown NotReady wrote a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
+func TestBrowserCommandAdmissionSerializesGenerationRolloverWithDurableAppend(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready-7"
+	if err := first.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.acquireIdempotencyGuard(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	guardHeld := true
+	defer func() {
+		if guardHeld {
+			store.releaseIdempotencyGuard()
+		}
+	}()
+
+	appendDone := make(chan error, 1)
+	go func() {
+		_, err := first.Append(
+			context.Background(),
+			testDirectChatProvenance(personalityAgentID),
+			"before-rollover",
+			json.RawMessage(`{"type":"user_message","text":"before","attachments":[]}`),
+		)
+		appendDone <- err
+	}()
+
+	// Append acquires the authoritative shared PAID lock before waiting on the
+	// command store. Observe that lock directly so the ordering is deterministic.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lock, err := second.openRuntimeLock(personalityAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		switch {
+		case errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
+			_ = lock.Close()
+			goto appendHoldsRuntimeLock
+		case err == nil:
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			_ = lock.Close()
+		default:
+			_ = lock.Close()
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser append did not acquire the shared PAID runtime lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+appendHoldsRuntimeLock:
+	rolloverDone := make(chan error, 1)
+	go func() {
+		rolloverDone <- second.PublishRuntimeState(personalityAgentID, 8, nil)
+	}()
+	select {
+	case err := <-rolloverDone:
+		t.Fatalf("generation rollover bypassed admitted browser append: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	store.releaseIdempotencyGuard()
+	guardHeld = false
+	if err := <-appendDone; err != nil {
+		t.Fatalf("Ready command append failed: %v", err)
+	}
+	if err := <-rolloverDone; err != nil {
+		t.Fatalf("generation rollover failed: %v", err)
+	}
+	if _, err := second.Append(
+		context.Background(),
+		testDirectChatProvenance(personalityAgentID),
+		"after-rollover",
+		json.RawMessage(`{"type":"user_message","text":"after","attachments":[]}`),
+	); !errors.Is(err, errBrowserRuntimeUnavailable) {
+		t.Fatalf("post-rollover NotReady command was admitted: %v", err)
+	}
+	if _, found, err := store.GetCommand(context.Background(), personalityAgentID, 2); err != nil || found {
+		t.Fatalf("post-rollover command reached durable seq 2: found=%v err=%v", found, err)
+	}
+}
+
+func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	oldGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, oldGateway, personalityAgentID)
+	oldKey := deriveLocalControlIntegrityKey([]byte("old-connection-integrity-secret-32-bytes"))
+	currentKey := deriveLocalControlIntegrityKey([]byte("new-connection-integrity-secret-32-bytes"))
+	if err := oldGateway.installLocalControlIntegrityKey(oldKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotated.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey},
+		[]string{personalityAgentID},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 16
+	start := make(chan struct{})
+	results := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			results <- rotated.ValidateConnectionLease(context.Background(), claims, lease)
+		}()
+	}
+	close(start)
+	for range readers {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent rotation validation failed: %v", err)
+		}
+	}
+
+	resigned, err := rotated.connectionLeaseState(personalityAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resigned.Integrity == nil ||
+		resigned.Integrity.KeyID != deriveLocalControlIntegrityKeyID(currentKey) {
+		t.Fatalf("lease was not re-signed with current key ID: %+v", resigned.Integrity)
+	}
+	if resigned.Generation != lease.Generation ||
+		resigned.Sequence != lease.Sequence ||
+		resigned.LeaseID != lease.ID ||
+		!resigned.Active {
+		t.Fatalf("rotation changed lease authority: %+v", resigned)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.installLocalControlIntegrityKey(currentKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.ValidateConnectionLease(context.Background(), claims, lease); err != nil {
+		t.Fatalf("current-only verifier rejected re-signed lease: %v", err)
+	}
+
+	resigned.Integrity.KeyID = strings.Repeat("f", 32)
+	unknownKeyRecord, err := json.Marshal(resigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rotated.connectionLeasePath(personalityAgentID), unknownKeyRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rotated.connectionLeaseState(personalityAgentID); err == nil ||
+		!strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("unknown integrity key ID did not fail closed: %v", err)
+	}
+
+	duplicateGateway := openRuntimeGateway(t)
+	if err := duplicateGateway.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey, oldKey},
+		[]string{personalityAgentID},
+	); err == nil {
+		t.Fatal("ambiguous duplicate previous integrity keys were accepted")
 	}
 }
 
@@ -1442,7 +1927,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	inner := uint64(2)
-	err := gateway.appendDurableEventLocked(personalityAgentID, durableEventRecord{
+	err := gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
 			Seq:                &inner,
@@ -1457,7 +1942,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 		t.Fatalf("expected seq mismatch error, got %v", err)
 	}
 
-	err = gateway.appendDurableEventLocked(personalityAgentID, durableEventRecord{
+	err = gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
 		Event: Envelope{
 			Seq:                nil,
