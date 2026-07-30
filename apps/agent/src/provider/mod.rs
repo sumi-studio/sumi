@@ -5750,12 +5750,30 @@ fi
             "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET"
         );
 
+        let ten_turn_stress = match env::var("SUMI_LIVE_TEST_TURNS") {
+            Err(env::VarError::NotPresent) => false,
+            Ok(value) if value == "10" => true,
+            Ok(value) => panic!(
+                "SUMI_LIVE_TEST_TURNS must be unset (the two-turn release gate) or exactly 10, got {value:?}"
+            ),
+            Err(env::VarError::NotUnicode(_)) => {
+                panic!("SUMI_LIVE_TEST_TURNS must be unset or UTF-8 value exactly 10")
+            }
+        };
         let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         spec.id = match env::var("SUMI_CODEX_RESPONSES_MODEL") {
-            Ok(model) if !model.trim().is_empty() => model,
+            Ok(model)
+                if !model.trim().is_empty() && (!ten_turn_stress || model == "gpt-5.6-terra") =>
+            {
+                model
+            }
+            Ok(model) if ten_turn_stress => panic!(
+                "SUMI_LIVE_TEST_TURNS=10 requires SUMI_CODEX_RESPONSES_MODEL=gpt-5.6-terra, got {model:?}"
+            ),
             Ok(_) => panic!(
                 "live Codex Responses release gate requires a non-empty SUMI_CODEX_RESPONSES_MODEL when set"
             ),
+            Err(_) if ten_turn_stress => "gpt-5.6-terra".to_owned(),
             // The release gate must exercise encrypted reasoning provider context.
             // gpt-5.6-luna is the cost-optimized tier and adaptively emits zero
             // reasoning tokens for simple tool-use turns, so the canonical first

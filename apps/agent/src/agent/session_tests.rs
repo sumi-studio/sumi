@@ -6936,7 +6936,27 @@ async fn run_live_responses_session(
     seq: u64,
     text: &str,
 ) -> RunCore {
-    let phase = format!("run_live_responses_session(seq={seq})");
+    run_live_responses_segment(store, core, driver, &[(seq, text)]).await
+}
+
+/// Drives several ordinary commands through one live Session.  Waiting for the
+/// matching Applied ACK, rather than any prior Applied ACK, makes this useful
+/// for state-transition probes as well as the single-command release gate.
+async fn run_live_responses_segment(
+    store: Store,
+    core: RunCore,
+    driver: Arc<InjectedRunDriver>,
+    turns: &[(u64, &str)],
+) -> RunCore {
+    assert!(
+        !turns.is_empty(),
+        "live Responses segment requires at least one turn"
+    );
+    let phase = format!(
+        "run_live_responses_segment(turns={}-{})",
+        turns.first().expect("non-empty turns").0,
+        turns.last().expect("non-empty turns").0
+    );
     eprintln!("[{phase}] starting session");
     let (session_gateway, commands, frames) = gateway();
     let session = tokio::time::timeout(
@@ -6954,28 +6974,39 @@ async fn run_live_responses_session(
     .expect("start canonical live Responses Session");
     eprintln!("[{phase}] session started; spawning run task");
     let task = tokio::spawn(session.run());
-    eprintln!("[{phase}] sending user command");
-    commands
-        .send(live_responses_user(seq, text))
-        .await
-        .expect("send live Responses user command");
-    eprintln!("[{phase}] waiting for durable Applied ACK");
-    tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            if frames.lock().expect("frame mutex").iter().any(|frame| {
-                matches!(frame, OutboundFrame::CommandAck { ack }
-                    if ack.status == CommandAckStatus::Applied)
-            }) || task.is_finished()
-            {
-                break;
+    for (seq, text) in turns {
+        eprintln!("[{phase}] sending user command seq={seq}");
+        commands
+            .send(live_responses_user(*seq, text))
+            .await
+            .expect("send live Responses user command");
+        eprintln!("[{phase}] waiting for durable Applied ACK seq={seq}");
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if frames.lock().expect("frame mutex").iter().any(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                        if ack.seq == *seq && ack.status == CommandAckStatus::Applied)
+                }) || task.is_finished()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("[{phase}] timed out waiting for durable Applied ACK (phase: applied_ack)")
-    });
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "[{phase}] timed out waiting for durable Applied ACK seq={seq} (phase: applied_ack)"
+            )
+        });
+        assert!(
+            frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::CommandAck { ack }
+                    if ack.seq == *seq && ack.status == CommandAckStatus::Applied)
+            }),
+            "[{phase}] session ended before Applied ACK for seq={seq}"
+        );
+    }
     eprintln!("[{phase}] Applied ACK received; dropping commands and awaiting session completion");
     drop(commands);
     let core = tokio::time::timeout(Duration::from_secs(120), task)
@@ -7096,7 +7127,28 @@ async fn assert_live_provider_context_private(
     }
 }
 
+fn live_responses_turn_count() -> usize {
+    match std::env::var("SUMI_LIVE_TEST_TURNS") {
+        Err(std::env::VarError::NotPresent) => 2,
+        Ok(value) if value == "10" => 10,
+        Ok(value) => panic!(
+            "SUMI_LIVE_TEST_TURNS must be unset (the two-turn release gate) or exactly 10, got {value:?}"
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SUMI_LIVE_TEST_TURNS must be unset or UTF-8 value exactly 10")
+        }
+    }
+}
+
 pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_key: String) {
+    if live_responses_turn_count() == 10 {
+        assert_eq!(
+            spec.id, "gpt-5.6-terra",
+            "the ten-turn stress harness is intentionally pinned to gpt-5.6-terra"
+        );
+        run_canonical_live_responses_ten_turn_stress(spec, api_key).await;
+        return;
+    }
     eprintln!(
         "run_canonical_live_responses_roundtrip: starting turn 1 with spec.id={}",
         spec.id
@@ -7246,6 +7298,191 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
         "turn2 canonical_restart=hydrated_context_items({replayed_context_items}); output=non_empty_expected_text"
     );
     second_pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+/// An explicitly opt-in, state-transition probe.  It deliberately keeps three
+/// Sessions (rather than ten one-command Sessions): commands 1-4, 5-7, and
+/// 8-10 exercise normal sequential operation, while the two close/reopen
+/// boundaries exercise authenticated provider-context hydration.
+async fn run_canonical_live_responses_ten_turn_stress(spec: ModelSpec, api_key: String) {
+    eprintln!("ten-turn Terra Responses stress: starting (three Session segments)");
+    assert!(
+        std::env::var(&spec.api_key_env).is_ok_and(|configured| configured == api_key),
+        "live proxy secret must be available to the canonical provider driver"
+    );
+    let path = std::env::current_dir()
+        .expect("agent package directory")
+        .join("target")
+        .join(format!(
+            "sumi-live-responses-ten-turn-{}.sqlite",
+            Uuid::now_v7()
+        ));
+    let tool = live_responses_tool();
+    let store = open_kill_restart_store(&path).await;
+    let first_pool = store.pool().clone();
+    let mut first_core = RunCore::new();
+    first_core.set_approval(live_responses_approval_broker());
+    let first_core = run_live_responses_segment(
+        store,
+        first_core,
+        live_responses_driver(spec.clone(), tool.clone(), "high", Some(serde_json::json!("auto"))),
+        &[
+            (1, "Reply with exactly responses-live-text-1. Do not call a tool."),
+            (2, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (3, "Reply with exactly responses-live-text-3. Do not call a tool."),
+            (4, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let first_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&first_pool)
+        .await
+        .expect("first context-row count");
+    assert!(
+        first_context_rows > 0 && !first_core.provider_context.is_empty(),
+        "first segment must retain durable provider context"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&first_pool)
+            .await
+            .expect("first tool-result count"),
+        2,
+        "turns 2 and 4 must be the only first-segment tool effects"
+    );
+    first_pool.close().await;
+
+    let reopened = open_kill_restart_store(&path).await;
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-ten-turn-restart-one-lease",
+    )
+    .expect("first stress restart lease");
+    let fence = GenerationRecoveryFence::new(&lease, "live-ten-turn-restart-one-fence")
+        .expect("first stress restart fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("first stress hydration")
+    {
+        HydrationOutcome::Complete(state) => state,
+        other => panic!("completed first stress segment unexpectedly requires recovery: {other:?}"),
+    };
+    let markers = live_opaque_markers(&hydrated.provider_context);
+    assert!(
+        !markers.is_empty(),
+        "first stress hydration must recover encrypted reasoning context"
+    );
+    assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
+    let mut second_core = RunCore::new();
+    second_core.set_approval(live_responses_approval_broker());
+    second_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+    let second_pool = reopened.pool().clone();
+    let second_core = run_live_responses_segment(
+        reopened,
+        second_core,
+        live_responses_driver(spec.clone(), tool.clone(), "high", Some(serde_json::json!("auto"))),
+        &[
+            (5, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (6, "Reply with exactly responses-live-text-6. Do not call a tool."),
+            (7, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let second_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&second_pool)
+        .await
+        .expect("second context-row count");
+    // Provider context is allowed to be compacted or retained under a bounded
+    // policy, so a raw row count is not a monotonic contract.  The durable
+    // invariant is non-empty authenticated continuity at every segment and
+    // privacy after each rehydration (asserted above).
+    assert!(
+        second_context_rows > 0 && !second_core.provider_context.is_empty(),
+        "provider context must remain durable and live after the first restart"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&second_pool)
+            .await
+            .expect("second tool-result count"),
+        4,
+        "turns 2, 4, 5, and 7 must be the only tool effects before second restart"
+    );
+    second_pool.close().await;
+
+    let reopened = open_kill_restart_store(&path).await;
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-ten-turn-restart-two-lease",
+    )
+    .expect("second stress restart lease");
+    let fence = GenerationRecoveryFence::new(&lease, "live-ten-turn-restart-two-fence")
+        .expect("second stress restart fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("second stress hydration")
+    {
+        HydrationOutcome::Complete(state) => state,
+        other => {
+            panic!("completed second stress segment unexpectedly requires recovery: {other:?}")
+        }
+    };
+    let markers = live_opaque_markers(&hydrated.provider_context);
+    assert!(
+        !markers.is_empty(),
+        "second stress hydration must recover encrypted reasoning context"
+    );
+    assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
+    let mut third_core = RunCore::new();
+    third_core.set_approval(live_responses_approval_broker());
+    third_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+    let final_pool = reopened.pool().clone();
+    let final_core = run_live_responses_segment(
+        reopened,
+        third_core,
+        live_responses_driver(spec, tool, "high", Some(serde_json::json!("auto"))),
+        &[
+            (8, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (9, "Reply with exactly responses-live-text-9. Do not call a tool."),
+            (10, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let final_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&final_pool)
+        .await
+        .expect("final context-row count");
+    assert!(
+        final_context_rows > 0 && !final_core.provider_context.is_empty(),
+        "provider context must remain durable and live across all stress segments"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&final_pool)
+            .await
+            .expect("final tool-result count"),
+        6,
+        "exactly the six requested tool turns may produce durable effects"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='user'")
+            .fetch_one(&final_pool)
+            .await
+            .expect("final user count"),
+        10,
+        "all ten sequential user commands must persist exactly once"
+    );
+    eprintln!(
+        "ten-turn Terra Responses stress complete: sessions=3; turns=10; tool_results=6; context_rows={final_context_rows}"
+    );
+    final_pool.close().await;
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
