@@ -6,6 +6,7 @@ mod event_log;
 mod event_writer;
 mod memory_state;
 mod physical_recovery;
+mod post_commit;
 mod provider_context;
 mod recovery;
 mod redactor;
@@ -47,6 +48,7 @@ use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
     PublicMessage, StopReason, validate_native_suffix_for_hydration,
 };
+use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{
     GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
 };
@@ -62,11 +64,16 @@ pub(crate) use self::delivery::{
     DurableDeliveryOutcome, current_event_head_seq, raw_events_after,
 };
 #[cfg(test)]
-pub(crate) use self::event_writer::seed_provider_context_owner_event_evidence;
+pub(crate) use self::event_writer::{
+    PostCommitPublishHook, seed_provider_context_owner_event_evidence,
+};
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
+};
+pub(crate) use self::post_commit::{
+    EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
 };
 #[cfg(test)]
 pub(crate) use self::provider_context::{
@@ -91,10 +98,11 @@ pub(crate) use crypto::{
 )]
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, ApprovalRuleMutation, BootstrapRecoveryGuard, DurableEvent,
-    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt,
-    InboundReceiptOrigin, InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation,
-    MemoryJobMutation, MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter,
-    RecoveryRequired, RunPhase, ToolExecutionMutation, user_message_id,
+    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, EventWriterAdmissionClosed,
+    EventWriterFinalizerFailure, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -407,6 +415,8 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
+    event_writer_finalizers: event_writer::CommitFinalizerRegistry,
+    post_commit_feed: post_commit::PostCommitFeed,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
@@ -510,6 +520,41 @@ impl Store {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn session_test_file_store(
+        path: &Path,
+        identity_fixture: &str,
+    ) -> Result<Self> {
+        #[derive(Clone)]
+        struct SessionFileTestKeyProvider(WrappingKey);
+
+        #[async_trait::async_trait]
+        impl KeyProvider for SessionFileTestKeyProvider {
+            async fn current_key(&self) -> Result<WrappingKey> {
+                Ok(self.0.clone())
+            }
+
+            async fn key_by_id(&self, key_id: &str) -> Result<WrappingKey> {
+                if key_id != self.0.key_id() {
+                    bail!("unknown session file-test wrapping key {key_id}");
+                }
+                Ok(self.0.clone())
+            }
+        }
+
+        let personality_agent_id = PersonalityAgentId::parse(identity_fixture)
+            .unwrap_or_else(|_| crate::gateway::test_personality_agent_id());
+        Self::open(
+            path,
+            AgentScope::new(personality_agent_id),
+            Arc::new(SessionFileTestKeyProvider(WrappingKey::new(
+                "session-file-test-key/v1",
+                [0x5b; 32],
+            ))),
+        )
+        .await
+    }
+
     async fn finish_open(
         pool: SqlitePool,
         scope: AgentScope,
@@ -538,6 +583,8 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
+            event_writer_finalizers: event_writer::CommitFinalizerRegistry::default(),
+            post_commit_feed: post_commit::PostCommitFeed::new(0),
             #[cfg(test)]
             _in_memory_anchor: None,
         });
@@ -551,7 +598,17 @@ impl Store {
         // Also cover the newly minted projection key and the rest of startup
         // invariants after initialization.
         store.validate_startup().await?;
-        Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
+        let mut store = Arc::try_unwrap(store)
+            .map_err(|_| anyhow!("recovery must not retain Store references"))?;
+        let initial_event_head: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM agent_events")
+                .fetch_one(&store.pool)
+                .await
+                .context("failed to initialize post-commit event high-water")?;
+        let initial_event_head = u64::try_from(initial_event_head)
+            .context("persisted event head is negative during Store open")?;
+        store.post_commit_feed = post_commit::PostCommitFeed::new(initial_event_head);
+        Ok(store)
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
@@ -696,6 +753,10 @@ impl Store {
             });
         }
 
+        self.post_commit_feed
+            .record_hydrated_epoch(lease, fence)
+            .await
+            .context("failed to bind post-commit feed to completed Store hydration")?;
         Ok(HydrationOutcome::Complete(HydratedRunState {
             scope: self.scope.clone(),
             lease: lease.clone(),
@@ -2033,6 +2094,119 @@ impl Store {
 
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
         self.event_writer_state.clone()
+    }
+
+    fn event_writer_finalizers(&self) -> event_writer::CommitFinalizerRegistry {
+        self.event_writer_finalizers.clone()
+    }
+
+    pub(crate) fn claim_post_commit_receiver(&self) -> Result<post_commit::PostCommitReceiver> {
+        self.post_commit_feed.claim()
+    }
+
+    /// Issue the one shared dispatcher/client/target capability only after the
+    /// exact runtime authority has completed Store hydration.
+    #[allow(
+        dead_code,
+        reason = "T26 production bootstrap composition is a follow-up"
+    )]
+    pub(crate) fn issue_post_commit_epoch(
+        &self,
+        authority: RuntimeEpochAuthority,
+        runtime_invalidated: tokio_util::sync::CancellationToken,
+    ) -> Result<PostCommitEpochCapability> {
+        self.post_commit_feed
+            .issue_epoch_capability(authority, runtime_invalidated)
+    }
+
+    pub(crate) fn validate_post_commit_epoch(
+        &self,
+        capability: &PostCommitEpochCapability,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if capability.is_unbound_test() {
+            return capability.ensure_active();
+        }
+        self.post_commit_feed.validate_epoch_capability(capability)
+    }
+
+    pub(crate) fn issue_post_commit_dispatcher_owner(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<PostCommitDispatcherOwner> {
+        self.validate_post_commit_epoch(epoch)?;
+        self.post_commit_feed.issue_dispatcher_owner(epoch)
+    }
+
+    fn reconcile_post_commit_authenticated_head(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed.reconcile_authenticated(durable_head)
+    }
+
+    fn mint_post_commit_quiescence(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+        through: u64,
+    ) -> Result<EventWriterQuiescence> {
+        self.post_commit_feed.mint_quiescence(owner, through)
+    }
+
+    pub(crate) fn validate_post_commit_quiescence(
+        &self,
+        proof: EventWriterQuiescence,
+        owner: &PostCommitDispatcherOwner,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<u64> {
+        self.post_commit_feed
+            .validate_quiescence(proof, owner, epoch)
+    }
+
+    fn publish_committed_event_seqs(&self, seqs: &[u64]) -> Result<()> {
+        self.post_commit_feed.publish_exact(seqs)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_committed_event_receipt(&self, seqs: &[u64]) -> Result<()> {
+        self.publish_committed_event_seqs(seqs)
+    }
+
+    /// Read one bounded exact sequence page from the canonical durable FIFO.
+    ///
+    /// T26 invokes this only after T17 hydration authenticated the retained
+    /// prefix. EventWriter authenticates and extends that prefix for every
+    /// later commit. A missing or non-contiguous row is therefore a permanent
+    /// dispatcher invariant failure rather than a transport retry.
+    pub(crate) async fn committed_event_sequences(
+        &self,
+        after_seq: u64,
+        through_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        if limit == 0 {
+            bail!("post-commit dispatcher page size must be positive");
+        }
+        if through_seq <= after_seq {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq
+             FROM agent_events
+             WHERE seq > ? AND seq <= ?
+             ORDER BY seq
+             LIMIT ?",
+        )
+        .bind(i64::try_from(after_seq).context("post-commit cursor exceeds SQLite INTEGER range")?)
+        .bind(
+            i64::try_from(through_seq)
+                .context("post-commit high-water exceeds SQLite INTEGER range")?,
+        )
+        .bind(i64::try_from(limit).context("post-commit page limit exceeds SQLite range")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to read committed post-commit sequence page")?;
+
+        rows.into_iter()
+            .map(|seq| u64::try_from(seq).context("committed event sequence is negative"))
+            .collect()
     }
 
     async fn validate_startup(&self) -> Result<()> {

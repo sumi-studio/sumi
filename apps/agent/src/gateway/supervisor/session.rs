@@ -41,11 +41,13 @@ pub(crate) enum DurableEventAdmission {
     Deferred { after_epoch: Option<DeliveryEpoch> },
 }
 
-/// Opaque T17 capability transferred from a durable source to Session.
+/// Opaque T26/T17 delivery capability transferred from a durable source to
+/// Session.
 ///
-/// Session can only notify a committed sequence or offer a typed volatile
-/// event. It never receives a `DeliveryEpoch` and cannot send an event frame
-/// directly to T24.
+/// Durable sequences await the one post-commit dispatcher's cumulative
+/// admission proof; volatile events are offered directly to T17's online
+/// delivery gate. Session never receives a `DeliveryEpoch` and cannot send an
+/// event frame directly to T24.
 #[derive(Clone)]
 pub struct SessionEventSink {
     delivery: Arc<dyn SessionEventDelivery>,
@@ -83,8 +85,8 @@ impl SessionEventSink {
 /// The supervisor remains the sole owner of connection epochs, delivery epoch
 /// creation/invalidation, stale-frame rejection, and the authenticated T17
 /// delivery mode. Session events are exhaustively separated from ACKs: durable
-/// events notify T17 by sequence, volatile events enter T17's Online+Raw gate,
-/// and only ACKs may use T24's lossy direct path.
+/// events await T26's one ordered post-commit proof, volatile events enter
+/// T17's Online+Raw gate, and only ACKs may use T24's direct path.
 pub struct SessionGateway {
     commands: mpsc::Receiver<InboundCommand>,
     ack_events: EventSender,

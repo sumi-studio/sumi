@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use sqlx::Row;
 use thiserror::Error;
 use tokio::{sync::mpsc, time::timeout};
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
@@ -169,7 +170,29 @@ impl DurableDeliveryReservation {
     }
 
     pub(crate) async fn deliver(&self) -> Result<DurableDeliveryOutcome> {
-        let _serial = self.pump.durable_serial.lock().await;
+        self.deliver_until_cancelled(None).await
+    }
+
+    /// Deliver while the reservation remains owned by `cancel`'s epoch.
+    ///
+    /// Every pending operation remains inside this future. Cancellation drops
+    /// the Store read or channel send in place, so no detached work can emit a
+    /// durable frame after the epoch has been invalidated.
+    pub(crate) async fn deliver_with_cancellation(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<DurableDeliveryOutcome> {
+        self.deliver_until_cancelled(Some(cancel)).await
+    }
+
+    async fn deliver_until_cancelled(
+        &self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<DurableDeliveryOutcome> {
+        let Some(_serial) = await_unless_cancelled(cancel, self.pump.durable_serial.lock()).await
+        else {
+            return Ok(DurableDeliveryOutcome::EpochLost);
+        };
         let (epoch, failure_tx) = match &*self.pump.lock_state() {
             PumpState::Idle => return Ok(DurableDeliveryOutcome::EpochLost),
             PumpState::CatchingUp {
@@ -182,39 +205,46 @@ impl DurableDeliveryReservation {
                 return Ok(DurableDeliveryOutcome::EpochLost);
             }
         };
-        if let Err(err) = send_event_range(
+        match send_event_range(
             &self.pump.store,
             &self.pump.channel,
             &epoch,
             self.seq,
             self.seq,
+            cancel,
         )
         .await
         {
-            let mut state = self.pump.lock_state();
-            // A replacement epoch may have been installed while the bounded
-            // durable send was waiting. Only the epoch that initiated the send
-            // may transition itself to Idle or notify its failure supervisor.
-            if matches!(
-                &*state,
-                PumpState::CatchingUp { epoch: current, .. }
-                    | PumpState::Online { epoch: current, .. }
-                    if *current == epoch
-            ) {
-                *state = PumpState::Idle;
-                if let Some(failure_tx) = failure_tx {
-                    let failure = if err.is::<DeliveryTransportError>() {
-                        DeliveryEpochFailure::Reconnect(format!("durable delivery failed: {err:#}"))
-                    } else {
-                        DeliveryEpochFailure::Fatal(format!(
-                            "durable delivery failed permanently: {err:#}"
-                        ))
-                    };
-                    let _ = failure_tx.send(failure);
+            Ok(false) => return Ok(DurableDeliveryOutcome::EpochLost),
+            Ok(true) => {}
+            Err(err) => {
+                let mut state = self.pump.lock_state();
+                // A replacement epoch may have been installed while the bounded
+                // durable send was waiting. Only the epoch that initiated the send
+                // may transition itself to Idle or notify its failure supervisor.
+                if matches!(
+                    &*state,
+                    PumpState::CatchingUp { epoch: current, .. }
+                        | PumpState::Online { epoch: current, .. }
+                        if *current == epoch
+                ) {
+                    *state = PumpState::Idle;
+                    if let Some(failure_tx) = failure_tx {
+                        let failure = if err.is::<DeliveryTransportError>() {
+                            DeliveryEpochFailure::Reconnect(format!(
+                                "durable delivery failed: {err:#}"
+                            ))
+                        } else {
+                            DeliveryEpochFailure::Fatal(format!(
+                                "durable delivery failed permanently: {err:#}"
+                            ))
+                        };
+                        let _ = failure_tx.send(failure);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
+                return Ok(DurableDeliveryOutcome::EpochLost);
             }
-            return Ok(DurableDeliveryOutcome::EpochLost);
         }
         Ok(DurableDeliveryOutcome::Enqueued)
     }
@@ -439,21 +469,28 @@ async fn send_event_range(
     epoch: &DeliveryEpoch,
     first_seq: u64,
     last_seq: u64,
-) -> Result<()> {
+    cancel: Option<&CancellationToken>,
+) -> Result<bool> {
     if first_seq > last_seq {
-        return Ok(());
+        return Ok(true);
     }
-    let rows = sqlx::query(
-        "SELECT seq, raw_key_ref, raw_ciphertext, envelope, redaction_version
-         FROM agent_events
-         WHERE seq >= ? AND seq <= ?
-         ORDER BY seq",
+    let Some(rows) = await_unless_cancelled(
+        cancel,
+        sqlx::query(
+            "SELECT seq, raw_key_ref, raw_ciphertext, envelope, redaction_version
+             FROM agent_events
+             WHERE seq >= ? AND seq <= ?
+             ORDER BY seq",
+        )
+        .bind(i64::try_from(first_seq).context("first_seq exceeds SQLite INTEGER range")?)
+        .bind(i64::try_from(last_seq).context("last_seq exceeds SQLite INTEGER range")?)
+        .fetch_all(store.pool()),
     )
-    .bind(i64::try_from(first_seq).context("first_seq exceeds SQLite INTEGER range")?)
-    .bind(i64::try_from(last_seq).context("last_seq exceeds SQLite INTEGER range")?)
-    .fetch_all(store.pool())
     .await
-    .context("failed to fetch durable events for delivery")?;
+    else {
+        return Ok(false);
+    };
+    let rows = rows.context("failed to fetch durable events for delivery")?;
 
     for row in rows {
         let seq: i64 = row.try_get("seq")?;
@@ -466,23 +503,51 @@ async fn send_event_range(
         let (raw, projection) = match channel.mode {
             DeliveryMode::RedactionOnly => (None, Some(envelope)),
             DeliveryMode::Raw => {
-                let raw = decrypt_event(store, seq, &key_ref, &ciphertext)
-                    .await
-                    .context("failed to decrypt durable event for raw delivery")?;
+                let Some(raw) = await_unless_cancelled(
+                    cancel,
+                    decrypt_event(store, seq, &key_ref, &ciphertext),
+                )
+                .await
+                else {
+                    return Ok(false);
+                };
+                let raw = raw.context("failed to decrypt durable event for raw delivery")?;
                 (Some(raw), None)
             }
         };
 
-        channel
-            .send(DeliveryFrame::Durable {
+        let Some(sent) = await_unless_cancelled(
+            cancel,
+            channel.send(DeliveryFrame::Durable {
                 seq,
                 epoch: *epoch,
                 raw,
                 projection,
-            })
-            .await?;
+            }),
+        )
+        .await
+        else {
+            return Ok(false);
+        };
+        sent?;
     }
-    Ok(())
+    Ok(true)
+}
+
+async fn await_unless_cancelled<F, T>(cancel: Option<&CancellationToken>, future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    match cancel {
+        Some(cancel) => {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                value = future => Some(value),
+            }
+        }
+        None => Some(future.await),
+    }
 }
 
 async fn decrypt_event(
