@@ -27,7 +27,7 @@ function Home() {
 
   const send = () => {
     const text = input.trim();
-    if (!text) return;
+    if (!text || ready !== "ready") return;
     if (!socket.sendCommand({ type: "user_message", text, attachments: [] })) return;
     setInput("");
   };
@@ -52,7 +52,7 @@ function Home() {
       <form className="mt-8 flex gap-2 border-t pt-4" onSubmit={(event) => { event.preventDefault(); send(); }}>
         <label className="sr-only" htmlFor="message">メッセージ</label>
         <textarea id="message" className="min-h-12 flex-1 resize-none rounded-lg border p-3" value={input} onChange={(event) => setInput(event.target.value)} placeholder="メッセージ…" />
-        <button className="rounded-lg bg-zinc-900 px-4 text-white disabled:opacity-40" disabled={connection !== "connected" || !input.trim()} type="submit">
+        <button className="rounded-lg bg-zinc-900 px-4 text-white disabled:opacity-40" disabled={connection !== "connected" || ready !== "ready" || !input.trim()} type="submit">
           {streaming ? "Steer" : "送信"}
         </button>
         {streaming && <button className="rounded-lg border px-3 disabled:opacity-40" disabled={connection !== "connected"} type="button" onClick={() => socket.sendCommand({ type: "abort" })}>停止</button>}
