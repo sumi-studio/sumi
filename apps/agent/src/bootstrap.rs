@@ -230,6 +230,12 @@ fn required_value(get: &mut impl FnMut(&str) -> Option<OsString>, name: &str) ->
         .with_context(|| format!("{name} is required for production bootstrap"))?
         .into_string()
         .map_err(|_| anyhow!("{name} must be valid UTF-8"))
+        .and_then(|value| {
+            if value.is_empty() {
+                bail!("{name} must not be empty");
+            }
+            Ok(value)
+        })
 }
 
 fn required_absolute_path(
@@ -2476,6 +2482,37 @@ mod tests {
             env.remove(name);
             let error = parse(&env).err().expect("missing value must fail");
             assert!(error.to_string().contains(name), "{name}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn every_required_environment_value_rejects_empty_before_composition() {
+        for name in [
+            "SUMI_PERSONALITY_AGENT_ID",
+            "SUMI_RPC_GENERATION",
+            "SUMI_RPC_NONCE",
+            "SUMI_PROCESS_GENERATION_LEASE_ID",
+            "SUMI_GENERATION_RECOVERY_FENCE_ID",
+            "SUMI_STATE_DIR",
+            "SUMI_EXECUTOR_SOCKET",
+            "SUMI_GATEWAY_URL",
+            "SUMI_LOCAL_CONTROL_UNIX_SOCKET",
+            "SUMI_LOCAL_CONTROL_SERVER_UID",
+            "SUMI_LOCAL_CONTROL_SOCKET_GID",
+            "SUMI_LOCAL_CONTROL_BEARER",
+            "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
+            "SUMI_AGENT_WRAPPING_KEY_ID",
+            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
+        ] {
+            let mut env = valid_env();
+            env.insert(name.to_owned(), OsString::new());
+            let error = parse(&env).err().expect("empty value must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{name} must not be empty")),
+                "{name}: {error:#}"
+            );
         }
     }
 
