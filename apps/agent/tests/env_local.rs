@@ -19,6 +19,7 @@ fn startup_loads_an_explicitly_selected_env_file() {
     .expect("write .env.local");
 
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--low-trust")
         .current_dir(&directory)
         .env("SUMI_ENV_FILE", directory.join(".env.local"))
         .env_remove("SUMI_CONFIG")
@@ -52,6 +53,7 @@ fn startup_does_not_implicitly_trust_dot_env_local_in_the_working_directory() {
     .expect("write .env.local");
 
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--low-trust")
         .current_dir(&directory)
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
@@ -72,4 +74,24 @@ fn startup_does_not_implicitly_trust_dot_env_local_in_the_working_directory() {
     fs::remove_dir_all(directory).expect("remove test directory");
 
     assert!(output.status.success());
+}
+
+#[test]
+fn normal_startup_never_falls_back_to_stdio() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .expect("run production-default sumi-agent");
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "production default wrote stdio frames"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SUMI_PERSONALITY_AGENT_ID is required for production bootstrap"),
+        "unexpected stderr: {stderr}"
+    );
 }
