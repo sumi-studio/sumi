@@ -11,7 +11,7 @@ use std::{
     process::{Command, Stdio},
     sync::{Mutex, MutexGuard, OnceLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_yaml::Value;
@@ -280,6 +280,22 @@ fn launch_runtime_env(command: &mut Command, fixture: &HostTrustFixture) {
     command
         .env_remove("SUMI_LOCAL_CONTROL_HOST_ROOT")
         .env_remove("SUMI_SUPERVISOR_LOCK_DIR");
+}
+
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -848,6 +864,14 @@ case "$*" in
     fi
     exit 0
     ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    for role in allocator prepare runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
+    exit 0
+    ;;
   *"compose.yaml up --detach --build --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
@@ -891,6 +915,10 @@ esac
     }
     assert!(markers.join("cleanup-lock-held").exists());
     assert!(!markers.join("cleanup-lock-missing").exists());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cleanup incomplete"),
+        "verified-empty cleanup was reported as incomplete"
+    );
 
     let calls = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
@@ -905,29 +933,204 @@ esac
 }
 
 #[test]
+fn failed_up_retries_cleanup_and_reports_redacted_exhaustion_without_replacing_status() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let cleanup_sentinel = "cleanup-output-sentinel-not-for-output";
+    let provider_sentinel = "cleanup-provider-sentinel-not-for-output";
+
+    for (mode, cleanup_attempts, expect_empty, expect_diagnostic) in
+        [("retry", 2, true, false), ("exhaust", 3, false, true)]
+    {
+        let root = std::env::temp_dir().join(format!("cleanup-{mode}-{}", Uuid::now_v7().simple()));
+        let bin = root.join("bin");
+        let markers = root.join("markers");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&markers).unwrap();
+        let fake_docker = bin.join("docker");
+        let script = r#"#!/bin/bash
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version" | *"compose.yaml config --quiet")
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    if [[ ! -f "$SUMI_FAKE_MARKERS/up-attempted" ]]; then
+      exit 0
+    fi
+    exec 9<>"$SUMI_EXPECT_LOCK_PATH"
+    if flock -n 9; then
+      touch "$SUMI_FAKE_MARKERS/cleanup-lock-missing"
+    else
+      touch "$SUMI_FAKE_MARKERS/cleanup-lock-held"
+    fi
+    attempt=0
+    if [[ -f "$SUMI_FAKE_MARKERS/cleanup-attempts" ]]; then
+      read -r attempt < "$SUMI_FAKE_MARKERS/cleanup-attempts"
+    fi
+    attempt=$((attempt + 1))
+    printf '%s\n' "$attempt" > "$SUMI_FAKE_MARKERS/cleanup-attempts"
+    printf '%s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY"
+    printf '%s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY" >&2
+    if [[ "$SUMI_FAKE_CLEANUP_MODE" == retry && "$attempt" -ge 2 ]]; then
+      rm -f \
+        "$SUMI_FAKE_MARKERS/allocator" \
+        "$SUMI_FAKE_MARKERS/prepare" \
+        "$SUMI_FAKE_MARKERS/runtime" \
+        "$SUMI_FAKE_MARKERS/executor" \
+        "$SUMI_FAKE_MARKERS/broker"
+    fi
+    exit 88
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    printf '%s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY" >&2
+    for role in allocator prepare runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container %s %s\n' "$SUMI_CLEANUP_SENTINEL" "$SUMI_PROVIDER_API_KEY"
+        exit 0
+      fi
+    done
+    exit 0
+    ;;
+  *"compose.yaml up --detach --build --wait")
+    touch "$SUMI_FAKE_MARKERS/up-attempted"
+    touch \
+      "$SUMI_FAKE_MARKERS/allocator" \
+      "$SUMI_FAKE_MARKERS/prepare" \
+      "$SUMI_FAKE_MARKERS/runtime" \
+      "$SUMI_FAKE_MARKERS/executor" \
+      "$SUMI_FAKE_MARKERS/broker"
+    exit 37
+    ;;
+  *)
+    exit 93
+    ;;
+esac
+"#;
+        std::fs::write(&fake_docker, script).unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = root.join("docker.log");
+
+        let mut command = Command::new(deploy_dir().join("supervisor"));
+        command
+            .arg("up")
+            .env("PATH", format!("{}:{inherited_path}", bin.display()))
+            .env("SUMI_FAKE_DOCKER_LOG", &log)
+            .env("SUMI_FAKE_MARKERS", &markers)
+            .env("SUMI_EXPECT_LOCK_PATH", &fixture.lock_path)
+            .env("SUMI_FAKE_CLEANUP_MODE", mode)
+            .env("SUMI_CLEANUP_SENTINEL", cleanup_sentinel);
+        launch_runtime_env(&mut command, &fixture);
+        command.env("SUMI_PROVIDER_API_KEY", provider_sentinel);
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "{mode} cleanup replaced the launch status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let combined = [output.stdout, output.stderr.clone()].concat();
+        for sentinel in [cleanup_sentinel, provider_sentinel] {
+            assert!(
+                !combined
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "{mode} cleanup leaked {sentinel}"
+            );
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains(
+                "partial-generation cleanup incomplete after 3 attempts (details redacted)"
+            ),
+            expect_diagnostic,
+            "unexpected {mode} cleanup diagnostic: {stderr}"
+        );
+        assert!(markers.join("cleanup-lock-held").exists());
+        assert!(!markers.join("cleanup-lock-missing").exists());
+        assert_eq!(
+            std::fs::read_to_string(markers.join("cleanup-attempts"))
+                .unwrap()
+                .trim(),
+            cleanup_attempts.to_string()
+        );
+        for role in ["allocator", "prepare", "runtime", "executor", "broker"] {
+            assert_eq!(
+                !markers.join(role).exists(),
+                expect_empty,
+                "unexpected {mode} cleanup state for {role}"
+            );
+        }
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("compose.lifecycle.yaml down --remove-orphans"))
+                .count(),
+            cleanup_attempts + 1,
+            "unexpected {mode} down attempts: {calls}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("compose.lifecycle.yaml ps --all --quiet"))
+                .count(),
+            cleanup_attempts,
+            "unexpected {mode} verification attempts: {calls}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
 fn interrupted_up_joins_partial_roles_and_returns_signal_status() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
     };
-    let root = std::env::temp_dir().join(format!("sig-{}", Uuid::now_v7().simple()));
-    let bin = root.join("bin");
-    let markers = root.join("markers");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::create_dir_all(&markers).unwrap();
-    let fake_docker = bin.join("docker");
-    let script = r#"#!/bin/bash
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    for (label, signal, expected_status) in
+        [("term", libc::SIGTERM, 143), ("int", libc::SIGINT, 130)]
+    {
+        let root = std::env::temp_dir().join(format!("sig-{label}-{}", Uuid::now_v7().simple()));
+        let bin = root.join("bin");
+        let markers = root.join("markers");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&markers).unwrap();
+        let fake_docker = bin.join("docker");
+        let script = r#"#!/bin/bash
+trap 'touch "$SUMI_FAKE_MARKERS/compose-child-terminated"; exit 143' TERM
+trap 'touch "$SUMI_FAKE_MARKERS/compose-child-interrupted"; exit 130' INT
 case "$*" in
   "compose version"|*"compose.yaml config --quiet")
     exit 0
     ;;
   *"compose.lifecycle.yaml down --remove-orphans"*)
     if [[ -f "$SUMI_FAKE_MARKERS/up-attempted" ]]; then
+      exec 9<>"$SUMI_EXPECT_LOCK_PATH"
+      if flock -n 9; then
+        touch "$SUMI_FAKE_MARKERS/cleanup-lock-missing"
+      else
+        touch "$SUMI_FAKE_MARKERS/cleanup-lock-held"
+      fi
       rm -f \
         "$SUMI_FAKE_MARKERS/runtime" \
         "$SUMI_FAKE_MARKERS/executor" \
         "$SUMI_FAKE_MARKERS/broker"
       touch "$SUMI_FAKE_MARKERS/cleanup-complete"
     fi
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    for role in runtime executor broker; do
+      if [[ -f "$SUMI_FAKE_MARKERS/$role" ]]; then
+        printf 'fake-container-%s\n' "$role"
+      fi
+    done
     exit 0
     ;;
   *"compose.yaml up --detach --build --wait")
@@ -943,47 +1146,57 @@ case "$*" in
     ;;
 esac
 "#;
-    std::fs::write(&fake_docker, script).unwrap();
-    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let inherited_path = std::env::var("PATH").unwrap_or_default();
+        std::fs::write(&fake_docker, script).unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut command = Command::new(deploy_dir().join("supervisor"));
-    command
-        .arg("up")
-        .process_group(0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("PATH", format!("{}:{inherited_path}", bin.display()))
-        .env("SUMI_FAKE_MARKERS", &markers);
-    launch_runtime_env(&mut command, &fixture);
-    let mut child = command.spawn().unwrap();
-    for _ in 0..100 {
-        if markers.join("up-attempted").exists() {
-            break;
+        let mut command = Command::new(deploy_dir().join("supervisor"));
+        command
+            .arg("up")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("PATH", format!("{}:{inherited_path}", bin.display()))
+            .env("SUMI_FAKE_MARKERS", &markers)
+            .env("SUMI_EXPECT_LOCK_PATH", &fixture.lock_path);
+        launch_runtime_env(&mut command, &fixture);
+        let mut child = command.spawn().unwrap();
+        for _ in 0..100 {
+            if markers.join("up-attempted").exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("supervisor exited before {label} fixture was ready: {status}");
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("supervisor exited before interrupt fixture was ready: {status}");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        markers.join("up-attempted").exists(),
-        "supervisor never entered the interruptible up phase"
-    );
-    assert_eq!(
-        unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) },
-        0
-    );
-    let status = child.wait().unwrap();
-    assert_eq!(status.code(), Some(143));
-    assert!(markers.join("cleanup-complete").exists());
-    for role in ["runtime", "executor", "broker"] {
         assert!(
-            !markers.join(role).exists(),
-            "partial {role} survived SIGTERM cleanup"
+            markers.join("up-attempted").exists(),
+            "supervisor never entered the {label} interruptible up phase"
         );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let status = match wait_for_child_exit(&mut child, Duration::from_secs(5)) {
+            Some(status) => status,
+            None => {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                panic!("PID-only {label} did not promptly terminate the supervisor");
+            }
+        };
+        assert_eq!(status.code(), Some(expected_status));
+        assert!(markers.join("compose-child-terminated").exists());
+        assert!(markers.join("cleanup-complete").exists());
+        assert!(markers.join("cleanup-lock-held").exists());
+        assert!(!markers.join("cleanup-lock-missing").exists());
+        for role in ["runtime", "executor", "broker"] {
+            assert!(
+                !markers.join(role).exists(),
+                "partial {role} survived PID-only {label}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

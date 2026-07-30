@@ -43,6 +43,10 @@ require_docker() {
   docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
 }
 
+require_tracked_compose_support() {
+  command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
+}
+
 validate_root_owned_anchor() {
   local path="$1"
   local owner mode canonical
@@ -226,6 +230,11 @@ declare SUPERVISOR_LOCK_FD
 declare LOCAL_CONTROL_TRUST_SNAPSHOT
 declare SUMI_LOCAL_CONTROL_HOST_DIR
 declare CLEANUP_ARMED=0
+declare ACTIVE_COMPOSE_PID=
+readonly CLEANUP_MAX_ATTEMPTS=3
+readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
+readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
+readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
 
 launch_compose() {
   docker compose \
@@ -241,24 +250,84 @@ lifecycle_compose() {
     "$@"
 }
 
+run_tracked_compose() {
+  local compose_file="$1"
+  shift
+  local status
+  setsid docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${compose_file}" \
+    "$@" &
+  ACTIVE_COMPOSE_PID=$!
+  if wait "${ACTIVE_COMPOSE_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  ACTIVE_COMPOSE_PID=
+  return "${status}"
+}
+
+terminate_active_compose() {
+  local pid="${ACTIVE_COMPOSE_PID:-}"
+  local attempt
+  [[ -n "${pid}" ]] || return 0
+  ACTIVE_COMPOSE_PID=
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+
 validate_compose_redacted() {
   if ! launch_compose config --quiet >/dev/null 2>&1; then
     fail "Compose validation failed (details redacted)"
   fi
 }
 
+cleanup_project_is_empty() {
+  local containers
+  containers="$(lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
+  [[ -z "${containers//[[:space:]]/}" ]]
+}
+
 cleanup_partial_generation() {
   local status="$1"
+  local attempt
+  local cleanup_complete=0
   trap - ERR EXIT
   # Once teardown starts, do not let a repeated terminal signal interrupt the
   # synchronous join. The saved launch/signal status is returned afterward.
   trap '' INT TERM
+  set +e
+  terminate_active_compose
   if (( CLEANUP_ARMED )); then
     CLEANUP_ARMED=0
-    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
-      >/dev/null 2>&1 || true
+    # A nonzero `down` can still leave an empty project, while a zero status is
+    # not the cleanup contract by itself. Bound retries on observed emptiness.
+    for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1
+      if cleanup_project_is_empty; then
+        cleanup_complete=1
+        break
+      fi
+      if (( attempt < CLEANUP_MAX_ATTEMPTS )); then
+        sleep "${CLEANUP_RETRY_DELAY_SECONDS}"
+      fi
+    done
+    if (( ! cleanup_complete )); then
+      log "ERROR: partial-generation cleanup incomplete after ${CLEANUP_MAX_ATTEMPTS} attempts (details redacted)"
+    fi
   fi
-  trap - INT TERM
   exit "${status}"
 }
 
@@ -289,15 +358,17 @@ case "${action}" in
   up|restart)
     acquire_supervisor_lock
     require_docker
+    require_tracked_compose_support
     require_launch_environment
     validate_compose_redacted
     revalidate_local_control_socket
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
-    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" \
+      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     revalidate_local_control_socket
-    launch_compose up --detach --build --wait
+    run_tracked_compose "${COMPOSE_FILE}" up --detach --build --wait
     revalidate_local_control_socket
     disarm_partial_generation_cleanup
     log "project ${SUMI_COMPOSE_PROJECT} containers started; runtime owns authenticated dependency Health and Ready"
