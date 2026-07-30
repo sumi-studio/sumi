@@ -1,6 +1,7 @@
 mod agent;
 mod apiclient;
 mod approval;
+mod bootstrap;
 mod config;
 mod gateway;
 mod memory;
@@ -63,7 +64,15 @@ async fn main() -> Result<()> {
             );
             return tools::executor::run_artifact_broker_mode().await;
         }
-        _ => {}
+        Some("--low-trust") => {
+            tracing::warn!(
+                service = "agent",
+                trust = "low-trust-stdio",
+                "starting explicit stdio mode"
+            );
+        }
+        Some(other) => anyhow::bail!("unknown sumi-agent mode {other}"),
+        None => return bootstrap::run_production().await,
     }
     let config = config::Config::load().await?;
 
