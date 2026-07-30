@@ -658,6 +658,39 @@ async fn finish_active(session: &mut Session<MockGateway>) {
         .expect("worker completion");
 }
 
+async fn replace_finished_active_join_with_gate(session: &mut Session<MockGateway>) -> Arc<Notify> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .active
+                .as_ref()
+                .expect("active worker")
+                .join
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker task finished after publishing completion");
+
+    let release = Arc::new(Notify::new());
+    let replacement = tokio::spawn({
+        let release = release.clone();
+        async move {
+            release.notified().await;
+        }
+    });
+    let original = {
+        let active = session.active.as_mut().expect("active worker");
+        std::mem::replace(&mut active.join, replacement)
+    };
+    original.await.expect("completed worker task");
+    release
+}
+
 async fn drive_active_to_completion<G: Gateway>(
     session: &mut Session<G>,
 ) -> Result<(), SessionFailure> {
@@ -4419,6 +4452,106 @@ async fn cancelling_shutdown_active_before_settlement_retains_worker_ownership()
     tokio::time::timeout(std::time::Duration::from_secs(2), worker_dropped.notified())
         .await
         .expect("resumed shutdown aborts the still-owned worker");
+}
+
+#[tokio::test]
+async fn cancelling_finish_after_completion_before_join_retains_returned_core() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let core = RunCore::fixture_with_unapproved_tools();
+    let ownership_id = core.ownership_id();
+    let mut session = session_with_core(gateway, worker, core).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let release_join = replace_finished_active_join_with_gate(&mut session).await;
+    let completion = session
+        .active
+        .as_mut()
+        .expect("active worker")
+        .completion_rx
+        .try_recv()
+        .expect("published completion");
+
+    let mut finish = Box::pin(session.finish_run(Ok(completion)));
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(finish.as_mut().poll(&mut context), Poll::Pending));
+    drop(finish);
+
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id),
+        "a cancelled completion handler must leave the returned RunCore in Session"
+    );
+    assert!(
+        session.active.is_some(),
+        "ActiveRun must remain installed until its join and output drain settle"
+    );
+
+    release_join.notify_one();
+    session.shutdown_active().await;
+    assert!(session.active.is_none());
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_shutdown_after_completion_before_join_retains_returned_core() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let core = RunCore::fixture_with_unapproved_tools();
+    let ownership_id = core.ownership_id();
+    let mut session = session_with_core(gateway, worker, core).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let release_join = replace_finished_active_join_with_gate(&mut session).await;
+
+    let mut shutdown = Box::pin(session.shutdown_active());
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        shutdown.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        shutdown.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(shutdown);
+
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id),
+        "a cancelled shutdown handler must leave the returned RunCore in Session"
+    );
+    assert!(
+        session.active.is_some(),
+        "ActiveRun must remain installed until its join and output drain settle"
+    );
+
+    release_join.notify_one();
+    session.shutdown_active().await;
+    assert!(session.active.is_none());
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id)
+    );
 }
 
 #[tokio::test]

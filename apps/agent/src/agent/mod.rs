@@ -1978,25 +1978,45 @@ impl<G: Gateway + 'static> Session<G> {
         self.finish_run_with_route(completion, true).await
     }
 
+    fn install_run_completion_ownership(
+        &mut self,
+        completion: RunCompletion,
+    ) -> Option<WorkerFailure> {
+        match completion {
+            RunCompletion::Completed(core) => {
+                self.core = Some(core);
+                None
+            }
+            RunCompletion::Failed { core, failure } => {
+                self.core = Some(core);
+                Some(failure)
+            }
+            RunCompletion::RehydrationRequired { failure } => {
+                self.core = None;
+                self.durable_core_invalidated = true;
+                Some(failure)
+            }
+        }
+    }
+
     async fn finish_run_with_route(
         &mut self,
         completion: std::result::Result<RunCompletion, oneshot::error::RecvError>,
         route_after_completion: bool,
     ) -> std::result::Result<(), SessionFailure> {
-        // Keep ActiveRun installed in Session across every await. Once it is
-        // taken below there are no cancellation points before the returned
-        // RunCore is installed, so cancelling this handler cannot orphan the
-        // unique owner.
-        let join_result = {
-            let active = self
-                .active
-                .as_mut()
-                .expect("completion requires active run");
-            (&mut active.join).await
-        };
-        let completion = match completion {
-            Ok(completion) => completion,
+        // A successful completion transfer carries the unique RunCore or a
+        // durable invalidation verdict. Install that ownership state before
+        // the first await, while retaining ActiveRun through join and drain.
+        let worker_failure = match completion {
+            Ok(completion) => self.install_run_completion_ownership(completion),
             Err(_) => {
+                let join_result = {
+                    let active = self
+                        .active
+                        .as_mut()
+                        .expect("completion requires active run");
+                    (&mut active.join).await
+                };
                 self.active.take();
                 return match join_result {
                     Err(error) => Err(worker_join_failure(error)),
@@ -2004,23 +2024,17 @@ impl<G: Gateway + 'static> Session<G> {
                 };
             }
         };
+        let join_result = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("completion requires active run");
+            (&mut active.join).await
+        };
         if let Err(error) = join_result {
             self.active.take();
             return Err(worker_join_failure(error));
         }
-        let (core, worker_failure) = match completion {
-            RunCompletion::Completed(core) => (Some(core), None),
-            RunCompletion::Failed { core, failure } => (Some(core), Some(failure)),
-            RunCompletion::RehydrationRequired { failure } => {
-                self.durable_core_invalidated = true;
-                (None, Some(failure))
-            }
-        };
-        // Install the returned owner before draining durable outputs. If this
-        // handler future is cancelled by a test harness after worker join,
-        // Session still owns both the returned core and the attached output
-        // lane and can resume settlement.
-        self.core = core;
         let delivery_failure = match self.drain_active_outputs(route_after_completion).await {
             Ok(failure) => failure,
             Err(error) => {
@@ -2140,7 +2154,10 @@ impl<G: Gateway + 'static> Session<G> {
             .completion_rx
             .try_recv();
         match completion {
-            Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. }) => {
+            Ok(completion) => {
+                // Consume the completion's RunCore or invalidation verdict
+                // synchronously before joining the task that published it.
+                let _ = self.install_run_completion_ownership(completion);
                 let join_result = {
                     let active = self.active.as_mut().expect("active run checked above");
                     (&mut active.join).await
@@ -2154,26 +2171,12 @@ impl<G: Gateway + 'static> Session<G> {
                 match self.drain_active_outputs(false).await {
                     Ok(_) => {
                         self.active.take();
-                        self.core = Some(core);
                     }
                     Err(_) => {
                         self.active.take();
                         self.durable_core_invalidated = true;
                     }
                 }
-            }
-            Ok(RunCompletion::RehydrationRequired { .. }) => {
-                let join_result = {
-                    let active = self.active.as_mut().expect("active run checked above");
-                    (&mut active.join).await
-                };
-                if join_result.is_err() {
-                    self.active.take();
-                    return;
-                }
-                self.durable_core_invalidated = true;
-                let _ = self.drain_active_outputs(false).await;
-                self.active.take();
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 {
