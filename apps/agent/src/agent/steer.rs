@@ -135,6 +135,21 @@ impl AttemptCancellation {
         self.hard_steer_committed.load(Ordering::Acquire)
     }
 
+    /// Runtime shutdown cancellation is not a durable hard-steer transition.
+    /// Signal the currently registered attempt without taking its token so the
+    /// worker can finish its normal cancellation suffix and return RunCore.
+    pub(crate) fn cancel_registered(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("attempt cancellation registry is poisoned"))?;
+        let Some(token) = state.token.as_ref() else {
+            return Ok(false);
+        };
+        token.cancel();
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn has_registered_attempt(&self) -> bool {
         self.state.lock().expect("attempt state").token.is_some()

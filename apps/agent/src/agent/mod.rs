@@ -26,6 +26,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -116,6 +117,7 @@ const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// This is not provider retry backoff; it only prevents one stalled local task
 /// from blocking the Session event lane indefinitely.
 const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -1000,6 +1002,60 @@ impl<G: Gateway + 'static> Session<G> {
                     })
                 };
                 SessionResult::Failed { failure, ownership }
+            }
+        }
+    }
+
+    /// Keep Session ownership inside the future while bootstrap publishes
+    /// NotReady. Cancellation then drains a cooperative active run before the
+    /// bounded abort fallback, so dropping an outer `select!` branch never
+    /// silently detaches Session while the registry is still Ready.
+    pub(crate) async fn run_until_cancelled(
+        mut self,
+        shutdown: CancellationToken,
+    ) -> SessionResult {
+        let result = tokio::select! {
+            result = self.run_until_exit() => Some(result),
+            _ = shutdown.cancelled() => None,
+        };
+        match result {
+            Some(Ok(())) => {
+                self.abort_writer().await;
+                SessionResult::Completed(
+                    self.core
+                        .take()
+                        .expect("clean idle exit retains the unique RunCore"),
+                )
+            }
+            Some(Err(failure)) => {
+                if self.active.is_some() {
+                    self.shutdown_active().await;
+                }
+                self.abort_writer().await;
+                let ownership = if self.durable_core_invalidated {
+                    self.core.take();
+                    RunOwnership::Lost
+                } else {
+                    self.core.take().map_or(RunOwnership::Lost, |core| {
+                        RunOwnership::Recovered(Box::new(core))
+                    })
+                };
+                SessionResult::Failed { failure, ownership }
+            }
+            None => {
+                if self.active.is_some() {
+                    self.shutdown_active_gracefully().await;
+                }
+                self.abort_writer().await;
+                match self.core.take() {
+                    Some(core) => SessionResult::Completed(core),
+                    None => SessionResult::Failed {
+                        failure: SessionFailure::Other(anyhow::anyhow!(
+                            "runtime shutdown could not recover the active RunCore"
+                        )),
+                        ownership: RunOwnership::Lost,
+                    },
+                }
             }
         }
     }
@@ -1985,6 +2041,38 @@ impl<G: Gateway + 'static> Session<G> {
                 let _ = (&mut active.join).await;
             }
             Err(oneshot::error::TryRecvError::Empty) => {
+                active.join.abort();
+                let _ = (&mut active.join).await;
+            }
+        }
+    }
+
+    async fn shutdown_active_gracefully(&mut self) {
+        let Some(mut active) = self.active.take() else {
+            return;
+        };
+        if let Some(approval) = active.approval.as_ref() {
+            approval.cancel_all();
+        }
+        if active.attempt_cancellation.cancel_registered().is_err() {
+            active.join.abort();
+        }
+        match tokio::time::timeout(RUNTIME_SHUTDOWN_GRACE, &mut active.completion_rx).await {
+            Ok(Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. })) => {
+                if (&mut active.join).await.is_err() {
+                    return;
+                }
+                // The caller already holds the primary Session failure. Commit
+                // the suffix, but do not re-enter a failed Gateway during shutdown.
+                match self.drain_disconnected_outputs(&mut active, false).await {
+                    Ok(_) => self.core = Some(core),
+                    Err(_) => self.durable_core_invalidated = true,
+                }
+            }
+            Ok(Err(_)) => {
+                let _ = (&mut active.join).await;
+            }
+            Err(_) => {
                 active.join.abort();
                 let _ = (&mut active.join).await;
             }

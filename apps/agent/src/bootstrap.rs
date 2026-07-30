@@ -15,7 +15,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -42,10 +45,13 @@ use crate::{
     },
     provider::{RequestOptions, types::PromptContext},
     runtime::{allocator::SupervisorAllocation, authority::RuntimeEpochAuthority},
-    store::{AgentScope, EnvironmentKeyProvider, HydrationOutcome, Redactor, Store},
+    store::{
+        AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome, RecoveryStep,
+        Redactor, Store,
+    },
     tools::{
         WorkspacePaths,
-        executor::{ExecutorClient, remote_executor_registry},
+        executor::{ArtifactBrokerClient, ExecutorClient, remote_executor_registry},
     },
 };
 
@@ -53,6 +59,7 @@ struct BootstrapContext {
     authority: RuntimeEpochAuthority,
     state_dir: PathBuf,
     executor_socket: PathBuf,
+    artifact_broker_socket: PathBuf,
     gateway_url: String,
     allow_insecure_loopback_gateway: bool,
     local_control_endpoint: LocalControlEndpoint,
@@ -92,6 +99,8 @@ impl BootstrapContext {
 
         let state_dir = required_absolute_path(&mut get, "SUMI_STATE_DIR")?;
         let executor_socket = required_absolute_path(&mut get, "SUMI_EXECUTOR_SOCKET")?;
+        let artifact_broker_socket =
+            required_absolute_path(&mut get, "SUMI_ARTIFACT_BROKER_SOCKET")?;
         let gateway_url = required_value(&mut get, "SUMI_GATEWAY_URL")?;
         let local_control_endpoint = local_control_endpoint_from_env(&mut get)?;
         let local_control_bearer = required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER")?;
@@ -119,6 +128,7 @@ impl BootstrapContext {
             authority: allocation.into_authority(),
             state_dir,
             executor_socket,
+            artifact_broker_socket,
             gateway_url,
             allow_insecure_loopback_gateway,
             local_control_endpoint,
@@ -252,6 +262,104 @@ fn decode_key(name: &str, value: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
+/// T17 authenticates and orders this plan, but intentionally does not assign
+/// runtime semantics to it. The Store/EventWriter owner must supply the
+/// executor that applies each step and reaches a new authenticated hydration
+/// fixed point. Bootstrap never translates a step into ad-hoc projections.
+#[async_trait]
+trait LogicalRecoveryExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        store: &Store,
+        steps: &[RecoveryStep],
+        authority: &RuntimeEpochAuthority,
+    ) -> Result<()>;
+}
+
+struct LogicalRecoveryExecutorUnavailable;
+
+#[async_trait]
+impl LogicalRecoveryExecutor for LogicalRecoveryExecutorUnavailable {
+    async fn execute(
+        &self,
+        _store: &Store,
+        steps: &[RecoveryStep],
+        _authority: &RuntimeEpochAuthority,
+    ) -> Result<()> {
+        bail!(
+            "authenticated logical recovery has {} ordered step(s), but no Store-owned LogicalRecoveryExecutor is composed; runtime remains NotReady",
+            steps.len()
+        )
+    }
+}
+
+async fn hydrate_to_fixed_point(
+    store: &Store,
+    authority: &RuntimeEpochAuthority,
+    recovery: &dyn LogicalRecoveryExecutor,
+) -> Result<HydratedRunState> {
+    let mut previous_plan = None;
+    loop {
+        match store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .context("hydrate authenticated Store")?
+        {
+            HydrationOutcome::Complete(hydrated) => return Ok(hydrated),
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                bail!(
+                    "physical recovery is required for {} execution(s); runtime remains NotReady",
+                    intents.len()
+                )
+            }
+            HydrationOutcome::LogicalRecoveryRequired { steps } => {
+                if steps.is_empty() {
+                    bail!("T17 returned an empty LogicalRecoveryRequired plan");
+                }
+                if previous_plan.as_ref() == Some(&steps) {
+                    bail!(
+                        "LogicalRecoveryExecutor returned success without advancing the authenticated recovery plan"
+                    );
+                }
+                previous_plan = Some(steps.clone());
+                recovery
+                    .execute(store, &steps, authority)
+                    .await
+                    .context("execute authenticated ordered logical recovery")?;
+            }
+        }
+    }
+}
+
+/// A monitor is constructed before Ready and completes only when an already
+/// authenticated dependency becomes unavailable. Merely probing a socket inode
+/// is not sufficient because it cannot bind PAID/generation/boot nonce.
+trait AuthenticatedDependencyMonitor: Send {
+    fn failure(self: Box<Self>) -> BoxFuture<'static, Result<()>>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "authenticated runtime dependency monitoring is unavailable; executor and artifact broker Health streams must bind the exact RpcIdentity before Ready"
+)]
+struct AuthenticatedDependencyMonitoringUnavailable;
+
+fn authenticated_dependency_monitor(
+    _executor: Arc<ExecutorClient>,
+    _broker: ArtifactBrokerClient,
+) -> Result<Box<dyn AuthenticatedDependencyMonitor>> {
+    Err(anyhow::Error::new(
+        AuthenticatedDependencyMonitoringUnavailable,
+    ))
+}
+
+fn artifact_broker_client(context: &BootstrapContext) -> ArtifactBrokerClient {
+    ArtifactBrokerClient::new(
+        &context.artifact_broker_socket,
+        context.authority.rpc_identity().clone(),
+    )
+}
+
 pub(crate) async fn run_production() -> Result<()> {
     disable_process_dumping()?;
     load_explicit_env_file()?;
@@ -344,25 +452,12 @@ async fn run_after_not_ready(
     )
     .await
     .context("open authenticated Store")?;
-    let hydrated = match store
-        .hydrate(context.authority.lease(), context.authority.fence())
-        .await
-        .context("hydrate authenticated Store")?
-    {
-        HydrationOutcome::Complete(hydrated) => hydrated,
-        HydrationOutcome::PhysicalRecoveryRequired(intents) => {
-            bail!(
-                "physical recovery is required for {} execution(s); runtime remains NotReady",
-                intents.len()
-            )
-        }
-        HydrationOutcome::LogicalRecoveryRequired { steps } => {
-            bail!(
-                "logical recovery is required for {} step(s); runtime remains NotReady",
-                steps.len()
-            )
-        }
-    };
+    let hydrated = hydrate_to_fixed_point(
+        &store,
+        &context.authority,
+        &LogicalRecoveryExecutorUnavailable,
+    )
+    .await?;
 
     let approval = Arc::new(ApprovalBroker::new(
         Policy::new(&config.workspace),
@@ -388,7 +483,8 @@ async fn run_after_not_ready(
         context.authority.rpc_identity().clone(),
     ));
     wait_for_authenticated_executor_ready(&executor_client).await?;
-    let registry = remote_executor_registry(executor_client)
+    let artifact_broker = artifact_broker_client(context);
+    let registry = remote_executor_registry(executor_client.clone())
         .context("build exact remote executor registry")?;
     let prompt = PromptContext {
         system_prompt: config.system_prompt.clone(),
@@ -407,6 +503,7 @@ async fn run_after_not_ready(
         Some(context.authority.generation()),
     )
     .context("compose real provider RunDriver")?
+    .with_broker(artifact_broker)
     .with_hydrated_memory(
         Arc::new(store.clone()),
         context.authority.lease(),
@@ -415,6 +512,8 @@ async fn run_after_not_ready(
     )
     .context("install authenticated memory/provider context")?;
     let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
+    let dependency_monitor =
+        authenticated_dependency_monitor(executor_client, artifact_broker_client(context))?;
 
     let command_digest_factory = store.command_digest_factory().await?;
     let connector = if context.allow_insecure_loopback_gateway {
@@ -472,25 +571,153 @@ async fn run_after_not_ready(
     wait_for_supervisor_online(&mut supervisor_online)
         .await
         .context("wait for authenticated Gateway catch-up")?;
-    publisher
-        .publish_ready(&ready_proof)
+    publish_ready_reconciling(|| publisher.publish_ready(&ready_proof))
         .await
         .context("publish exact Ready")?;
 
-    let session_result = tokio::select! {
-        result = session.run() => Some(result),
-        signal = shutdown_signal() => {
-            signal.context("wait for shutdown signal")?;
-            None
+    supervise_ready_session(
+        publisher,
+        session,
+        shutdown_signal(),
+        dependency_monitor.failure(),
+    )
+    .await
+}
+
+async fn publish_ready_reconciling<'a, Publish, Published>(mut publish: Publish) -> Result<()>
+where
+    Publish: FnMut() -> Published,
+    Published: std::future::Future<Output = Result<()>> + 'a,
+{
+    loop {
+        match publish().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Ready publication response was indeterminate; reconciling the same publication identity"
+                );
+                // LocalControlReadyPublisher retains its pending publication,
+                // including publication_id and expected_revision, until an
+                // exact ACK is validated. Never construct a replacement here.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
+    }
+}
+
+async fn publish_shutdown_not_ready_reconciling<P>(publisher: &P) -> Result<()>
+where
+    P: LocalReadyPublisher,
+{
+    loop {
+        match publisher.publish_shutdown_not_ready().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "shutdown NotReady response was indeterminate; reconciling before stopping Session"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn cancel_session_after_not_ready<'a, Publish, Published, SessionRun>(
+    mut publish: Publish,
+    shutdown: &CancellationToken,
+    session_run: SessionRun,
+) -> Result<SessionResult>
+where
+    Publish: FnMut() -> Published,
+    Published: std::future::Future<Output = Result<()>> + 'a,
+    SessionRun: std::future::Future<Output = SessionResult>,
+{
+    loop {
+        match publish().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "shutdown NotReady response was indeterminate; reconciling before stopping Session"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    shutdown.cancel();
+    Ok(session_run.await)
+}
+
+async fn supervise_ready_session<Signal, Dependency>(
+    publisher: &LocalRuntimePublisher,
+    session: Session<SessionGateway>,
+    signal: Signal,
+    dependency_failure: Dependency,
+) -> Result<()>
+where
+    Signal: std::future::Future<Output = Result<()>>,
+    Dependency: std::future::Future<Output = Result<()>>,
+{
+    let shutdown = CancellationToken::new();
+    let session_run = session.run_until_cancelled(shutdown.clone());
+    tokio::pin!(session_run);
+    tokio::pin!(signal);
+    tokio::pin!(dependency_failure);
+
+    enum Exit {
+        Session(SessionResult),
+        Signal(Result<()>),
+        Dependency(Result<()>),
+    }
+
+    let exit = tokio::select! {
+        result = &mut session_run => Exit::Session(result),
+        result = &mut signal => Exit::Signal(result),
+        result = &mut dependency_failure => Exit::Dependency(result),
     };
-    publisher
-        .publish_shutdown_not_ready()
-        .await
-        .context("publish shutdown NotReady")?;
-    match session_result {
-        None | Some(SessionResult::Completed(_)) => Ok(()),
-        Some(SessionResult::Failed { failure, .. }) => Err(anyhow!(failure)),
+    match exit {
+        Exit::Session(result) => {
+            publish_shutdown_not_ready_reconciling(publisher)
+                .await
+                .context("publish NotReady after Session termination")?;
+            session_result(result)
+        }
+        Exit::Signal(result) => {
+            result.context("wait for shutdown signal")?;
+            // Preserve the serving runtime until the registry has durably
+            // stopped routing new commands to this generation.
+            let result = cancel_session_after_not_ready(
+                || publisher.publish_shutdown_not_ready(),
+                &shutdown,
+                &mut session_run,
+            )
+            .await
+            .context("publish signal shutdown NotReady")?;
+            session_result(result)
+        }
+        Exit::Dependency(result) => {
+            let failure = match result {
+                Ok(()) => anyhow!("authenticated runtime dependency became unavailable"),
+                Err(error) => error.context("authenticated runtime dependency monitor failed"),
+            };
+            let _ = cancel_session_after_not_ready(
+                || publisher.publish_shutdown_not_ready(),
+                &shutdown,
+                &mut session_run,
+            )
+            .await
+            .context("publish dependency-failure NotReady")?;
+            Err(failure)
+        }
+    }
+}
+
+fn session_result(result: SessionResult) -> Result<()> {
+    match result {
+        SessionResult::Completed(_) => Ok(()),
+        SessionResult::Failed { failure, .. } => Err(anyhow!(failure)),
     }
 }
 
@@ -622,6 +849,10 @@ mod tests {
                 "/tmp/sumi-executor.sock".into(),
             ),
             (
+                "SUMI_ARTIFACT_BROKER_SOCKET".to_owned(),
+                "/tmp/sumi-artifact-broker.sock".into(),
+            ),
+            (
                 "SUMI_GATEWAY_URL".to_owned(),
                 "wss://gateway.example.test/agent".into(),
             ),
@@ -674,6 +905,7 @@ mod tests {
             "SUMI_GENERATION_RECOVERY_FENCE_ID",
             "SUMI_STATE_DIR",
             "SUMI_EXECUTOR_SOCKET",
+            "SUMI_ARTIFACT_BROKER_SOCKET",
             "SUMI_GATEWAY_URL",
             "SUMI_LOCAL_CONTROL_UNIX_SOCKET",
             "SUMI_LOCAL_CONTROL_SERVER_UID",
@@ -799,5 +1031,124 @@ mod tests {
                 .is_some()
         );
         assert!(error.to_string().contains("exact RpcIdentity Health/Hello"));
+    }
+
+    #[tokio::test]
+    async fn logical_received_recovery_is_typed_and_fails_closed_without_store_executor() {
+        let context = parse(&valid_env()).unwrap();
+        let store = Store::session_test_store("bootstrap-received-recovery")
+            .await
+            .expect("test Store");
+        let steps = vec![RecoveryStep::Reclassify {
+            command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        }];
+        let error = LogicalRecoveryExecutorUnavailable
+            .execute(&store, &steps, &context.authority)
+            .await
+            .expect_err("bootstrap must not invent Received recovery projections");
+        assert!(error.to_string().contains("LogicalRecoveryExecutor"));
+        assert!(error.to_string().contains("1 ordered step"));
+    }
+
+    #[tokio::test]
+    async fn pending_approval_recovery_is_typed_and_fails_closed_without_store_executor() {
+        let context = parse(&valid_env()).unwrap();
+        let store = Store::session_test_store("bootstrap-pending-approval-recovery")
+            .await
+            .expect("test Store");
+        let steps = vec![RecoveryStep::CancelPendingApproval {
+            command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            run_id: "run-a".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            request_id: "request-a".to_owned(),
+            tool_call_id: "tool-a".to_owned(),
+        }];
+        let error = LogicalRecoveryExecutorUnavailable
+            .execute(&store, &steps, &context.authority)
+            .await
+            .expect_err("bootstrap must not invent approval cancellation events");
+        assert!(error.to_string().contains("LogicalRecoveryExecutor"));
+        assert!(error.to_string().contains("1 ordered step"));
+    }
+
+    #[test]
+    fn oversized_input_path_composes_the_exact_artifact_broker_epoch() {
+        let context = parse(&valid_env()).unwrap();
+        let broker = artifact_broker_client(&context);
+        let oversized_input = vec![b'x'; 50 * 1024 + 1];
+        assert!(oversized_input.len() > 50 * 1024);
+        assert_eq!(broker.socket(), Path::new("/tmp/sumi-artifact-broker.sock"));
+        assert_eq!(broker.identity(), context.authority.rpc_identity());
+    }
+
+    #[tokio::test]
+    async fn lost_ready_ack_retries_the_same_publisher_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        publish_ready_reconciling(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!("simulated lost Ready ACK");
+            }
+            Ok(())
+        })
+        .await
+        .expect("second attempt reconciles the retained publication");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_publishes_not_ready_before_cancelling_and_joining_session() {
+        use std::sync::Mutex;
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let session = {
+            let order = order.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                shutdown.cancelled().await;
+                order.lock().unwrap().push("session_cancelled");
+                SessionResult::Completed(crate::agent::RunCore::new())
+            }
+        };
+        let result = cancel_session_after_not_ready(
+            {
+                let order = order.clone();
+                move || {
+                    let order = order.clone();
+                    async move {
+                        order.lock().unwrap().push("not_ready");
+                        Ok(())
+                    }
+                }
+            },
+            &shutdown,
+            session,
+        )
+        .await
+        .expect("ordered shutdown");
+        assert!(matches!(result, SessionResult::Completed(_)));
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["not_ready", "session_cancelled"]
+        );
+    }
+
+    #[test]
+    fn dependency_monitor_is_fail_closed_until_authenticated_health_exists() {
+        let context = parse(&valid_env()).unwrap();
+        let executor = Arc::new(ExecutorClient::new(
+            &context.executor_socket,
+            context.authority.rpc_identity().clone(),
+        ));
+        let error = authenticated_dependency_monitor(executor, artifact_broker_client(&context))
+            .err()
+            .expect("missing Health API must prevent Ready");
+        assert!(
+            error
+                .downcast_ref::<AuthenticatedDependencyMonitoringUnavailable>()
+                .is_some()
+        );
     }
 }

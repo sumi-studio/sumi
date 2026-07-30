@@ -4368,6 +4368,47 @@ async fn cancelling_shutdown_active_aborts_the_taken_worker() {
         .expect("cancellation during shutdown aborts the taken worker");
 }
 
+#[tokio::test]
+async fn runtime_shutdown_cancels_active_attempt_and_joins_returned_core() {
+    let (gateway, commands, _frames) = gateway();
+    let attempt_entered = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let attempt_entered = attempt_entered.clone();
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              _events: mpsc::Sender<AgentEvent>| {
+            let attempt_entered = attempt_entered.clone();
+            async move {
+                let cancel = CancellationToken::new();
+                let _guard = core
+                    .attempt_cancellation
+                    .as_ref()
+                    .expect("Session installs attempt registry")
+                    .register(cancel.clone())
+                    .expect("register active attempt");
+                attempt_entered.notify_one();
+                cancel.cancelled().await;
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = session(gateway, worker).await;
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+
+    commands.send(user(1)).await.expect("start active run");
+    tokio::time::timeout(Duration::from_secs(2), attempt_entered.notified())
+        .await
+        .expect("worker registered cancellation");
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("graceful shutdown timeout")
+        .expect("Session task join");
+    assert!(matches!(result, SessionResult::Completed(_)));
+}
+
 #[test]
 fn reliable_outbound_admission_fails_explicitly_when_full_or_closed() {
     let (tx, rx) = mpsc::channel(1);

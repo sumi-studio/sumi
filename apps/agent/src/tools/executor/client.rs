@@ -209,6 +209,10 @@ impl ArtifactBrokerClient {
         &self.socket
     }
 
+    pub(crate) const fn identity(&self) -> &RpcIdentity {
+        &self.identity
+    }
+
     pub async fn put_attachment(
         &self,
         artifact_id: &str,
