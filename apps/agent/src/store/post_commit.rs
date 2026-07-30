@@ -21,10 +21,6 @@ struct HydratedEpoch {
     lease: ProcessGenerationLease,
     fence: GenerationRecoveryFence,
     lifecycle: Arc<EpochLifecycle>,
-    #[allow(
-        dead_code,
-        reason = "used once T26 production bootstrap issues its epoch"
-    )]
     issued: Option<PostCommitEpochCapability>,
 }
 
@@ -72,10 +68,6 @@ pub(crate) struct PostCommitEpochCapability {
 }
 
 impl PostCommitEpochCapability {
-    #[allow(
-        dead_code,
-        reason = "used once T26 production bootstrap issues its epoch"
-    )]
     fn bound(
         authority: RuntimeEpochAuthority,
         hydration_lifecycle: Arc<EpochLifecycle>,
@@ -358,10 +350,6 @@ impl PostCommitFeed {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used once T26 production bootstrap issues its epoch"
-    )]
     pub(super) fn issue_epoch_capability(
         &self,
         authority: RuntimeEpochAuthority,

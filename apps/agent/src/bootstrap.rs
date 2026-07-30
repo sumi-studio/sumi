@@ -41,8 +41,8 @@ use crate::{
             LocalRuntimeComponent, first_browser_vertical_ready_gate,
         },
         supervisor::{
-            ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig, seams::T17StoreAdapter,
-            session::SessionGateway,
+            ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig,
+            post_commit::ProductionPostCommitRuntime, session::SessionGateway,
         },
         ws::WebSocketConnector,
     },
@@ -388,6 +388,17 @@ enum PreReadyWait<T> {
     Signal(Result<()>),
 }
 
+enum PreReadyRuntimeExit {
+    Signal(Result<()>),
+    Dependency(Result<()>),
+    PostCommit(Result<()>),
+}
+
+enum OwnedPreReadyWait<T> {
+    Completed(T),
+    Exit(PreReadyRuntimeExit),
+}
+
 async fn wait_pre_ready_or_signal<T>(
     operation: impl std::future::Future<Output = T>,
     signal: &mut BoxFuture<'static, Result<()>>,
@@ -397,6 +408,28 @@ async fn wait_pre_ready_or_signal<T>(
         biased;
         observed = signal.as_mut() => PreReadyWait::Signal(observed),
         completed = &mut operation => PreReadyWait::Completed(completed),
+    }
+}
+
+async fn wait_owned_pre_ready<T>(
+    operation: impl std::future::Future<Output = T>,
+    signal: &mut BoxFuture<'static, Result<()>>,
+    dependency: &mut BoxFuture<'static, Result<()>>,
+    post_commit: &mut BoxFuture<'static, Result<()>>,
+) -> OwnedPreReadyWait<T> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        observed = signal.as_mut() => {
+            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::Signal(observed))
+        }
+        observed = dependency.as_mut() => {
+            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::Dependency(observed))
+        }
+        observed = post_commit.as_mut() => {
+            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::PostCommit(observed))
+        }
+        completed = &mut operation => OwnedPreReadyWait::Completed(completed),
     }
 }
 
@@ -490,6 +523,16 @@ struct TerminalControlPlaneStateEscalation {
 )]
 struct SignalTeardownFailure {
     signal: String,
+    control_plane: String,
+    session: SessionTerminationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "post-commit dispatcher failed: {dispatcher}; shutdown control-plane result: {control_plane}; {session}"
+)]
+struct PostCommitTeardownFailure {
+    dispatcher: String,
     control_plane: String,
     session: SessionTerminationReport,
 }
@@ -672,7 +715,7 @@ async fn run_after_not_ready(
     // supervisor catch-up, or other pre-Ready await can begin.
     let mut signal = install_shutdown_signal().context("install shutdown signal handlers")?;
     let shutdown = CancellationToken::new();
-    let pre_ready = async {
+    let preparation = async {
         validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
         validate_trusted_ipc_socket_parent(&context.artifact_broker_socket, "artifact broker")?;
         let config = Config::load().await.context("load production config")?;
@@ -690,15 +733,17 @@ async fn run_after_not_ready(
             "SUMI_AGENT_WRAPPING_KEY",
             &context.wrapping_key_id,
         )?);
-        let store = Store::open(
-            &config.database_path,
-            AgentScope::new(context.authority.personality_agent_id().clone()),
-            key_provider,
-        )
-        .await
-        .context("open authenticated Store")?;
+        let store = Arc::new(
+            Store::open(
+                &config.database_path,
+                AgentScope::new(context.authority.personality_agent_id().clone()),
+                key_provider,
+            )
+            .await
+            .context("open authenticated Store")?,
+        );
         let hydrated = hydrate_to_fixed_point(
-            &store,
+            store.as_ref(),
             &context.authority,
             &LogicalRecoveryExecutorUnavailable,
         )
@@ -755,7 +800,7 @@ async fn run_after_not_ready(
         .context("compose real provider RunDriver")?
         .with_broker(artifact_broker)
         .with_hydrated_memory(
-            Arc::new(store.clone()),
+            store.clone(),
             context.authority.lease(),
             context.authority.fence(),
             &hydrated,
@@ -781,60 +826,220 @@ async fn run_after_not_ready(
         let (hydration_tx, hydration_rx) = watch::channel(None);
         let (ready_controller, ready_latch) =
             first_browser_vertical_ready_gate(context.authority.clone(), hydration_rx);
-        // This is the sole Store/post-commit dispatcher seam. Bootstrap does not
-        // synthesize an in-process fallback while the coordinated dispatcher fix
-        // is integrated; the supervisor must receive the real adapter.
-        let store_adapter = T17StoreAdapter::new(Arc::new(store.clone()));
         let credentials = LocalCredentialProvider::new(
             context.authority.clone(),
             DeliveryAuthorization::Raw,
-            control,
+            control.clone(),
         );
-        let supervisor = ConnectionSupervisor::new(
-            connector,
-            credentials,
-            store_adapter,
-            ready_latch.clone(),
-            supervisor_config(&context.authority),
-        );
-
         for component in FIRST_BROWSER_VERTICAL_COMPONENTS {
             if component != LocalRuntimeComponent::Session {
                 ready_controller.mark_ready(context.authority.rpc_identity(), component)?;
             }
         }
-        let supervisor_handle = supervisor.start();
-        let mut supervisor_online = supervisor_handle.online.clone();
-        let gateway = SessionGateway::from(supervisor_handle);
         let (core, start_authority) =
             SessionStartAuthority::from_hydrated(context.authority.clone(), &hydrated, approval)
                 .context("bind required ApprovalBroker before Session")?;
-        let session = Session::start_hydrated(store, gateway, core, worker, start_authority)
-            .await
-            .context("start exact hydrated Session")?;
-        ready_controller.mark_ready(
-            context.authority.rpc_identity(),
-            LocalRuntimeComponent::Session,
-        )?;
-        hydration_tx.send_replace(Some(hydrated.receipt.clone()));
-        let ready_proof = ready_latch
-            .wait_for_proof(context.authority.generation())
-            .await
-            .context("wait for exact local runtime Ready proof")?;
-        wait_for_supervisor_online(&mut supervisor_online)
-            .await
-            .context("wait for authenticated Gateway catch-up")?;
-        Ok::<_, anyhow::Error>((session, ready_proof, dependency_monitor))
+        Ok::<_, anyhow::Error>((
+            store,
+            hydrated,
+            worker,
+            dependency_monitor,
+            connector,
+            credentials,
+            hydration_tx,
+            ready_controller,
+            ready_latch,
+            core,
+            start_authority,
+        ))
     };
-    let (session, ready_proof, dependency_monitor) =
-        match wait_pre_ready_or_signal(pre_ready, &mut signal).await {
-            PreReadyWait::Completed(result) => result?,
-            PreReadyWait::Signal(result) => {
-                shutdown.cancel();
-                let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-                return pre_ready_signal_result(result, control_result);
+    let (
+        store,
+        hydrated,
+        worker,
+        dependency_monitor,
+        connector,
+        credentials,
+        hydration_tx,
+        ready_controller,
+        ready_latch,
+        core,
+        start_authority,
+    ) = match wait_pre_ready_or_signal(preparation, &mut signal).await {
+        PreReadyWait::Completed(result) => result?,
+        PreReadyWait::Signal(result) => {
+            shutdown.cancel();
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            return pre_ready_signal_result(result, control_result);
+        }
+    };
+
+    // This is the only production post-COMMIT composition seam. It mints one
+    // Store-local authenticated epoch and starts its receiver before Session
+    // can admit any command or create an EventWriter commit.
+    let (post_commit, store_adapter) =
+        ProductionPostCommitRuntime::start(store.clone(), &context.authority).await?;
+    let post_commit_client = post_commit.client();
+    let mut post_commit_failure: BoxFuture<'static, Result<()>> = Box::pin({
+        let client = post_commit_client.clone();
+        async move { client.termination().await }
+    });
+    let mut dependency_failure = dependency_monitor.failure();
+    let supervisor = ConnectionSupervisor::new(
+        connector,
+        credentials,
+        store_adapter,
+        ready_latch.clone(),
+        supervisor_config(&context.authority),
+    );
+    let supervisor_handle = supervisor.start();
+    let mut supervisor_online = supervisor_handle.online.clone();
+    let gateway = SessionGateway::from(supervisor_handle);
+
+    // Session construction owns the sole RunCore in a retained task. A signal
+    // can stop admission immediately without cancelling and dropping that
+    // in-flight ownership transfer.
+    let mut session_start = tokio::spawn(async move {
+        Session::start_hydrated(
+            store.as_ref().clone(),
+            gateway,
+            core,
+            worker,
+            start_authority,
+        )
+        .await
+        .context("start exact hydrated Session")
+    });
+    let session = tokio::select! {
+        biased;
+        observed = signal.as_mut() => {
+            shutdown.cancel();
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            let started = (&mut session_start)
+                .await
+                .context("join exact hydrated Session startup task");
+            return match started {
+                Ok(Ok(session)) => {
+                    let report = SessionTerminationReport::from_result(
+                        session.run_until_cancelled(shutdown.clone()).await,
+                    );
+                    let primary = combine_results(
+                        pre_ready_signal_result(observed, control_result),
+                        report.into_result(),
+                        "pre-Ready Session shutdown",
+                    );
+                    finish_post_commit(primary, post_commit.shutdown_orderly().await)
+                }
+                Ok(Err(start_error)) => {
+                    let primary = combine_results(
+                        pre_ready_signal_result(observed, control_result),
+                        Err(start_error),
+                        "pre-Ready Session startup",
+                    );
+                    finish_post_commit(primary, post_commit.invalidate_and_join().await)
+                }
+                Err(join_error) => {
+                    let primary = combine_results(
+                        pre_ready_signal_result(observed, control_result),
+                        Err(join_error),
+                        "pre-Ready Session startup ownership",
+                    );
+                    finish_post_commit(primary, post_commit.invalidate_and_join().await)
+                }
+            };
+        }
+        started = &mut session_start => {
+            match started.context("join exact hydrated Session startup task") {
+                Ok(Ok(session)) => session,
+                Ok(Err(start_error)) => {
+                    return finish_post_commit(
+                        Err(start_error),
+                        post_commit.invalidate_and_join().await,
+                    );
+                }
+                Err(join_error) => {
+                    return finish_post_commit(
+                        Err(join_error),
+                        post_commit.invalidate_and_join().await,
+                    );
+                }
             }
-        };
+        }
+    };
+
+    if let Err(error) = ready_controller.mark_ready(
+        context.authority.rpc_identity(),
+        LocalRuntimeComponent::Session,
+    ) {
+        return teardown_pre_ready_operation_failure(
+            session,
+            post_commit,
+            shutdown,
+            error.context("mark exact Session component Ready"),
+        )
+        .await;
+    }
+    hydration_tx.send_replace(Some(hydrated.receipt.clone()));
+    let ready_proof = match wait_owned_pre_ready(
+        ready_latch.wait_for_proof(context.authority.generation()),
+        &mut signal,
+        &mut dependency_failure,
+        &mut post_commit_failure,
+    )
+    .await
+    {
+        OwnedPreReadyWait::Completed(result) => match result {
+            Ok(proof) => proof,
+            Err(error) => {
+                return teardown_pre_ready_operation_failure(
+                    session,
+                    post_commit,
+                    shutdown,
+                    error.context("wait for exact local runtime Ready proof"),
+                )
+                .await;
+            }
+        },
+        OwnedPreReadyWait::Exit(exit) => {
+            return teardown_owned_pre_ready_runtime(
+                publisher,
+                session,
+                post_commit,
+                shutdown,
+                exit,
+            )
+            .await;
+        }
+    };
+    match wait_owned_pre_ready(
+        wait_for_supervisor_online(&mut supervisor_online),
+        &mut signal,
+        &mut dependency_failure,
+        &mut post_commit_failure,
+    )
+    .await
+    {
+        OwnedPreReadyWait::Completed(Ok(())) => {}
+        OwnedPreReadyWait::Completed(Err(error)) => {
+            return teardown_pre_ready_operation_failure(
+                session,
+                post_commit,
+                shutdown,
+                error.context("wait for authenticated Gateway catch-up"),
+            )
+            .await;
+        }
+        OwnedPreReadyWait::Exit(exit) => {
+            return teardown_owned_pre_ready_runtime(
+                publisher,
+                session,
+                post_commit,
+                shutdown,
+                exit,
+            )
+            .await;
+        }
+    }
 
     let ready_outcome = match publish_ready_reconciling(
         || publisher.publish_ready(&ready_proof),
@@ -853,7 +1058,9 @@ async fn run_after_not_ready(
             );
             let report =
                 SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-            return Err(control_teardown_error(control, report)).context("publish exact Ready");
+            let primary =
+                Err(control_teardown_error(control, report)).context("publish exact Ready");
+            return finish_post_commit(primary, post_commit.shutdown_orderly().await);
         }
     };
 
@@ -874,7 +1081,8 @@ async fn run_after_not_ready(
         }
         let report =
             SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-        return signal_teardown_result(ready_outcome.signal_failure, control_result, report);
+        let primary = signal_teardown_result(ready_outcome.signal_failure, control_result, report);
+        return finish_post_commit(primary, post_commit.shutdown_orderly().await);
     }
 
     supervise_ready_session(
@@ -882,7 +1090,9 @@ async fn run_after_not_ready(
         publisher,
         session,
         signal,
-        dependency_monitor.failure(),
+        dependency_failure,
+        post_commit_failure,
+        post_commit,
         shutdown,
     )
     .await
@@ -1032,33 +1242,130 @@ fn signal_teardown_result(
     session.into_result()
 }
 
-async fn supervise_ready_session<Signal, Dependency>(
+fn combine_results(
+    primary: Result<()>,
+    secondary: Result<()>,
+    secondary_label: &'static str,
+) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(secondary)) => Err(secondary.context(secondary_label)),
+        (Err(primary), Err(secondary)) => Err(anyhow!(
+            "{primary:#}; {secondary_label} also failed: {secondary:#}"
+        )),
+    }
+}
+
+fn finish_post_commit(primary: Result<()>, post_commit: Result<()>) -> Result<()> {
+    combine_results(primary, post_commit, "post-commit teardown")
+}
+
+async fn teardown_pre_ready_operation_failure(
+    session: Session<SessionGateway>,
+    post_commit: ProductionPostCommitRuntime,
+    shutdown: CancellationToken,
+    failure: anyhow::Error,
+) -> Result<()> {
+    shutdown.cancel();
+    let report =
+        SessionTerminationReport::from_result(session.run_until_cancelled(shutdown.clone()).await);
+    let primary = combine_results(
+        Err(failure),
+        report.into_result(),
+        "pre-Ready Session shutdown",
+    );
+    finish_post_commit(primary, post_commit.shutdown_orderly().await)
+}
+
+async fn teardown_owned_pre_ready_runtime(
+    publisher: &LocalRuntimePublisher,
+    session: Session<SessionGateway>,
+    post_commit: ProductionPostCommitRuntime,
+    shutdown: CancellationToken,
+    exit: PreReadyRuntimeExit,
+) -> Result<()> {
+    shutdown.cancel();
+    let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+    let report =
+        SessionTerminationReport::from_result(session.run_until_cancelled(shutdown.clone()).await);
+    match exit {
+        PreReadyRuntimeExit::Signal(signal) => {
+            let primary = signal_teardown_result(
+                signal
+                    .err()
+                    .map(|error| format!("wait for pre-Ready shutdown signal: {error:#}")),
+                control_result,
+                report,
+            );
+            finish_post_commit(primary, post_commit.shutdown_orderly().await)
+        }
+        PreReadyRuntimeExit::Dependency(dependency) => {
+            let failure = match dependency {
+                Ok(()) => anyhow!("authenticated runtime dependency became unavailable"),
+                Err(error) => error.context("authenticated runtime dependency monitor failed"),
+            };
+            let primary = Err(anyhow::Error::new(DependencyTeardownFailure {
+                dependency: failure.to_string(),
+                control_plane: control_result.err().map_or_else(
+                    || "acknowledged NotReady".to_owned(),
+                    |error| error.to_string(),
+                ),
+                session: report,
+            }));
+            finish_post_commit(primary, post_commit.shutdown_orderly().await)
+        }
+        PreReadyRuntimeExit::PostCommit(dispatcher) => {
+            let failure = match dispatcher {
+                Ok(()) => "post-commit dispatcher stopped unexpectedly".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            let primary = Err(anyhow::Error::new(PostCommitTeardownFailure {
+                dispatcher: failure,
+                control_plane: control_result.err().map_or_else(
+                    || "acknowledged NotReady".to_owned(),
+                    |error| error.to_string(),
+                ),
+                session: report,
+            }));
+            finish_post_commit(primary, post_commit.invalidate_and_join().await)
+        }
+    }
+}
+
+async fn supervise_ready_session<Signal, Dependency, PostCommit>(
     authority: &RuntimeEpochAuthority,
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
     signal: Signal,
     dependency_failure: Dependency,
+    post_commit_failure: PostCommit,
+    post_commit: ProductionPostCommitRuntime,
     shutdown: CancellationToken,
 ) -> Result<()>
 where
     Signal: std::future::Future<Output = Result<()>>,
     Dependency: std::future::Future<Output = Result<()>>,
+    PostCommit: std::future::Future<Output = Result<()>>,
 {
     let session_run = session.run_until_cancelled(shutdown.clone());
     tokio::pin!(session_run);
     tokio::pin!(signal);
     tokio::pin!(dependency_failure);
+    tokio::pin!(post_commit_failure);
 
     enum Exit {
         Session(SessionResult),
         Signal(Result<()>),
         Dependency(Result<()>),
+        PostCommit(Result<()>),
     }
 
     let exit = tokio::select! {
         biased;
         result = &mut signal => Exit::Signal(result),
         result = &mut dependency_failure => Exit::Dependency(result),
+        result = &mut post_commit_failure => Exit::PostCommit(result),
         result = &mut session_run => Exit::Session(result),
     };
     match exit {
@@ -1072,9 +1379,13 @@ where
                     &control,
                     "post-Session NotReady could not be reconciled",
                 );
-                return Err(control_teardown_error(control, report));
+                return finish_post_commit(
+                    Err(control_teardown_error(control, report)),
+                    post_commit.shutdown_orderly().await,
+                );
             }
-            report.into_result()
+            let primary = report.into_result();
+            finish_post_commit(primary, post_commit.shutdown_orderly().await)
         }
         Exit::Signal(result) => {
             // Preserve the serving runtime until the registry has durably
@@ -1092,13 +1403,14 @@ where
                 shutdown.cancel();
             }
             let report = SessionTerminationReport::from_result((&mut session_run).await);
-            signal_teardown_result(
+            let primary = signal_teardown_result(
                 result
                     .err()
                     .map(|error| format!("wait for shutdown signal: {error:#}")),
                 control_result,
                 report,
-            )
+            );
+            finish_post_commit(primary, post_commit.shutdown_orderly().await)
         }
         Exit::Dependency(result) => {
             let failure = match result {
@@ -1117,14 +1429,42 @@ where
                 shutdown.cancel();
             }
             let report = SessionTerminationReport::from_result((&mut session_run).await);
-            Err(anyhow::Error::new(DependencyTeardownFailure {
+            let primary = Err(anyhow::Error::new(DependencyTeardownFailure {
                 dependency: failure.to_string(),
                 control_plane: control_result.err().map_or_else(
                     || "acknowledged NotReady".to_owned(),
                     |error| error.to_string(),
                 ),
                 session: report,
-            }))
+            }));
+            finish_post_commit(primary, post_commit.shutdown_orderly().await)
+        }
+        Exit::PostCommit(result) => {
+            let failure = match result {
+                Ok(()) => "post-commit dispatcher stopped unexpectedly".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            if let Err(control) = control_result.as_ref() {
+                stop_for_control_failure(
+                    authority,
+                    &shutdown,
+                    control,
+                    "post-commit failure NotReady could not be reconciled",
+                );
+            } else {
+                shutdown.cancel();
+            }
+            let report = SessionTerminationReport::from_result((&mut session_run).await);
+            let primary = Err(anyhow::Error::new(PostCommitTeardownFailure {
+                dispatcher: failure,
+                control_plane: control_result.err().map_or_else(
+                    || "acknowledged NotReady".to_owned(),
+                    |error| error.to_string(),
+                ),
+                session: report,
+            }));
+            finish_post_commit(primary, post_commit.invalidate_and_join().await)
         }
     }
 }

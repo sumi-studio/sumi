@@ -14,16 +14,17 @@ use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
 };
-#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::DeliveryEpoch;
+use super::seams::T17StoreAdapter;
 use super::session::DurableEventAdmission;
 use crate::{
+    runtime::authority::RuntimeEpochAuthority,
     runtime::contracts::PersonalityAgentId,
     store::{
-        EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability,
+        EventWriter, EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability,
         PostCommitReceiver, Store,
     },
 };
@@ -128,6 +129,37 @@ impl PostCommitDispatcherClient {
                 biased;
                 _ = self.epoch.cancelled() => {
                     bail!("post-commit runtime epoch invalidated before seq {seq} was admitted");
+                }
+                changed = progress.changed() => {
+                    changed.context("post-commit dispatcher progress channel closed")?;
+                }
+            }
+        }
+    }
+
+    /// Complete when the serving dispatcher stops or its exact runtime epoch
+    /// is invalidated. Bootstrap treats either result as an emergency serving
+    /// boundary and retains the dispatcher owner until it has joined.
+    pub(crate) async fn termination(&self) -> Result<()> {
+        let mut progress = self.progress.clone();
+        loop {
+            let state = progress.borrow().clone();
+            match state {
+                DispatchState::Failed {
+                    processed_through,
+                    reason,
+                } => {
+                    bail!("post-commit dispatcher failed after seq {processed_through}: {reason}")
+                }
+                DispatchState::Stopped { processed_through } => {
+                    bail!("post-commit dispatcher stopped after seq {processed_through}")
+                }
+                DispatchState::Running { .. } => {}
+            }
+            tokio::select! {
+                biased;
+                _ = self.epoch.cancelled() => {
+                    bail!("post-commit runtime epoch invalidated while serving");
                 }
                 changed = progress.changed() => {
                     changed.context("post-commit dispatcher progress channel closed")?;
@@ -276,16 +308,28 @@ impl OrderedPostCommitDispatcher {
     /// Drain the exact boundary proven by closed EventWriter admission, then
     /// invalidate this dispatcher's owner capability.
     pub(crate) async fn shutdown(mut self, quiescence: EventWriterQuiescence) -> Result<()> {
-        let through = self.store.validate_post_commit_quiescence(
+        let through = match self.store.validate_post_commit_quiescence(
             quiescence,
             &self.shutdown_owner,
             &self.epoch,
-        )?;
+        ) {
+            Ok(through) => through,
+            Err(validation_error) => {
+                let join_result = self.invalidate_task_and_join().await;
+                return combine_shutdown_failure(
+                    validation_error.context("validate post-commit quiescence proof"),
+                    join_result,
+                );
+            }
+        };
         self.drain_through.send_replace(Some(through));
-        self.target
-            .resolve_pending_admission(&self.epoch)
-            .await
-            .context("resolve pending post-commit target admission for shutdown")?;
+        if let Err(resolve_error) = self.target.resolve_pending_admission(&self.epoch).await {
+            let join_result = self.invalidate_task_and_join().await;
+            return combine_shutdown_failure(
+                resolve_error.context("resolve pending post-commit target admission for shutdown"),
+                join_result,
+            );
+        }
         let task = self
             .task
             .take()
@@ -293,6 +337,25 @@ impl OrderedPostCommitDispatcher {
         let result = flatten_join(task.await).context("post-commit dispatcher shutdown");
         self.epoch.invalidate();
         result
+    }
+
+    /// Invalidate an unquiesced runtime epoch and retain task ownership until
+    /// every in-flight target admission has resolved and the exclusive Store
+    /// receiver has been released.
+    pub(crate) async fn invalidate_and_join(mut self) -> Result<()> {
+        self.invalidate_task_and_join().await
+    }
+
+    async fn invalidate_task_and_join(&mut self) -> Result<()> {
+        self.epoch.invalidate();
+        let task = self
+            .task
+            .take()
+            .expect("post-commit dispatcher task is owned until emergency shutdown");
+        match flatten_join(task.await) {
+            Err(error) if error.is::<PostCommitRuntimeEpochInvalidated>() => Ok(()),
+            result => result.context("join invalidated post-commit dispatcher"),
+        }
     }
 }
 
@@ -306,6 +369,158 @@ impl Drop for OrderedPostCommitDispatcher {
 
 fn flatten_join(result: std::result::Result<Result<()>, JoinError>) -> Result<()> {
     result.map_err(|error| anyhow!("post-commit dispatcher task failed to join: {error}"))?
+}
+
+fn combine_shutdown_failure(primary: anyhow::Error, join: Result<()>) -> Result<()> {
+    Err(combine_shutdown_error(primary, join))
+}
+
+fn combine_shutdown_error(primary: anyhow::Error, join: Result<()>) -> anyhow::Error {
+    match join {
+        Ok(()) => primary,
+        Err(join) => {
+            anyhow!("{primary:#}; invalidated post-commit dispatcher also failed to join: {join:#}")
+        }
+    }
+}
+
+/// The one production bootstrap owner for Store finalizers, dispatcher
+/// admission, and the exact post-hydration runtime epoch.
+pub(crate) struct ProductionPostCommitRuntime {
+    store: Arc<Store>,
+    dispatcher: Option<OrderedPostCommitDispatcher>,
+    runtime_invalidated: CancellationToken,
+}
+
+impl fmt::Debug for ProductionPostCommitRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionPostCommitRuntime")
+            .field(
+                "personality_agent_id",
+                self.store.scope().personality_agent_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProductionPostCommitRuntime {
+    /// Mint and bind the exact authenticated epoch after Store hydration.
+    ///
+    /// The authenticated Store head is captured after epoch issuance and
+    /// before this method returns, so existing rows remain owned by T24
+    /// catch-up and every later EventWriter commit is owned by this dispatcher.
+    pub(crate) async fn start(
+        store: Arc<Store>,
+        authority: &RuntimeEpochAuthority,
+    ) -> Result<(Self, T17StoreAdapter)> {
+        let runtime_invalidated = CancellationToken::new();
+        let epoch = store
+            .issue_post_commit_epoch(authority.clone(), runtime_invalidated.clone())
+            .context("issue exact authenticated post-commit epoch")?;
+        let start_after_seq = match store.post_commit_published_through(&epoch) {
+            Ok(start_after_seq) => start_after_seq,
+            Err(error) => {
+                runtime_invalidated.cancel();
+                return Err(error.context("capture authenticated pre-producer event head"));
+            }
+        };
+        let target = match T17StoreAdapter::new(store.clone()).bind_post_commit_epoch(epoch.clone())
+        {
+            Ok(target) => target,
+            Err(error) => {
+                runtime_invalidated.cancel();
+                return Err(error.context("bind T17 to exact post-commit epoch"));
+            }
+        };
+        let dispatcher = match OrderedPostCommitDispatcher::start_bound(
+            store.clone(),
+            target.clone(),
+            start_after_seq,
+            epoch,
+        ) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                runtime_invalidated.cancel();
+                return Err(error.context("start exact ordered post-commit dispatcher"));
+            }
+        };
+        let adapter = match target.bind_post_commit_dispatcher(dispatcher.client()) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                let join_result = dispatcher.invalidate_and_join().await;
+                runtime_invalidated.cancel();
+                return Err(combine_shutdown_error(
+                    error.context("bind Session to exact post-commit dispatcher"),
+                    join_result,
+                ));
+            }
+        };
+        Ok((
+            Self {
+                store,
+                dispatcher: Some(dispatcher),
+                runtime_invalidated,
+            },
+            adapter,
+        ))
+    }
+
+    pub(crate) fn client(&self) -> PostCommitDispatcherClient {
+        self.dispatcher
+            .as_ref()
+            .expect("production post-commit dispatcher is owned until teardown")
+            .client()
+    }
+
+    /// Stop every producer first, then close the shared EventWriter admission
+    /// gate, settle retained COMMIT finalizers, and drain the proven boundary.
+    pub(crate) async fn shutdown_orderly(mut self) -> Result<()> {
+        let dispatcher = self
+            .dispatcher
+            .take()
+            .expect("production post-commit dispatcher is shut down once");
+        let quiescence = match EventWriter::new(self.store.clone())
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await
+        {
+            Ok(quiescence) => quiescence,
+            Err(close_error) => {
+                let join_result = dispatcher.invalidate_and_join().await;
+                self.runtime_invalidated.cancel();
+                return match join_result {
+                    Ok(()) => Err(close_error
+                        .context("close post-commit EventWriter admission before emergency join")),
+                    Err(join_error) => Err(anyhow!(
+                        "close post-commit EventWriter admission failed: {close_error:#}; \
+                         emergency dispatcher join also failed: {join_error:#}"
+                    )),
+                };
+            }
+        };
+        let result = dispatcher.shutdown(quiescence).await;
+        self.runtime_invalidated.cancel();
+        result.context("drain production post-commit dispatcher")
+    }
+
+    /// Emergency and hydration-rollover teardown cannot mint a drain proof.
+    /// Invalidate the exact capability and still retain the task until join.
+    pub(crate) async fn invalidate_and_join(mut self) -> Result<()> {
+        self.runtime_invalidated.cancel();
+        self.dispatcher
+            .take()
+            .expect("production post-commit dispatcher is joined once")
+            .invalidate_and_join()
+            .await
+    }
+}
+
+impl Drop for ProductionPostCommitRuntime {
+    fn drop(&mut self) {
+        // Explicit teardown paths retain and join the task. This cancellation
+        // is only the panic/unwind backstop and prevents continued admission.
+        self.runtime_invalidated.cancel();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,10 +653,14 @@ fn cancellation_failure(
     progress: &watch::Sender<DispatchState>,
     processed_through: u64,
 ) -> anyhow::Error {
-    let error = anyhow!("post-commit runtime epoch invalidated before orderly drain completed");
+    let error = anyhow::Error::new(PostCommitRuntimeEpochInvalidated);
     publish_failure(progress, processed_through, &error);
     error
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("post-commit runtime epoch invalidated before orderly drain completed")]
+struct PostCommitRuntimeEpochInvalidated;
 
 fn publish_failure(
     progress: &watch::Sender<DispatchState>,
@@ -1649,17 +1868,39 @@ mod tests {
         .await;
         let blocker = fixture.block_delivery_at_phase().await;
 
-        drop(
-            fixture
-                .dispatcher
-                .take()
-                .expect("emergency drop owns the dispatcher"),
-        );
+        fixture
+            .dispatcher
+            .take()
+            .expect("emergency teardown owns the dispatcher")
+            .invalidate_and_join()
+            .await
+            .expect("emergency teardown joins the invalidated dispatcher");
         fixture.wait_for_receiver_release().await;
         assert_eq!(fixture.adapter.durable_fence_count(), 0);
         fixture.assert_no_old_epoch_delivery();
 
         blocker.release();
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn emergency_invalidation_joins_a_pool_blocked_t17_delivery_read() {
+        let mut fixture =
+            PoolBlockedAdmissionFixture::start("post-commit-drop-pool-blocked-t17").await;
+        let connection = fixture.block_delivery_on_store_connection().await;
+
+        fixture
+            .dispatcher
+            .take()
+            .expect("emergency teardown owns the dispatcher")
+            .invalidate_and_join()
+            .await
+            .expect("emergency teardown joins the invalidated dispatcher");
+        fixture.wait_for_receiver_release().await;
+        assert_eq!(fixture.adapter.durable_fence_count(), 0);
+        fixture.assert_no_old_epoch_delivery();
+
+        drop(connection);
         fixture.finish().await;
     }
 
@@ -1758,6 +1999,84 @@ mod tests {
             lease,
             fence,
         )
+    }
+
+    #[tokio::test]
+    async fn production_composition_delivers_one_commit_once_and_releases_teardown_ownership() {
+        let store = Arc::new(
+            Store::session_test_store("production-post-commit-seam")
+                .await
+                .unwrap(),
+        );
+        let paid = store.scope().personality_agent_id.clone();
+        let (authority, lease, fence) = runtime_authority(&paid, 41, "production-seam");
+        assert!(matches!(
+            store.hydrate(&lease, &fence).await.unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+
+        let (runtime, adapter) = ProductionPostCommitRuntime::start(store.clone(), &authority)
+            .await
+            .unwrap();
+        let adapter = adapter
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let delivery_epoch = DeliveryEpoch::for_test("production-post-commit-seam");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let delivery_cancel = CancellationToken::new();
+        let delivery_runtime = adapter
+            .install_delivery_epoch(delivery_epoch, 0, events, delivery_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("install the real T17 durable delivery runtime");
+
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(maintenance("production-seam"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("committed event reaches the durable Gateway lane")
+            .expect("durable Gateway lane remains open");
+        assert_eq!(delivered.0, delivery_epoch);
+        assert_eq!(
+            super::super::outbound_frame_event_seq(&delivered.2).unwrap(),
+            1
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "one committed row must not be admitted to the Gateway twice"
+        );
+
+        runtime.shutdown_orderly().await.unwrap();
+        assert_eq!(
+            adapter.durable_fence_count(),
+            0,
+            "orderly teardown releases every durable forwarder fence"
+        );
+        let receiver = store
+            .claim_post_commit_receiver()
+            .expect("joined dispatcher releases the exclusive Store receiver");
+        drop(receiver);
+        delivery_cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery_runtime.join())
+            .await
+            .expect("T17 delivery runtime terminates")
+            .expect("T17 delivery runtime joins");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "teardown must not emit a duplicate durable frame"
+        );
     }
 
     #[tokio::test]
