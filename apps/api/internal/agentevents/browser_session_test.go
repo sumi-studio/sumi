@@ -55,6 +55,33 @@ func TestHMACUserSessionVerifierAcceptsValidSession(t *testing.T) {
 	}
 }
 
+func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	want := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	session, err := v.IssueSession(context.Background(), want, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	got, err := v.VerifySession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("verify issued session: %v", err)
+	}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	if _, err := v.IssueSession(context.Background(), want, time.Hour+time.Second); err == nil {
+		t.Fatal("expected overlong session TTL to be rejected")
+	}
+}
+
 func TestHMACUserSessionVerifierRejectsWrongAudience(t *testing.T) {
 	v, err := NewHMACUserSessionVerifier(testSessionSecret, "sumi:web:conversation")
 	if err != nil {

@@ -5,6 +5,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,7 +35,7 @@ type UserSessionClaims struct {
 }
 
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
-// Session issuance/login is a control-plane responsibility outside T28.
+// The Firebase exchange control-plane issues this format server-side.
 type UserSessionVerifier interface {
 	VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error)
 }
@@ -41,6 +43,13 @@ type UserSessionVerifier interface {
 type HMACUserSessionVerifier struct {
 	secret   []byte
 	audience string
+}
+
+// BrowserSessionIssuer creates the same short-lived signed session consumed by
+// UserSessionVerifier. Issuance remains server-side: browsers never receive
+// the tenant or personality-agent binding outside the opaque HttpOnly cookie.
+type BrowserSessionIssuer interface {
+	IssueSession(ctx context.Context, claims UserSessionClaims, ttl time.Duration) (string, error)
 }
 
 type userSessionWireClaims struct {
@@ -59,6 +68,52 @@ func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessio
 		audience = defaultBrowserAudience
 	}
 	return &HMACUserSessionVerifier{secret: append([]byte(nil), secret...), audience: audience}, nil
+}
+
+// IssueSession signs a bounded-lifetime browser session using the verifier's
+// configured audience and key. Callers choose a short TTL appropriate for the
+// browser authentication boundary.
+func (v *HMACUserSessionVerifier) IssueSession(
+	ctx context.Context,
+	claims UserSessionClaims,
+	ttl time.Duration,
+) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
+		!provenanceIDRegexp.MatchString(claims.UserID) {
+		return "", errors.New("browser session has invalid tenant or user binding")
+	}
+	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
+		return "", fmt.Errorf("browser session personality_agent_id: %w", err)
+	}
+	if ttl < time.Minute || ttl > time.Hour {
+		return "", errors.New("browser session TTL must be between one minute and one hour")
+	}
+
+	headerPart := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload, err := json.Marshal(userSessionWireClaims{
+		TenantID:           claims.TenantID,
+		UserID:             claims.UserID,
+		PersonalityAgentID: claims.PersonalityAgentID,
+		Exp:                time.Now().Add(ttl).Unix(),
+		Aud:                v.audience,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal browser session claims: %w", err)
+	}
+	payloadPart := base64.RawURLEncoding.EncodeToString(payload)
+	signingInput := headerPart + "." + payloadPart
+	mac := hmac.New(sha256.New, v.secret)
+	_, _ = mac.Write([]byte(signingInput))
+	signed := signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if len(signed) > maxSignedTokenBytes {
+		return "", errors.New("browser session exceeds maximum allowed size")
+	}
+	return signed, nil
 }
 
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {

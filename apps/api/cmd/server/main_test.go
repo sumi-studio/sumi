@@ -200,6 +200,68 @@ func TestAllowedOriginsFromEnv(t *testing.T) {
 	})
 }
 
+func TestBrowserAuthDisabledWithoutExplicitFirebaseUID(t *testing.T) {
+	t.Setenv("SUMI_AUTH_FIREBASE_UID", "")
+	server, enabled, err := browserAuthServerFromEnv(
+		context.Background(),
+		nil,
+		[]string{testBrowserOrigin},
+	)
+	if err != nil {
+		t.Fatalf("disabled auth: %v", err)
+	}
+	if enabled || server != nil {
+		t.Fatal("auth routes must remain disabled without explicit Firebase UID binding")
+	}
+}
+
+func TestBrowserAuthPartialConfigurationFailsClosed(t *testing.T) {
+	t.Setenv("SUMI_AUTH_FIREBASE_UID", "firebase-user")
+	t.Setenv("SUMI_AUTH_TENANT_ID", "")
+	t.Setenv("SUMI_AUTH_USER_ID", "")
+	t.Setenv("SUMI_AUTH_PERSONALITY_AGENT_ID", "")
+	sessions, err := agentevents.NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := browserAuthServerFromEnv(
+		context.Background(),
+		sessions,
+		[]string{testBrowserOrigin},
+	); err == nil {
+		t.Fatal("partial Firebase binding must fail startup")
+	}
+}
+
+func TestAuthSessionTTLFromEnvIsShortAndBounded(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("SUMI_AUTH_SESSION_TTL", "")
+		got, err := authSessionTTLFromEnv()
+		if err != nil || got != 15*time.Minute {
+			t.Fatalf("got %v, %v", got, err)
+		}
+	})
+	t.Run("configured", func(t *testing.T) {
+		t.Setenv("SUMI_AUTH_SESSION_TTL", "20m")
+		got, err := authSessionTTLFromEnv()
+		if err != nil || got != 20*time.Minute {
+			t.Fatalf("got %v, %v", got, err)
+		}
+	})
+	t.Run("overlong", func(t *testing.T) {
+		t.Setenv("SUMI_AUTH_SESSION_TTL", "61m")
+		if _, err := authSessionTTLFromEnv(); err == nil {
+			t.Fatal("expected overlong session TTL to fail")
+		}
+	})
+	t.Run("too short", func(t *testing.T) {
+		t.Setenv("SUMI_AUTH_SESSION_TTL", "30s")
+		if _, err := authSessionTTLFromEnv(); err == nil {
+			t.Fatal("expected sub-minute session TTL to fail")
+		}
+	})
+}
+
 func TestNewRouter_RequiresCommandLogDir(t *testing.T) {
 	t.Setenv("SUMI_COMMAND_LOG_DIR", "")
 	_, err := newRouter()

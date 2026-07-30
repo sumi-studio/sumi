@@ -181,6 +181,14 @@ func newApplicationFromEnv() (*application, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	authServer, authEnabled, err := browserAuthServerFromEnv(context.Background(), sv, browserAllowedOriginsFromEnv())
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("browser auth: %w", err)
+	}
+	if authEnabled {
+		authServer.RegisterRoutes(mux)
+	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)
 	if err != nil {
 		_ = store.Close()
@@ -1579,9 +1587,9 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 }
 
 // browserSessionVerifierFromEnv is deliberately separate from the agent token
-// verifier. Browser sessions are HttpOnly cookies scoped to users and
-// conversations; agent bearer tokens never enter this route.
-func browserSessionVerifierFromEnv() (agentevents.UserSessionVerifier, error) {
+// verifier. Browser sessions are HttpOnly cookies scoped to users and their
+// server-bound personality agents; agent bearer tokens never enter this route.
+func browserSessionVerifierFromEnv() (*agentevents.HMACUserSessionVerifier, error) {
 	b64 := os.Getenv("SUMI_BROWSER_SESSION_SECRET")
 	if b64 == "" {
 		return nil, errBrowserSessionSecretMissing
