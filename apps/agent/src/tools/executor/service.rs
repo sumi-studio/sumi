@@ -70,8 +70,6 @@ const EXECUTOR_INITIAL_FRAME_DEADLINE: Duration = Duration::from_secs(1);
 const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(135);
 const SOCKET_CONNECT_DEADLINE: Duration = Duration::from_secs(1);
 const SOCKET_PATH_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
-const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
-const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
 struct OwnedUnixListener {
@@ -145,28 +143,6 @@ impl<R> ExecutorInput<R> {
             test_controls,
         }
     }
-}
-
-/// Wait until a Unix-domain endpoint accepts a connection. A missing endpoint
-/// may still be starting; every other error fails closed.
-async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
-    for attempt in 0..SOCKET_READINESS_RETRY_LIMIT {
-        match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(Err(error)) => {
-                bail!(
-                    "{label} socket {} is not accepting connections: {error}",
-                    path.display()
-                );
-            }
-            Err(_) => {}
-        }
-        if attempt + 1 < SOCKET_READINESS_RETRY_LIMIT {
-            tokio::time::sleep(SOCKET_READINESS_RETRY_DELAY).await;
-        }
-    }
-    bail!("{label} socket {} did not become accepting", path.display())
 }
 
 /// Bind without stealing a live endpoint. Only a connection-refused path that
@@ -1225,18 +1201,12 @@ pub async fn run_tool_executor_mode() -> Result<()> {
 pub async fn run_tool_executor_socket_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
-    let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
     let blocking_fs = BlockingFsRegistry::production();
     let fs = blocking_fs
         .open_workspace(workspace.clone())
         .await
         .context("failed to open executor workspace")?;
-    let broker = Arc::new(ArtifactBrokerClient::new(broker_socket, identity.clone()));
-
-    wait_for_unix_socket(broker.socket(), "artifact broker")
-        .await
-        .context("artifact broker socket is not ready")?;
     let listener = bind_unix_listener(&executor_socket, "executor").await?;
     let handshakes = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
     let ordinary_connections = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
@@ -1254,9 +1224,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             .context("executor initial-frame admission is closed")?;
         let (stream, _) = listener.accept_verified("executor").await?;
         let identity = identity.clone();
-        let workspace = workspace.clone();
         let fs = fs.clone();
-        let broker = broker.clone();
         let manager = manager.clone();
         let blocking_fs = blocking_fs.clone();
         let ordinary_connections = ordinary_connections.clone();
@@ -1287,7 +1255,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             let control = matches!(
                 decoded,
                 Ok(RpcRequest {
-                    operation: ExecutorOperation::Cancel { .. } | ExecutorOperation::Health {},
+                    operation: ExecutorOperation::Health { .. },
                     ..
                 })
             );
@@ -1305,13 +1273,11 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                 return;
             };
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
-                run_executor_service_with_writer(
-                    ExecutorInput::prefetched(read, first_line),
+                run_critical_executor_service(
+                    first_line,
                     ExecutorWriter::start(write),
                     identity,
-                    workspace,
                     fs,
-                    broker,
                     manager,
                     blocking_fs,
                 )
@@ -1332,6 +1298,155 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             drop(connection_permit);
         });
     }
+}
+
+/// Serve the production Unix endpoint's deliberately narrow contract.
+///
+/// This path has no artifact-broker capability and admits only exact-identity
+/// Health plus workspace-dirfd `read_file`. The broader stdio fixture service
+/// remains separate and cannot be reached through production bootstrap.
+async fn run_critical_executor_service(
+    first_line: Vec<u8>,
+    (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
+    identity: RpcIdentity,
+    fs: Arc<WorkspaceFs>,
+    manager: Arc<ExecutorManager>,
+    blocking_fs: BlockingFsRegistry,
+) -> Result<()> {
+    let result =
+        run_critical_executor_exchange(first_line, &writer, identity, fs, manager, blocking_fs)
+            .await;
+    writer_task.abort();
+    let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
+    result
+}
+
+async fn run_critical_executor_exchange(
+    first_line: Vec<u8>,
+    writer: &ExecutorWriter,
+    identity: RpcIdentity,
+    fs: Arc<WorkspaceFs>,
+    manager: Arc<ExecutorManager>,
+    blocking_fs: BlockingFsRegistry,
+) -> Result<()> {
+    let request = match decode_executor_request(&first_line, &identity)? {
+        Ok(request) => request,
+        Err((request_id, error)) => {
+            let result = match manager.reject_request(&request_id) {
+                Ok(()) => Err(error),
+                Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                Err(error) => return Err(error.into()),
+            };
+            writer.terminal(&identity, request_id, result).await?;
+            return Ok(());
+        }
+    };
+
+    match request.operation {
+        ExecutorOperation::Health { service_role } => {
+            // Health intentionally bypasses every lifecycle/admission registry:
+            // it authenticates this process identity and role without consuming
+            // replay budget or acquiring an operation permit.
+            writer
+                .terminal(
+                    &identity,
+                    request.request_id,
+                    Ok(ExecutorResponse::Healthy { service_role }),
+                )
+                .await?;
+        }
+        operation @ ExecutorOperation::ReadFile { .. } => {
+            let execution_id = operation_execution_id(&operation).to_owned();
+            let registration =
+                match manager.register_execution(request.request_id.clone(), execution_id, None) {
+                    Ok(registration) => registration,
+                    Err(error) if is_typed_admission_error(&error) => {
+                        writer
+                            .terminal(&identity, request.request_id, Err(rpc_error(error)))
+                            .await?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            let execution = match registration {
+                ExecutionRegistration::Replay(result) => {
+                    writer
+                        .terminal(&identity, request.request_id, result)
+                        .await?;
+                    return Ok(());
+                }
+                ExecutionRegistration::Pending(mut pending) => {
+                    let permit = pending.wait_for_admission().await?.ok_or_else(|| {
+                        ToolError::Protocol(
+                            "non-cancellable executor operation lost admission".to_owned(),
+                        )
+                    })?;
+                    pending.promote(permit)?
+                }
+            };
+            let result = start_critical_read_file_execution(execution, fs, blocking_fs, operation)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "critical read_file ownership task stopped");
+                    Err(bounded_error("rpc_indeterminate"))
+                });
+            writer
+                .terminal(&identity, request.request_id, result)
+                .await?;
+        }
+        _ => {
+            let result = match manager.reject_request(&request.request_id) {
+                Ok(()) => Err(bounded_error("protocol")),
+                Err(error) if is_boot_uniqueness_exhausted(&error) => Err(rpc_error(error)),
+                Err(error) => return Err(error.into()),
+            };
+            writer
+                .terminal(&identity, request.request_id, result)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn start_critical_read_file_execution(
+    mut execution: ExecutionLease,
+    fs: Arc<WorkspaceFs>,
+    blocking_fs: BlockingFsRegistry,
+    operation: ExecutorOperation,
+) -> JoinHandle<Result<ExecutorResponse, RpcError>> {
+    tokio::spawn(async move {
+        let result = match operation {
+            ExecutorOperation::ReadFile {
+                path,
+                offset,
+                limit,
+                ..
+            } => match resolve_input("read_file", &path) {
+                Ok(InputRoute::Workspace) => {
+                    blocking_fs
+                        .execute(move || {
+                            Ok(ExecutorResponse::ReadFile {
+                                result: fs.read_file(Path::new(&path), offset, limit)?,
+                            })
+                        })
+                        .await
+                }
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact reads".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+            _ => Err(ToolError::Protocol(
+                "critical executor received a non-read operation".to_owned(),
+            )),
+        }
+        .map_err(rpc_error);
+        if let Err(error) = execution.complete(result.clone()) {
+            tracing::error!(%error, "failed to settle critical read_file ownership");
+            return Err(bounded_error("rpc_indeterminate"));
+        }
+        result
+    })
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
@@ -1614,12 +1729,12 @@ where
             }
         };
         match request.operation {
-            ExecutorOperation::Health {} => {
+            ExecutorOperation::Health { service_role } => {
                 writer
                     .terminal(
                         &identity,
                         request.request_id,
-                        Ok(ExecutorResponse::Healthy {}),
+                        Ok(ExecutorResponse::Healthy { service_role }),
                     )
                     .await?;
             }
@@ -2412,7 +2527,7 @@ async fn execute_non_bash(
                     .await
             }
         }
-        ExecutorOperation::Health {}
+        ExecutorOperation::Health { .. }
         | ExecutorOperation::Bash { .. }
         | ExecutorOperation::Cancel { .. } => Err(ToolError::Protocol(
             "operation belongs to executor control loop".to_owned(),
@@ -2431,7 +2546,7 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
         | ExecutorOperation::Grep { execution_id, .. }
         | ExecutorOperation::Bash { execution_id, .. }
         | ExecutorOperation::Cancel { execution_id } => execution_id,
-        ExecutorOperation::Health {} => {
+        ExecutorOperation::Health { .. } => {
             unreachable!("health requests do not carry execution identities")
         }
     }
@@ -3679,7 +3794,9 @@ mod tests {
                 manager.clone(),
                 blocking_fs.clone(),
                 "request-health-under-fs-load",
-                ExecutorOperation::Health {},
+                ExecutorOperation::Health {
+                    service_role: crate::tools::executor::ExecutorServiceRole::ToolExecutor,
+                },
             );
             let health = timeout(
                 Duration::from_millis(250),

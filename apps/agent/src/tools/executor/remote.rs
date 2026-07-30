@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorResponse};
 use crate::{
     provider::types::{ToolDefinition, ValidatedToolArguments},
-    runtime::contracts::RpcIdentity,
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolRisk,
         text_output,
@@ -54,29 +53,27 @@ impl ExecutorInvoker for ExecutorClient {
     }
 }
 
-/// Builds the complete frozen workspace tool registry from one immutable,
-/// supervisor-issued executor client. Registration is explicit and duplicate
-/// checked by [`ToolRegistryBuilder`].
+/// Builds the production executor registry from one immutable,
+/// supervisor-issued client. The critical Unix endpoint intentionally exposes
+/// only workspace `read_file`.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
     let identity = client.identity().clone();
-    registry_from_invoker_for_identity(client, identity)
+    let mut builder = ToolRegistryBuilder::default();
+    builder.register(Arc::new(RemoteTool {
+        kind: RemoteToolKind::ReadFile,
+        client,
+    }))?;
+    Ok(builder.build_for_executor_identity(identity))
 }
 
 #[cfg(test)]
 fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker_inner(client, None)
+    broad_test_registry_from_invoker(client)
 }
 
-fn registry_from_invoker_for_identity(
+#[cfg(test)]
+fn broad_test_registry_from_invoker(
     client: Arc<dyn ExecutorInvoker>,
-    identity: RpcIdentity,
-) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker_inner(client, Some(identity))
-}
-
-fn registry_from_invoker_inner(
-    client: Arc<dyn ExecutorInvoker>,
-    identity: Option<RpcIdentity>,
 ) -> Result<ToolRegistry, ToolError> {
     let mut builder = ToolRegistryBuilder::default();
     for kind in [
@@ -94,10 +91,7 @@ fn registry_from_invoker_inner(
             client: client.clone(),
         }))?;
     }
-    Ok(match identity {
-        Some(identity) => builder.build_for_executor_identity(identity),
-        None => builder.build(),
-    })
+    Ok(builder.build())
 }
 
 #[derive(Clone, Copy)]
@@ -1464,7 +1458,9 @@ mod tests {
                 generation: request.generation,
                 nonce: "stale-nonce".to_owned(),
                 request_id: request.request_id,
-                result: Ok(ExecutorResponse::Written {}),
+                result: Ok(ExecutorResponse::ReadFile {
+                    result: truncation("forged"),
+                }),
             };
             write
                 .write_all(&serde_json::to_vec(&forged).unwrap())
@@ -1479,10 +1475,10 @@ mod tests {
         let registry = remote_executor_registry(client).unwrap();
         let error = run(
             &registry,
-            "write_file",
+            "read_file",
             "flow",
             "call",
-            json!({"path":"x","content":"y"}),
+            json!({"path":"x"}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1517,6 +1513,30 @@ mod tests {
                 .is_err(),
             "an unbound fixture registry cannot satisfy production validation"
         );
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+        for forbidden in [
+            "bash",
+            "write_file",
+            "edit_file",
+            "delete",
+            "list_dir",
+            "glob",
+            "grep",
+        ] {
+            assert!(
+                registry.get(forbidden).is_none(),
+                "{forbidden} leaked into the production registry"
+            );
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@ use uuid::Uuid;
 use super::manager::RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE;
 use super::protocol::{RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, parse_artifact_handle};
 use super::{
-    ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
-    RpcOperationValidation, RpcRequest, decode_rpc_frame,
+    ArtifactResponse, ExecutorOperation, ExecutorResponse, ExecutorServiceRole, MAX_RPC_LINE_BYTES,
+    RpcError, RpcFrame, RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
 use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
@@ -117,13 +117,17 @@ impl ExecutorClient {
     pub async fn health(&self) -> Result<(), ToolError> {
         match self
             .execute(
-                ExecutorOperation::Health {},
+                ExecutorOperation::Health {
+                    service_role: ExecutorServiceRole::ToolExecutor,
+                },
                 CancellationToken::new(),
                 Arc::new(|_| {}),
             )
             .await?
         {
-            ExecutorResponse::Healthy {} => Ok(()),
+            ExecutorResponse::Healthy {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            } => Ok(()),
             _ => Err(ToolError::Protocol(
                 "executor health returned a non-health response".to_owned(),
             )),
@@ -476,7 +480,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
 
 fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
-        ExecutorOperation::Health {} => "",
+        ExecutorOperation::Health { .. } => "",
         ExecutorOperation::ReadFile { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
@@ -496,7 +500,14 @@ fn validate_response_for_personality_agent(
 ) -> Result<(), ToolError> {
     validate_operation_for_personality_agent(operation, personality_agent_id)?;
     let valid = match (operation, response) {
-        (ExecutorOperation::Health {}, ExecutorResponse::Healthy {}) => true,
+        (
+            ExecutorOperation::Health {
+                service_role: requested,
+            },
+            ExecutorResponse::Healthy {
+                service_role: responding,
+            },
+        ) => requested == responding && *responding == ExecutorServiceRole::ToolExecutor,
         (
             ExecutorOperation::ReadFile { path, limit, .. },
             ExecutorResponse::ReadFile { result },
@@ -1083,7 +1094,16 @@ mod tests {
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
 
-        for mode in ["wrong-identity", "rogue", "stalled"] {
+        for mode in [
+            "wrong-identity",
+            "malformed",
+            "stalled",
+            "eof",
+            "trailing",
+            "duplicate",
+            "wrong-request-id",
+            "rpc-error",
+        ] {
             let root = temp_root(&format!("health-{mode}"));
             let socket = root.join("executor.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -1101,13 +1121,85 @@ mod tests {
                                 "generation":7,
                                 "nonce":"wrong",
                                 "request_id":request["request_id"],
-                                "result":{"Ok":{"type":"healthy"}}
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":"tool_executor"
+                                }}
                             }),
                         )
                         .await;
                     }
-                    "rogue" => write.write_all(b"not-json\n").await.unwrap(),
+                    "malformed" => write.write_all(b"not-json\n").await.unwrap(),
                     "stalled" => tokio::time::sleep(Duration::from_secs(1)).await,
+                    "eof" => {}
+                    "trailing" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":request["request_id"],
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":"tool_executor"
+                                }}
+                            }),
+                        )
+                        .await;
+                        write.write_all(b"x").await.unwrap();
+                    }
+                    "duplicate" => {
+                        for _ in 0..2 {
+                            write_json_line(
+                                &mut write,
+                                json!({
+                                    "type":"terminal",
+                                    "personality_agent_id":PAID,
+                                    "generation":7,
+                                    "nonce":"boot-nonce",
+                                    "request_id":request["request_id"],
+                                    "result":{"Ok":{
+                                        "type":"healthy",
+                                        "service_role":"tool_executor"
+                                    }}
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "wrong-request-id" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":"wrong-request",
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":"tool_executor"
+                                }}
+                            }),
+                        )
+                        .await;
+                    }
+                    "rpc-error" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":request["request_id"],
+                                "result":{"Err":{"code":"protocol"}}
+                            }),
+                        )
+                        .await;
+                    }
                     _ => unreachable!(),
                 }
             });
@@ -1119,10 +1211,14 @@ mod tests {
                 .health()
                 .await
                 .expect_err("untrusted health endpoint");
-            assert!(
-                matches!(error, ToolError::RpcIndeterminate(_)),
-                "{mode}: {error:?}"
-            );
+            if mode == "rpc-error" {
+                assert!(matches!(error, ToolError::Protocol(_)), "{mode}: {error:?}");
+            } else {
+                assert!(
+                    matches!(error, ToolError::RpcIndeterminate(_)),
+                    "{mode}: {error:?}"
+                );
+            }
             server.await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
         }

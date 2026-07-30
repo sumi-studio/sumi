@@ -28,6 +28,12 @@ const RPC_CANCEL_UNIQUENESS_RESERVE: usize = RPC_ACTIVE_REQUEST_CAPACITY;
 pub(super) const RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE: &str = "rpc_boot_uniqueness_exhausted";
 type RpcIdDigest = [u8; 32];
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorServiceRole {
+    ToolExecutor,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpcRequest<T> {
@@ -105,7 +111,9 @@ impl RpcError {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorOperation {
-    Health {},
+    Health {
+        service_role: ExecutorServiceRole,
+    },
     ReadFile {
         path: String,
         offset: u64,
@@ -152,7 +160,7 @@ pub enum ExecutorOperation {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorResponse {
-    Healthy {},
+    Healthy { service_role: ExecutorServiceRole },
     ReadFile { result: TruncationResult },
     Written {},
     Edited {},
@@ -220,7 +228,7 @@ pub trait RpcOperationValidation {
 impl RpcOperationValidation for ExecutorOperation {
     fn validate(&self) -> Result<(), ToolError> {
         match self {
-            Self::Health {} => Ok(()),
+            Self::Health { .. } => Ok(()),
             Self::ReadFile {
                 path,
                 limit,
@@ -831,6 +839,44 @@ mod tests {
 
     fn identity() -> RpcIdentity {
         RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap()
+    }
+
+    #[test]
+    fn health_requires_the_exact_tool_executor_role_without_legacy_shape() {
+        let request = |operation| {
+            json!({
+                "personality_agent_id": PAID,
+                "generation": 7,
+                "nonce": "boot-nonce",
+                "request_id": "health-request",
+                "operation": operation,
+            })
+        };
+        let exact = serde_json::to_vec(&request(json!({
+            "type": "health",
+            "service_role": "tool_executor",
+        })))
+        .unwrap();
+        assert_eq!(
+            decode_rpc_line::<ExecutorOperation>(&exact, &identity())
+                .unwrap()
+                .operation,
+            ExecutorOperation::Health {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            }
+        );
+        for rejected in [
+            json!({"type": "health"}),
+            json!({"type": "health", "service_role": "artifact_broker"}),
+            json!({
+                "type": "health",
+                "service_role": "tool_executor",
+                "legacy": true,
+            }),
+        ] {
+            let line = serde_json::to_vec(&request(rejected)).unwrap();
+            assert!(decode_rpc_line::<ExecutorOperation>(&line, &identity()).is_err());
+        }
     }
 
     #[test]
