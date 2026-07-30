@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
-import type { ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
 import { SduiView } from "@sumi/sdui";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { forwardRef, type ReactNode, useImperativeHandle } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatScreen } from "./chat-screen";
 
 const state = vi.hoisted(() => ({
   sendMessage: vi.fn(() => true),
+  scrollToEnd: vi.fn(),
 }));
 
 vi.mock("../agent/store", () => ({
@@ -49,22 +50,37 @@ vi.mock("../agent/store", () => ({
   }),
 }));
 
-vi.mock("@sumi/ui/ai-elements/conversation", () => {
-  const Container = ({ children }: { children: ReactNode }) => <>{children}</>;
-  return {
-    Conversation: Container,
-    ConversationContent: Container,
-    ConversationItem: Container,
-    ConversationProvider: Container,
-    ConversationViewport: Container,
-    ConversationScrollButton: () => null,
-    useConversationScroll: () => ({
-      scrollToEnd: vi.fn(),
-      scrollToMessage: vi.fn(),
-    }),
-    useConversationVisibility: () => ({ visibleMessageIds: [] }),
-  };
-});
+vi.mock("./conversation-virtualizer", () => ({
+  ConversationVirtualizer: forwardRef(
+    (
+      {
+        items,
+        renderItem,
+        busy,
+        ariaLabel,
+      }: {
+        items: { id: string }[];
+        renderItem: (item: { id: string }) => ReactNode;
+        busy: boolean;
+        ariaLabel: string;
+      },
+      ref,
+    ) => {
+      useImperativeHandle(ref, () => ({
+        isAtEnd: () => false,
+        scrollToEnd: state.scrollToEnd,
+        scrollToMessage: vi.fn(() => true),
+      }));
+      return (
+        <div role="log" aria-label={ariaLabel} aria-busy={busy}>
+          {items.map((item) => (
+            <div key={item.id}>{renderItem(item)}</div>
+          ))}
+        </div>
+      );
+    },
+  ),
+}));
 
 vi.mock("./app-navigation", () => ({
   AppNavigation: () => null,
@@ -86,9 +102,19 @@ vi.mock("./timeline-scrubber", () => ({
 
 afterEach(() => {
   state.sendMessage.mockClear();
+  state.scrollToEnd.mockClear();
 });
 
 describe("SDUI action boundary", () => {
+  it("renders conversation items through the virtualized log", () => {
+    render(<ChatScreen />);
+
+    expect(screen.getByRole("log", { name: "Sumiとの会話" })).toHaveAttribute(
+      "aria-busy",
+      "false",
+    );
+  });
+
   it("keeps an unwired card action disabled and cannot send a user message", async () => {
     render(<ChatScreen />);
 

@@ -1,21 +1,24 @@
-import {
-  Conversation,
-  ConversationContent,
-  ConversationItem,
-  ConversationProvider,
-  ConversationScrollButton,
-  ConversationViewport,
-  useConversationScroll,
-  useConversationVisibility,
-} from "@sumi/ui/ai-elements/conversation";
 import { Button } from "@sumi/ui/components/button";
-import { History } from "lucide-react";
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { ArrowDown, History } from "lucide-react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { ChatItem } from "../agent/model";
 import { collectAgentCopyText, projectConversation } from "../agent/projection";
 import { useConversation } from "../agent/store";
 import { hasInspectableTrace } from "../agent/work-summary";
 import { AppNavigation } from "./app-navigation";
 import { ChatPromptInput } from "./chat-prompt-input";
+import {
+  ConversationVirtualizer,
+  type ConversationVirtualizerHandle,
+} from "./conversation-virtualizer";
 import {
   createConversationTimeline,
   MobileTimelineSheet,
@@ -27,12 +30,16 @@ const ChatItemView = lazy(() =>
 );
 
 export function ChatScreen() {
-  return (
-    <ConversationProvider autoScroll defaultScrollPosition="end">
-      <ChatScreenContent />
-    </ConversationProvider>
-  );
+  return <ChatScreenContent />;
 }
+
+const WAITING_ROW_ID = "__sumi_waiting_for_first_token__";
+const BOTTOM_SPACER_ROW_ID = "__sumi_conversation_bottom_spacer__";
+
+type ConversationRow =
+  | ChatItem
+  | { id: typeof WAITING_ROW_ID; kind: "waiting" }
+  | { id: typeof BOTTOM_SPACER_ROW_ID; kind: "spacer" };
 
 function ChatScreenContent() {
   const {
@@ -49,6 +56,9 @@ function ChatScreenContent() {
   } = useConversation();
   const [draft, setDraft] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [atEnd, setAtEnd] = useState(true);
+  const [visibleMessageIds, setVisibleMessageIds] = useState<string[]>([]);
+  const conversationRef = useRef<ConversationVirtualizerHandle>(null);
   const items = useMemo(
     () => projectConversation(conversation),
     [conversation],
@@ -57,8 +67,6 @@ function ChatScreenContent() {
     () => collectAgentCopyText(conversation),
     [conversation],
   );
-  const { scrollToEnd, scrollToMessage } = useConversationScroll();
-  const { visibleMessageIds } = useConversationVisibility();
   const timeline = useMemo(
     () => createConversationTimeline(items, visibleMessageIds),
     [items, visibleMessageIds],
@@ -74,7 +82,7 @@ function ChatScreenContent() {
     const text = draft.trim();
     if (!text || !sendMessage(text)) return;
     setDraft("");
-    requestAnimationFrame(() => scrollToEnd({ behavior: "smooth" }));
+    requestAnimationFrame(() => scrollToEnd());
   };
   const lastItem = items.at(-1);
   const waitingForFirstToken =
@@ -82,6 +90,34 @@ function ChatScreenContent() {
     (!lastItem ||
       lastItem.kind === "user" ||
       (lastItem.kind === "agent-run" && !hasInspectableTrace(lastItem.trace)));
+  const rows = useMemo<ConversationRow[]>(() => {
+    if (items.length === 0) return [];
+    return [
+      ...items,
+      ...(waitingForFirstToken
+        ? [{ id: WAITING_ROW_ID, kind: "waiting" as const }]
+        : []),
+      { id: BOTTOM_SPACER_ROW_ID, kind: "spacer" },
+    ];
+  }, [items, waitingForFirstToken]);
+  const onVisibleRowsChange = useCallback(
+    (ids: string[]) => {
+      const messageIds = new Set(items.map((item) => item.id));
+      setVisibleMessageIds(ids.filter((id) => messageIds.has(id)));
+    },
+    [items],
+  );
+  const scrollToEnd = useCallback((behavior: "smooth" | "auto" = "smooth") => {
+    conversationRef.current?.scrollToEnd({ behavior });
+  }, []);
+  const scrollToMessage = useCallback(
+    (messageId: string) =>
+      conversationRef.current?.scrollToMessage(messageId, {
+        align: "start",
+        behavior: "smooth",
+      }),
+    [],
+  );
   const lastAssistantMessage = items.findLast(
     (item) => item.kind === "prose" && item.agentMessageFinal,
   );
@@ -124,66 +160,66 @@ function ChatScreenContent() {
         </header>
 
         <div className="relative min-h-0 flex-1">
-          <Conversation>
-            <ConversationViewport
-              role="log"
-              aria-label="Sumiとの会話"
-              aria-busy={running}
+          <ConversationVirtualizer
+            ref={conversationRef}
+            items={rows}
+            busy={running}
+            ariaLabel="Sumiとの会話"
+            className="scroll-fade-b scrollbar-ui scrollbar-gutter-stable size-full min-h-0 min-w-0 overscroll-contain contain-content"
+            onAtEndChange={setAtEnd}
+            onVisibleMessageIdsChange={onVisibleRowsChange}
+            renderItem={(row) => {
+              if (row.kind === "waiting") {
+                return (
+                  <div
+                    role="status"
+                    className="mx-auto w-full max-w-2xl px-4 py-3 sm:px-6"
+                  >
+                    <span className="inline-block size-2.5 animate-pulse rounded-full bg-neutral-400" />
+                    <span className="sr-only">Sumiが応答を考えています</span>
+                  </div>
+                );
+              }
+              if (row.kind === "spacer") return <div className="h-6" />;
+
+              return (
+                <div className="mx-auto w-full max-w-2xl px-4 sm:px-6">
+                  <Suspense fallback={null}>
+                    <ChatItemView
+                      item={row}
+                      copyAlwaysVisible={
+                        row.kind === "prose" &&
+                        row.id === lastAssistantMessage?.id &&
+                        !row.streaming
+                      }
+                      agentMessageCopyText={
+                        row.kind === "prose" && row.runId
+                          ? copyTextByRunId.get(row.runId)
+                          : undefined
+                      }
+                      onApprovalDecision={decideApproval}
+                    />
+                  </Suspense>
+                </div>
+              );
+            }}
+          />
+          {items.length === 0 && (
+            <div className="pointer-events-none absolute inset-0">
+              <EmptyState available={available} />
+            </div>
+          )}
+          {items.length > 0 && !atEnd && (
+            <Button
+              variant="outline"
+              size="icon-lg"
+              aria-label="最新へ移動"
+              onClick={() => scrollToEnd()}
+              className="absolute right-3 bottom-3 rounded-full border-border bg-background shadow-[0_2px_12px_rgba(0,0,0,0.08)]"
             >
-              <ConversationContent>
-                {items.length === 0 ? (
-                  <EmptyState available={available} />
-                ) : (
-                  <>
-                    {items.map((item) => (
-                      <ConversationItem
-                        key={item.id}
-                        messageId={item.id}
-                        scrollAnchor={item.kind === "user"}
-                        className="w-full"
-                      >
-                        <div className="mx-auto w-full max-w-2xl px-4 sm:px-6">
-                          <Suspense fallback={null}>
-                            <ChatItemView
-                              item={item}
-                              copyAlwaysVisible={
-                                item.kind === "prose" &&
-                                item.id === lastAssistantMessage?.id &&
-                                !item.streaming
-                              }
-                              agentMessageCopyText={
-                                item.kind === "prose" && item.runId
-                                  ? copyTextByRunId.get(item.runId)
-                                  : undefined
-                              }
-                              onApprovalDecision={decideApproval}
-                            />
-                          </Suspense>
-                        </div>
-                      </ConversationItem>
-                    ))}
-                    {waitingForFirstToken && (
-                      <div
-                        role="status"
-                        className="mx-auto w-full max-w-2xl px-4 py-3 sm:px-6"
-                      >
-                        <span className="inline-block size-2.5 animate-pulse rounded-full bg-neutral-400" />
-                        <span className="sr-only">
-                          Sumiが応答を考えています
-                        </span>
-                      </div>
-                    )}
-                    <div className="h-6" />
-                  </>
-                )}
-              </ConversationContent>
-            </ConversationViewport>
-            {items.length > 0 && (
-              <ConversationScrollButton
-                onClick={() => scrollToEnd({ behavior: "smooth" })}
-              />
-            )}
-          </Conversation>
+              <ArrowDown />
+            </Button>
+          )}
 
           {timeline.ticks.length > 1 && (
             <div className="-translate-y-1/2 absolute top-1/2 left-2 hidden h-[72%] md:block">
@@ -193,10 +229,7 @@ function ChatScreenContent() {
                 onJump={(index) => {
                   const messageId = timeline.messageIds[index];
                   if (messageId) {
-                    scrollToMessage(messageId, {
-                      align: "start",
-                      behavior: "smooth",
-                    });
+                    scrollToMessage(messageId);
                   }
                 }}
               />
@@ -231,16 +264,13 @@ function ChatScreenContent() {
           onJump={(index) => {
             const messageId = timeline.messageIds[index];
             if (messageId) {
-              scrollToMessage(messageId, {
-                align: "start",
-                behavior: "smooth",
-              });
+              scrollToMessage(messageId);
             }
             setTimelineOpen(false);
           }}
         />
         <p className="sr-only" role="status" aria-live="polite">
-          {running ? "Sumiが応答中です" : "応答が完了しました"}
+          {running ? "Sumiが応答中です" : "応答を待機しています"}
         </p>
       </main>
     </div>
@@ -267,7 +297,7 @@ function describeAvailability(
   if (connection === "connecting") return "接続中";
   if (connection === "closed") return "再接続中";
   if (ready === "ready") return "エージェント利用可能";
-  if (ready === "not_ready") return "エージェント停止中";
+  if (ready === "not_ready") return "エージェント利用不可";
   return "エージェント確認中";
 }
 
@@ -276,7 +306,7 @@ function composerPlaceholder(
   ready: "unknown" | "ready" | "not_ready",
 ) {
   if (connection !== "connected") return "接続を待っています…";
-  if (ready === "not_ready") return "エージェントを起動すると話せます";
+  if (ready === "not_ready") return "現在エージェントを利用できません";
   if (ready === "unknown") return "エージェントを確認しています…";
   return "メッセージを入力…";
 }
