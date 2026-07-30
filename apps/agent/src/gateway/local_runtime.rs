@@ -1112,6 +1112,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::runtime::contracts::{
@@ -1618,6 +1619,55 @@ mod tests {
         let stale = authority_with(PAID, 8, "boot-stale");
         let stale_publisher = LocalControlReadyPublisher::new(stale, control);
         assert!(stale_publisher.publish_not_ready().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn signal_after_ready_commit_ack_loss_reconciles_same_cas_before_shutdown() {
+        let expected = authority();
+        let control = Arc::new(FakeControlPlane::new(expected.clone()));
+        let publisher = LocalControlReadyPublisher::new(expected.clone(), control.clone());
+        let proof = ready_proof(&expected).await;
+        let shutdown = CancellationToken::new();
+
+        publisher.publish_not_ready().await.unwrap();
+        control.state.lock().unwrap().drop_next_publication_ack = true;
+        assert!(
+            publisher
+                .publish_ready(&proof)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("response loss")
+        );
+        assert!(
+            control.state.lock().unwrap().receipt.is_some(),
+            "the registry committed Ready even though its ACK was lost"
+        );
+        shutdown.cancel();
+        assert!(shutdown.is_cancelled(), "test signal is now observed");
+        publisher
+            .publish_ready(&proof)
+            .await
+            .expect("retry must reconcile the retained Ready publication");
+        publisher.publish_shutdown_not_ready().await.unwrap();
+
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.publications.len(), 3);
+        assert_eq!(state.publication_attempts.len(), 4);
+        let first_ready = &state.publication_attempts[1];
+        let retried_ready = &state.publication_attempts[2];
+        assert_eq!(first_ready, retried_ready);
+        assert_eq!(first_ready.expected_revision, Some(1));
+        assert_eq!(retried_ready.expected_revision, Some(1));
+        assert_eq!(
+            state.publication_attempts[3].expected_revision,
+            Some(2),
+            "shutdown must advance from the reconciled Ready revision"
+        );
+        assert_eq!(
+            state.publication_attempts[3].reason,
+            LocalRuntimePublicationReason::Shutdown
+        );
     }
 
     #[test]

@@ -1240,6 +1240,8 @@ fn fragments_to_items(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::memory::estimate::EvictionFootprint;
     use crate::memory::{BatchState, ConsolidatedMemory, L0Batch};
@@ -1251,6 +1253,10 @@ mod tests {
         },
     };
     use chrono::Utc;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
 
     fn model_spec() -> ModelSpec {
         ModelSpec::preset("kimi-k3").expect("preset")
@@ -1469,6 +1475,97 @@ mod tests {
                 .to_string()
                 .contains("attachment identity msg-1-0 was reused with different content")
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_context_assembly_round_trips_through_real_artifact_broker() {
+        use crate::{
+            runtime::contracts::RpcIdentity,
+            tools::executor::{
+                ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, RpcFrame, RpcRequest,
+                decode_rpc_line, encode_rpc_frame,
+            },
+        };
+
+        const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+        let fixture_root =
+            std::env::temp_dir().join(format!("sumi-context-real-broker-{}", uuid::Uuid::now_v7()));
+        let artifact_root = fixture_root.join("artifacts");
+        std::fs::create_dir_all(&artifact_root).expect("create broker fixture root");
+        let socket = fixture_root.join("broker.sock");
+        let listener = UnixListener::bind(&socket).expect("bind broker fixture socket");
+        let identity = RpcIdentity::from_wire(PAID, 7, "context-broker").expect("fixture identity");
+        let broker = Arc::new(ArtifactBroker::open(&artifact_root).expect("open real broker"));
+        let server_identity = identity.clone();
+        let server = tokio::spawn(async move {
+            // Begin, one <=64KiB append, and Finish are separate authenticated
+            // client exchanges for this >50KiB attachment.
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept broker request");
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = Vec::new();
+                read.read_until(b'\n', &mut line)
+                    .await
+                    .expect("read broker request");
+                assert_eq!(line.pop(), Some(b'\n'));
+                let request: RpcRequest<ArtifactOperation> =
+                    decode_rpc_line(&line, &server_identity).expect("decode broker request");
+                let response = broker
+                    .execute(server_identity.personality_agent_id(), request.operation)
+                    .expect("real broker operation");
+                let encoded = encode_rpc_frame(&RpcFrame::Terminal {
+                    personality_agent_id: server_identity.personality_agent_id().clone(),
+                    generation: server_identity.generation().as_u64(),
+                    nonce: server_identity.nonce().as_str().to_owned(),
+                    request_id: request.request_id,
+                    result: Ok(response),
+                })
+                .expect("encode broker response");
+                write
+                    .write_all(&encoded)
+                    .await
+                    .expect("write broker response");
+                write.shutdown().await.expect("close broker response");
+            }
+        });
+
+        let oversized = "x".repeat(USER_ATTACHMENT_TRUNCATION_BYTES + 1);
+        let assembler = assembler().with_broker(ArtifactBrokerClient::new(&socket, identity));
+        let assembled = assembler
+            .assemble_for_call_with_estimate(
+                &[user(&oversized, 1)],
+                ProviderCallTrigger::FirstAfterUser,
+            )
+            .await
+            .expect("assemble through real broker");
+        let attached_text = assembled
+            .prompt
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                ContextMessage::Persisted {
+                    message: Message::User(user),
+                    ..
+                } => user.content.iter().find_map(|content| match content {
+                    UserContent::Text { text } => Some(text),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("assembled user attachment");
+        let expected_handle = format!("artifact://{PAID}/attachments/msg-1-0");
+        assert!(attached_text.contains(&expected_handle));
+        assert_ne!(attached_text, &oversized);
+        assert!(attached_text.starts_with(&oversized[..USER_ATTACHMENT_TRUNCATION_BYTES]));
+
+        server.await.expect("real broker fixture join");
+        assert_eq!(
+            std::fs::read_to_string(artifact_root.join(PAID).join("attachments/msg-1-0"))
+                .expect("read persisted attachment"),
+            oversized
+        );
+        std::fs::remove_dir_all(&fixture_root).expect("remove real broker fixture");
     }
 
     #[test]

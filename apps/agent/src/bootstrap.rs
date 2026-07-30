@@ -7,8 +7,10 @@
 use std::{
     env,
     ffi::OsString,
+    fs::OpenOptions,
     net::IpAddr,
     num::NonZeroUsize,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -360,6 +362,174 @@ fn artifact_broker_client(context: &BootstrapContext) -> ArtifactBrokerClient {
     )
 }
 
+const CONTROL_PLANE_RECONCILIATION_ATTEMPTS: usize = 4;
+const CONTROL_PLANE_RECONCILIATION_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{transition} control-plane state is indeterminate after {attempts} exact reconciliation attempts"
+)]
+struct IndeterminateControlPlaneState {
+    transition: &'static str,
+    attempts: usize,
+    #[source]
+    source: anyhow::Error,
+}
+
+#[derive(Debug)]
+struct ReadyPublicationOutcome {
+    shutdown_requested: bool,
+    signal_failure: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionOwnershipReport {
+    Recovered,
+    Lost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionTerminationReport {
+    status: &'static str,
+    ownership: SessionOwnershipReport,
+    failure: Option<String>,
+}
+
+impl std::fmt::Display for SessionTerminationReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Session status={}, ownership={:?}",
+            self.status, self.ownership
+        )?;
+        if let Some(failure) = self.failure.as_deref() {
+            write!(formatter, ", failure={failure}")?;
+        }
+        Ok(())
+    }
+}
+
+impl SessionTerminationReport {
+    fn from_result(result: SessionResult) -> Self {
+        use crate::agent::RunOwnership;
+
+        match result {
+            SessionResult::Completed(_) => Self {
+                status: "completed",
+                ownership: SessionOwnershipReport::Recovered,
+                failure: None,
+            },
+            SessionResult::Failed { failure, ownership } => Self {
+                status: "failed",
+                ownership: match ownership {
+                    RunOwnership::Recovered(_) => SessionOwnershipReport::Recovered,
+                    RunOwnership::Lost => SessionOwnershipReport::Lost,
+                },
+                failure: Some(failure.to_string()),
+            },
+        }
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self.failure {
+            None => Ok(()),
+            Some(_) => Err(anyhow!(self)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "authenticated dependency failed: {dependency}; shutdown control-plane result: {control_plane}; {session}"
+)]
+struct DependencyTeardownFailure {
+    dependency: String,
+    control_plane: String,
+    session: SessionTerminationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "indeterminate control-plane state escalated after local generation fencing: {control}; {session}"
+)]
+struct IndeterminateControlPlaneStateEscalation {
+    #[source]
+    control: anyhow::Error,
+    session: SessionTerminationReport,
+}
+
+/// Validate a UDS parent with the same trust properties as executor-owned IPC:
+/// normalized absolute path, no symlinked directory component, current-uid
+/// ownership, owner write/execute, and no group/other write access.
+fn validate_trusted_ipc_socket_parent(path: &Path, label: &'static str) -> Result<()> {
+    use std::path::Component;
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("{label} socket path has no parent"))?;
+    if !parent.is_absolute() {
+        bail!("{label} socket parent must be absolute");
+    }
+    let mut current = PathBuf::from("/");
+    for component in parent.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(component) => current.push(component),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::Prefix(_) => {
+                bail!("{label} socket parent must be a normalized absolute Unix path")
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("inspect {label} socket parent {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{label} socket parent contains a symlink component: {}",
+                current.display()
+            );
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(parent)
+        .with_context(|| format!("open trusted {label} socket parent {}", parent.display()))?;
+    let descriptor = file
+        .metadata()
+        .with_context(|| format!("stat trusted {label} socket parent {}", parent.display()))?;
+    let pathname = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("restat trusted {label} socket parent {}", parent.display()))?;
+    if !descriptor.file_type().is_dir()
+        || descriptor.uid() != unsafe { libc::geteuid() }
+        || descriptor.nlink() == 0
+        || descriptor.mode() & 0o300 != 0o300
+        || descriptor.mode() & 0o022 != 0
+        || pathname.file_type().is_symlink()
+        || !pathname.file_type().is_dir()
+        || pathname.dev() != descriptor.dev()
+        || pathname.ino() != descriptor.ino()
+    {
+        bail!("{label} socket parent is not a stable uid-owned non-peer-writable directory");
+    }
+    Ok(())
+}
+
+fn fence_generation_locally(
+    authority: &RuntimeEpochAuthority,
+    shutdown: &CancellationToken,
+    reason: &'static str,
+) {
+    tracing::error!(
+        personality_agent_id = %authority.personality_agent_id(),
+        generation = authority.generation().as_u64(),
+        lease_id = authority.lease().lease_id(),
+        fence_id = authority.fence().fence_id(),
+        reason,
+        "locally fencing the authenticated runtime generation"
+    );
+    shutdown.cancel();
+}
+
 pub(crate) async fn run_production() -> Result<()> {
     disable_process_dumping()?;
     load_explicit_env_file()?;
@@ -430,6 +600,8 @@ async fn run_after_not_ready(
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
+    validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
+    validate_trusted_ipc_socket_parent(&context.artifact_broker_socket, "artifact broker")?;
     let config = Config::load().await.context("load production config")?;
     if config.personality_agent_id != *context.authority.personality_agent_id() {
         bail!("config PAID does not match the supervisor runtime allocation");
@@ -482,7 +654,12 @@ async fn run_after_not_ready(
         &context.executor_socket,
         context.authority.rpc_identity().clone(),
     ));
-    wait_for_authenticated_executor_ready(&executor_client).await?;
+    wait_for_authenticated_executor_ready(
+        &executor_client,
+        &context.authority,
+        &ExecutorHealthApiUnavailable,
+    )
+    .await?;
     let artifact_broker = artifact_broker_client(context);
     let registry = remote_executor_registry(executor_client.clone())
         .context("build exact remote executor registry")?;
@@ -531,6 +708,9 @@ async fn run_after_not_ready(
     let (hydration_tx, hydration_rx) = watch::channel(None);
     let (ready_controller, ready_latch) =
         first_browser_vertical_ready_gate(context.authority.clone(), hydration_rx);
+    // This is the sole Store/post-commit dispatcher seam. Bootstrap does not
+    // synthesize an in-process fallback while the coordinated dispatcher fix
+    // is integrated; the supervisor must receive the real adapter.
     let store_adapter = T17StoreAdapter::new(Arc::new(store.clone()));
     let credentials = LocalCredentialProvider::new(
         context.authority.clone(),
@@ -571,96 +751,196 @@ async fn run_after_not_ready(
     wait_for_supervisor_online(&mut supervisor_online)
         .await
         .context("wait for authenticated Gateway catch-up")?;
-    publish_ready_reconciling(|| publisher.publish_ready(&ready_proof))
-        .await
-        .context("publish exact Ready")?;
+    // Unix handlers are synchronously installed here, and the future is
+    // polled inside the very first Ready attempt. A signal cannot slip through
+    // the Ready transition before bootstrap owns the shutdown path.
+    let mut signal = install_shutdown_signal().context("install shutdown signal handlers")?;
+    let shutdown = CancellationToken::new();
+    let ready_outcome = match publish_ready_reconciling(
+        || publisher.publish_ready(&ready_proof),
+        &mut signal,
+        &shutdown,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(control) => {
+            fence_generation_locally(
+                &context.authority,
+                &shutdown,
+                "Ready could not be reconciled",
+            );
+            let report =
+                SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
+            return Err(anyhow::Error::new(
+                IndeterminateControlPlaneStateEscalation {
+                    control,
+                    session: report,
+                },
+            ))
+            .context("publish exact Ready");
+        }
+    };
+
+    if ready_outcome.shutdown_requested {
+        // Even when the first Ready response was lost after commit, the
+        // publisher has now reconciled that exact pending publication. Only
+        // then is the subsequent shutdown NotReady transition legal.
+        let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+        if control_result.is_err() {
+            fence_generation_locally(
+                &context.authority,
+                &shutdown,
+                "shutdown NotReady could not be reconciled",
+            );
+        } else {
+            shutdown.cancel();
+        }
+        let report =
+            SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
+        if let Err(control) = control_result {
+            return Err(anyhow::Error::new(
+                IndeterminateControlPlaneStateEscalation {
+                    control,
+                    session: report,
+                },
+            ));
+        }
+        if let Some(signal_failure) = ready_outcome.signal_failure {
+            return Err(anyhow!(
+                "shutdown signal monitor failed during Ready reconciliation: {signal_failure}; {report}"
+            ));
+        }
+        return report.into_result();
+    }
 
     supervise_ready_session(
+        &context.authority,
         publisher,
         session,
-        shutdown_signal(),
+        signal,
         dependency_monitor.failure(),
+        shutdown,
     )
     .await
 }
 
-async fn publish_ready_reconciling<'a, Publish, Published>(mut publish: Publish) -> Result<()>
+async fn publish_ready_reconciling<'a, Publish, Published>(
+    mut publish: Publish,
+    signal: &mut BoxFuture<'static, Result<()>>,
+    shutdown: &CancellationToken,
+) -> Result<ReadyPublicationOutcome>
 where
     Publish: FnMut() -> Published,
     Published: std::future::Future<Output = Result<()>> + 'a,
 {
-    loop {
-        match publish().await {
-            Ok(()) => return Ok(()),
+    let mut shutdown_requested = false;
+    let mut signal_failure = None;
+    let mut last_error = None;
+    for attempt in 1..=CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
+        let publication = if shutdown_requested {
+            publish().await
+        } else {
+            tokio::select! {
+                published = publish() => published,
+                observed = signal.as_mut() => {
+                    shutdown_requested = true;
+                    shutdown.cancel();
+                    if let Err(error) = observed {
+                        signal_failure = Some(error.to_string());
+                    }
+                    Err(anyhow!(
+                        "shutdown was observed while Ready publication was in flight"
+                    ))
+                }
+            }
+        };
+        match publication {
+            Ok(()) => {
+                return Ok(ReadyPublicationOutcome {
+                    shutdown_requested,
+                    signal_failure,
+                });
+            }
             Err(error) => {
                 tracing::warn!(
+                    attempt,
+                    max_attempts = CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
                     %error,
                     "Ready publication response was indeterminate; reconciling the same publication identity"
                 );
                 // LocalControlReadyPublisher retains its pending publication,
                 // including publication_id and expected_revision, until an
                 // exact ACK is validated. Never construct a replacement here.
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                last_error = Some(error);
+            }
+        }
+        if attempt < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
+            if shutdown_requested {
+                tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY).await;
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY) => {}
+                    observed = signal.as_mut() => {
+                        shutdown_requested = true;
+                        shutdown.cancel();
+                        if let Err(error) = observed {
+                            signal_failure = Some(error.to_string());
+                        }
+                    }
+                }
             }
         }
     }
+    Err(anyhow::Error::new(IndeterminateControlPlaneState {
+        transition: "Ready",
+        attempts: CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
+        source: last_error.unwrap_or_else(|| anyhow!("Ready publication produced no result")),
+    }))
 }
 
 async fn publish_shutdown_not_ready_reconciling<P>(publisher: &P) -> Result<()>
 where
     P: LocalReadyPublisher,
 {
-    loop {
+    let mut last_error = None;
+    for attempt in 1..=CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
         match publisher.publish_shutdown_not_ready().await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 tracing::warn!(
+                    attempt,
+                    max_attempts = CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
                     %error,
-                    "shutdown NotReady response was indeterminate; reconciling before stopping Session"
+                    "shutdown NotReady response was indeterminate; bounded reconciliation remains"
                 );
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                last_error = Some(error);
             }
         }
-    }
-}
-
-async fn cancel_session_after_not_ready<'a, Publish, Published, SessionRun>(
-    mut publish: Publish,
-    shutdown: &CancellationToken,
-    session_run: SessionRun,
-) -> Result<SessionResult>
-where
-    Publish: FnMut() -> Published,
-    Published: std::future::Future<Output = Result<()>> + 'a,
-    SessionRun: std::future::Future<Output = SessionResult>,
-{
-    loop {
-        match publish().await {
-            Ok(()) => break,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "shutdown NotReady response was indeterminate; reconciling before stopping Session"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        if attempt < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
+            tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY).await;
         }
     }
-    shutdown.cancel();
-    Ok(session_run.await)
+    Err(anyhow::Error::new(IndeterminateControlPlaneState {
+        transition: "shutdown NotReady",
+        attempts: CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
+        source: last_error
+            .unwrap_or_else(|| anyhow!("shutdown NotReady publication produced no result")),
+    }))
 }
 
 async fn supervise_ready_session<Signal, Dependency>(
+    authority: &RuntimeEpochAuthority,
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
     signal: Signal,
     dependency_failure: Dependency,
+    shutdown: CancellationToken,
 ) -> Result<()>
 where
     Signal: std::future::Future<Output = Result<()>>,
     Dependency: std::future::Future<Output = Result<()>>,
 {
-    let shutdown = CancellationToken::new();
     let session_run = session.run_until_cancelled(shutdown.clone());
     tokio::pin!(session_run);
     tokio::pin!(signal);
@@ -679,45 +959,74 @@ where
     };
     match exit {
         Exit::Session(result) => {
-            publish_shutdown_not_ready_reconciling(publisher)
-                .await
-                .context("publish NotReady after Session termination")?;
-            session_result(result)
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            let report = SessionTerminationReport::from_result(result);
+            if let Err(control) = control_result {
+                fence_generation_locally(
+                    authority,
+                    &shutdown,
+                    "post-Session NotReady could not be reconciled",
+                );
+                return Err(anyhow::Error::new(
+                    IndeterminateControlPlaneStateEscalation {
+                        control,
+                        session: report,
+                    },
+                ));
+            }
+            report.into_result()
         }
         Exit::Signal(result) => {
-            result.context("wait for shutdown signal")?;
             // Preserve the serving runtime until the registry has durably
-            // stopped routing new commands to this generation.
-            let result = cancel_session_after_not_ready(
-                || publisher.publish_shutdown_not_ready(),
-                &shutdown,
-                &mut session_run,
-            )
-            .await
-            .context("publish signal shutdown NotReady")?;
-            session_result(result)
+            // stopped routing new commands to this generation. If the bounded
+            // transition is indeterminate, fence locally before joining.
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            if control_result.is_err() {
+                fence_generation_locally(
+                    authority,
+                    &shutdown,
+                    "signal shutdown NotReady could not be reconciled",
+                );
+            } else {
+                shutdown.cancel();
+            }
+            let report = SessionTerminationReport::from_result((&mut session_run).await);
+            if let Err(control) = control_result {
+                return Err(anyhow::Error::new(
+                    IndeterminateControlPlaneStateEscalation {
+                        control,
+                        session: report,
+                    },
+                ));
+            }
+            result.context("wait for shutdown signal")?;
+            report.into_result()
         }
         Exit::Dependency(result) => {
             let failure = match result {
                 Ok(()) => anyhow!("authenticated runtime dependency became unavailable"),
                 Err(error) => error.context("authenticated runtime dependency monitor failed"),
             };
-            let _ = cancel_session_after_not_ready(
-                || publisher.publish_shutdown_not_ready(),
-                &shutdown,
-                &mut session_run,
-            )
-            .await
-            .context("publish dependency-failure NotReady")?;
-            Err(failure)
+            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            if control_result.is_err() {
+                fence_generation_locally(
+                    authority,
+                    &shutdown,
+                    "dependency-failure NotReady could not be reconciled",
+                );
+            } else {
+                shutdown.cancel();
+            }
+            let report = SessionTerminationReport::from_result((&mut session_run).await);
+            Err(anyhow::Error::new(DependencyTeardownFailure {
+                dependency: failure.to_string(),
+                control_plane: control_result.err().map_or_else(
+                    || "acknowledged NotReady".to_owned(),
+                    |error| error.to_string(),
+                ),
+                session: report,
+            }))
         }
-    }
-}
-
-fn session_result(result: SessionResult) -> Result<()> {
-    match result {
-        SessionResult::Completed(_) => Ok(()),
-        SessionResult::Failed { failure, .. } => Err(anyhow!(failure)),
     }
 }
 
@@ -793,38 +1102,70 @@ fn supervisor_config(authority: &RuntimeEpochAuthority) -> SupervisorConfig {
 )]
 struct AuthenticatedExecutorReadinessUnavailable;
 
-/// Single replacement point for the executor-owned Health/Hello API.
-///
-/// Constructing a typed client proves only local composition. A socket inode
-/// check or bare connect/accept cannot authenticate the listener, so the
-/// interim production bootstrap remains NotReady.
-async fn wait_for_authenticated_executor_ready(_client: &ExecutorClient) -> Result<()> {
-    Err(anyhow::Error::new(
-        AuthenticatedExecutorReadinessUnavailable,
-    ))
+#[async_trait]
+trait AuthenticatedExecutorHealthApi: Send + Sync {
+    async fn ready(&self, client: &ExecutorClient, authority: &RuntimeEpochAuthority)
+    -> Result<()>;
 }
 
-async fn shutdown_signal() -> Result<()> {
+struct ExecutorHealthApiUnavailable;
+
+#[async_trait]
+impl AuthenticatedExecutorHealthApi for ExecutorHealthApiUnavailable {
+    async fn ready(
+        &self,
+        _client: &ExecutorClient,
+        _authority: &RuntimeEpochAuthority,
+    ) -> Result<()> {
+        Err(anyhow::Error::new(
+            AuthenticatedExecutorReadinessUnavailable,
+        ))
+    }
+}
+
+/// Narrow adapter point for the executor-owned Health API. The coordinated
+/// executor commit implements this without changing bootstrap ownership.
+/// Constructing a typed client or probing an inode is intentionally
+/// insufficient in the standalone branch.
+async fn wait_for_authenticated_executor_ready(
+    client: &ExecutorClient,
+    authority: &RuntimeEpochAuthority,
+    health: &dyn AuthenticatedExecutorHealthApi,
+) -> Result<()> {
+    authority
+        .validate_rpc_identity(client.identity())
+        .context("executor Health client identity differs from runtime authority")?;
+    health.ready(client, authority).await
+}
+
+fn install_shutdown_signal() -> Result<BoxFuture<'static, Result<()>>> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {}
-        }
-        Ok(())
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        Ok(Box::pin(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            Ok(())
+        }))
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await?;
-        Ok(())
+        Ok(Box::pin(async move {
+            tokio::signal::ctrl_c().await?;
+            Ok(())
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -884,6 +1225,29 @@ mod tests {
 
     fn parse(map: &HashMap<String, OsString>) -> Result<BootstrapContext> {
         BootstrapContext::from_source(|name| map.get(name).cloned())
+    }
+
+    struct UnavailableShutdownPublisher {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LocalReadyPublisher for UnavailableShutdownPublisher {
+        async fn publish_not_ready(&self) -> Result<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_ready(
+            &self,
+            _proof: &crate::gateway::local_runtime::LocalReadyProof,
+        ) -> Result<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_shutdown_not_ready(&self) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            bail!("local control unavailable")
+        }
     }
 
     #[test]
@@ -1017,14 +1381,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn broker_socket_parent_uses_trusted_ipc_contract() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sumi-bootstrap-ipc-parent-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root).expect("create isolated socket parent");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict isolated socket parent");
+        let socket = root.join("broker.sock");
+        validate_trusted_ipc_socket_parent(&socket, "artifact broker")
+            .expect("uid-owned non-peer-writable parent");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770))
+            .expect("make fixture peer-writable");
+        assert!(
+            validate_trusted_ipc_socket_parent(&socket, "artifact broker")
+                .unwrap_err()
+                .to_string()
+                .contains("non-peer-writable")
+        );
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restore fixture permissions");
+        std::fs::remove_dir(&root).expect("remove isolated socket parent");
+    }
+
     #[tokio::test]
     async fn typed_client_alone_cannot_satisfy_executor_ready() {
         let identity = crate::runtime::contracts::RpcIdentity::from_wire(PAID, 7, "boot-a")
             .expect("fixture identity");
         let client = ExecutorClient::new("/tmp/untrusted-executor.sock", identity);
-        let error = wait_for_authenticated_executor_ready(&client)
-            .await
-            .expect_err("an unprobed client must remain NotReady");
+        let context = parse(&valid_env()).unwrap();
+        let error = wait_for_authenticated_executor_ready(
+            &client,
+            &context.authority,
+            &ExecutorHealthApiUnavailable,
+        )
+        .await
+        .expect_err("an unprobed client must remain NotReady");
         assert!(
             error
                 .downcast_ref::<AuthenticatedExecutorReadinessUnavailable>()
@@ -1071,68 +1468,131 @@ mod tests {
         assert!(error.to_string().contains("1 ordered step"));
     }
 
-    #[test]
-    fn oversized_input_path_composes_the_exact_artifact_broker_epoch() {
-        let context = parse(&valid_env()).unwrap();
-        let broker = artifact_broker_client(&context);
-        let oversized_input = vec![b'x'; 50 * 1024 + 1];
-        assert!(oversized_input.len() > 50 * 1024);
-        assert_eq!(broker.socket(), Path::new("/tmp/sumi-artifact-broker.sock"));
-        assert_eq!(broker.identity(), context.authority.rpc_identity());
-    }
-
     #[tokio::test]
-    async fn lost_ready_ack_retries_the_same_publisher_operation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let attempts = AtomicUsize::new(0);
-        publish_ready_reconciling(|| async {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                bail!("simulated lost Ready ACK");
-            }
-            Ok(())
-        })
-        .await
-        .expect("second attempt reconciles the retained publication");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn shutdown_publishes_not_ready_before_cancelling_and_joining_session() {
-        use std::sync::Mutex;
-
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let shutdown = CancellationToken::new();
-        let session = {
-            let order = order.clone();
-            let shutdown = shutdown.clone();
-            async move {
-                shutdown.cancelled().await;
-                order.lock().unwrap().push("session_cancelled");
-                SessionResult::Completed(crate::agent::RunCore::new())
-            }
+    async fn signal_during_lost_ready_ack_reconciles_before_shutdown() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
         };
-        let result = cancel_session_after_not_ready(
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let committed_tx = Arc::new(Mutex::new(Some(committed_tx)));
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            committed_rx.await.expect("first Ready committed");
+            signal_tx.send(()).expect("signal observer remains");
+        });
+        let mut signal: BoxFuture<'static, Result<()>> =
+            Box::pin(async move { signal_rx.await.context("test signal sender dropped") });
+        let shutdown = CancellationToken::new();
+        let outcome = publish_ready_reconciling(
             {
+                let attempts = attempts.clone();
                 let order = order.clone();
                 move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                     let order = order.clone();
+                    let committed_tx = committed_tx.clone();
                     async move {
-                        order.lock().unwrap().push("not_ready");
-                        Ok(())
+                        if attempt == 0 {
+                            order.lock().unwrap().push("ready_committed_ack_lost");
+                            committed_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("one commit signal")
+                                .send(())
+                                .expect("signal task remains");
+                            std::future::pending::<Result<()>>().await
+                        } else {
+                            order.lock().unwrap().push("ready_reconciled");
+                            Ok(())
+                        }
                     }
                 }
             },
+            &mut signal,
             &shutdown,
-            session,
         )
         .await
-        .expect("ordered shutdown");
-        assert!(matches!(result, SessionResult::Completed(_)));
+        .expect("second attempt reconciles the retained Ready publication");
+        assert!(outcome.shutdown_requested);
+        assert!(shutdown.is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        order.lock().unwrap().push("shutdown_not_ready");
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["not_ready", "session_cancelled"]
+            [
+                "ready_committed_ack_lost",
+                "ready_reconciled",
+                "shutdown_not_ready"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn ready_reconciliation_is_bounded_and_typed() {
+        let attempts = AtomicUsize::new(0);
+        let mut signal: BoxFuture<'static, Result<()>> =
+            Box::pin(std::future::pending::<Result<()>>());
+        let shutdown = CancellationToken::new();
+        let error = publish_ready_reconciling(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                bail!("local control unavailable")
+            },
+            &mut signal,
+            &shutdown,
+        )
+        .await
+        .expect_err("reconciliation must escalate instead of serving forever");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            CONTROL_PLANE_RECONCILIATION_ATTEMPTS
+        );
+        assert!(
+            error
+                .downcast_ref::<IndeterminateControlPlaneState>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_not_ready_reconciliation_is_bounded_and_typed() {
+        let publisher = UnavailableShutdownPublisher {
+            attempts: AtomicUsize::new(0),
+        };
+        let error = publish_shutdown_not_ready_reconciling(&publisher)
+            .await
+            .expect_err("permanent local-control loss must escalate");
+        assert_eq!(
+            publisher.attempts.load(Ordering::SeqCst),
+            CONTROL_PLANE_RECONCILIATION_ATTEMPTS
+        );
+        assert!(
+            error
+                .downcast_ref::<IndeterminateControlPlaneState>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn dependency_teardown_error_preserves_trigger_and_ownership_loss() {
+        let report = SessionTerminationReport::from_result(SessionResult::Failed {
+            failure: crate::agent::SessionFailure::RuntimeShutdownOwnershipLost,
+            ownership: crate::agent::RunOwnership::Lost,
+        });
+        let error = DependencyTeardownFailure {
+            dependency: "executor Health failed".to_owned(),
+            control_plane: "shutdown NotReady indeterminate".to_owned(),
+            session: report,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("executor Health failed"));
+        assert!(rendered.contains("ownership=Lost"));
+        assert!(rendered.contains("runtime shutdown"));
     }
 
     #[test]

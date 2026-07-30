@@ -652,6 +652,12 @@ fn bound_core(seq: u64) -> RunCore {
     core
 }
 
+fn bound_core_with_runtime_shutdown(seq: u64, shutdown: &CancellationToken) -> RunCore {
+    let mut core = bound_core(seq);
+    core.runtime_shutdown = shutdown.child_token();
+    core
+}
+
 #[tokio::test]
 async fn tool_evaluation_without_broker_fails_closed() {
     let command = admitted_user(1);
@@ -4020,6 +4026,59 @@ struct ControlProbeDriver {
     cancelled: Arc<AtomicBool>,
 }
 
+struct RuntimeProviderProbeDriver {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for RuntimeProviderProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        self.cancelled.notify_one();
+        Err(anyhow!("runtime provider start cancelled"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        unreachable!("provider probe has no tools")
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("provider probe has no overflow recovery")
+    }
+}
+
 impl ControlProbeDriver {
     fn new() -> Self {
         Self {
@@ -4028,6 +4087,157 @@ impl ControlProbeDriver {
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+#[tokio::test]
+async fn runtime_shutdown_reaches_provider_start_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(RuntimeProviderProbeDriver {
+        started: Arc::new(Notify::new()),
+        cancelled: Arc::new(Notify::new()),
+    });
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    runner
+        .claim_ordered_initial(admitted_user(1))
+        .expect("claim initial command");
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+
+    driver.started.notified().await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), driver.cancelled.notified())
+        .await
+        .expect("provider receives runtime shutdown");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_retry_wait_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(FixtureDriver::new(Vec::new()).blocking_retry());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let task =
+        tokio::spawn(async move { runner.wait_retry_or_control(Duration::from_secs(30)).await });
+
+    driver.retry_waiting.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("retry wait observes shutdown")
+            .expect("retry task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_pending_approval_phase() {
+    let shutdown = CancellationToken::new();
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let call = ToolCall {
+        id: "runtime-shutdown-approval".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let ApprovalOutcome::Pending { mut pending } = broker
+        .start_request(
+            &call,
+            &[],
+            "runtime-run",
+            "runtime-turn",
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval")
+    else {
+        panic!("fixture must enter pending approval")
+    };
+    let request_id = pending.request().id.clone();
+    let mut core = bound_core_with_runtime_shutdown(1, &shutdown);
+    core.set_approval(broker);
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let task = tokio::spawn(async move {
+        runner
+            .wait_for_approval(request_id, pending.receiver_mut())
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("approval wait observes shutdown")
+            .expect("approval task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_tool_and_reaper_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let call = call("runtime-shutdown-probe");
+    let task =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("tool phase observes shutdown")
+            .expect("tool task join"),
+        Err(ExecuteToolError::Cancelled)
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !driver.cancelled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool driver/reaper observes the propagated cancellation");
 }
 
 #[async_trait]
