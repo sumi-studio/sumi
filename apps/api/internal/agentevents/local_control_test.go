@@ -46,7 +46,7 @@ func localControlAuthorization(
 
 func TestLocalControlRuntimeUpdateFlockHonorsCancellation(t *testing.T) {
 	_, gateway := openLocalControlTestGateway(t, t.TempDir())
-	lock, err := openLocalControlLock(gateway.localControlLockPath(localControlTestPAID))
+	lock, err := gateway.openRuntimeLock(localControlTestPAID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,5 +1011,135 @@ func TestLocalControlIntegrityKeyInstallIsIdempotentAndFencesUnconfiguredReaders
 		t.Fatal("different local control integrity key replaced the installed key")
 	} else if strings.Contains(err.Error(), string(otherSecret)) {
 		t.Fatal("integrity-key conflict exposed secret material")
+	}
+}
+
+func TestLocalControlIntegrityRotationConstructorMigratesPreviousKeyState(t *testing.T) {
+	runtimeDir := t.TempDir()
+	store, oldGateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	oldSecret := []byte("old-local-control-rotation-secret-0000000001")
+	currentSecret := []byte("new-local-control-rotation-secret-0000000002")
+	oldControl, err := NewLocalControlServer(
+		oldGateway,
+		oldSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldControl.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup-old-key", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	rotatedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(
+		rotatedGateway,
+		currentSecret,
+		[][]byte{oldSecret},
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("rotation overlap rejected previous-key state: %v", err)
+	}
+	state, err := rotatedGateway.state(context.Background(), localControlTestPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentKeyID := deriveLocalControlIntegrityKeyID(
+		deriveLocalControlIntegrityKey(currentSecret),
+	)
+	if state.LocalControl == nil ||
+		state.LocalControl.Integrity == nil ||
+		state.LocalControl.Integrity.KeyID != currentKeyID ||
+		state.needsResign {
+		t.Fatalf("previous-key runtime state was not migrated under PAID EX: %+v", state.LocalControl)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalControlServer(
+		currentOnly,
+		currentSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("current-only process rejected migrated runtime state: %v", err)
+	}
+
+	tooManyPrevious := [][]byte{
+		[]byte("previous-local-control-secret-number-000001"),
+		[]byte("previous-local-control-secret-number-000002"),
+		[]byte("previous-local-control-secret-number-000003"),
+	}
+	if _, err := NewLocalControlServerWithPreviousSigningSecrets(
+		openRuntimeGateway(t),
+		currentSecret,
+		tooManyPrevious,
+		[]LocalRuntimeAuthorization{authorization},
+	); err == nil {
+		t.Fatal("constructor accepted an unbounded previous-key verification set")
+	}
+}
+
+func TestDurableGatewayObserveDistinguishesStartupFromTerminalNotReady(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	authorization := localControlAuthorization(
+		localControlTestBearer,
+		localControlTestPAID,
+		7,
+		"boot-a",
+	)
+	control, err := NewLocalControlServer(
+		gateway,
+		localControlTestSigningSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.publishRuntimeState(
+		context.Background(),
+		startupPublication("startup", localControlTestPAID, 7, "boot-a"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	claims := TokenClaims{PersonalityAgentID: localControlTestPAID, Generation: 7}
+	observation, err := gateway.Observe(context.Background(), claims, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Ready || observation.TerminalNotReady {
+		t.Fatalf("startup NotReady was not connectable: %+v", observation)
+	}
+
+	if _, err := control.publishRuntimeState(context.Background(), LocalRuntimeStatePublication{
+		PublicationID:      "shutdown-before-ready",
+		PersonalityAgentID: localControlTestPAID,
+		Generation:         7,
+		RPCBootNonce:       "boot-a",
+		ExpectedRevision:   revision(1),
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeShutdown,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observation, err = gateway.Observe(context.Background(), claims, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Ready || !observation.TerminalNotReady {
+		t.Fatalf("shutdown NotReady was not terminal: %+v", observation)
 	}
 }

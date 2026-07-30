@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -103,7 +104,8 @@ type CommandSource interface {
 	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error)
 	// ApplyAck records a terminal command acknowledgement.
 	// Implementations must honor ctx cancellation; Server supplies an
-	// independent SideEffectTimeout while holding the authoritative lease.
+	// independent SideEffectTimeout and always invokes this method inside the
+	// authoritative lease boundary.
 	ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error
 }
 
@@ -111,19 +113,29 @@ type CommandSource interface {
 // Production wiring belongs to T17.
 type EventSink interface {
 	// Receive must honor ctx cancellation; Server supplies an independent
-	// SideEffectTimeout while holding the authoritative lease.
+	// SideEffectTimeout and always invokes this method inside the authoritative
+	// lease boundary.
 	Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error
 	// LastReceivedEventSeq returns the durable consumed prefix for this API
 	// identity. It must not be inferred from an agent-provided hello cursor.
 	LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 }
 
-// HydrationLatch waits for the current ProcessGeneration to become Ready.
+// HydrationLatch durably observes the current ProcessGeneration's Ready state.
+// The fenced hello exchange may precede Ready, but traffic may not.
 // Production wiring belongs to T17.
+type HydrationObservation struct {
+	Ready            bool
+	TerminalNotReady bool
+}
+
 type HydrationLatch interface {
 	// WaitFor blocks until the given generation is Ready or the context is done.
 	// If the generation is already Ready it returns immediately.
 	WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error
+	// Observe observes the durable state for exactly this generation. A
+	// generation change is an error, not readiness for the replacement.
+	Observe(ctx context.Context, claims TokenClaims, generation uint64) (HydrationObservation, error)
 }
 
 // Server is the production WebSocket gateway handler.
@@ -159,10 +171,11 @@ type Server struct {
 	// remain open after its ProcessGeneration is rolled over.
 	GenerationPollInterval time.Duration
 
-	// SideEffectTimeout bounds the authoritative lease interval around each
-	// synchronous ACK/event sink call. It independently guarantees that a sink
-	// waiting on context cancellation cannot indefinitely block reconnect or
-	// generation rollover from acquiring the exclusive PAID lease lock.
+	// SideEffectTimeout is the independent cancellation deadline supplied to
+	// each synchronous ACK/event sink call. Cooperative sinks return by that
+	// deadline. A sink that ignores cancellation remains inside the shared
+	// lease boundary until it returns; reconnect and rollover fail-stop rather
+	// than releasing the fence while a stale callback can still commit.
 	SideEffectTimeout time.Duration
 
 	// AllowedOrigins lists the exact origins allowed to open a WebSocket.
@@ -185,9 +198,43 @@ type agentConnectionEpoch struct {
 	conn                   *websocket.Conn
 	cancel                 context.CancelFunc
 	generationWatchStopped chan struct{}
+	readyObserved          atomic.Bool
 }
 
 var errConnectionEpochRevoked = errors.New("agent websocket connection epoch revoked")
+var errAgentRuntimeNotReady = errors.New("agent runtime is not Ready")
+
+// ErrSideEffectCancellationContract identifies an ACK/event adapter that
+// returned without reporting the cancellation observed by its supplied
+// context. The authoritative shared lease remains held until that adapter has
+// actually returned.
+var ErrSideEffectCancellationContract = errors.New("agent side-effect adapter violated its cancellation contract")
+
+// SideEffectCancellationContractError preserves both the cancellation and any
+// unrelated adapter error while supporting errors.Is with
+// ErrSideEffectCancellationContract.
+type SideEffectCancellationContractError struct {
+	ContextErr error
+	AdapterErr error
+}
+
+func (e *SideEffectCancellationContractError) Error() string {
+	if e.AdapterErr != nil {
+		return fmt.Sprintf("%v: context=%v adapter=%v", ErrSideEffectCancellationContract, e.ContextErr, e.AdapterErr)
+	}
+	return fmt.Sprintf("%v: context=%v", ErrSideEffectCancellationContract, e.ContextErr)
+}
+
+func (e *SideEffectCancellationContractError) Is(target error) bool {
+	return target == ErrSideEffectCancellationContract
+}
+
+func (e *SideEffectCancellationContractError) Unwrap() []error {
+	if e.AdapterErr == nil {
+		return []error{e.ContextErr}
+	}
+	return []error{e.ContextErr, e.AdapterErr}
+}
 
 // NewServer returns a Server with the required seams. Missing seams leave the
 // handler fail-closed.
@@ -322,9 +369,39 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	attempt := s.newConnectionAttempt()
 	defer s.removeConnectionAttempt(claims.PersonalityAgentID, attempt)
 
-	if err := s.Latch.WaitFor(helloCtx, claims, hello.Generation); err != nil {
-		return fmt.Errorf("hydration wait: %w", err)
+	// Claim the authoritative PAID lease before observing any durable cursor.
+	// A predecessor remains entitled to commit through its shared lease lock
+	// until this exclusive claim succeeds, so snapshots taken before the claim
+	// could advertise state that is already stale in the replacement hello.
+	if err := s.Generation.VerifyGeneration(
+		helloCtx,
+		claims.PersonalityAgentID,
+		claims.Generation,
+	); err != nil {
+		return fmt.Errorf("verify generation before lease claim: %w", err)
 	}
+	if !s.activateConnectionAttempt(claims.PersonalityAgentID, attempt) {
+		return errConnectionEpochRevoked
+	}
+	s.cancelLocalPredecessor(claims)
+	lease, err := s.Leases.ClaimConnectionLease(helloCtx, claims)
+	if err != nil {
+		return fmt.Errorf("claim connection lease: %w", err)
+	}
+	epoch, err := s.installConnectionEpoch(ctx, conn, claims, lease, cancel)
+	if err != nil {
+		_ = s.Leases.ReleaseConnectionLease(context.Background(), claims, lease)
+		return fmt.Errorf("install connection lease: %w", err)
+	}
+	go s.watchGeneration(ctx, epoch)
+	defer func() {
+		cancel()
+		<-epoch.generationWatchStopped
+		s.removeConnectionEpoch(epoch)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), s.writeTimeout())
+		defer releaseCancel()
+		_ = s.Leases.ReleaseConnectionLease(releaseCtx, claims, lease)
+	}()
 
 	firstSeq, err := s.Commands.FirstCommandSeq(helloCtx, claims)
 	if err != nil {
@@ -389,42 +466,13 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextSeq,
 	}
-	if err := s.Generation.VerifyGeneration(
-		helloCtx,
-		claims.PersonalityAgentID,
-		claims.Generation,
-	); err != nil {
-		return fmt.Errorf("verify generation before lease claim: %w", err)
-	}
-	if !s.activateConnectionAttempt(claims.PersonalityAgentID, attempt) {
-		return errConnectionEpochRevoked
-	}
-	s.cancelLocalPredecessor(claims)
-	lease, err := s.Leases.ClaimConnectionLease(helloCtx, claims)
-	if err != nil {
-		return fmt.Errorf("claim connection lease: %w", err)
-	}
-	epoch, err := s.installConnectionEpoch(ctx, conn, claims, lease, cancel)
-	if err != nil {
-		_ = s.Leases.ReleaseConnectionLease(context.Background(), claims, lease)
-		return fmt.Errorf("install connection lease: %w", err)
-	}
-	go s.watchGeneration(ctx, epoch)
-	defer func() {
-		cancel()
-		<-epoch.generationWatchStopped
-		s.removeConnectionEpoch(epoch)
-		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), s.writeTimeout())
-		defer releaseCancel()
-		_ = s.Leases.ReleaseConnectionLease(releaseCtx, claims, lease)
-	}()
 	if err := s.writeJSONForEpoch(ctx, epoch, apiHello); err != nil {
 		return fmt.Errorf("write api hello: %w", err)
 	}
+	helloDone()
 
-	// Install the pong handler before catch-up. The read pump installs its
-	// initial deadline immediately before the first read so a long catch-up
-	// cannot consume the peer's entire PongWait budget.
+	// Install the pong handler before waiting for Ready. The read pump starts
+	// now so a peer cannot queue pre-Ready events/ACKs for later admission.
 	if s.PongWait > 0 {
 		conn.SetPongHandler(func(string) error {
 			if s.PongWait > 0 {
@@ -433,6 +481,45 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 			return nil
 		})
 	}
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	var stopOnce sync.Once
+	stopPumps := func() {
+		stopOnce.Do(func() {
+			cancel()
+			// Close is allowed concurrently with gorilla's sole reader and writer.
+			// Deadline mutation here would race either pump.
+			_ = conn.Close()
+		})
+	}
+	defer func() {
+		stopPumps()
+		wg.Wait()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errCh <- s.readPump(ctx, epoch)
+		stopPumps()
+	}()
+
+	// The authenticated, current-generation socket and ApiHello are permitted
+	// while NotReady to break the bootstrap circular wait. Durable command
+	// delivery and inbound side effects remain gated until this exact
+	// generation becomes Ready.
+	if err := s.Latch.WaitFor(ctx, claims, hello.Generation); err != nil {
+		select {
+		case pumpErr := <-errCh:
+			if pumpErr != nil {
+				return pumpErr
+			}
+		default:
+		}
+		return fmt.Errorf("hydration wait: %w", err)
+	}
+	epoch.readyObserved.Store(true)
 
 	commands, err := s.Commands.CatchUp(ctx, claims, nextSeq)
 	if err != nil {
@@ -450,25 +537,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("live commands: %w", err)
 	}
 
-	errCh := make(chan error, 2)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	var stopOnce sync.Once
-	stopPumps := func() {
-		stopOnce.Do(func() {
-			cancel()
-			// Close is allowed concurrently with gorilla's sole reader and writer.
-			// Deadline mutation here would race either pump.
-			_ = conn.Close()
-		})
-	}
-
-	go func() {
-		defer wg.Done()
-		errCh <- s.readPump(ctx, epoch)
-		stopPumps()
-	}()
-
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		errCh <- s.writePump(ctx, epoch, live, liveErr)
@@ -483,7 +552,6 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 			pumpErrs = append(pumpErrs, err)
 		}
 	}
-	wg.Wait()
 	if len(pumpErrs) > 0 {
 		return errors.Join(pumpErrs...)
 	}
@@ -492,11 +560,6 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 
 func (s *Server) readPump(ctx context.Context, epoch *agentConnectionEpoch) error {
 	conn, claims := epoch.conn, epoch.claims
-	if s.PongWait > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
-			return fmt.Errorf("set initial pong read deadline: %w", err)
-		}
-	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -569,6 +632,11 @@ func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, liv
 		}
 	}
 
+	if err := s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
+		return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
+	}); err != nil {
+		return err
+	}
 	ticker := time.NewTicker(s.PingInterval)
 	defer ticker.Stop()
 	for {
@@ -622,7 +690,7 @@ func (s *Server) sendCommandEnvelope(
 	if cmd.PersonalityAgentID != epoch.claims.PersonalityAgentID {
 		return errors.New("command envelope target does not match token claim")
 	}
-	return s.writeJSONForEpoch(ctx, epoch, cmd)
+	return s.writeJSONForReadyEpoch(ctx, epoch, cmd)
 }
 
 func (s *Server) writeJSONForEpoch(
@@ -631,11 +699,32 @@ func (s *Server) writeJSONForEpoch(
 	value any,
 ) error {
 	return s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
-		if err := epoch.conn.SetWriteDeadline(s.writeDeadline()); err != nil {
-			return fmt.Errorf("set write deadline: %w", err)
-		}
-		return epoch.conn.WriteJSON(value)
+		return s.writeJSONOnEpoch(epoch, value)
 	})
+}
+
+func (s *Server) writeJSONForReadyEpoch(
+	ctx context.Context,
+	epoch *agentConnectionEpoch,
+	value any,
+) error {
+	return s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
+		observation, err := s.Latch.Observe(ctx, epoch.claims, epoch.claims.Generation)
+		if err != nil {
+			return err
+		}
+		if !observation.Ready {
+			return errAgentRuntimeNotReady
+		}
+		return s.writeJSONOnEpoch(epoch, value)
+	})
+}
+
+func (s *Server) writeJSONOnEpoch(epoch *agentConnectionEpoch, value any) error {
+	if err := epoch.conn.SetWriteDeadline(s.writeDeadline()); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	return epoch.conn.WriteJSON(value)
 }
 
 func (s *Server) writeDeadline() time.Time {
@@ -674,7 +763,32 @@ func (s *Server) withSideEffectLease(
 		effectCtx,
 		epoch.claims,
 		epoch.lease,
-		func() error { return call(effectCtx) },
+		func() error {
+			observation, readyErr := s.Latch.Observe(
+				effectCtx,
+				epoch.claims,
+				epoch.claims.Generation,
+			)
+			var callErr error
+			switch {
+			case readyErr != nil:
+				callErr = readyErr
+			case !observation.Ready:
+				callErr = errAgentRuntimeNotReady
+			default:
+				callErr = call(effectCtx)
+			}
+			contextErr := effectCtx.Err()
+			if contextErr == nil || errors.Is(callErr, contextErr) {
+				return callErr
+			}
+			// This check deliberately runs before WithConnectionLease returns,
+			// so a non-cooperative adapter cannot outlive the shared fence.
+			return &SideEffectCancellationContractError{
+				ContextErr: contextErr,
+				AdapterErr: callErr,
+			}
+		},
 	)
 }
 
@@ -793,6 +907,23 @@ func (s *Server) watchGeneration(ctx context.Context, epoch *agentConnectionEpoc
 				epoch.claims,
 				epoch.lease,
 			); err != nil {
+				s.revokeConnectionEpoch(epoch)
+				return
+			}
+			observation, err := s.Latch.Observe(
+				ctx,
+				epoch.claims,
+				epoch.claims.Generation,
+			)
+			if err != nil {
+				s.revokeConnectionEpoch(epoch)
+				return
+			}
+			if observation.Ready {
+				epoch.readyObserved.Store(true)
+				continue
+			}
+			if observation.TerminalNotReady || epoch.readyObserved.Load() {
 				s.revokeConnectionEpoch(epoch)
 				return
 			}

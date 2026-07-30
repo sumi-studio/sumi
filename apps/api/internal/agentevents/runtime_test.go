@@ -366,6 +366,86 @@ func TestConnectionLeaseLockIsIsolatedPerPersonalityAgent(t *testing.T) {
 	}
 }
 
+func TestDurableGatewayRejectsMutableDirectoryAndReplacedPinnedLock(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	publicDir := t.TempDir()
+	if err := os.Chmod(publicDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(publicDir, store); err == nil {
+		t.Fatal("gateway accepted a group/world-writable runtime directory")
+	}
+
+	symlinkParent := t.TempDir()
+	symlinkPath := filepath.Join(symlinkParent, "runtime-link")
+	if err := os.Symlink(t.TempDir(), symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(symlinkPath, store); err == nil {
+		t.Fatal("gateway accepted a symlink runtime directory")
+	}
+	realParent := t.TempDir()
+	symlinkedParent := filepath.Join(t.TempDir(), "linked-parent")
+	if err := os.Symlink(realParent, symlinkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurableGateway(filepath.Join(symlinkedParent, "runtime"), store); err == nil {
+		t.Fatal("gateway accepted a runtime directory beneath a symlink path component")
+	}
+
+	runtimeDir := t.TempDir()
+	gateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, gateway, personalityAgentID)
+	firstLease, err := gateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := gateway.localControlLockPath(personalityAgentID)
+	displacedLockPath := lockPath + ".displaced"
+	if err := os.Chmod(runtimeDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(lockPath, displacedLockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway claimed through a runtime directory made mutable after open")
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ClaimConnectionLease(context.Background(), claims); err == nil {
+		t.Fatal("gateway accepted a replacement for its pinned PAID lock inode")
+	}
+	after, err := os.ReadFile(gateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("refused split-lock claims changed the authoritative lease record")
+	}
+	if err := gateway.ValidateConnectionLease(context.Background(), claims, firstLease); err == nil {
+		t.Fatal("gateway continued through the replaced lock instead of failing closed")
+	}
+}
+
 func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
@@ -419,6 +499,126 @@ func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *
 	}
 	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
 		t.Fatal("tampered connection lease passed local-control integrity verification")
+	}
+}
+
+func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	oldGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, oldGateway, personalityAgentID)
+	oldKey := deriveLocalControlIntegrityKey([]byte("old-connection-integrity-secret-32-bytes"))
+	currentKey := deriveLocalControlIntegrityKey([]byte("new-connection-integrity-secret-32-bytes"))
+	if err := oldGateway.installLocalControlIntegrityKey(oldKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a pre-key-ID record from the previous deployment. Integrity covers
+	// the lease payload, not the metadata wrapper, so removing the ID preserves
+	// the valid legacy MAC.
+	raw, err := os.ReadFile(oldGateway.connectionLeasePath(personalityAgentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy connectionLeaseState
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Integrity.KeyID = ""
+	raw, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldGateway.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotated.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey},
+		[]string{personalityAgentID},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 16
+	start := make(chan struct{})
+	results := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			results <- rotated.ValidateConnectionLease(context.Background(), claims, lease)
+		}()
+	}
+	close(start)
+	for range readers {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent rotation validation failed: %v", err)
+		}
+	}
+
+	resigned, err := rotated.connectionLeaseState(personalityAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resigned.Integrity == nil ||
+		resigned.Integrity.KeyID != deriveLocalControlIntegrityKeyID(currentKey) {
+		t.Fatalf("lease was not re-signed with current key ID: %+v", resigned.Integrity)
+	}
+	if resigned.Generation != lease.Generation ||
+		resigned.Sequence != lease.Sequence ||
+		resigned.LeaseID != lease.ID ||
+		!resigned.Active {
+		t.Fatalf("rotation changed lease authority: %+v", resigned)
+	}
+
+	currentOnly, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.installLocalControlIntegrityKey(currentKey, []string{personalityAgentID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := currentOnly.ValidateConnectionLease(context.Background(), claims, lease); err != nil {
+		t.Fatalf("current-only verifier rejected re-signed lease: %v", err)
+	}
+
+	resigned.Integrity.KeyID = strings.Repeat("f", 32)
+	unknownKeyRecord, err := json.Marshal(resigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rotated.connectionLeasePath(personalityAgentID), unknownKeyRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rotated.connectionLeaseState(personalityAgentID); err == nil ||
+		!strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("unknown integrity key ID did not fail closed: %v", err)
+	}
+
+	duplicateGateway := openRuntimeGateway(t)
+	if err := duplicateGateway.installLocalControlIntegrityKeyring(
+		currentKey,
+		[][]byte{oldKey, oldKey},
+		[]string{personalityAgentID},
+	); err == nil {
+		t.Fatal("ambiguous duplicate previous integrity keys were accepted")
 	}
 }
 

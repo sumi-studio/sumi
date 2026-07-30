@@ -24,6 +24,26 @@ type fakeGenerationVerifier struct {
 	lease         ConnectionLease
 }
 
+type gatedClaimLeaseAuthority struct {
+	*DurableGateway
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedClaimLeaseAuthority) ClaimConnectionLease(
+	ctx context.Context,
+	claims TokenClaims,
+) (ConnectionLease, error) {
+	g.once.Do(func() { close(g.entered) })
+	select {
+	case <-ctx.Done():
+		return ConnectionLease{}, ctx.Err()
+	case <-g.release:
+	}
+	return g.DurableGateway.ClaimConnectionLease(ctx, claims)
+}
+
 func (f *fakeGenerationVerifier) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -263,6 +283,7 @@ func (s *blockingEventSink) Receive(ctx context.Context, claims TokenClaims, env
 type fakeHydrationLatch struct {
 	mu          sync.Mutex
 	ready       bool
+	terminal    bool
 	ch          chan struct{}
 	waitStarted chan struct{}
 }
@@ -294,6 +315,22 @@ func (f *fakeHydrationLatch) WaitFor(ctx context.Context, claims TokenClaims, ge
 	}
 }
 
+func (f *fakeHydrationLatch) Observe(
+	ctx context.Context,
+	claims TokenClaims,
+	generation uint64,
+) (HydrationObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return HydrationObservation{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return HydrationObservation{
+		Ready:            f.ready,
+		TerminalNotReady: f.terminal,
+	}, nil
+}
+
 func (f *fakeHydrationLatch) waitUntilBlocked(t *testing.T) {
 	t.Helper()
 	select {
@@ -308,7 +345,18 @@ func (f *fakeHydrationLatch) setReady() {
 	defer f.mu.Unlock()
 	if !f.ready {
 		f.ready = true
+		f.terminal = false
 		close(f.ch)
+	}
+}
+
+func (f *fakeHydrationLatch) setNotReady() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ready {
+		f.ready = false
+		f.terminal = true
+		f.ch = make(chan struct{})
 	}
 }
 
@@ -470,8 +518,8 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
 
-	// First connection: NotReady, so hello succeeds up to latch wait, then
-	// blocks. Close it before latch becomes Ready.
+	// First connection: NotReady still permits the fenced hello exchange, but
+	// command catch-up remains held. Close it before the latch becomes Ready.
 	conn1, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -486,16 +534,18 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 		t.Fatalf("write hello: %v", err)
 	}
 	hl.waitUntilBlocked(t)
-	conn1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	var apiHello ApiHello
-	if err := conn1.ReadJSON(&apiHello); err == nil {
-		t.Fatal("expected first connection to wait for hydration")
+	if err := conn2Wait(conn1, &apiHello, time.Second); err != nil {
+		t.Fatalf("NotReady connection did not receive fenced API hello: %v", err)
+	}
+	if calls := cs.catchUpCount(); calls != 0 {
+		t.Fatalf("expected no command catch-up before Ready, got %d calls", calls)
 	}
 	conn1.Close()
 
 	// Reconnect with the same generation while it is still NotReady. The new
-	// epoch must independently observe NotReady and keep its hello/command
-	// path held; it must not inherit a release from the old connection epoch.
+	// epoch must independently observe NotReady and keep command delivery held;
+	// it must not inherit a release from the old connection epoch.
 	conn2, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial reconnect: %v", err)
@@ -511,25 +561,317 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 		t.Fatalf("write hello: %v", err)
 	}
 	hl.waitUntilBlocked(t)
+	if err := conn2Wait(conn2, &apiHello, time.Second); err != nil {
+		t.Fatalf("read fenced API hello after reconnect: %v", err)
+	}
+	if apiHello.NextCommandSeq != 1 {
+		t.Fatalf("unexpected next command seq after reconnect: %d", apiHello.NextCommandSeq)
+	}
 	if calls := cs.catchUpCount(); calls != 0 {
 		t.Fatalf("expected no command catch-up before Ready, got %d calls", calls)
 	}
 
 	// Only a Ready latch for the same generation may release the new epoch.
 	hl.setReady()
-	if err := conn2.ReadJSON(&apiHello); err != nil {
-		t.Fatalf("read api hello after reconnect: %v", err)
-	}
-	if apiHello.NextCommandSeq != 1 {
-		t.Fatalf("unexpected next command seq after reconnect: %d", apiHello.NextCommandSeq)
-	}
-
 	var received CommandEnvelope
 	if err := conn2.ReadJSON(&received); err != nil {
 		t.Fatalf("read command after reconnect: %v", err)
 	}
 	if received.Seq != 1 {
 		t.Fatalf("unexpected command seq after reconnect: %d", received.Seq)
+	}
+}
+
+func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway.PollInterval = 5 * time.Millisecond
+	authorization := LocalRuntimeAuthorization{
+		BearerToken:           "not-ready-control-bearer-32-bytes-minimum",
+		TenantID:              "tenant-local",
+		PersonalityAgentID:    testPersonalityAgentID,
+		Generation:            7,
+		RPCBootNonce:          "boot-not-ready",
+		Audience:              defaultAgentAudience,
+		DeliveryAuthorization: LocalDeliveryRaw,
+	}
+	control, err := NewLocalControlServer(
+		gateway,
+		[]byte("not-ready-control-signing-secret-32-bytes-minimum"),
+		[]LocalRuntimeAuthorization{authorization},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.publishRuntimeState(context.Background(), LocalRuntimeStatePublication{
+		PublicationID:      "startup-not-ready",
+		PersonalityAgentID: testPersonalityAgentID,
+		Generation:         7,
+		RPCBootNonce:       "boot-not-ready",
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeStartup,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	command, err := store.Append(
+		context.Background(),
+		testDirectChatProvenance(testPersonalityAgentID),
+		"",
+		json.RawMessage(`{"type":"user_message","text":"after-ready","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	browserServer := NewBrowserServer(sessions, store, gateway)
+	browserServer.AllowedOrigins = []string{"https://web.example"}
+	browserMux := http.NewServeMux()
+	browserMux.Handle("GET /direct-chat/ws", browserServer)
+	browserHTTP := httptest.NewServer(browserMux)
+	defer browserHTTP.Close()
+	browserClaims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: testPersonalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	browser := dialBrowserWS(
+		t,
+		browserHTTP,
+		signBrowserSession(t, testSecret, browserClaims),
+		testPersonalityAgentID,
+	)
+	defer browser.Close()
+	if err := browser.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, browser, "unavailable")
+
+	server := NewServer(
+		&fakeTokenVerifier{},
+		gateway,
+		gateway,
+		gateway,
+		gateway,
+	)
+	server.GenerationPollInterval = 5 * time.Millisecond
+	agentHTTP := startTestServer(t, server)
+	defer agentHTTP.Close()
+	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
+	testDeadline := 5 * time.Second
+	connectNotReady := func() *websocket.Conn {
+		t.Helper()
+		conn, _, err := dialTestWS(t, agentHTTP, headers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.WriteJSON(AgentHello{
+			PersonalityAgentID:     testPersonalityAgentID,
+			Generation:             7,
+			LastSentEventSeq:       1,
+			LastReceivedCommandSeq: 0,
+			LastAppliedCommandSeq:  0,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var hello ApiHello
+		if err := conn2Wait(conn, &hello, testDeadline); err != nil {
+			t.Fatalf("NotReady connection did not receive ApiHello: %v", err)
+		}
+		if hello.LastReceivedEventSeq != 0 || hello.NextCommandSeq != command.Seq {
+			t.Fatalf("unexpected NotReady ApiHello: %+v", hello)
+		}
+		return conn
+	}
+	waitInactive := func() {
+		t.Helper()
+		deadline := time.Now().Add(testDeadline)
+		for {
+			server.connectionsMu.Lock()
+			active := len(server.connections)
+			server.connectionsMu.Unlock()
+			leaseState, leaseErr := gateway.connectionLeaseState(testPersonalityAgentID)
+			if active == 0 && leaseErr == nil && leaseState.present && !leaseState.Active {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("agent connection did not settle: active=%d lease=%+v err=%v", active, leaseState, leaseErr)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	eventOffender := connectNotReady()
+	seq := uint64(1)
+	if err := eventOffender.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var closedFrame json.RawMessage
+	if err := conn2Wait(eventOffender, &closedFrame, testDeadline); err == nil {
+		t.Fatal("pre-Ready event did not close the offending connection")
+	}
+	_ = eventOffender.Close()
+	waitInactive()
+	if last, err := gateway.LastReceivedEventSeq(
+		context.Background(),
+		TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+	); err != nil || last != 0 {
+		t.Fatalf("pre-Ready event reached durable sink: last=%d err=%v", last, err)
+	}
+
+	ackOffender := connectNotReady()
+	if err := ackOffender.WriteJSON(OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			PersonalityAgentID: testPersonalityAgentID,
+			Seq:                command.Seq,
+			CommandID:          command.CommandID,
+			Status:             "applied",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn2Wait(ackOffender, &closedFrame, testDeadline); err == nil {
+		t.Fatal("pre-Ready ACK did not close the offending connection")
+	}
+	_ = ackOffender.Close()
+	waitInactive()
+	if next, err := gateway.NextCommandSeq(
+		context.Background(),
+		TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+	); err != nil || next != command.Seq {
+		t.Fatalf("pre-Ready ACK reached durable sink: next=%d err=%v", next, err)
+	}
+
+	agent := connectNotReady()
+	defer agent.Close()
+	server.connectionsMu.Lock()
+	epoch := server.connections[testPersonalityAgentID]
+	server.connectionsMu.Unlock()
+	if epoch == nil {
+		t.Fatal("NotReady connection did not retain its fenced lease")
+	}
+	commandResult := make(chan error, 1)
+	go func() {
+		var delivered CommandEnvelope
+		err := agent.ReadJSON(&delivered)
+		if err == nil && (delivered.Seq != command.Seq || delivered.CommandID != command.CommandID) {
+			err = fmt.Errorf("unexpected command after Ready: %+v", delivered)
+		}
+		commandResult <- err
+	}()
+
+	readyReceipt := "ready-receipt-7"
+	if _, err := control.publishRuntimeState(context.Background(), LocalRuntimeStatePublication{
+		PublicationID:            "ready-exact-generation",
+		PersonalityAgentID:       testPersonalityAgentID,
+		Generation:               7,
+		RPCBootNonce:             "boot-not-ready",
+		ExpectedRevision:         revision(1),
+		State:                    LocalRuntimeReady,
+		HydrationReceiptIdentity: &readyReceipt,
+		Reason:                   LocalRuntimeHydrated,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-commandResult:
+		if err != nil {
+			t.Fatalf("Ready did not unlock exactly one command delivery: %v", err)
+		}
+	case <-time.After(testDeadline):
+		t.Fatal("Ready did not unlock command delivery")
+	}
+	assertDirectChatStatus(t, browser, "ready")
+
+	if err := agent.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.WriteJSON(OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			PersonalityAgentID: testPersonalityAgentID,
+			Seq:                command.Seq,
+			CommandID:          command.CommandID,
+			Status:             "applied",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(testDeadline)
+	for {
+		last, eventErr := gateway.LastReceivedEventSeq(
+			context.Background(),
+			TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+		)
+		next, ackErr := gateway.NextCommandSeq(
+			context.Background(),
+			TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+		)
+		if eventErr == nil && ackErr == nil && last == 1 && next == command.Seq+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-Ready traffic did not commit: last=%d eventErr=%v next=%d ackErr=%v", last, eventErr, next, ackErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertBrowserEvent(t, browser, "agent_start", true)
+
+	postCommandRead := make(chan error, 1)
+	go func() {
+		var extra json.RawMessage
+		postCommandRead <- agent.ReadJSON(&extra)
+	}()
+	if _, err := control.publishRuntimeState(context.Background(), LocalRuntimeStatePublication{
+		PublicationID:      "shutdown-not-ready",
+		PersonalityAgentID: testPersonalityAgentID,
+		Generation:         7,
+		RPCBootNonce:       "boot-not-ready",
+		ExpectedRevision:   revision(2),
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeShutdown,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, browser, "unavailable")
+	select {
+	case err := <-postCommandRead:
+		if err == nil {
+			t.Fatal("command was delivered more than once before shutdown fencing")
+		}
+	case <-time.After(testDeadline):
+		t.Fatal("shutdown NotReady did not close the agent connection")
+	}
+	waitInactive()
+	if err := gateway.ValidateConnectionLease(context.Background(), epoch.claims, epoch.lease); err == nil {
+		t.Fatal("shutdown NotReady left the old connection lease active")
 	}
 }
 
@@ -837,6 +1179,199 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	}
 }
 
+func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	command, err := store.Append(
+		context.Background(),
+		testDirectChatProvenance(testPersonalityAgentID),
+		"",
+		json.RawMessage(`{"type":"user_message","text":"lease-race","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := t.TempDir()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := "ready-7"
+	if err := firstGateway.PublishRuntimeState(testPersonalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	tv := &fakeTokenVerifier{}
+	firstServer := NewServer(tv, firstGateway, firstGateway, firstGateway, firstGateway)
+	firstServer.GenerationPollInterval = 5 * time.Millisecond
+	firstHTTP := startTestServer(t, firstServer)
+	defer firstHTTP.Close()
+	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
+
+	first, _, err := dialTestWS(t, firstHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	writeTestAgentHello(t, first, 7)
+	var hello ApiHello
+	if err := conn2Wait(first, &hello, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var delivered CommandEnvelope
+	if err := conn2Wait(first, &delivered, time.Second); err != nil {
+		t.Fatalf("first owner did not receive command to acknowledge: %v", err)
+	}
+	if delivered.Seq != command.Seq || delivered.CommandID != command.CommandID {
+		t.Fatalf("first owner received wrong command: %+v", delivered)
+	}
+
+	claimEntered := make(chan struct{})
+	releaseClaim := make(chan struct{})
+	gatedAuthority := &gatedClaimLeaseAuthority{
+		DurableGateway: secondGateway,
+		entered:        claimEntered,
+		release:        releaseClaim,
+	}
+	secondServer := NewServer(tv, gatedAuthority, secondGateway, secondGateway, secondGateway)
+	secondServer.GenerationPollInterval = 5 * time.Millisecond
+	secondHTTP := startTestServer(t, secondServer)
+	defer secondHTTP.Close()
+	second, _, err := dialTestWS(t, secondHTTP, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := second.WriteJSON(AgentHello{
+		PersonalityAgentID:     testPersonalityAgentID,
+		Generation:             7,
+		LastSentEventSeq:       2,
+		LastReceivedCommandSeq: command.Seq,
+		LastAppliedCommandSeq:  command.Seq,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-claimEntered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not reach authoritative lease claim")
+	}
+
+	seq := uint64(1)
+	if err := first.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.WriteJSON(OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			PersonalityAgentID: testPersonalityAgentID,
+			Seq:                command.Seq,
+			CommandID:          command.CommandID,
+			Status:             "applied",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		last, err := firstGateway.LastReceivedEventSeq(
+			context.Background(),
+			TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+		)
+		next, nextErr := firstGateway.NextCommandSeq(
+			context.Background(),
+			TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+		)
+		if err == nil && nextErr == nil && last == 1 && next == command.Seq+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"predecessor did not commit cursors N+1 before replacement claim: event=%d eventErr=%v next=%d nextErr=%v",
+				last,
+				err,
+				next,
+				nextErr,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseClaim)
+
+	if err := conn2Wait(second, &hello, time.Second); err != nil {
+		t.Fatalf("replacement did not complete hello: %v", err)
+	}
+	if hello.LastReceivedEventSeq != 1 || hello.NextCommandSeq != command.Seq+1 {
+		t.Fatalf("replacement hello used a pre-claim snapshot: %+v", hello)
+	}
+
+	seq = 2
+	if err := second.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_end"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(time.Second)
+	for {
+		last, err := secondGateway.LastReceivedEventSeq(
+			context.Background(),
+			TokenClaims{PersonalityAgentID: testPersonalityAgentID, Generation: 7},
+		)
+		if err == nil && last == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement was torn down or replay cursor was wrong: last=%d err=%v", last, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = first.Close()
+	_ = second.Close()
+	deadline = time.Now().Add(time.Second)
+	for {
+		firstServer.connectionsMu.Lock()
+		firstActive := len(firstServer.connections)
+		firstServer.connectionsMu.Unlock()
+		secondServer.connectionsMu.Lock()
+		secondActive := len(secondServer.connections)
+		secondServer.connectionsMu.Unlock()
+		leaseState, leaseErr := firstGateway.connectionLeaseState(testPersonalityAgentID)
+		if firstActive == 0 && secondActive == 0 &&
+			leaseErr == nil && leaseState.present && !leaseState.Active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"claim-before-snapshot cleanup did not settle: first=%d second=%d lease=%+v err=%v",
+				firstActive,
+				secondActive,
+				leaseState,
+				leaseErr,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *testing.T) {
 	store, err := OpenCommandStore(t.TempDir())
 	if err != nil {
@@ -946,6 +1481,102 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 			)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSideEffectCancellationViolationRetainsLeaseUntilCallbackReturns(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := "ready-7"
+	if err := firstGateway.PublishRuntimeState(testPersonalityAgentID, 7, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	claims := TokenClaims{
+		TenantID:           "tenant-a",
+		PersonalityAgentID: testPersonalityAgentID,
+		Generation:         7,
+	}
+	lease, err := firstGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(&fakeTokenVerifier{}, firstGateway, firstGateway, firstGateway, firstGateway)
+	server.SideEffectTimeout = 25 * time.Millisecond
+	epoch := &agentConnectionEpoch{claims: claims, lease: lease}
+
+	entered := make(chan struct{})
+	expired := make(chan struct{})
+	release := make(chan struct{})
+	committed := make(chan struct{})
+	effectDone := make(chan error, 1)
+	go func() {
+		effectDone <- server.withSideEffectLease(
+			context.Background(),
+			epoch,
+			func(effectCtx context.Context) error {
+				close(entered)
+				<-effectCtx.Done()
+				close(expired)
+				<-release // Deliberately ignore cancellation until the test releases it.
+				close(committed)
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("side-effect callback did not enter the shared lease")
+	}
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("side-effect callback did not observe its independent deadline")
+	}
+
+	claimDone := make(chan error, 1)
+	go func() {
+		_, err := secondGateway.ClaimConnectionLease(context.Background(), claims)
+		claimDone <- err
+	}()
+	select {
+	case err := <-claimDone:
+		t.Fatalf("replacement claim crossed a still-running stale callback: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	close(release)
+	err = <-effectDone
+	var contractErr *SideEffectCancellationContractError
+	if !errors.Is(err, ErrSideEffectCancellationContract) ||
+		!errors.Is(err, context.DeadlineExceeded) ||
+		!errors.As(err, &contractErr) {
+		t.Fatalf("ctx-ignoring callback did not return typed contract violation: %T %v", err, err)
+	}
+	select {
+	case <-committed:
+	default:
+		t.Fatal("side-effect result returned before the callback ended")
+	}
+	select {
+	case err := <-claimDone:
+		if err != nil {
+			t.Fatalf("replacement claim failed after stale callback returned: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement claim did not proceed after stale callback returned")
 	}
 }
 

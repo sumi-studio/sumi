@@ -66,6 +66,14 @@ func (failClosedHydrationLatch) WaitFor(ctx context.Context, claims TokenClaims,
 	return errNotWired
 }
 
+func (failClosedHydrationLatch) Observe(
+	ctx context.Context,
+	claims TokenClaims,
+	generation uint64,
+) (HydrationObservation, error) {
+	return HydrationObservation{}, errNotWired
+}
+
 // NewFailClosedServer returns a Server whose seams all reject. It is suitable
 // for cmd/server until T26/T17 inject the real production implementations.
 func NewFailClosedServer() *Server {
