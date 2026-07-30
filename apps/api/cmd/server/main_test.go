@@ -519,6 +519,25 @@ func trustedShortSocketParent(t *testing.T) string {
 	return parent
 }
 
+func replaceTrustedSocketParent(t *testing.T, parent string, gid int) string {
+	t.Helper()
+	movedParent := parent + "-pinned"
+	if err := os.Rename(parent, movedParent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(movedParent) })
+	if err := os.Mkdir(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	return movedParent
+}
+
 func TestUnixLocalControlRoundTripRequiresBearerAndNeverUsesPublicMux(t *testing.T) {
 	setCompleteLocalControlEnv(t)
 	parent := trustedSocketParent(t)
@@ -1156,6 +1175,172 @@ func TestUnixListenerCrashResidueConverges(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestUnixListenerParentReplacementDuringLockPublicationFailsClosed(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var movedParent string
+	hooks := &localControlListenerTestHooks{
+		afterLockPublication: func() {
+			movedParent = replaceTrustedSocketParent(t, parent, gid)
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err == nil {
+		_ = listener.Close()
+		t.Fatal("listener returned after its configured parent was replaced")
+	}
+	if !strings.Contains(err.Error(), "no longer names the pinned trusted directory") {
+		t.Fatalf("unexpected parent replacement error: %v", err)
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement parent received a socket: %v", err)
+	}
+	if _, err := os.Lstat(socketPath + ".owner.lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement parent received an ownership lock: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pinned parent received a socket after publication race: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock.owner.lock")); err != nil {
+		t.Fatalf("atomic ownership lock was not published in the pinned parent: %v", err)
+	}
+}
+
+func TestUnixListenerParentReplacementBeforeReturnCleansOnlyPinnedSocket(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var movedParent string
+	var replacement *net.UnixListener
+	var replacementDev uint64
+	var replacementIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeListenerReturn: func() {
+			movedParent = replaceTrustedSocketParent(t, parent, gid)
+			var err error
+			replacement, err = net.ListenUnix(
+				"unix",
+				&net.UnixAddr{Name: socketPath, Net: "unix"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+				t.Fatal(err)
+			}
+			replacementDev, replacementIno = socketInode(t, socketPath)
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("listener returned after its configured parent was replaced")
+	}
+	if replacement == nil {
+		t.Fatal("parent replacement hook did not install its live socket")
+	}
+	defer replacement.Close()
+	if err == nil || !strings.Contains(err.Error(), "no longer names the pinned trusted directory") {
+		t.Fatalf("unexpected parent replacement error: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned socket was not removed from the pinned parent: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != replacementDev || gotIno != replacementIno {
+		t.Fatal("cleanup removed or replaced the non-owned socket in the configured replacement parent")
+	}
+}
+
+func TestUnixListenerLockPublicationNeverReplacesNoncooperatingDestination(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	lockPath := socketPath + ".owner.lock"
+	gid := os.Getegid()
+	const installed = "same-uid-noncooperating-destination"
+	var installedDev uint64
+	var installedIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeLockPublication: func() {
+			if err := os.WriteFile(lockPath, []byte(installed), localControlLockMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(lockPath, os.Geteuid(), gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(lockPath, localControlLockMode); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				t.Fatal("destination installer inode is unavailable")
+			}
+			installedDev, installedIno = stat.Dev, stat.Ino
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err == nil {
+		_ = listener.Close()
+		t.Fatal("no-replace lock publication overwrote a competing destination")
+	}
+	if !strings.Contains(err.Error(), "appeared during atomic publication") {
+		t.Fatalf("unexpected no-replace publication error: %v", err)
+	}
+	content, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != installed {
+		t.Fatalf("competing destination content changed: %q", content)
+	}
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Dev != installedDev || stat.Ino != installedIno {
+		t.Fatal("competing destination inode was replaced")
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".owner.lock.init-") {
+			t.Fatalf("failed no-replace publication left initializer residue: %s", entry.Name())
+		}
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed no-replace publication created a socket: %v", err)
 	}
 }
 
