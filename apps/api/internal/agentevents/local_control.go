@@ -138,7 +138,7 @@ type localControlDurableState struct {
 
 type localControlStateIntegrity struct {
 	Version uint8  `json:"version"`
-	KeyID   string `json:"key_id,omitempty"`
+	KeyID   string `json:"key_id"`
 	MAC     string `json:"mac"`
 }
 
@@ -259,10 +259,13 @@ func newLocalControlServer(
 		if _, checked := checkedState[authorization.PersonalityAgentID]; checked {
 			continue
 		}
-		state, err := gateway.stateWithIntegrityMigration(
+		if err := gateway.resignIntegrityStates(
 			context.Background(),
 			authorization.PersonalityAgentID,
-		)
+		); err != nil {
+			return nil, fmt.Errorf("repair local control integrity state: %w", err)
+		}
+		state, err := gateway.state(context.Background(), authorization.PersonalityAgentID)
 		if err != nil {
 			return nil, fmt.Errorf("validate existing local control runtime state: %w", err)
 		}
@@ -848,13 +851,11 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 		len(control.Integrity.MAC) != sha256.Size*2 {
 		return errors.New("invalid local control state integrity metadata")
 	}
-	if control.Integrity.KeyID != "" {
-		if len(control.Integrity.KeyID) != 32 {
-			return errors.New("invalid local control state integrity key identifier")
-		}
-		if _, err := hex.DecodeString(control.Integrity.KeyID); err != nil {
-			return errors.New("invalid local control state integrity key identifier")
-		}
+	if len(control.Integrity.KeyID) != 32 {
+		return errors.New("invalid local control state integrity key identifier")
+	}
+	if _, err := hex.DecodeString(control.Integrity.KeyID); err != nil {
+		return errors.New("invalid local control state integrity key identifier")
 	}
 	if _, err := hex.DecodeString(control.Integrity.MAC); err != nil {
 		return errors.New("invalid local control state integrity metadata")
@@ -1229,57 +1230,31 @@ func verifyLocalControlIntegrity(
 	if err != nil || len(actual) != sha256.Size {
 		return false, errors.New("invalid local control state integrity")
 	}
-
-	if integrity.KeyID != "" {
-		var key localControlIntegrityKey
-		switch {
-		case integrity.KeyID == keyring.Current.ID:
-			key = keyring.Current
-		default:
-			var ok bool
-			key, ok = keyring.Previous[integrity.KeyID]
-			if !ok {
-				return false, errors.New("unknown local control integrity key identifier")
-			}
-		}
-		expected, err := macForKey(key.Key)
-		if err != nil {
-			return false, err
-		}
-		if subtle.ConstantTimeCompare(actual, expected) != 1 {
-			return false, errors.New("invalid local control state integrity")
-		}
-		return key.ID != keyring.Current.ID, nil
+	if len(integrity.KeyID) != 32 {
+		return false, errors.New("invalid local control integrity key identifier")
 	}
-
-	// Legacy records without a key ID are accepted only when exactly one
-	// configured key verifies them. They are marked for rewrite so the
-	// ambiguity cannot persist beyond the overlap window.
-	matches := 0
-	for _, key := range append(
-		[]localControlIntegrityKey{keyring.Current},
-		mapLocalControlIntegrityKeys(keyring.Previous)...,
-	) {
-		expected, err := macForKey(key.Key)
-		if err != nil {
-			return false, err
-		}
-		if subtle.ConstantTimeCompare(actual, expected) == 1 {
-			matches++
+	if _, err := hex.DecodeString(integrity.KeyID); err != nil {
+		return false, errors.New("invalid local control integrity key identifier")
+	}
+	var key localControlIntegrityKey
+	switch {
+	case integrity.KeyID == keyring.Current.ID:
+		key = keyring.Current
+	default:
+		var ok bool
+		key, ok = keyring.Previous[integrity.KeyID]
+		if !ok {
+			return false, errors.New("unknown local control integrity key identifier")
 		}
 	}
-	if matches != 1 {
-		return false, errors.New("unknown or ambiguous legacy local control integrity key")
+	expected, err := macForKey(key.Key)
+	if err != nil {
+		return false, err
 	}
-	return true, nil
-}
-
-func mapLocalControlIntegrityKeys(keys map[string]localControlIntegrityKey) []localControlIntegrityKey {
-	result := make([]localControlIntegrityKey, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, key)
+	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+		return false, errors.New("invalid local control state integrity")
 	}
-	return result
+	return key.ID != keyring.Current.ID, nil
 }
 
 func (g *DurableGateway) verifyLocalControlRuntimeStateIntegrity(state runtimeState) (bool, error) {

@@ -490,7 +490,29 @@ func TestConnectionLeaseStateUsesLocalControlIntegrityWithoutIdentityLeakage(t *
 		t.Fatalf("gateway with matching key rejected shared signed lease: %v", err)
 	}
 
-	tampered := bytes.Replace(raw, []byte(`"sequence":1`), []byte(`"sequence":2`), 1)
+	var missingKeyID connectionLeaseState
+	if err := unmarshalStrict(raw, &missingKeyID); err != nil {
+		t.Fatal(err)
+	}
+	if missingKeyID.Integrity == nil {
+		t.Fatal("signed connection lease did not contain integrity metadata")
+	}
+	missingKeyID.Integrity.KeyID = ""
+	tampered, err := json.Marshal(missingKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.connectionLeaseState(personalityAgentID); err == nil {
+		t.Fatal("connection lease without an integrity key identifier was accepted")
+	}
+	if err := os.WriteFile(gateway.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tampered = bytes.Replace(raw, []byte(`"sequence":1`), []byte(`"sequence":2`), 1)
 	if bytes.Equal(tampered, raw) {
 		t.Fatal("test did not alter signed connection lease")
 	}
@@ -522,26 +544,6 @@ func TestConnectionLeaseIntegrityKeyRotationResignsConcurrently(t *testing.T) {
 	}
 	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
 	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Model a pre-key-ID record from the previous deployment. Integrity covers
-	// the lease payload, not the metadata wrapper, so removing the ID preserves
-	// the valid legacy MAC.
-	raw, err := os.ReadFile(oldGateway.connectionLeasePath(personalityAgentID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var legacy connectionLeaseState
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		t.Fatal(err)
-	}
-	legacy.Integrity.KeyID = ""
-	raw, err = json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(oldGateway.connectionLeasePath(personalityAgentID), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

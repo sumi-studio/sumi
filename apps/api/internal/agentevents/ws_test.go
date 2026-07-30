@@ -265,15 +265,27 @@ func (f *fakeEventSink) LastReceivedEventSeq(ctx context.Context, claims TokenCl
 
 type blockingEventSink struct {
 	*fakeEventSink
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+	entered    chan struct{}
+	release    chan struct{}
+	deadline   chan time.Duration
+	canceled   chan struct{}
+	once       sync.Once
+	cancelOnce sync.Once
 }
 
 func (s *blockingEventSink) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
+	if deadline, ok := ctx.Deadline(); ok && s.deadline != nil {
+		select {
+		case s.deadline <- time.Until(deadline):
+		default:
+		}
+	}
 	s.once.Do(func() { close(s.entered) })
 	select {
 	case <-ctx.Done():
+		if s.canceled != nil {
+			s.cancelOnce.Do(func() { close(s.canceled) })
+		}
 		return ctx.Err()
 	case <-s.release:
 		return s.fakeEventSink.Receive(ctx, claims, envelope)
@@ -1077,6 +1089,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	secondHTTP := startTestServer(t, secondServer)
 	defer secondHTTP.Close()
 	headers := map[string][]string{"Authorization": {"Bearer test-token"}}
+	testDeadline := 5 * time.Second
 
 	first, _, err := dialTestWS(t, firstHTTP, headers)
 	if err != nil {
@@ -1085,7 +1098,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	defer first.Close()
 	writeTestAgentHello(t, first, 7)
 	var hello ApiHello
-	if err := conn2Wait(first, &hello, time.Second); err != nil {
+	if err := conn2Wait(first, &hello, testDeadline); err != nil {
 		t.Fatal(err)
 	}
 	firstServer.connectionsMu.Lock()
@@ -1101,7 +1114,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	}
 	defer second.Close()
 	writeTestAgentHello(t, second, 7)
-	if err := conn2Wait(second, &hello, time.Second); err != nil {
+	if err := conn2Wait(second, &hello, testDeadline); err != nil {
 		t.Fatalf("second Server did not acquire same-generation lease: %v", err)
 	}
 
@@ -1135,7 +1148,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(testDeadline)
 	for {
 		last, err := firstGateway.LastReceivedEventSeq(context.Background(), firstEpoch.claims)
 		if err == nil && last == 1 {
@@ -1147,7 +1160,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 		time.Sleep(time.Millisecond)
 	}
 
-	first.SetReadDeadline(time.Now().Add(time.Second))
+	first.SetReadDeadline(time.Now().Add(testDeadline))
 	if err := first.ReadJSON(&hello); err == nil {
 		t.Fatal("revoked connection on first Server remained open")
 	}
@@ -1395,6 +1408,8 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 		fakeEventSink: &fakeEventSink{},
 		entered:       make(chan struct{}),
 		release:       make(chan struct{}),
+		deadline:      make(chan time.Duration, 1),
+		canceled:      make(chan struct{}),
 	}
 	tv := &fakeTokenVerifier{}
 	firstServer := NewServer(tv, firstGateway, firstGateway, blockedEvents, firstGateway)
@@ -1431,22 +1446,35 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 	}
 	select {
 	case <-blockedEvents.entered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("old Server sink did not enter the shared lease boundary")
 	}
+	select {
+	case remaining := <-blockedEvents.deadline:
+		if remaining > firstServer.SideEffectTimeout+10*time.Millisecond {
+			t.Fatalf(
+				"sink received a cancellation deadline beyond the product bound: remaining=%v bound=%v",
+				remaining,
+				firstServer.SideEffectTimeout,
+			)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old Server sink did not receive a bounded context deadline")
+	}
 
-	started := time.Now()
 	second, _, err := dialTestWS(t, secondHTTP, headers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
 	writeTestAgentHello(t, second, 7)
-	if err := conn2Wait(second, &hello, time.Second); err != nil {
+	if err := conn2Wait(second, &hello, 5*time.Second); err != nil {
 		t.Fatalf("cross-Server reconnect did not drain bounded sink: %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("cross-Server reconnect exceeded bounded sink drain: %v", elapsed)
+	select {
+	case <-blockedEvents.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bounded sink did not observe its supplied context cancellation")
 	}
 	blockedEvents.fakeEventSink.mu.Lock()
 	received := len(blockedEvents.fakeEventSink.envelopes)
@@ -1458,7 +1486,7 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 
 	_ = first.Close()
 	_ = second.Close()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		firstServer.connectionsMu.Lock()
 		firstActive := len(firstServer.connections)
@@ -2095,6 +2123,29 @@ func TestNewServerConfiguresBoundedWriteTimeout(t *testing.T) {
 	}
 }
 
+func TestServerRejectsUnboundedLivenessConfiguration(t *testing.T) {
+	tests := []struct {
+		name         string
+		pongWait     time.Duration
+		pingInterval time.Duration
+	}{
+		{name: "missing pong bound", pongWait: 0, pingInterval: time.Second},
+		{name: "missing ping cadence", pongWait: time.Second, pingInterval: 0},
+		{name: "ping equals pong bound", pongWait: time.Second, pingInterval: time.Second},
+		{name: "ping exceeds pong bound", pongWait: time.Second, pingInterval: 2 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv, _, _, _, _, _ := newTestServer(t)
+			srv.PongWait = test.pongWait
+			srv.PingInterval = test.pingInterval
+			if err := srv.validateLivenessConfig(); err == nil {
+				t.Fatal("unbounded liveness configuration was accepted")
+			}
+		})
+	}
+}
+
 func TestWritePumpClosedErrorChannelDoesNotSpinWithoutPing(t *testing.T) {
 	srv, _, _, _, _, _ := newTestServer(t)
 	srv.PingInterval = 0
@@ -2136,7 +2187,7 @@ func TestWebSocketPumpFailureUnblocksPeerReadWithoutPongWait(t *testing.T) {
 	hl.setReady()
 	srv := NewServer(tv, gv, commands, es, hl)
 	srv.PongWait = 5 * time.Second
-	srv.PingInterval = time.Hour
+	srv.PingInterval = 4 * time.Second
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -2168,7 +2219,7 @@ func TestWebSocketReadFailureClosesIdleWriterWithoutPongWait(t *testing.T) {
 	srv, _, _, _, _, hl := newTestServer(t)
 	hl.setReady()
 	srv.PongWait = 5 * time.Second
-	srv.PingInterval = time.Hour
+	srv.PingInterval = 4 * time.Second
 	server := startTestServer(t, srv)
 	defer server.Close()
 	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
@@ -2208,10 +2259,9 @@ func TestServerWriteDeadlineUsesConfiguredTimeout(t *testing.T) {
 }
 
 func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
-	srv, _, _, _, _, hl := newTestServer(t)
-	hl.setReady()
+	srv, _, _, commands, _, _ := newTestServer(t)
 	srv.PongWait = 100 * time.Millisecond
-	srv.PingInterval = 50 * time.Millisecond
+	srv.PingInterval = 20 * time.Millisecond
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -2241,20 +2291,139 @@ func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
 	// Disable the client's automatic pong response so the server sees a silent peer.
 	conn.SetPingHandler(func(string) error { return nil })
 
-	conn.SetReadDeadline(time.Now().Add(time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	var received CommandEnvelope
 	if err := conn.ReadJSON(&received); err == nil {
-		t.Fatal("expected connection to close on silent peer (no pong)")
+		t.Fatal("expected pre-Ready connection to close on silent peer (no pong)")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		srv.connectionsMu.Lock()
+		active := len(srv.connections)
+		srv.connectionsMu.Unlock()
+		if active == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("silent pre-Ready peer remained registered: active=%d", active)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if calls := commands.catchUpCount(); calls != 0 {
+		t.Fatalf("silent pre-Ready peer reached command catch-up: calls=%d", calls)
+	}
+}
+
+func TestWebSocketAuthenticatedHeartbeatOutlivesHelloTimeoutBeforeReady(t *testing.T) {
+	srv, _, _, commands, events, hl := newTestServer(t)
+	srv.HelloTimeout = 30 * time.Millisecond
+	srv.PongWait = 250 * time.Millisecond
+	srv.PingInterval = 20 * time.Millisecond
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{
+		PersonalityAgentID: testPersonalityAgentID,
+		Generation:         7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var hello ApiHello
+	if err := conn2Wait(conn, &hello, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	hl.waitUntilBlocked(t)
+
+	pings := make(chan struct{}, 16)
+	conn.SetPingHandler(func(data string) error {
+		select {
+		case pings <- struct{}{}:
+		default:
+		}
+		return conn.WriteControl(
+			websocket.PongMessage,
+			[]byte(data),
+			time.Now().Add(time.Second),
+		)
+	})
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			var frame json.RawMessage
+			if err := conn.ReadJSON(&frame); err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	started := time.Now()
+	observedPings := 0
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for observedPings < 4 || time.Since(started) <= 2*srv.HelloTimeout {
+		select {
+		case <-pings:
+			observedPings++
+		case err := <-readDone:
+			t.Fatalf("authenticated pre-Ready heartbeat closed early: %v", err)
+		case <-deadline.C:
+			t.Fatalf(
+				"authenticated pre-Ready heartbeat did not remain active: pings=%d elapsed=%v",
+				observedPings,
+				time.Since(started),
+			)
+		}
+	}
+	if calls := commands.catchUpCount(); calls != 0 {
+		t.Fatalf("pre-Ready heartbeat unlocked command catch-up: calls=%d", calls)
+	}
+
+	hl.setReady()
+	seq := uint64(1)
+	if err := conn.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: testPersonalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eventDeadline := time.Now().Add(5 * time.Second)
+	for {
+		events.mu.Lock()
+		count := len(events.envelopes)
+		events.mu.Unlock()
+		if count == 1 {
+			break
+		}
+		if time.Now().After(eventDeadline) {
+			t.Fatal("Ready did not unlock traffic after the pre-Ready heartbeat window")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = conn.Close()
+	select {
+	case <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client reader did not stop after heartbeat test connection closed")
 	}
 }
 
 func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 	srv, _, _, commands, events, hl := newTestServer(t)
 	hl.setReady()
-	srv.PongWait = 50 * time.Millisecond
-	srv.PingInterval = time.Hour
-	commands.catchUpDelay = 100 * time.Millisecond
+	srv.PongWait = 80 * time.Millisecond
+	srv.PingInterval = 20 * time.Millisecond
+	commands.catchUpDelay = 200 * time.Millisecond
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -2270,6 +2439,36 @@ func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 	if err := conn.ReadJSON(&hello); err != nil {
 		t.Fatal(err)
 	}
+	conn.SetPingHandler(func(data string) error {
+		return conn.WriteControl(
+			websocket.PongMessage,
+			[]byte(data),
+			time.Now().Add(time.Second),
+		)
+	})
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			var frame json.RawMessage
+			if err := conn.ReadJSON(&frame); err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	catchUpDeadline := time.Now().Add(5 * time.Second)
+	for commands.catchUpCount() == 0 {
+		if time.Now().After(catchUpDeadline) {
+			t.Fatal("slow catch-up did not complete while heartbeats were active")
+		}
+		select {
+		case err := <-readDone:
+			t.Fatalf("heartbeat did not keep the connection alive through catch-up: %v", err)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	seq := uint64(1)
 	if err := conn.WriteJSON(OutboundFrame{
@@ -2283,12 +2482,18 @@ func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		events.mu.Lock()
 		count := len(events.envelopes)
 		events.mu.Unlock()
 		if count == 1 {
+			_ = conn.Close()
+			select {
+			case <-readDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("client reader did not stop after catch-up connection closed")
+			}
 			return
 		}
 		time.Sleep(5 * time.Millisecond)

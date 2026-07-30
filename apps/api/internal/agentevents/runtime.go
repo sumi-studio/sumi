@@ -777,6 +777,10 @@ func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, genera
 			}
 			return nil
 		}
+		if state.LocalControl != nil &&
+			state.LocalControl.Reason == LocalRuntimeShutdown {
+			return errHydrationTerminalNotReady
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -491,5 +492,155 @@ func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing
 		t.Fatal("decoded agent token secret was accepted as the local control bearer")
 	} else if strings.Contains(err.Error(), string(testTokenSecret)) {
 		t.Fatal("secret-separation error exposed the credential value")
+	}
+}
+
+func TestLocalControlServerFromEnvMigratesPreviousSigningSecret(t *testing.T) {
+	store, err := agentevents.OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtimeDir := t.TempDir()
+	oldGateway, err := agentevents.OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001"
+		bearer             = "server-rotation-control-bearer-32-bytes-minimum"
+	)
+	oldSecret := []byte("server-old-signing-secret-32-bytes-minimum")
+	currentSecret := []byte("server-new-signing-secret-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", bearer)
+	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", personalityAgentID)
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_AGENT_TOKEN_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(oldSecret))
+	t.Setenv(localControlPreviousSigningSecretsEnv, "")
+
+	oldControl, enabled, err := localControlServerFromEnv(oldGateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Fatal("complete local-control environment did not enable the server")
+	}
+	mux := http.NewServeMux()
+	if err := oldControl.RegisterRoutes(mux); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(mux)
+	publication, err := json.Marshal(agentevents.LocalRuntimeStatePublication{
+		PublicationID:      "startup-before-server-secret-rotation",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         7,
+		RPCBootNonce:       "boot-fixture",
+		State:              agentevents.LocalRuntimeNotReady,
+		Reason:             agentevents.LocalRuntimeStartup,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(
+		http.MethodPost,
+		server.URL+agentevents.LocalRuntimeStatePublishPath,
+		bytes.NewReader(publication),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+bearer)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	server.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("seed local-control state: got %d, want 200", response.StatusCode)
+	}
+
+	claims := agentevents.TokenClaims{
+		PersonalityAgentID: personalityAgentID,
+		Generation:         7,
+	}
+	lease, err := oldGateway.ClaimConnectionLease(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotatedGateway, err := agentevents.OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(currentSecret))
+	t.Setenv(
+		localControlPreviousSigningSecretsEnv,
+		base64.StdEncoding.EncodeToString(oldSecret),
+	)
+	if _, enabled, err := localControlServerFromEnv(rotatedGateway); err != nil {
+		t.Fatalf("server bootstrap did not accept the bounded previous signing secret: %v", err)
+	} else if !enabled {
+		t.Fatal("rotation bootstrap unexpectedly disabled local control")
+	}
+
+	currentOnly, err := agentevents.OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(localControlPreviousSigningSecretsEnv, "")
+	if _, _, err := localControlServerFromEnv(currentOnly); err != nil {
+		t.Fatalf("current-only bootstrap rejected migrated durable state: %v", err)
+	}
+	if err := currentOnly.ValidateConnectionLease(context.Background(), claims, lease); err != nil {
+		t.Fatalf("server bootstrap rotation changed lease authority: %v", err)
+	}
+}
+
+func TestLocalControlPreviousSigningSecretsFromEnvIsBoundedAndStrict(t *testing.T) {
+	first := []byte("first-previous-server-signing-secret-32-bytes")
+	second := []byte("second-previous-server-signing-secret-32-bytes")
+	t.Setenv(
+		localControlPreviousSigningSecretsEnv,
+		base64.StdEncoding.EncodeToString(first)+", "+
+			base64.StdEncoding.EncodeToString(second),
+	)
+	secrets, err := localControlPreviousSigningSecretsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets) != 2 || !bytes.Equal(secrets[0], first) || !bytes.Equal(secrets[1], second) {
+		t.Fatalf("unexpected previous signing secrets: %d", len(secrets))
+	}
+
+	t.Setenv(
+		localControlPreviousSigningSecretsEnv,
+		base64.StdEncoding.EncodeToString(first)+",",
+	)
+	if _, err := localControlPreviousSigningSecretsFromEnv(); err == nil {
+		t.Fatal("empty previous signing-secret entry was accepted")
+	}
+	t.Setenv(localControlPreviousSigningSecretsEnv, "not-base64")
+	if _, err := localControlPreviousSigningSecretsFromEnv(); err == nil {
+		t.Fatal("malformed previous signing secret was accepted")
+	}
+	t.Setenv(
+		localControlPreviousSigningSecretsEnv,
+		strings.Join([]string{
+			base64.StdEncoding.EncodeToString(first),
+			base64.StdEncoding.EncodeToString(second),
+			base64.StdEncoding.EncodeToString(first),
+		}, ","),
+	)
+	if _, err := localControlPreviousSigningSecretsFromEnv(); err == nil {
+		t.Fatal("unbounded previous signing-secret set was accepted")
 	}
 }

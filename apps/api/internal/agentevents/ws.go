@@ -159,12 +159,12 @@ type Server struct {
 	// the hello onward. A value of zero disables the limit.
 	MaxReadLimit int64
 
-	// PongWait is the duration the server will wait for a pong after the
-	// hello exchange before closing the connection.
+	// PongWait is the post-hello liveness bound, including while the authenticated
+	// current generation is still NotReady.
 	PongWait time.Duration
 
-	// PingInterval is how often the server sends ping control frames from the
-	// writer goroutine. It must be shorter than PongWait.
+	// PingInterval is how often the dedicated post-hello liveness pump sends a
+	// lease-fenced ping. It must be positive and shorter than PongWait.
 	PingInterval time.Duration
 
 	// GenerationPollInterval bounds how long an otherwise-idle connection can
@@ -203,6 +203,7 @@ type agentConnectionEpoch struct {
 
 var errConnectionEpochRevoked = errors.New("agent websocket connection epoch revoked")
 var errAgentRuntimeNotReady = errors.New("agent runtime is not Ready")
+var errHydrationTerminalNotReady = errors.New("agent runtime entered terminal NotReady")
 
 // ErrSideEffectCancellationContract identifies an ACK/event adapter that
 // returned without reporting the cancellation observed by its supplied
@@ -336,6 +337,9 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if err := s.validateLivenessConfig(); err != nil {
+		return err
+	}
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
 	}
@@ -471,18 +475,18 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	}
 	helloDone()
 
-	// Install the pong handler before waiting for Ready. The read pump starts
-	// now so a peer cannot queue pre-Ready events/ACKs for later admission.
-	if s.PongWait > 0 {
-		conn.SetPongHandler(func(string) error {
-			if s.PongWait > 0 {
-				_ = conn.SetReadDeadline(time.Now().Add(s.PongWait))
-			}
-			return nil
-		})
+	// Replace the hello deadline with the explicit post-hello liveness bound.
+	// This permits hydration to outlive HelloTimeout while still bounding a
+	// silent authenticated peer throughout NotReady, catch-up, and live traffic.
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(s.PongWait))
+		return nil
+	})
+	if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
+		return fmt.Errorf("set post-hello liveness deadline: %w", err)
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
 	var stopOnce sync.Once
 	stopPumps := func() {
@@ -498,10 +502,15 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		wg.Wait()
 	}()
 
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		errCh <- s.readPump(ctx, epoch)
+		stopPumps()
+	}()
+	go func() {
+		defer wg.Done()
+		errCh <- s.livenessPump(ctx, epoch)
 		stopPumps()
 	}()
 
@@ -547,7 +556,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	<-ctx.Done()
 	stopPumps()
 	var pumpErrs []error
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		if err := <-errCh; err != nil {
 			pumpErrs = append(pumpErrs, err)
 		}
@@ -571,10 +580,8 @@ func (s *Server) readPump(ctx context.Context, epoch *agentConnectionEpoch) erro
 		if err := conn.ReadJSON(&frame); err != nil {
 			return err
 		}
-		if s.PongWait > 0 {
-			if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
-				return err
-			}
+		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
+			return err
 		}
 		if err := frame.Validate(); err != nil {
 			return err
@@ -609,36 +616,6 @@ func (s *Server) readPump(ctx context.Context, epoch *agentConnectionEpoch) erro
 }
 
 func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, live <-chan CommandEnvelope, liveErr <-chan error) error {
-	if s.PingInterval <= 0 {
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case cmd, ok := <-live:
-				if !ok {
-					return sourceCloseError(liveErr)
-				}
-				if err := s.sendCommandEnvelope(ctx, epoch, cmd); err != nil {
-					return err
-				}
-			case err, ok := <-liveErr:
-				if !ok {
-					return errors.New("command source closed")
-				}
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if err := s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
-		return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
-	}); err != nil {
-		return err
-	}
-	ticker := time.NewTicker(s.PingInterval)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -657,10 +634,31 @@ func (s *Server) writePump(ctx context.Context, epoch *agentConnectionEpoch, liv
 			if err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// livenessPump starts only after token, hello, generation, and PAID lease
+// authentication have succeeded. WriteControl is concurrency-safe with the
+// sole data writer, while the shared lease prevents a revoked epoch from
+// extending its socket lifetime.
+func (s *Server) livenessPump(ctx context.Context, epoch *agentConnectionEpoch) error {
+	ping := func() error {
+		return s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
+			return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
+		})
+	}
+	if err := ping(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(s.PingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
-			if err := s.Leases.WithConnectionLease(ctx, epoch.claims, epoch.lease, func() error {
-				return epoch.conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline())
-			}); err != nil {
+			if err := ping(); err != nil {
 				return err
 			}
 		}
@@ -736,6 +734,19 @@ func (s *Server) writeTimeout() time.Duration {
 		return s.WriteTimeout
 	}
 	return 10 * time.Second
+}
+
+func (s *Server) validateLivenessConfig() error {
+	if s.PongWait <= 0 {
+		return errors.New("agent websocket PongWait must be positive")
+	}
+	if s.PingInterval <= 0 {
+		return errors.New("agent websocket PingInterval must be positive")
+	}
+	if s.PingInterval >= s.PongWait {
+		return errors.New("agent websocket PingInterval must be shorter than PongWait")
+	}
+	return nil
 }
 
 func (s *Server) generationPollInterval() time.Duration {

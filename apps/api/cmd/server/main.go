@@ -115,6 +115,11 @@ func originsFromEnv(name string) []string {
 var errTokenSecretMissing = errors.New("SUMI_AGENT_TOKEN_SECRET not set")
 var errBrowserSessionSecretMissing = errors.New("SUMI_BROWSER_SESSION_SECRET not set")
 
+const (
+	localControlPreviousSigningSecretsEnv = "SUMI_LOCAL_CONTROL_PREVIOUS_SIGNING_SECRETS"
+	maxLocalControlPreviousSigningSecrets = 2
+)
+
 func tokenVerifierFromEnv() (agentevents.TokenVerifier, error) {
 	secret, err := tokenSecretFromEnv()
 	if err != nil {
@@ -130,6 +135,46 @@ func tokenSecretFromEnv() ([]byte, error) {
 		return nil, errTokenSecretMissing
 	}
 	return base64.StdEncoding.DecodeString(b64)
+}
+
+// localControlPreviousSigningSecretsFromEnv parses a bounded comma-separated
+// list of base64 secrets used only to verify and re-sign durable local-control
+// state during a coordinated rotation. They never verify agent bearer tokens.
+func localControlPreviousSigningSecretsFromEnv() ([][]byte, error) {
+	raw := os.Getenv(localControlPreviousSigningSecretsEnv)
+	if raw == "" {
+		return nil, nil
+	}
+	encoded := strings.Split(raw, ",")
+	if len(encoded) > maxLocalControlPreviousSigningSecrets {
+		return nil, fmt.Errorf(
+			"%s supports at most %d secrets",
+			localControlPreviousSigningSecretsEnv,
+			maxLocalControlPreviousSigningSecrets,
+		)
+	}
+	secrets := make([][]byte, 0, len(encoded))
+	for index, value := range encoded {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf(
+				"%s entry %d is empty",
+				localControlPreviousSigningSecretsEnv,
+				index+1,
+			)
+		}
+		secret, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"decode %s entry %d: %w",
+				localControlPreviousSigningSecretsEnv,
+				index+1,
+				err,
+			)
+		}
+		secrets = append(secrets, secret)
+	}
+	return secrets, nil
 }
 
 // localControlServerFromEnv is an explicit local/CI fixture switch. Production
@@ -183,6 +228,10 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 	if err != nil {
 		return nil, false, err
 	}
+	previousSigningSecrets, err := localControlPreviousSigningSecretsFromEnv()
+	if err != nil {
+		return nil, false, err
+	}
 	agentAudience := os.Getenv("SUMI_AGENT_TOKEN_AUDIENCE")
 	if agentAudience == "" {
 		agentAudience = agentevents.DefaultAgentAudience()
@@ -194,9 +243,10 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 	if controlAudience != agentAudience {
 		return nil, false, errors.New("SUMI_LOCAL_CONTROL_AUDIENCE must match SUMI_AGENT_TOKEN_AUDIENCE")
 	}
-	control, err := agentevents.NewLocalControlServer(
+	control, err := agentevents.NewLocalControlServerWithPreviousSigningSecrets(
 		runtime,
 		signingSecret,
+		previousSigningSecrets,
 		[]agentevents.LocalRuntimeAuthorization{{
 			BearerToken:           bearer,
 			TenantID:              tenantID,
