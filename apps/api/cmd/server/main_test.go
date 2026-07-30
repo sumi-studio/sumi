@@ -7,9 +7,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +25,8 @@ import (
 
 var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
 var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
+
+const testLocalControlPAID = "0198f0f4-9b72-7000-8000-000000000001"
 
 type testTokenClaims struct {
 	TenantID           string `json:"tenant_id"`
@@ -391,7 +400,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	}
 }
 
-func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *testing.T) {
+func TestNewRouter_LocalControlRoutesAreAbsentFromPublicMux(t *testing.T) {
 	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "0")
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
@@ -414,21 +423,35 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
 	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-control-bearer-32-bytes-minimum")
 	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
-	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", "0198f0f4-9b72-7000-8000-000000000001")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", testLocalControlPAID)
 	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
 	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
 	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
 	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "127.0.0.1:0")
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
 	commandDir := t.TempDir()
 	runtimeDir := t.TempDir()
 	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
-	mux, err = newRouter()
+	app, err := newApplicationFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(mux)
+	defer app.Close()
+
+	publicRequest := httptest.NewRequest(
+		http.MethodPost,
+		agentevents.LocalRuntimeStatePublishPath,
+		strings.NewReader(`{}`),
+	)
+	publicRecorder := httptest.NewRecorder()
+	app.publicMux.ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusNotFound {
+		t.Fatalf("enabled local control route leaked onto public mux: got %d, want 404", publicRecorder.Code)
+	}
+
+	server := httptest.NewServer(app.localMux)
 	defer server.Close()
 
 	publication := []byte(`{
@@ -463,14 +486,18 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	// A local API process restart can be provisioned with the next exact
 	// runtime epoch while reusing the same durable PAID-keyed registry.
 	server.Close()
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-next-control-bearer-32-bytes-minimum")
 	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "8")
 	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture-next")
-	mux, err = newRouter()
+	app, err = newApplicationFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	restartedServer := httptest.NewServer(mux)
+	defer app.Close()
+	restartedServer := httptest.NewServer(app.localMux)
 	defer restartedServer.Close()
 	rollover := []byte(`{
 		"publication_id":"startup-fixture-next",
@@ -510,6 +537,1174 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	}
 	if ack.Generation != 8 || ack.Revision != 2 || ack.State != "not_ready" {
 		t.Fatalf("restart rollover ack mismatch: %+v", ack)
+	}
+}
+
+func setCompleteLocalControlEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-control-bearer-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", "0198f0f4-9b72-7000-8000-000000000001")
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+}
+
+func trustedSocketParent(t *testing.T) string {
+	t.Helper()
+	parent := t.TempDir()
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	return parent
+}
+
+func trustedShortSocketParent(t *testing.T) string {
+	t.Helper()
+	parent, err := os.MkdirTemp("", "su-p-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	return parent
+}
+
+func replaceTrustedSocketParent(t *testing.T, parent string, gid int) string {
+	t.Helper()
+	movedParent := parent + "-pinned"
+	if err := os.Rename(parent, movedParent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(movedParent) })
+	if err := os.Mkdir(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	return movedParent
+}
+
+func TestUnixLocalControlRoundTripRequiresBearerAndNeverUsesPublicMux(t *testing.T) {
+	setCompleteLocalControlEnv(t)
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", socketPath)
+	t.Setenv("SUMI_LOCAL_CONTROL_SOCKET_GID", strconv.Itoa(os.Getegid()))
+
+	app, err := newApplicationFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	listener, err := app.localListener.listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: app.localListener.handler(app.localMux)}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Shutdown(context.Background())
+		<-serveDone
+	})
+
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	publication := []byte(`{
+		"publication_id":"uds-startup",
+		"personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001",
+		"generation":7,
+		"rpc_boot_nonce":"boot-fixture",
+		"expected_revision":null,
+		"state":"not_ready",
+		"hydration_receipt_identity":null,
+		"reason":"startup"
+	}`)
+	post := func(bearer string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(
+			http.MethodPost,
+			"http://local-control.invalid"+agentevents.LocalRuntimeStatePublishPath,
+			bytes.NewReader(publication),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	unauthorized := post("wrong-bearer")
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer: got %d, want 401", unauthorized.StatusCode)
+	}
+	authorized := post("server-fixture-control-bearer-32-bytes-minimum")
+	authorized.Body.Close()
+	if authorized.StatusCode != http.StatusOK {
+		t.Fatalf("UDS publication: got %d, want 200", authorized.StatusCode)
+	}
+
+	publicRequest := httptest.NewRequest(
+		http.MethodPost,
+		agentevents.LocalRuntimeStatePublishPath,
+		bytes.NewReader(publication),
+	)
+	publicRequest.Header.Set("Authorization", "Bearer server-fixture-control-bearer-32-bytes-minimum")
+	publicRecorder := httptest.NewRecorder()
+	app.publicMux.ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusNotFound {
+		t.Fatalf("public local-control route: got %d, want 404", publicRecorder.Code)
+	}
+
+	socketInfo, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if socketInfo.Mode().Perm() != localControlSocketMode {
+		t.Fatalf("socket mode: got %04o, want %04o", socketInfo.Mode().Perm(), localControlSocketMode)
+	}
+}
+
+func TestUnixLocalControlTrustChecksFailClosed(t *testing.T) {
+	gid := os.Getegid()
+	t.Run("wrong parent mode", func(t *testing.T) {
+		parent := t.TempDir()
+		socketPath := filepath.Join(parent, "control.sock")
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "parent mode") {
+			t.Fatalf("wrong parent mode was accepted: %v", err)
+		}
+	})
+
+	t.Run("symlink parent", func(t *testing.T) {
+		parent, err := os.MkdirTemp("", "su-a-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(parent) })
+		if err := os.Chmod(parent, localControlParentMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		linkRoot, err := os.MkdirTemp("", "su-l-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(linkRoot) })
+		link := filepath.Join(linkRoot, "p")
+		if err := os.Symlink(parent, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(filepath.Join(link, "control.sock"), gid, testLocalControlPAID); err == nil ||
+			(!strings.Contains(err.Error(), "symlink") && !strings.Contains(err.Error(), "real directory")) {
+			t.Fatalf("symlink parent was accepted: %v", err)
+		}
+	})
+
+	t.Run("non-socket stale target", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		if err := os.WriteFile(socketPath, []byte("not a socket"), localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "not a Unix socket") {
+			t.Fatalf("non-socket target was accepted: %v", err)
+		}
+		if _, err := os.Lstat(socketPath); err != nil {
+			t.Fatalf("untrusted target was removed: %v", err)
+		}
+	})
+
+	t.Run("symlink ownership lock", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		target := filepath.Join(parent, "unrelated")
+		if err := os.WriteFile(target, []byte("do not touch"), localControlLockMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, socketPath+".owner.lock"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "ownership lock") {
+			t.Fatalf("symlink ownership lock was accepted: %v", err)
+		}
+		body, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "do not touch" {
+			t.Fatal("symlink target was modified")
+		}
+	})
+
+	t.Run("wrong-mode ownership lock", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		lockPath := socketPath + ".owner.lock"
+		if err := os.WriteFile(lockPath, nil, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(lockPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(lockPath, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "neither complete") {
+			t.Fatalf("wrong-mode ownership lock was accepted: %v", err)
+		}
+	})
+
+	t.Run("hardlinked ownership lock", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		lockPath := socketPath + ".owner.lock"
+		if err := os.WriteFile(lockPath, nil, localControlLockMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(lockPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(lockPath, filepath.Join(parent, "second-lock-link")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "neither complete") {
+			t.Fatalf("hardlinked ownership lock was accepted: %v", err)
+		}
+	})
+
+	t.Run("arbitrary initializer residue", func(t *testing.T) {
+		parent := trustedShortSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		residue := socketPath + ".owner.lock.init-arbitrary"
+		if err := os.WriteFile(residue, []byte("unrelated-content"), localControlLockMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(residue, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil {
+			_ = listener.Close()
+			t.Fatal("arbitrary initializer residue was accepted")
+		} else if !strings.Contains(err.Error(), "untrusted") {
+			t.Fatalf("unexpected arbitrary initializer residue error: %v", err)
+		}
+		body, err := os.ReadFile(residue)
+		if err != nil {
+			t.Fatalf("arbitrary initializer residue was removed: %v", err)
+		}
+		if string(body) != "unrelated-content" {
+			t.Fatal("arbitrary initializer residue was modified")
+		}
+	})
+
+	t.Run("wrong-mode stale socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "socket mode") {
+			t.Fatalf("wrong-mode stale socket was accepted: %v", err)
+		}
+	})
+
+	t.Run("live socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		live, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer live.Close()
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "live local control socket") {
+			t.Fatalf("live socket was replaced: %v", err)
+		}
+	})
+
+	t.Run("hardlinked socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(socketPath, filepath.Join(parent, "second-link.sock")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlinked socket was accepted: %v", err)
+		}
+	})
+
+	t.Run("trusted stale socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+		if err != nil {
+			t.Fatalf("trusted stale socket was not recovered: %v", err)
+		}
+		if err := replacement.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func socketInode(t *testing.T, path string) (uint64, uint64) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("socket stat unavailable")
+	}
+	return stat.Dev, stat.Ino
+}
+
+func bindTrustedTestSocket(t *testing.T, path string, gid int) *net.UnixListener {
+	t.Helper()
+	listener, err := net.ListenUnix(
+		"unix",
+		&net.UnixAddr{Name: path, Net: "unix"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := os.Chown(path, os.Geteuid(), gid); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, localControlSocketMode); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	return listener
+}
+
+func assertUnixSocketIsLive(t *testing.T, path string) {
+	t.Helper()
+	connection, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("socket %s is not live: %v", path, err)
+	}
+	_ = connection.Close()
+}
+
+func TestUnixListenerOwnershipLockPreventsReplicaEvictionAndLateUnlink(t *testing.T) {
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+
+	first, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDev, firstIno := socketInode(t, socketPath)
+
+	secondAttempt, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err == nil {
+		_ = secondAttempt.Close()
+		t.Fatal("second replica acquired the listener ownership lock")
+	}
+	if !strings.Contains(err.Error(), "ownership lock is already held") {
+		t.Fatalf("unexpected second replica error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != firstDev || gotIno != firstIno {
+		t.Fatal("second replica replaced the first listener socket")
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("first listener did not remove its owned socket: %v", err)
+	}
+
+	survivor, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	survivorDev, survivorIno := socketInode(t, socketPath)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gotDev, gotIno = socketInode(t, socketPath)
+	if gotDev != survivorDev || gotIno != survivorIno {
+		t.Fatal("late close from the first replica unlinked its successor")
+	}
+	if err := survivor.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := listenTrustedUnixSocket(socketPath, gid, "0198f0f4-9b72-7000-8000-000000000099"); err == nil ||
+		!strings.Contains(err.Error(), "neither complete") {
+		t.Fatalf("persistent listener lock accepted a different PAID: %v", err)
+	}
+}
+
+func TestUnixListenerCloseNeverUnlinksAReplacementInode(t *testing.T) {
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	owned, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owned.listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	keptOldInode := filepath.Join(parent, "old-inode.sock")
+	if err := os.Link(socketPath, keptOldInode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+		t.Fatal(err)
+	}
+	replacementDev, replacementIno := socketInode(t, socketPath)
+
+	err = owned.Close()
+	if err == nil || !strings.Contains(err.Error(), "no longer owned") {
+		t.Fatalf("close did not report replacement inode: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != replacementDev || gotIno != replacementIno {
+		t.Fatal("listener close unlinked the replacement socket")
+	}
+}
+
+func TestUnixListenerOwnershipSerializesConcurrentStaleRecovery(t *testing.T) {
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		listener *ownedUnixListener
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+			results <- result{listener: listener, err: err}
+		}()
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	successes := 0
+	var winner *ownedUnixListener
+	for _, candidate := range []result{first, second} {
+		if candidate.err == nil {
+			successes++
+			winner = candidate.listener
+			continue
+		}
+		if !strings.Contains(candidate.err.Error(), "ownership lock is already held") &&
+			!strings.Contains(candidate.err.Error(), "bootstrap lock is already held") {
+			t.Fatalf("unexpected concurrent stale-recovery error: %v", candidate.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent stale recovery produced %d successful listeners, want 1", successes)
+	}
+	socketInode(t, socketPath)
+	if err := winner.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnixListenerOwnershipLockIsProcessIndependent(t *testing.T) {
+	const childMarker = "SUMI_TEST_LOCAL_CONTROL_LOCK_CHILD"
+	if os.Getenv(childMarker) == "1" {
+		socketPath := os.Getenv("SUMI_TEST_LOCAL_CONTROL_LOCK_SOCKET")
+		gid, err := strconv.Atoi(os.Getenv("SUMI_TEST_LOCAL_CONTROL_LOCK_GID"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+		if err == nil {
+			_ = listener.Close()
+			t.Fatal("child process acquired a lock held by the parent process")
+		}
+		if !strings.Contains(err.Error(), "ownership lock is already held") {
+			t.Fatalf("child received unexpected ownership error: %v", err)
+		}
+		return
+	}
+
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	dev, ino := socketInode(t, socketPath)
+
+	command := exec.Command(os.Args[0], "-test.run=^TestUnixListenerOwnershipLockIsProcessIndependent$")
+	command.Env = append(
+		os.Environ(),
+		childMarker+"=1",
+		"SUMI_TEST_LOCAL_CONTROL_LOCK_SOCKET="+socketPath,
+		"SUMI_TEST_LOCAL_CONTROL_LOCK_GID="+strconv.Itoa(gid),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("child lock probe failed: %v\n%s", err, output)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != dev || gotIno != ino {
+		t.Fatal("child process replaced the parent listener socket")
+	}
+}
+
+func TestUnixListenerCrashResidueConverges(t *testing.T) {
+	const childMarker = "SUMI_TEST_LOCAL_CONTROL_CRASH_CHILD"
+	if os.Getenv(childMarker) == "1" {
+		socketPath := os.Getenv("SUMI_TEST_LOCAL_CONTROL_CRASH_SOCKET")
+		gid, err := strconv.Atoi(os.Getenv("SUMI_TEST_LOCAL_CONTROL_CRASH_GID"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err != nil {
+			t.Fatalf("crash child failed before failpoint: %v", err)
+		} else {
+			_ = listener.Close()
+			t.Fatal("crash failpoint did not terminate child")
+		}
+		return
+	}
+
+	for _, failpoint := range []string{
+		"lock-create-before-metadata",
+		"lock-metadata-before-binding",
+		"lock-binding-before-fsync",
+		"socket-bind-before-metadata",
+	} {
+		t.Run(failpoint, func(t *testing.T) {
+			parent := trustedSocketParent(t)
+			socketPath := filepath.Join(parent, "control.sock")
+			gid := os.Getegid()
+			command := exec.Command(os.Args[0], "-test.run=^TestUnixListenerCrashResidueConverges$")
+			command.Env = append(
+				os.Environ(),
+				childMarker+"=1",
+				"SUMI_TEST_LOCAL_CONTROL_CRASH_SOCKET="+socketPath,
+				"SUMI_TEST_LOCAL_CONTROL_CRASH_GID="+strconv.Itoa(gid),
+				"SUMI_TEST_LOCAL_CONTROL_CRASH_FAILPOINT="+failpoint,
+			)
+			output, err := command.CombinedOutput()
+			exitError, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("crash child was not killed: %v\n%s", err, output)
+			}
+			status, ok := exitError.Sys().(syscall.WaitStatus)
+			if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+				t.Fatalf("crash child exit was not SIGKILL: %v\n%s", err, output)
+			}
+			lockPath := socketPath + ".owner.lock"
+			if strings.HasPrefix(failpoint, "lock-") {
+				if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("partially initialized lock became visible: %v", err)
+				}
+			} else {
+				content, err := os.ReadFile(lockPath)
+				if err != nil {
+					t.Fatalf("socket failpoint lost initialized ownership lock: %v", err)
+				}
+				if !bytes.Contains(content, []byte("personality_agent_id="+testLocalControlPAID)) {
+					t.Fatal("published ownership lock lacks exact PAID binding")
+				}
+			}
+
+			restarted, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+			if err != nil {
+				t.Fatalf("restart did not recover %s residue: %v", failpoint, err)
+			}
+			dev, ino := socketInode(t, socketPath)
+			competing, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+			if err == nil {
+				_ = competing.Close()
+				t.Fatal("competing replica acquired listener after crash recovery")
+			}
+			gotDev, gotIno := socketInode(t, socketPath)
+			if gotDev != dev || gotIno != ino {
+				t.Fatal("competing replica removed the recovered live socket")
+			}
+			if err := restarted.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			entries, err := os.ReadDir(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.Contains(entry.Name(), ".owner.lock.init-") {
+					t.Fatalf("initialization residue was not cleaned: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestUnixListenerParentReplacementDuringLockPublicationFailsClosed(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var movedParent string
+	hooks := &localControlListenerTestHooks{
+		afterLockPublication: func() {
+			movedParent = replaceTrustedSocketParent(t, parent, gid)
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err == nil {
+		_ = listener.Close()
+		t.Fatal("listener returned after its configured parent was replaced")
+	}
+	if !strings.Contains(err.Error(), "no longer names the pinned trusted directory") {
+		t.Fatalf("unexpected parent replacement error: %v", err)
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement parent received a socket: %v", err)
+	}
+	if _, err := os.Lstat(socketPath + ".owner.lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement parent received an ownership lock: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pinned parent received a socket after publication race: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock.owner.lock")); err != nil {
+		t.Fatalf("atomic ownership lock was not published in the pinned parent: %v", err)
+	}
+}
+
+func TestUnixListenerParentReplacementBeforeReturnCleansOnlyPinnedSocket(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var movedParent string
+	var replacement *net.UnixListener
+	var replacementDev uint64
+	var replacementIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeListenerReturn: func() {
+			movedParent = replaceTrustedSocketParent(t, parent, gid)
+			var err error
+			replacement, err = net.ListenUnix(
+				"unix",
+				&net.UnixAddr{Name: socketPath, Net: "unix"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+				t.Fatal(err)
+			}
+			replacementDev, replacementIno = socketInode(t, socketPath)
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("listener returned after its configured parent was replaced")
+	}
+	if replacement == nil {
+		t.Fatal("parent replacement hook did not install its live socket")
+	}
+	defer replacement.Close()
+	if err == nil || !strings.Contains(err.Error(), "no longer names the pinned trusted directory") {
+		t.Fatalf("unexpected parent replacement error: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned socket was not removed from the pinned parent: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != replacementDev || gotIno != replacementIno {
+		t.Fatal("cleanup removed or replaced the non-owned socket in the configured replacement parent")
+	}
+}
+
+func TestUnixListenerLockPublicationNeverReplacesNoncooperatingDestination(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	lockPath := socketPath + ".owner.lock"
+	gid := os.Getegid()
+	const installed = "same-uid-noncooperating-destination"
+	var installedDev uint64
+	var installedIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeLockPublication: func() {
+			if err := os.WriteFile(lockPath, []byte(installed), localControlLockMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(lockPath, os.Geteuid(), gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(lockPath, localControlLockMode); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				t.Fatal("destination installer inode is unavailable")
+			}
+			installedDev, installedIno = stat.Dev, stat.Ino
+		},
+	}
+
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err == nil {
+		_ = listener.Close()
+		t.Fatal("no-replace lock publication overwrote a competing destination")
+	}
+	if !strings.Contains(err.Error(), "appeared during atomic publication") {
+		t.Fatalf("unexpected no-replace publication error: %v", err)
+	}
+	content, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != installed {
+		t.Fatalf("competing destination content changed: %q", content)
+	}
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Dev != installedDev || stat.Ino != installedIno {
+		t.Fatal("competing destination inode was replaced")
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".owner.lock.init-") {
+			t.Fatalf("failed no-replace publication left initializer residue: %s", entry.Name())
+		}
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed no-replace publication created a socket: %v", err)
+	}
+}
+
+func TestUnixListenerStaleQuarantineRestoresLiveReplacement(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	stale := bindTrustedTestSocket(t, socketPath, gid)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var replacement *net.UnixListener
+	var replacementDev uint64
+	var replacementIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeSocketQuarantine: func() {
+			if err := os.Remove(socketPath); err != nil {
+				t.Fatal(err)
+			}
+			replacement = bindTrustedTestSocket(t, socketPath, gid)
+			replacementDev, replacementIno = socketInode(t, socketPath)
+		},
+	}
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("stale cleanup accepted a socket rebound after validation")
+	}
+	if replacement == nil {
+		t.Fatal("replacement hook did not install a live socket")
+	}
+	defer func() {
+		_ = replacement.Close()
+		_ = os.Remove(socketPath)
+	}()
+	if err == nil || !strings.Contains(err.Error(), "replacement restored without overwrite") {
+		t.Fatalf("unexpected stale quarantine error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != replacementDev || gotIno != replacementIno {
+		t.Fatal("stale quarantine removed or replaced the live rebound socket")
+	}
+	assertUnixSocketIsLive(t, socketPath)
+}
+
+func TestUnixListenerCloseQuarantinePreservesBothLiveSocketsOnRestoreConflict(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var firstReplacement *net.UnixListener
+	var secondReplacement *net.UnixListener
+	var firstDev uint64
+	var firstIno uint64
+	var secondDev uint64
+	var secondIno uint64
+	var quarantinePath string
+	hooks := &localControlListenerTestHooks{
+		beforeSocketQuarantine: func() {
+			if err := os.Remove(socketPath); err != nil {
+				t.Fatal(err)
+			}
+			firstReplacement = bindTrustedTestSocket(t, socketPath, gid)
+			firstDev, firstIno = socketInode(t, socketPath)
+		},
+		afterSocketQuarantine: func(quarantineName string) {
+			quarantinePath = filepath.Join(parent, quarantineName)
+			secondReplacement = bindTrustedTestSocket(t, socketPath, gid)
+			secondDev, secondIno = socketInode(t, socketPath)
+		},
+	}
+	owned, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = owned.Close()
+	if firstReplacement == nil || secondReplacement == nil || quarantinePath == "" {
+		t.Fatal("close quarantine hooks did not install both live replacements")
+	}
+	defer func() {
+		_ = firstReplacement.Close()
+		_ = secondReplacement.Close()
+		_ = os.Remove(quarantinePath)
+		_ = os.Remove(socketPath)
+	}()
+	if err == nil || !strings.Contains(err.Error(), "both preserved") {
+		t.Fatalf("unexpected close quarantine conflict error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, quarantinePath)
+	if gotDev != firstDev || gotIno != firstIno {
+		t.Fatal("close quarantine deleted the first rebound socket")
+	}
+	gotDev, gotIno = socketInode(t, socketPath)
+	if gotDev != secondDev || gotIno != secondIno {
+		t.Fatal("close quarantine overwrote the newly published socket")
+	}
+	assertUnixSocketIsLive(t, quarantinePath)
+	assertUnixSocketIsLive(t, socketPath)
+}
+
+func TestUnixListenerRejectsAncestorSymlinkEvenWhenItResolvesToPinnedParent(t *testing.T) {
+	root, err := os.MkdirTemp("", "su-r-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	ancestor := filepath.Join(root, "ancestor")
+	parent := filepath.Join(ancestor, "parent")
+	if err := os.MkdirAll(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	gid := os.Getegid()
+	if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(parent, "control.sock")
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedParent, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("configured parent inode is unavailable")
+	}
+	movedAncestor := filepath.Join(root, "ancestor-pinned")
+	hooks := &localControlListenerTestHooks{
+		afterLockPublication: func() {
+			if err := os.Rename(ancestor, movedAncestor); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(movedAncestor, ancestor); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("listener accepted an ancestor symlink back to the pinned parent")
+	}
+	if err == nil || !strings.Contains(err.Error(), "without symlinks") {
+		t.Fatalf("unexpected same-inode ancestor symlink error: %v", err)
+	}
+	movedParent := filepath.Join(movedAncestor, "parent")
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ancestor symlink race published a socket in the pinned parent: %v", err)
+	}
+
+	if err := os.Remove(ancestor); err != nil {
+		t.Fatal(err)
+	}
+	replacementAncestor := filepath.Join(root, "ancestor-replacement")
+	replacementParent := filepath.Join(replacementAncestor, "parent")
+	if err := os.MkdirAll(replacementParent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(replacementParent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(replacementParent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(replacementAncestor, ancestor); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfiguredParentIdentity(parent, *expectedParent, gid); err == nil ||
+		!strings.Contains(err.Error(), "without symlinks") {
+		t.Fatalf("retargeted ancestor symlink was accepted: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(replacementParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retargeted ancestor received a socket: %v", err)
+	}
+}
+
+func TestUnixListenerRecoversAuthenticatedLegacyPartialPublishedLock(t *testing.T) {
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	lockPath := socketPath + ".owner.lock"
+	gid := os.Getegid()
+	if err := os.WriteFile(lockPath, nil, localControlLockMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(lockPath, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockPath, localControlLockMode); err != nil {
+		t.Fatal(err)
+	}
+
+	listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatalf("restart rejected authenticated legacy partial lock: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(content, []byte("personality_agent_id="+testLocalControlPAID)) {
+		t.Fatal("recovered lock was not republished with the exact PAID binding")
+	}
+}
+
+func TestUnixListenerNeverTreatsLivePrivateSocketAsCrashResidue(t *testing.T) {
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+
+	initializer, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initializer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	live, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, ino := socketInode(t, socketPath)
+
+	if listener, err := listenTrustedUnixSocket(socketPath, gid, testLocalControlPAID); err == nil {
+		_ = listener.Close()
+		t.Fatal("restart replaced a live private initialization socket")
+	} else if !strings.Contains(err.Error(), "live local control socket") {
+		t.Fatalf("unexpected live private socket error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != dev || gotIno != ino {
+		t.Fatal("restart removed a live private initialization socket")
+	}
+}
+
+func TestLocalControlTransportRequiresExactlyOneExplicitSelection(t *testing.T) {
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", "")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "")
+	if _, err := localControlListenerFromEnv(true); err == nil {
+		t.Fatal("enabled local control accepted neither transport")
+	}
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", "/run/sumi/local-control/control.sock")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "127.0.0.1:4321")
+	if _, err := localControlListenerFromEnv(true); err == nil {
+		t.Fatal("enabled local control accepted both transports")
 	}
 }
 
