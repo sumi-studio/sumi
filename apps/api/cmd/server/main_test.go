@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,7 +331,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	}
 }
 
-func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *testing.T) {
+func TestNewRouter_LocalControlRoutesAreAbsentFromPublicMux(t *testing.T) {
 	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "0")
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
@@ -354,16 +359,30 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
 	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
 	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "127.0.0.1:0")
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
 	commandDir := t.TempDir()
 	runtimeDir := t.TempDir()
 	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", runtimeDir)
-	mux, err = newRouter()
+	app, err := newApplicationFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(mux)
+	defer app.Close()
+
+	publicRequest := httptest.NewRequest(
+		http.MethodPost,
+		agentevents.LocalRuntimeStatePublishPath,
+		strings.NewReader(`{}`),
+	)
+	publicRecorder := httptest.NewRecorder()
+	app.publicMux.ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusNotFound {
+		t.Fatalf("enabled local control route leaked onto public mux: got %d, want 404", publicRecorder.Code)
+	}
+
+	server := httptest.NewServer(app.localMux)
 	defer server.Close()
 
 	publication := []byte(`{
@@ -398,14 +417,18 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	// A local API process restart can be provisioned with the next exact
 	// runtime epoch while reusing the same durable PAID-keyed registry.
 	server.Close()
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-next-control-bearer-32-bytes-minimum")
 	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "8")
 	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture-next")
-	mux, err = newRouter()
+	app, err = newApplicationFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	restartedServer := httptest.NewServer(mux)
+	defer app.Close()
+	restartedServer := httptest.NewServer(app.localMux)
 	defer restartedServer.Close()
 	rollover := []byte(`{
 		"publication_id":"startup-fixture-next",
@@ -445,6 +468,301 @@ func TestNewRouter_LocalControlRoutesRequireExplicitCompleteFixtureConfig(t *tes
 	}
 	if ack.Generation != 8 || ack.Revision != 2 || ack.State != "not_ready" {
 		t.Fatalf("restart rollover ack mismatch: %+v", ack)
+	}
+}
+
+func setCompleteLocalControlEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SUMI_LOCAL_CONTROL_ENABLED", "1")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", "server-fixture-control-bearer-32-bytes-minimum")
+	t.Setenv("SUMI_LOCAL_CONTROL_TENANT_ID", "tenant-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID", "0198f0f4-9b72-7000-8000-000000000001")
+	t.Setenv("SUMI_LOCAL_CONTROL_GENERATION", "7")
+	t.Setenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE", "boot-fixture")
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION", "raw")
+	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+}
+
+func trustedSocketParent(t *testing.T) string {
+	t.Helper()
+	parent := t.TempDir()
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	return parent
+}
+
+func TestUnixLocalControlRoundTripRequiresBearerAndNeverUsesPublicMux(t *testing.T) {
+	setCompleteLocalControlEnv(t)
+	parent := trustedSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", socketPath)
+	t.Setenv("SUMI_LOCAL_CONTROL_SOCKET_GID", strconv.Itoa(os.Getegid()))
+
+	app, err := newApplicationFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	listener, err := app.localListener.listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: app.localListener.handler(app.localMux)}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Shutdown(context.Background())
+		<-serveDone
+	})
+
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	publication := []byte(`{
+		"publication_id":"uds-startup",
+		"personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001",
+		"generation":7,
+		"rpc_boot_nonce":"boot-fixture",
+		"expected_revision":null,
+		"state":"not_ready",
+		"hydration_receipt_identity":null,
+		"reason":"startup"
+	}`)
+	post := func(bearer string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(
+			http.MethodPost,
+			"http://local-control.invalid"+agentevents.LocalRuntimeStatePublishPath,
+			bytes.NewReader(publication),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	unauthorized := post("wrong-bearer")
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer: got %d, want 401", unauthorized.StatusCode)
+	}
+	authorized := post("server-fixture-control-bearer-32-bytes-minimum")
+	authorized.Body.Close()
+	if authorized.StatusCode != http.StatusOK {
+		t.Fatalf("UDS publication: got %d, want 200", authorized.StatusCode)
+	}
+
+	publicRequest := httptest.NewRequest(
+		http.MethodPost,
+		agentevents.LocalRuntimeStatePublishPath,
+		bytes.NewReader(publication),
+	)
+	publicRequest.Header.Set("Authorization", "Bearer server-fixture-control-bearer-32-bytes-minimum")
+	publicRecorder := httptest.NewRecorder()
+	app.publicMux.ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusNotFound {
+		t.Fatalf("public local-control route: got %d, want 404", publicRecorder.Code)
+	}
+
+	socketInfo, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if socketInfo.Mode().Perm() != localControlSocketMode {
+		t.Fatalf("socket mode: got %04o, want %04o", socketInfo.Mode().Perm(), localControlSocketMode)
+	}
+}
+
+func TestUnixLocalControlTrustChecksFailClosed(t *testing.T) {
+	gid := os.Getegid()
+	t.Run("wrong parent mode", func(t *testing.T) {
+		parent := t.TempDir()
+		socketPath := filepath.Join(parent, "control.sock")
+		if _, err := listenTrustedUnixSocket(socketPath, gid); err == nil ||
+			!strings.Contains(err.Error(), "parent mode") {
+			t.Fatalf("wrong parent mode was accepted: %v", err)
+		}
+	})
+
+	t.Run("symlink parent", func(t *testing.T) {
+		parent, err := os.MkdirTemp("", "su-a-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(parent) })
+		if err := os.Chmod(parent, localControlParentMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		linkRoot, err := os.MkdirTemp("", "su-l-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(linkRoot) })
+		link := filepath.Join(linkRoot, "p")
+		if err := os.Symlink(parent, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(filepath.Join(link, "control.sock"), gid); err == nil ||
+			(!strings.Contains(err.Error(), "symlink") && !strings.Contains(err.Error(), "real directory")) {
+			t.Fatalf("symlink parent was accepted: %v", err)
+		}
+	})
+
+	t.Run("non-socket stale target", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		if err := os.WriteFile(socketPath, []byte("not a socket"), localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid); err == nil ||
+			!strings.Contains(err.Error(), "not a Unix socket") {
+			t.Fatalf("non-socket target was accepted: %v", err)
+		}
+		if _, err := os.Lstat(socketPath); err != nil {
+			t.Fatalf("untrusted target was removed: %v", err)
+		}
+	})
+
+	t.Run("wrong-mode stale socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid); err == nil ||
+			!strings.Contains(err.Error(), "socket mode") {
+			t.Fatalf("wrong-mode stale socket was accepted: %v", err)
+		}
+	})
+
+	t.Run("live socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		live, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer live.Close()
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid); err == nil ||
+			!strings.Contains(err.Error(), "live local control socket") {
+			t.Fatalf("live socket was replaced: %v", err)
+		}
+	})
+
+	t.Run("hardlinked socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(socketPath, filepath.Join(parent, "second-link.sock")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := listenTrustedUnixSocket(socketPath, gid); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlinked socket was accepted: %v", err)
+		}
+	})
+
+	t.Run("trusted stale socket", func(t *testing.T) {
+		parent := trustedSocketParent(t)
+		socketPath := filepath.Join(parent, "control.sock")
+		stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.SetUnlinkOnClose(false)
+		if err := os.Chown(socketPath, os.Geteuid(), gid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socketPath, localControlSocketMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.Close(); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err := listenTrustedUnixSocket(socketPath, gid)
+		if err != nil {
+			t.Fatalf("trusted stale socket was not recovered: %v", err)
+		}
+		if err := replacement.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestLocalControlTransportRequiresExactlyOneExplicitSelection(t *testing.T) {
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", "")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "")
+	if _, err := localControlListenerFromEnv(true); err == nil {
+		t.Fatal("enabled local control accepted neither transport")
+	}
+	t.Setenv("SUMI_LOCAL_CONTROL_UNIX_SOCKET", "/run/sumi/local-control/control.sock")
+	t.Setenv("SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN", "127.0.0.1:4321")
+	if _, err := localControlListenerFromEnv(true); err == nil {
+		t.Fatal("enabled local control accepted both transports")
 	}
 }
 

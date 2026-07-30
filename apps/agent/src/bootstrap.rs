@@ -30,10 +30,9 @@ use crate::{
     config::Config,
     gateway::{
         local_runtime::{
-            FIRST_BROWSER_VERTICAL_COMPONENTS, LocalControlCredential,
+            FIRST_BROWSER_VERTICAL_COMPONENTS, LocalControlCredential, LocalControlHttpClient,
             LocalControlReadyPublisher as LocalRuntimePublisher, LocalCredentialProvider,
-            LocalReadyPublisher, LocalRuntimeComponent,
-            LoopbackHttpControlClient as LocalControlHttpClient, first_browser_vertical_ready_gate,
+            LocalReadyPublisher, LocalRuntimeComponent, first_browser_vertical_ready_gate,
         },
         supervisor::{
             ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig, seams::T17StoreAdapter,
@@ -56,11 +55,16 @@ struct BootstrapContext {
     executor_socket: PathBuf,
     gateway_url: String,
     allow_insecure_loopback_gateway: bool,
-    local_control_url: String,
+    local_control_endpoint: LocalControlEndpoint,
     local_control_bearer: Zeroizing<String>,
     local_control_bearer_expires_at: SystemTime,
     wrapping_key_id: String,
     approval_secret_digest_key: [u8; 32],
+}
+
+enum LocalControlEndpoint {
+    Unix(PathBuf),
+    Loopback(String),
 }
 
 impl BootstrapContext {
@@ -85,7 +89,7 @@ impl BootstrapContext {
         let state_dir = required_absolute_path(&mut get, "SUMI_STATE_DIR")?;
         let executor_socket = required_absolute_path(&mut get, "SUMI_EXECUTOR_SOCKET")?;
         let gateway_url = required_value(&mut get, "SUMI_GATEWAY_URL")?;
-        let local_control_url = required_value(&mut get, "SUMI_LOCAL_CONTROL_URL")?;
+        let local_control_endpoint = local_control_endpoint_from_env(&mut get)?;
         let local_control_bearer = required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER")?;
         let local_control_bearer_expires_at = parse_unix_time(
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
@@ -113,13 +117,57 @@ impl BootstrapContext {
             executor_socket,
             gateway_url,
             allow_insecure_loopback_gateway,
-            local_control_url,
+            local_control_endpoint,
             local_control_bearer: Zeroizing::new(local_control_bearer),
             local_control_bearer_expires_at,
             wrapping_key_id,
             approval_secret_digest_key,
         })
     }
+}
+
+fn local_control_endpoint_from_env(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<LocalControlEndpoint> {
+    let unix_socket = optional_value(get, "SUMI_LOCAL_CONTROL_UNIX_SOCKET")?;
+    let loopback_url = optional_value(get, "SUMI_LOCAL_CONTROL_URL")?;
+    match (unix_socket, loopback_url) {
+        (Some(socket), None) => {
+            let socket = PathBuf::from(socket);
+            if !socket.is_absolute() {
+                bail!("SUMI_LOCAL_CONTROL_UNIX_SOCKET must be an absolute path");
+            }
+            Ok(LocalControlEndpoint::Unix(socket))
+        }
+        (None, Some(url)) => Ok(LocalControlEndpoint::Loopback(url)),
+        (Some(_), Some(_)) => {
+            bail!(
+                "SUMI_LOCAL_CONTROL_UNIX_SOCKET and SUMI_LOCAL_CONTROL_URL are mutually exclusive"
+            )
+        }
+        (None, None) => bail!(
+            "exactly one of SUMI_LOCAL_CONTROL_UNIX_SOCKET or SUMI_LOCAL_CONTROL_URL is required for production bootstrap"
+        ),
+    }
+}
+
+fn optional_value(
+    get: &mut impl FnMut(&str) -> Option<OsString>,
+    name: &str,
+) -> Result<Option<String>> {
+    get(name)
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("{name} must be valid UTF-8"))
+                .and_then(|value| {
+                    if value.is_empty() {
+                        bail!("{name} must not be empty when set");
+                    }
+                    Ok(value)
+                })
+        })
+        .transpose()
 }
 
 fn required_value(get: &mut impl FnMut(&str) -> Option<OsString>, name: &str) -> Result<String> {
@@ -199,14 +247,17 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         context.local_control_bearer_expires_at,
     )
     .context("invalid local-control bearer")?;
-    let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> = Arc::new(
-        LocalControlHttpClient::new(
-            &context.local_control_url,
-            context.authority.clone(),
-            control_credential,
-        )
-        .context("construct local-control HTTP client")?,
-    );
+    let control_client = match &context.local_control_endpoint {
+        LocalControlEndpoint::Unix(socket) => {
+            LocalControlHttpClient::new_unix(socket, context.authority.clone(), control_credential)
+        }
+        LocalControlEndpoint::Loopback(url) => {
+            LocalControlHttpClient::new_loopback(url, context.authority.clone(), control_credential)
+        }
+    }
+    .context("construct local-control HTTP client")?;
+    let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> =
+        Arc::new(control_client);
     let publisher = LocalRuntimePublisher::new(context.authority.clone(), control.clone());
     publisher
         .publish_not_ready()
@@ -525,8 +576,8 @@ mod tests {
                 "wss://gateway.example.test/agent".into(),
             ),
             (
-                "SUMI_LOCAL_CONTROL_URL".to_owned(),
-                "http://127.0.0.1:4321/".into(),
+                "SUMI_LOCAL_CONTROL_UNIX_SOCKET".to_owned(),
+                "/run/sumi/local-control/control.sock".into(),
             ),
             (
                 "SUMI_LOCAL_CONTROL_BEARER".to_owned(),
@@ -572,7 +623,7 @@ mod tests {
             "SUMI_STATE_DIR",
             "SUMI_EXECUTOR_SOCKET",
             "SUMI_GATEWAY_URL",
-            "SUMI_LOCAL_CONTROL_URL",
+            "SUMI_LOCAL_CONTROL_UNIX_SOCKET",
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
@@ -596,6 +647,37 @@ mod tests {
             env.insert(name.to_owned(), value.into());
             assert!(parse(&env).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn local_control_transport_rejects_both_or_neither() {
+        let mut neither = valid_env();
+        neither.remove("SUMI_LOCAL_CONTROL_UNIX_SOCKET");
+        let error = parse(&neither).err().expect("missing transport must fail");
+        assert!(error.to_string().contains("exactly one"));
+
+        let mut both = valid_env();
+        both.insert(
+            "SUMI_LOCAL_CONTROL_URL".to_owned(),
+            "http://127.0.0.1:4321/".into(),
+        );
+        let error = parse(&both).err().expect("ambiguous transport must fail");
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn explicit_loopback_local_control_remains_a_developer_option() {
+        let mut env = valid_env();
+        env.remove("SUMI_LOCAL_CONTROL_UNIX_SOCKET");
+        env.insert(
+            "SUMI_LOCAL_CONTROL_URL".to_owned(),
+            "http://127.0.0.1:4321/".into(),
+        );
+        let context = parse(&env).unwrap();
+        assert!(matches!(
+            context.local_control_endpoint,
+            LocalControlEndpoint::Loopback(_)
+        ));
     }
 
     #[test]

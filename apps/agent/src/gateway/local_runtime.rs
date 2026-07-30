@@ -1,15 +1,18 @@
-//! Explicit local/CI control-plane clients for one authenticated runtime epoch.
+//! Explicit local control-plane clients for one authenticated runtime epoch.
 //!
-//! The loopback control fixture owns the local HMAC signing key and authoritative
-//! runtime registry.  The normal Rust runtime holds only an agent/process-scoped
-//! control credential and receives opaque short-lived Gateway credentials.  This
-//! keeps the local vertical honest about the production trust direction while
-//! leaving workload identity and the central cross-VM issuer/registry to the
-//! remaining Cloud scope of issue #80.
+//! The host control plane owns the local HMAC signing key and authoritative
+//! runtime registry. The normal Rust runtime holds only an agent/process-scoped
+//! control credential and receives opaque short-lived Gateway credentials.
+//! Production uses a least-privilege Unix socket; literal loopback HTTP remains
+//! an explicit developer fixture. This local boundary does not replace workload
+//! identity or the central cross-VM issuer/registry tracked by issue #80.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::IpAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,8 +44,11 @@ const MAX_LOCAL_GATEWAY_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_LOCAL_GATEWAY_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_LOCAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
+const TRUSTED_UNIX_SOCKET_MODE: u32 = 0o660;
+const TRUSTED_UNIX_PARENT_MODE: u32 = 0o750;
 
-/// Short-lived credential accepted only by the loopback local-control fixture.
+/// Short-lived credential accepted only by the local-control transport.
 ///
 /// This is not the Gateway bearer token and is not a signing key.  It is bound
 /// to the exact PAID/generation/boot nonce before the HTTP client can use it.
@@ -96,8 +102,8 @@ impl fmt::Debug for LocalControlCredential {
     }
 }
 
-/// Injectable local-control seam.  Unit tests use an in-memory fake; the
-/// bootstrap-facing implementation is `LoopbackHttpControlClient`.
+/// Injectable local-control seam. Unit tests use an in-memory fake; production
+/// bootstrap uses `LocalControlHttpClient::new_unix`.
 #[async_trait]
 pub(crate) trait LocalControlPlane: Send + Sync + 'static {
     async fn issue_gateway_credential(
@@ -111,32 +117,65 @@ pub(crate) trait LocalControlPlane: Send + Sync + 'static {
     ) -> Result<LocalRuntimeStateAck>;
 }
 
-/// Authenticated HTTP client for the Go-owned local-control fixture.
+/// Authenticated HTTP client for the Go-owned local-control plane.
 #[derive(Clone)]
-pub(crate) struct LoopbackHttpControlClient {
+pub(crate) struct LocalControlHttpClient {
     authority: RuntimeEpochAuthority,
     base_url: reqwest::Url,
     credential: Arc<LocalControlCredential>,
     http: reqwest::Client,
+    transport: LocalControlTransport,
 }
 
-impl fmt::Debug for LoopbackHttpControlClient {
+#[derive(Clone, Copy, Debug)]
+enum LocalControlTransport {
+    Unix,
+    Loopback,
+}
+
+impl fmt::Debug for LocalControlHttpClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("LoopbackHttpControlClient")
+            .debug_struct("LocalControlHttpClient")
             .field(
                 "personality_agent_id",
                 self.authority.personality_agent_id(),
             )
             .field("generation", &self.authority.generation())
-            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
             .field("credential", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
 
-impl LoopbackHttpControlClient {
-    pub(crate) fn new(
+impl LocalControlHttpClient {
+    pub(crate) fn new_unix(
+        socket_path: impl AsRef<Path>,
+        authority: RuntimeEpochAuthority,
+        credential: LocalControlCredential,
+    ) -> Result<Self> {
+        credential.validate_at(&authority, SystemTime::now())?;
+        let socket_path = validate_unix_socket_path(socket_path.as_ref())?;
+        let base_url = reqwest::Url::parse("http://local-control.invalid/")
+            .context("construct local control endpoint")?;
+        let http = reqwest::Client::builder()
+            .unix_socket(socket_path)
+            .connect_timeout(DEFAULT_LOCAL_CONTROL_CONNECT_TIMEOUT)
+            .timeout(DEFAULT_LOCAL_CONTROL_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("build Unix local control HTTP client")?;
+        Ok(Self {
+            authority,
+            base_url,
+            credential: Arc::new(credential),
+            http,
+            transport: LocalControlTransport::Unix,
+        })
+    }
+
+    pub(crate) fn new_loopback(
         base_url: impl AsRef<str>,
         authority: RuntimeEpochAuthority,
         credential: LocalControlCredential,
@@ -155,6 +194,7 @@ impl LoopbackHttpControlClient {
             base_url,
             credential: Arc::new(credential),
             http,
+            transport: LocalControlTransport::Loopback,
         })
     }
 
@@ -203,7 +243,7 @@ impl LoopbackHttpControlClient {
 }
 
 #[async_trait]
-impl LocalControlPlane for LoopbackHttpControlClient {
+impl LocalControlPlane for LocalControlHttpClient {
     async fn issue_gateway_credential(
         &self,
         request: LocalCredentialIssueRequest,
@@ -279,6 +319,78 @@ fn validate_loopback_base_url(value: &str) -> Result<reqwest::Url> {
         bail!("local control base URL must not contain credentials, path, query, or fragment");
     }
     Ok(url)
+}
+
+fn validate_unix_socket_path(value: &Path) -> Result<PathBuf> {
+    if !value.is_absolute() {
+        bail!("local control Unix socket path must be absolute");
+    }
+    if value.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        bail!("local control Unix socket path exceeds bounded length");
+    }
+    if value
+        .components()
+        .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        bail!("local control Unix socket path must be lexically clean");
+    }
+    let parent = value
+        .parent()
+        .context("local control Unix socket must have a parent")?;
+    let canonical_parent =
+        std::fs::canonicalize(parent).context("resolve local control Unix socket parent")?;
+    if canonical_parent != parent {
+        bail!("local control Unix socket parent path must not contain symlinks");
+    }
+    let parent_metadata =
+        std::fs::symlink_metadata(parent).context("inspect local control Unix socket parent")?;
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        bail!("local control Unix socket parent must be a real directory");
+    }
+    if parent_metadata.mode() & 0o777 != TRUSTED_UNIX_PARENT_MODE {
+        bail!("local control Unix socket parent mode must be 0750");
+    }
+
+    let socket_metadata =
+        std::fs::symlink_metadata(value).context("inspect local control Unix socket")?;
+    if !socket_metadata.file_type().is_socket() || socket_metadata.file_type().is_symlink() {
+        bail!("local control Unix socket target must be a real socket");
+    }
+    if socket_metadata.mode() & 0o777 != TRUSTED_UNIX_SOCKET_MODE {
+        bail!("local control Unix socket mode must be 0660");
+    }
+    if socket_metadata.nlink() != 1 {
+        bail!("local control Unix socket link count must be exactly one");
+    }
+    if parent_metadata.uid() != socket_metadata.uid()
+        || parent_metadata.gid() != socket_metadata.gid()
+    {
+        bail!("local control Unix socket parent and socket ownership must match");
+    }
+    let euid = unsafe { libc::geteuid() };
+    if euid != socket_metadata.uid() && !process_has_group(socket_metadata.gid())? {
+        bail!("local control Unix socket group is not assigned to this runtime");
+    }
+    Ok(value.to_path_buf())
+}
+
+fn process_has_group(gid: u32) -> Result<bool> {
+    if unsafe { libc::getegid() } == gid {
+        return Ok(true);
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error()).context("read runtime supplementary groups");
+    }
+    let mut groups = vec![0; usize::try_from(count).context("invalid supplementary group count")?];
+    if count > 0 {
+        let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if read != count {
+            return Err(std::io::Error::last_os_error())
+                .context("read runtime supplementary groups");
+        }
+    }
+    Ok(groups.contains(&gid))
 }
 
 /// Fixed-scope T24 credential provider backed by the Go local-control fixture.
@@ -871,6 +983,7 @@ fn system_time_from_unix(seconds: i64) -> Result<SystemTime> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Mutex as StdMutex;
 
     use axum::Json;
@@ -878,6 +991,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::runtime::contracts::{
@@ -886,6 +1000,31 @@ mod tests {
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
+
+    struct TestSocketDir(PathBuf);
+
+    impl TestSocketDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("su-{}", Uuid::now_v7().simple()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(TRUSTED_UNIX_PARENT_MODE),
+            )
+            .unwrap();
+            Self(path)
+        }
+
+        fn socket(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestSocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn authority_with(
         personality_agent_id: &str,
@@ -1473,8 +1612,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            LoopbackHttpControlClient::new("http://192.0.2.1:8080", expected.clone(), credential)
-                .is_err()
+            LocalControlHttpClient::new_loopback(
+                "http://192.0.2.1:8080",
+                expected.clone(),
+                credential,
+            )
+            .is_err()
         );
 
         let expired = LocalControlCredential::new(
@@ -1484,7 +1627,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            LoopbackHttpControlClient::new("http://127.0.0.1:8080", expected, expired).is_err()
+            LocalControlHttpClient::new_loopback("http://127.0.0.1:8080", expected, expired)
+                .is_err()
         );
     }
 
@@ -1497,9 +1641,12 @@ mod tests {
             SystemTime::now() + Duration::from_secs(30),
         )
         .unwrap();
-        let client =
-            LoopbackHttpControlClient::new("http://127.0.0.1:9", expected.clone(), credential)
-                .unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            "http://127.0.0.1:9",
+            expected.clone(),
+            credential,
+        )
+        .unwrap();
 
         let credential_request = LocalCredentialIssueRequest {
             request_id: "request-a".to_owned(),
@@ -1551,6 +1698,202 @@ mod tests {
                 .to_string()
                 .contains("runtime epoch mismatch")
         );
+    }
+
+    async fn read_unix_http_request(
+        stream: &mut tokio::net::UnixStream,
+    ) -> (String, String, Vec<u8>) {
+        let mut request = Vec::new();
+        let (header_end, content_length) = loop {
+            assert!(request.len() <= MAX_LOCAL_CONTROL_RESPONSE_BYTES);
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "HTTP client closed before sending a request");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            break (header_end + 4, content_length);
+        };
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let request_line = headers.lines().next().unwrap().to_owned();
+        let authorization = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap();
+        (
+            request_line,
+            authorization,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    async fn write_unix_http_json(stream: &mut tokio::net::UnixStream, value: &impl Serialize) {
+        let body = serde_json::to_vec(value).unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_client_round_trip_sends_exact_bearer_and_epoch_bodies() {
+        let directory = TestSocketDir::new();
+        let socket_path = directory.socket("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut issue_stream, _) = listener.accept().await.unwrap();
+            let (request_line, authorization, body) =
+                read_unix_http_request(&mut issue_stream).await;
+            assert_eq!(
+                request_line,
+                format!("POST /{ISSUE_CREDENTIAL_PATH} HTTP/1.1")
+            );
+            assert_eq!(authorization, "Bearer control-secret");
+            let issue: LocalCredentialIssueRequest = serde_json::from_slice(&body).unwrap();
+            assert_eq!(issue.personality_agent_id, PAID);
+            assert_eq!(issue.generation, 7);
+            assert_eq!(issue.rpc_boot_nonce, "boot-a");
+            assert_eq!(issue.audience, LOCAL_AGENT_AUDIENCE);
+            let issue_response = LocalCredentialIssueResponse {
+                request_id: issue.request_id,
+                personality_agent_id: issue.personality_agent_id,
+                generation: issue.generation,
+                rpc_boot_nonce: issue.rpc_boot_nonce,
+                audience: issue.audience,
+                expires_at_unix: unix_now() + 30,
+                delivery_authorization: DeliveryAuthorization::Raw,
+                token: "fixture-issued-token".to_owned(),
+            };
+            write_unix_http_json(&mut issue_stream, &issue_response).await;
+
+            let (mut publish_stream, _) = listener.accept().await.unwrap();
+            let (request_line, authorization, body) =
+                read_unix_http_request(&mut publish_stream).await;
+            assert_eq!(
+                request_line,
+                format!("POST /{PUBLISH_RUNTIME_STATE_PATH} HTTP/1.1")
+            );
+            assert_eq!(authorization, "Bearer control-secret");
+            let publication: LocalRuntimeStatePublication = serde_json::from_slice(&body).unwrap();
+            assert_eq!(publication.personality_agent_id, PAID);
+            assert_eq!(publication.generation, 7);
+            assert_eq!(publication.rpc_boot_nonce, "boot-a");
+            assert_eq!(publication.state, LocalRuntimePublicationState::NotReady);
+            assert_eq!(publication.reason, LocalRuntimePublicationReason::Startup);
+            let ack = LocalRuntimeStateAck {
+                publication_id: publication.publication_id,
+                personality_agent_id: publication.personality_agent_id,
+                generation: publication.generation,
+                rpc_boot_nonce: publication.rpc_boot_nonce,
+                revision: 1,
+                state: publication.state,
+                hydration_receipt_identity: publication.hydration_receipt_identity,
+            };
+            write_unix_http_json(&mut publish_stream, &ack).await;
+        });
+
+        let expected = authority();
+        let credential = LocalControlCredential::new(
+            "control-secret",
+            expected.rpc_identity().clone(),
+            SystemTime::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        let control = Arc::new(
+            LocalControlHttpClient::new_unix(&socket_path, expected.clone(), credential).unwrap(),
+        );
+        let mut provider = LocalCredentialProvider::new(
+            expected.clone(),
+            DeliveryAuthorization::Raw,
+            control.clone(),
+        );
+        assert_eq!(
+            provider.fresh_credential().await.unwrap().token(),
+            "fixture-issued-token"
+        );
+        let publisher = LocalControlReadyPublisher::new(expected, control);
+        publisher.publish_not_ready().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn unix_client_rejects_wrong_mode_symlink_and_hardlinked_socket() {
+        let expected = authority();
+        let credential = || {
+            LocalControlCredential::new(
+                "control-secret",
+                expected.rpc_identity().clone(),
+                SystemTime::now() + Duration::from_secs(30),
+            )
+            .unwrap()
+        };
+
+        let wrong_mode_dir = TestSocketDir::new();
+        let wrong_mode_path = wrong_mode_dir.socket("wrong-mode.sock");
+        let _wrong_mode_listener =
+            std::os::unix::net::UnixListener::bind(&wrong_mode_path).unwrap();
+        std::fs::set_permissions(&wrong_mode_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error =
+            LocalControlHttpClient::new_unix(&wrong_mode_path, expected.clone(), credential())
+                .unwrap_err();
+        assert!(error.to_string().contains("mode must be 0660"));
+
+        let symlink_dir = TestSocketDir::new();
+        let real_path = symlink_dir.socket("real.sock");
+        let _real_listener = std::os::unix::net::UnixListener::bind(&real_path).unwrap();
+        std::fs::set_permissions(
+            &real_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+        let linked_path = symlink_dir.socket("linked.sock");
+        symlink(&real_path, &linked_path).unwrap();
+        let error = LocalControlHttpClient::new_unix(&linked_path, expected.clone(), credential())
+            .unwrap_err();
+        assert!(error.to_string().contains("real socket"));
+
+        let hardlink_dir = TestSocketDir::new();
+        let hardlink_path = hardlink_dir.socket("hardlink.sock");
+        let _hardlink_listener = std::os::unix::net::UnixListener::bind(&hardlink_path).unwrap();
+        std::fs::set_permissions(
+            &hardlink_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+        std::fs::hard_link(&hardlink_path, hardlink_dir.socket("second-link.sock")).unwrap();
+        let error =
+            LocalControlHttpClient::new_unix(&hardlink_path, expected.clone(), credential())
+                .unwrap_err();
+        assert!(error.to_string().contains("link count"));
     }
 
     #[derive(Clone)]
@@ -1644,7 +1987,7 @@ mod tests {
         )
         .unwrap();
         let control = Arc::new(
-            LoopbackHttpControlClient::new(
+            LocalControlHttpClient::new_loopback(
                 format!("http://{address}"),
                 expected.clone(),
                 credential,
