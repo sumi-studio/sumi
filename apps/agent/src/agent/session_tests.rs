@@ -424,6 +424,14 @@ impl Drop for DropNotifier {
     }
 }
 
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl Drop for EofBlockingWriter {
     fn drop(&mut self) {
         self.dropped.notify_one();
@@ -4453,7 +4461,7 @@ async fn runtime_shutdown_cancels_active_attempt_and_joins_returned_core() {
 }
 
 #[tokio::test]
-async fn runtime_shutdown_deadline_covers_blocked_store_persistence() {
+async fn runtime_shutdown_deadline_joins_aborted_worker_before_reporting_ownership_loss() {
     let store = Store::session_test_store("runtime-shutdown-blocked-store")
         .await
         .expect("test store");
@@ -4461,16 +4469,20 @@ async fn runtime_shutdown_deadline_covers_blocked_store_persistence() {
     let (gateway, commands, _frames) = gateway();
     let worker_entered = Arc::new(Notify::new());
     let event_sent = Arc::new(Notify::new());
+    let worker_dropped = Arc::new(AtomicBool::new(false));
     let worker: Arc<dyn RunWorker> = Arc::new({
         let worker_entered = worker_entered.clone();
         let event_sent = event_sent.clone();
+        let worker_dropped = worker_dropped.clone();
         move |core: RunCore,
               _initial: AdmittedCommand,
               _controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let worker_entered = worker_entered.clone();
             let event_sent = event_sent.clone();
+            let worker_dropped = worker_dropped.clone();
             async move {
+                let _drop_flag = DropFlag(worker_dropped);
                 worker_entered.notify_one();
                 core.runtime_shutdown.cancelled().await;
                 events
@@ -4507,6 +4519,10 @@ async fn runtime_shutdown_deadline_covers_blocked_store_persistence() {
         SessionFailure::RuntimeShutdownOwnershipLost
     ));
     assert!(matches!(ownership, RunOwnership::Lost));
+    assert!(
+        worker_dropped.load(Ordering::SeqCst),
+        "Session must join the aborted worker before returning ownership loss"
+    );
     drop(store_guard);
 }
 

@@ -118,6 +118,11 @@ const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// from blocking the Session event lane indefinitely.
 const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Once the graceful shutdown deadline has made the durable boundary
+/// indeterminate, do not detach the still-owned worker while reporting that
+/// outcome. The abort itself is not settlement: retain and join the exact
+/// handle within this independent ownership bound.
+const RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -2207,16 +2212,37 @@ impl<G: Gateway + 'static> Session<G> {
                 // The grace period is absolute: it includes Store commits,
                 // worker settlement, output draining, and every other await in
                 // the graceful path. Cancellation of any of those operations
-                // makes the durable/worker boundary indeterminate, so abort
-                // the retained worker and report ownership loss.
-                if let Some(active) = self.active.as_mut() {
-                    active.join.abort();
-                }
+                // makes the durable/worker boundary indeterminate. Abort and
+                // settle the exact retained task before reporting lost RunCore
+                // ownership; the two ownership questions are distinct.
+                self.abort_and_join_active_worker_or_fail_stop().await;
                 self.active.take();
                 self.core.take();
                 self.durable_core_invalidated = true;
                 Err(SessionFailure::RuntimeShutdownOwnershipLost)
             }
+        }
+    }
+
+    async fn abort_and_join_active_worker_or_fail_stop(&mut self) {
+        let joined = {
+            let active = self
+                .active
+                .as_mut()
+                .expect("shutdown timeout requires an active run");
+            active.join.abort();
+            tokio::time::timeout(RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT, &mut active.join).await
+        };
+        if joined.is_err() {
+            // Returning would drop the JoinHandle and detach a task that may
+            // still own RunCore. The durable outcome is already
+            // indeterminate, but only a process fail-stop preserves the
+            // single-owner invariant when task settlement misses its bound.
+            tracing::error!(
+                timeout_millis = RUNTIME_SHUTDOWN_ABORT_JOIN_TIMEOUT.as_millis(),
+                "aborted active run did not join within its ownership bound"
+            );
+            std::process::abort();
         }
     }
 
