@@ -611,6 +611,133 @@ mod tests {
         }
     }
 
+    struct PoolBlockedAdmissionFixture {
+        store: Arc<Store>,
+        adapter: T17StoreAdapter,
+        hook: DurableAdmissionHook,
+        delivery_epoch: DeliveryEpoch,
+        dispatcher: Option<OrderedPostCommitDispatcher>,
+        delivery_runtime: Option<super::super::DeliveryEpochRuntime>,
+        pump_cancel: CancellationToken,
+        event_rx: mpsc::Receiver<(DeliveryEpoch, bool, OutboundFrame)>,
+    }
+
+    impl PoolBlockedAdmissionFixture {
+        async fn start(label: &str) -> Self {
+            let store = Arc::new(Store::session_test_store(label).await.unwrap());
+            let adapter = T17StoreAdapter::new(store.clone())
+                .bind_delivery_authorization(DeliveryAuthorization::Raw)
+                .unwrap();
+            let hook = DurableAdmissionHook::default();
+            adapter.set_durable_admission_hook(Some(hook.clone()));
+            let delivery_epoch = DeliveryEpoch::for_test(label);
+            let (event_tx, event_rx) = mpsc::channel(4);
+            let (_online_tx, online) = watch::channel(true);
+            let events = EventSender {
+                tx: event_tx,
+                online,
+            };
+            let pump_cancel = CancellationToken::new();
+            let delivery_runtime = adapter
+                .install_delivery_epoch(delivery_epoch, 0, events, pump_cancel.child_token())
+                .await
+                .unwrap()
+                .expect("install the pool-blocked T17 delivery forwarder");
+            let dispatcher = OrderedPostCommitDispatcher::start(
+                store.clone(),
+                adapter.clone(),
+                0,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                EventWriter::new(store.clone())
+                    .apply(maintenance(label))
+                    .await
+                    .unwrap(),
+                vec![1]
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), hook.reserved.notified())
+                .await
+                .expect("dispatcher reserves the delivery epoch");
+            hook.allow_registration.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                hook.registered.notified(),
+            )
+            .await
+            .expect("dispatcher registers the durable completion fence");
+            Self {
+                store,
+                adapter,
+                hook,
+                delivery_epoch,
+                dispatcher: Some(dispatcher),
+                delivery_runtime: Some(delivery_runtime),
+                pump_cancel,
+                event_rx,
+            }
+        }
+
+        async fn block_delivery_on_store_connection(
+            &self,
+        ) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+            let connection = self.store.pool().acquire().await.unwrap();
+            self.hook.allow_delivery.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.hook.delivery_started.notified(),
+            )
+            .await
+            .expect("T17 delivery reaches the Store read");
+            connection
+        }
+
+        async fn wait_for_receiver_release(&self) {
+            let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Ok(receiver) = self.store.claim_post_commit_receiver() {
+                        break receiver;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled dispatcher releases its exclusive receiver");
+            drop(receiver);
+        }
+
+        fn assert_no_old_epoch_delivery(&mut self) {
+            assert!(
+                self.event_rx.try_recv().is_err(),
+                "cancelled Store read must not emit into the old delivery epoch"
+            );
+        }
+
+        async fn finish(mut self) {
+            if let Some(dispatcher) = self.dispatcher.take() {
+                drop(dispatcher);
+            }
+            self.adapter.set_durable_admission_hook(None);
+            self.adapter
+                .invalidate_delivery_epoch(self.delivery_epoch)
+                .await
+                .unwrap();
+            self.pump_cancel.cancel();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.delivery_runtime
+                    .take()
+                    .expect("delivery runtime is joined once")
+                    .join(),
+            )
+            .await
+            .expect("pool-blocked T17 forwarder terminates")
+            .expect("pool-blocked T17 forwarder joins");
+            self.assert_no_old_epoch_delivery();
+        }
+    }
+
     fn maintenance(kind: &str) -> EventBatch {
         EventBatch {
             writes: vec![EventWrite {
@@ -1445,6 +1572,87 @@ mod tests {
         .expect("receiver claim is released while the SQLite pool remains occupied");
         drop(receiver);
         drop(connection);
+    }
+
+    #[tokio::test]
+    async fn emergency_drop_cancels_a_pool_blocked_t17_delivery_read() {
+        let mut fixture =
+            PoolBlockedAdmissionFixture::start("post-commit-drop-pool-blocked-t17").await;
+        let connection = fixture.block_delivery_on_store_connection().await;
+
+        drop(
+            fixture
+                .dispatcher
+                .take()
+                .expect("emergency drop owns the dispatcher"),
+        );
+        fixture.wait_for_receiver_release().await;
+        assert_eq!(fixture.adapter.durable_fence_count(), 0);
+        fixture.assert_no_old_epoch_delivery();
+
+        drop(connection);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_cancels_a_pool_blocked_t17_delivery_read() {
+        let mut fixture =
+            PoolBlockedAdmissionFixture::start("post-commit-shutdown-pool-blocked-t17").await;
+        let proof = EventWriter::new(fixture.store.clone())
+            .close_post_commit_admission(
+                fixture
+                    .dispatcher
+                    .as_ref()
+                    .expect("dispatcher owns its shutdown proof")
+                    .shutdown_owner(),
+            )
+            .await
+            .unwrap();
+        let connection = fixture.block_delivery_on_store_connection().await;
+
+        let dispatcher = fixture
+            .dispatcher
+            .take()
+            .expect("orderly shutdown owns the dispatcher");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.shutdown(proof),
+        )
+        .await
+        .expect("orderly shutdown cancels the pool-blocked Store read")
+        .unwrap();
+        assert_eq!(fixture.adapter.durable_fence_count(), 0);
+        fixture.assert_no_old_epoch_delivery();
+
+        drop(connection);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn hydration_rollover_cancels_a_pool_blocked_t17_delivery_read() {
+        let mut fixture =
+            PoolBlockedAdmissionFixture::start("post-commit-rollover-pool-blocked-t17").await;
+        let runtime_epoch = fixture
+            .dispatcher
+            .as_ref()
+            .expect("rollover owns the dispatcher")
+            .client()
+            .epoch()
+            .clone();
+        let connection = fixture.block_delivery_on_store_connection().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime_epoch.invalidate_hydration_lifecycle_for_test(),
+        )
+        .await
+        .expect("hydration rollover cancels the pool-blocked Store read");
+        fixture.wait_for_receiver_release().await;
+        assert_eq!(fixture.adapter.durable_fence_count(), 0);
+        fixture.assert_no_old_epoch_delivery();
+
+        drop(connection);
+        fixture.finish().await;
     }
 
     fn runtime_authority(

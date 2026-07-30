@@ -159,6 +159,11 @@ impl PostCommitEpochCapability {
     pub(crate) fn invalidate(&self) {
         self.inner.owner_invalidated.cancel();
     }
+
+    #[cfg(test)]
+    pub(crate) async fn invalidate_hydration_lifecycle_for_test(&self) {
+        self.inner.hydration_lifecycle.invalidate_and_wait().await;
+    }
 }
 
 /// Unforgeable proof that EventWriter admission is closed and every admitted

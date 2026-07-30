@@ -58,6 +58,7 @@ pub(crate) struct DurableAdmissionHook {
     pub(crate) allow_registration: Arc<Notify>,
     pub(crate) registered: Arc<Notify>,
     pub(crate) allow_delivery: Arc<Notify>,
+    pub(crate) delivery_started: Arc<Notify>,
     pub(crate) enqueued: Arc<Notify>,
 }
 
@@ -447,11 +448,12 @@ impl T17StoreAdapter {
             hook.calls.fetch_add(1, Ordering::SeqCst);
         }
         let (fence_tx, fence_rx) = oneshot::channel();
-        let (reservation, epoch, key) = {
-            // Reservation and fence registration are one admission operation
-            // with respect to epoch invalidation. Invalidation takes this same
-            // slot lock before sweeping fences, so it cannot pass between the
-            // epoch proof and ownership of the completion fence.
+        let (reservation, epoch, key, delivery_cancel) = {
+            // Reservation, the exact forwarder cancellation token, and fence
+            // registration are one admission operation with respect to epoch
+            // invalidation. Invalidation takes this same slot lock before
+            // sweeping fences, so it cannot pass between the epoch proof and
+            // ownership of the completion fence.
             let slot = self.pump.lock().await;
             let Some(active) = slot.as_ref() else {
                 return Ok(DurableEventAdmission::Deferred { after_epoch: None });
@@ -490,7 +492,7 @@ impl T17StoreAdapter {
                     }
                 }
             }
-            (reservation, epoch, key)
+            (reservation, epoch, key, active.cancel.clone())
         };
         // Dropping the dispatcher admission future (for example during T26
         // shutdown) removes the completion sender. The DeliveryPump
@@ -515,7 +517,17 @@ impl T17StoreAdapter {
             }
         }
 
-        let mut delivery = Box::pin(reservation.deliver());
+        #[cfg(test)]
+        let delivery_started = hook.as_ref().map(|hook| hook.delivery_started.clone());
+        let mut delivery = Box::pin(async move {
+            #[cfg(test)]
+            if let Some(delivery_started) = delivery_started {
+                delivery_started.notify_one();
+            }
+            reservation
+                .deliver_with_cancellation(&delivery_cancel)
+                .await
+        });
         let delivery = tokio::select! {
             biased;
             _ = runtime_epoch.cancelled() => {
