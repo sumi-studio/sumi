@@ -13,6 +13,10 @@ readonly BROKER_GID=10003
 readonly EXECUTOR_IPC_GID=10020
 readonly BROKER_IPC_GID=10021
 readonly IDENTITY_FILE=/run/sumi/identity/identity.env
+readonly LOCAL_CONTROL_BEARER_FILE=/run/secrets/sumi_local_control_bearer
+readonly AGENT_WRAPPING_KEY_FILE=/run/secrets/sumi_agent_wrapping_key
+readonly APPROVAL_SECRET_DIGEST_KEY_FILE=/run/secrets/sumi_approval_secret_digest_key
+readonly PROVIDER_API_KEY_FILE=/run/secrets/sumi_provider_api_key
 
 fail() {
   printf '[sumi-entrypoint] %s\n' "$*" >&2
@@ -22,6 +26,36 @@ fail() {
 require_env() {
   local name="$1"
   [[ -n "${!name:-}" ]] || fail "missing required ${name}"
+}
+
+# Compose environment-backed secrets are mounted with an exact runtime owner
+# and mode. Secret values are one non-empty byte string with no line ending:
+# accepting line-oriented input would make trailing-newline normalization
+# dependent on how the host supplied the value.
+load_runtime_secret() {
+  local name="$1"
+  local file="$2"
+  local metadata byte_count value
+  local LC_ALL=C
+
+  [[ -f "${file}" && ! -L "${file}" ]] ||
+    fail "runtime secret must be a regular non-symlink"
+  metadata="$(stat -Lc '%u:%g:%a:%h' -- "${file}")" ||
+    fail "cannot inspect runtime secret"
+  [[ "${metadata}" == "10001:10001:400:1" ]] ||
+    fail "runtime secret has invalid owner, mode, or link count"
+  [[ -r "${file}" ]] || fail "runtime secret is not readable by runtime"
+
+  byte_count="$(stat -Lc '%s' -- "${file}")" || fail "cannot size runtime secret"
+  [[ "${byte_count}" =~ ^[0-9]+$ ]] || fail "cannot size runtime secret"
+  value="$(<"${file}")" || fail "cannot read runtime secret"
+  [[ -n "${value}" ]] || fail "runtime secret must not be empty"
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] ||
+    fail "runtime secret must not contain newline or carriage return"
+  (( byte_count == ${#value} )) ||
+    fail "runtime secret byte length changed during parsing"
+  printf -v "${name}" '%s' "${value}"
+  export "${name}"
 }
 
 # Docker services are permitted only stdin/stdout/stderr. Bash keeps its script
@@ -157,7 +191,18 @@ case "${role}" in
     ;;
 
   runtime)
+    declare -a runtime_environment
     load_identity runtime "${IDENTITY_FILE}"
+    # Do not let an image or caller-provided legacy environment value bypass
+    # the fixed secret-file contract.
+    unset SUMI_LOCAL_CONTROL_BEARER
+    unset SUMI_AGENT_WRAPPING_KEY
+    unset SUMI_APPROVAL_SECRET_DIGEST_KEY
+    unset SUMI_PROVIDER_API_KEY
+    load_runtime_secret SUMI_LOCAL_CONTROL_BEARER "${LOCAL_CONTROL_BEARER_FILE}"
+    load_runtime_secret SUMI_AGENT_WRAPPING_KEY "${AGENT_WRAPPING_KEY_FILE}"
+    load_runtime_secret SUMI_APPROVAL_SECRET_DIGEST_KEY "${APPROVAL_SECRET_DIGEST_KEY_FILE}"
+    load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
     for name in \
       SUMI_GATEWAY_URL \
       SUMI_LOCAL_CONTROL_UNIX_SOCKET \
@@ -172,31 +217,40 @@ case "${role}" in
     do
       require_env "${name}"
     done
+    if [[ -v SUMI_MODEL_ID ]]; then
+      [[ -n "${SUMI_MODEL_ID}" ]] || fail "SUMI_MODEL_ID must not be empty when set"
+    fi
+    runtime_environment=(
+      "PATH=/usr/local/bin:/usr/bin:/bin"
+      "HOME=/var/lib/sumi"
+      "LANG=C.UTF-8"
+      "SUMI_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}"
+      "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}"
+      "SUMI_RPC_NONCE=${SUMI_RPC_NONCE}"
+      "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}"
+      "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}"
+      "SUMI_STATE_DIR=/var/lib/sumi"
+      "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock"
+      "SUMI_GATEWAY_URL=${SUMI_GATEWAY_URL}"
+      "SUMI_LOCAL_CONTROL_UNIX_SOCKET=${SUMI_LOCAL_CONTROL_UNIX_SOCKET}"
+      "SUMI_LOCAL_CONTROL_SERVER_UID=${SUMI_LOCAL_CONTROL_SERVER_UID}"
+      "SUMI_LOCAL_CONTROL_SOCKET_GID=${SUMI_LOCAL_CONTROL_SOCKET_GID}"
+      "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}"
+      "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX=${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}"
+      "SUMI_AGENT_WRAPPING_KEY=${SUMI_AGENT_WRAPPING_KEY}"
+      "SUMI_AGENT_WRAPPING_KEY_ID=${SUMI_AGENT_WRAPPING_KEY_ID}"
+      "SUMI_APPROVAL_SECRET_DIGEST_KEY=${SUMI_APPROVAL_SECRET_DIGEST_KEY}"
+      "SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET:-kimi-k3}"
+      "SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY"
+      "SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}"
+      "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}"
+      "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
+    )
+    if [[ -v SUMI_MODEL_ID ]]; then
+      runtime_environment+=("SUMI_MODEL_ID=${SUMI_MODEL_ID}")
+    fi
     close_unlisted_fds
-    exec env -i \
-      PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi LANG=C.UTF-8 \
-      SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
-      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
-      SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
-      SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID}" \
-      SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
-      SUMI_STATE_DIR=/var/lib/sumi \
-      SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
-      SUMI_GATEWAY_URL="${SUMI_GATEWAY_URL}" \
-      SUMI_LOCAL_CONTROL_UNIX_SOCKET="${SUMI_LOCAL_CONTROL_UNIX_SOCKET}" \
-      SUMI_LOCAL_CONTROL_SERVER_UID="${SUMI_LOCAL_CONTROL_SERVER_UID}" \
-      SUMI_LOCAL_CONTROL_SOCKET_GID="${SUMI_LOCAL_CONTROL_SOCKET_GID}" \
-      SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER}" \
-      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}" \
-      SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
-      SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID}" \
-      SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY}" \
-      SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}" \
-      SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY \
-      SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY}" \
-      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY="${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}" \
-      SUMI_LOG="${SUMI_LOG:-sumi_agent=info}" \
-      /usr/local/bin/sumi-agent
+    exec env -i "${runtime_environment[@]}" /usr/local/bin/sumi-agent
     ;;
 
   executor)

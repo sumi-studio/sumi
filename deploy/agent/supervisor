@@ -225,6 +225,18 @@ require_launch_environment() {
   do
     [[ -n "${!name:-}" ]] || fail "${name} is required"
   done
+  for name in \
+    SUMI_LOCAL_CONTROL_BEARER \
+    SUMI_AGENT_WRAPPING_KEY \
+    SUMI_APPROVAL_SECRET_DIGEST_KEY \
+    SUMI_PROVIDER_API_KEY
+  do
+    [[ "${!name}" != *$'\n'* && "${!name}" != *$'\r'* ]] ||
+      fail "${name} must not contain newline or carriage return"
+  done
+  if [[ -v SUMI_MODEL_ID && -z "${SUMI_MODEL_ID}" ]]; then
+    fail "SUMI_MODEL_ID must not be empty when set"
+  fi
   validate_local_control_socket
 }
 
@@ -458,12 +470,10 @@ case "${action}" in
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     ;;
   status|ps)
-    acquire_supervisor_lock
     require_docker
     lifecycle_compose ps
     ;;
   logs)
-    acquire_supervisor_lock
     require_docker
     lifecycle_compose logs "${@:2}"
     ;;

@@ -1291,6 +1291,11 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     let broker_env = environment_keys(broker);
     assert!(runtime_env.contains("SUMI_LOCAL_CONTROL_UNIX_SOCKET"));
     assert!(runtime_env.contains("SUMI_LOCAL_CONTROL_SERVER_UID"));
+    assert!(runtime_env.contains("SUMI_MODEL_ID"));
+    assert!(
+        runtime["environment"]["SUMI_MODEL_ID"].is_null(),
+        "optional model ID must be a host pass-through without a default"
+    );
     assert_eq!(
         runtime["environment"]["SUMI_LOCAL_CONTROL_SOCKET_GID"].as_str(),
         Some("${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}")
@@ -1314,9 +1319,39 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         "SUMI_APPROVAL_SECRET_DIGEST_KEY",
         "SUMI_PROVIDER_API_KEY",
     ] {
-        assert!(runtime_env.contains(sensitive));
+        assert!(
+            !runtime_env.contains(sensitive),
+            "{sensitive} must not survive in Docker Config.Env"
+        );
         assert!(!executor_env.contains(sensitive));
         assert!(!broker_env.contains(sensitive));
+    }
+    let expected_secrets = [
+        ("sumi_local_control_bearer", "SUMI_LOCAL_CONTROL_BEARER"),
+        ("sumi_agent_wrapping_key", "SUMI_AGENT_WRAPPING_KEY"),
+        (
+            "sumi_approval_secret_digest_key",
+            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
+        ),
+        ("sumi_provider_api_key", "SUMI_PROVIDER_API_KEY"),
+    ];
+    let runtime_secrets = runtime["secrets"]
+        .as_sequence()
+        .expect("runtime must receive explicit secret mounts");
+    assert_eq!(runtime_secrets.len(), expected_secrets.len());
+    for (source, host_environment) in expected_secrets {
+        assert_eq!(
+            compose["secrets"][source]["environment"].as_str(),
+            Some(host_environment)
+        );
+        let mount = runtime_secrets
+            .iter()
+            .find(|mount| mount["source"].as_str() == Some(source))
+            .unwrap_or_else(|| panic!("missing runtime secret {source}"));
+        assert_eq!(mount["target"].as_str(), Some(source));
+        assert_eq!(mount["uid"].as_str(), Some("10001"));
+        assert_eq!(mount["gid"].as_str(), Some("10001"));
+        assert_eq!(mount["mode"].as_u64(), Some(0o400));
     }
     let entrypoint = read_deploy("container-entrypoint");
     assert!(
@@ -1327,6 +1362,18 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         entrypoint.matches("SUMI_LOCAL_CONTROL_SOCKET_GID").count() >= 2,
         "runtime env scrubber dropped the supervisor-validated local-control socket gid"
     );
+    for (source, _) in expected_secrets {
+        assert!(
+            entrypoint.contains(&format!("/run/secrets/{source}")),
+            "entrypoint does not use the fixed {source} path"
+        );
+    }
+    assert!(entrypoint.contains("runtime secret must not contain newline or carriage return"));
+    assert!(entrypoint.contains("runtime secret byte length changed during parsing"));
+    assert!(entrypoint.contains("10001:10001:400:1"));
+    assert!(entrypoint.contains("if [[ -v SUMI_MODEL_ID ]]"));
+    assert!(entrypoint.contains(r#"runtime_environment+=("SUMI_MODEL_ID=${SUMI_MODEL_ID}")"#));
+    assert!(!entrypoint.contains("SUMI_MODEL_ID:-"));
 }
 
 #[test]
@@ -2061,6 +2108,145 @@ fn lifecycle_actions_work_after_launch_configuration_is_removed() {
 }
 
 #[test]
+fn read_only_supervisor_actions_do_not_require_the_host_mutation_lock() {
+    let root = std::env::temp_dir().join(format!("read-only-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    let log = root.join("docker.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    std::fs::write(
+        &fake_docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    for (action, expected) in [("status", " ps"), ("logs", " logs --tail 1")] {
+        std::fs::write(&log, b"").unwrap();
+        let mut command = Command::new(deploy_dir().join("supervisor"));
+        command
+            .env_clear()
+            .arg(action)
+            .env("PATH", format!("{}:{inherited_path}", bin.display()))
+            .env("SUMI_CONFIG_FILE", "/dev/null")
+            .env("SUMI_PERSONALITY_AGENT_ID", PAID_A)
+            .env("SUMI_FAKE_DOCKER_LOG", &log);
+        if action == "logs" {
+            command.args(["--tail", "1"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{action} required or created the host mutation lock: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("compose version"));
+        assert!(
+            calls.contains(&format!(
+                "--project-name sumi-{} --file {}{expected}",
+                PAID_A.replace('-', ""),
+                deploy_dir().join("compose.lifecycle.yaml").display()
+            )),
+            "unexpected {action} calls: {calls}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn followed_logs_do_not_block_an_exclusive_stop() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("logs-stop-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    let markers = root.join("markers");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&markers).unwrap();
+    let fake_docker = bin.join("docker");
+    std::fs::write(
+        &fake_docker,
+        r#"#!/bin/sh
+case "$*" in
+  "compose version")
+    exit 0
+    ;;
+  *" logs -f")
+    touch "$SUMI_FAKE_MARKERS/logs-started"
+    while test ! -e "$SUMI_FAKE_MARKERS/release-logs"; do
+      sleep 0.01
+    done
+    exit 0
+    ;;
+  *" down --remove-orphans "*)
+    touch "$SUMI_FAKE_MARKERS/stop-completed"
+    exit 0
+    ;;
+  *)
+    exit 97
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut logs = Command::new(deploy_dir().join("supervisor"));
+    logs.arg("logs")
+        .arg("-f")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_MARKERS", &markers)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    launch_runtime_env(&mut logs, &fixture);
+    let mut logs = logs.spawn().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !markers.join("logs-started").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let logs_started = markers.join("logs-started").exists();
+
+    let mut stop = Command::new(deploy_dir().join("supervisor"));
+    stop.arg("stop")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_MARKERS", &markers);
+    launch_runtime_env(&mut stop, &fixture);
+    let stop_output = stop.output().unwrap();
+
+    std::fs::write(markers.join("release-logs"), b"").unwrap();
+    let logs_status = wait_for_child_exit(&mut logs, Duration::from_secs(5));
+    if logs_status.is_none() {
+        let _ = logs.kill();
+        let _ = logs.wait();
+    }
+
+    assert!(
+        logs_started,
+        "followed logs did not reach the fake Docker stream"
+    );
+    assert!(
+        stop_output.status.success(),
+        "stop could not acquire the mutation lock while logs followed output: {}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+    assert!(
+        markers.join("stop-completed").exists(),
+        "stop did not reach Docker while logs remained active"
+    );
+    assert_eq!(
+        logs_status.and_then(|status| status.code()),
+        Some(0),
+        "followed logs did not terminate after its fake stream was released"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn failed_up_cleans_every_partial_role_under_lock_and_preserves_status() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
@@ -2573,6 +2759,61 @@ fn validate_error_redacts_combined_compose_output() {
 }
 
 #[test]
+fn supervisor_rejects_multiline_secret_before_compose_mutation_without_echoing_it() {
+    let root = std::env::temp_dir().join(format!("secret-lines-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    let log = root.join("docker.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_docker = bin.join("docker");
+    std::fs::write(
+        &fake_docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUMI_FAKE_DOCKER_LOG\"\ncase \"$*\" in \"compose version\") exit 0 ;; *) exit 97 ;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let sentinel = "provider-secret-must-not-echo\nsecond-line";
+    let mut command = Command::new(deploy_dir().join("supervisor"));
+    command
+        .arg("validate")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log)
+        .env("SUMI_PROVIDER_API_KEY", sentinel)
+        .env("SUMI_LOCAL_CONTROL_SERVER_UID", "1000")
+        .env(
+            "SUMI_LOCAL_CONTROL_SOCKET_GID",
+            LOCAL_CONTROL_GID.to_string(),
+        );
+    launch_env(&mut command, PAID_A);
+    command
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_DOCKER_LOG", &log)
+        .env("SUMI_PROVIDER_API_KEY", sentinel)
+        .env("SUMI_LOCAL_CONTROL_SERVER_UID", "1000")
+        .env(
+            "SUMI_LOCAL_CONTROL_SOCKET_GID",
+            LOCAL_CONTROL_GID.to_string(),
+        );
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    let combined = [output.stdout, output.stderr].concat();
+    assert!(
+        !combined
+            .windows(sentinel.len())
+            .any(|window| window == sentinel.as_bytes())
+    );
+    assert!(
+        String::from_utf8_lossy(&combined).contains("must not contain newline or carriage return")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim(),
+        "compose version",
+        "multiline secret reached Compose validation or lifecycle mutation"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn supervisor_rejects_reserved_or_role_colliding_local_control_gids() {
     let Some(fixture) = HostTrustFixture::new() else {
         return;
@@ -2908,11 +3149,65 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
             Some("10022")
         );
         assert!(
+            rendered["services"]["runtime"]["environment"]
+                .get("SUMI_MODEL_ID")
+                .is_none(),
+            "unset optional model ID survived rendered Config.Env"
+        );
+        for sensitive in [
+            "SUMI_LOCAL_CONTROL_BEARER",
+            "SUMI_AGENT_WRAPPING_KEY",
+            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
+            "SUMI_PROVIDER_API_KEY",
+        ] {
+            assert!(
+                rendered["services"]["runtime"]["environment"]
+                    .get(sensitive)
+                    .is_none(),
+                "{sensitive} survived rendered Config.Env"
+            );
+        }
+        assert!(
             rendered["services"]["runtime"]["group_add"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|group| group.as_str() == Some("10022"))
+        );
+
+        let mut exact_model = Command::new("docker");
+        exact_model.args([
+            "compose",
+            "--project-name",
+            project,
+            "--file",
+            deploy_dir().join("compose.yaml").to_str().unwrap(),
+            "config",
+            "--format",
+            "json",
+        ]);
+        launch_env(&mut exact_model, paid);
+        exact_model
+            .env("SUMI_LOCAL_CONTROL_SERVER_UID", "1000")
+            .env(
+                "SUMI_LOCAL_CONTROL_SOCKET_GID",
+                LOCAL_CONTROL_GID.to_string(),
+            )
+            .env(
+                "SUMI_LOCAL_CONTROL_HOST_DIR",
+                format!("/run/sumi/local-control/{}", paid.replace('-', "")),
+            )
+            .env("SUMI_MODEL_ID", "gpt-5.6-terra");
+        let exact_model = exact_model.output().unwrap();
+        assert!(
+            exact_model.status.success(),
+            "docker compose config with exact model failed: {}",
+            String::from_utf8_lossy(&exact_model.stderr)
+        );
+        let exact_model: serde_json::Value = serde_json::from_slice(&exact_model.stdout).unwrap();
+        assert_eq!(
+            exact_model["services"]["runtime"]["environment"]["SUMI_MODEL_ID"].as_str(),
+            Some("gpt-5.6-terra")
         );
 
         let lifecycle = Command::new("docker")
@@ -3007,6 +3302,51 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
             .arg("up");
         launch_owned_acceptance_env(&mut up, &fixture);
         let output = up.output().expect("run owned Docker/AppArmor acceptance");
+        let runtime_id = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "ps".into(),
+                "--quiet".into(),
+                "--filter".into(),
+                format!("label=com.docker.compose.project={}", fixture.project),
+                "--filter".into(),
+                "label=com.docker.compose.service=runtime".into(),
+            ],
+        );
+        let runtime_id_text = String::from_utf8_lossy(&runtime_id.stdout)
+            .trim()
+            .to_owned();
+        let runtime_inspect = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &["inspect".into(), runtime_id_text.clone()],
+        );
+        let secret_metadata = bounded_docker_output(
+            deploy_dir().parent().unwrap().parent().unwrap(),
+            30,
+            &[
+                "exec".into(),
+                runtime_id_text.clone(),
+                "/bin/sh".into(),
+                "-ec".into(),
+                r#"
+for secret in \
+  /run/secrets/sumi_local_control_bearer \
+  /run/secrets/sumi_agent_wrapping_key \
+  /run/secrets/sumi_approval_secret_digest_key \
+  /run/secrets/sumi_provider_api_key
+do
+  test -f "$secret"
+  test ! -L "$secret"
+  test "$(stat -Lc '%u:%g:%a:%h' -- "$secret")" = 10001:10001:400:1
+  test -r "$secret"
+  test -s "$secret"
+done
+"#
+                .into(),
+            ],
+        );
         // Always issue independent lifecycle teardown before asserting launch.
         // The outer cleanup below remains mandatory on every exit path.
         let mut stop = Command::new("timeout");
@@ -3026,6 +3366,52 @@ fn docker_runtime_acceptance_is_never_silently_treated_as_covered() {
             output.status.success(),
             "real deployment failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            runtime_id.status.success() && !runtime_id_text.is_empty(),
+            "cannot resolve exact runtime container without printing secrets: {}",
+            String::from_utf8_lossy(&runtime_id.stderr)
+        );
+        assert!(
+            runtime_inspect.status.success(),
+            "cannot inspect exact runtime container: {}",
+            String::from_utf8_lossy(&runtime_inspect.stderr)
+        );
+        let runtime_inspect: JsonValue =
+            serde_json::from_slice(&runtime_inspect.stdout).expect("runtime inspect JSON");
+        let runtime_environment = runtime_inspect[0]["Config"]["Env"]
+            .as_array()
+            .expect("runtime Config.Env");
+        for sensitive in [
+            "SUMI_LOCAL_CONTROL_BEARER",
+            "SUMI_AGENT_WRAPPING_KEY",
+            "SUMI_APPROVAL_SECRET_DIGEST_KEY",
+            "SUMI_PROVIDER_API_KEY",
+        ] {
+            assert!(
+                runtime_environment.iter().all(|entry| {
+                    !entry
+                        .as_str()
+                        .is_some_and(|entry| entry.starts_with(&format!("{sensitive}=")))
+                }),
+                "{sensitive} survived in runtime Config.Env"
+            );
+        }
+        assert!(
+            runtime_environment.iter().all(|entry| {
+                !entry.as_str().is_some_and(|entry| {
+                    entry.contains("deployment-test-local-control-")
+                        || entry.contains("deployment-test-wrapping-")
+                        || entry.contains("deployment-test-approval-")
+                        || entry.contains("deployment-test-provider-")
+                })
+            }),
+            "a runtime secret value survived under another Config.Env key"
+        );
+        assert!(
+            secret_metadata.status.success(),
+            "runtime secret metadata/readability contract failed: {}",
+            String::from_utf8_lossy(&secret_metadata.stderr)
         );
     }));
     let cleanup = cleanup_owned_compose_resources(&fixture).and_then(|()| fixture.cleanup());
