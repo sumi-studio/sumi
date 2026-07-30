@@ -10,16 +10,17 @@ use std::{fmt, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use tokio::{
-    sync::watch,
-    task::{JoinError, JoinHandle},
-};
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::DeliveryEpoch;
 use super::seams::T17StoreAdapter;
 use super::session::DurableEventAdmission;
+use super::{
+    OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT, fail_stop_teardown_deadline, join_owned_runtime_task,
+    settle_finished_or_fail_stop_runtime_task,
+};
 use crate::{
     runtime::authority::RuntimeEpochAuthority,
     runtime::contracts::PersonalityAgentId,
@@ -307,7 +308,23 @@ impl OrderedPostCommitDispatcher {
 
     /// Drain the exact boundary proven by closed EventWriter admission, then
     /// invalidate this dispatcher's owner capability.
-    pub(crate) async fn shutdown(mut self, quiescence: EventWriterQuiescence) -> Result<()> {
+    pub(crate) async fn shutdown(&mut self, quiescence: EventWriterQuiescence) -> Result<()> {
+        self.shutdown_with_timeout(quiescence, OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_with_timeout(
+        &mut self,
+        quiescence: EventWriterQuiescence,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        match tokio::time::timeout(timeout, self.shutdown_inner(quiescence)).await {
+            Ok(result) => result,
+            Err(_) => fail_stop_teardown_deadline("post-commit dispatcher orderly owner", timeout),
+        }
+    }
+
+    async fn shutdown_inner(&mut self, quiescence: EventWriterQuiescence) -> Result<()> {
         let through = match self.store.validate_post_commit_quiescence(
             quiescence,
             &self.shutdown_owner,
@@ -315,7 +332,7 @@ impl OrderedPostCommitDispatcher {
         ) {
             Ok(through) => through,
             Err(validation_error) => {
-                let join_result = self.invalidate_task_and_join().await;
+                let join_result = self.invalidate_task_and_join_inner().await;
                 return combine_shutdown_failure(
                     validation_error.context("validate post-commit quiescence proof"),
                     join_result,
@@ -324,17 +341,16 @@ impl OrderedPostCommitDispatcher {
         };
         self.drain_through.send_replace(Some(through));
         if let Err(resolve_error) = self.target.resolve_pending_admission(&self.epoch).await {
-            let join_result = self.invalidate_task_and_join().await;
+            let join_result = self.invalidate_task_and_join_inner().await;
             return combine_shutdown_failure(
                 resolve_error.context("resolve pending post-commit target admission for shutdown"),
                 join_result,
             );
         }
-        let task = self
-            .task
-            .take()
-            .expect("post-commit dispatcher task is owned until shutdown");
-        let result = flatten_join(task.await).context("post-commit dispatcher shutdown");
+        let result =
+            join_owned_runtime_task(&mut self.task, "post-commit dispatcher orderly owner")
+                .await
+                .context("post-commit dispatcher shutdown");
         self.epoch.invalidate();
         result
     }
@@ -342,17 +358,28 @@ impl OrderedPostCommitDispatcher {
     /// Invalidate an unquiesced runtime epoch and retain task ownership until
     /// every in-flight target admission has resolved and the exclusive Store
     /// receiver has been released.
-    pub(crate) async fn invalidate_and_join(mut self) -> Result<()> {
-        self.invalidate_task_and_join().await
+    pub(crate) async fn invalidate_and_join(&mut self) -> Result<()> {
+        self.invalidate_and_join_with_timeout(OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
     }
 
-    async fn invalidate_task_and_join(&mut self) -> Result<()> {
+    async fn invalidate_and_join_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        match tokio::time::timeout(timeout, self.invalidate_task_and_join_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                fail_stop_teardown_deadline("post-commit dispatcher invalidation owner", timeout)
+            }
+        }
+    }
+
+    async fn invalidate_task_and_join_inner(&mut self) -> Result<()> {
         self.epoch.invalidate();
-        let task = self
-            .task
-            .take()
-            .expect("post-commit dispatcher task is owned until emergency shutdown");
-        match flatten_join(task.await) {
+        match join_owned_runtime_task(&mut self.task, "post-commit dispatcher invalidation owner")
+            .await
+        {
             Err(error) if error.is::<PostCommitRuntimeEpochInvalidated>() => Ok(()),
             result => result.context("join invalidated post-commit dispatcher"),
         }
@@ -364,11 +391,8 @@ impl Drop for OrderedPostCommitDispatcher {
         // An un-awaited owner drop cannot leave the exclusive Store receiver
         // or an in-flight T17 fence alive indefinitely.
         self.epoch.invalidate();
+        settle_finished_or_fail_stop_runtime_task(&mut self.task, "post-commit dispatcher owner");
     }
-}
-
-fn flatten_join(result: std::result::Result<Result<()>, JoinError>) -> Result<()> {
-    result.map_err(|error| anyhow!("post-commit dispatcher task failed to join: {error}"))?
 }
 
 fn combine_shutdown_failure(primary: anyhow::Error, join: Result<()>) -> Result<()> {
@@ -433,7 +457,7 @@ impl ProductionPostCommitRuntime {
                 return Err(error.context("bind T17 to exact post-commit epoch"));
             }
         };
-        let dispatcher = match OrderedPostCommitDispatcher::start_bound(
+        let mut dispatcher = match OrderedPostCommitDispatcher::start_bound(
             store.clone(),
             target.clone(),
             start_after_seq,
@@ -475,10 +499,22 @@ impl ProductionPostCommitRuntime {
 
     /// Stop every producer first, then close the shared EventWriter admission
     /// gate, settle retained COMMIT finalizers, and drain the proven boundary.
-    pub(crate) async fn shutdown_orderly(mut self) -> Result<()> {
+    pub(crate) async fn shutdown_orderly(&mut self) -> Result<()> {
+        self.shutdown_orderly_with_timeout(OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_orderly_with_timeout(&mut self, timeout: std::time::Duration) -> Result<()> {
+        match tokio::time::timeout(timeout, self.shutdown_orderly_inner()).await {
+            Ok(result) => result,
+            Err(_) => fail_stop_teardown_deadline("production post-commit orderly owner", timeout),
+        }
+    }
+
+    async fn shutdown_orderly_inner(&mut self) -> Result<()> {
         let dispatcher = self
             .dispatcher
-            .take()
+            .as_mut()
             .expect("production post-commit dispatcher is shut down once");
         let quiescence = match EventWriter::new(self.store.clone())
             .close_post_commit_admission(dispatcher.shutdown_owner())
@@ -486,7 +522,7 @@ impl ProductionPostCommitRuntime {
         {
             Ok(quiescence) => quiescence,
             Err(close_error) => {
-                let join_result = dispatcher.invalidate_and_join().await;
+                let join_result = dispatcher.invalidate_task_and_join_inner().await;
                 self.runtime_invalidated.cancel();
                 return match join_result {
                     Ok(()) => Err(close_error
@@ -498,19 +534,36 @@ impl ProductionPostCommitRuntime {
                 };
             }
         };
-        let result = dispatcher.shutdown(quiescence).await;
+        let result = dispatcher.shutdown_inner(quiescence).await;
         self.runtime_invalidated.cancel();
         result.context("drain production post-commit dispatcher")
     }
 
     /// Emergency and hydration-rollover teardown cannot mint a drain proof.
     /// Invalidate the exact capability and still retain the task until join.
-    pub(crate) async fn invalidate_and_join(mut self) -> Result<()> {
+    pub(crate) async fn invalidate_and_join(&mut self) -> Result<()> {
+        self.invalidate_and_join_with_timeout(OWNED_RUNTIME_TASK_TEARDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn invalidate_and_join_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        match tokio::time::timeout(timeout, self.invalidate_and_join_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                fail_stop_teardown_deadline("production post-commit invalidation owner", timeout)
+            }
+        }
+    }
+
+    async fn invalidate_and_join_inner(&mut self) -> Result<()> {
         self.runtime_invalidated.cancel();
         self.dispatcher
-            .take()
+            .as_mut()
             .expect("production post-commit dispatcher is joined once")
-            .invalidate_and_join()
+            .invalidate_task_and_join_inner()
             .await
     }
 }
@@ -804,6 +857,25 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct PanickingTarget;
+
+    #[async_trait]
+    impl PostCommitAdmissionTarget for PanickingTarget {
+        fn bind_post_commit_epoch(&self, _epoch: &PostCommitEpochCapability) -> Result<()> {
+            Ok(())
+        }
+
+        async fn admit_committed(
+            &self,
+            _epoch: &PostCommitEpochCapability,
+            _personality_agent_id: &PersonalityAgentId,
+            seq: u64,
+        ) -> Result<DurableEventAdmission> {
+            panic!("injected dispatcher panic at seq {seq}");
+        }
+    }
+
+    #[derive(Clone)]
     struct CapabilityTarget {
         epoch: PostCommitEpochCapability,
         calls: Arc<Mutex<Vec<u64>>>,
@@ -1000,8 +1072,11 @@ mod tests {
         }
 
         async fn finish(mut self) {
-            if let Some(dispatcher) = self.dispatcher.take() {
-                drop(dispatcher);
+            if let Some(mut dispatcher) = self.dispatcher.take() {
+                dispatcher
+                    .invalidate_and_join()
+                    .await
+                    .expect("fixture explicitly joins its post-commit dispatcher");
             }
             self.adapter.set_durable_admission_hook(None);
             self.adapter
@@ -1033,6 +1108,48 @@ mod tests {
         }
     }
 
+    fn test_production_runtime(
+        store: Arc<Store>,
+        dispatcher: OrderedPostCommitDispatcher,
+    ) -> ProductionPostCommitRuntime {
+        ProductionPostCommitRuntime {
+            store,
+            dispatcher: Some(dispatcher),
+            runtime_invalidated: CancellationToken::new(),
+        }
+    }
+
+    async fn blocked_recording_dispatcher(
+        label: &str,
+    ) -> (Arc<Store>, OrderedPostCommitDispatcher, Arc<Notify>) {
+        let store = Arc::new(Store::session_test_store(label).await.unwrap());
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let dispatcher = OrderedPostCommitDispatcher::start(
+            store.clone(),
+            RecordingTarget {
+                epoch: DeliveryEpoch::for_test(label),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                first_started: first_started.clone(),
+                release_first: release_first.clone(),
+            },
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(maintenance(label))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started.notified())
+            .await
+            .expect("dispatcher target must enter its retained admission");
+        (store, dispatcher, release_first)
+    }
+
     async fn close_writer(
         store: &Arc<Store>,
         dispatcher: &OrderedPostCommitDispatcher,
@@ -1060,7 +1177,7 @@ mod tests {
             release_first: release_first.clone(),
         };
         let cancel = CancellationToken::new();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, cancel).unwrap();
         let client = dispatcher.client();
         let writer = EventWriter::new(store.clone());
@@ -1113,7 +1230,7 @@ mod tests {
             first_started: first_started.clone(),
             release_first: release_first.clone(),
         };
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
         let writer = EventWriter::new(store.clone());
@@ -1125,17 +1242,17 @@ mod tests {
             .close_post_commit_admission(dispatcher.shutdown_owner())
             .await
             .unwrap();
-        let shutdown = tokio::spawn(dispatcher.shutdown(quiescence));
-        tokio::task::yield_now().await;
+        let mut shutdown = Box::pin(dispatcher.shutdown(quiescence));
         assert!(
-            !shutdown.is_finished(),
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown)
+                .await
+                .is_err(),
             "shutdown must not abandon a captured committed sequence"
         );
         release_first.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
             .await
             .expect("dispatcher drains promptly")
-            .expect("shutdown task")
             .expect("drained dispatcher succeeds");
         assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
 
@@ -1144,6 +1261,227 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is::<EventWriterAdmissionClosed>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatcher_shutdown_retains_task_for_emergency_join() {
+        let (store, mut dispatcher, release) =
+            blocked_recording_dispatcher("post-commit-cancelled-orderly").await;
+        let proof = close_writer(&store, &dispatcher).await;
+        let mut drain = dispatcher.drain_through.subscribe();
+        let mut shutdown = Box::pin(dispatcher.shutdown(proof));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while drain.borrow().is_none() {
+                tokio::select! {
+                    result = &mut shutdown => {
+                        panic!("orderly teardown resolved before its blocked target: {result:?}")
+                    }
+                    changed = drain.changed() => changed.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("orderly teardown must install its authenticated drain boundary");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown)
+                .await
+                .is_err(),
+            "blocked target keeps orderly teardown pending"
+        );
+        drop(shutdown);
+        assert!(
+            dispatcher.task.is_some(),
+            "cancelling orderly teardown must retain the dispatcher JoinHandle"
+        );
+
+        release.notify_one();
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("emergency teardown joins the retained dispatcher task");
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatcher_invalidation_retains_task_for_later_join() {
+        let (_store, mut dispatcher, release) =
+            blocked_recording_dispatcher("post-commit-cancelled-invalidation").await;
+        let mut invalidation = Box::pin(dispatcher.invalidate_and_join());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut invalidation,)
+                .await
+                .is_err(),
+            "blocked target keeps invalidation teardown pending"
+        );
+        drop(invalidation);
+        assert!(
+            dispatcher.task.is_some(),
+            "cancelling invalidation must retain the dispatcher JoinHandle"
+        );
+
+        release.notify_one();
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("a later invalidation joins the retained dispatcher task");
+    }
+
+    #[tokio::test]
+    async fn cancelled_production_orderly_teardown_retains_dispatcher_owner() {
+        let (store, dispatcher, release) =
+            blocked_recording_dispatcher("production-cancelled-orderly").await;
+        let mut runtime = test_production_runtime(store, dispatcher);
+        let mut drain = runtime
+            .dispatcher
+            .as_ref()
+            .expect("production runtime owns its dispatcher")
+            .drain_through
+            .subscribe();
+        let mut shutdown = Box::pin(runtime.shutdown_orderly());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while drain.borrow().is_none() {
+                tokio::select! {
+                    result = &mut shutdown => {
+                        panic!("production teardown resolved before its blocked target: {result:?}")
+                    }
+                    changed = drain.changed() => changed.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("production teardown must install its drain boundary");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown)
+                .await
+                .is_err(),
+            "blocked target keeps production orderly teardown pending"
+        );
+        drop(shutdown);
+        assert!(
+            runtime
+                .dispatcher
+                .as_ref()
+                .expect("production owner remains live")
+                .task
+                .is_some(),
+            "cancelling production teardown must retain its dispatcher JoinHandle"
+        );
+
+        release.notify_one();
+        runtime
+            .invalidate_and_join()
+            .await
+            .expect("production emergency teardown joins the retained dispatcher");
+    }
+
+    #[tokio::test]
+    async fn cancelled_production_invalidation_retains_dispatcher_owner() {
+        let (store, dispatcher, release) =
+            blocked_recording_dispatcher("production-cancelled-invalidation").await;
+        let mut runtime = test_production_runtime(store, dispatcher);
+        let mut invalidation = Box::pin(runtime.invalidate_and_join());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut invalidation,)
+                .await
+                .is_err(),
+            "blocked target keeps production invalidation pending"
+        );
+        drop(invalidation);
+        assert!(
+            runtime
+                .dispatcher
+                .as_ref()
+                .expect("production owner remains live")
+                .task
+                .is_some(),
+            "cancelling production invalidation must retain its dispatcher JoinHandle"
+        );
+
+        release.notify_one();
+        runtime
+            .invalidate_and_join()
+            .await
+            .expect("a later production invalidation joins the retained dispatcher");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for the owned post-commit deadline fail-stop"]
+    async fn hung_post_commit_drain_deadline_child() {
+        if std::env::var("SUMI_HUNG_POST_COMMIT_DEADLINE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let (store, mut dispatcher, _release) =
+            blocked_recording_dispatcher("post-commit-hung-deadline-child").await;
+        let proof = close_writer(&store, &dispatcher).await;
+        dispatcher
+            .shutdown_with_timeout(proof, std::time::Duration::from_millis(25))
+            .await
+            .expect("a hung post-commit drain must fail-stop before returning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_post_commit_drain_deadline_fail_stops_without_emergency_downgrade() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        )
+        .arg("--exact")
+        .arg("gateway::supervisor::post_commit::tests::hung_post_commit_drain_deadline_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_HUNG_POST_COMMIT_DEADLINE_CHILD", "1")
+        .output()
+        .expect("run hung post-commit deadline child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "deadline must abort instead of downgrading or detaching:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for unsettled post-commit owner Drop"]
+    async fn unsettled_post_commit_owner_drop_child() {
+        if std::env::var("SUMI_UNSETTLED_POST_COMMIT_DROP_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let (_store, dispatcher, _release) =
+            blocked_recording_dispatcher("post-commit-unsettled-drop-child").await;
+        drop(dispatcher);
+        panic!("dropping an unsettled post-commit owner must fail-stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_owner_drop_cannot_detach_an_unsettled_drain() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        )
+        .arg("--exact")
+        .arg("gateway::supervisor::post_commit::tests::unsettled_post_commit_owner_drop_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_UNSETTLED_POST_COMMIT_DROP_CHILD", "1")
+        .output()
+        .expect("run unsettled post-commit owner child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "post-commit Drop must abort instead of detaching an in-flight drain:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
@@ -1188,7 +1526,7 @@ mod tests {
             .await
             .unwrap();
 
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             store.clone(),
             adapter.clone(),
             0,
@@ -1262,7 +1600,7 @@ mod tests {
         );
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
         let hooked_writer = EventWriter::new(store.clone());
@@ -1332,7 +1670,7 @@ mod tests {
         );
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
         let writer = EventWriter::new(store.clone());
@@ -1390,7 +1728,7 @@ mod tests {
         );
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
         let writer = EventWriter::new(store.clone());
@@ -1467,7 +1805,7 @@ mod tests {
 
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
         let error = EventWriter::new(store.clone())
@@ -1509,7 +1847,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             store.clone(),
             ImmediateTarget::default(),
             0,
@@ -1543,7 +1881,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            let dispatcher = OrderedPostCommitDispatcher::start(
+            let mut dispatcher = OrderedPostCommitDispatcher::start(
                 store.clone(),
                 ImmediateTarget::default(),
                 0,
@@ -1609,7 +1947,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            drop(dispatcher);
+            let _ = dispatcher.invalidate_and_join().await;
         }
     }
 
@@ -1620,7 +1958,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             store.clone(),
             ImmediateTarget::default(),
             0,
@@ -1650,7 +1988,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let dispatcher_a = OrderedPostCommitDispatcher::start(
+        let mut dispatcher_a = OrderedPostCommitDispatcher::start(
             store.clone(),
             ImmediateTarget::default(),
             0,
@@ -1661,7 +1999,10 @@ mod tests {
             .close_post_commit_admission(dispatcher_a.shutdown_owner())
             .await
             .unwrap();
-        drop(dispatcher_a);
+        dispatcher_a
+            .invalidate_and_join()
+            .await
+            .expect("dispatcher A invalidation releases its receiver claim");
         let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if let Ok(receiver) = store.claim_post_commit_receiver() {
@@ -1674,7 +2015,7 @@ mod tests {
         .expect("dispatcher A releases its receiver claim");
         drop(receiver);
 
-        let dispatcher_b = OrderedPostCommitDispatcher::start(
+        let mut dispatcher_b = OrderedPostCommitDispatcher::start(
             store,
             ImmediateTarget::default(),
             0,
@@ -1698,7 +2039,7 @@ mod tests {
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
         let cancel = CancellationToken::new();
-        let dispatcher =
+        let mut dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, cancel.clone()).unwrap();
         cancel.cancel();
         assert_eq!(
@@ -1728,7 +2069,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             store.clone(),
             FailingTarget,
             0,
@@ -1759,6 +2100,47 @@ mod tests {
             .await
             .unwrap();
         assert!(dispatcher.shutdown(quiescence).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_panic_is_surfaced_and_joined() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-panic")
+                .await
+                .unwrap(),
+        );
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
+            store.clone(),
+            PanickingTarget,
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let writer = EventWriter::new(store.clone());
+        assert_eq!(writer.apply(maintenance("panic-1")).await.unwrap(), vec![1]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dispatcher
+                .task
+                .as_ref()
+                .expect("dispatcher task remains owned before join")
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("injected dispatcher panic must terminate its task");
+
+        let quiescence = writer
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await
+            .unwrap();
+        let error = dispatcher.shutdown(quiescence).await.unwrap_err();
+        assert!(format!("{error:#}").contains("panicked"), "{error:#}");
+        assert!(
+            dispatcher.task.is_none(),
+            "panic outcome must be transferred before task ownership clears"
+        );
     }
 
     #[tokio::test]
@@ -1797,7 +2179,7 @@ mod tests {
         );
         let target = ImmediateTarget::default();
         let calls = target.calls.clone();
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             reopened.clone(),
             target,
             0,
@@ -1827,13 +2209,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_cancels_a_pool_blocked_page_read_and_releases_the_receiver_claim() {
+    async fn invalidation_joins_a_pool_blocked_page_read_and_releases_the_receiver_claim() {
         let store = Arc::new(
             Store::session_test_store("post-commit-drop-pool-read")
                 .await
                 .unwrap(),
         );
-        let dispatcher = OrderedPostCommitDispatcher::start(
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
             store.clone(),
             ImmediateTarget::default(),
             0,
@@ -1844,7 +2226,10 @@ mod tests {
         store.publish_test_committed_event_receipt(&[1]).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        drop(dispatcher);
+        dispatcher
+            .invalidate_and_join()
+            .await
+            .expect("explicit invalidation joins the pool-blocked dispatcher");
         let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if let Ok(receiver) = store.claim_post_commit_receiver() {
@@ -1923,7 +2308,7 @@ mod tests {
             .unwrap();
         let blocker = fixture.block_delivery_at_phase().await;
 
-        let dispatcher = fixture
+        let mut dispatcher = fixture
             .dispatcher
             .take()
             .expect("orderly shutdown owns the dispatcher");
@@ -2015,7 +2400,7 @@ mod tests {
             HydrationOutcome::Complete(_)
         ));
 
-        let (runtime, adapter) = ProductionPostCommitRuntime::start(store.clone(), &authority)
+        let (mut runtime, adapter) = ProductionPostCommitRuntime::start(store.clone(), &authority)
             .await
             .unwrap();
         let adapter = adapter
@@ -2135,7 +2520,7 @@ mod tests {
         let old_target = base_adapter
             .bind_post_commit_epoch(old_epoch.clone())
             .unwrap();
-        let old = OrderedPostCommitDispatcher::start_bound(
+        let mut old = OrderedPostCommitDispatcher::start_bound(
             store.clone(),
             old_target,
             0,
@@ -2206,7 +2591,7 @@ mod tests {
         let new_target = base_adapter
             .bind_post_commit_epoch(new_epoch.clone())
             .unwrap();
-        let new = OrderedPostCommitDispatcher::start_bound(
+        let mut new = OrderedPostCommitDispatcher::start_bound(
             store.clone(),
             new_target,
             processed_through,
@@ -2289,7 +2674,7 @@ mod tests {
             "a capability issued by another Store hydration must fail before dispatcher start"
         );
         let old_calls = Arc::new(Mutex::new(Vec::new()));
-        let old = OrderedPostCommitDispatcher::start_bound(
+        let mut old = OrderedPostCommitDispatcher::start_bound(
             store.clone(),
             CapabilityTarget {
                 epoch: old_epoch.clone(),
@@ -2347,7 +2732,7 @@ mod tests {
             .issue_post_commit_epoch(new_authority, CancellationToken::new())
             .unwrap();
         let new_calls = Arc::new(Mutex::new(Vec::new()));
-        let new = OrderedPostCommitDispatcher::start_bound(
+        let mut new = OrderedPostCommitDispatcher::start_bound(
             store.clone(),
             CapabilityTarget {
                 epoch: new_epoch.clone(),

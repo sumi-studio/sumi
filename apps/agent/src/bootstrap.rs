@@ -1427,8 +1427,8 @@ fn combine_results(
 
 async fn finish_runtime(
     primary: Result<()>,
-    post_commit: ProductionPostCommitRuntime,
-    supervisor: SupervisorRuntime,
+    mut post_commit: ProductionPostCommitRuntime,
+    mut supervisor: SupervisorRuntime,
     emergency: bool,
 ) -> Result<()> {
     let post_commit_result = if emergency {

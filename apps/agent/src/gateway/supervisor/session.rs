@@ -96,8 +96,8 @@ pub struct SessionGateway {
     online: watch::Receiver<bool>,
     session_events: Option<SessionEventSink>,
     // Production construction has no lifecycle field: bootstrap retains the
-    // SupervisorRuntime. Tests keep the old writer-owned drop backstop only as
-    // an isolated compatibility fixture.
+    // SupervisorRuntime. Channel-only tests may keep an already-settled
+    // lifecycle here; live-task fixtures extract and join it explicitly.
     #[cfg(test)]
     lifecycle: Option<SupervisorLifecycle>,
 }
@@ -550,8 +550,6 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: CancellationToken::new(),
                 task: None,
-                runtime: tokio::runtime::Handle::current(),
-                fallback_reaped: None,
             },
         };
         (
@@ -1033,11 +1031,9 @@ mod tests {
             lifecycle: SupervisorLifecycle {
                 cancel: cancel.clone(),
                 task: Some(task),
-                runtime: tokio::runtime::Handle::current(),
-                fallback_reaped: None,
             },
         };
-        let (gateway, runtime) = SessionGateway::from_supervisor(handle);
+        let (gateway, mut runtime) = SessionGateway::from_supervisor(handle);
 
         let (reader, writer) = gateway.split();
         drop(reader);
@@ -1059,7 +1055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_writer_owns_supervisor_lifecycle_until_it_is_dropped() {
+    async fn split_writer_retains_supervisor_lifecycle_until_explicit_join() {
         let (mut gateway, _command_tx, _event_rx, _epochs_tx, _online_tx, _delivery) =
             make_gateway(1, 1, Some(DeliveryEpoch::for_test("session-lifecycle")));
         let cancel = CancellationToken::new();
@@ -1073,11 +1069,9 @@ mod tests {
         gateway.lifecycle = Some(SupervisorLifecycle {
             cancel: cancel.clone(),
             task: Some(task),
-            runtime: tokio::runtime::Handle::current(),
-            fallback_reaped: None,
         });
 
-        let (reader, writer) = gateway.split();
+        let (reader, mut writer) = gateway.split();
         drop(reader);
         tokio::task::yield_now().await;
         assert!(
@@ -1085,10 +1079,19 @@ mod tests {
             "reader ownership must not tear down the writer's supervisor"
         );
 
+        let mut lifecycle = writer
+            ._lifecycle
+            .take()
+            .expect("writer retains the supervisor lifecycle");
         drop(writer);
+        lifecycle.cancel.cancel();
+        lifecycle
+            .join()
+            .await
+            .expect("retained lifecycle joins explicitly");
         tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
             .await
-            .expect("dropping the writer must cancel supervisor lifecycle");
+            .expect("explicit teardown cancels supervisor lifecycle");
         tokio::time::timeout(Duration::from_secs(1), finished_rx)
             .await
             .expect("cancelled supervisor task must finish")

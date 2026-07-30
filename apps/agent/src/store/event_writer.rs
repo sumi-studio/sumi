@@ -25638,7 +25638,7 @@ mod tests {
 
         let store = test_store().await;
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher =
+        let mut dispatcher =
             crate::gateway::supervisor::post_commit::OrderedPostCommitDispatcher::start(
                 store.clone(),
                 RecordingTarget(calls.clone()),
