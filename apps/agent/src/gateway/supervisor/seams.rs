@@ -53,10 +53,12 @@ impl Drop for DurableFenceRegistration {
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct DurableAdmissionHook {
+    pub(crate) calls: Arc<AtomicU64>,
     pub(crate) reserved: Arc<Notify>,
     pub(crate) allow_registration: Arc<Notify>,
     pub(crate) registered: Arc<Notify>,
     pub(crate) allow_delivery: Arc<Notify>,
+    pub(crate) enqueued: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -380,6 +382,12 @@ impl T17StoreAdapter {
     /// Called only by T26's ordered post-commit dispatcher. EventWriter never
     /// awaits this bounded delivery path inside its database transaction.
     pub(super) async fn admit_ordered_commit(&self, seq: u64) -> Result<DurableEventAdmission> {
+        #[cfg(test)]
+        let hook = self.durable_admission_hook.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(hook) = hook.as_ref() {
+            hook.calls.fetch_add(1, Ordering::SeqCst);
+        }
         let (fence_tx, fence_rx) = oneshot::channel();
         let (reservation, epoch, key) = {
             // Reservation and fence registration are one admission operation
@@ -395,8 +403,6 @@ impl T17StoreAdapter {
             };
             let epoch = reservation.epoch();
 
-            #[cfg(test)]
-            let hook = self.durable_admission_hook.lock().unwrap().clone();
             #[cfg(test)]
             if let Some(hook) = hook.as_ref() {
                 hook.reserved.notify_one();
@@ -430,14 +436,19 @@ impl T17StoreAdapter {
         };
 
         #[cfg(test)]
-        let hook = self.durable_admission_hook.lock().unwrap().clone();
-        #[cfg(test)]
         if let Some(hook) = hook.as_ref() {
             hook.registered.notify_one();
             hook.allow_delivery.notified().await;
         }
 
-        match reservation.deliver().await {
+        let delivery = reservation.deliver().await;
+        #[cfg(test)]
+        if matches!(&delivery, Ok(DurableDeliveryOutcome::Enqueued))
+            && let Some(hook) = hook.as_ref()
+        {
+            hook.enqueued.notify_one();
+        }
+        match delivery {
             Ok(DurableDeliveryOutcome::Enqueued) => {}
             Ok(DurableDeliveryOutcome::EpochLost) => {
                 return Ok(DurableEventAdmission::Deferred {

@@ -2234,8 +2234,8 @@ mod tests {
     };
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
-        EventBatch, EventWrite, EventWriter, HydrationOutcome, Store, insert_test_durable_event,
-        user_message_id,
+        EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome, Store,
+        insert_test_durable_event, user_message_id,
     };
 
     struct TestDigestFactory;
@@ -2808,6 +2808,13 @@ mod tests {
             .bind_post_commit_dispatcher(dispatcher.client())
             .expect("bind the dispatcher proof to Session delivery");
         (bound, dispatcher)
+    }
+
+    async fn close_test_post_commit_writer(store: &Arc<Store>) -> EventWriterQuiescence {
+        EventWriter::new(store.clone())
+            .close_post_commit_admission()
+            .await
+            .expect("close the test EventWriter admission boundary")
     }
 
     fn test_maintenance_batch(kind: &str) -> EventBatch {
@@ -8067,7 +8074,10 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store).await)
+            .await
+            .unwrap();
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -8222,7 +8232,10 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store).await)
+            .await
+            .unwrap();
 
         assert!(
             serde_json::to_string(&*raw_sent.lock().unwrap())
@@ -8353,7 +8366,10 @@ mod tests {
         drop(session_writer);
         drop(session_reader);
         wait_for_t17_idle(&adapter).await;
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store).await)
+            .await
+            .unwrap();
 
         let delivered: Vec<_> = sent
             .lock()
@@ -8512,7 +8528,10 @@ mod tests {
             .expect("durable frame and ACK send");
 
         base_adapter.set_durable_admission_hook(None);
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store).await)
+            .await
+            .unwrap();
         pump_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), runtime.join())
             .await
@@ -8716,7 +8735,10 @@ mod tests {
             .expect("durable callback and ACK complete");
 
         adapter.set_durable_admission_hook(None);
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store).await)
+            .await
+            .unwrap();
         adapter
             .invalidate_delivery_epoch(replacement)
             .await
@@ -8733,7 +8755,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emergency_dispatcher_drop_removes_its_inflight_t17_fence() {
+    async fn emergency_post_commit_dispatcher_drop_preserves_inflight_t17_admission_until_outcome()
+    {
         let store = Arc::new(
             Store::session_test_store("t26-emergency-fence-cleanup")
                 .await
@@ -8745,7 +8768,7 @@ mod tests {
         let hook = seams::DurableAdmissionHook::default();
         adapter.set_durable_admission_hook(Some(hook.clone()));
         let epoch = DeliveryEpoch::for_test("emergency-fence-cleanup");
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
         let (_online_tx, online) = watch::channel(true);
         let events = EventSender {
             tx: event_tx,
@@ -8782,13 +8805,25 @@ mod tests {
         assert_eq!(adapter.durable_fence_count(), 1);
 
         drop(dispatcher);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            adapter.durable_fence_count(),
+            1,
+            "owner drop must not cancel a target that may already have enqueued"
+        );
+        hook.allow_delivery.notify_one();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("owned T17 admission reaches the external lane")
+            .expect("external lane remains open");
+        assert_eq!(outbound_frame_event_seq(&delivered.2).unwrap(), 1);
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.durable_fence_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("emergency cancellation drops the RAII fence owner");
+        .expect("completed durable outcome releases the RAII fence owner");
         assert_eq!(
             EventWriter::new(store)
                 .apply(test_maintenance_batch("writer-after-emergency"))
@@ -9168,7 +9203,8 @@ mod tests {
             .unwrap();
         let store_arc = Arc::new(store.clone());
         let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
-        let (adapter, dispatcher) = bind_test_post_commit_dispatcher(store_arc, &base_adapter, 0);
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let first_sent = Arc::new(Mutex::new(Vec::new()));
         let second_sent = Arc::new(Mutex::new(Vec::new()));
@@ -9345,7 +9381,10 @@ mod tests {
             .expect_err("test cleanup aborts the otherwise idle Session");
         assert!(error.is_cancelled());
         wait_for_t17_idle(&adapter).await;
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store_arc).await)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -9359,7 +9398,8 @@ mod tests {
         let pool = store.pool().clone();
         let store_arc = Arc::new(store.clone());
         let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
-        let (adapter, dispatcher) = bind_test_post_commit_dispatcher(store_arc, &base_adapter, 0);
+        let (adapter, dispatcher) =
+            bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let writer_blocked = Arc::new(Notify::new());
         let writer_release = Arc::new(Notify::new());
@@ -9575,7 +9615,10 @@ mod tests {
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
         wait_for_t17_idle(&adapter).await;
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_test_post_commit_writer(&store_arc).await)
+            .await
+            .unwrap();
     }
 
     #[derive(Clone)]

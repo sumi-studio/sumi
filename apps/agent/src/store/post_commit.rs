@@ -62,10 +62,10 @@ struct EpochCapabilityInner {
 /// Store hydration rollover, the owning runtime cancellation, and dispatcher
 /// teardown. It is therefore not a copyable PAID/generation value witness.
 ///
-/// This capability is process-local. Cross-process exclusion for two `Store`
-/// instances opened on the same SQLite file remains a supervisor/bootstrap
-/// obligation: the old process must stop and join before the new runtime is
-/// made Ready.
+/// This capability is Store-instance-local. Cross-Store and cross-process
+/// exclusion for two `Store` instances opened on the same SQLite file remains
+/// a supervisor/bootstrap obligation tracked by #104: the old process must
+/// stop and join before the new runtime is made Ready.
 #[derive(Clone, Debug)]
 pub(crate) struct PostCommitEpochCapability {
     inner: Arc<EpochCapabilityInner>,
@@ -159,6 +159,13 @@ impl PostCommitEpochCapability {
     pub(crate) fn invalidate(&self) {
         self.inner.owner_invalidated.cancel();
     }
+}
+
+/// Unforgeable proof that EventWriter admission is closed and every admitted
+/// commit finalizer has completed publication through `through`.
+pub(crate) struct EventWriterQuiescence {
+    feed: PostCommitFeed,
+    through: u64,
 }
 
 #[derive(Debug)]
@@ -366,6 +373,44 @@ impl PostCommitFeed {
         Ok(())
     }
 
+    pub(super) fn reconcile_and_quiesce(&self, durable_head: u64) -> Result<EventWriterQuiescence> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reason) = state.invariant_failure.as_ref() {
+            bail!("post-commit feed is failed: {reason}");
+        }
+        if durable_head < state.published_through {
+            bail!(
+                "durable event head {durable_head} is behind post-commit publication {}",
+                state.published_through
+            );
+        }
+        state.published_through = durable_head;
+        drop(state);
+        self.inner.changed.notify_waiters();
+        Ok(EventWriterQuiescence {
+            feed: self.clone(),
+            through: durable_head,
+        })
+    }
+
+    pub(super) fn validate_quiescence(&self, proof: EventWriterQuiescence) -> Result<u64> {
+        if !Arc::ptr_eq(&self.inner, &proof.feed.inner) {
+            bail!("EventWriter quiescence proof belongs to another Store instance");
+        }
+        let published = self.snapshot()?;
+        if published != proof.through {
+            bail!(
+                "EventWriter quiescence proof through {} does not match feed high-water {published}",
+                proof.through
+            );
+        }
+        Ok(proof.through)
+    }
+
     fn snapshot(&self) -> Result<u64> {
         let state = self
             .inner
@@ -451,5 +496,20 @@ mod tests {
         assert!(feed.claim().is_err());
         drop(receiver);
         assert!(feed.claim().is_ok());
+    }
+
+    #[test]
+    fn quiescence_proof_is_bound_to_one_exact_feed_high_water() {
+        let feed = PostCommitFeed::new(4);
+        let other = PostCommitFeed::new(4);
+        let wrong_store = feed.reconcile_and_quiesce(4).unwrap();
+        assert!(other.validate_quiescence(wrong_store).is_err());
+
+        let stale_boundary = feed.reconcile_and_quiesce(4).unwrap();
+        feed.publish_exact(&[5]);
+        assert!(feed.validate_quiescence(stale_boundary).is_err());
+
+        let exact = feed.reconcile_and_quiesce(5).unwrap();
+        assert_eq!(feed.validate_quiescence(exact).unwrap(), 5);
     }
 }

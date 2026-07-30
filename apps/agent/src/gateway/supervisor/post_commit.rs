@@ -22,7 +22,7 @@ use super::DeliveryEpoch;
 use super::session::DurableEventAdmission;
 use crate::{
     runtime::contracts::PersonalityAgentId,
-    store::{PostCommitEpochCapability, PostCommitReceiver, Store},
+    store::{EventWriterQuiescence, PostCommitEpochCapability, PostCommitReceiver, Store},
 };
 
 const DEFAULT_DISPATCH_PAGE_SIZE: usize = 64;
@@ -255,14 +255,10 @@ impl OrderedPostCommitDispatcher {
         self.client.clone()
     }
 
-    /// Stop after admitting every event committed before the drain capture.
-    ///
-    /// The caller must quiesce every EventWriter producer first. Capture takes
-    /// EventWriter's gate, so a transaction already committed cannot remain
-    /// unpublished on the other side of this boundary. Drop remains the
-    /// emergency cancellation path.
-    pub(crate) async fn shutdown(mut self) -> Result<()> {
-        let through = self.store.capture_post_commit_drain_through().await?;
+    /// Drain the exact boundary proven by closed EventWriter admission, then
+    /// invalidate this dispatcher's owner capability.
+    pub(crate) async fn shutdown(mut self, quiescence: EventWriterQuiescence) -> Result<()> {
+        let through = self.store.validate_post_commit_quiescence(quiescence)?;
         self.drain_through.send_replace(Some(through));
         let task = self
             .task
@@ -388,24 +384,25 @@ async fn run_dispatcher(
                         })?
                     }
                 };
-                let admission = tokio::select! {
-                    biased;
-                    _ = epoch.cancelled() => {
-                        return Err(cancellation_failure(&progress, processed_through));
-                    }
-                    result = target.admit_committed(&epoch, &personality_agent_id, seq) => {
-                        result.inspect_err(|error| {
-                            publish_failure(&progress, processed_through, error);
-                        })?
-                    }
-                };
-                drop(admission_guard);
+                // Admission is now owned. Rollover invalidates the capability
+                // and waits on this guard, so dropping the target future here
+                // could duplicate an already-enqueued durable frame in the
+                // replacement epoch. Await its bounded outcome before release.
+                let admission = target
+                    .admit_committed(&epoch, &personality_agent_id, seq)
+                    .await
+                    .inspect_err(|error| {
+                        publish_failure(&progress, processed_through, error);
+                    })?;
                 cumulative_admission = combine_admission(cumulative_admission, admission);
                 processed_through = seq;
                 progress.send_replace(DispatchState::Running {
                     processed_through,
                     admission: cumulative_admission,
                 });
+                // Hydration rollover can proceed only after both the target's
+                // durable outcome and this dispatcher cursor are visible.
+                drop(admission_guard);
             }
         }
     }
@@ -465,13 +462,20 @@ fn combine_admission(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::Ordering};
 
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, mpsc, watch};
 
     use super::*;
     use crate::{
-        gateway::test_personality_agent_id,
+        gateway::{
+            Envelope, OutboundFrame,
+            supervisor::{
+                DeliveryAuthorization, DurableSource, EventSender,
+                seams::{DurableAdmissionHook, T17StoreAdapter},
+            },
+            test_personality_agent_id,
+        },
         runtime::{
             authority::RuntimeEpochAuthority,
             contracts::{
@@ -479,8 +483,8 @@ mod tests {
             },
         },
         store::{
-            DurableEvent, EventBatch, EventWrite, EventWriter, HydrationOutcome,
-            PostCommitPublishHook,
+            DurableEvent, EventBatch, EventWrite, EventWriter, EventWriterAdmissionClosed,
+            HydrationOutcome, PostCommitPublishHook,
         },
     };
 
@@ -591,6 +595,13 @@ mod tests {
         }
     }
 
+    async fn close_writer(store: &Arc<Store>) -> EventWriterQuiescence {
+        EventWriter::new(store.clone())
+            .close_post_commit_admission()
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn held_n_fences_n_plus_one_without_blocking_the_event_writer_gate() {
         let store = Arc::new(
@@ -641,11 +652,14 @@ mod tests {
             }
         );
         assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_writer(&store).await)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn orderly_shutdown_drains_the_captured_published_high_water() {
+    async fn orderly_shutdown_drains_the_quiesced_published_high_water() {
         let store = Arc::new(
             Store::session_test_store("post-commit-drain")
                 .await
@@ -668,7 +682,8 @@ mod tests {
         first_started.notified().await;
         assert_eq!(writer.apply(maintenance("drain-2")).await.unwrap(), vec![2]);
 
-        let shutdown = tokio::spawn(dispatcher.shutdown());
+        let quiescence = writer.close_post_commit_admission().await.unwrap();
+        let shutdown = tokio::spawn(dispatcher.shutdown(quiescence));
         tokio::task::yield_now().await;
         assert!(
             !shutdown.is_finished(),
@@ -682,31 +697,15 @@ mod tests {
             .expect("drained dispatcher succeeds");
         assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
 
-        // The receiver claim is released only after the drain. A later
-        // runtime can own commits made after that boundary.
-        let next_target = ImmediateTarget::default();
-        let next_calls = next_target.calls.clone();
-        let next = OrderedPostCommitDispatcher::start(
-            store.clone(),
-            next_target,
-            2,
-            CancellationToken::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            writer.apply(maintenance("next-runtime")).await.unwrap(),
-            vec![3]
-        );
-        next.client()
-            .admission_for(&store.scope().personality_agent_id, 3)
+        let error = writer
+            .apply(maintenance("closed-runtime"))
             .await
-            .unwrap();
-        assert_eq!(*next_calls.lock().unwrap(), vec![3]);
-        next.shutdown().await.unwrap();
+            .unwrap_err();
+        assert!(error.is::<EventWriterAdmissionClosed>(), "{error:#}");
     }
 
     #[tokio::test]
-    async fn shutdown_capture_waits_for_commit_to_publish_barrier() {
+    async fn cancelled_caller_after_commit_still_publishes_and_reconstructs_checkpoint() {
         let store = Arc::new(
             Store::session_test_store("post-commit-publication-barrier")
                 .await
@@ -717,28 +716,91 @@ mod tests {
         let dispatcher =
             OrderedPostCommitDispatcher::start(store.clone(), target, 0, CancellationToken::new())
                 .unwrap();
-        let writer = EventWriter::new(store.clone());
+        let hooked_writer = EventWriter::new(store.clone());
         let hook = PostCommitPublishHook::default();
-        writer
+        hooked_writer
             .set_post_commit_publish_hook(Some(hook.clone()))
             .await;
-        let write =
-            tokio::spawn(
-                async move { writer.apply(maintenance("commit-before-publication")).await },
-            );
+        let write = tokio::spawn(async move {
+            hooked_writer
+                .apply(maintenance("commit-before-publication"))
+                .await
+        });
         hook.committed.notified().await;
 
-        let shutdown = tokio::spawn(dispatcher.shutdown());
+        let durable_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(durable_rows, 1, "the cancellation point is after COMMIT");
+        write.abort();
+        assert!(write.await.unwrap_err().is_cancelled());
+
+        let next_store = store.clone();
+        let next_write = tokio::spawn(async move {
+            EventWriter::new(next_store)
+                .apply(maintenance("after-cancelled-commit"))
+                .await
+        });
+        let gate_observer = EventWriter::new(store.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !gate_observer.test_writer_gate_is_locked() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the next writer owns admission while waiting for the detached finalizer");
+        assert!(
+            !next_write.is_finished(),
+            "the next same-Store write must wait for the detached finalizer"
+        );
+        let close_store = store.clone();
+        let close = tokio::spawn(async move {
+            EventWriter::new(close_store)
+                .close_post_commit_admission()
+                .await
+        });
         tokio::task::yield_now().await;
         assert!(
-            !shutdown.is_finished(),
-            "drain capture must serialize behind COMMIT-to-publication"
+            !close.is_finished(),
+            "admission close must wait for the admitted cancellation-independent finalizer"
         );
 
         hook.allow_publication.notify_one();
-        assert_eq!(write.await.unwrap().unwrap(), vec![1]);
-        shutdown.await.unwrap().unwrap();
-        assert_eq!(*calls.lock().unwrap(), vec![1]);
+        assert_eq!(next_write.await.unwrap().unwrap(), vec![2]);
+        let quiescence = close.await.unwrap().unwrap();
+        dispatcher.shutdown(quiescence).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn writer_started_after_admission_close_cannot_commit() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-closed-writer")
+                .await
+                .unwrap(),
+        );
+        let dispatcher = OrderedPostCommitDispatcher::start(
+            store.clone(),
+            ImmediateTarget::default(),
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let writer = EventWriter::new(store.clone());
+        let quiescence = writer.close_post_commit_admission().await.unwrap();
+
+        let error = writer
+            .apply(maintenance("must-not-commit"))
+            .await
+            .unwrap_err();
+        assert!(error.is::<EventWriterAdmissionClosed>(), "{error:#}");
+        let durable_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(durable_rows, 0);
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[tokio::test]
@@ -762,7 +824,10 @@ mod tests {
             vec![1]
         );
 
-        let error = dispatcher.shutdown().await.unwrap_err();
+        let error = dispatcher
+            .shutdown(close_writer(&store).await)
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("before orderly drain completed"),
             "{error:#}"
@@ -806,7 +871,12 @@ mod tests {
             vec![2],
             "post-COMMIT dispatcher failure cannot retain EventWriter's gate"
         );
-        assert!(dispatcher.shutdown().await.is_err());
+        assert!(
+            dispatcher
+                .shutdown(writer.close_post_commit_admission().await.unwrap())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -865,7 +935,10 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
 
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(close_writer(&reopened).await)
+            .await
+            .unwrap();
         reopened.pool().close().await;
         drop(reopened);
         tokio::fs::remove_dir_all(root)
@@ -934,6 +1007,189 @@ mod tests {
             lease,
             fence,
         )
+    }
+
+    #[tokio::test]
+    async fn hydration_rollover_waits_for_enqueued_t17_fence_and_publishes_progress_once() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-enqueued-rollover")
+                .await
+                .unwrap(),
+        );
+        let paid = store.scope().personality_agent_id.clone();
+        let (old_authority, old_lease, old_fence) = runtime_authority(&paid, 17, "enqueued-old");
+        assert!(matches!(
+            store.hydrate(&old_lease, &old_fence).await.unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+        let old_epoch = store
+            .issue_post_commit_epoch(old_authority, CancellationToken::new())
+            .unwrap();
+
+        let base_adapter = T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = DurableAdmissionHook::default();
+        base_adapter.set_durable_admission_hook(Some(hook.clone()));
+        let delivery_epoch = DeliveryEpoch::for_test("enqueued-rollover-delivery");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let pump_cancel = CancellationToken::new();
+        let delivery_runtime = base_adapter
+            .install_delivery_epoch(delivery_epoch, 0, events.clone(), pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("install the real T17 delivery forwarder");
+
+        // Fill T24's bounded lane. T17 can enqueue seq 1 into its DeliveryPump,
+        // but its forwarder cannot complete the durable fence until this
+        // blocker is consumed.
+        events
+            .send((
+                delivery_epoch,
+                OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: None,
+                        personality_agent_id: paid.clone(),
+                        event: serde_json::json!({"type": "error", "message": "lane blocker"}),
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+
+        let old_target = base_adapter
+            .bind_post_commit_epoch(old_epoch.clone())
+            .unwrap();
+        let old = OrderedPostCommitDispatcher::start_bound(
+            store.clone(),
+            old_target,
+            0,
+            old_epoch.clone(),
+        )
+        .unwrap();
+        let old_client = old.client();
+        let writer = EventWriter::new(store.clone());
+        assert_eq!(
+            writer
+                .apply(maintenance("enqueued-before-rollover"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("T17 reserves seq 1");
+        hook.allow_registration.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            hook.registered.notified(),
+        )
+        .await
+        .expect("T17 registers the seq 1 forwarder fence");
+        hook.allow_delivery.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), hook.enqueued.notified())
+            .await
+            .expect("seq 1 is enqueued before its forwarder fence completes");
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+
+        let (new_authority, new_lease, new_fence) = runtime_authority(&paid, 18, "enqueued-new");
+        let rollover = {
+            let store = store.clone();
+            tokio::spawn(async move { store.hydrate(&new_lease, &new_fence).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), old_epoch.cancelled())
+            .await
+            .expect("rollover invalidates the old capability");
+        assert!(
+            !rollover.is_finished(),
+            "rollover must wait for the already-enqueued T17 outcome"
+        );
+        assert!(matches!(
+            &*old_client.progress.borrow(),
+            DispatchState::Running {
+                processed_through: 0,
+                ..
+            }
+        ));
+
+        let blocker = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("release T24 lane backpressure")
+            .expect("T24 lane remains open");
+        assert!(matches!(
+            blocker.2,
+            OutboundFrame::Event {
+                envelope: Envelope { seq: None, .. }
+            }
+        ));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("the real T17 forwarder admits seq 1")
+            .expect("T24 lane remains open");
+        assert!(matches!(
+            delivered.2,
+            OutboundFrame::Event {
+                envelope: Envelope { seq: Some(1), .. }
+            }
+        ));
+        assert!(matches!(
+            rollover.await.unwrap().unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+
+        let processed_through = match &*old_client.progress.borrow() {
+            DispatchState::Running {
+                processed_through, ..
+            }
+            | DispatchState::Failed {
+                processed_through, ..
+            }
+            | DispatchState::Stopped { processed_through } => *processed_through,
+        };
+        assert_eq!(
+            processed_through, 1,
+            "the old cursor must publish before rollover acquires the guard"
+        );
+        assert!(old.shutdown(close_writer(&store).await).await.is_err());
+
+        let new_epoch = store
+            .issue_post_commit_epoch(new_authority, CancellationToken::new())
+            .unwrap();
+        let new_target = base_adapter
+            .bind_post_commit_epoch(new_epoch.clone())
+            .unwrap();
+        let new = OrderedPostCommitDispatcher::start_bound(
+            store.clone(),
+            new_target,
+            processed_through,
+            new_epoch,
+        )
+        .unwrap();
+        new.shutdown(close_writer(&store).await).await.unwrap();
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            1,
+            "replacement epoch must not invoke T17 again for seq 1"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "replacement epoch must not emit a duplicate external frame"
+        );
+
+        base_adapter
+            .invalidate_delivery_epoch(delivery_epoch)
+            .await
+            .unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery_runtime.join())
+            .await
+            .expect("T17 forwarder terminates")
+            .expect("T17 forwarder joins");
     }
 
     #[tokio::test]
@@ -1030,7 +1286,7 @@ mod tests {
             vec![1]
         );
         assert!(old.client().admission_for(&paid, 1).await.is_err());
-        assert!(old.shutdown().await.is_err());
+        assert!(old.shutdown(close_writer(&store).await).await.is_err());
         assert!(old_calls.lock().unwrap().is_empty());
 
         let new_epoch = store
@@ -1049,7 +1305,7 @@ mod tests {
         .unwrap();
         new.client().admission_for(&paid, 1).await.unwrap();
         assert_eq!(*new_calls.lock().unwrap(), vec![1]);
-        new.shutdown().await.unwrap();
+        new.shutdown(close_writer(&store).await).await.unwrap();
     }
 
     #[test]

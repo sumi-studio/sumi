@@ -48,9 +48,9 @@ use crate::{
 };
 
 use super::{
-    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
-    InjectionBatchSizeInput, InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store,
-    command_payload_digest,
+    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer,
+    EventWriterQuiescence, InjectionApplication, InjectionBatchSizeInput,
+    InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store, command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
@@ -1654,12 +1654,27 @@ impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
     }
 }
 
-#[derive(Default)]
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
+    admission_open: bool,
     #[cfg(test)]
     post_commit_publish_hook: Option<PostCommitPublishHook>,
 }
+
+impl Default for WriterState {
+    fn default() -> Self {
+        Self {
+            checkpoint: None,
+            admission_open: true,
+            #[cfg(test)]
+            post_commit_publish_hook: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("EventWriter mutation admission is closed")]
+pub(crate) struct EventWriterAdmissionClosed;
 
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -1771,9 +1786,28 @@ impl EventWriter {
         Self { store, gate }
     }
 
+    /// Permanently close mutation admission for this Store runtime and return
+    /// a typed proof only after every admitted COMMIT finalizer has published.
+    ///
+    /// Bootstrap teardown order is: stop and join command, Session,
+    /// maintenance, and recovery producers; call this method; pass the proof
+    /// to `OrderedPostCommitDispatcher::shutdown`; then invalidate and join
+    /// the T17 delivery/runtime epoch.
+    pub(crate) async fn close_post_commit_admission(&self) -> Result<EventWriterQuiescence> {
+        let mut state = self.gate.lock().await;
+        state.admission_open = false;
+        let _finalizers = self.store.event_writer_finalizer().lock_owned().await;
+        self.store.reconcile_post_commit_quiescence().await
+    }
+
     #[cfg(test)]
     pub(crate) async fn set_post_commit_publish_hook(&self, hook: Option<PostCommitPublishHook>) {
         self.gate.lock().await.post_commit_publish_hook = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_writer_gate_is_locked(&self) -> bool {
+        self.gate.try_lock().is_err()
     }
 
     /// Build the fixed Invalidate target set for an authenticated Error
@@ -2710,6 +2744,13 @@ impl EventWriter {
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<ApplyBatchOutcome> {
+        if !state.admission_open {
+            return Err(EventWriterAdmissionClosed.into());
+        }
+        // A detached COMMIT finalizer from a cancelled caller owns this gate
+        // through checkpoint-independent feed publication. No subsequent
+        // mutation or close reconciliation can race that unknown outcome.
+        let commit_finalizer = self.store.event_writer_finalizer().lock_owned().await;
         self.ensure_checkpoint(state).await?;
         for command in &batch.injected_commands {
             command
@@ -3003,30 +3044,49 @@ impl EventWriter {
         if let Some((name, false, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "before_commit", readiness_path);
         }
-        transaction
-            .commit()
-            .await
-            .context("failed to commit EventBatch")?;
-        state.checkpoint = Some(LifecycleCheckpoint {
+        let next_checkpoint = LifecycleCheckpoint {
             event_head: updated_event_head,
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
             memory_projections: updated_memory_projections,
             historical_rows_visited: checkpoint.historical_rows_visited,
-        });
-        if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
-            abrupt_transaction_exit(name, "after_commit", readiness_path);
-        }
+        };
+        // From this point the database outcome is intentionally unknown to
+        // WriterState until the finalizer joins. If the caller is cancelled,
+        // the detached finalizer still owns `commit_finalizer`, commits, and
+        // publishes; the next writer reconstructs its checkpoint afterwards.
+        state.checkpoint = None;
         #[cfg(test)]
-        if let Some(hook) = state.post_commit_publish_hook.take() {
-            hook.committed.notify_one();
-            hook.allow_publication.notified().await;
-        }
-        // COMMIT is the durability boundary. Publication is an O(1) wake
-        // high-water over the canonical `agent_events` FIFO and never awaits
-        // T17/T24 while this writer gate is held. Keeping the abrupt
-        // after-commit failpoint above this line exercises crash recovery when
-        // the durable row exists but no in-memory wake was emitted.
-        self.store.publish_committed_event_seqs(&event_seqs);
+        let publish_hook = state.post_commit_publish_hook.take();
+        #[cfg(all(test, unix))]
+        let after_commit_failpoint = effective_abrupt_failpoint
+            .filter(|(_, after_commit, _)| *after_commit)
+            .map(|(name, _, path)| (name.to_owned(), path.to_path_buf()));
+        let finalizer_store = self.store.clone();
+        let finalizer_event_seqs = event_seqs.clone();
+        let finalizer = tokio::spawn(async move {
+            let _commit_finalizer = commit_finalizer;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit EventBatch")?;
+            #[cfg(all(test, unix))]
+            if let Some((name, readiness_path)) = after_commit_failpoint {
+                abrupt_transaction_exit(&name, "after_commit", &readiness_path);
+            }
+            #[cfg(test)]
+            if let Some(hook) = publish_hook {
+                hook.committed.notify_one();
+                hook.allow_publication.notified().await;
+            }
+            // COMMIT is the durability boundary. Publication is an O(1) wake
+            // high-water over the canonical durable FIFO.
+            finalizer_store.publish_committed_event_seqs(&finalizer_event_seqs);
+            Ok::<(), anyhow::Error>(())
+        });
+        finalizer
+            .await
+            .map_err(|error| anyhow!("EventWriter COMMIT finalizer failed to join: {error}"))??;
+        state.checkpoint = Some(next_checkpoint);
         Ok(ApplyBatchOutcome {
             seqs: event_seqs,
             receipt_outcome,
@@ -25321,7 +25381,15 @@ mod tests {
             (1..=final_seq).collect::<Vec<_>>(),
             "every producer must enter the one exact durable FIFO"
         );
-        dispatcher.shutdown().await.unwrap();
+        dispatcher
+            .shutdown(
+                EventWriter::new(store.clone())
+                    .close_post_commit_admission()
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]

@@ -72,7 +72,9 @@ pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
-pub(crate) use self::post_commit::{PostCommitEpochCapability, PostCommitReceiver};
+pub(crate) use self::post_commit::{
+    EventWriterQuiescence, PostCommitEpochCapability, PostCommitReceiver,
+};
 #[cfg(test)]
 pub(crate) use self::provider_context::{
     EncryptedProviderContextRecord, provider_context_record_id,
@@ -96,10 +98,11 @@ pub(crate) use crypto::{
 )]
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, ApprovalRuleMutation, BootstrapRecoveryGuard, DurableEvent,
-    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt,
-    InboundReceiptOrigin, InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation,
-    MemoryJobMutation, MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter,
-    RecoveryRequired, RunPhase, ToolExecutionMutation, user_message_id,
+    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, EventWriterAdmissionClosed,
+    InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
+    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
+    MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -412,6 +415,7 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
+    event_writer_finalizer: Arc<Mutex<()>>,
     post_commit_feed: post_commit::PostCommitFeed,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
@@ -579,6 +583,7 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
+            event_writer_finalizer: Arc::new(Mutex::new(())),
             post_commit_feed: post_commit::PostCommitFeed::new(0),
             #[cfg(test)]
             _in_memory_anchor: None,
@@ -2091,6 +2096,10 @@ impl Store {
         self.event_writer_state.clone()
     }
 
+    fn event_writer_finalizer(&self) -> Arc<Mutex<()>> {
+        self.event_writer_finalizer.clone()
+    }
+
     pub(crate) fn claim_post_commit_receiver(&self) -> Result<post_commit::PostCommitReceiver> {
         self.post_commit_feed.claim()
     }
@@ -2121,16 +2130,18 @@ impl Store {
         self.post_commit_feed.validate_epoch_capability(capability)
     }
 
-    /// Capture an orderly drain boundary under EventWriter's single-writer
-    /// gate. Every transaction committed before this lock acquisition has
-    /// therefore completed its post-COMMIT feed publication.
-    ///
-    /// The runtime must quiesce all EventWriter producers before calling this
-    /// boundary. Commits started after capture are intentionally not owned by
-    /// the draining dispatcher.
-    pub(crate) async fn capture_post_commit_drain_through(&self) -> Result<u64> {
-        let _writer = self.event_writer_state.lock().await;
-        self.post_commit_feed.published_through()
+    async fn reconcile_post_commit_quiescence(&self) -> Result<EventWriterQuiescence> {
+        let durable_head = current_event_head_seq(&self.pool)
+            .await
+            .context("failed to reconcile durable event head during EventWriter close")?;
+        self.post_commit_feed.reconcile_and_quiesce(durable_head)
+    }
+
+    pub(crate) fn validate_post_commit_quiescence(
+        &self,
+        proof: EventWriterQuiescence,
+    ) -> Result<u64> {
+        self.post_commit_feed.validate_quiescence(proof)
     }
 
     fn publish_committed_event_seqs(&self, seqs: &[u64]) {
