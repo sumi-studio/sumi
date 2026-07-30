@@ -412,7 +412,43 @@ impl PostCommitFeed {
         Ok(())
     }
 
-    pub(super) fn reconcile_authenticated(&self, durable_head: u64) -> Result<()> {
+    /// Advance a clean feed to the head established by the first authenticated
+    /// EventWriter checkpoint.
+    ///
+    /// This is not recovery authority: a prior publication invariant failure
+    /// remains terminal. Existing receivers are notified so they scan every
+    /// newly authenticated row from their own processed cursor.
+    pub(super) fn sync_authenticated_checkpoint(&self, durable_head: u64) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reason) = state.invariant_failure.as_ref() {
+            bail!("post-commit feed is failed: {reason}");
+        }
+        if durable_head < state.published_through {
+            bail!(
+                "durable event head {durable_head} is behind post-commit publication {}",
+                state.published_through
+            );
+        }
+        let advanced = durable_head > state.published_through;
+        state.published_through = durable_head;
+        drop(state);
+        if advanced {
+            self.inner.changed.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// Reconcile a Store-owned COMMIT finalizer whose durable outcome was
+    /// authenticated after its in-memory publication outcome became unknown.
+    ///
+    /// Only an authenticated durable advance can heal a publication failure.
+    /// An equal head cannot explain a duplicate, stale, or otherwise invalid
+    /// receipt, so that failure remains terminal.
+    pub(super) fn recover_authenticated_finalizer(&self, durable_head: u64) -> Result<()> {
         let mut state = self
             .inner
             .state
@@ -424,10 +460,20 @@ impl PostCommitFeed {
                 state.published_through
             );
         }
+        if durable_head == state.published_through
+            && let Some(reason) = state.invariant_failure.as_ref()
+        {
+            bail!(
+                "authenticated durable head {durable_head} did not advance failed post-commit feed: {reason}"
+            );
+        }
+        let advanced = durable_head > state.published_through;
         state.published_through = durable_head;
         state.invariant_failure = None;
         drop(state);
-        self.inner.changed.notify_waiters();
+        if advanced {
+            self.inner.changed.notify_waiters();
+        }
         Ok(())
     }
 
@@ -588,8 +634,25 @@ mod tests {
     fn a_gap_fails_the_feed_without_rewriting_durable_state() {
         let feed = PostCommitFeed::new(4);
         feed.publish_exact(&[6]).unwrap_err();
+        let sync_error = feed.sync_authenticated_checkpoint(4).unwrap_err();
+        assert!(format!("{sync_error:#}").contains("post-commit feed is failed"));
         let error = feed.published_through().unwrap_err();
         assert!(format!("{error:#}").contains("not the exact next durable sequence range"));
+    }
+
+    #[test]
+    fn finalizer_recovery_requires_an_authenticated_durable_advance_to_heal_a_failure() {
+        let feed = PostCommitFeed::new(4);
+        feed.publish_exact(&[6]).unwrap_err();
+        let error = feed.recover_authenticated_finalizer(4).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not advance failed post-commit feed"),
+            "{error:#}"
+        );
+        assert!(feed.published_through().is_err());
+
+        feed.recover_authenticated_finalizer(6).unwrap();
+        assert_eq!(feed.published_through().unwrap(), 6);
     }
 
     #[test]
