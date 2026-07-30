@@ -1,6 +1,7 @@
 mod agent;
 mod apiclient;
 mod approval;
+mod bootstrap;
 mod config;
 mod gateway;
 mod memory;
@@ -12,7 +13,7 @@ mod tools;
 
 use std::{env, io, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use gateway::stdio::{InvalidCommand, StdioGateway};
 use gateway::{
     CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
@@ -36,8 +37,28 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(
     agent::run_canonical_live_responses_roundtrip(spec, api_key).await;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut arguments = env::args();
+    let _program = arguments.next();
+    let mode = arguments.next();
+    if arguments.next().is_some() {
+        anyhow::bail!("sumi-agent accepts at most one mode argument");
+    }
+    if mode.as_deref() == Some("--supervisor-allocate") {
+        let config = runtime::supervisor_allocator::SupervisorAllocatorConfig::from_process_env()?;
+        let metadata = runtime::supervisor_allocator::allocate(&config)?;
+        println!("{}", serde_json::to_string(&metadata)?);
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to construct Tokio runtime")?;
+    runtime.block_on(async_main(mode))
+}
+
+async fn async_main(mode: Option<String>) -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_writer(io::stderr)
@@ -46,7 +67,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sumi_agent=info")),
         )
         .init();
-    match env::args().nth(1).as_deref() {
+    match mode.as_deref() {
         Some("--tool-executor") => {
             tracing::warn!(
                 service = "tool-executor",
@@ -63,7 +84,15 @@ async fn main() -> Result<()> {
             );
             return tools::executor::run_artifact_broker_mode().await;
         }
-        _ => {}
+        Some("--low-trust") => {
+            tracing::warn!(
+                service = "agent",
+                trust = "low-trust-stdio",
+                "starting explicit stdio mode"
+            );
+        }
+        Some(other) => anyhow::bail!("unknown sumi-agent mode {other}"),
+        None => return bootstrap::run_production().await,
     }
     let config = config::Config::load().await?;
 

@@ -6,11 +6,7 @@
 //! `WebSocketGateway` performs the agent/API hello exchange and then splits into
 //! a `WsGatewayReader` / `WsGatewayWriter` pair for the epoch.
 
-// TODO(T26): Remove this once `WebSocketConnector`/`WsGatewayReader`/`WsGatewayWriter`
-// are wired into the process bootstrap. The whole module is dead-code until then.
-#![allow(dead_code, reason = "T26 production wiring not yet connected")]
-
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -36,8 +32,8 @@ use super::{
 };
 
 /// Outbound connector for `wss://` (production). `ws://` is only allowed when
-/// constructed with [`WebSocketConnector::new_insecure`], which is exposed for
-/// test fixtures that spin a local plaintext server.
+/// constructed with [`WebSocketConnector::new_loopback_insecure`], which is an
+/// explicit production-like local/CI mode restricted to literal loopback IPs.
 pub struct WebSocketConnector {
     url: String,
     digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
@@ -57,17 +53,37 @@ impl WebSocketConnector {
         }
     }
 
-    /// Create a test-only connector that permits `ws://`.
+    /// Create an explicit production-like local/CI connector.
+    ///
+    /// The URL must use `ws://` and a literal `127.0.0.0/8` or `::1` host.
+    /// Hostnames (including `localhost`) and non-loopback IPs are rejected
+    /// before any bearer credential can be added to a request.
+    pub fn new_loopback_insecure(
+        url: impl Into<String>,
+        digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    ) -> Result<Self> {
+        let url = url.into();
+        validate_loopback_insecure_url(&url)?;
+        Ok(Self {
+            url,
+            digest_factory,
+            allow_insecure: true,
+        })
+    }
+
+    /// Compatibility helper for unit fixtures. Production-like local callers
+    /// use the fallible constructor above and must handle invalid URLs.
     #[cfg(test)]
     pub fn new_insecure(
         url: impl Into<String>,
         digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
     ) -> Self {
-        Self {
-            url: url.into(),
-            digest_factory,
-            allow_insecure: true,
-        }
+        Self::new_loopback_insecure(url, digest_factory)
+            .expect("test insecure WebSocket URL must be literal loopback")
+    }
+
+    pub(crate) fn validate_configuration(&self) -> Result<()> {
+        validate_connector_url(&self.url, self.allow_insecure)
     }
 }
 
@@ -88,24 +104,8 @@ impl GatewayConnector for WebSocketConnector {
         &mut self,
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
-        let (scheme, _rest) = self.url.split_once("://").ok_or_else(|| {
-            ConnectorError::InvalidConfiguration(anyhow!("websocket url is missing a scheme"))
-        })?;
-        let scheme_lower = scheme.to_ascii_lowercase();
-        match scheme_lower.as_str() {
-            "wss" => {}
-            "ws" if self.allow_insecure => {}
-            "ws" => {
-                return Err(ConnectorError::InvalidConfiguration(anyhow!(
-                    "refusing to send bearer credential over insecure ws://"
-                )));
-            }
-            _ => {
-                return Err(ConnectorError::InvalidConfiguration(anyhow!(
-                    "unsupported websocket scheme: {scheme}"
-                )));
-            }
-        }
+        validate_connector_url(&self.url, self.allow_insecure)
+            .map_err(ConnectorError::InvalidConfiguration)?;
 
         let mut request = self.url.as_str().into_client_request().map_err(|e| {
             ConnectorError::InvalidConfiguration(anyhow!("invalid websocket url: {e}"))
@@ -153,6 +153,50 @@ impl GatewayConnector for WebSocketConnector {
             ))),
         }
     }
+}
+
+fn validate_connector_url(value: &str, allow_insecure: bool) -> Result<()> {
+    let (scheme, _) = value
+        .split_once("://")
+        .context("websocket URL is missing a scheme")?;
+    let url = reqwest::Url::parse(value).context("invalid websocket URL")?;
+    match scheme.to_ascii_lowercase().as_str() {
+        "wss" => {}
+        "ws" if allow_insecure => validate_loopback_insecure_url(value)?,
+        "ws" => bail!("refusing to send bearer credential over insecure ws://"),
+        scheme => bail!("unsupported websocket scheme: {scheme}"),
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("websocket URL must not contain credentials or a fragment");
+    }
+    url.host_str().context("websocket URL is missing a host")?;
+    Ok(())
+}
+
+fn validate_loopback_insecure_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("invalid local WebSocket URL")?;
+    if url.scheme() != "ws" {
+        bail!("production-like local WebSocket URL must use ws://");
+    }
+    let host = url
+        .host_str()
+        .and_then(parse_ip_literal)
+        .context("local WebSocket URL host must be a literal IP address")?;
+    if !host.is_loopback() {
+        bail!("local WebSocket URL host must be loopback");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("local WebSocket URL must not contain credentials or a fragment");
+    }
+    Ok(())
+}
+
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
 }
 
 fn ensure_rustls_crypto_provider() -> Result<(), ConnectorError> {
@@ -412,6 +456,27 @@ mod tests {
             matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn explicit_local_mode_accepts_only_literal_loopback() {
+        for url in ["ws://127.0.0.1:1234/gateway", "ws://[::1]:1234/gateway"] {
+            assert!(
+                WebSocketConnector::new_loopback_insecure(url, Arc::new(TestDigestFactory)).is_ok(),
+                "{url}"
+            );
+        }
+        for url in [
+            "ws://localhost:1234/gateway",
+            "ws://192.168.1.20:1234/gateway",
+            "wss://127.0.0.1:1234/gateway",
+        ] {
+            assert!(
+                WebSocketConnector::new_loopback_insecure(url, Arc::new(TestDigestFactory))
+                    .is_err(),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1179,7 +1244,7 @@ mod tests {
         // the error message must not contain the secret.
         let secret_with_control = "Bearer test-token\nwith-secret";
         let mut connector = WebSocketConnector::new_insecure(
-            "ws://localhost:0".to_owned(),
+            "ws://127.0.0.1:0".to_owned(),
             Arc::new(TestDigestFactory),
         );
         let result = connector
