@@ -45,6 +45,10 @@ export interface ReducerContext {
   id: () => string;
 }
 
+// Dispositions are only an out-of-order correlation cache for the bounded
+// private outbox, not part of the rendered or canonical life log.
+export const MaxCommandDispositionCacheEntries = 32;
+
 export type ReduceEnvelopeResult =
   | { kind: "applied"; session: AgentSession }
   | { kind: "ignored"; session: AgentSession };
@@ -206,10 +210,10 @@ export function reduceEnvelope(
     case "command_disposition":
       session = {
         ...session,
-        commandDispositions: {
-          ...session.commandDispositions,
-          [commandDispositionKey(event.command_id, event.command_seq)]: event,
-        },
+        commandDispositions: rememberCommandDisposition(
+          session.commandDispositions,
+          event,
+        ),
       };
       break;
     case "turn_start":
@@ -226,6 +230,18 @@ export function commandDispositionKey(
   commandSeq: number,
 ): string {
   return `${commandId}:${commandSeq}`;
+}
+
+function rememberCommandDisposition(
+  current: Record<string, CommandDispositionEvent>,
+  event: CommandDispositionEvent,
+): Record<string, CommandDispositionEvent> {
+  const key = commandDispositionKey(event.command_id, event.command_seq);
+  const next = { ...current, [key]: event };
+  const keys = Object.keys(next);
+  if (keys.length <= MaxCommandDispositionCacheEntries) return next;
+  const { [keys[0]]: _oldest, ...bounded } = next;
+  return bounded;
 }
 
 function applyMessage(
@@ -260,7 +276,10 @@ function applyMessage(
   let conversation = session.conversation;
   const finalText = assistantText(message);
   const entryId = `message:${messageId}`;
-  if (finalText.length > 0 || conversation.entries[entryId]?.kind === "prose") {
+  if (
+    finalText.length > 0 ||
+    (complete && conversation.entries[entryId]?.kind === "prose")
+  ) {
     conversation =
       complete && finalText.length === 0
         ? removeEntry(conversation, entryId)

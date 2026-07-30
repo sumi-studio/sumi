@@ -133,6 +133,80 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 }
 
+func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	gateway.PollInterval = time.Hour
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         7,
+	}
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	volatile := make(chan Envelope)
+	appendResult := make(chan error, 1)
+	var frames []browserEventFrame
+	write := func(frame any) error {
+		eventFrame, ok := frame.(browserEventFrame)
+		if !ok {
+			t.Fatalf("unexpected browser frame: %#v", frame)
+		}
+		frames = append(frames, eventFrame)
+		if eventFrame.Envelope.Seq != nil && *eventFrame.Envelope.Seq == 1 {
+			go func() {
+				next := uint64(2)
+				err := gateway.Receive(context.Background(), claims, Envelope{
+					Seq:                &next,
+					PersonalityAgentID: personalityAgentID,
+					Event:              json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"assistant","content":[],"model":"fixture","provider":"fixture","origin":{"provider_instance_id":"fixture","protocol":"open_ai_responses","model":"fixture"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"stop","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`),
+				})
+				appendResult <- err
+				if err == nil {
+					volatile <- Envelope{
+						PersonalityAgentID: personalityAgentID,
+						Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`),
+					}
+				}
+			}()
+		}
+		if eventFrame.Envelope.Seq == nil {
+			cancel()
+		}
+		return nil
+	}
+
+	server := &BrowserServer{Events: gateway}
+	err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, write)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("browser event pump returned %v, want context cancellation", err)
+	}
+	if err := <-appendResult; err != nil {
+		t.Fatalf("append durable event between catch-up and volatile delivery: %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("browser event frames = %d, want durable seq 1, durable seq 2, volatile", len(frames))
+	}
+	if frames[0].Envelope.Seq == nil || *frames[0].Envelope.Seq != 1 ||
+		frames[1].Envelope.Seq == nil || *frames[1].Envelope.Seq != 2 ||
+		frames[2].Envelope.Seq != nil {
+		t.Fatalf("browser event order = %+v, want durable seq 1, durable seq 2, volatile", frames)
+	}
+}
+
 func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"

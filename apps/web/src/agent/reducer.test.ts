@@ -12,6 +12,7 @@ import { projectConversation } from "./projection";
 import {
   commandDispositionKey,
   createAgentSession,
+  MaxCommandDispositionCacheEntries,
   reduceEnvelope,
 } from "./reducer";
 
@@ -97,6 +98,65 @@ test("durable message_end replaces volatile text and durable replay is ignored",
   assert.deepEqual(
     projectConversation(session.conversation).map((item) => item.kind),
     ["agent-run", "prose"],
+  );
+});
+
+test("late empty message_start preserves update-before-start prose until authoritative end", () => {
+  let session = createAgentSession();
+  session = apply(session, {
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    event: {
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 0, delta: "before start" },
+    },
+  });
+  session = apply(session, {
+    seq: 2,
+    event: {
+      type: "message_start",
+      message_id: AssistantMessageId,
+      message: assistantMessage(""),
+    },
+  });
+  session = apply(session, {
+    seq: 3,
+    event: {
+      type: "message_start",
+      message_id: AssistantMessageId,
+      message: assistantMessage(""),
+    },
+  });
+  session = apply(session, {
+    event: {
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 0, delta: " and after" },
+    },
+  });
+
+  const streaming =
+    session.conversation.entries[`message:${AssistantMessageId}`];
+  assert.equal(streaming?.kind, "prose");
+  if (streaming?.kind === "prose") {
+    assert.equal(streaming.text, "before start and after");
+    assert.equal(streaming.streaming, true);
+  }
+
+  session = apply(session, {
+    seq: 4,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: assistantMessage(""),
+    },
+  });
+  assert.equal(
+    session.conversation.entries[`message:${AssistantMessageId}`],
+    undefined,
   );
 });
 
@@ -313,6 +373,37 @@ test("durable command disposition advances the cursor without entering conversat
     session.commandDispositions[commandDispositionKey(CommandId, 9)],
     envelope.event,
   );
+});
+
+test("command dispositions remain a bounded out-of-order correlation cache", () => {
+  let session = createAgentSession();
+  for (let sequence = 1; sequence <= 10_000; sequence++) {
+    session = apply(session, {
+      seq: sequence,
+      event: {
+        type: "command_disposition",
+        command_id: CommandId,
+        command_seq: sequence,
+        status: "applied",
+      },
+    });
+  }
+
+  assert.equal(
+    Object.keys(session.commandDispositions).length,
+    MaxCommandDispositionCacheEntries,
+  );
+  assert.equal(
+    session.commandDispositions[commandDispositionKey(CommandId, 1)],
+    undefined,
+  );
+  assert.equal(
+    session.commandDispositions[commandDispositionKey(CommandId, 10_000)]
+      ?.status,
+    "applied",
+  );
+  assert.deepEqual(session.conversation.entryOrder, []);
+  assert.deepEqual(session.conversation.runOrder, []);
 });
 
 function apply(

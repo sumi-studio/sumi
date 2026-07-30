@@ -506,6 +506,14 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 			if envelope.PersonalityAgentID != personalityAgentID {
 				return errors.New("browser volatile event target mismatch")
 			}
+			// A durable commit can land after the catch-up above while its
+			// corresponding volatile successor is already queued. Re-establish
+			// the durable cursor before emitting that live-only frame so the
+			// browser never observes the successor before its durable prefix.
+			next, err = s.browserDurableCatchUp(ctx, personalityAgentID, next, write)
+			if err != nil {
+				return err
+			}
 			projected, err := projectBrowserEvent(envelope)
 			if err != nil {
 				return fmt.Errorf("project volatile browser event: %w", err)
