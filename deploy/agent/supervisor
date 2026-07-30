@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
+SUMI_CONFIG_FILE="${SUMI_CONFIG_FILE:-${SUPERVISOR_DIR}/config.env}"
+
+if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if ! [[ -v "${key}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < "${SUMI_CONFIG_FILE}"
+fi
+
+: "${SUMI_COMPOSE_TIMEOUT:=30}"
+
+log() {
+  printf '[sumi-supervisor] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_paid() {
+  : "${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}"
+  [[ "${SUMI_PERSONALITY_AGENT_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || fail "docker is required"
+  docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
+}
+
+require_launch_environment() {
+  local name
+  for name in \
+    SUMI_GATEWAY_URL \
+    SUMI_LOCAL_CONTROL_URL \
+    SUMI_LOCAL_CONTROL_BEARER \
+    SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
+    SUMI_AGENT_WRAPPING_KEY \
+    SUMI_AGENT_WRAPPING_KEY_ID \
+    SUMI_APPROVAL_SECRET_DIGEST_KEY \
+    SUMI_PROVIDER_API_KEY
+  do
+    [[ -n "${!name:-}" ]] || fail "${name} is required"
+  done
+}
+
+require_paid
+readonly PAID_COMPACT="${SUMI_PERSONALITY_AGENT_ID//-/}"
+readonly SUMI_COMPOSE_PROJECT="sumi-${PAID_COMPACT}"
+
+compose() {
+  docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${COMPOSE_FILE}" \
+    "$@"
+}
+
+action="${1:-up}"
+case "${action}" in
+  project-name)
+    printf '%s\n' "${SUMI_COMPOSE_PROJECT}"
+    ;;
+  config)
+    require_docker
+    require_launch_environment
+    compose config
+    ;;
+  up|restart)
+    require_docker
+    require_launch_environment
+    # `down` synchronously stops and joins every old-generation container.
+    # Only after it returns may the allocator issue a replacement generation.
+    compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    compose up --detach --build --wait
+    log "project ${SUMI_COMPOSE_PROJECT} started; authoritative Ready is published through authenticated local control"
+    ;;
+  stop|down)
+    require_docker
+    compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    ;;
+  status|ps)
+    require_docker
+    compose ps
+    ;;
+  logs)
+    require_docker
+    compose logs "${@:2}"
+    ;;
+  *)
+    fail "usage: supervisor {up|restart|stop|status|logs|config|project-name}"
+    ;;
+esac

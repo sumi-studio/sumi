@@ -1,0 +1,42 @@
+#include <tunables/global>
+
+# The executor alone may create the user/mount/network namespace used to hide
+# the broker socket from bash children. The profile retains Docker's proc/sys
+# and ptrace restrictions around that narrow allowance.
+profile sumi-agent-executor flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  userns,
+  deny network alg,
+  capability setuid setgid setpcap sys_admin,
+  file,
+
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (send,receive) peer=sumi-agent-executor,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  mount options=(rprivate) none -> /,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/broker.sock,
+  mount options=(bind) /tmp/.sumi-broker-preflight-src-* -> /tmp/.sumi-broker-preflight-tgt-*,
+  umount /tmp/.sumi-broker-preflight-tgt-*,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,tracedby,read,readby) peer=sumi-agent-executor,
+}

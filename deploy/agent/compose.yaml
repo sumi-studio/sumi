@@ -1,0 +1,154 @@
+# One Compose project is one canonical global PersonalityAgentId. The host
+# supervisor supplies the PAID-derived --project-name; this file deliberately
+# has no fixed Compose `name`.
+
+x-long-lived-hardening: &long-lived-hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:./seccomp/sidecar.json
+    - apparmor:docker-default
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m
+  stdin_open: false
+  tty: false
+  restart: "no"
+
+services:
+  # The allocator is the only service that can mutate the generation ledger.
+  # It distributes role-minimal identity.env files atomically and exits.
+  allocator:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [allocator]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:docker-default
+    environment:
+      SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
+      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator
+      SUMI_IDENTITY_OUTPUT_ROOT: /run/sumi/identity-output
+    volumes:
+      - allocator-state:/var/lib/sumi-allocator
+      - runtime-identity:/run/sumi/identity-output/runtime
+      - executor-identity:/run/sumi/identity-output/executor
+      - broker-identity:/run/sumi/identity-output/broker
+
+  # Root is confined to a short-lived ownership/setup role. It cannot see the
+  # allocator ledger, identities, provider credentials, or local-control bearer.
+  prepare:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [prepare]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:docker-default
+    volumes:
+      - state:/var/lib/sumi
+      - workspace:/workspace
+      - artifacts:/var/lib/sumi-artifacts
+      - executor-ipc:/run/sumi/executor
+      - broker-ipc:/run/sumi/broker
+
+  runtime:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10001:10001"
+    group_add: ["10020"]
+    command: [runtime]
+    environment:
+      SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
+      SUMI_LOCAL_CONTROL_URL: ${SUMI_LOCAL_CONTROL_URL:?SUMI_LOCAL_CONTROL_URL is required}
+      SUMI_LOCAL_CONTROL_BEARER: ${SUMI_LOCAL_CONTROL_BEARER:?SUMI_LOCAL_CONTROL_BEARER is required}
+      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:?SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX is required}
+      SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
+      SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:?SUMI_AGENT_WRAPPING_KEY_ID is required}
+      SUMI_APPROVAL_SECRET_DIGEST_KEY: ${SUMI_APPROVAL_SECRET_DIGEST_KEY:?SUMI_APPROVAL_SECRET_DIGEST_KEY is required}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      SUMI_MODEL_API_KEY_ENV: SUMI_PROVIDER_API_KEY
+      SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}
+      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: ${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}
+      SUMI_LOG: ${SUMI_LOG:-sumi_agent=info}
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+      executor:
+        condition: service_started
+    volumes:
+      - state:/var/lib/sumi
+      - runtime-identity:/run/sumi/identity:ro
+      - executor-ipc:/run/sumi/executor:ro
+
+  executor:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10002:10002"
+    group_add: ["10021"]
+    command: [executor]
+    network_mode: none
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:sumi-agent-executor
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+      broker:
+        condition: service_started
+    volumes:
+      - workspace:/workspace
+      - executor-identity:/run/sumi/identity:ro
+      - executor-ipc:/run/sumi/executor
+      - broker-ipc:/run/sumi/broker:ro
+
+  broker:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10003:10003"
+    command: [broker]
+    network_mode: none
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+    volumes:
+      - artifacts:/var/lib/sumi-artifacts
+      - broker-identity:/run/sumi/identity:ro
+      - broker-ipc:/run/sumi/broker
+
+volumes:
+  allocator-state: {}
+  state: {}
+  workspace: {}
+  artifacts: {}
+  runtime-identity: {}
+  executor-identity: {}
+  broker-identity: {}
+  executor-ipc: {}
+  broker-ipc: {}
