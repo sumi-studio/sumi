@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::Value as JsonValue;
 use serde_yaml::Value;
 use uuid::Uuid;
 
@@ -423,6 +424,294 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
         assert!(dockerfile.contains(&format!(
             "/var/lib/sumi-allocator-root/identity-output/{role}"
         )));
+    }
+}
+
+#[test]
+fn deployed_allocator_cli_durably_advances_two_generations_without_rebinding_outputs() {
+    let Some(role_gids) = usable_allocator_role_gids() else {
+        eprintln!(
+            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        );
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("sumi-deploy-allocator-{}", Uuid::now_v7()));
+    let state = root.join("state");
+    let output = root.join("identity-output");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&output).unwrap();
+    for role in ["runtime", "executor", "broker"] {
+        std::fs::create_dir(output.join(role)).unwrap();
+    }
+    for directory in [&root, &state, &output] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for role in ["runtime", "executor", "broker"] {
+        std::fs::set_permissions(output.join(role), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+    if !can_assign_allocator_role_gids(&output, &role_gids) {
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(root);
+        eprintln!(
+            "HOST_UNAVAILABLE: allocator integration requires three usable supplemental groups or chgrp authority"
+        );
+        return;
+    }
+
+    let paid = Uuid::now_v7().to_string();
+    let allocate = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+            .env_clear()
+            .arg("--supervisor-allocate")
+            .env("SUMI_PERSONALITY_AGENT_ID", &paid)
+            .env("SUMI_ALLOCATOR_TRUST_ROOT", &root)
+            .env("SUMI_ALLOCATOR_STATE_DIR", &state)
+            .env("SUMI_IDENTITY_OUTPUT_ROOT", &output)
+            .env("SUMI_RUNTIME_IDENTITY_GID", role_gids[0].to_string())
+            .env("SUMI_EXECUTOR_IDENTITY_GID", role_gids[1].to_string())
+            .env("SUMI_BROKER_IDENTITY_GID", role_gids[2].to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "allocator CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<JsonValue>(&output.stdout).unwrap()
+    };
+
+    let first = allocate();
+    assert_eq!(first["status"].as_str(), Some("allocated"));
+    assert_eq!(first["generation"].as_u64(), Some(0));
+    let bound_inodes = allocator_directory_inodes(&root, &state, &output);
+    assert_allocator_persistence(&state, &output, &paid, &bound_inodes, 1);
+    let first_identities = assert_allocator_identities(&output, &paid, &role_gids, 0);
+    assert_no_allocator_temps_or_interrupted_handoff(&state, &output);
+
+    let second = allocate();
+    assert_eq!(second["status"].as_str(), Some("allocated"));
+    assert_eq!(second["generation"].as_u64(), Some(1));
+    assert_eq!(
+        allocator_directory_inodes(&root, &state, &output),
+        bound_inodes
+    );
+    assert_allocator_persistence(&state, &output, &paid, &bound_inodes, 2);
+    let second_identities = assert_allocator_identities(&output, &paid, &role_gids, 1);
+    for role in ["runtime", "executor", "broker"] {
+        assert_ne!(first_identities[role], second_identities[role]);
+    }
+    assert_no_allocator_temps_or_interrupted_handoff(&state, &output);
+
+    make_tree_removable(&root);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn usable_allocator_role_gids() -> Option<[libc::gid_t; 3]> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Some([61_001, 61_002, 61_003]);
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return None;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    if count > 0 && unsafe { libc::getgroups(count, groups.as_mut_ptr()) } != count {
+        return None;
+    }
+    let real_gid = unsafe { libc::getgid() };
+    let effective_gid = unsafe { libc::getegid() };
+    let groups: Vec<_> = groups
+        .into_iter()
+        .filter(|gid| *gid != 0 && *gid != real_gid && *gid != effective_gid)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    (groups.len() >= 3).then(|| [groups[0], groups[1], groups[2]])
+}
+
+fn can_assign_allocator_role_gids(output: &std::path::Path, role_gids: &[libc::gid_t; 3]) -> bool {
+    let allocator_gid = unsafe { libc::getegid() };
+    ["runtime", "executor", "broker"]
+        .into_iter()
+        .zip(*role_gids)
+        .all(|(role, gid)| {
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .open(output.join(role))
+                .ok();
+            let Some(directory) = directory else {
+                return false;
+            };
+            (unsafe { libc::fchown(directory.as_raw_fd(), libc::uid_t::MAX, gid) }) == 0
+                && (unsafe { libc::fchown(directory.as_raw_fd(), libc::uid_t::MAX, allocator_gid) })
+                    == 0
+        })
+}
+
+fn allocator_directory_inodes(
+    root: &std::path::Path,
+    state: &std::path::Path,
+    output: &std::path::Path,
+) -> BTreeMap<&'static str, (u64, u64)> {
+    [
+        ("trust_root", root.to_path_buf()),
+        ("state", state.to_path_buf()),
+        ("output", output.to_path_buf()),
+        ("runtime", output.join("runtime")),
+        ("executor", output.join("executor")),
+        ("broker", output.join("broker")),
+    ]
+    .into_iter()
+    .map(|(name, path)| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (name, (metadata.dev(), metadata.ino()))
+    })
+    .collect()
+}
+
+fn assert_allocator_persistence(
+    state: &std::path::Path,
+    output: &std::path::Path,
+    paid: &str,
+    bound_inodes: &BTreeMap<&str, (u64, u64)>,
+    next_generation: u64,
+) {
+    for path in [
+        state.join("allocator-ledger.json"),
+        output.join("allocator-binding.json"),
+    ] {
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+    let ledger: JsonValue =
+        serde_json::from_slice(&std::fs::read(state.join("allocator-ledger.json")).unwrap())
+            .unwrap();
+    let binding: JsonValue =
+        serde_json::from_slice(&std::fs::read(output.join("allocator-binding.json")).unwrap())
+            .unwrap();
+    for document in [&ledger, &binding] {
+        assert_eq!(document["version"].as_u64(), Some(1));
+        assert_eq!(document["personality_agent_id"].as_str(), Some(paid));
+        for (name, (device, inode)) in bound_inodes {
+            assert_eq!(
+                document["directories"][*name]["device"].as_u64(),
+                Some(*device)
+            );
+            assert_eq!(
+                document["directories"][*name]["inode"].as_u64(),
+                Some(*inode)
+            );
+        }
+    }
+    assert_eq!(ledger["state"]["status"].as_str(), Some("next"));
+    assert_eq!(
+        ledger["state"]["generation"].as_u64(),
+        Some(next_generation)
+    );
+}
+
+fn assert_allocator_identities(
+    output: &std::path::Path,
+    paid: &str,
+    role_gids: &[libc::gid_t; 3],
+    generation: u64,
+) -> BTreeMap<&'static str, BTreeMap<String, String>> {
+    let mut identities = BTreeMap::new();
+    for (index, role) in ["runtime", "executor", "broker"].into_iter().enumerate() {
+        let directory = output.join(role);
+        let directory_metadata = std::fs::metadata(&directory).unwrap();
+        assert_eq!(directory_metadata.permissions().mode() & 0o7777, 0o550);
+        assert_eq!(directory_metadata.gid(), role_gids[index]);
+        let identity_path = directory.join("identity.env");
+        let metadata = std::fs::metadata(&identity_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o440);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.gid(), role_gids[index]);
+        let identity = std::fs::read_to_string(identity_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_owned(), value.to_owned())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected = BTreeMap::from([
+            ("SUMI_PERSONALITY_AGENT_ID".to_owned(), paid.to_owned()),
+            ("SUMI_RPC_GENERATION".to_owned(), generation.to_string()),
+        ]);
+        if role == "runtime" {
+            expected.insert(
+                "SUMI_PROCESS_GENERATION_LEASE_ID".to_owned(),
+                identity["SUMI_PROCESS_GENERATION_LEASE_ID"].clone(),
+            );
+            expected.insert(
+                "SUMI_GENERATION_RECOVERY_FENCE_ID".to_owned(),
+                identity["SUMI_GENERATION_RECOVERY_FENCE_ID"].clone(),
+            );
+        }
+        expected.insert(
+            "SUMI_RPC_NONCE".to_owned(),
+            identity["SUMI_RPC_NONCE"].clone(),
+        );
+        assert_eq!(identity, expected, "unexpected {role} identity");
+        identities.insert(role, identity);
+    }
+    let nonce = identities["runtime"]["SUMI_RPC_NONCE"].clone();
+    assert_eq!(identities["executor"]["SUMI_RPC_NONCE"], nonce);
+    assert_eq!(identities["broker"]["SUMI_RPC_NONCE"], nonce);
+    identities
+}
+
+fn assert_no_allocator_temps_or_interrupted_handoff(
+    state: &std::path::Path,
+    output: &std::path::Path,
+) {
+    for (directory, prefix) in [
+        (state, ".allocator-ledger.json.tmp-"),
+        (output, ".allocator-binding.json.tmp-"),
+    ] {
+        assert!(std::fs::read_dir(directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix)
+        }));
+    }
+    for role in ["runtime", "executor", "broker"] {
+        let directory = output.join(role);
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+            0o550
+        );
+        assert!(std::fs::read_dir(directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".identity.env.tmp-")
+        }));
+    }
+}
+
+fn make_tree_removable(path: &std::path::Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.is_dir() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_tree_removable(&entry.path());
+            }
+        }
+    } else {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
 }
 
