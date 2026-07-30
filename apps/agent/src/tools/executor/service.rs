@@ -2,10 +2,13 @@
 
 use std::{
     env,
+    ffi::{CString, OsStr, OsString},
     fs::{File, OpenOptions},
     future::{Future, poll_fn},
+    mem::MaybeUninit,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -40,7 +43,7 @@ use super::{
 };
 use crate::runtime::contracts::{PersonalityAgentId, RpcIdentity};
 use crate::tools::{
-    ToolError,
+    ResourceLimit, ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
     fs::WorkspaceFs,
     truncate::{TruncationOptions, truncate_tail},
@@ -61,20 +64,47 @@ const EXECUTOR_CANCEL_SETTLEMENT_DEADLINE: Duration = Duration::from_secs(3);
 const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
 const EXECUTOR_CONTROL_CONNECTION_CAPACITY: usize = 32;
 const EXECUTOR_OPERATION_CAPACITY: usize = 8;
+const EXECUTOR_BLOCKING_FS_WORKER_CAPACITY: usize = 4;
+const EXECUTOR_BLOCKING_FS_TOTAL_CAPACITY: usize = 8;
 const EXECUTOR_INITIAL_FRAME_DEADLINE: Duration = Duration::from_secs(1);
 const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(135);
 const SOCKET_CONNECT_DEADLINE: Duration = Duration::from_secs(1);
+const SOCKET_PATH_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
 const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
 struct OwnedUnixListener {
     listener: UnixListener,
-    _parent_directory: File,
+    trusted_path: TrustedSocketPath,
+    bound_address: PathBuf,
+    socket_identity: UnixMetadataSnapshot,
     // The stable adjacent inode is intentionally retained for the complete
     // listener lifetime. Cooperating starters may inspect it but never unlink
     // it, avoiding a lock-file replacement race during handoff.
     _ownership_lock: File,
+}
+
+struct TrustedSocketPath {
+    path: PathBuf,
+    file_name: OsString,
+    directories: Vec<PinnedDirectory>,
+}
+
+struct PinnedDirectory {
+    directory: File,
+    name_in_parent: Option<OsString>,
+    identity: UnixMetadataSnapshot,
+    final_parent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnixMetadataSnapshot {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    nlink: u64,
+    uid: u32,
 }
 
 struct ExecutorInput<R> {
@@ -142,8 +172,9 @@ async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
 /// Bind without stealing a live endpoint. Only a connection-refused path that
 /// is itself a Unix socket is eligible for stale-socket cleanup.
 async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListener> {
-    let parent_directory = acquire_trusted_socket_parent(path, label)?;
-    let ownership_lock = acquire_socket_ownership(path, label)?;
+    let trusted_path = TrustedSocketPath::open(path, label)?;
+    let ownership_lock = acquire_socket_ownership(&trusted_path, label)?;
+    trusted_path.validate(label)?;
     match timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path)).await {
         Ok(Ok(_)) => {
             bail!(
@@ -153,18 +184,20 @@ async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListene
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
-            let metadata = std::fs::symlink_metadata(path).with_context(|| {
-                format!("failed to inspect stale {label} socket {}", path.display())
-            })?;
-            if !metadata.file_type().is_socket() {
+            trusted_path.validate(label)?;
+            let metadata = trusted_path.socket_entry(label)?;
+            if !metadata.is_socket()
+                || metadata.uid != unsafe { libc::geteuid() }
+                || metadata.nlink != 1
+                || (metadata.mode & 0o777 != 0o660 && metadata.mode & 0o022 != 0)
+            {
                 bail!(
-                    "{label} socket path {} is not a stale Unix socket",
+                    "{label} socket path {} is not a trusted stale Unix socket",
                     path.display()
                 );
             }
-            tokio::fs::remove_file(path).await.with_context(|| {
-                format!("failed to remove stale {label} socket {}", path.display())
-            })?;
+            trusted_path.unlink_socket(label)?;
+            trusted_path.validate(label)?;
         }
         Ok(Err(error)) => {
             bail!(
@@ -179,167 +212,463 @@ async fn bind_unix_listener(path: &Path, label: &str) -> Result<OwnedUnixListene
             );
         }
     }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("failed to bind {label} socket {}", path.display()))?;
+    trusted_path.validate(label)?;
+    // Linux has no bindat(2). Resolve the final socket name through the
+    // retained parent descriptor so an ancestor rename between validation and
+    // bind cannot redirect creation into a replacement path.
+    let bound_address = trusted_path.descriptor_relative_socket_path();
+    let listener = UnixListener::bind(&bound_address).with_context(|| {
+        format!(
+            "failed to bind {label} socket {} through its pinned parent",
+            path.display()
+        )
+    })?;
+    trusted_path.validate(label)?;
     // Executor/runtime and broker/executor run under separate service UIDs.
     // Deployment supplies a listener-UID-owned, non-peer-writable IPC
     // subdirectory whose group permits the authenticated peer to traverse it.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-        .with_context(|| format!("failed to restrict {label} socket {}", path.display()))?;
-    validate_trusted_socket_parent(&parent_directory, path, label)?;
-    Ok(OwnedUnixListener {
+    chmod_at(
+        trusted_path.parent_directory(),
+        &trusted_path.file_name,
+        0o660,
+    )
+    .with_context(|| format!("failed to restrict {label} socket {}", path.display()))?;
+    let socket_identity = trusted_path.socket_entry(label)?;
+    let owned = OwnedUnixListener {
         listener,
-        _parent_directory: parent_directory,
+        trusted_path,
+        bound_address,
+        socket_identity,
         _ownership_lock: ownership_lock,
-    })
+    };
+    owned.verify(label)?;
+
+    // Prove that the pinned directory entry routes to this listener before it
+    // is exposed to the service loop. Pathname metadata and a socket fd use
+    // different inode namespaces on Linux, so local_addr plus a real
+    // connect/accept exchange is the authoritative binding check.
+    let probe = timeout(SOCKET_CONNECT_DEADLINE, UnixStream::connect(path))
+        .await
+        .with_context(|| format!("{label} socket post-bind probe timed out"))?
+        .with_context(|| format!("{label} socket post-bind probe failed"))?;
+    let (accepted_probe, _) = timeout(SOCKET_CONNECT_DEADLINE, owned.listener.accept())
+        .await
+        .with_context(|| format!("{label} listener did not accept its post-bind probe"))?
+        .with_context(|| format!("{label} listener post-bind accept failed"))?;
+    drop((probe, accepted_probe));
+    owned.verify(label)?;
+    Ok(owned)
 }
 
-fn acquire_trusted_socket_parent(path: &Path, label: &str) -> Result<File> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no parent directory"))?;
-    validate_socket_parent_path(parent, label)?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(parent)
-        .with_context(|| {
-            format!(
-                "failed to securely open {label} socket parent {}",
-                parent.display()
+impl OwnedUnixListener {
+    fn verify(&self, label: &str) -> Result<()> {
+        self.trusted_path.validate(label)?;
+        let entry = self.trusted_path.socket_entry(label)?;
+        let effective_uid = unsafe { libc::geteuid() };
+        if entry != self.socket_identity
+            || !entry.is_socket()
+            || entry.uid != effective_uid
+            || entry.mode & 0o777 != 0o660
+            || entry.nlink != 1
+        {
+            bail!(
+                "{label} socket {} no longer matches its pinned bound directory entry",
+                self.trusted_path.path.display()
+            );
+        }
+        let local_path = self
+            .listener
+            .local_addr()
+            .context("failed to inspect bound Unix listener address")?
+            .as_pathname()
+            .map(Path::to_owned);
+        if local_path.as_deref() != Some(self.bound_address.as_path()) {
+            bail!(
+                "{label} listener address is not rooted at the pinned parent for {}",
+                self.trusted_path.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    async fn accept_verified(
+        &self,
+        label: &str,
+    ) -> Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+        loop {
+            self.verify(label)?;
+            match timeout(SOCKET_PATH_REVALIDATION_INTERVAL, self.listener.accept()).await {
+                Ok(Ok(accepted)) => {
+                    self.verify(label)?;
+                    return Ok(accepted);
+                }
+                Ok(Err(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to accept {label} connection"));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+impl TrustedSocketPath {
+    fn open(path: &Path, label: &str) -> Result<Self> {
+        if !path.is_absolute() {
+            bail!("{label} socket path {} is not absolute", path.display());
+        }
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{label} socket path has no file name"))?
+            .to_os_string();
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{label} socket path has no parent directory"))?;
+        let names = parent
+            .strip_prefix(Path::new("/"))
+            .context("absolute socket parent did not have a root prefix")?
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                Component::CurDir => Ok(OsString::new()),
+                Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
+                    Err(anyhow::anyhow!(
+                        "{label} socket parent {} is not a normalized absolute Unix path",
+                        parent.display()
+                    ))
+                }
+            })
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .map_or(true, |name| !name.as_os_str().is_empty())
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open("/")
+            .with_context(|| format!("failed to open root while pinning {label} socket path"))?;
+        let mut directories = vec![PinnedDirectory {
+            identity: UnixMetadataSnapshot::from_file(&root)?,
+            directory: root,
+            name_in_parent: None,
+            final_parent: names.is_empty(),
+        }];
+        for (index, name) in names.iter().enumerate() {
+            let parent_directory = &directories
+                .last()
+                .expect("pinned socket chain always contains root")
+                .directory;
+            let directory = openat_file(
+                parent_directory,
+                name,
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0,
             )
-        })?;
-    validate_trusted_socket_parent(&directory, path, label)?;
-    Ok(directory)
+            .with_context(|| {
+                format!(
+                    "failed to securely open {label} socket parent component {}",
+                    name.to_string_lossy()
+                )
+            })?;
+            directories.push(PinnedDirectory {
+                identity: UnixMetadataSnapshot::from_file(&directory)?,
+                directory,
+                name_in_parent: Some(name.clone()),
+                final_parent: index + 1 == names.len(),
+            });
+        }
+        let trusted = Self {
+            path: path.to_owned(),
+            file_name,
+            directories,
+        };
+        trusted.validate(label)?;
+        Ok(trusted)
+    }
+
+    fn parent_directory(&self) -> &File {
+        &self
+            .directories
+            .last()
+            .expect("pinned socket chain always contains a parent")
+            .directory
+    }
+
+    fn descriptor_relative_socket_path(&self) -> PathBuf {
+        PathBuf::from("/proc/self/fd")
+            .join(self.parent_directory().as_raw_fd().to_string())
+            .join(&self.file_name)
+    }
+
+    fn validate(&self, label: &str) -> Result<()> {
+        let effective_uid = unsafe { libc::geteuid() };
+        for (index, pinned) in self.directories.iter().enumerate() {
+            let current = UnixMetadataSnapshot::from_file(&pinned.directory)?;
+            if current.dev != pinned.identity.dev
+                || current.ino != pinned.identity.ino
+                || current.uid != pinned.identity.uid
+                || current.mode != pinned.identity.mode
+            {
+                bail!(
+                    "{label} socket ancestor {} changed after it was pinned",
+                    self.path.display()
+                );
+            }
+            validate_pinned_directory(current, effective_uid, pinned.final_parent, label)?;
+            if let Some(name) = &pinned.name_in_parent {
+                let parent = &self.directories[index - 1].directory;
+                let entry = stat_at(parent, name).with_context(|| {
+                    format!(
+                        "failed to revalidate {label} socket ancestor component {}",
+                        name.to_string_lossy()
+                    )
+                })?;
+                if !entry.same_directory_entry(current) {
+                    bail!(
+                        "{label} socket ancestor component {} was renamed or replaced",
+                        name.to_string_lossy()
+                    );
+                }
+            } else {
+                let root = std::fs::symlink_metadata("/")
+                    .context("failed to revalidate root directory")?;
+                let root = UnixMetadataSnapshot::from_metadata(&root);
+                if !root.same_directory_entry(current) {
+                    bail!("root directory changed while validating {label} socket path");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn socket_entry(&self, label: &str) -> Result<UnixMetadataSnapshot> {
+        stat_at(self.parent_directory(), &self.file_name).with_context(|| {
+            format!(
+                "failed to inspect {label} socket directory entry {}",
+                self.path.display()
+            )
+        })
+    }
+
+    fn unlink_socket(&self, label: &str) -> Result<()> {
+        unlink_at(self.parent_directory(), &self.file_name).with_context(|| {
+            format!(
+                "failed to remove stale {label} socket {}",
+                self.path.display()
+            )
+        })
+    }
 }
 
-fn validate_trusted_socket_parent(directory: &File, path: &Path, label: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no parent directory"))?;
-    validate_socket_parent_path(parent, label)?;
-    let descriptor = directory
-        .metadata()
-        .with_context(|| format!("failed to inspect {label} socket parent descriptor"))?;
-    let pathname = std::fs::symlink_metadata(parent).with_context(|| {
-        format!(
-            "failed to inspect {label} socket parent {}",
-            parent.display()
-        )
-    })?;
-    let effective_uid = unsafe { libc::geteuid() };
-    if !descriptor.file_type().is_dir()
-        || descriptor.uid() != effective_uid
-        || descriptor.nlink() == 0
-        || descriptor.mode() & 0o300 != 0o300
-        || descriptor.mode() & 0o022 != 0
-        || pathname.file_type().is_symlink()
-        || !pathname.file_type().is_dir()
-        || pathname.dev() != descriptor.dev()
-        || pathname.ino() != descriptor.ino()
+fn validate_pinned_directory(
+    metadata: UnixMetadataSnapshot,
+    effective_uid: u32,
+    final_parent: bool,
+    label: &str,
+) -> Result<()> {
+    if !metadata.is_directory() || metadata.nlink == 0 {
+        bail!("{label} socket path contains a detached non-directory ancestor");
+    }
+    if final_parent {
+        if metadata.uid != effective_uid
+            || metadata.mode & 0o300 != 0o300
+            || metadata.mode & 0o022 != 0
+        {
+            bail!(
+                "{label} socket parent must be listener-uid-owned, owner-writable/executable, and non-peer-writable"
+            );
+        }
+        return Ok(());
+    }
+
+    let listener_owned = metadata.uid == effective_uid && metadata.mode & 0o022 == 0;
+    let root_owned_traversal = metadata.uid == 0 && metadata.mode & 0o022 == 0;
+    // `/tmp`-style traversal is the sole peer-writable exception: root owns
+    // the directory and the sticky bit prevents peers from replacing an
+    // entry owned by the listener uid. The listener-owned descendant itself
+    // remains non-peer-writable and is pinned by fd.
+    let root_owned_sticky_traversal =
+        metadata.uid == 0 && metadata.mode & libc::S_ISVTX != 0 && metadata.mode & 0o002 != 0;
+    if metadata.mode & 0o111 == 0
+        || !(listener_owned || root_owned_traversal || root_owned_sticky_traversal)
     {
         bail!(
-            "{label} socket parent {} is not a stable uid-owned non-peer-writable directory",
-            parent.display()
+            "{label} socket ancestor is neither trusted root-owned traversal nor listener-owned non-peer-writable traversal"
         );
     }
     Ok(())
 }
 
-fn validate_socket_parent_path(parent: &Path, label: &str) -> Result<()> {
-    if !parent.is_absolute() {
-        bail!("{label} socket parent {} is not absolute", parent.display());
-    }
-    let mut prefix = PathBuf::new();
-    for component in parent.components() {
-        match component {
-            Component::RootDir | Component::Normal(_) => {
-                prefix.push(component.as_os_str());
-                let metadata = std::fs::symlink_metadata(&prefix).with_context(|| {
-                    format!(
-                        "failed to inspect {label} socket parent component {}",
-                        prefix.display()
-                    )
-                })?;
-                if metadata.file_type().is_symlink() {
-                    bail!(
-                        "{label} socket parent component {} is a symlink",
-                        prefix.display()
-                    );
-                }
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                bail!(
-                    "{label} socket parent {} is not a normalized absolute Unix path",
-                    parent.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn acquire_socket_ownership(path: &Path, label: &str) -> Result<File> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{label} socket path has no file name"))?;
-    let mut lock_name = file_name.to_os_string();
+fn acquire_socket_ownership(path: &TrustedSocketPath, label: &str) -> Result<File> {
+    let mut lock_name = path.file_name.clone();
     lock_name.push(".lock");
-    let lock_path = path.with_file_name(lock_name);
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&lock_path)
-        .with_context(|| {
-            format!(
-                "failed to securely open {label} socket ownership lock {}",
-                lock_path.display()
-            )
-        })?;
-    validate_socket_ownership_lock(&lock, &lock_path, label)?;
+    let lock = openat_file(
+        path.parent_directory(),
+        &lock_name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0o600,
+    )
+    .with_context(|| {
+        format!(
+            "failed to securely open {label} socket ownership lock {}",
+            path.path.with_file_name(&lock_name).display()
+        )
+    })?;
+    validate_socket_ownership_lock(&lock, path, &lock_name, label)?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         bail!(
             "{label} socket {} is already owned by another starter: {error}",
-            path.display()
+            path.path.display()
         );
     }
     // Revalidate after locking so an unlink/replacement between open and
     // flock cannot establish a second cooperating ownership inode.
-    validate_socket_ownership_lock(&lock, &lock_path, label)?;
+    path.validate(label)?;
+    validate_socket_ownership_lock(&lock, path, &lock_name, label)?;
     Ok(lock)
 }
 
-fn validate_socket_ownership_lock(lock: &File, path: &Path, label: &str) -> Result<()> {
-    let descriptor = lock
-        .metadata()
-        .with_context(|| format!("failed to inspect {label} ownership lock descriptor"))?;
-    let pathname = std::fs::symlink_metadata(path).with_context(|| {
+fn validate_socket_ownership_lock(
+    lock: &File,
+    path: &TrustedSocketPath,
+    lock_name: &OsStr,
+    label: &str,
+) -> Result<()> {
+    let descriptor = UnixMetadataSnapshot::from_file(lock)?;
+    let pathname = stat_at(path.parent_directory(), lock_name).with_context(|| {
         format!(
             "failed to inspect {label} socket ownership lock {}",
-            path.display()
+            path.path.with_file_name(lock_name).display()
         )
     })?;
     let effective_uid = unsafe { libc::geteuid() };
-    if !descriptor.file_type().is_file()
-        || descriptor.uid() != effective_uid
-        || descriptor.nlink() != 1
-        || descriptor.mode() & 0o777 != 0o600
-        || pathname.file_type().is_symlink()
-        || !pathname.file_type().is_file()
-        || pathname.dev() != descriptor.dev()
-        || pathname.ino() != descriptor.ino()
+    if !descriptor.is_regular()
+        || descriptor.uid != effective_uid
+        || descriptor.nlink != 1
+        || descriptor.mode & 0o777 != 0o600
+        || pathname != descriptor
     {
         bail!(
             "{label} socket ownership lock {} is not a stable uid-owned 0600 regular file",
-            path.display()
+            path.path.with_file_name(lock_name).display()
         );
     }
     Ok(())
+}
+
+impl UnixMetadataSnapshot {
+    fn from_file(file: &File) -> Result<Self> {
+        let metadata = file
+            .metadata()
+            .context("failed to inspect pinned descriptor")?;
+        Ok(Self::from_metadata(&metadata))
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            uid: metadata.uid(),
+        }
+    }
+
+    fn from_stat(metadata: libc::stat) -> Self {
+        Self {
+            dev: metadata.st_dev,
+            ino: metadata.st_ino,
+            mode: metadata.st_mode,
+            nlink: metadata.st_nlink,
+            uid: metadata.st_uid,
+        }
+    }
+
+    fn is_directory(self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    fn is_regular(self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    fn is_socket(self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFSOCK
+    }
+
+    fn same_directory_entry(self, other: Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.mode == other.mode
+            && self.uid == other.uid
+            && self.nlink > 0
+            && other.nlink > 0
+    }
+}
+
+fn os_str_cstring(value: &OsStr) -> std::io::Result<CString> {
+    CString::new(value.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contained NUL"))
+}
+
+fn openat_file(
+    parent: &File,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: u32,
+) -> std::io::Result<File> {
+    let name = os_str_cstring(name)?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn stat_at(parent: &File, name: &OsStr) -> std::io::Result<UnixMetadataSnapshot> {
+    let name = os_str_cstring(name)?;
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(UnixMetadataSnapshot::from_stat(unsafe {
+        metadata.assume_init()
+    }))
+}
+
+fn unlink_at(parent: &File, name: &OsStr) -> std::io::Result<()> {
+    let name = os_str_cstring(name)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn chmod_at(parent: &File, name: &OsStr, mode: u32) -> std::io::Result<()> {
+    let name = os_str_cstring(name)?;
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -748,6 +1077,93 @@ struct BlockingWorkRegistry {
     permits: Arc<Semaphore>,
 }
 
+#[derive(Clone)]
+struct BlockingFsRegistry {
+    workers: Arc<Semaphore>,
+    total: Arc<Semaphore>,
+    #[cfg(test)]
+    before_execute: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl BlockingFsRegistry {
+    fn new(worker_capacity: usize, total_capacity: usize) -> Self {
+        assert!(worker_capacity > 0);
+        assert!(total_capacity >= worker_capacity);
+        Self {
+            workers: Arc::new(Semaphore::new(worker_capacity)),
+            total: Arc::new(Semaphore::new(total_capacity)),
+            #[cfg(test)]
+            before_execute: None,
+        }
+    }
+
+    fn production() -> Self {
+        Self::new(
+            EXECUTOR_BLOCKING_FS_WORKER_CAPACITY,
+            EXECUTOR_BLOCKING_FS_TOTAL_CAPACITY,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_hook(
+        worker_capacity: usize,
+        total_capacity: usize,
+        before_execute: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            before_execute: Some(before_execute),
+            ..Self::new(worker_capacity, total_capacity)
+        }
+    }
+
+    async fn execute<T, F>(&self, operation: F) -> Result<T, ToolError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ToolError> + Send + 'static,
+    {
+        let total_permit = self
+            .total
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ToolError::ResourceLimit(ResourceLimit::Concurrency))?;
+        let worker_permit = self
+            .workers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| io_error("executor filesystem blocking-work registry closed"))?;
+        #[cfg(test)]
+        let before_execute = self.before_execute.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permits = (total_permit, worker_permit);
+            #[cfg(test)]
+            if let Some(before_execute) = before_execute {
+                before_execute();
+            }
+            operation()
+        })
+        .await
+        .map_err(|_| {
+            ToolError::RpcIndeterminate("executor filesystem blocking worker stopped".to_owned())
+        })?
+    }
+
+    async fn open_workspace(&self, workspace: PathBuf) -> Result<Arc<WorkspaceFs>, ToolError> {
+        self.execute(move || WorkspaceFs::open(&workspace).map(Arc::new))
+            .await
+    }
+
+    #[cfg(test)]
+    fn available_total_permits(&self) -> usize {
+        self.total.available_permits()
+    }
+
+    #[cfg(test)]
+    fn available_worker_permits(&self) -> usize {
+        self.workers.available_permits()
+    }
+}
+
 impl BlockingWorkRegistry {
     fn new(capacity: usize) -> Self {
         Self {
@@ -779,8 +1195,12 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
-    let fs = WorkspaceFs::open(&workspace).context("failed to open executor workspace")?;
-    let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
+    let blocking_fs = BlockingFsRegistry::production();
+    let fs = blocking_fs
+        .open_workspace(workspace.clone())
+        .await
+        .context("failed to open executor workspace")?;
+    let broker = Arc::new(ArtifactBrokerClient::new(broker_socket, identity.clone()));
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
     let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
@@ -792,6 +1212,7 @@ pub async fn run_tool_executor_mode() -> Result<()> {
         fs,
         broker,
         manager,
+        blocking_fs,
     )
     .await
 }
@@ -806,8 +1227,14 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
     let workspace = required_path("SUMI_WORKSPACE")?;
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
+    let blocking_fs = BlockingFsRegistry::production();
+    let fs = blocking_fs
+        .open_workspace(workspace.clone())
+        .await
+        .context("failed to open executor workspace")?;
+    let broker = Arc::new(ArtifactBrokerClient::new(broker_socket, identity.clone()));
 
-    wait_for_unix_socket(&broker_socket, "artifact broker")
+    wait_for_unix_socket(broker.socket(), "artifact broker")
         .await
         .context("artifact broker socket is not ready")?;
     let listener = bind_unix_listener(&executor_socket, "executor").await?;
@@ -825,15 +1252,13 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
             .acquire_owned()
             .await
             .context("executor initial-frame admission is closed")?;
-        let (stream, _) = listener
-            .listener
-            .accept()
-            .await
-            .context("failed to accept executor connection")?;
+        let (stream, _) = listener.accept_verified("executor").await?;
         let identity = identity.clone();
         let workspace = workspace.clone();
-        let broker_socket = broker_socket.clone();
+        let fs = fs.clone();
+        let broker = broker.clone();
         let manager = manager.clone();
+        let blocking_fs = blocking_fs.clone();
         let ordinary_connections = ordinary_connections.clone();
         let control_connections = control_connections.clone();
         tokio::spawn(async move {
@@ -880,8 +1305,6 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                 return;
             };
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
-                let fs = WorkspaceFs::open(&workspace)?;
-                let broker = ArtifactBrokerClient::new(broker_socket, identity.clone());
                 run_executor_service_with_writer(
                     ExecutorInput::prefetched(read, first_line),
                     ExecutorWriter::start(write),
@@ -890,6 +1313,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                     fs,
                     broker,
                     manager,
+                    blocking_fs,
                 )
                 .await
             })
@@ -921,7 +1345,7 @@ pub async fn run_artifact_broker_mode() -> Result<()> {
     let blocking_work = BlockingWorkRegistry::new(BROKER_BLOCKING_WORK_CAPACITY);
     let identity = Arc::new(identity);
     loop {
-        let (stream, _) = listener.listener.accept().await?;
+        let (stream, _) = listener.accept_verified("artifact broker").await?;
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             tracing::warn!("artifact broker connection capacity reached");
             drop(stream);
@@ -1070,14 +1494,16 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let blocking_fs = BlockingFsRegistry::production();
     run_executor_service_with_writer(
         ExecutorInput::new(read),
         ExecutorWriter::start(write),
         identity,
         workspace,
-        fs,
-        broker,
+        Arc::new(fs),
+        Arc::new(broker),
         manager,
+        blocking_fs,
     )
     .await
 }
@@ -1096,44 +1522,60 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let blocking_fs = BlockingFsRegistry::production();
     run_executor_service_with_writer(
         ExecutorInput::with_test_controls(read, test_controls),
         ExecutorWriter::start(write),
         identity,
         workspace,
-        fs,
-        broker,
+        Arc::new(fs),
+        Arc::new(broker),
         ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY),
+        blocking_fs,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_executor_service_with_writer<R>(
     input: ExecutorInput<R>,
     (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
     identity: RpcIdentity,
     workspace: PathBuf,
-    fs: WorkspaceFs,
-    broker: ArtifactBrokerClient,
+    fs: Arc<WorkspaceFs>,
+    broker: Arc<ArtifactBrokerClient>,
     manager: Arc<ExecutorManager>,
+    blocking_fs: BlockingFsRegistry,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let result = run_executor_loop(input, &writer, identity, workspace, fs, broker, manager).await;
+    let result = run_executor_loop(
+        input,
+        &writer,
+        identity,
+        workspace,
+        fs,
+        broker,
+        manager,
+        blocking_fs,
+    )
+    .await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_executor_loop<R>(
     input: ExecutorInput<R>,
     writer: &ExecutorWriter,
     identity: RpcIdentity,
     workspace: PathBuf,
-    fs: WorkspaceFs,
-    broker: ArtifactBrokerClient,
+    fs: Arc<WorkspaceFs>,
+    broker: Arc<ArtifactBrokerClient>,
     manager: Arc<ExecutorManager>,
+    blocking_fs: BlockingFsRegistry,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1302,7 +1744,7 @@ where
                     }
                     Err(error) => return Err(error.into()),
                 };
-                let mut execution = match registration {
+                let execution = match registration {
                     ExecutionRegistration::Replay(result) => {
                         writer
                             .terminal(&identity, request.request_id, result)
@@ -1321,10 +1763,18 @@ where
                         pending.promote(permit)?
                     }
                 };
-                let result = execute_non_bash(&fs, &broker, operation)
-                    .await
-                    .map_err(rpc_error);
-                execution.complete(result.clone())?;
+                let result = start_non_bash_execution(
+                    execution,
+                    fs.clone(),
+                    broker.clone(),
+                    blocking_fs.clone(),
+                    operation,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "executor non-Bash ownership task stopped");
+                    Err(bounded_error("rpc_indeterminate"))
+                });
                 writer
                     .terminal(&identity, request.request_id, result)
                     .await?;
@@ -1334,6 +1784,25 @@ where
             return Ok(());
         }
     }
+}
+
+fn start_non_bash_execution(
+    mut execution: ExecutionLease,
+    fs: Arc<WorkspaceFs>,
+    broker: Arc<ArtifactBrokerClient>,
+    blocking_fs: BlockingFsRegistry,
+    operation: ExecutorOperation,
+) -> JoinHandle<Result<ExecutorResponse, RpcError>> {
+    tokio::spawn(async move {
+        let result = execute_non_bash(fs, broker, blocking_fs, operation)
+            .await
+            .map_err(rpc_error);
+        if let Err(error) = execution.complete(result.clone()) {
+            tracing::error!(%error, "failed to settle executor non-Bash operation ownership");
+            return Err(bounded_error("rpc_indeterminate"));
+        }
+        result
+    })
 }
 
 enum PendingBashAdmission {
@@ -1849,8 +2318,9 @@ fn classify_active_control(
 }
 
 async fn execute_non_bash(
-    fs: &WorkspaceFs,
-    broker: &ArtifactBrokerClient,
+    fs: Arc<WorkspaceFs>,
+    broker: Arc<ArtifactBrokerClient>,
+    blocking_fs: BlockingFsRegistry,
     operation: ExecutorOperation,
 ) -> Result<ExecutorResponse, ToolError> {
     match operation {
@@ -1860,17 +2330,27 @@ async fn execute_non_bash(
             limit,
             ..
         } => match resolve_input("read_file", &path)? {
-            InputRoute::Workspace => Ok(ExecutorResponse::ReadFile {
-                result: fs.read_file(path.as_ref(), offset, limit)?,
-            }),
+            InputRoute::Workspace => {
+                blocking_fs
+                    .execute(move || {
+                        Ok(ExecutorResponse::ReadFile {
+                            result: fs.read_file(Path::new(&path), offset, limit)?,
+                        })
+                    })
+                    .await
+            }
             InputRoute::Artifact => Ok(ExecutorResponse::Artifact {
                 response: broker.read_artifact(&path, offset, limit).await?,
             }),
         },
         ExecutorOperation::WriteFile { path, content, .. } => {
             resolve_input("write_file", &path)?;
-            fs.write_file(path.as_ref(), content.as_bytes())?;
-            Ok(ExecutorResponse::Written {})
+            blocking_fs
+                .execute(move || {
+                    fs.write_file(Path::new(&path), content.as_bytes())?;
+                    Ok(ExecutorResponse::Written {})
+                })
+                .await
         }
         ExecutorOperation::EditFile {
             path,
@@ -1879,25 +2359,41 @@ async fn execute_non_bash(
             ..
         } => {
             resolve_input("edit_file", &path)?;
-            fs.edit_file(path.as_ref(), &old_string, &new_string)?;
-            Ok(ExecutorResponse::Edited {})
+            blocking_fs
+                .execute(move || {
+                    fs.edit_file(Path::new(&path), &old_string, &new_string)?;
+                    Ok(ExecutorResponse::Edited {})
+                })
+                .await
         }
         ExecutorOperation::RemoveFile { path, .. } => {
             resolve_input("remove_file", &path)?;
-            fs.remove_file(path.as_ref())?;
-            Ok(ExecutorResponse::Removed {})
+            blocking_fs
+                .execute(move || {
+                    fs.remove_file(Path::new(&path))?;
+                    Ok(ExecutorResponse::Removed {})
+                })
+                .await
         }
         ExecutorOperation::ListDir { path, .. } => {
             resolve_input("list_dir", &path)?;
-            Ok(ExecutorResponse::Listed {
-                entries: fs.list_dir(path.as_ref())?,
-            })
+            blocking_fs
+                .execute(move || {
+                    Ok(ExecutorResponse::Listed {
+                        entries: fs.list_dir(Path::new(&path))?,
+                    })
+                })
+                .await
         }
         ExecutorOperation::Glob { pattern, .. } => {
             resolve_input("glob", &pattern)?;
-            Ok(ExecutorResponse::Globbed {
-                paths: fs.glob(&pattern)?,
-            })
+            blocking_fs
+                .execute(move || {
+                    Ok(ExecutorResponse::Globbed {
+                        paths: fs.glob(&pattern)?,
+                    })
+                })
+                .await
         }
         ExecutorOperation::Grep { path, pattern, .. } => {
             if resolve_input("grep", &path)? == InputRoute::Artifact {
@@ -1907,9 +2403,13 @@ async fn execute_non_bash(
             } else {
                 let pattern = Regex::new(&pattern)
                     .map_err(|_| ToolError::Protocol("invalid grep pattern".to_owned()))?;
-                Ok(ExecutorResponse::Grepped {
-                    matches: fs.grep(path.as_ref(), &pattern)?,
-                })
+                blocking_fs
+                    .execute(move || {
+                        Ok(ExecutorResponse::Grepped {
+                            matches: fs.grep(Path::new(&path), &pattern)?,
+                        })
+                    })
+                    .await
             }
         }
         ExecutorOperation::Health {}
@@ -2166,13 +2666,107 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Condvar;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::{runtime::contracts::MAX_PROCESS_GENERATION, tools::executor::decode_rpc_frame};
 
+    #[derive(Default)]
+    struct BlockingFsGate {
+        state: Mutex<BlockingFsGateState>,
+        released: Condvar,
+    }
+
+    #[derive(Default)]
+    struct BlockingFsGateState {
+        started: usize,
+        released: bool,
+    }
+
+    impl BlockingFsGate {
+        fn block(&self) {
+            let mut state = self.state.lock().expect("blocking fs gate");
+            state.started += 1;
+            while !state.released {
+                state = self.released.wait(state).expect("blocking fs gate wait");
+            }
+        }
+
+        fn started(&self) -> usize {
+            self.state.lock().expect("blocking fs gate").started
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("blocking fs gate");
+            state.released = true;
+            self.released.notify_all();
+        }
+    }
+
+    async fn wait_for_blocking_fs_starts(gate: &BlockingFsGate, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while gate.started() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking filesystem workers did not start");
+    }
+
+    fn test_identity() -> RpcIdentity {
+        RpcIdentity::from_wire(PAID, 7, "blocking-fs-test").expect("test RPC identity")
+    }
+
+    fn start_prefetched_test_session(
+        identity: RpcIdentity,
+        workspace: PathBuf,
+        fs: Arc<WorkspaceFs>,
+        broker: Arc<ArtifactBrokerClient>,
+        manager: Arc<ExecutorManager>,
+        blocking_fs: BlockingFsRegistry,
+        request_id: &str,
+        operation: ExecutorOperation,
+    ) -> (tokio::io::DuplexStream, JoinHandle<Result<()>>) {
+        let request = RpcRequest {
+            personality_agent_id: identity.personality_agent_id().clone(),
+            generation: identity.generation().to_wire(),
+            nonce: identity.nonce().as_str().to_owned(),
+            request_id: request_id.to_owned(),
+            operation,
+        };
+        let line = serde_json::to_vec(&request).expect("encode test request");
+        let (client, server) = tokio::io::duplex(MAX_RPC_LINE_BYTES);
+        let (read, write) = tokio::io::split(server);
+        let task = tokio::spawn(run_executor_service_with_writer(
+            ExecutorInput::prefetched(read, line),
+            ExecutorWriter::start(write),
+            identity,
+            workspace,
+            fs,
+            broker,
+            manager,
+            blocking_fs,
+        ));
+        (client, task)
+    }
+
+    async fn read_test_terminal(stream: &mut tokio::io::DuplexStream) -> Value {
+        let mut line = String::new();
+        timeout(
+            Duration::from_secs(2),
+            BufReader::new(stream).read_line(&mut line),
+        )
+        .await
+        .expect("test terminal deadline")
+        .expect("read test terminal");
+        assert!(!line.is_empty(), "service closed before terminal");
+        serde_json::from_str(&line).expect("decode test terminal")
+    }
+
     #[tokio::test]
     async fn socket_ownership_lock_rejects_symlink_and_unsafe_permissions_before_cleanup() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{FileTypeExt, symlink};
 
         let root = std::env::temp_dir().join(format!(
             "sumi-executor-socket-lock-{}",
@@ -2249,6 +2843,20 @@ mod tests {
                 .is_socket()
         );
 
+        let unsafe_ancestor = root.join("unsafe-ancestor");
+        let safe_descendant = unsafe_ancestor.join("safe-parent");
+        std::fs::create_dir_all(&safe_descendant).expect("create unsafe ancestor chain");
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777))
+            .expect("make ancestor peer-writable");
+        std::fs::set_permissions(&safe_descendant, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict final parent");
+        assert!(
+            bind_unix_listener(&safe_descendant.join("executor.sock"), "test")
+                .await
+                .is_err(),
+            "a peer-writable ancestor must fail closed even when the final parent is safe"
+        );
+
         let trusted_parent = root.join("trusted-parent");
         std::fs::create_dir(&trusted_parent).expect("create trusted parent");
         std::fs::set_permissions(&trusted_parent, std::fs::Permissions::from_mode(0o700))
@@ -2274,6 +2882,67 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("remove socket lock test directory");
+    }
+
+    #[tokio::test]
+    async fn bound_listener_detects_post_bind_ancestor_unlink_rename_and_entry_replacement() {
+        let root = std::env::temp_dir().join(format!("sxr-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).expect("create socket revalidation root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict socket revalidation root");
+
+        let rename_ancestor = root.join("rename/ancestor");
+        let rename_parent = rename_ancestor.join("parent");
+        std::fs::create_dir_all(&rename_parent).expect("create rename chain");
+        let rename_socket = rename_parent.join("executor.sock");
+        let renamed_listener = bind_unix_listener(&rename_socket, "test")
+            .await
+            .expect("bind rename listener");
+        let detached_ancestor = root.join("rename/detached");
+        std::fs::rename(&rename_ancestor, &detached_ancestor).expect("rename pinned ancestor");
+        std::fs::create_dir_all(&rename_parent).expect("replace ancestor chain");
+        assert!(
+            renamed_listener.verify("test").is_err(),
+            "renamed and replaced ancestor chain remained trusted"
+        );
+        drop(renamed_listener);
+
+        let unlink_ancestor = root.join("unlink/ancestor");
+        let unlink_parent = unlink_ancestor.join("parent");
+        std::fs::create_dir_all(&unlink_parent).expect("create unlink chain");
+        let unlink_socket = unlink_parent.join("executor.sock");
+        let unlinked_listener = bind_unix_listener(&unlink_socket, "test")
+            .await
+            .expect("bind unlink listener");
+        std::fs::remove_file(&unlink_socket).expect("unlink bound socket entry");
+        std::fs::remove_file(unlink_parent.join("executor.sock.lock"))
+            .expect("unlink ownership entry");
+        std::fs::remove_dir(&unlink_parent).expect("unlink pinned parent directory");
+        std::fs::remove_dir(&unlink_ancestor).expect("unlink pinned ancestor directory");
+        assert!(
+            unlinked_listener.verify("test").is_err(),
+            "unlinked pinned ancestor chain remained trusted"
+        );
+        drop(unlinked_listener);
+
+        let replacement_parent = root.join("replacement");
+        std::fs::create_dir(&replacement_parent).expect("create replacement parent");
+        let replacement_socket = replacement_parent.join("executor.sock");
+        let original_listener = bind_unix_listener(&replacement_socket, "test")
+            .await
+            .expect("bind original listener");
+        std::fs::remove_file(&replacement_socket).expect("unlink original socket entry");
+        let replacement_listener = std::os::unix::net::UnixListener::bind(&replacement_socket)
+            .expect("bind replacement socket entry");
+        std::fs::set_permissions(&replacement_socket, std::fs::Permissions::from_mode(0o660))
+            .expect("match replacement socket mode");
+        assert!(
+            original_listener.verify("test").is_err(),
+            "replacement socket entry matched the pinned listener identity"
+        );
+        drop((replacement_listener, original_listener));
+
+        std::fs::remove_dir_all(root).expect("remove socket revalidation root");
     }
 
     #[test]
@@ -2908,6 +3577,284 @@ mod tests {
         assert!(!is_interrupted_read_error(&std::io::Error::from(
             std::io::ErrorKind::BrokenPipe,
         )));
+    }
+
+    #[test]
+    fn blocking_fs_saturation_does_not_starve_health_or_cancel_on_one_worker() {
+        let root = std::env::temp_dir().join(format!("sumi-blocking-fs-{}", uuid::Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create blocking filesystem workspace");
+        let fs = Arc::new(WorkspaceFs::open(&workspace).expect("open test workspace"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .expect("build one-worker runtime");
+        let cleanup_root = root.clone();
+
+        runtime.block_on(async move {
+            let identity = test_identity();
+            let broker = Arc::new(ArtifactBrokerClient::new(
+                root.join("unused-broker.sock"),
+                identity.clone(),
+            ));
+            let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+            let gate = Arc::new(BlockingFsGate::default());
+            let hook_gate = gate.clone();
+            let blocking_fs =
+                BlockingFsRegistry::with_test_hook(2, 4, Arc::new(move || hook_gate.block()));
+
+            let mut filesystem_jobs = Vec::new();
+            for index in 0..4 {
+                let execution = manager
+                    .begin_execution(
+                        format!("request-blocking-fs-{index}"),
+                        format!("execution-blocking-fs-{index}"),
+                        None,
+                    )
+                    .await
+                    .expect("admit blocking filesystem execution");
+                filesystem_jobs.push(start_non_bash_execution(
+                    execution,
+                    fs.clone(),
+                    broker.clone(),
+                    blocking_fs.clone(),
+                    ExecutorOperation::WriteFile {
+                        path: format!("blocked-{index}.txt"),
+                        content: format!("content-{index}"),
+                        execution_id: format!("execution-blocking-fs-{index}"),
+                    },
+                ));
+            }
+            wait_for_blocking_fs_starts(&gate, 2).await;
+            timeout(Duration::from_secs(2), async {
+                while blocking_fs.available_total_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("filesystem running and waiting capacity was not saturated");
+            assert_eq!(blocking_fs.available_worker_permits(), 0);
+
+            let overflow_execution = manager
+                .begin_execution(
+                    "request-blocking-fs-overflow".to_owned(),
+                    "execution-blocking-fs-overflow".to_owned(),
+                    None,
+                )
+                .await
+                .expect("admit bounded overflow execution");
+            let overflow = timeout(
+                Duration::from_millis(250),
+                start_non_bash_execution(
+                    overflow_execution,
+                    fs.clone(),
+                    broker.clone(),
+                    blocking_fs.clone(),
+                    ExecutorOperation::WriteFile {
+                        path: "must-not-write.txt".to_owned(),
+                        content: "overflow".to_owned(),
+                        execution_id: "execution-blocking-fs-overflow".to_owned(),
+                    },
+                ),
+            )
+            .await
+            .expect("blocking filesystem overflow did not backpressure promptly")
+            .expect("blocking filesystem overflow ownership task");
+            assert!(matches!(
+                overflow,
+                Err(RpcError {
+                    code,
+                    resource_limit: Some(ResourceLimit::Concurrency),
+                }) if code == "resource_limit"
+            ));
+            assert!(!workspace.join("must-not-write.txt").exists());
+
+            let (mut health_client, health_task) = start_prefetched_test_session(
+                identity.clone(),
+                workspace.clone(),
+                fs.clone(),
+                broker.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                "request-health-under-fs-load",
+                ExecutorOperation::Health {},
+            );
+            let health = timeout(
+                Duration::from_millis(250),
+                read_test_terminal(&mut health_client),
+            )
+            .await
+            .expect("Health was starved by saturated filesystem work");
+            assert_eq!(health["result"]["Ok"]["type"], "healthy");
+            health_task
+                .await
+                .expect("join Health service")
+                .expect("Health service result");
+
+            let pid_path = workspace.join("blocking-fs-bash.pid");
+            let (mut bash_client, bash_task) = start_prefetched_test_session(
+                identity.clone(),
+                workspace.clone(),
+                fs.clone(),
+                broker.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                "request-bash-under-fs-load",
+                ExecutorOperation::Bash {
+                    command: "printf '%s' \"$$\" > blocking-fs-bash.pid; sleep 60".to_owned(),
+                    execution_id: "execution-bash-under-fs-load".to_owned(),
+                },
+            );
+            let process_group = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(pid) = tokio::fs::read_to_string(&pid_path).await
+                        && let Ok(pid) = pid.trim().parse::<i32>()
+                    {
+                        break pid;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Bash process did not start under filesystem load");
+
+            let (mut cancel_client, cancel_task) = start_prefetched_test_session(
+                identity.clone(),
+                workspace.clone(),
+                fs.clone(),
+                broker.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                "request-cancel-under-fs-load",
+                ExecutorOperation::Cancel {
+                    execution_id: "execution-bash-under-fs-load".to_owned(),
+                },
+            );
+            let cancel = timeout(
+                Duration::from_secs(1),
+                read_test_terminal(&mut cancel_client),
+            )
+            .await
+            .expect("Cancel was starved by saturated filesystem work");
+            assert_eq!(cancel["result"]["Ok"]["type"], "cancel_accepted");
+            cancel_task
+                .await
+                .expect("join Cancel service")
+                .expect("Cancel service result");
+
+            let bash = timeout(Duration::from_secs(1), read_test_terminal(&mut bash_client))
+                .await
+                .expect("cancelled Bash terminal was starved by filesystem work");
+            assert_eq!(bash["result"]["Ok"]["result"]["cancelled"], true);
+            bash_task
+                .await
+                .expect("join Bash service")
+                .expect("Bash service result");
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let result = unsafe { libc::kill(-process_group, 0) };
+                    if result != 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled Bash process group remained alive");
+
+            gate.release();
+            for job in filesystem_jobs {
+                assert_eq!(
+                    job.await.expect("join blocking filesystem ownership task"),
+                    Ok(ExecutorResponse::Written {})
+                );
+            }
+            assert_eq!(blocking_fs.available_total_permits(), 4);
+            assert_eq!(blocking_fs.available_worker_permits(), 2);
+        });
+        drop(runtime);
+        std::fs::remove_dir_all(cleanup_root).expect("remove blocking filesystem fixture");
+    }
+
+    #[test]
+    fn disconnected_non_bash_request_retains_blocking_operation_and_exact_outcome() {
+        let root = std::env::temp_dir().join(format!("sumi-detached-fs-{}", uuid::Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create detached filesystem workspace");
+        let fs = Arc::new(WorkspaceFs::open(&workspace).expect("open test workspace"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("build one-worker runtime");
+        let cleanup_root = root.clone();
+
+        runtime.block_on(async move {
+            let identity = test_identity();
+            let broker = Arc::new(ArtifactBrokerClient::new(
+                root.join("unused-broker.sock"),
+                identity.clone(),
+            ));
+            let manager = ExecutorManager::new(1);
+            let gate = Arc::new(BlockingFsGate::default());
+            let hook_gate = gate.clone();
+            let blocking_fs =
+                BlockingFsRegistry::with_test_hook(1, 1, Arc::new(move || hook_gate.block()));
+            let (client, service) = start_prefetched_test_session(
+                identity,
+                workspace.clone(),
+                fs,
+                broker,
+                manager.clone(),
+                blocking_fs.clone(),
+                "request-detached-fs",
+                ExecutorOperation::WriteFile {
+                    path: "committed-after-disconnect.txt".to_owned(),
+                    content: "durable result".to_owned(),
+                    execution_id: "execution-detached-fs".to_owned(),
+                },
+            );
+
+            wait_for_blocking_fs_starts(&gate, 1).await;
+            service.abort();
+            assert!(
+                service
+                    .await
+                    .expect_err("service cancellation")
+                    .is_cancelled()
+            );
+            drop(client);
+            assert_eq!(manager.active_count(), 1);
+
+            gate.release();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if manager.retained_outcome("execution-detached-fs")
+                        == Some(Ok(ExecutorResponse::Written {}))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("detached filesystem operation did not retain its exact outcome");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("committed-after-disconnect.txt"))
+                    .expect("read detached filesystem result"),
+                "durable result"
+            );
+            assert_eq!(manager.active_count(), 0);
+            assert_eq!(blocking_fs.available_total_permits(), 1);
+            assert_eq!(blocking_fs.available_worker_permits(), 1);
+        });
+        drop(runtime);
+        std::fs::remove_dir_all(cleanup_root).expect("remove detached filesystem fixture");
     }
 
     #[tokio::test]
