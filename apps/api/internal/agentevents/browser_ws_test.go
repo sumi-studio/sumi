@@ -1087,7 +1087,7 @@ func signBrowserSession(t *testing.T, secret []byte, claims userSessionWireClaim
 		t.Fatal(err)
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, secret)
+	mac := hmac.New(sha256.New, deriveBrowserSessionSigningKey(secret))
 	_, _ = mac.Write([]byte(header + "." + encoded))
 	return header + "." + encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }

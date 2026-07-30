@@ -232,6 +232,80 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	}
 }
 
+func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{
+		identity: FirebaseIdentity{UID: "firebase-user"},
+	}
+	bindings := &fakeBindingResolver{claims: UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}}
+	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
+	now := time.Now().UTC().Truncate(time.Second)
+	preFence := signPreFenceTestSession(
+		t,
+		testSessionSecret,
+		testSessionClaims{
+			TenantID:           bindings.claims.TenantID,
+			UserID:             bindings.claims.UserID,
+			PersonalityAgentID: bindings.claims.PersonalityAgentID,
+			Iat:                now.Add(-time.Minute).Unix(),
+			Exp:                now.Add(time.Minute).Unix(),
+			Aud:                defaultBrowserAudience,
+		},
+	)
+	if _, err := sessions.VerifySession(
+		context.Background(),
+		preFence,
+	); err == nil || !strings.Contains(err.Error(), "invalid browser session signature") {
+		t.Fatalf("pre-fence cookie verification = %v, want signature rejection", err)
+	}
+
+	csrf, csrfCookie := obtainCSRF(t, server)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/auth/session",
+		strings.NewReader(`{"id_token":"verified-by-fake"}`),
+	)
+	request.Header.Set("Origin", browserAuthTestOrigin)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", csrf)
+	request.AddCookie(csrfCookie)
+	request.AddCookie(&http.Cookie{
+		Name:  BrowserSessionCookie,
+		Value: preFence,
+	})
+	recorder := httptest.NewRecorder()
+	server.serveSessionExchange(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf(
+			"exchange pre-fence cookie: status %d body %s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != BrowserSessionCookie {
+		t.Fatalf("replacement cookies = %+v, want one browser session", cookies)
+	}
+	if cookies[0].Value == preFence {
+		t.Fatal("Firebase exchange returned the pre-fence credential")
+	}
+	replacement, err := sessions.VerifySession(
+		context.Background(),
+		cookies[0].Value,
+	)
+	if err != nil {
+		t.Fatalf("Firebase exchange did not issue a valid v2 cookie: %v", err)
+	}
+	if replacement.TenantID != bindings.claims.TenantID ||
+		replacement.UserID != bindings.claims.UserID ||
+		replacement.PersonalityAgentID != bindings.claims.PersonalityAgentID {
+		t.Fatalf("replacement claims = %+v, want %+v", replacement, bindings.claims)
+	}
+}
+
 func TestBrowserAuthRejectsOriginBeforeAuthAndBody(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{}

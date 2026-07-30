@@ -532,10 +532,14 @@ func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocati
 				"invalid legacy browser session revocation state",
 			)
 		}
-		// Version 1 persisted only Entries. Normalize it in memory so the
-		// next successful mutation atomically upgrades the durable format.
-		state.Version = browserSessionRevocationStateVersion
-		state.Lineages = make(map[string]browserSessionLineageRecord)
+		if err := validateLegacyBrowserSessionRevocationState(state); err != nil {
+			return browserSessionRevocationState{}, err
+		}
+		// The v2 cookie-signing domain rejects every credential represented
+		// by this pre-lineage denylist. Start the new credential namespace
+		// empty instead of pretending its unknowable successor graph can be
+		// reconstructed; the next mutation persists the v2 format.
+		state = newBrowserSessionRevocationState()
 	case browserSessionRevocationStateVersion:
 		if !hasLineages || state.Lineages == nil {
 			return browserSessionRevocationState{}, errors.New(
@@ -551,6 +555,22 @@ func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocati
 		return browserSessionRevocationState{}, err
 	}
 	return state, nil
+}
+
+func validateLegacyBrowserSessionRevocationState(
+	state browserSessionRevocationState,
+) error {
+	if state.Version != legacyBrowserSessionRevocationStateVersion ||
+		state.Entries == nil ||
+		len(state.Entries) > maxRevokedSessions {
+		return errors.New("invalid legacy browser session revocation state")
+	}
+	for sessionID, expiresAt := range state.Entries {
+		if !validBrowserSessionID(sessionID) || expiresAt <= 0 {
+			return errors.New("invalid legacy browser session revocation entry")
+		}
+	}
+	return nil
 }
 
 func validateBrowserSessionRevocationState(

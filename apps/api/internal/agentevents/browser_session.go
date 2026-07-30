@@ -23,6 +23,7 @@ const (
 	maxRevokedSessions             = 4096
 	browserSessionIDBytes          = 32
 	browserAuthorityBindingIDBytes = sha256.Size
+	browserSessionSigningKeyDomain = "sumi:browser-session-signing-key:v2"
 	browserAuthorityBindingDomain  = "sumi:browser-authority-binding:v1"
 	// BrowserSessionCookie is the name of the signed HttpOnly session cookie
 	// used by browser routes.
@@ -61,11 +62,12 @@ type UserSessionVerifier interface {
 }
 
 type HMACUserSessionVerifier struct {
-	secret      []byte
-	audience    string
-	now         func() time.Time
-	random      io.Reader
-	revocations BrowserSessionRevocationStore
+	signingKey          []byte
+	authorityBindingKey []byte
+	audience            string
+	now                 func() time.Time
+	random              io.Reader
+	revocations         BrowserSessionRevocationStore
 }
 
 // BrowserSessionRevocationStore is the shared durability and serialization
@@ -201,10 +203,11 @@ func newHMACBrowserSessionSigner(
 		audience = defaultBrowserAudience
 	}
 	return &HMACUserSessionVerifier{
-		secret:   append([]byte(nil), secret...),
-		audience: audience,
-		now:      time.Now,
-		random:   rand.Reader,
+		signingKey:          deriveBrowserSessionSigningKey(secret),
+		authorityBindingKey: append([]byte(nil), secret...),
+		audience:            audience,
+		now:                 time.Now,
+		random:              rand.Reader,
 	}, nil
 }
 
@@ -279,7 +282,10 @@ func (v *HMACUserSessionVerifier) prepareSession(
 			PersonalityAgentID: wireClaims.PersonalityAgentID,
 			sessionID:          wireClaims.SID,
 			expiresAt:          time.Unix(wireClaims.Exp, 0),
-			authorityBindingID: deriveBrowserAuthorityBindingID(v.secret, wireClaims),
+			authorityBindingID: deriveBrowserAuthorityBindingID(
+				v.authorityBindingKey,
+				wireClaims,
+			),
 		},
 		signingInput: signingInput,
 	}, nil
@@ -288,7 +294,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 func (v *HMACUserSessionVerifier) signPreparedSession(
 	prepared preparedBrowserSession,
 ) string {
-	mac := hmac.New(sha256.New, v.secret)
+	mac := hmac.New(sha256.New, v.signingKey)
 	_, _ = mac.Write([]byte(prepared.signingInput))
 	return prepared.signingInput + "." +
 		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -326,7 +332,7 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 		return UserSessionClaims{}, errors.New("invalid browser session format")
 	}
 	signingInput := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, v.secret)
+	mac := hmac.New(sha256.New, v.signingKey)
 	_, _ = mac.Write([]byte(signingInput))
 	expected := mac.Sum(nil)
 	signature, err := decodeBase64URL(parts[2])
@@ -389,12 +395,21 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 		PersonalityAgentID: claims.PersonalityAgentID,
 		sessionID:          claims.SID,
 		expiresAt:          time.Unix(claims.Exp, 0),
-		// Derive only after the cookie signature and claims have been
-		// validated. A future verifier key ring must use the exact key that
-		// verified this cookie; rotating the signing key then deliberately
-		// changes the ID and causes a safe browser-side authority reset.
-		authorityBindingID: deriveBrowserAuthorityBindingID(v.secret, claims),
+		// The protocol-versioned cookie signing key deliberately differs
+		// from this stable authority key. Upgrading the cookie protocol
+		// fences old credentials without resetting the same human/target
+		// binding; rotating the configured base secret still resets it.
+		authorityBindingID: deriveBrowserAuthorityBindingID(
+			v.authorityBindingKey,
+			claims,
+		),
 	}, nil
+}
+
+func deriveBrowserSessionSigningKey(secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(browserSessionSigningKeyDomain))
+	return mac.Sum(nil)
 }
 
 func validBrowserSessionID(sessionID string) bool {

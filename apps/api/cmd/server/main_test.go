@@ -89,20 +89,23 @@ func signTestSession(t *testing.T, secret []byte, claims testSessionClaims) stri
 	if claims.Iat == 0 && claims.Exp != 0 {
 		claims.Iat = claims.Exp - int64(time.Hour/time.Second)
 	}
-	if claims.SID == "" {
-		claims.SID = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	}
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	claimsBytes, err := json.Marshal(claims)
+	issuer, err := agentevents.NewHMACBrowserSessionIssuer(secret, claims.Aud)
 	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
+		t.Fatalf("construct browser session issuer: %v", err)
 	}
-	claimsPart := base64.RawURLEncoding.EncodeToString(claimsBytes)
-	signingInput := header + "." + claimsPart
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(signingInput))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return signingInput + "." + sig
+	session, err := issuer.IssueSession(
+		context.Background(),
+		agentevents.UserSessionClaims{
+			TenantID:           claims.TenantID,
+			UserID:             claims.UserID,
+			PersonalityAgentID: claims.PersonalityAgentID,
+		},
+		time.Duration(claims.Exp-claims.Iat)*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("issue browser session: %v", err)
+	}
+	return session
 }
 
 func setTokenSecret(t *testing.T) {

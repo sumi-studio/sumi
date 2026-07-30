@@ -194,13 +194,93 @@ func signTestSession(t *testing.T, secret []byte, claims testSessionClaims) stri
 
 func signRawTestSession(t *testing.T, secret []byte, claims testSessionClaims) string {
 	t.Helper()
+	return signTestSessionWithKey(
+		t,
+		deriveBrowserSessionSigningKey(secret),
+		claims,
+	)
+}
+
+func signPreFenceTestSession(
+	t *testing.T,
+	secret []byte,
+	claims testSessionClaims,
+) string {
+	t.Helper()
+	if claims.Iat == 0 && claims.Exp != 0 {
+		claims.Iat = claims.Exp - int64(maxBrowserSessionTTL/time.Second)
+	}
+	if claims.SID == "" {
+		claims.SID = base64.RawURLEncoding.EncodeToString(
+			make([]byte, browserSessionIDBytes),
+		)
+	}
+	return signTestSessionWithKey(t, secret, claims)
+}
+
+func signTestSessionWithKey(
+	t *testing.T,
+	signingKey []byte,
+	claims testSessionClaims,
+) string {
+	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload := base64.RawURLEncoding.EncodeToString(mustJSON(t, claims))
 	signingInput := header + "." + payload
-	mac := hmac.New(sha256.New, secret)
+	mac := hmac.New(sha256.New, signingKey)
 	mac.Write([]byte(signingInput))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return signingInput + "." + sig
+}
+
+func TestHMACUserSessionVerifierFencesPreLineageCookies(t *testing.T) {
+	verifier, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	verifier.now = func() time.Time { return now }
+	claims := testSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		Iat:                now.Add(-time.Minute).Unix(),
+		Exp:                now.Add(time.Minute).Unix(),
+		Aud:                defaultBrowserAudience,
+		SID: base64.RawURLEncoding.EncodeToString(
+			make([]byte, browserSessionIDBytes),
+		),
+	}
+
+	preFence := signPreFenceTestSession(t, testSessionSecret, claims)
+	if _, err := verifier.VerifySession(
+		context.Background(),
+		preFence,
+	); err == nil || !strings.Contains(err.Error(), "invalid browser session signature") {
+		t.Fatalf("pre-lineage cookie verification = %v, want signature rejection", err)
+	}
+
+	current := signRawTestSession(t, testSessionSecret, claims)
+	if _, err := verifier.VerifySession(context.Background(), current); err != nil {
+		t.Fatalf("v2 cookie was rejected: %v", err)
+	}
+	parts := strings.Split(current, ".")
+	if len(parts) != 3 {
+		t.Fatalf("v2 cookie has %d parts, want 3", len(parts))
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	preFenceMAC := hmac.New(sha256.New, testSessionSecret)
+	_, _ = preFenceMAC.Write([]byte(parts[0] + "." + parts[1]))
+	if hmac.Equal(preFenceMAC.Sum(nil), signature) {
+		t.Fatal("v2 cookie remained valid under the pre-fence signing key")
+	}
 }
 
 func TestHMACUserSessionVerifierRequiresBoundedLifecycleClaims(t *testing.T) {
@@ -496,7 +576,7 @@ func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T)
 	}
 }
 
-func TestDurableBrowserSessionRevocationRejectsCorruptionButAcceptsLegacyState(
+func TestDurableBrowserSessionRevocationRejectsCorruptionAndResetsPreLineageState(
 	t *testing.T,
 ) {
 	_, gateway, _ := openSharedBrowserSessionGateways(t)
@@ -516,6 +596,13 @@ func TestDurableBrowserSessionRevocationRejectsCorruptionButAcceptsLegacyState(
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		},
 		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localClaims, err := verifier.verifySignedSession(
+		context.Background(),
+		session,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -549,7 +636,11 @@ func TestDurableBrowserSessionRevocationRejectsCorruptionButAcceptsLegacyState(
 	}
 	if err := os.WriteFile(
 		statePath,
-		[]byte(`{"version":1,"entries":{}}`),
+		[]byte(fmt.Sprintf(
+			`{"version":1,"entries":{%q:%d}}`,
+			localClaims.sessionID,
+			localClaims.expiresAt.Unix(),
+		)),
 		0o600,
 	); err != nil {
 		t.Fatal(err)
@@ -558,11 +649,11 @@ func TestDurableBrowserSessionRevocationRejectsCorruptionButAcceptsLegacyState(
 		context.Background(),
 		session,
 	); err != nil {
-		t.Fatalf("legacy revocation state rejected a valid signed cookie: %v", err)
+		t.Fatalf("pre-lineage state carried an obsolete SID into v2: %v", err)
 	}
 }
 
-func TestDurableBrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
+func TestV2BrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
 	t *testing.T,
 ) {
 	store, firstGateway, secondGateway := openSharedBrowserSessionGateways(t)
@@ -650,7 +741,7 @@ func TestDurableBrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
 	}
 }
 
-func TestDurableBrowserSessionRotationThenLogoutRevokesSuccessorAcrossRestart(
+func TestV2BrowserSessionRotationThenLogoutRevokesSuccessorAcrossRestart(
 	t *testing.T,
 ) {
 	store, firstGateway, secondGateway := openSharedBrowserSessionGateways(t)
@@ -1072,6 +1163,21 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 	if !validBrowserAuthorityBindingID(first.authorityBindingID) {
 		t.Fatalf("authority binding ID is not canonical: %q", first.authorityBindingID)
 	}
+	preFenceBindingID := deriveBrowserAuthorityBindingID(
+		testSessionSecret,
+		userSessionWireClaims{
+			TenantID:           binding.TenantID,
+			UserID:             binding.UserID,
+			PersonalityAgentID: binding.PersonalityAgentID,
+		},
+	)
+	if first.authorityBindingID != preFenceBindingID {
+		t.Fatalf(
+			"v2 signing fence changed stable authority binding: %q != %q",
+			first.authorityBindingID,
+			preFenceBindingID,
+		)
+	}
 
 	for _, tc := range []struct {
 		name   string
@@ -1178,7 +1284,10 @@ func TestHMACUserSessionVerifierRejectsDuplicateKeysUnknownFieldsAndWrongTyp(t *
 			header := base64.RawURLEncoding.EncodeToString([]byte(tc.header))
 			claims := base64.RawURLEncoding.EncodeToString([]byte(tc.claims))
 			signingInput := header + "." + claims
-			mac := hmac.New(sha256.New, testSessionSecret)
+			mac := hmac.New(
+				sha256.New,
+				deriveBrowserSessionSigningKey(testSessionSecret),
+			)
 			mac.Write([]byte(signingInput))
 			sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 			session := signingInput + "." + sig
