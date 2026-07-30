@@ -109,7 +109,11 @@ export class LoopbackChatProvider {
       this.requests.push({ messages, raw });
       const turn = this.requests.length;
       if (turn === 1) {
-        if (!hasMessage(messages, "user", firstUserMessage)) {
+        if (
+          !hasExactConversationSuffix(messages, [
+            { role: "user", text: firstUserMessage },
+          ])
+        ) {
           respondJSON(response, 422, { error: "turn_one_user_missing" });
           return;
         }
@@ -117,14 +121,13 @@ export class LoopbackChatProvider {
         return;
       }
       if (turn === 2) {
-        const hasFirstUser = hasMessage(messages, "user", firstUserMessage);
-        const hasFirstAssistant = hasMessage(
-          messages,
-          "assistant",
-          firstProviderResponse,
-        );
-        const hasSecondUser = hasMessage(messages, "user", secondUserMessage);
-        if (!hasFirstUser || !hasFirstAssistant || !hasSecondUser) {
+        if (
+          !hasExactConversationSuffix(messages, [
+            { role: "user", text: firstUserMessage },
+            { role: "assistant", text: firstProviderResponse },
+            { role: "user", text: secondUserMessage },
+          ])
+        ) {
           respondJSON(response, 422, { error: "shared_context_missing" });
           return;
         }
@@ -188,6 +191,20 @@ export class RealAgentStack {
         sameSite: "Lax",
       },
     ]);
+  }
+
+  diagnostics(): string {
+    const sections = this.children
+      .map((child) => child.diagnosticSection())
+      .filter((section) => section.length > 0);
+    sections.push(
+      [
+        "Loopback provider:",
+        `request_count=${this.provider.requestCount}`,
+        `context_verified=${this.provider.contextVerified}`,
+      ].join("\n"),
+    );
+    return sections.join("\n\n");
   }
 
   async stop(): Promise<void> {
@@ -257,6 +274,22 @@ export async function removeRealAgentBuild(
 }
 
 export async function startRealAgentStack(
+  build: RealAgentBuild,
+): Promise<RealAgentStack> {
+  const maxAddressBindAttempts = 3;
+  for (let attempt = 1; attempt <= maxAddressBindAttempts; attempt++) {
+    try {
+      return await startRealAgentStackOnce(build);
+    } catch (error) {
+      if (attempt === maxAddressBindAttempts || !isAddressInUse(error)) {
+        throw error;
+      }
+    }
+  }
+  throw new Error("unreachable address-bind retry exhaustion");
+}
+
+async function startRealAgentStackOnce(
   build: RealAgentBuild,
 ): Promise<RealAgentStack> {
   const runtimeDirectory = await secureTempDirectory(
@@ -348,6 +381,7 @@ export async function startRealAgentStack(
       env: {
         ...process.env,
         PORT: String(publicPort),
+        SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${publicPort}`,
         SUMI_COMMAND_LOG_DIR: paths.commandLog,
         SUMI_AGENT_RUNTIME_STATE_DIR: paths.gatewayState,
         SUMI_AGENT_TOKEN_SECRET: agentTokenSecret,
@@ -367,6 +401,8 @@ export async function startRealAgentStack(
     });
     children.push(api);
     await waitForHTTP(`${apiURL}/health`, api, 20_000);
+    await delay(100);
+    api.assertRunning();
 
     const executor = ManagedProcess.start(
       "Rust tool executor",
@@ -447,6 +483,8 @@ export async function startRealAgentStack(
     );
     children.push(vite);
     await waitForHTTP(`${webURL}/`, vite, 20_000);
+    await delay(100);
+    vite.assertRunning();
 
     return new RealAgentStack({
       apiURL,
@@ -523,6 +561,17 @@ class ManagedProcess {
   diagnostics(): string {
     const value = this.log.value().trim();
     return value ? `:\n${value}` : "";
+  }
+
+  diagnosticSection(): string {
+    const status =
+      this.child.exitCode === null && this.child.signalCode === null
+        ? "running"
+        : `exited (${this.child.exitCode ?? this.child.signalCode})`;
+    const value = this.log.value().trim();
+    return value
+      ? `${this.label} [${status}]:\n${value}`
+      : `${this.label} [${status}]: no captured output`;
   }
 
   capturedOutput(): string {
@@ -741,16 +790,24 @@ async function readBoundedJSON(
   return parsed;
 }
 
-function hasMessage(
+function hasExactConversationSuffix(
   messages: unknown[],
-  role: string,
-  expectedText: string,
+  expected: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
 ): boolean {
-  return messages.some(
-    (message) =>
-      isRecord(message) &&
-      message.role === role &&
-      messageText(message.content).includes(expectedText),
+  const conversation = messages.flatMap((message) => {
+    if (
+      !isRecord(message) ||
+      (message.role !== "user" && message.role !== "assistant")
+    ) {
+      return [];
+    }
+    return [{ role: message.role, text: messageText(message.content) }];
+  });
+  if (conversation.length < expected.length) return false;
+  const suffix = conversation.slice(-expected.length);
+  return expected.every(
+    (entry, index) =>
+      suffix[index]?.role === entry.role && suffix[index]?.text === entry.text,
   );
 }
 
@@ -837,4 +894,10 @@ function delay(milliseconds: number): Promise<void> {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return /address already in use|port \d+ is already in use/i.test(
+    toError(error).message,
+  );
 }

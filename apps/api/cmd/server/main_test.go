@@ -1829,6 +1829,30 @@ func TestLocalControlTransportRequiresExactlyOneExplicitSelection(t *testing.T) 
 	}
 }
 
+func TestPublicLoopbackListenIsExplicitAndValidated(t *testing.T) {
+	t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", "")
+	if got, err := publicListenAddressFromEnv("8080"); err != nil || got != ":8080" {
+		t.Fatalf("default public listener changed: address=%q err=%v", got, err)
+	}
+
+	t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", "127.0.0.1:4321")
+	if got, err := publicListenAddressFromEnv("8080"); err != nil || got != "127.0.0.1:4321" {
+		t.Fatalf("valid loopback listener rejected: address=%q err=%v", got, err)
+	}
+
+	for _, invalid := range []string{
+		"0.0.0.0:4321",
+		"localhost:4321",
+		"127.0.0.1:0",
+		"127.0.0.1:not-a-port",
+	} {
+		t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", invalid)
+		if _, err := publicListenAddressFromEnv("8080"); err == nil {
+			t.Fatalf("invalid public loopback listener %q was accepted", invalid)
+		}
+	}
+}
+
 func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing.T) {
 	store, err := agentevents.OpenCommandStore(t.TempDir())
 	if err != nil {

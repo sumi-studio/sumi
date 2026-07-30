@@ -39,6 +39,10 @@ func run(ctx context.Context) error {
 	if port == "" {
 		port = "8080"
 	}
+	publicAddress, err := publicListenAddressFromEnv(port)
+	if err != nil {
+		return err
+	}
 
 	app, err := newApplicationFromEnv()
 	if err != nil {
@@ -47,7 +51,7 @@ func run(ctx context.Context) error {
 	defer app.Close()
 
 	publicServer := &http.Server{
-		Addr:              ":" + port,
+		Addr:              publicAddress,
 		Handler:           app.publicMux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -68,7 +72,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("listen on public API: %w", err)
 	}
 
-	log.Printf("sumi api listening on :%s", port)
+	log.Printf("sumi api listening on %s", publicListener.Addr())
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
@@ -87,6 +91,26 @@ func run(ctx context.Context) error {
 		serverAndListener{server: publicServer, listener: publicListener},
 		serverAndListener{server: localServer, listener: localListener},
 	)
+}
+
+func publicListenAddressFromEnv(port string) (string, error) {
+	address := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LOOPBACK_LISTEN"))
+	if address == "" {
+		return ":" + port, nil
+	}
+	host, configuredPort, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("SUMI_PUBLIC_LOOPBACK_LISTEN must be host:port: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", errors.New("SUMI_PUBLIC_LOOPBACK_LISTEN host must be a literal loopback IP")
+	}
+	numericPort, err := strconv.Atoi(configuredPort)
+	if err != nil || numericPort < 1 || numericPort > 65535 {
+		return "", errors.New("SUMI_PUBLIC_LOOPBACK_LISTEN port must be an integer from 1 to 65535")
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(numericPort)), nil
 }
 
 type serverAndListener struct {

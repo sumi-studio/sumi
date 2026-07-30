@@ -1264,6 +1264,7 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = receipt.ack;
         let receipt_origin = receipt.origin;
         let received_at = receipt.received_at;
+        self.enqueue_durable_events(receipt.events).await?;
         self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])
             .await?;
         if receipt_origin == InboundReceiptOrigin::Replay {
@@ -1556,7 +1557,7 @@ impl<G: Gateway + 'static> Session<G> {
             .active
             .as_mut()
             .ok_or(SessionFailure::CompletionChannelClosed)?;
-        let mut acks = active
+        let (dispositions, mut acks) = active
             .bridge
             .bind_abort(&self.writer, command)
             .await
@@ -1566,6 +1567,7 @@ impl<G: Gateway + 'static> Session<G> {
                 "abort worker exited before durability authorization".to_owned(),
             ))
         })?;
+        self.send_committed(dispositions, None, Vec::new()).await?;
         let superseded: std::collections::HashSet<String> = acks
             .iter()
             .filter(|ack| ack.status == CommandAckStatus::Superseded)
@@ -1825,8 +1827,9 @@ impl<G: Gateway + 'static> Session<G> {
         // carry ApprovalResolved and is validated as the intended terminal
         // no-op. Retrying after a failure here is safe: the broker and durable
         // approval/tool state already agree on the cancellation.
-        self.writer
-            .apply(EventBatch {
+        let disposition_events = self
+            .writer
+            .apply_with_events(EventBatch {
                 writes: vec![EventWrite {
                     event: None,
                     projections: vec![Projection::CommandApplied {
@@ -1842,6 +1845,7 @@ impl<G: Gateway + 'static> Session<G> {
                 tracing::error!(%error, %command_id, "approval decision could not be applied");
                 SessionFailure::from(error)
             })?;
+        self.enqueue_durable_events(disposition_events).await?;
         let ack = CommandAck {
             seq,
             command_id,
@@ -1857,14 +1861,15 @@ impl<G: Gateway + 'static> Session<G> {
     async fn route_idle(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
         self.apply_idle_memory_maintenance().await?;
         if matches!(command.envelope().command, Command::Abort {}) {
-            let mut terminal = self
+            let terminal = self
                 .writer
-                .apply_idle_abort_cutoff(
+                .apply_idle_abort_cutoff_with_events(
                     command.envelope().command_id.as_str(),
                     command.envelope().seq,
                 )
                 .await?;
-            for ack in terminal.drain(..) {
+            self.enqueue_durable_events(terminal.events).await?;
+            for ack in terminal.acks {
                 self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
                     .await?;
             }
@@ -2103,11 +2108,15 @@ impl<G: Gateway + 'static> Session<G> {
                 break;
             };
             let abort_seq = abort.envelope().seq;
-            let mut terminal = self
+            let terminal = self
                 .writer
-                .apply_idle_abort_cutoff(abort.envelope().command_id.as_str(), abort_seq)
+                .apply_idle_abort_cutoff_with_events(
+                    abort.envelope().command_id.as_str(),
+                    abort_seq,
+                )
                 .await?;
-            for ack in terminal.drain(..) {
+            self.enqueue_durable_events(terminal.events).await?;
+            for ack in terminal.acks {
                 self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])
                     .await?;
             }
@@ -2530,6 +2539,28 @@ impl<G: Gateway + 'static> Session<G> {
             },
             result => result,
         }
+    }
+
+    async fn enqueue_durable_events(
+        &mut self,
+        events: Vec<(u64, AgentEvent)>,
+    ) -> Result<(), SessionFailure> {
+        let frames = events
+            .into_iter()
+            .map(|(seq, event)| {
+                Ok(OutboundFrame::Event {
+                    envelope: crate::gateway::Envelope {
+                        seq: Some(seq),
+                        personality_agent_id: self.personality_agent_id.clone(),
+                        event: serde_json::to_value(event).map_err(anyhow::Error::from)?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        if !frames.is_empty() {
+            self.enqueue_reliable(frames).await?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

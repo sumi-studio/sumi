@@ -137,7 +137,22 @@ struct PhysicalRecoveryContext<'a> {
 /// transaction by `PhysicalRecoveryApplier::apply_in_transaction`.
 struct ApplyBatchOutcome {
     seqs: Vec<u64>,
+    events: Vec<AgentEvent>,
     receipt_outcome: Option<ApplyReceiptOutcome>,
+}
+
+pub(crate) struct AbortCutoffOutcome {
+    pub(crate) events: Vec<(u64, AgentEvent)>,
+    pub(crate) acks: Vec<CommandAck>,
+}
+
+impl ApplyBatchOutcome {
+    fn sequenced_events(self) -> Result<Vec<(u64, AgentEvent)>> {
+        if self.seqs.len() != self.events.len() {
+            bail!("EventWriter outcome event/sequence cardinality mismatch");
+        }
+        Ok(self.seqs.into_iter().zip(self.events).collect())
+    }
 }
 
 #[derive(Clone)]
@@ -795,11 +810,11 @@ impl IntoCanonicalCommandId for String {
 }
 
 pub(crate) fn user_message_id(
-    personality_agent_id: &PersonalityAgentId,
+    _personality_agent_id: &PersonalityAgentId,
     command_id: &(impl CanonicalCommandIdentity + ?Sized),
 ) -> String {
     Uuid::new_v5(
-        personality_agent_id.as_uuid(),
+        &crate::gateway::wire::USER_MESSAGE_ID_NAMESPACE,
         command_id.canonical_command_uuid().as_bytes(),
     )
     .to_string()
@@ -1864,6 +1879,11 @@ pub(crate) struct InboundReceipt {
     pub(crate) ack: CommandAck,
     pub(crate) origin: InboundReceiptOrigin,
     pub(crate) received_at: DateTime<Utc>,
+    /// Exact writer-owned public events produced by a newly persisted
+    /// admission. Received commands have none; terminal rejection carries its
+    /// durable disposition. Replays rely on gateway catch-up and leave this
+    /// empty to avoid duplicate live publication.
+    pub(crate) events: Vec<(u64, AgentEvent)>,
 }
 
 impl InboundAdmission {
@@ -1887,6 +1907,7 @@ impl InboundAdmission {
         self.mode == InboundAdmissionMode::ReplayOnly
     }
 
+    #[cfg(test)]
     pub(crate) async fn receive(
         &mut self,
         writer: &EventWriter,
@@ -2359,6 +2380,7 @@ impl EventWriter {
                 ack,
                 origin: InboundReceiptOrigin::Replay,
                 received_at,
+                events: Vec::new(),
             });
         }
         if admission == InboundAdmissionMode::ReplayOnly {
@@ -2392,18 +2414,22 @@ impl EventWriter {
                 payload_digest: payload_digest.clone(),
             },
         };
-        self.apply_locked(
-            EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![projection],
-                }],
-                injected_commands: Vec::new(),
-            },
-            None,
-            &mut guard,
-        )
-        .await?;
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![projection],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
         let ack = self
             .ack_for_command(command_id)
             .await?
@@ -2413,6 +2439,7 @@ impl EventWriter {
             ack,
             origin: InboundReceiptOrigin::NewlyPersisted,
             received_at,
+            events,
         })
     }
 
@@ -2486,22 +2513,48 @@ impl EventWriter {
         self.apply_locked(batch, None, &mut guard).await
     }
 
+    /// Commit an EventBatch and return the exact typed public events materialized
+    /// by EventWriter with their durable sequences. This includes writer-owned
+    /// command dispositions inserted after their terminal projection owner.
+    pub(crate) async fn apply_with_events(
+        &self,
+        batch: EventBatch,
+    ) -> Result<Vec<(u64, AgentEvent)>> {
+        let mut guard = self.gate.lock().await;
+        self.apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?
+            .sequenced_events()
+    }
+
     /// Commit an EventBatch and, when it contains the one allowed calibration
     /// observation, return the exact persisted ratio while still holding the
     /// single-writer gate. This closes the commit-to-runtime race: a later
     /// MessageEnd cannot advance the singleton before the caller receives the
     /// value committed by this batch.
+    #[cfg(test)]
     pub(crate) async fn apply_with_calibration_receipt(
         &self,
         batch: EventBatch,
     ) -> Result<(Vec<u64>, Option<[u8; 8]>)> {
+        let (events, ratio_bits) = self
+            .apply_with_events_and_calibration_receipt(batch)
+            .await?;
+        Ok((events.into_iter().map(|(seq, _)| seq).collect(), ratio_bits))
+    }
+
+    pub(crate) async fn apply_with_events_and_calibration_receipt(
+        &self,
+        batch: EventBatch,
+    ) -> Result<(Vec<(u64, AgentEvent)>, Option<[u8; 8]>)> {
         let has_calibration_observation = batch.writes.iter().any(|write| {
             write.projections.iter().any(|projection| {
                 matches!(projection, Projection::MemoryCalibrationObservation { .. })
             })
         });
         let mut guard = self.gate.lock().await;
-        let seqs = self.apply_locked(batch, None, &mut guard).await?;
+        let outcome = self
+            .apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?;
         let ratio_bits = if has_calibration_observation {
             let bits: Vec<u8> =
                 sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
@@ -2517,7 +2570,7 @@ impl EventWriter {
         } else {
             None
         };
-        Ok((seqs, ratio_bits))
+        Ok((outcome.sequenced_events()?, ratio_bits))
     }
 
     /// Hydration entry point for a T27 physical recovery proof.  The receipt
@@ -2619,25 +2672,35 @@ impl EventWriter {
     ) -> Result<Vec<CommandAck>> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
             .await
+            .map(|outcome| outcome.acks)
     }
 
-    pub(crate) async fn apply_active_abort_cutoff(
+    pub(crate) async fn apply_idle_abort_cutoff_with_events(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+    ) -> Result<AbortCutoffOutcome> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff_with_events(
         &self,
         abort_command_id: &str,
         abort_seq: u64,
         run_id: &str,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), None)
             .await
     }
 
-    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition(
+    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition_and_events(
         &self,
         abort_command_id: &str,
         abort_seq: u64,
         run_id: &str,
         disposition: ErrorContextDisposition,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), Some(disposition))
             .await
     }
@@ -2648,7 +2711,7 @@ impl EventWriter {
         abort_seq: u64,
         run_id: Option<&str>,
         error_context_disposition: Option<ErrorContextDisposition>,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         let mut guard = self.gate.lock().await;
         let mut authentication = self.store.pool().begin().await?;
         let command = load_authenticated_command(
@@ -2920,15 +2983,19 @@ impl EventWriter {
             projections,
         });
 
-        self.apply_locked(
-            EventBatch {
-                writes,
-                injected_commands: Vec::new(),
-            },
-            None,
-            &mut guard,
-        )
-        .await?;
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
 
         let expected_acks = terminal_ids.len();
         let mut acks = Vec::with_capacity(expected_acks);
@@ -2944,7 +3011,7 @@ impl EventWriter {
             expected_acks,
             "Abort cutoff ACK count must match terminal command count"
         );
-        Ok(acks)
+        Ok(AbortCutoffOutcome { events, acks })
     }
 
     async fn apply_locked(
@@ -2970,6 +3037,11 @@ impl EventWriter {
             return Err(EventWriterAdmissionClosed.into());
         }
         let batch = materialize_command_dispositions(batch)?;
+        let events = batch
+            .writes
+            .iter()
+            .filter_map(|write| write.event.as_ref().map(|event| event.value.clone()))
+            .collect();
         // A cancelled caller can leave one Store-owned COMMIT finalizer. Its
         // shared outcome and the authenticated database/feed reconciliation
         // must settle before this mutation can derive N+1.
@@ -3320,6 +3392,7 @@ impl EventWriter {
             .await?;
         Ok(ApplyBatchOutcome {
             seqs: event_seqs,
+            events,
             receipt_outcome,
         })
     }
@@ -18492,11 +18565,24 @@ mod tests {
             )),
             payload_digest: None,
         };
-        let rejected_ack = writer
-            .persist_inbound(&rejected)
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let rejected_receipt = admission
+            .receive_with_origin(&writer, &rejected)
             .await
             .expect("persist rejected command");
+        let rejected_ack = rejected_receipt.ack;
         assert_eq!(rejected_ack.status, CommandAckStatus::Rejected);
+        assert_eq!(rejected_receipt.events.len(), 1);
+        assert!(matches!(
+            &rejected_receipt.events[0],
+            (
+                _,
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    disposition: CommandDisposition::Rejected { .. },
+                    ..
+                })
+            )
+        ));
 
         let envelope: String = sqlx::query_scalar(
             "SELECT envelope FROM agent_events WHERE event_type='command_disposition'",
@@ -18517,12 +18603,14 @@ mod tests {
             "public disposition must not expose provenance, personality-agent identity, or command body"
         );
 
-        assert_eq!(
-            writer
-                .persist_inbound(&rejected)
-                .await
-                .expect("replay rejected command"),
-            rejected_ack
+        let replay = admission
+            .receive_with_origin(&writer, &rejected)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.ack, rejected_ack);
+        assert!(
+            replay.events.is_empty(),
+            "gateway catch-up owns replayed dispositions"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -21322,6 +21410,12 @@ mod tests {
         let command_id = "018f0000-0000-7000-8000-000000000001";
         let canonical = test_user_message_id(command_id);
         assert_eq!(canonical, test_user_message_id(command_id));
+        assert_eq!(
+            canonical,
+            crate::gateway::wire::user_message_id_from_command_id(command_id)
+                .expect("public wire message id"),
+            "Store projection must use the public command-to-message namespace"
+        );
         assert_eq!(
             Uuid::parse_str(&canonical)
                 .expect("derived message UUID")
