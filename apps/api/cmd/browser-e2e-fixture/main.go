@@ -4,9 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -45,6 +42,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	preissuedSession, err := browserSessions.IssueSession(
+		context.Background(),
+		agentevents.UserSessionClaims{
+			TenantID:           "tenant",
+			UserID:             "user",
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		},
+		time.Hour,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Use the same production router as cmd/server so the E2E journey exercises
 	// production wiring. We do not expose the agent WebSocket boundary in this
@@ -56,7 +65,7 @@ func main() {
 
 	fixture := newFixture(store, gateway)
 	mux.HandleFunc("GET /__e2e__/session", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signSession(), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: agentevents.BrowserSessionCookie, Value: preissuedSession, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("POST /__e2e__/emit-terminal", fixture.emitTerminal)
@@ -214,13 +223,4 @@ func (f *fixture) volatile(event string) {
 	if err != nil {
 		log.Printf("fixture volatile event: %v", err)
 	}
-}
-
-func signSession() string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payload, _ := json.Marshal(map[string]any{"tenant_id": "tenant", "user_id": "user", "personality_agent_id": "018f47a2-9b3c-7def-8abc-0123456789ab", "exp": time.Now().Add(time.Hour).Unix(), "aud": agentevents.DefaultBrowserAudience()})
-	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(header + "." + encoded))
-	return header + "." + encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }

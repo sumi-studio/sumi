@@ -176,7 +176,7 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
 
-	mux, _, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -187,6 +187,7 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("browser auth: %w", err)
 	}
 	if authEnabled {
+		authServer.Connections = browser
 		authServer.RegisterRoutes(mux)
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)

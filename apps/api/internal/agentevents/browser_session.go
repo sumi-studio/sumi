@@ -3,21 +3,34 @@ package agentevents
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	defaultBrowserAudience = "sumi:web:direct-chat"
+	maxBrowserSessionTTL   = time.Hour
+	maxRevokedSessions     = 4096
+	browserSessionIDBytes  = 32
 	// BrowserSessionCookie is the name of the signed HttpOnly session cookie
 	// used by browser routes.
 	BrowserSessionCookie = "sumi_session"
+)
+
+var (
+	errBrowserSessionMissing   = errors.New("browser session cookie is missing")
+	errBrowserSessionDuplicate = errors.New("duplicate browser session cookies")
+	errRevocationCapacity      = errors.New("browser session revocation capacity exhausted")
 )
 
 // DefaultBrowserAudience returns the default audience for browser session
@@ -32,6 +45,8 @@ type UserSessionClaims struct {
 	TenantID           string
 	UserID             string
 	PersonalityAgentID string
+	sessionID          string
+	expiresAt          time.Time
 }
 
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
@@ -43,6 +58,12 @@ type UserSessionVerifier interface {
 type HMACUserSessionVerifier struct {
 	secret   []byte
 	audience string
+	now      func() time.Time
+	random   io.Reader
+
+	lifecycleMu sync.RWMutex
+	revoked     map[string]int64
+	maxRevoked  int
 }
 
 // BrowserSessionIssuer creates the same short-lived signed session consumed by
@@ -52,12 +73,31 @@ type BrowserSessionIssuer interface {
 	IssueSession(ctx context.Context, claims UserSessionClaims, ttl time.Duration) (string, error)
 }
 
+// UserSessionAuthorizer serializes command admission against logout.
+type UserSessionAuthorizer interface {
+	UserSessionVerifier
+	AuthorizeSession(ctx context.Context, claims UserSessionClaims, operation func() error) error
+}
+
+// BrowserSessionLifecycle owns issuance and process-local revocation in
+// addition to command admission. Revocations are retained until signed expiry
+// in a deliberately bounded in-memory set. A deployment with multiple API
+// processes must replace this process-local authority with a shared store and
+// connection fan-out before claiming cross-process immediate logout.
+type BrowserSessionLifecycle interface {
+	UserSessionAuthorizer
+	BrowserSessionIssuer
+	RevokeSession(ctx context.Context, signedCookie string) (UserSessionClaims, error)
+}
+
 type userSessionWireClaims struct {
 	TenantID           string `json:"tenant_id"`
 	UserID             string `json:"user_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
+	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
 	Aud                string `json:"aud"`
+	SID                string `json:"sid"`
 }
 
 func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessionVerifier, error) {
@@ -67,7 +107,14 @@ func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessio
 	if audience == "" {
 		audience = defaultBrowserAudience
 	}
-	return &HMACUserSessionVerifier{secret: append([]byte(nil), secret...), audience: audience}, nil
+	return &HMACUserSessionVerifier{
+		secret:     append([]byte(nil), secret...),
+		audience:   audience,
+		now:        time.Now,
+		random:     rand.Reader,
+		revoked:    make(map[string]int64),
+		maxRevoked: maxRevokedSessions,
+	}, nil
 }
 
 // IssueSession signs a bounded-lifetime browser session using the verifier's
@@ -90,17 +137,25 @@ func (v *HMACUserSessionVerifier) IssueSession(
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
 		return "", fmt.Errorf("browser session personality_agent_id: %w", err)
 	}
-	if ttl < time.Minute || ttl > time.Hour {
+	if ttl < time.Minute || ttl > maxBrowserSessionTTL {
 		return "", errors.New("browser session TTL must be between one minute and one hour")
 	}
+	sessionIDBytes := make([]byte, browserSessionIDBytes)
+	if _, err := io.ReadFull(v.random, sessionIDBytes); err != nil {
+		return "", fmt.Errorf("generate browser session ID: %w", err)
+	}
+	now := v.now().UTC().Truncate(time.Second)
+	sessionID := base64.RawURLEncoding.EncodeToString(sessionIDBytes)
 
 	headerPart := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, err := json.Marshal(userSessionWireClaims{
 		TenantID:           claims.TenantID,
 		UserID:             claims.UserID,
 		PersonalityAgentID: claims.PersonalityAgentID,
-		Exp:                time.Now().Add(ttl).Unix(),
+		Iat:                now.Unix(),
+		Exp:                now.Add(ttl).Unix(),
 		Aud:                v.audience,
+		SID:                sessionID,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal browser session claims: %w", err)
@@ -117,6 +172,19 @@ func (v *HMACUserSessionVerifier) IssueSession(
 }
 
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
+	claims, err := v.verifySignedSession(ctx, signedCookie)
+	if err != nil {
+		return UserSessionClaims{}, err
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if _, revoked := v.revoked[claims.sessionID]; revoked {
+		return UserSessionClaims{}, errors.New("browser session revoked")
+	}
+	return claims, nil
+}
+
+func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
 	select {
 	case <-ctx.Done():
 		return UserSessionClaims{}, ctx.Err()
@@ -173,18 +241,118 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
 		!provenanceIDRegexp.MatchString(claims.UserID) ||
 		claims.PersonalityAgentID == "" ||
-		claims.Exp == 0 {
+		claims.Iat == 0 ||
+		claims.Exp == 0 ||
+		!validBrowserSessionID(claims.SID) {
 		return UserSessionClaims{}, errors.New("browser session missing required claims")
 	}
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
 		return UserSessionClaims{}, fmt.Errorf("browser session personality_agent_id: %w", err)
 	}
-	if time.Now().Unix() >= claims.Exp || claims.Aud != v.audience {
+	now := v.now().Unix()
+	if now >= claims.Exp ||
+		claims.Iat > now ||
+		claims.Exp <= claims.Iat ||
+		claims.Exp-claims.Iat > int64(maxBrowserSessionTTL/time.Second) ||
+		claims.Aud != v.audience {
 		return UserSessionClaims{}, errors.New("browser session expired or audience mismatch")
 	}
 	return UserSessionClaims{
 		TenantID:           claims.TenantID,
 		UserID:             claims.UserID,
 		PersonalityAgentID: claims.PersonalityAgentID,
+		sessionID:          claims.SID,
+		expiresAt:          time.Unix(claims.Exp, 0),
 	}, nil
+}
+
+func validBrowserSessionID(sessionID string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(sessionID)
+	return err == nil &&
+		len(decoded) == browserSessionIDBytes &&
+		base64.RawURLEncoding.EncodeToString(decoded) == sessionID
+}
+
+func uniqueBrowserSessionCookie(r *http.Request) (*http.Cookie, error) {
+	cookies := r.CookiesNamed(BrowserSessionCookie)
+	switch len(cookies) {
+	case 0:
+		return nil, errBrowserSessionMissing
+	case 1:
+		return cookies[0], nil
+	default:
+		return nil, errBrowserSessionDuplicate
+	}
+}
+
+func browserSessionOperationContext(
+	parent context.Context,
+	claims UserSessionClaims,
+) (context.Context, context.CancelFunc) {
+	if claims.expiresAt.IsZero() {
+		return context.WithCancel(parent)
+	}
+	return context.WithDeadline(parent, claims.expiresAt)
+}
+
+// AuthorizeSession holds a read lease across a security-sensitive operation.
+// Logout takes the write lease, so its successful response is a barrier after
+// which no command from that session can be appended.
+func (v *HMACUserSessionVerifier) AuthorizeSession(
+	ctx context.Context,
+	claims UserSessionClaims,
+	operation func() error,
+) error {
+	if operation == nil {
+		return errors.New("browser session authorization operation is required")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	v.lifecycleMu.RLock()
+	defer v.lifecycleMu.RUnlock()
+	if claims.sessionID == "" || !validBrowserSessionID(claims.sessionID) {
+		return errors.New("browser session has invalid lifecycle claims")
+	}
+	if _, revoked := v.revoked[claims.sessionID]; revoked {
+		return errors.New("browser session revoked")
+	}
+	if !v.now().Before(claims.expiresAt) {
+		return errors.New("browser session expired")
+	}
+	return operation()
+}
+
+// RevokeSession invalidates one signed browser session until its expiration.
+// Revocations are process-local and time-bounded; callers must treat a full
+// revocation set as an unavailable logout rather than evicting a live entry.
+func (v *HMACUserSessionVerifier) RevokeSession(
+	ctx context.Context,
+	signedCookie string,
+) (UserSessionClaims, error) {
+	claims, err := v.verifySignedSession(ctx, signedCookie)
+	if err != nil {
+		return UserSessionClaims{}, err
+	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
+	now := v.now().Unix()
+	if now >= claims.expiresAt.Unix() {
+		return UserSessionClaims{}, errors.New("browser session expired")
+	}
+	for sessionID, exp := range v.revoked {
+		if now >= exp {
+			delete(v.revoked, sessionID)
+		}
+	}
+	if _, exists := v.revoked[claims.sessionID]; exists {
+		return claims, nil
+	}
+	if len(v.revoked) >= v.maxRevoked {
+		return UserSessionClaims{}, errRevocationCapacity
+	}
+	v.revoked[claims.sessionID] = claims.expiresAt.Unix()
+	return claims, nil
 }

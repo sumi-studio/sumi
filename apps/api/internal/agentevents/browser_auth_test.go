@@ -33,6 +33,14 @@ type fakeBindingResolver struct {
 	calls  int
 }
 
+type fakeBrowserConnectionCloser struct {
+	sessionIDs []string
+}
+
+func (f *fakeBrowserConnectionCloser) CloseBrowserSession(sessionID string) {
+	f.sessionIDs = append(f.sessionIDs, sessionID)
+}
+
 func (f *fakeBindingResolver) ResolveIdentity(
 	_ context.Context,
 	_ FirebaseIdentity,
@@ -137,7 +145,9 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify session cookie: %v", err)
 	}
-	if claims != bindings.claims {
+	if claims.TenantID != bindings.claims.TenantID ||
+		claims.UserID != bindings.claims.UserID ||
+		claims.PersonalityAgentID != bindings.claims.PersonalityAgentID {
 		t.Fatalf("got %+v, want %+v", claims, bindings.claims)
 	}
 
@@ -346,6 +356,78 @@ func TestBrowserAuthLogoutClearsSessionAndCSRF(t *testing.T) {
 	}
 }
 
+func TestBrowserAuthLogoutRevokesSessionAndClosesOnlyItsConnections(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{}
+	bindings := &fakeBindingResolver{}
+	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
+	closer := &fakeBrowserConnectionCloser{}
+	server.Connections = closer
+	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := sessions.VerifySession(context.Background(), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf, csrfCookie := obtainCSRF(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.Header.Set("Origin", browserAuthTestOrigin)
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.AddCookie(csrfCookie)
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: session})
+	recorder := httptest.NewRecorder()
+	server.serveLogout(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("got %d, want 204", recorder.Code)
+	}
+	if _, err := sessions.VerifySession(context.Background(), session); err == nil {
+		t.Fatal("logout left the session valid")
+	}
+	if len(closer.sessionIDs) != 1 || closer.sessionIDs[0] != claims.sessionID {
+		t.Fatalf("closed sessions %v, want %q", closer.sessionIDs, claims.sessionID)
+	}
+}
+
+func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
+	bindings := &fakeBindingResolver{}
+	server, _ := newTestBrowserAuthServer(t, firebase, bindings)
+	csrf, csrfCookie := obtainCSRF(t, server)
+	duplicate := &http.Cookie{Name: BrowserSessionCookie, Value: "one"}
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "exchange", method: http.MethodPost, path: "/auth/session", call: server.serveSessionExchange},
+		{name: "status", method: http.MethodGet, path: "/auth/session", call: server.serveSessionStatus},
+		{name: "logout", method: http.MethodPost, path: "/auth/logout", call: server.serveLogout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"id_token":"token"}`))
+			req.Header.Set("Origin", browserAuthTestOrigin)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-CSRF-Token", csrf)
+			req.AddCookie(csrfCookie)
+			req.AddCookie(duplicate)
+			req.AddCookie(duplicate)
+			recorder := httptest.NewRecorder()
+			tc.call(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400", recorder.Code)
+			}
+		})
+	}
+}
+
 func TestStaticIdentityBindingResolverAllowsOnlyConfiguredUID(t *testing.T) {
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
@@ -362,5 +444,18 @@ func TestStaticIdentityBindingResolverAllowsOnlyConfiguredUID(t *testing.T) {
 	}
 	if _, err := resolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "other-uid"}); err == nil {
 		t.Fatal("expected all unconfigured UIDs to be denied")
+	}
+	if _, err := resolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid", TenantID: "tenant-auth"}); err == nil {
+		t.Fatal("tenant token must be denied without an explicit Firebase tenant binding")
+	}
+	tenantResolver, err := NewStaticIdentityBindingResolverForTenant("allowed-uid", "tenant-auth", claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenantResolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid"}); err == nil {
+		t.Fatal("non-tenant token must not satisfy an explicit Firebase tenant binding")
+	}
+	if _, err := tenantResolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid", TenantID: "tenant-auth"}); err != nil {
+		t.Fatalf("explicit tenant binding rejected: %v", err)
 	}
 }

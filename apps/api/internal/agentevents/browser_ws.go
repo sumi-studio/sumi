@@ -17,7 +17,7 @@ import (
 // accepts an agent bearer token or public target: the signed HttpOnly session
 // supplies the target and authenticated provenance.
 type BrowserServer struct {
-	Sessions UserSessionVerifier
+	Sessions UserSessionAuthorizer
 	Appender CommandAppender
 	Events   *DurableGateway
 
@@ -30,8 +30,13 @@ type BrowserServer struct {
 
 	upgrader      websocket.Upgrader
 	connectionsMu sync.Mutex
-	connections   map[*websocket.Conn]struct{}
+	connections   map[*websocket.Conn]browserConnection
 	accepted      uint64
+}
+
+type browserConnection struct {
+	sessionID string
+	conn      *websocket.Conn
 }
 
 // BrowserConnectionStats is a point-in-time view of the browser WebSocket
@@ -229,7 +234,7 @@ type browserCommandHead struct {
 	RequestID string `json:"request_id"`
 }
 
-func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, events *DurableGateway) *BrowserServer {
+func NewBrowserServer(sessions UserSessionAuthorizer, appender CommandAppender, events *DurableGateway) *BrowserServer {
 	s := &BrowserServer{
 		Sessions:     sessions,
 		Appender:     appender,
@@ -239,7 +244,7 @@ func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, ev
 		MaxReadLimit: MaxUserCommandBytes + 16*1024,
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
-	s.connections = make(map[*websocket.Conn]struct{})
+	s.connections = make(map[*websocket.Conn]browserConnection)
 	return s
 }
 
@@ -272,8 +277,12 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "browser websocket not configured", http.StatusServiceUnavailable)
 		return
 	}
-	cookie, err := r.Cookie(BrowserSessionCookie)
+	cookie, err := uniqueBrowserSessionCookie(r)
 	if err != nil {
+		if errors.Is(err, errBrowserSessionDuplicate) {
+			http.Error(w, "duplicate session cookies", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "missing session", http.StatusUnauthorized)
 		return
 	}
@@ -286,7 +295,18 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s.addConnection(conn)
+	if err := s.Sessions.AuthorizeSession(r.Context(), claims, func() error {
+		s.addConnection(conn, claims.sessionID)
+		return nil
+	}); err != nil {
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session unavailable"),
+			time.Now().Add(s.writeTimeout()),
+		)
+		_ = conn.Close()
+		return
+	}
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if err := s.run(r.Context(), conn, claims); err != nil && !errors.Is(err, context.Canceled) {
@@ -306,6 +326,32 @@ func (s *BrowserServer) CloseBrowserConnections() {
 	s.connectionsMu.Unlock()
 	for _, conn := range connections {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway reconnect"), time.Now().Add(s.writeTimeout()))
+		_ = conn.Close()
+	}
+}
+
+// CloseBrowserSession terminates only live sockets authorized by the matching
+// process-local session. RevokeSession prevents a concurrent post-upgrade
+// registration from escaping this close barrier.
+func (s *BrowserServer) CloseBrowserSession(sessionID string) {
+	if !validBrowserSessionID(sessionID) {
+		return
+	}
+	s.connectionsMu.Lock()
+	connections := make([]*websocket.Conn, 0)
+	for _, connection := range s.connections {
+		if connection.sessionID == sessionID {
+			connections = append(connections, connection.conn)
+		}
+	}
+	s.connectionsMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session ended"),
+			time.Now().Add(s.writeTimeout()),
+		)
+		_ = conn.Close()
 	}
 }
 
@@ -318,10 +364,10 @@ func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
 	}
 }
 
-func (s *BrowserServer) addConnection(conn *websocket.Conn) {
+func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string) {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
-	s.connections[conn] = struct{}{}
+	s.connections[conn] = browserConnection{sessionID: sessionID, conn: conn}
 	s.accepted++
 }
 
@@ -337,7 +383,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(s.helloTimeout())); err != nil {
+	if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.helloTimeout())); err != nil {
 		return err
 	}
 	_, raw, err := conn.ReadMessage()
@@ -358,10 +404,10 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	// next PongWait interval.
 	if s.pongWait() > 0 {
 		conn.SetPongHandler(func(string) error {
-			_ = conn.SetReadDeadline(time.Now().Add(s.pongWait()))
+			_ = conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait()))
 			return nil
 		})
-		if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+		if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait())); err != nil {
 			return err
 		}
 	}
@@ -521,7 +567,7 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 			return err
 		}
 		if s.pongWait() > 0 {
-			if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+			if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait())); err != nil {
 				return err
 			}
 		}
@@ -549,8 +595,20 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 			}
 			continue
 		}
-		envelope, err := s.Appender.Append(ctx, directChatProvenance(claims), frame.IdempotencyKey, frame.Command)
+		var envelope CommandEnvelope
+		operationCalled := false
+		operationContext, cancelOperation := browserSessionOperationContext(ctx, claims)
+		err = s.Sessions.AuthorizeSession(ctx, claims, func() error {
+			operationCalled = true
+			var appendErr error
+			envelope, appendErr = s.Appender.Append(operationContext, directChatProvenance(claims), frame.IdempotencyKey, frame.Command)
+			return appendErr
+		})
+		cancelOperation()
 		if err != nil {
+			if !operationCalled {
+				return errors.New("browser session authority ended")
+			}
 			if errors.Is(err, errBrowserRuntimeUnavailable) {
 				if writeErr := write(browserCommandRejectedFrame{
 					Type:           "command_rejected",
@@ -676,4 +734,12 @@ func (s *BrowserServer) pingInterval() time.Duration {
 		return s.PingInterval
 	}
 	return 54 * time.Second
+}
+
+func (s *BrowserServer) sessionReadDeadline(claims UserSessionClaims, interval time.Duration) time.Time {
+	deadline := time.Now().Add(interval)
+	if !claims.expiresAt.IsZero() && claims.expiresAt.Before(deadline) {
+		return claims.expiresAt
+	}
+	return deadline
 }

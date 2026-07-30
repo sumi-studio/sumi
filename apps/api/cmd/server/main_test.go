@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
@@ -41,14 +42,30 @@ type testSessionClaims struct {
 	TenantID           string `json:"tenant_id"`
 	UserID             string `json:"user_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
+	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
 	Aud                string `json:"aud"`
+	SID                string `json:"sid"`
 }
 
 type testCommandReceipt struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	CommandID      string `json:"command_id"`
 	Seq            uint64 `json:"seq"`
+}
+
+type fakeFirebaseIDTokenClient struct {
+	token *firebaseauth.Token
+	err   error
+	calls int
+}
+
+func (f *fakeFirebaseIDTokenClient) VerifyIDTokenAndCheckRevoked(
+	_ context.Context,
+	_ string,
+) (*firebaseauth.Token, error) {
+	f.calls++
+	return f.token, f.err
 }
 
 func signTestToken(t *testing.T, secret []byte, claims testTokenClaims) string {
@@ -68,6 +85,12 @@ func signTestToken(t *testing.T, secret []byte, claims testTokenClaims) string {
 
 func signTestSession(t *testing.T, secret []byte, claims testSessionClaims) string {
 	t.Helper()
+	if claims.Iat == 0 && claims.Exp != 0 {
+		claims.Iat = claims.Exp - int64(time.Hour/time.Second)
+	}
+	if claims.SID == "" {
+		claims.SID = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	}
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	claimsBytes, err := json.Marshal(claims)
 	if err != nil {
@@ -212,6 +235,36 @@ func TestBrowserAuthDisabledWithoutExplicitFirebaseUID(t *testing.T) {
 	}
 	if enabled || server != nil {
 		t.Fatal("auth routes must remain disabled without explicit Firebase UID binding")
+	}
+}
+
+func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
+	client := &fakeFirebaseIDTokenClient{token: &firebaseauth.Token{
+		UID:      "firebase-user",
+		Firebase: firebaseauth.FirebaseInfo{Tenant: "firebase-tenant"},
+	}}
+	verifier := &firebaseAdminIDTokenVerifier{client: client}
+	identity, err := verifier.VerifyIDToken(context.Background(), "id-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("revocation-aware verification calls = %d, want 1", client.calls)
+	}
+	if identity.UID != "firebase-user" || identity.TenantID != "firebase-tenant" {
+		t.Fatalf("unexpected identity: %+v", identity)
+	}
+}
+
+func TestBrowserAuthOptionalOnlyConfigurationFailsClosed(t *testing.T) {
+	t.Setenv("SUMI_AUTH_FIREBASE_UID", "")
+	t.Setenv("SUMI_AUTH_SESSION_TTL", "20m")
+	if _, _, err := browserAuthServerFromEnv(
+		context.Background(),
+		nil,
+		[]string{testBrowserOrigin},
+	); err == nil || !strings.Contains(err.Error(), "SUMI_AUTH_FIREBASE_UID") {
+		t.Fatalf("partial SUMI_AUTH_* configuration did not fail startup: %v", err)
 	}
 }
 

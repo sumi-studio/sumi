@@ -238,6 +238,20 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 			}
 		})
 	}
+
+	header := http.Header{
+		"Origin": {"https://web.example"},
+		"Cookie": {
+			BrowserSessionCookie + "=one; " + BrowserSessionCookie + "=two",
+		},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected duplicate cookie rejection, response=%v err=%v", response, err)
+	}
 }
 
 func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
@@ -282,6 +296,146 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	}
 	assertBrowserEvent(t, second, "agent_end", true)
 	assertDirectChatStatus(t, second, "unavailable")
+}
+
+func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionClaims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+	}
+	firstSession, err := sessions.IssueSession(context.Background(), sessionClaims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSession, err := sessions.IssueSession(context.Background(), sessionClaims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := dialBrowserWS(t, httpServer, firstSession, personalityAgentID)
+	defer first.Close()
+	second := dialBrowserWS(t, httpServer, secondSession, personalityAgentID)
+	defer second.Close()
+	for _, conn := range []*websocket.Conn{first, second} {
+		if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+			t.Fatal(err)
+		}
+		assertDirectChatStatus(t, conn, "ready")
+	}
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 2, Accepted: 2})
+
+	auth, err := NewBrowserAuthServer(
+		&fakeFirebaseVerifier{},
+		&fakeBindingResolver{},
+		sessions,
+		[]string{browserAuthTestOrigin},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.Connections = browser
+	csrf, csrfCookie := obtainCSRF(t, auth)
+	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logout.Header.Set("Origin", browserAuthTestOrigin)
+	logout.Header.Set("X-CSRF-Token", csrf)
+	logout.AddCookie(csrfCookie)
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: firstSession})
+	logoutRecorder := httptest.NewRecorder()
+	auth.serveLogout(logoutRecorder, logout)
+	if logoutRecorder.Code != http.StatusNoContent {
+		t.Fatalf("logout: %d %s", logoutRecorder.Code, logoutRecorder.Body.String())
+	}
+	assertBrowserConnectionClosedBeforeFrame(t, first)
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 1, Accepted: 2})
+
+	command := browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "still-authorized",
+		Command:        json.RawMessage(`{"type":"user_message","text":"hi","attachments":[]}`),
+	}
+	if err := second.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var accepted browserCommandAcceptedFrame
+	if err := second.ReadJSON(&accepted); err != nil {
+		t.Fatalf("unrelated session was closed: %v", err)
+	}
+	if accepted.Type != "command_accepted" {
+		t.Fatalf("unexpected command result: %+v", accepted)
+	}
+
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	header := http.Header{
+		"Origin": {"https://web.example"},
+		"Cookie": {BrowserSessionCookie + "=" + firstSession},
+	}
+	reconnected, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if reconnected != nil {
+		reconnected.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked session reconnected: response=%v err=%v", response, err)
+	}
+}
+
+func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	expires := time.Now().Add(2 * time.Second).Unix()
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Iat:                expires - int64(time.Minute/time.Second),
+		Exp:                expires,
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, session, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("session remained live past its signed expiry")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("client deadline elapsed before the server closed expired session: %v", err)
+	}
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 0, Accepted: 1})
 }
 
 func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
@@ -359,6 +513,12 @@ func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn
 
 func signBrowserSession(t *testing.T, secret []byte, claims userSessionWireClaims) string {
 	t.Helper()
+	if claims.Iat == 0 && claims.Exp != 0 {
+		claims.Iat = claims.Exp - int64(maxBrowserSessionTTL/time.Second)
+	}
+	if claims.SID == "" {
+		claims.SID = base64.RawURLEncoding.EncodeToString(make([]byte, browserSessionIDBytes))
+	}
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, err := json.Marshal(claims)
 	if err != nil {

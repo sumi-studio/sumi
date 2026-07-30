@@ -21,7 +21,11 @@ const (
 )
 
 type firebaseAdminIDTokenVerifier struct {
-	client *firebaseauth.Client
+	client firebaseIDTokenClient
+}
+
+type firebaseIDTokenClient interface {
+	VerifyIDTokenAndCheckRevoked(ctx context.Context, idToken string) (*firebaseauth.Token, error)
 }
 
 func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
@@ -31,14 +35,14 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 	if v == nil || v.client == nil {
 		return agentevents.FirebaseIdentity{}, errors.New("Firebase verifier is unavailable")
 	}
-	token, err := v.client.VerifyIDToken(ctx, idToken)
+	token, err := v.client.VerifyIDTokenAndCheckRevoked(ctx, idToken)
 	if err != nil {
 		return agentevents.FirebaseIdentity{}, err
 	}
-	if token.UID == "" {
+	if token == nil || token.UID == "" {
 		return agentevents.FirebaseIdentity{}, errors.New("verified Firebase token has no UID")
 	}
-	return agentevents.FirebaseIdentity{UID: token.UID}, nil
+	return agentevents.FirebaseIdentity{UID: token.UID, TenantID: token.Firebase.Tenant}, nil
 }
 
 // browserAuthServerFromEnv creates the Firebase exchange boundary only when
@@ -51,6 +55,19 @@ func browserAuthServerFromEnv(
 ) (*agentevents.BrowserAuthServer, bool, error) {
 	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
 	if firebaseUID == "" {
+		for _, name := range []string{
+			"SUMI_AUTH_FIREBASE_TENANT_ID",
+			"SUMI_AUTH_TENANT_ID",
+			"SUMI_AUTH_USER_ID",
+			"SUMI_AUTH_PERSONALITY_AGENT_ID",
+			"SUMI_AUTH_FIREBASE_PROJECT_ID",
+			"SUMI_AUTH_ALLOW_INSECURE_COOKIES",
+			"SUMI_AUTH_SESSION_TTL",
+		} {
+			if strings.TrimSpace(os.Getenv(name)) != "" {
+				return nil, false, errors.New("SUMI_AUTH_FIREBASE_UID is required when any SUMI_AUTH_* setting is configured")
+			}
+		}
 		return nil, false, nil
 	}
 	if sessions == nil {
@@ -72,8 +89,10 @@ func browserAuthServerFromEnv(
 		return nil, false, errors.New("SUMI_AUTH_FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT is required when Firebase auth is enabled")
 	}
 
-	bindings, err := agentevents.NewStaticIdentityBindingResolver(
+	firebaseTenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_TENANT_ID"))
+	bindings, err := agentevents.NewStaticIdentityBindingResolverForTenant(
 		firebaseUID,
+		firebaseTenantID,
 		agentevents.UserSessionClaims{
 			TenantID:           tenantID,
 			UserID:             userID,
@@ -92,6 +111,14 @@ func browserAuthServerFromEnv(
 	if err != nil {
 		return nil, false, fmt.Errorf("initialize Firebase Auth client: %w", err)
 	}
+	var verifierClient firebaseIDTokenClient = client
+	if firebaseTenantID != "" {
+		tenantClient, err := client.TenantManager.AuthForTenant(firebaseTenantID)
+		if err != nil {
+			return nil, false, fmt.Errorf("initialize Firebase tenant Auth client: %w", err)
+		}
+		verifierClient = tenantClient
+	}
 
 	secureCookies := true
 	if raw := strings.TrimSpace(os.Getenv("SUMI_AUTH_ALLOW_INSECURE_COOKIES")); raw != "" {
@@ -103,7 +130,7 @@ func browserAuthServerFromEnv(
 	}
 
 	server, err := agentevents.NewBrowserAuthServer(
-		&firebaseAdminIDTokenVerifier{client: client},
+		&firebaseAdminIDTokenVerifier{client: verifierClient},
 		bindings,
 		sessions,
 		allowedOrigins,

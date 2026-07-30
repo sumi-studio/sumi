@@ -25,7 +25,8 @@ const (
 // FirebaseIdentity contains only the stable server-verified Firebase
 // principal needed for Sumi identity binding.
 type FirebaseIdentity struct {
-	UID string
+	UID      string
+	TenantID string
 }
 
 // FirebaseIDTokenVerifier verifies a Firebase client ID token server-side.
@@ -44,16 +45,31 @@ type IdentityBindingResolver interface {
 // exactly one configured Firebase UID maps to exactly one server-owned Sumi
 // principal. Every other external identity is denied.
 type StaticIdentityBindingResolver struct {
-	firebaseUID string
-	claims      UserSessionClaims
+	firebaseUID      string
+	firebaseTenantID string
+	claims           UserSessionClaims
 }
 
 func NewStaticIdentityBindingResolver(
 	firebaseUID string,
 	claims UserSessionClaims,
 ) (*StaticIdentityBindingResolver, error) {
+	return NewStaticIdentityBindingResolverForTenant(firebaseUID, "", claims)
+}
+
+// NewStaticIdentityBindingResolverForTenant explicitly binds both the
+// Firebase UID and, when non-empty, its Identity Platform tenant. An
+// unconfigured tenant binding accepts only non-tenant Firebase tokens.
+func NewStaticIdentityBindingResolverForTenant(
+	firebaseUID string,
+	firebaseTenantID string,
+	claims UserSessionClaims,
+) (*StaticIdentityBindingResolver, error) {
 	if firebaseUID == "" || len(firebaseUID) > 128 {
 		return nil, errors.New("Firebase UID binding must be between 1 and 128 bytes")
+	}
+	if len(firebaseTenantID) > 128 {
+		return nil, errors.New("Firebase tenant binding must not exceed 128 bytes")
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
 		!provenanceIDRegexp.MatchString(claims.UserID) {
@@ -63,8 +79,9 @@ func NewStaticIdentityBindingResolver(
 		return nil, errors.New("identity binding has invalid personality-agent ID")
 	}
 	return &StaticIdentityBindingResolver{
-		firebaseUID: firebaseUID,
-		claims:      claims,
+		firebaseUID:      firebaseUID,
+		firebaseTenantID: firebaseTenantID,
+		claims:           claims,
 	}, nil
 }
 
@@ -77,15 +94,18 @@ func (r *StaticIdentityBindingResolver) ResolveIdentity(
 		return UserSessionClaims{}, ctx.Err()
 	default:
 	}
-	if identity.UID != r.firebaseUID {
+	if identity.UID != r.firebaseUID || identity.TenantID != r.firebaseTenantID {
 		return UserSessionClaims{}, errors.New("Firebase identity is not bound")
 	}
 	return r.claims, nil
 }
 
 type browserSessionManager interface {
-	UserSessionVerifier
-	BrowserSessionIssuer
+	BrowserSessionLifecycle
+}
+
+type BrowserSessionConnectionCloser interface {
+	CloseBrowserSession(sessionID string)
 }
 
 // BrowserAuthServer exchanges verified Firebase identities for the same
@@ -97,6 +117,7 @@ type BrowserAuthServer struct {
 	AllowedOrigins []string
 	SecureCookies  bool
 	SessionTTL     time.Duration
+	Connections    BrowserSessionConnectionCloser
 	random         io.Reader
 }
 
@@ -156,6 +177,10 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}
+	if len(r.CookiesNamed(BrowserSessionCookie)) > 1 {
+		writeBrowserAuthError(w, http.StatusBadRequest, "duplicate session cookies")
+		return
+	}
 	if !hasJSONContentType(r.Header.Get("Content-Type")) {
 		writeBrowserAuthError(w, http.StatusUnsupportedMediaType, "application/json required")
 		return
@@ -208,8 +233,12 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 	if !s.allowSafeReadOrigin(w, r) {
 		return
 	}
-	cookie, err := r.Cookie(BrowserSessionCookie)
+	cookie, err := uniqueBrowserSessionCookie(r)
 	if err != nil {
+		if errors.Is(err, errBrowserSessionDuplicate) {
+			writeBrowserAuthError(w, http.StatusBadRequest, "duplicate session cookies")
+			return
+		}
 		writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 		return
 	}
@@ -234,6 +263,24 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) {
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
+	}
+	cookie, err := uniqueBrowserSessionCookie(r)
+	if err != nil && !errors.Is(err, errBrowserSessionMissing) {
+		writeBrowserAuthError(w, http.StatusBadRequest, "duplicate session cookies")
+		return
+	}
+	if err == nil {
+		claims, revokeErr := s.Sessions.RevokeSession(r.Context(), cookie.Value)
+		if revokeErr == nil {
+			if s.Connections != nil {
+				s.Connections.CloseBrowserSession(claims.sessionID)
+			}
+		} else if errors.Is(revokeErr, errRevocationCapacity) ||
+			errors.Is(revokeErr, context.Canceled) ||
+			errors.Is(revokeErr, context.DeadlineExceeded) {
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			return
+		}
 	}
 	http.SetCookie(w, s.sessionCookie("", -1))
 	http.SetCookie(w, s.csrfCookie("", -1))

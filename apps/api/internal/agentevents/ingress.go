@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 	"unicode/utf8"
 )
 
@@ -61,7 +62,7 @@ type CommandAppender interface {
 // commands.
 type UserCommandIngress struct {
 	Appender       CommandAppender
-	Sessions       UserSessionVerifier
+	Sessions       UserSessionAuthorizer
 	MaxBytes       int64
 	AllowedOrigins []string
 }
@@ -74,7 +75,7 @@ var errCommandAppenderRequired = errors.New("CommandAppender is required")
 // fail-closed allowlist. Once an origin is accepted, a nil Sessions verifier
 // causes the request to be rejected with 401 until a production
 // UserSessionVerifier is wired.
-func NewUserCommandIngress(appender CommandAppender, sessions UserSessionVerifier) (*UserCommandIngress, error) {
+func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthorizer) (*UserCommandIngress, error) {
 	if appender == nil {
 		return nil, errCommandAppenderRequired
 	}
@@ -92,8 +93,12 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cookie, err := r.Cookie(BrowserSessionCookie)
+	cookie, err := uniqueBrowserSessionCookie(r)
 	if err != nil || h.Sessions == nil {
+		if errors.Is(err, errBrowserSessionDuplicate) {
+			http.Error(w, "duplicate session cookies", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "missing session", http.StatusUnauthorized)
 		return
 	}
@@ -129,8 +134,22 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	env, err := h.Appender.Append(r.Context(), directChatProvenance(claims), idempotencyKey, raw)
+	var env CommandEnvelope
+	operationCalled := false
+	operationContext, cancelOperation := browserSessionOperationContext(r.Context(), claims)
+	defer cancelOperation()
+	err = h.Sessions.AuthorizeSession(r.Context(), claims, func() error {
+		operationCalled = true
+		var appendErr error
+		env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
+		return appendErr
+	})
 	if err != nil {
+		if !operationCalled ||
+			(errors.Is(err, context.DeadlineExceeded) && !time.Now().Before(claims.expiresAt)) {
+			http.Error(w, "invalid session", http.StatusUnauthorized)
+			return
+		}
 		if errors.Is(err, errBrowserRuntimeUnavailable) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)

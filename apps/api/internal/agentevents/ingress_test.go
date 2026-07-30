@@ -104,6 +104,17 @@ func (f *fakeSessionVerifier) VerifySession(ctx context.Context, cookie string) 
 	}, nil
 }
 
+func (f *fakeSessionVerifier) AuthorizeSession(
+	ctx context.Context,
+	claims UserSessionClaims,
+	operation func() error,
+) error {
+	if _, err := f.VerifySession(ctx, ""); err != nil {
+		return err
+	}
+	return operation()
+}
+
 func (f *fakeSessionVerifier) setReject(reject bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -531,6 +542,26 @@ func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 	}
 	if appender.callCount() != 0 {
 		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+}
+
+func TestUserCommandIngressRejectsDuplicateSessionCookies(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/direct-chat/commands",
+		strings.NewReader(`{"type":"user_message","text":"hi","attachments":[]}`),
+	)
+	req.Header.Set("Origin", testBrowserOrigin)
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: "one"})
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: "two"})
+	recorder := httptest.NewRecorder()
+	ingress.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", recorder.Code)
+	}
+	if appender.callCount() != 0 {
+		t.Fatal("duplicate session cookies reached command admission")
 	}
 }
 
