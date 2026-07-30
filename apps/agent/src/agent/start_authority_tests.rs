@@ -8,14 +8,16 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use super::{
-    AdmittedCommand, RunCompletion, RunControl, RunCore, RunOutput, RunWorker, Session,
-    SessionStartAuthority, WorkerFuture,
+    AdmittedCommand, InjectedRunDriver, RunCompletion, RunControl, RunCore, RunOutput, RunWorker,
+    SequentialRunWorker, Session, SessionStartAuthority, StreamStarter, WorkerFuture,
 };
 use crate::{
+    approval::{ApprovalBroker, Policy, SecretAwareActionProjector, SecretDigestKey},
     gateway::{
         AgentHello, ApiHello, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError,
         InboundCommand, OutboundFrame,
     },
+    provider::{ModelSpec, RequestOptions, types::PromptContext},
     runtime::{
         authority::RuntimeEpochAuthority,
         contracts::{
@@ -23,7 +25,11 @@ use crate::{
             RpcIdentity,
         },
     },
-    store::{HydratedRunState, HydrationOutcome, Store},
+    store::{HydratedRunState, HydrationOutcome, Redactor, Store},
+    tools::{
+        WorkspacePaths,
+        executor::{ExecutorClient, remote_executor_registry},
+    },
 };
 
 const PAID_A: &str = "0198f0f4-9b72-7000-8000-000000000001";
@@ -72,6 +78,42 @@ async fn data_key_count(store: &Store) -> i64 {
         .expect("count data keys")
 }
 
+fn approval_broker() -> Arc<ApprovalBroker> {
+    Arc::new(ApprovalBroker::headless(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+    ))
+}
+
+fn remote_worker(identity: RpcIdentity) -> Arc<dyn RunWorker> {
+    let registry = remote_executor_registry(Arc::new(ExecutorClient::new(
+        "/tmp/sumi-unused-session-executor.sock",
+        identity.clone(),
+    )))
+    .expect("remote registry");
+    let prompt = PromptContext {
+        system_prompt: "session identity fixture".to_owned(),
+        memory_blocks: Vec::new(),
+        messages: Vec::new(),
+        provider_context: Vec::new(),
+        tools: registry.definitions(),
+        replay_provenance: None,
+    };
+    let stream_starter: Arc<StreamStarter> =
+        Arc::new(|_, _, _, _, _| panic!("identity validation must not start a provider"));
+    let driver = InjectedRunDriver::with_stream_starter(
+        ModelSpec::preset("kimi-k3").expect("model"),
+        RequestOptions::default(),
+        Some(prompt),
+        Some(registry),
+        Some(WorkspacePaths::new("/workspace").expect("workspace")),
+        Some(identity.generation()),
+        stream_starter,
+    )
+    .expect("identity-bound driver");
+    Arc::new(SequentialRunWorker::new(Arc::new(driver)))
+}
+
 struct ProbeGateway {
     split_count: Arc<AtomicUsize>,
 }
@@ -112,14 +154,22 @@ impl Gateway for ProbeGateway {
 }
 
 struct ProbeWorker {
-    expected_generation: ProcessGeneration,
+    expected_identity: RpcIdentity,
     validation_count: Arc<AtomicUsize>,
 }
 
 impl RunWorker for ProbeWorker {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        self.validation_count.fetch_add(1, Ordering::SeqCst);
+        if identity != &self.expected_identity {
+            return Err(anyhow!("unexpected executor RPC identity"));
+        }
+        Ok(())
+    }
+
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         self.validation_count.fetch_add(1, Ordering::SeqCst);
-        if generation != self.expected_generation {
+        if generation != self.expected_identity.generation() {
             return Err(anyhow!("unexpected executor generation"));
         }
         Ok(())
@@ -136,7 +186,9 @@ impl RunWorker for ProbeWorker {
     }
 }
 
-fn probes() -> (
+fn probes(
+    expected_identity: RpcIdentity,
+) -> (
     ProbeGateway,
     Arc<AtomicUsize>,
     Arc<dyn RunWorker>,
@@ -150,7 +202,7 @@ fn probes() -> (
         },
         split_count,
         Arc::new(ProbeWorker {
-            expected_generation: generation(),
+            expected_identity,
             validation_count: validation_count.clone(),
         }),
         validation_count,
@@ -161,11 +213,14 @@ fn probes() -> (
 async fn valid_hydrated_authority_starts_the_exact_bound_core() {
     let store = Store::session_test_store(PAID_A).await.expect("store");
     let runtime = runtime_authority(&store, "boot-valid", "lease-valid", "fence-valid");
+    let runtime_identity = runtime.rpc_identity().clone();
     let hydrated = hydrate_complete(&store, &runtime).await;
+    let approval = approval_broker();
+    let expected_approval = approval.clone();
     let (core, start_authority) =
-        SessionStartAuthority::from_hydrated(runtime, &hydrated).expect("bind hydration");
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval).expect("bind hydration");
     let bound_core_id = core.ownership_id();
-    let (gateway, split_count, worker, validation_count) = probes();
+    let (gateway, split_count, worker, validation_count) = probes(runtime_identity);
 
     let session = Session::start_hydrated(store, gateway, core, worker, start_authority)
         .await
@@ -173,10 +228,12 @@ async fn valid_hydrated_authority_starts_the_exact_bound_core() {
 
     assert_eq!(split_count.load(Ordering::SeqCst), 1);
     assert_eq!(validation_count.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        session.core.as_ref().expect("Session core").ownership_id(),
-        bound_core_id
-    );
+    let session_core = session.core.as_ref().expect("Session core");
+    assert_eq!(session_core.ownership_id(), bound_core_id);
+    assert!(Arc::ptr_eq(
+        session_core.approval.as_ref().expect("composed approval"),
+        &expected_approval
+    ));
     assert_eq!(session.executor_generation, generation());
 }
 
@@ -191,16 +248,18 @@ async fn cross_paid_authority_fails_before_store_gateway_or_worker_side_effects(
         "lease-cross-paid",
         "fence-cross-paid",
     );
+    let runtime_identity = runtime.rpc_identity().clone();
     let hydrated = hydrate_complete(&source_store, &runtime).await;
     let (core, start_authority) =
-        SessionStartAuthority::from_hydrated(runtime, &hydrated).expect("bind source hydration");
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind source hydration");
 
     let target_store = Store::session_test_store(PAID_B)
         .await
         .expect("target store");
     let target_observer = target_store.clone();
     let keys_before = data_key_count(&target_observer).await;
-    let (gateway, split_count, worker, validation_count) = probes();
+    let (gateway, split_count, worker, validation_count) = probes(runtime_identity);
 
     let error =
         match Session::start_hydrated(target_store, gateway, core, worker, start_authority).await {
@@ -221,9 +280,10 @@ async fn same_generation_stale_lease_or_fence_cannot_bind_hydration() {
     let hydrated = hydrate_complete(&store, &current).await;
 
     let stale_lease = runtime_authority(&store, "boot-current", "lease-stale", "fence-stale-lease");
-    let lease_error = SessionStartAuthority::from_hydrated(stale_lease, &hydrated)
-        .err()
-        .expect("same-generation stale lease must fail");
+    let lease_error =
+        SessionStartAuthority::from_hydrated(stale_lease, &hydrated, approval_broker())
+            .err()
+            .expect("same-generation stale lease must fail");
     assert!(lease_error.to_string().contains("lease is stale"));
 
     let stale_fence = GenerationRecoveryFence::new(current.lease(), "fence-stale")
@@ -234,9 +294,10 @@ async fn same_generation_stale_lease_or_fence_cannot_bind_hydration() {
         stale_fence,
     )
     .expect("internally consistent stale-fence authority");
-    let fence_error = SessionStartAuthority::from_hydrated(stale_fence_runtime, &hydrated)
-        .err()
-        .expect("same-generation stale fence must fail");
+    let fence_error =
+        SessionStartAuthority::from_hydrated(stale_fence_runtime, &hydrated, approval_broker())
+            .err()
+            .expect("same-generation stale fence must fail");
     assert!(fence_error.to_string().contains("fence is stale"));
 }
 
@@ -252,7 +313,7 @@ async fn forged_hydration_receipt_cannot_mint_start_authority() {
     let mut hydrated = hydrate_complete(&store, &runtime).await;
     hydrated.receipt.fence_id = "forged-fence".to_owned();
 
-    let error = SessionStartAuthority::from_hydrated(runtime, &hydrated)
+    let error = SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
         .err()
         .expect("forged hydration receipt must fail");
 
@@ -268,13 +329,15 @@ async fn arbitrary_core_cannot_use_an_authentic_hydration_authority() {
         "lease-arbitrary-core",
         "fence-arbitrary-core",
     );
+    let runtime_identity = runtime.rpc_identity().clone();
     let hydrated = hydrate_complete(&store, &runtime).await;
     let (_bound_core, start_authority) =
-        SessionStartAuthority::from_hydrated(runtime, &hydrated).expect("bind hydration");
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
     let arbitrary_core = RunCore::new();
     let observer = store.clone();
     let keys_before = data_key_count(&observer).await;
-    let (gateway, split_count, worker, validation_count) = probes();
+    let (gateway, split_count, worker, validation_count) = probes(runtime_identity);
 
     let error = match Session::start_hydrated(
         store,
@@ -304,13 +367,15 @@ async fn core_mutated_after_hydration_binding_cannot_start() {
         "lease-mutated-core",
         "fence-mutated-core",
     );
+    let runtime_identity = runtime.rpc_identity().clone();
     let hydrated = hydrate_complete(&store, &runtime).await;
     let (mut core, start_authority) =
-        SessionStartAuthority::from_hydrated(runtime, &hydrated).expect("bind hydration");
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
     core.mark_mutated();
     let observer = store.clone();
     let keys_before = data_key_count(&observer).await;
-    let (gateway, split_count, worker, validation_count) = probes();
+    let (gateway, split_count, worker, validation_count) = probes(runtime_identity);
 
     let error = match Session::start_hydrated(store, gateway, core, worker, start_authority).await {
         Ok(_) => panic!("core mutation after hydration binding must fail closed"),
@@ -321,4 +386,132 @@ async fn core_mutated_after_hydration_binding_cannot_start() {
     assert_eq!(data_key_count(&observer).await, keys_before);
     assert_eq!(split_count.load(Ordering::SeqCst), 0);
     assert_eq!(validation_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn approval_broker_replaced_after_hydration_binding_cannot_start() {
+    let store = Store::session_test_store(PAID_A).await.expect("store");
+    let runtime = runtime_authority(
+        &store,
+        "boot-replaced-approval",
+        "lease-replaced-approval",
+        "fence-replaced-approval",
+    );
+    let runtime_identity = runtime.rpc_identity().clone();
+    let hydrated = hydrate_complete(&store, &runtime).await;
+    let (mut core, start_authority) =
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
+    core.set_approval(approval_broker());
+
+    let observer = store.clone();
+    let keys_before = data_key_count(&observer).await;
+    let (gateway, split_count, worker, validation_count) = probes(runtime_identity);
+    let error = match Session::start_hydrated(store, gateway, core, worker, start_authority).await {
+        Ok(_) => panic!("post-bind approval replacement must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("exact unmutated core"));
+    assert_eq!(data_key_count(&observer).await, keys_before);
+    assert_eq!(split_count.load(Ordering::SeqCst), 0);
+    assert_eq!(validation_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn worker_bound_to_wrong_paid_rejects_before_session_side_effects() {
+    let store = Store::session_test_store(PAID_A).await.expect("store");
+    let runtime = runtime_authority(
+        &store,
+        "boot-worker-paid",
+        "lease-worker-paid",
+        "fence-worker-paid",
+    );
+    let hydrated = hydrate_complete(&store, &runtime).await;
+    let (core, start_authority) =
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
+    let wrong_identity = RpcIdentity::from_wire(PAID_B, generation().as_u64(), "boot-worker-paid")
+        .expect("wrong-PAID identity");
+
+    let observer = store.clone();
+    let keys_before = data_key_count(&observer).await;
+    let split_count = Arc::new(AtomicUsize::new(0));
+    let gateway = ProbeGateway {
+        split_count: split_count.clone(),
+    };
+    let worker = remote_worker(wrong_identity);
+    let error = match Session::start_hydrated(store, gateway, core, worker, start_authority).await {
+        Ok(_) => panic!("worker with wrong PAID must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("executor RPC identity"));
+    assert_eq!(data_key_count(&observer).await, keys_before);
+    assert_eq!(split_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn worker_bound_to_same_generation_wrong_nonce_rejects_before_session_side_effects() {
+    let store = Store::session_test_store(PAID_A).await.expect("store");
+    let runtime = runtime_authority(
+        &store,
+        "boot-worker-current",
+        "lease-worker-nonce",
+        "fence-worker-nonce",
+    );
+    let hydrated = hydrate_complete(&store, &runtime).await;
+    let (core, start_authority) =
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
+    let wrong_identity = RpcIdentity::from_wire(PAID_A, generation().as_u64(), "boot-worker-stale")
+        .expect("wrong-nonce identity");
+
+    let observer = store.clone();
+    let keys_before = data_key_count(&observer).await;
+    let split_count = Arc::new(AtomicUsize::new(0));
+    let gateway = ProbeGateway {
+        split_count: split_count.clone(),
+    };
+    let worker = remote_worker(wrong_identity);
+    let error = match Session::start_hydrated(store, gateway, core, worker, start_authority).await {
+        Ok(_) => panic!("worker with wrong boot nonce must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("executor RPC identity"));
+    assert_eq!(data_key_count(&observer).await, keys_before);
+    assert_eq!(split_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn production_remote_worker_accepts_the_exact_runtime_identity() {
+    let store = Store::session_test_store(PAID_A).await.expect("store");
+    let runtime = runtime_authority(
+        &store,
+        "boot-worker-exact",
+        "lease-worker-exact",
+        "fence-worker-exact",
+    );
+    let runtime_identity = runtime.rpc_identity().clone();
+    let hydrated = hydrate_complete(&store, &runtime).await;
+    let (core, start_authority) =
+        SessionStartAuthority::from_hydrated(runtime, &hydrated, approval_broker())
+            .expect("bind hydration");
+    let split_count = Arc::new(AtomicUsize::new(0));
+    let gateway = ProbeGateway {
+        split_count: split_count.clone(),
+    };
+
+    let _session = Session::start_hydrated(
+        store,
+        gateway,
+        core,
+        remote_worker(runtime_identity),
+        start_authority,
+    )
+    .await
+    .expect("exact remote executor identity");
+
+    assert_eq!(split_count.load(Ordering::SeqCst), 1);
 }

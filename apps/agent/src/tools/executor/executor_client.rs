@@ -89,6 +89,10 @@ impl ExecutorClient {
         self.identity.generation()
     }
 
+    pub(crate) const fn identity(&self) -> &RpcIdentity {
+        &self.identity
+    }
+
     pub async fn execute(
         &self,
         operation: ExecutorOperation,

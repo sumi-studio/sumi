@@ -41,7 +41,7 @@ use crate::{
     },
     runtime::{
         authority::RuntimeEpochAuthority,
-        contracts::{PersonalityAgentId, ProcessGeneration},
+        contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity},
     },
     store::{
         ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
@@ -322,6 +322,7 @@ impl RunCore {
 
     pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
         self.approval = Some(broker);
+        self.mark_mutated();
     }
 
     #[cfg(test)]
@@ -407,12 +408,13 @@ impl SessionStartAuthority {
     /// Bind a completed T17 hydration result to the exact runtime epoch that
     /// requested it and construct the only RunCore that this authority admits.
     ///
-    /// T26 may inspect `hydrated` first to compose memory/driver dependencies,
-    /// but Session state itself is always initialized from the authenticated
-    /// messages and provider context here.
+    /// T26 may inspect `hydrated` first to compose approval, memory, and driver
+    /// dependencies, but Session state itself is always initialized from the
+    /// authenticated messages and provider context here.
     pub(crate) fn from_hydrated(
         runtime: RuntimeEpochAuthority,
         hydrated: &HydratedRunState,
+        approval: Arc<ApprovalBroker>,
     ) -> Result<(RunCore, Self)> {
         if hydrated.scope.personality_agent_id != *runtime.personality_agent_id() {
             bail!("hydrated Store scope does not match the authenticated runtime PAID");
@@ -430,6 +432,10 @@ impl SessionStartAuthority {
         let mut core = RunCore::new();
         core.runtime_context = hydrated.messages.clone();
         core.provider_context = hydrated.provider_context.clone();
+        // Approval is a security-sensitive dependency of this exact RunCore.
+        // Compose it before minting the binding; every later replacement goes
+        // through `set_approval` and invalidates the binding.
+        core.approval = Some(approval);
         let binding = HydratedSessionBinding {
             binding_id: Uuid::now_v7(),
             runtime,
@@ -581,6 +587,16 @@ pub(crate) enum WorkerFailure {
 }
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
+    /// Hydrated production starts must preserve the complete executor RPC
+    /// identity through the worker/driver boundary.
+    fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "run worker is not bound to a production executor RPC identity"
+        ))
+    }
+
+    /// Generation-only validation is retained for explicit unhydrated test
+    /// fixtures; it cannot admit a hydrated production Session.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
     fn apply_idle_memory_maintenance<'a>(
@@ -881,7 +897,15 @@ impl<G: Gateway + 'static> Session<G> {
         // Every authority/core/Store check precedes key creation, recovery,
         // gateway splitting, task creation, and worker validation.
         let executor_generation = start_authority.validate_for(&store, &core)?;
-        worker.validate_executor_generation(executor_generation)?;
+        match &start_authority.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                worker.validate_runtime_identity(binding.runtime.rpc_identity())?;
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => {
+                worker.validate_executor_generation(executor_generation)?;
+            }
+        }
         let personality_agent_id = store.scope().personality_agent_id.clone();
         let store = Arc::new(store);
         for purpose in [

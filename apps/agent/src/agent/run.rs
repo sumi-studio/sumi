@@ -41,7 +41,7 @@ use crate::{
             ToolCall, ToolResultMessage, UserContent, UserMessage,
         },
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{ProcessGeneration, RpcIdentity},
     store::user_message_id,
     tools::ToolError,
 };
@@ -129,7 +129,16 @@ pub(crate) struct ProviderCallAttempt {
 /// unit fixtures can remain transport- and credential-free.
 #[async_trait]
 pub(crate) trait RunDriver: Send + Sync + 'static {
+    /// Fail closed unless the driver can prove that its immutable executor
+    /// client is bound to the exact authenticated runtime identity.
+    fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "run driver is not bound to a production executor RPC identity"
+        ))
+    }
+
     /// Fail closed before Session creates keys, recovery state, or a worker.
+    /// This narrower check exists for unhydrated test fixtures only.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
     /// T21 idle maintenance must return true only after its durable transition
@@ -256,6 +265,10 @@ impl SequentialRunWorker {
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        self.driver.validate_runtime_identity(identity)
+    }
+
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         self.driver.validate_executor_generation(generation)
     }

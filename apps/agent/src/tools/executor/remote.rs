@@ -2,9 +2,9 @@
 //!
 //! This module translates already-validated model arguments into the T13 RPC
 //! contract. It deliberately owns neither executor bootstrap nor generation
-//! rotation. The client keeps its socket and nonce private, and the bounded
-//! execution identifier below is only a retry-stable live invocation identity;
-//! it is not the durable T26 idempotency key.
+//! rotation. The registry copies the client's immutable RPC identity only for
+//! Session-start validation; the bounded execution identifier below remains a
+//! retry-stable live invocation identity, not the durable T26 idempotency key.
 
 use std::{fmt::Write as _, sync::Arc};
 
@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorResponse};
 use crate::{
     provider::types::{ToolDefinition, ValidatedToolArguments},
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::RpcIdentity,
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolRisk,
         text_output,
@@ -58,8 +58,8 @@ impl ExecutorInvoker for ExecutorClient {
 /// supervisor-issued executor client. Registration is explicit and duplicate
 /// checked by [`ToolRegistryBuilder`].
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
-    let generation = client.generation();
-    registry_from_invoker_for_generation(client, generation)
+    let identity = client.identity().clone();
+    registry_from_invoker_for_identity(client, identity)
 }
 
 #[cfg(test)]
@@ -67,16 +67,16 @@ fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistr
     registry_from_invoker_inner(client, None)
 }
 
-fn registry_from_invoker_for_generation(
+fn registry_from_invoker_for_identity(
     client: Arc<dyn ExecutorInvoker>,
-    generation: ProcessGeneration,
+    identity: RpcIdentity,
 ) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker_inner(client, Some(generation))
+    registry_from_invoker_inner(client, Some(identity))
 }
 
 fn registry_from_invoker_inner(
     client: Arc<dyn ExecutorInvoker>,
-    generation: Option<ProcessGeneration>,
+    identity: Option<RpcIdentity>,
 ) -> Result<ToolRegistry, ToolError> {
     let mut builder = ToolRegistryBuilder::default();
     for kind in [
@@ -94,8 +94,8 @@ fn registry_from_invoker_inner(
             client: client.clone(),
         }))?;
     }
-    Ok(match generation {
-        Some(generation) => builder.build_for_executor_generation(generation),
+    Ok(match identity {
+        Some(identity) => builder.build_for_executor_identity(identity),
         None => builder.build(),
     })
 }
@@ -658,6 +658,7 @@ mod tests {
     use super::*;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -1490,6 +1491,32 @@ mod tests {
         assert!(matches!(error, ToolError::RpcIndeterminate(_)));
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_registry_binds_the_clients_complete_rpc_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry = remote_executor_registry(Arc::new(ExecutorClient::new(
+            "/tmp/sumi-unused-executor.sock",
+            identity.clone(),
+        )))
+        .unwrap();
+
+        registry
+            .validate_executor_identity(&identity)
+            .expect("exact identity");
+        let wrong_paid = RpcIdentity::from_wire(OTHER_PAID, 7, "current-nonce").unwrap();
+        assert!(registry.validate_executor_identity(&wrong_paid).is_err());
+        let wrong_nonce = RpcIdentity::from_wire(PAID, 7, "stale-nonce").unwrap();
+        assert!(registry.validate_executor_identity(&wrong_nonce).is_err());
+
+        let fixture_registry = registry_from_invoker(Arc::new(FakeInvoker::default())).unwrap();
+        assert!(
+            fixture_registry
+                .validate_executor_identity(&identity)
+                .is_err(),
+            "an unbound fixture registry cannot satisfy production validation"
+        );
     }
 
     #[test]

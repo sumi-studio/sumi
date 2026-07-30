@@ -35,7 +35,9 @@ use crate::{
             ToolResultMessage, Usage,
         },
     },
-    runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
+    runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease, RpcIdentity,
+    },
     store::{HydratedRunState, HydrationOutcome, Store},
     tools::executor::ArtifactBrokerClient,
     tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
@@ -379,6 +381,18 @@ impl InjectedRunDriver {
 
 #[async_trait]
 impl RunDriver for InjectedRunDriver {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        if identity.generation() != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {}",
+                self.executor_generation,
+                identity.generation()
+            );
+        }
+        self.registry.validate_executor_identity(identity)?;
+        Ok(())
+    }
+
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         if generation != self.executor_generation {
             bail!(
@@ -738,6 +752,7 @@ mod tests {
     use super::*;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
     use crate::{
         agent::{RunCore, SequentialRunWorker, Session, SessionResult},
         gateway::InjectedStdioGateway,
@@ -983,10 +998,11 @@ mod tests {
     }
 
     #[test]
-    fn construction_binds_remote_registry_to_executor_generation() {
+    fn construction_binds_remote_registry_to_complete_executor_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity");
         let client = Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
-            RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity"),
+            identity.clone(),
         ));
         let registry = remote_executor_registry(client).expect("remote registry");
         let prompt = PromptContext {
@@ -1026,6 +1042,25 @@ mod tests {
         )
         .expect("matching remote generation");
         assert_eq!(driver.executor_generation(), generation(7));
+        driver
+            .validate_runtime_identity(&identity)
+            .expect("complete executor identity matches");
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(OTHER_PAID, 7, "boot-nonce")
+                        .expect("wrong-PAID identity"),
+                )
+                .is_err()
+        );
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(PAID, 7, "stale-boot-nonce")
+                        .expect("wrong-nonce identity"),
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]
