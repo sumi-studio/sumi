@@ -1,4 +1,4 @@
 {
   "extends": "@sumi/typescript-config/base.json",
-  "include": ["src"]
+  "include": ["src", "test"]
 }

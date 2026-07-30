@@ -19,7 +19,7 @@ func NewProductionMux(
 	store *CommandStore,
 	runtime *DurableGateway,
 	tv TokenVerifier,
-	sv UserSessionVerifier,
+	sv UserSessionAuthorizer,
 	agentOrigins,
 	browserOrigins []string,
 ) (*http.ServeMux, *BrowserServer, *Server, error) {

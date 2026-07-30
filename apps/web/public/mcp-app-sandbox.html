@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      This source artifact is deliberately inert. A dedicated HTTPS sandbox
+      deployment must replace the marker below and serve the CSP in this meta
+      element as an HTTP response header, plus an exact frame-ancestors host.
+      The broad source directives permit a resource-specific policy boundary
+      to be created after the Host supplies the resource CSP. That boundary's
+      CSP is inherited by the View and limits every replacement navigation;
+      the same policy is also injected before any View HTML. Tightening this
+      deployment policy would silently break validly declared domains. See
+      mcp-app-sandbox-deployment.md next to this file.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src * data: blob:; script-src * data: blob: 'unsafe-inline'; style-src * data: blob: 'unsafe-inline'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; connect-src https: wss:; frame-src *; worker-src * blob:; object-src 'none'; base-uri *; form-action 'none'"
+    />
+    <meta
+      name="sumi-mcp-sandbox-deployment"
+      content="__SUMI_MCP_SANDBOX_DEPLOYMENT__"
+    />
+    <title>MCP App sandbox</title>
+    <style>
+      html,
+      body,
+      iframe {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        border: 0;
+        background: transparent;
+      }
+
+      body {
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      (() => {
+        "use strict";
+
+        const SANDBOX_READY = "ui/notifications/sandbox-proxy-ready";
+        const RESOURCE_READY = "ui/notifications/sandbox-resource-ready";
+        const MAX_HTML_BYTES = 512 * 1024;
+        const MAX_MESSAGE_BYTES = 256 * 1024;
+        const MAX_CSP_ORIGINS = 16;
+        const MAX_MESSAGES_PER_WINDOW = 120;
+        const MESSAGE_RATE_WINDOW_MS = 1000;
+        const DEPLOYMENT_PATTERN = /^[a-f0-9]{64}$/;
+        const RESOURCE_BOOTSTRAP = "sumi/mcp/resource-bootstrap";
+        const encoder = new TextEncoder();
+        let boundary = null;
+        let loaded = false;
+        const rateWindows = {
+          parent: { startedAt: -1, count: 0 },
+          boundary: { startedAt: -1, count: 0 },
+        };
+
+        const deploymentMarker = document
+          .querySelector('meta[name="sumi-mcp-sandbox-deployment"]')
+          ?.getAttribute("content");
+        const query = new URLSearchParams(location.search);
+        const deploymentId = query.get("deploymentId");
+        const parentOrigin = exactHttpsOrigin(query.get("hostOrigin"));
+
+        if (
+          !window.isSecureContext ||
+          window.parent === window ||
+          !("credentialless" in HTMLIFrameElement.prototype) ||
+          !DEPLOYMENT_PATTERN.test(deploymentMarker || "") ||
+          deploymentMarker !== deploymentId ||
+          !parentOrigin
+        ) {
+          document.body.textContent = "MCP App sandbox unavailable.";
+          return;
+        }
+
+        function exactHttpsOrigin(value) {
+          if (!value) return null;
+          try {
+            const url = new URL(value);
+            return url.protocol === "https:" &&
+              url.username === "" &&
+              url.password === ""
+              ? url.origin
+              : null;
+          } catch {
+            return null;
+          }
+        }
+
+        function isJsonRpcMessage(value) {
+          return (
+            value !== null &&
+            typeof value === "object" &&
+            !Array.isArray(value) &&
+            value.jsonrpc === "2.0" &&
+            (typeof value.method === "string" ||
+              Object.hasOwn(value, "result") ||
+              Object.hasOwn(value, "error"))
+          );
+        }
+
+        function isBoundedMessage(value) {
+          try {
+            const serialized = JSON.stringify(value);
+            return (
+              serialized !== undefined &&
+              encoder.encode(serialized).byteLength <= MAX_MESSAGE_BYTES
+            );
+          } catch {
+            return false;
+          }
+        }
+
+        function consumeRateLimit(source) {
+          const current = rateWindows[source];
+          const now = Date.now();
+          if (
+            current.startedAt < 0 ||
+            now - current.startedAt >= MESSAGE_RATE_WINDOW_MS
+          ) {
+            current.startedAt = now;
+            current.count = 1;
+            return true;
+          }
+          current.count += 1;
+          return current.count <= MAX_MESSAGES_PER_WINDOW;
+        }
+
+        function cspSources(value, allowWebSocket, allowWildcard) {
+          if (value === undefined) return [];
+          if (!Array.isArray(value) || value.length > MAX_CSP_ORIGINS) {
+            return null;
+          }
+          const sources = [];
+          for (const item of value) {
+            if (typeof item !== "string") return null;
+            try {
+              const url = new URL(item);
+              const wildcard = url.hostname.startsWith("*.");
+              if (
+                !(
+                  (url.protocol === "https:" ||
+                    (allowWebSocket && url.protocol === "wss:")) &&
+                  url.username === "" &&
+                  url.password === "" &&
+                  url.pathname === "/" &&
+                  url.search === "" &&
+                  url.hash === "" &&
+                  (!wildcard ||
+                    (allowWildcard &&
+                      url.hostname.length > 3 &&
+                      !url.hostname.slice(2).includes("*"))) &&
+                  item === url.origin
+                )
+              ) {
+                return null;
+              }
+              sources.push(item);
+            } catch {
+              return null;
+            }
+          }
+          return sources;
+        }
+
+        function createPolicy(csp) {
+          return createPolicyForBoundary(csp, false);
+        }
+
+        function createPolicyForBoundary(csp, isBoundary) {
+          if (
+            csp === null ||
+            typeof csp !== "object" ||
+            Array.isArray(csp)
+          ) {
+            return null;
+          }
+          const allowedKeys = new Set([
+            "connectDomains",
+            "resourceDomains",
+            "frameDomains",
+            "baseUriDomains",
+          ]);
+          if (Object.keys(csp).some((key) => !allowedKeys.has(key))) {
+            return null;
+          }
+          const connect = cspSources(csp.connectDomains, true, false);
+          const resources = cspSources(csp.resourceDomains, false, true);
+          const frames = cspSources(csp.frameDomains, false, false);
+          const bases = cspSources(csp.baseUriDomains, false, false);
+          if (!connect || !resources || !frames || !bases) return null;
+          return [
+            "default-src 'none'",
+            `script-src 'self' 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `style-src 'self' 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `img-src 'self' data: blob: ${resources.join(" ")}`.trim(),
+            `font-src 'self' data: ${resources.join(" ")}`.trim(),
+            `media-src 'self' data: blob: ${resources.join(" ")}`.trim(),
+            `connect-src 'self' ${connect.join(" ")}`.trim(),
+            `frame-src ${
+              isBoundary
+                ? ["'self'", ...frames].join(" ")
+                : frames.length
+                  ? frames.join(" ")
+                  : "'none'"
+            }`,
+            `base-uri ${bases.length ? bases.join(" ") : "'self'"}`,
+            "object-src 'none'",
+            "form-action 'none'",
+          ].join("; ");
+        }
+
+        function createBoundaryDocument(csp) {
+          const policy = createPolicyForBoundary(
+            csp === undefined ? {} : csp,
+            true,
+          );
+          if (!policy) return null;
+          const escapedPolicy = policy
+            .replaceAll("&", "&amp;")
+            .replaceAll('"', "&quot;");
+          const program = `(${resourceBoundaryMain.toString()})()`;
+          return (
+            "<!doctype html><html><head>" +
+            `<meta http-equiv="Content-Security-Policy" content="${escapedPolicy}">` +
+            '<meta name="referrer" content="no-referrer">' +
+            "</head><body><script>" +
+            program +
+            "<" +
+            "/script></body></html>"
+          );
+        }
+
+        function resourceBoundaryMain() {
+          "use strict";
+
+          const RESOURCE_BOOTSTRAP = "sumi/mcp/resource-bootstrap";
+          const MAX_HTML_BYTES = 512 * 1024;
+          const MAX_MESSAGE_BYTES = 256 * 1024;
+          const MAX_MESSAGES_PER_WINDOW = 120;
+          const MESSAGE_RATE_WINDOW_MS = 1000;
+          const NAVIGATION_SETTLE_MS = 50;
+          const encoder = new TextEncoder();
+          let view = null;
+          let trusted = false;
+          let bootstrapped = false;
+          let viewLoads = 0;
+          let trustEpoch = 0;
+          const rateWindows = {
+            parent: { startedAt: -1, count: 0 },
+            view: { startedAt: -1, count: 0 },
+          };
+
+          function isJsonRpcMessage(value) {
+            return (
+              value !== null &&
+              typeof value === "object" &&
+              !Array.isArray(value) &&
+              value.jsonrpc === "2.0" &&
+              (typeof value.method === "string" ||
+                Object.hasOwn(value, "result") ||
+                Object.hasOwn(value, "error"))
+            );
+          }
+
+          function isBoundedMessage(value) {
+            try {
+              const serialized = JSON.stringify(value);
+              return (
+                serialized !== undefined &&
+                encoder.encode(serialized).byteLength <= MAX_MESSAGE_BYTES
+              );
+            } catch {
+              return false;
+            }
+          }
+
+          function consumeRateLimit(source) {
+            const current = rateWindows[source];
+            const now = Date.now();
+            if (
+              current.startedAt < 0 ||
+              now - current.startedAt >= MESSAGE_RATE_WINDOW_MS
+            ) {
+              current.startedAt = now;
+              current.count = 1;
+              return true;
+            }
+            current.count += 1;
+            return current.count <= MAX_MESSAGES_PER_WINDOW;
+          }
+
+          function revokeViewTrust() {
+            if (!trusted && !view) return;
+            trusted = false;
+            trustEpoch += 1;
+            view?.remove();
+            view = null;
+          }
+
+          function createView(html) {
+            trusted = true;
+            view = document.createElement("iframe");
+            view.title = "MCP App";
+            view.sandbox = "allow-scripts";
+            view.allow =
+              "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'";
+            view.referrerPolicy = "no-referrer";
+            view.credentialless = true;
+            view.addEventListener("load", () => {
+              viewLoads += 1;
+              if (viewLoads > 1) {
+                revokeViewTrust();
+              }
+            });
+            view.srcdoc = html;
+            document.body.replaceChildren(view);
+          }
+
+          // The boundary policy's frame-src controls navigation of its direct
+          // child. A blocked replacement reports here; accepted replacements
+          // are caught by the child's second load event.
+          document.addEventListener(
+            "securitypolicyviolation",
+            (event) => {
+              if (
+                event.violatedDirective === "frame-src" ||
+                event.effectiveDirective === "frame-src"
+              ) {
+                revokeViewTrust();
+              }
+            },
+            true,
+          );
+
+          window.addEventListener("message", (event) => {
+            if (event.source === window.parent) {
+              if (
+                !consumeRateLimit("parent") ||
+                !isBoundedMessage(event.data)
+              ) {
+                return;
+              }
+              if (
+                !bootstrapped &&
+                event.data !== null &&
+                typeof event.data === "object" &&
+                !Array.isArray(event.data) &&
+                event.data.type === RESOURCE_BOOTSTRAP &&
+                typeof event.data.html === "string" &&
+                encoder.encode(event.data.html).byteLength <= MAX_HTML_BYTES
+              ) {
+                bootstrapped = true;
+                createView(event.data.html);
+              } else if (
+                trusted &&
+                view &&
+                isJsonRpcMessage(event.data)
+              ) {
+                view.contentWindow?.postMessage(event.data, "*");
+              }
+              return;
+            }
+
+            const source = view?.contentWindow;
+            if (
+              !trusted ||
+              !source ||
+              event.source !== source ||
+              event.origin !== "null" ||
+              !consumeRateLimit("view") ||
+              !isBoundedMessage(event.data) ||
+              !isJsonRpcMessage(event.data) ||
+              String(event.data.method || "").startsWith(
+                "ui/notifications/sandbox-",
+              )
+            ) {
+              return;
+            }
+
+            // Navigation load/CSP events can be queued beside postMessage.
+            // Hold the message for a bounded settle window so revocation at
+            // the outer policy boundary wins before any post-navigation data.
+            const epoch = trustEpoch;
+            const message = event.data;
+            setTimeout(() => {
+              if (
+                trusted &&
+                view?.contentWindow === source &&
+                trustEpoch === epoch
+              ) {
+                window.parent.postMessage(message, "*");
+              }
+            }, NAVIGATION_SETTLE_MS);
+          });
+        }
+
+        function withPolicy(html, csp) {
+          const policy = createPolicy(csp === undefined ? {} : csp);
+          if (!policy) return null;
+          const escapedPolicy = policy
+            .replaceAll("&", "&amp;")
+            .replaceAll('"', "&quot;");
+          const meta =
+            `<meta http-equiv="Content-Security-Policy" content="${escapedPolicy}">`;
+          const insertionIndex = afterLeadingDoctype(html);
+          return (
+            html.slice(0, insertionIndex) +
+            meta +
+            html.slice(insertionIndex)
+          );
+        }
+
+        // A CSP meta element must be parsed before any executable View token.
+        // This scanner preserves the resource bytes verbatim and only finds the
+        // end of a leading HTML5 doctype. It does not parse, fetch, allowlist,
+        // remove, or otherwise rewrite View content.
+        function afterLeadingDoctype(html) {
+          let cursor = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+          while (cursor < html.length) {
+            const whitespace = /^[\t\n\f\r ]+/.exec(html.slice(cursor));
+            if (whitespace) {
+              cursor += whitespace[0].length;
+              continue;
+            }
+            if (html.startsWith("<!--", cursor)) {
+              const commentEnd = html.indexOf("-->", cursor + 4);
+              if (commentEnd === -1) return 0;
+              cursor = commentEnd + 3;
+              continue;
+            }
+            break;
+          }
+          if (html.slice(cursor, cursor + 9).toLowerCase() !== "<!doctype") {
+            return 0;
+          }
+          let quote = "";
+          for (let index = cursor + 9; index < html.length; index += 1) {
+            const character = html[index];
+            if (quote) {
+              if (character === quote) quote = "";
+            } else if (character === '"' || character === "'") {
+              quote = character;
+            } else if (character === ">") {
+              return index + 1;
+            }
+          }
+          return 0;
+        }
+
+        function loadResource(params) {
+          if (
+            loaded ||
+            params === null ||
+            typeof params !== "object" ||
+            Array.isArray(params) ||
+            Object.keys(params).some(
+              (key) => !["html", "sandbox", "csp"].includes(key),
+            ) ||
+            typeof params.html !== "string" ||
+            encoder.encode(params.html).byteLength > MAX_HTML_BYTES ||
+            params.sandbox !== "allow-scripts"
+          ) {
+            return;
+          }
+          const securedHtml = withPolicy(params.html, params.csp);
+          if (!securedHtml) return;
+          const boundaryHtml = createBoundaryDocument(params.csp);
+          if (!boundaryHtml) return;
+
+          loaded = true;
+          boundary = document.createElement("iframe");
+          boundary.title = "MCP App policy boundary";
+          boundary.sandbox = "allow-scripts";
+          boundary.allow =
+            "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'";
+          boundary.referrerPolicy = "no-referrer";
+          boundary.credentialless = true;
+          boundary.addEventListener(
+            "load",
+            () => {
+              boundary?.contentWindow?.postMessage(
+                { type: RESOURCE_BOOTSTRAP, html: securedHtml },
+                "*",
+              );
+            },
+            { once: true },
+          );
+          boundary.srcdoc = boundaryHtml;
+          document.body.replaceChildren(boundary);
+        }
+
+        window.addEventListener("message", (event) => {
+          if (
+            event.source === window.parent &&
+            event.origin === parentOrigin
+          ) {
+            if (
+              !consumeRateLimit("parent") ||
+              !isBoundedMessage(event.data) ||
+              !isJsonRpcMessage(event.data)
+            ) {
+              return;
+            }
+            if (event.data.method === RESOURCE_READY) {
+              loadResource(event.data.params);
+            } else if (boundary) {
+              boundary.contentWindow?.postMessage(event.data, "*");
+            }
+            return;
+          }
+          if (
+            event.source === boundary?.contentWindow &&
+            event.origin === "null" &&
+            consumeRateLimit("boundary") &&
+            isBoundedMessage(event.data) &&
+            isJsonRpcMessage(event.data) &&
+            !String(event.data.method || "").startsWith(
+              "ui/notifications/sandbox-",
+            )
+          ) {
+            window.parent.postMessage(event.data, parentOrigin);
+          }
+        });
+
+        window.parent.postMessage(
+          { jsonrpc: "2.0", method: SANDBOX_READY, params: {} },
+          parentOrigin,
+        );
+      })();
+    </script>
+  </body>
+</html>

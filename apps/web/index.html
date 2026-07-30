@@ -4,6 +4,43 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      /*
+       * Keep the document itself non-scrollable before the application
+       * stylesheet loads. The chat viewport owns scrolling.
+       */
+      html,
+      body,
+      #root {
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        margin: 0;
+      }
+    </style>
+    <script>
+      (() => {
+        const root = document.documentElement;
+        let preference = "system";
+        try {
+          const stored = localStorage.getItem("sumi:theme");
+          if (stored === "light" || stored === "dark" || stored === "system") {
+            preference = stored;
+          }
+        } catch {}
+        const resolved =
+          preference === "system"
+            ? matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : preference;
+        root.dataset.theme = resolved;
+        root.dataset.themePreference = preference;
+      })();
+    </script>
     <title>Sumi</title>
   </head>
   <body>

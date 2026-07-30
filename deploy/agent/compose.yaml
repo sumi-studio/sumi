@@ -86,6 +86,9 @@ services:
     command: [runtime]
     environment:
       SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
+      # This is the executor's logical workspace address. Runtime uses it only
+      # for lexical policy/action projection and receives no workspace volume.
+      SUMI_WORKSPACE: /workspace
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_SERVER_UID: ${SUMI_LOCAL_CONTROL_SERVER_UID:?SUMI_LOCAL_CONTROL_SERVER_UID is required}
       SUMI_LOCAL_CONTROL_SOCKET_GID: ${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}

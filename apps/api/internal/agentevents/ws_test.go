@@ -642,7 +642,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 		t.Fatal(err)
 	}
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,20 +34,26 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context) (runErr error) {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+	publicAddress, err := publicListenAddressFromEnv(port)
+	if err != nil {
+		return err
 	}
 
 	app, err := newApplicationFromEnv()
 	if err != nil {
 		return err
 	}
-	defer app.Close()
+	defer func() {
+		runErr = errors.Join(runErr, app.Close())
+	}()
 
 	publicServer := &http.Server{
-		Addr:              ":" + port,
+		Addr:              publicAddress,
 		Handler:           app.publicMux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -68,7 +74,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("listen on public API: %w", err)
 	}
 
-	log.Printf("sumi api listening on :%s", port)
+	log.Printf("sumi api listening on %s", publicListener.Addr())
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
@@ -87,6 +93,51 @@ func run(ctx context.Context) error {
 		serverAndListener{server: publicServer, listener: publicListener},
 		serverAndListener{server: localServer, listener: localListener},
 	)
+}
+
+func publicListenAddressFromEnv(port string) (string, error) {
+	publicAddress := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LISTEN"))
+	loopbackAddress := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LOOPBACK_LISTEN"))
+	if publicAddress != "" && loopbackAddress != "" {
+		return "", errors.New("SUMI_PUBLIC_LISTEN and SUMI_PUBLIC_LOOPBACK_LISTEN are mutually exclusive")
+	}
+	if publicAddress != "" {
+		return literalListenAddress("SUMI_PUBLIC_LISTEN", publicAddress, false)
+	}
+	if loopbackAddress == "" {
+		return ":" + port, nil
+	}
+	return literalListenAddress("SUMI_PUBLIC_LOOPBACK_LISTEN", loopbackAddress, true)
+}
+
+func literalListenAddress(name, address string, requireLoopback bool) (string, error) {
+	host, configuredPort, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("%s must be host:port: %w", name, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", fmt.Errorf("%s host must be a literal IP", name)
+	}
+	if requireLoopback && !ip.IsLoopback() {
+		return "", fmt.Errorf("%s host must be a literal loopback IP", name)
+	}
+	if !requireLoopback && (ip.IsUnspecified() || ip.IsMulticast()) {
+		return "", fmt.Errorf("%s host must not be unspecified or multicast", name)
+	}
+	if configuredPort == "" {
+		return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+	}
+	for _, digit := range configuredPort {
+		if digit < '0' || digit > '9' {
+			return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+		}
+	}
+	numericPort, err := strconv.Atoi(configuredPort)
+	if err != nil || numericPort < 1 || numericPort > 65535 {
+		return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(numericPort)), nil
 }
 
 type serverAndListener struct {
@@ -130,13 +181,26 @@ type application struct {
 	localMux      *http.ServeMux
 	localListener *localControlListenerConfig
 	store         *agentevents.CommandStore
+	browser       *agentevents.BrowserServer
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 func (a *application) Close() error {
-	if a == nil || a.store == nil {
+	if a == nil {
 		return nil
 	}
-	return a.store.Close()
+	a.closeOnce.Do(func() {
+		if a.browser != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
+			cancel()
+		}
+		if a.store != nil {
+			a.closeErr = errors.Join(a.closeErr, a.store.Close())
+		}
+	})
+	return a.closeErr
 }
 
 func newRouter() (*http.ServeMux, error) {
@@ -152,11 +216,6 @@ func newApplicationFromEnv() (*application, error) {
 	if err != nil && !errors.Is(err, errTokenSecretMissing) {
 		return nil, fmt.Errorf("agent token verifier: %w", err)
 	}
-	sv, err := browserSessionVerifierFromEnv()
-	if err != nil && !errors.Is(err, errBrowserSessionSecretMissing) {
-		return nil, fmt.Errorf("browser session verifier: %w", err)
-	}
-
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
@@ -175,11 +234,25 @@ func newApplicationFromEnv() (*application, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
+	sv, browserOrigins, err := browserSessionConfigFromEnv(runtime)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("browser session configuration: %w", err)
+	}
 
-	mux, _, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
+	}
+	authServer, authEnabled, err := browserAuthServerFromEnv(context.Background(), sv, browserOrigins)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("browser auth: %w", err)
+	}
+	if authEnabled {
+		authServer.Connections = browser
+		authServer.RegisterRoutes(mux)
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)
 	if err != nil {
@@ -205,6 +278,7 @@ func newApplicationFromEnv() (*application, error) {
 		localMux:      localMux,
 		localListener: localListener,
 		store:         store,
+		browser:       browser,
 	}, nil
 }
 
@@ -1412,6 +1486,30 @@ func browserAllowedOriginsFromEnv() []string {
 	return originsFromEnv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")
 }
 
+func browserSessionConfigFromEnv(
+	revocations agentevents.BrowserSessionRevocationStore,
+) (*agentevents.HMACUserSessionVerifier, []string, error) {
+	secretConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_SECRET")) != ""
+	audienceConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")) != ""
+	originsConfigured := strings.TrimSpace(os.Getenv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")) != ""
+	authConfigured := browserAuthConfiguredFromEnv()
+	if !secretConfigured && !audienceConfigured && !originsConfigured && !authConfigured {
+		return nil, nil, nil
+	}
+	if !secretConfigured || !audienceConfigured || !originsConfigured {
+		return nil, nil, errors.New("SUMI_BROWSER_SESSION_SECRET, SUMI_BROWSER_SESSION_AUDIENCE, and SUMI_BROWSER_WS_ALLOWED_ORIGINS must be configured together")
+	}
+	origins := browserAllowedOriginsFromEnv()
+	if len(origins) == 0 {
+		return nil, nil, errors.New("SUMI_BROWSER_WS_ALLOWED_ORIGINS must contain at least one exact origin")
+	}
+	sessions, err := browserSessionVerifierFromEnv(revocations)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sessions, origins, nil
+}
+
 func originsFromEnv(name string) []string {
 	raw := os.Getenv(name)
 	if raw == "" {
@@ -1579,9 +1677,11 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 }
 
 // browserSessionVerifierFromEnv is deliberately separate from the agent token
-// verifier. Browser sessions are HttpOnly cookies scoped to users and
-// conversations; agent bearer tokens never enter this route.
-func browserSessionVerifierFromEnv() (agentevents.UserSessionVerifier, error) {
+// verifier. Browser sessions are HttpOnly cookies scoped to users and their
+// server-bound personality agents; agent bearer tokens never enter this route.
+func browserSessionVerifierFromEnv(
+	revocations agentevents.BrowserSessionRevocationStore,
+) (*agentevents.HMACUserSessionVerifier, error) {
 	b64 := os.Getenv("SUMI_BROWSER_SESSION_SECRET")
 	if b64 == "" {
 		return nil, errBrowserSessionSecretMissing
@@ -1591,5 +1691,5 @@ func browserSessionVerifierFromEnv() (agentevents.UserSessionVerifier, error) {
 		return nil, err
 	}
 	audience := os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")
-	return agentevents.NewHMACUserSessionVerifier(secret, audience)
+	return agentevents.NewHMACUserSessionVerifier(secret, audience, revocations)
 }

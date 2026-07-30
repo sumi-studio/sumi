@@ -67,6 +67,7 @@ pub(crate) enum AgentEvent {
         retry_at: DateTime<Utc>,
         error_message: String,
     },
+    CommandDisposition(CommandDispositionEvent),
     Error {
         message: String,
     },
@@ -88,11 +89,40 @@ impl AgentEvent {
             Self::Steered { .. } => "steered",
             Self::MemoryMaintenance { .. } => "memory_maintenance",
             Self::RetryScheduled { .. } => "retry_scheduled",
+            Self::CommandDisposition(_) => "command_disposition",
             Self::MessageUpdate { .. } | Self::ToolExecutionUpdate { .. } | Self::Error { .. } => {
                 return None;
             }
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct CommandDispositionEvent {
+    pub(crate) command_id: String,
+    pub(crate) command_seq: u64,
+    #[serde(flatten)]
+    pub(crate) disposition: CommandDisposition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CommandDisposition {
+    Applied {},
+    Superseded {},
+    Rejected {
+        reject_reason: CommandDispositionRejectReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandDispositionRejectReason {
+    UnknownCommand,
+    SchemaViolation,
+    AttachmentsNotEmpty,
+    Oversized,
+    NotAllowed,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -232,5 +262,41 @@ impl MemoryMaintKind {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::AgentEvent;
+
+    #[test]
+    fn command_disposition_round_trips_under_closed_durable_schema() {
+        let raw = json!({
+            "type": "command_disposition",
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "command_seq": 1,
+            "status": "rejected",
+            "reject_reason": "schema_violation"
+        });
+        let event: AgentEvent =
+            serde_json::from_value(raw.clone()).expect("deserialize durable command disposition");
+        assert_eq!(
+            serde_json::to_value(event).expect("serialize durable command disposition"),
+            raw
+        );
+
+        let with_private_payload = json!({
+            "type": "command_disposition",
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "command_seq": 1,
+            "status": "applied",
+            "provenance": {"source": "browser"}
+        });
+        assert!(
+            serde_json::from_value::<AgentEvent>(with_private_payload).is_err(),
+            "closed durable event must reject private provenance"
+        );
     }
 }

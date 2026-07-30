@@ -325,6 +325,31 @@ func (s *CommandStore) rollbackLocked(st *personalityAgentState, offset int64, o
 // CommandEnvelope is returned without allocating a second seq. A changed
 // target, tenant, actor, source, or command is a conflict.
 func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
+	return s.append(ctx, provenance, idempotencyKey, command, nil)
+}
+
+// appendWithIdempotencyStatus preserves Append's atomic idempotency decision
+// while reporting whether this call returned a pre-existing durable command.
+// Browser reconciliation uses the bit to avoid scanning the lifetime event log
+// for every first-time admission.
+func (s *CommandStore) appendWithIdempotencyStatus(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, bool, error) {
+	existing := false
+	envelope, err := s.append(ctx, provenance, idempotencyKey, command, &existing)
+	return envelope, existing, err
+}
+
+func (s *CommandStore) append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+	existingResult *bool,
+) (CommandEnvelope, error) {
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, err
 	}
@@ -361,6 +386,9 @@ func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenan
 			if existing.PersonalityAgentID == provenance.PersonalityAgentID &&
 				existing.Provenance == provenance &&
 				string(existing.Command) == string(command) {
+				if existingResult != nil {
+					*existingResult = true
+				}
 				return existing, nil
 			}
 			return CommandEnvelope{}, fmt.Errorf("idempotency key %q reused with different command: %w", idempotencyKey, errIdempotencyConflict)

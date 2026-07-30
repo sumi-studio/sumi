@@ -4,6 +4,7 @@ import {
   DirectChatSocket,
   isDirectChatCommand,
   parseDirectChatServerFrame,
+  resolveDirectChatURL,
 } from "../src/lib/direct-chat-socket.ts";
 import { DirectChatTimeline } from "../src/lib/direct-chat-timeline.ts";
 
@@ -35,7 +36,13 @@ test.after(() => {
   Object.defineProperty(globalThis, "location", { configurable: true, value: originalLocation });
 });
 
-const accepted = (key) => ({ type: "command_accepted", idempotency_key: key, command_id: "00000000-0000-4000-8000-000000000001", seq: 1 });
+const accepted = (key, disposition) => ({
+  type: "command_accepted",
+  idempotency_key: key,
+  command_id: "00000000-0000-4000-8000-000000000001",
+  seq: 1,
+  ...(disposition ? { disposition } : {}),
+});
 const event = (seq, value) => ({ type: "event", envelope: { seq, event: value } });
 const timestamp = "2026-07-28T00:00:00Z";
 const usage = { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: 0 };
@@ -68,8 +75,14 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   const wire = FakeWebSocket.instances.at(-1);
   assert.equal(new URL(wire.url).pathname, "/direct-chat/ws");
   assert.equal(new URL(wire.url).search, "");
-  wire.open();
+  assert.deepEqual(wire.sent, []);
   assert.equal(socket.sendCommand({ type: "user_message", text: "hello", attachments: [] }, "key-1"), true);
+  assert.deepEqual(wire.sent, []);
+  wire.open();
+  assert.deepEqual(wire.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.deepEqual(wire.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  wire.receive({ type: "direct_chat_status", status: "ready" });
   const commands = wire.sent.map(JSON.parse).filter((frame) => frame.type === "command");
   assert.deepEqual(commands, [{ type: "command", idempotency_key: "key-1", command: { type: "user_message", text: "hello", attachments: [] } }]);
   assert.equal(JSON.stringify(commands).includes("personality_agent_id"), false);
@@ -80,17 +93,33 @@ test("uses the session-resolved direct-chat route and sends no target or provena
   socket.close();
 });
 
+test("rejects a path-prefixed API base instead of silently discarding it", () => {
+  assert.throws(
+    () =>
+      resolveDirectChatURL({
+        apiBaseURL: "http://browser.test/api",
+        pageOrigin: "http://browser.test",
+      }),
+    /must contain only an origin/,
+  );
+});
+
 test("retries an uncertain command with its original key and stops after acceptance", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
   socket.sendCommand({ type: "abort" }, "stable-key");
   first.close();
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [{ type: "hello", last_event_seq: 0 }]);
+  second.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  second.receive({ type: "direct_chat_status", status: "ready" });
   const resent = second.sent.map(JSON.parse).filter((frame) => frame.type === "command");
   assert.deepEqual(resent, [{ type: "command", idempotency_key: "stable-key", command: { type: "abort" } }]);
   second.receive(accepted("stable-key"));
@@ -109,6 +138,7 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
   socket.sendCommand({ type: "abort" }, "conflicting-key");
   first.receive({ type: "command_rejected", idempotency_key: "conflicting-key", reject_reason: "idempotency_conflict" });
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
@@ -120,21 +150,52 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   socket.close();
 });
 
-test("a terminal unavailable rejection clears its pending key without closing or reconnect resend", () => {
+test("unavailable status retains pending commands without sending until ready", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
+  socket.sendCommand({ type: "abort" }, "unavailable-key");
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["unavailable-key"]);
+  assert.equal(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  wire.receive({ type: "direct_chat_status", status: "unavailable" });
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["unavailable-key"]);
+  assert.equal(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  wire.receive({ type: "direct_chat_status", status: "ready" });
+  assert.deepEqual(wire.sent.map(JSON.parse).filter((frame) => frame.type === "command"), [
+    { type: "command", idempotency_key: "unavailable-key", command: { type: "abort" } },
+  ]);
+  socket.close();
+});
+
+test("authority reset drops replay cursor and pending commands before reconnect", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
   socket.connect();
   const first = FakeWebSocket.instances.at(-1);
   first.open();
-  socket.sendCommand({ type: "abort" }, "unavailable-key");
-  first.receive({ type: "command_rejected", idempotency_key: "unavailable-key", reject_reason: "unavailable" });
+  first.receive(event(1, { type: "agent_start" }));
+  socket.sendCommand({ type: "abort" }, "old-authority-key");
+  assert.deepEqual(socket.pendingIdempotencyKeys(), ["old-authority-key"]);
+
+  socket.resetAuthority();
+
+  assert.equal(first.readyState, FakeWebSocket.CLOSED);
   assert.deepEqual(socket.pendingIdempotencyKeys(), []);
-  assert.equal(first.readyState, FakeWebSocket.OPEN);
-  first.close();
   socket.connect();
   const second = FakeWebSocket.instances.at(-1);
   second.open();
-  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 0 },
+  ]);
+  second.receive({ type: "direct_chat_status", status: "ready" });
+  assert.equal(
+    second.sent
+      .map(JSON.parse)
+      .filter((frame) => frame.type === "command").length,
+    0,
+  );
   socket.close();
 });
 
@@ -167,6 +228,139 @@ test("rejects legacy target-bearing and malformed server frames", () => {
   }
   assert.equal(parseDirectChatServerFrame(accepted("k"), 0)?.type, "command_accepted");
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame({ ...accepted("x".repeat(1025)) }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame({
+    type: "command_rejected",
+    idempotency_key: "x".repeat(1025),
+    reject_reason: "unavailable",
+  }, 0), undefined);
+});
+
+test("accepts only exact durable command disposition shapes", () => {
+  const command_id = "00000000-0000-4000-8000-000000000001";
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 7, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "superseded" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "rejected",
+      reject_reason: "not_allowed",
+    },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(event(1, disposition), 0)?.type, "event");
+  }
+
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 7, status: "rejected" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "applied",
+      reject_reason: "not_allowed",
+    },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "rejected",
+      reject_reason: "idempotency_conflict",
+    },
+    { type: "command_disposition", command_id, command_seq: -1, status: "applied" },
+    { type: "command_disposition", command_id: "not-a-uuid", command_seq: 7, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "received" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "applied", extra: true },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(event(1, disposition), 0), undefined);
+  }
+  assert.equal(parseDirectChatServerFrame({
+    type: "event",
+    envelope: {
+      event: { type: "command_disposition", command_id, command_seq: 7, status: "applied" },
+    },
+  }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame(event(2, {
+    type: "command_disposition",
+    command_id,
+    command_seq: 7,
+    status: "applied",
+  }), 0), undefined);
+});
+
+test("acceptance permits only an exactly correlated terminal disposition", () => {
+  const command_id = "00000000-0000-4000-8000-000000000001";
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 1, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 1, status: "superseded" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "rejected",
+      reject_reason: "not_allowed",
+    },
+  ]) {
+    assert.equal(
+      parseDirectChatServerFrame(accepted("key", disposition), 0)?.type,
+      "command_accepted",
+    );
+  }
+
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 2, status: "applied" },
+    {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000002",
+      command_seq: 1,
+      status: "applied",
+    },
+    { type: "command_disposition", command_id, command_seq: 1, status: "received" },
+    { type: "command_disposition", command_id, command_seq: 1, status: "rejected" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "applied",
+      reject_reason: "not_allowed",
+    },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "applied",
+      extra: true,
+    },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(accepted("key", disposition), 0), undefined);
+  }
+  assert.equal(
+    parseDirectChatServerFrame({ ...accepted("key"), disposition: null }, 0),
+    undefined,
+  );
+});
+
+test("durable disposition advances the socket replay cursor", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive(event(1, {
+    type: "command_disposition",
+    command_id: "00000000-0000-4000-8000-000000000001",
+    command_seq: 1,
+    status: "applied",
+  }));
+  first.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 1 },
+  ]);
+  socket.close();
 });
 
 test("rejects identity aliases and provenance only when they are structural fields", () => {

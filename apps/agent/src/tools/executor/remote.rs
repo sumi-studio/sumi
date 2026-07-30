@@ -54,15 +54,22 @@ impl ExecutorInvoker for ExecutorClient {
 }
 
 /// Builds the production executor registry from one immutable,
-/// supervisor-issued client. The critical Unix endpoint intentionally exposes
-/// only workspace `read_file`.
+/// supervisor-issued client. The critical Unix endpoint exposes only bounded,
+/// workspace-confined read and discovery operations.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
     let identity = client.identity().clone();
     let mut builder = ToolRegistryBuilder::default();
-    builder.register(Arc::new(RemoteTool {
-        kind: RemoteToolKind::WorkspaceReadFile,
-        client,
-    }))?;
+    for kind in [
+        RemoteToolKind::WorkspaceReadFile,
+        RemoteToolKind::ListDir,
+        RemoteToolKind::Glob,
+        RemoteToolKind::WorkspaceGrep,
+    ] {
+        builder.register(Arc::new(RemoteTool {
+            kind,
+            client: client.clone(),
+        }))?;
+    }
     Ok(builder.build_for_executor_identity(identity))
 }
 
@@ -97,6 +104,7 @@ fn broad_test_registry_from_invoker(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteToolKind {
     WorkspaceReadFile,
+    WorkspaceGrep,
     ReadFile,
     WriteFile,
     EditFile,
@@ -123,6 +131,10 @@ impl Tool for RemoteTool {
             RemoteToolKind::ReadFile => definition::<ReadFileArgs>(
                 "read_file",
                 "Read UTF-8 text from a workspace path or artifact handle.",
+            ),
+            RemoteToolKind::WorkspaceGrep => definition::<WorkspaceGrepArgs>(
+                "grep",
+                "Search a workspace path with a regular expression. Artifact handles are not accepted.",
             ),
             RemoteToolKind::WriteFile => definition::<WriteFileArgs>(
                 "write_file",
@@ -154,6 +166,7 @@ impl Tool for RemoteTool {
     fn risk(&self) -> ToolRisk {
         match self.kind {
             RemoteToolKind::WorkspaceReadFile
+            | RemoteToolKind::WorkspaceGrep
             | RemoteToolKind::ReadFile
             | RemoteToolKind::ListDir
             | RemoteToolKind::Glob
@@ -221,6 +234,19 @@ impl RemoteToolKind {
                     path: args.path,
                     offset: args.offset,
                     limit,
+                    execution_id,
+                }
+            }
+            Self::WorkspaceGrep => {
+                let args: WorkspaceGrepArgs = decode(args)?;
+                if args.path.starts_with("artifact://") {
+                    return Err(ToolError::InvalidPath(
+                        "production grep accepts workspace paths only".to_owned(),
+                    ));
+                }
+                ExecutorOperation::Grep {
+                    path: args.path,
+                    pattern: args.pattern,
                     execution_id,
                 }
             }
@@ -307,7 +333,7 @@ impl RemoteToolKind {
                     json!({"paths": paths, "count": paths.len()}),
                 ))
             }
-            (Self::Grep, ExecutorResponse::Grepped { matches }) => {
+            (Self::WorkspaceGrep | Self::Grep, ExecutorResponse::Grepped { matches }) => {
                 let rendered = bounded_lines(
                     matches
                         .iter()
@@ -640,6 +666,7 @@ struct EditFileArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PathArgs {
+    /// A workspace path. Artifact handles are not accepted.
     #[schemars(length(min = 1))]
     path: String,
 }
@@ -647,6 +674,7 @@ struct PathArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GlobArgs {
+    /// A workspace-relative glob pattern. Artifact handles are not accepted.
     #[schemars(length(min = 1))]
     pattern: String,
 }
@@ -654,6 +682,16 @@ struct GlobArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GrepArgs {
+    #[schemars(length(min = 1))]
+    path: String,
+    #[schemars(length(min = 1))]
+    pattern: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceGrepArgs {
+    /// A workspace path. `artifact://` handles are not accepted.
     #[schemars(length(min = 1))]
     path: String,
     #[schemars(length(min = 1))]
@@ -1548,16 +1586,16 @@ mod tests {
             "an unbound fixture registry cannot satisfy production validation"
         );
 
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len(), 4);
         assert_eq!(
             registry
                 .definitions()
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect::<Vec<_>>(),
-            vec!["read_file"]
+            vec!["glob", "grep", "list_dir", "read_file"]
         );
-        let definition = registry.definitions().into_iter().next().unwrap();
+        let definition = registry.get("read_file").unwrap().def();
         assert_eq!(
             definition.description,
             "Read UTF-8 text from a workspace path. Artifact handles are not accepted."
@@ -1566,20 +1604,34 @@ mod tests {
             definition.parameters["properties"]["path"]["description"],
             "A workspace path. `artifact://` handles are not accepted."
         );
-        for forbidden in [
-            "bash",
-            "write_file",
-            "edit_file",
-            "delete",
-            "list_dir",
-            "glob",
-            "grep",
-        ] {
+        for forbidden in ["bash", "write_file", "edit_file", "delete"] {
             assert!(
                 registry.get(forbidden).is_none(),
                 "{forbidden} leaked into the production registry"
             );
         }
+        for allowed in ["read_file", "list_dir", "glob", "grep"] {
+            assert_eq!(registry.get(allowed).unwrap().risk(), ToolRisk::ReadOnly);
+        }
+        let grep = registry.get("grep").unwrap().def();
+        assert_eq!(
+            grep.description,
+            "Search a workspace path with a regular expression. Artifact handles are not accepted."
+        );
+        assert_eq!(
+            grep.parameters["properties"]["path"]["description"],
+            "A workspace path. `artifact://` handles are not accepted."
+        );
+        let list_dir = registry.get("list_dir").unwrap().def();
+        assert_eq!(
+            list_dir.parameters["properties"]["path"]["description"],
+            "A workspace path. Artifact handles are not accepted."
+        );
+        let glob = registry.get("glob").unwrap().def();
+        assert_eq!(
+            glob.parameters["properties"]["pattern"]["description"],
+            "A workspace-relative glob pattern. Artifact handles are not accepted."
+        );
     }
 
     #[tokio::test]
@@ -1601,6 +1653,43 @@ mod tests {
             json!({
                 "path":
                     "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/forbidden"
+            }),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidPath(_)));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "production artifact input contacted the executor endpoint"
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_artifact_grep_is_rejected_before_endpoint_interaction() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-workspace-grep-only-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry =
+            remote_executor_registry(Arc::new(ExecutorClient::new(&socket, identity))).unwrap();
+
+        let error = run(
+            &registry,
+            "grep",
+            "flow",
+            "artifact-call",
+            json!({
+                "path":
+                    "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/forbidden",
+                "pattern": "secret",
             }),
             CancellationToken::new(),
             Arc::new(|_| {}),

@@ -55,6 +55,9 @@ type DurableGateway struct {
 	// durable replay. Zero values use conservative defaults.
 	MaxPersonalityAgentTails int
 	MaxAckTail               int
+	// MaxBrowserSessionRevocations bounds the durable browser-session denylist.
+	// Zero uses maxRevokedSessions.
+	MaxBrowserSessionRevocations int
 
 	tails map[string]*personalityAgentLogState
 	// browserSubscribers carry volatile frames only. Durable replay always
@@ -64,6 +67,13 @@ type DurableGateway struct {
 	nextBrowserSubscriber uint64
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
+	writeAtomic           func(string, []byte, os.FileMode) error
+	// browserSessionMutationHook is test-only synchronization invoked while
+	// the shared exclusive lifecycle lock is held.
+	browserSessionMutationHook func(browserSessionMutationKind)
+	// browserSessionLockAttemptHook is test-only synchronization invoked
+	// immediately before attempting the shared lifecycle lock.
+	browserSessionLockAttemptHook func()
 
 	// stateMu protects run-in-flight and pending-approval state derived from
 	// durable events. Readers also take mu first so they cannot observe the
@@ -267,22 +277,24 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		return nil, err
 	}
 	return &DurableGateway{
-		dir:                      abs,
-		commands:                 commands,
-		runtimeDir:               runtimeDir,
-		runtimeDirIdentity:       identity,
-		runtimeLockIDs:           make(map[string]durableFileIdentity),
-		PollInterval:             50 * time.Millisecond,
-		MaxPersonalityAgentTails: 128,
-		MaxAckTail:               256,
-		tails:                    make(map[string]*personalityAgentLogState),
-		browserSubscribers:       make(map[string]map[uint64]chan Envelope),
-		stateRebuilt:             make(map[string]bool),
-		runInFlight:              make(map[string]bool),
-		pendingApprovals:         make(map[string]map[string]bool),
+		dir:                          abs,
+		commands:                     commands,
+		runtimeDir:                   runtimeDir,
+		runtimeDirIdentity:           identity,
+		runtimeLockIDs:               make(map[string]durableFileIdentity),
+		PollInterval:                 50 * time.Millisecond,
+		MaxPersonalityAgentTails:     128,
+		MaxAckTail:                   256,
+		MaxBrowserSessionRevocations: maxRevokedSessions,
+		tails:                        make(map[string]*personalityAgentLogState),
+		browserSubscribers:           make(map[string]map[uint64]chan Envelope),
+		stateRebuilt:                 make(map[string]bool),
+		runInFlight:                  make(map[string]bool),
+		pendingApprovals:             make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
+		writeAtomic: writeFileAtomic,
 	}, nil
 }
 
@@ -480,44 +492,76 @@ func (g *DurableGateway) Append(
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, error) {
+	envelope, _, err := g.appendWithIdempotencyStatus(
+		ctx,
+		provenance,
+		idempotencyKey,
+		command,
+	)
+	return envelope, err
+}
+
+// AppendWithIdempotencyStatus is the browser receipt variant of Append. It
+// returns true only when the atomic command-store decision reused an existing
+// durable command for the same key and authenticated bytes.
+func (g *DurableGateway) AppendWithIdempotencyStatus(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, bool, error) {
+	return g.appendWithIdempotencyStatus(ctx, provenance, idempotencyKey, command)
+}
+
+func (g *DurableGateway) appendWithIdempotencyStatus(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return CommandEnvelope{}, err
+		return CommandEnvelope{}, false, err
 	}
 	if err := provenance.Validate(); err != nil {
-		return CommandEnvelope{}, fmt.Errorf("validate browser command provenance: %w", err)
+		return CommandEnvelope{}, false, fmt.Errorf("validate browser command provenance: %w", err)
 	}
 	for {
 		lock, err := g.openRuntimeLock(provenance.PersonalityAgentID)
 		if err != nil {
-			return CommandEnvelope{}, err
+			return CommandEnvelope{}, false, err
 		}
 		if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
 			_ = lock.Close()
-			return CommandEnvelope{}, fmt.Errorf("lock browser command admission: %w", err)
+			return CommandEnvelope{}, false, fmt.Errorf("lock browser command admission: %w", err)
 		}
 		state, stateErr := g.state(ctx, provenance.PersonalityAgentID)
 		switch {
 		case stateErr != nil:
 			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 			_ = lock.Close()
-			return CommandEnvelope{}, stateErr
+			return CommandEnvelope{}, false, stateErr
 		case state.needsResign:
 			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 			_ = lock.Close()
 			if err := g.resignIntegrityStates(ctx, provenance.PersonalityAgentID); err != nil {
-				return CommandEnvelope{}, err
+				return CommandEnvelope{}, false, err
 			}
 			continue
 		case !state.present || state.HydrationReceiptIdentity == nil:
 			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 			_ = lock.Close()
-			return CommandEnvelope{}, errBrowserRuntimeUnavailable
+			return CommandEnvelope{}, false, errBrowserRuntimeUnavailable
 		}
 
-		envelope, appendErr := g.commands.Append(ctx, provenance, idempotencyKey, command)
+		envelope, existing, appendErr := g.commands.appendWithIdempotencyStatus(
+			ctx,
+			provenance,
+			idempotencyKey,
+			command,
+		)
 		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 		_ = lock.Close()
-		return envelope, appendErr
+		return envelope, existing, appendErr
 	}
 }
 
@@ -1117,6 +1161,98 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID st
 		return nil, fmt.Errorf("browser event cursor %d is ahead of durable tail %d", lastConsumedSeq, previous)
 	}
 	return out, nil
+}
+
+// CommandDispositionFor returns the exact durable terminal disposition for a
+// command, when one has already been committed. The scan deliberately retains
+// only the matching event: browser idempotency reconciliation must not turn a
+// lifetime event log into an unbounded in-memory disposition index.
+func (g *DurableGateway) CommandDispositionFor(
+	ctx context.Context,
+	command CommandEnvelope,
+) (json.RawMessage, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if err := command.Validate(); err != nil {
+		return nil, false, fmt.Errorf("validate command disposition lookup: %w", err)
+	}
+	persisted, found, err := g.commands.GetCommand(
+		ctx,
+		command.PersonalityAgentID,
+		command.Seq,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("load command for disposition lookup: %w", err)
+	}
+	if !found || persisted.CommandID != command.CommandID {
+		return nil, false, errors.New("command disposition lookup does not match durable command log")
+	}
+
+	path := g.eventPath(command.PersonalityAgentID)
+	file, err := g.newFile(path, os.O_RDONLY, 0o600)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_SH); err != nil {
+		return nil, false, fmt.Errorf("lock durable event log for command disposition lookup: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+
+	r := bufio.NewReader(file)
+	var previous uint64
+	var disposition json.RawMessage
+	for {
+		line, readErr := r.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) != 0 {
+			var record durableEventRecord
+			if err := json.Unmarshal(trimmed, &record); err != nil {
+				return nil, false, fmt.Errorf("decode durable event log for command disposition lookup: %w", err)
+			}
+			if record.Seq != previous+1 {
+				return nil, false, fmt.Errorf("durable event log is non-contiguous: got %d after %d", record.Seq, previous)
+			}
+			if record.Event.Seq == nil || *record.Event.Seq != record.Seq {
+				return nil, false, fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", record.Seq, record.Event.Seq)
+			}
+			if record.Event.PersonalityAgentID != command.PersonalityAgentID {
+				return nil, false, fmt.Errorf(
+					"durable event record personality agent mismatch: got %q, want %q",
+					record.Event.PersonalityAgentID,
+					command.PersonalityAgentID,
+				)
+			}
+			previous = record.Seq
+
+			if eventType(record.Event.Event) == "command_disposition" {
+				var correlation struct {
+					CommandID  string `json:"command_id"`
+					CommandSeq uint64 `json:"command_seq"`
+				}
+				if err := json.Unmarshal(record.Event.Event, &correlation); err != nil {
+					return nil, false, fmt.Errorf("decode durable command disposition correlation: %w", err)
+				}
+				if correlation.CommandID == command.CommandID && correlation.CommandSeq == command.Seq {
+					if disposition != nil {
+						return nil, false, errors.New("durable event log contains duplicate command dispositions")
+					}
+					disposition = append(json.RawMessage(nil), record.Event.Event...)
+				}
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, false, fmt.Errorf("read durable event log for command disposition lookup: %w", readErr)
+		}
+	}
+	return disposition, disposition != nil, nil
 }
 
 // SubscribeBrowserVolatile registers one bounded live-only receiver. A slow

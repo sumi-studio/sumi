@@ -185,7 +185,21 @@ async fn async_main(mode: Option<String>) -> Result<()> {
             );
         }
 
-        let receipt_ack = admission.receive(&event_writer, &inbound).await?;
+        let receipt = admission
+            .receive_with_origin(&event_writer, &inbound)
+            .await?;
+        for (seq, event) in receipt.events {
+            gateway_writer
+                .send(OutboundFrame::Event {
+                    envelope: gateway::Envelope {
+                        seq: Some(seq),
+                        personality_agent_id: personality_agent_id.clone(),
+                        event: serde_json::to_value(event)?,
+                    },
+                })
+                .await?;
+        }
+        let receipt_ack = receipt.ack;
         if receipt_ack.status != CommandAckStatus::Received {
             gateway_writer
                 .send(OutboundFrame::CommandAck { ack: receipt_ack })
@@ -204,9 +218,21 @@ async fn async_main(mode: Option<String>) -> Result<()> {
             {
                 // A fully idle Abort is a durable no-op. Commit terminal state
                 // before either ACK is attempted so a writer failure is replay-safe.
-                let mut terminal_acks = event_writer
-                    .apply_idle_abort_cutoff(command.command_id.as_str(), command.seq)
+                let terminal = event_writer
+                    .apply_idle_abort_cutoff_with_events(command.command_id.as_str(), command.seq)
                     .await?;
+                for (seq, event) in terminal.events {
+                    gateway_writer
+                        .send(OutboundFrame::Event {
+                            envelope: gateway::Envelope {
+                                seq: Some(seq),
+                                personality_agent_id: personality_agent_id.clone(),
+                                event: serde_json::to_value(event)?,
+                            },
+                        })
+                        .await?;
+                }
+                let mut terminal_acks = terminal.acks;
                 let terminal_ack = terminal_acks
                     .pop()
                     .ok_or_else(|| anyhow!("terminal Abort ACK disappeared"))?;

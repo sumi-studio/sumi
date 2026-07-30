@@ -20,7 +20,10 @@ use super::*;
 use crate::store::KeyProvider;
 use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
-    gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
+    gateway::{
+        AgentHello, ApiHello, CommandAck, CommandId, CommandRejectReason, HelloError,
+        RejectedCommandPayload, SensitiveCommandPayload,
+    },
     memory::estimate::ProviderContextItemWithFootprint,
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
@@ -590,6 +593,141 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
         .collect()
 }
 
+fn assert_terminal_ack_follows_disposition(
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    command_id: &str,
+) {
+    let frames = frames.lock().expect("frame mutex");
+    let disposition = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.seq.is_some()
+                    && envelope.event["type"] == "command_disposition"
+                    && envelope.event["command_id"] == command_id)
+        })
+        .unwrap_or_else(|| panic!("missing durable disposition for {command_id}"));
+    let terminal_ack = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::CommandAck { ack }
+            if ack.command_id == command_id
+                && matches!(
+                    ack.status,
+                    CommandAckStatus::Applied
+                        | CommandAckStatus::Superseded
+                        | CommandAckStatus::Rejected
+                ))
+        })
+        .unwrap_or_else(|| panic!("missing terminal ACK for {command_id}"));
+    assert!(
+        disposition < terminal_ack,
+        "terminal ACK for {command_id} preceded its durable disposition"
+    );
+}
+
+#[tokio::test]
+async fn newly_rejected_admission_publishes_disposition_before_terminal_ack() {
+    let store = Store::session_test_store("rejected-admission-disposition-order")
+        .await
+        .expect("test store");
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move {
+            panic!("rejected admission must not start a worker")
+        },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let command_id =
+        CommandId::parse("00000000-0000-4000-8000-000000000091").expect("canonical UUID");
+    session
+        .admit_and_route(InboundCommand::Invalid {
+            seq: 1,
+            command_id: command_id.clone(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                br#"{"type":"abort",}"#.to_vec(),
+            )),
+            payload_digest: None,
+        })
+        .await
+        .expect("reject invalid command durably");
+    session.wait_outbound_idle().await;
+
+    let frames = frames.lock().expect("frames");
+    let disposition = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.seq.is_some()
+                    && envelope.event["type"] == "command_disposition"
+                    && envelope.event["command_id"] == command_id.as_str()
+                    && envelope.event["status"] == "rejected")
+        })
+        .expect("durable rejected disposition frame");
+    let terminal_ack = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::CommandAck { ack }
+                if ack.command_id == command_id.as_str()
+                    && ack.status == CommandAckStatus::Rejected)
+        })
+        .expect("Rejected ACK");
+    assert!(
+        disposition < terminal_ack,
+        "terminal ACK must be admitted behind its durable disposition"
+    );
+}
+
+#[tokio::test]
+async fn idle_approval_noop_publishes_disposition_before_terminal_ack() {
+    let store = Store::session_test_store("idle-approval-disposition-order")
+        .await
+        .expect("test store");
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move {
+            panic!("idle approval no-op must not start a worker")
+        },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let decision = approval_decision(1, "already-terminal-request");
+    let command_id = match &decision {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        InboundCommand::Invalid { .. } => unreachable!("approval decision is valid"),
+    };
+    session
+        .admit_and_route(decision)
+        .await
+        .expect("apply idle approval no-op");
+    session.wait_outbound_idle().await;
+    assert_terminal_ack_follows_disposition(&frames, &command_id);
+}
+
 async fn close_mock_gateway_after_idle_boundary(
     commands: mpsc::Sender<InboundCommand>,
     frames: &Arc<Mutex<Vec<OutboundFrame>>>,
@@ -622,6 +760,7 @@ async fn close_mock_gateway_after_idle_boundary(
     })
     .await
     .expect("idle-boundary sentinel applied");
+    assert_terminal_ack_follows_disposition(frames, &sentinel_command_id);
     drop(commands);
 }
 
@@ -1640,11 +1779,14 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
         .expect("durable message count");
     assert_eq!(durable_messages, 2);
     let durable_tail: Vec<String> =
-        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 3")
             .fetch_all(&pool)
             .await
             .expect("durable shutdown tail");
-    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
+    assert_eq!(
+        durable_tail,
+        vec!["command_disposition", "agent_end", "turn_end"]
+    );
 }
 
 #[tokio::test]
@@ -1784,11 +1926,14 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
         .expect("durable message count");
     assert_eq!(durable_messages, 2);
     let durable_tail: Vec<String> =
-        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 3")
             .fetch_all(&pool)
             .await
             .expect("durable completion tail");
-    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
+    assert_eq!(
+        durable_tail,
+        vec!["command_disposition", "agent_end", "turn_end"]
+    );
 }
 
 #[tokio::test]
@@ -3131,6 +3276,13 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
     assert_eq!(states[1], (2, "superseded".to_owned(), None));
     assert_eq!(states[2], (3, "applied".to_owned(), None));
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 #[tokio::test]
@@ -3179,6 +3331,13 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     })
     .await
     .expect("later user run");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while applied_acks(&frames).len() < 3 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all applied outcomes delivered");
     drop(commands);
     completed(task.await.expect("session join"));
 
@@ -3191,6 +3350,13 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     assert_eq!(states[2].1, "applied");
     assert!(states[2].2.is_some());
     assert_eq!(run_count.load(Ordering::SeqCst), 2);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 #[tokio::test]
@@ -3339,6 +3505,13 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
     assert_eq!(states[2].1, "applied");
     assert_eq!(states[2].2, None);
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 struct OpaqueContextDriver {
@@ -4960,7 +5133,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     commands_tx.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if observed.lock().expect("observed mutex").len() == 8 {
+            if observed.lock().expect("observed mutex").len() == 9 {
                 break;
             }
             if task.is_finished() {
@@ -4975,13 +5148,32 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     completed(task.await.expect("session join"));
 
     let observed = observed.lock().expect("observed mutex").clone();
-    assert_eq!(observed.len(), 8);
-    assert!(observed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(
+        observed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        (1..=9).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .map(|(_, kind)| kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "command_disposition",
+        ]
+    );
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
         .fetch_one(&pool)
         .await
         .expect("stored events");
-    assert_eq!(stored, 8);
+    assert_eq!(stored, 9);
     let projected: String = sqlx::query_scalar(
         "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='assistant-bridge'",
     )
@@ -6391,14 +6583,19 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 4,
+        kinds.len() > retry + 5,
         "retry suffix must contain injection and the next assistant start"
     );
     assert_eq!(
-        &kinds[retry + 1..retry + 4],
-        ["steered", "message_start", "message_end"]
+        &kinds[retry + 1..retry + 5],
+        [
+            "steered",
+            "message_start",
+            "command_disposition",
+            "message_end",
+        ]
     );
-    assert_eq!(kinds[retry + 4], "message_start");
+    assert_eq!(kinds[retry + 5], "message_start");
 
     let steer_command_id = match user(2) {
         InboundCommand::Valid(envelope) => envelope.command_id,
@@ -8409,22 +8606,22 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 8,
+        kinds.len() > retry + 12,
         "retry suffix contains group injection and assistant"
     );
     assert_eq!(&kinds[retry + 1..retry + 3], ["steered", "steered"]);
     assert_eq!(
-        &kinds[retry + 3..retry + 5],
-        ["message_start", "message_end"]
+        &kinds[retry + 3..retry + 6],
+        ["message_start", "command_disposition", "message_end"]
     );
     assert_eq!(
-        &kinds[retry + 5..retry + 7],
-        ["message_start", "message_end"]
+        &kinds[retry + 6..retry + 9],
+        ["message_start", "command_disposition", "message_end"]
     );
-    assert_eq!(kinds[retry + 7], "message_start");
-    assert_eq!(kinds[retry + 8], "message_end");
-    assert_eq!(kinds[retry + 9], "turn_end");
-    assert_eq!(kinds[retry + 10], "agent_end");
+    assert_eq!(kinds[retry + 9], "message_start");
+    assert_eq!(kinds[retry + 10], "message_end");
+    assert_eq!(kinds[retry + 11], "turn_end");
+    assert_eq!(kinds[retry + 12], "agent_end");
 
     let steer_command_ids: Vec<String> = [user(2), user(3)]
         .iter()
@@ -8542,7 +8739,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 13,
+        kinds.len() > retry + 16,
         "retry suffix contains group injection and assistant"
     );
     assert_eq!(
@@ -8550,20 +8747,23 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         ["steered", "steered", "steered"]
     );
     assert_eq!(
-        &kinds[retry + 4..retry + 10],
+        &kinds[retry + 4..retry + 13],
         [
             "message_start",
+            "command_disposition",
             "message_end",
             "message_start",
+            "command_disposition",
             "message_end",
             "message_start",
+            "command_disposition",
             "message_end",
         ]
     );
-    assert_eq!(kinds[retry + 10], "message_start");
-    assert_eq!(kinds[retry + 11], "message_end");
-    assert_eq!(kinds[retry + 12], "turn_end");
-    assert_eq!(kinds[retry + 13], "agent_end");
+    assert_eq!(kinds[retry + 13], "message_start");
+    assert_eq!(kinds[retry + 14], "message_end");
+    assert_eq!(kinds[retry + 15], "turn_end");
+    assert_eq!(kinds[retry + 16], "agent_end");
 
     let steer_command_ids: Vec<String> = [user(2), user(3), user(4)]
         .iter()

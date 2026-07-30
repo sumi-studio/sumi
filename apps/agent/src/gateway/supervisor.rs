@@ -3235,9 +3235,9 @@ mod tests {
 
     struct MockGatewayWriter {
         fail_after: Option<usize>,
-        /// Record the Nth frame as a completed wire write, then fail the
+        /// Record a matching frame as a completed wire write, then fail the
         /// connection before the peer's durable handler can be assumed.
-        fail_after_record: Option<usize>,
+        fail_after_record: Option<fn(&OutboundFrame) -> bool>,
         sent: Arc<std::sync::Mutex<Vec<OutboundFrame>>>,
         delay: Option<Duration>,
         /// Number of successfully sent frames after which the writer blocks.
@@ -3289,8 +3289,11 @@ mod tests {
                 {
                     bail!("writer failure");
                 }
+                let fail_after_record = self
+                    .fail_after_record
+                    .is_some_and(|predicate| predicate(&frame));
                 sent.push(frame);
-                if self.fail_after_record == Some(sent.len()) {
+                if fail_after_record {
                     bail!("writer failed after wire send before peer persistence");
                 }
                 let blocked = self.block_after.is_some_and(|n| sent.len() == n);
@@ -10342,17 +10345,26 @@ mod tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let adapter = seams::T17StoreAdapter::new(Arc::new(store.clone()));
+        let store_arc = Arc::new(store.clone());
+        let base_adapter = seams::T17StoreAdapter::new(store_arc.clone());
+        let (adapter, mut dispatcher) =
+            bind_test_post_commit_dispatcher(store_arc.clone(), &base_adapter, 0);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let first_sent = Arc::new(Mutex::new(Vec::new()));
         let second_sent = Arc::new(Mutex::new(Vec::new()));
 
         let mut gateway1 = MockGateway::new(VecDeque::from([Ok(valid_command(1, COMMAND_ID))]));
         gateway1.writer.sent = first_sent.clone();
-        gateway1.writer.fail_after_record = Some(2);
+        gateway1.writer.fail_after_record = Some(|frame| {
+            matches!(
+                frame,
+                OutboundFrame::CommandAck { ack }
+                    if ack.seq == 1 && ack.status == CommandAckStatus::Applied
+            )
+        });
 
         // Production API semantics use its durable ACK log. The first epoch's
-        // terminal frame reached the wire but failed before ApplyAck, so the
+        // terminal ACK reached the wire but failed before ApplyAck, so the
         // API returns seq 1 despite the agent's second hello reporting local
         // applied=1.
         let mut gateway2 = MockGateway::new(VecDeque::from([Ok(valid_command(1, COMMAND_ID))]))
@@ -10431,8 +10443,12 @@ mod tests {
             first_sent.lock().unwrap().as_slice(),
             [
                 OutboundFrame::CommandAck { ack: received },
+                OutboundFrame::Event { envelope: disposition },
                 OutboundFrame::CommandAck { ack: applied },
             ] if received.status == CommandAckStatus::Received
+                && disposition.event["type"] == "command_disposition"
+                && disposition.event["command_id"] == COMMAND_ID
+                && disposition.event["status"] == "applied"
                 && applied.status == CommandAckStatus::Applied
         ));
         assert_eq!(
@@ -10456,6 +10472,8 @@ mod tests {
             .await
             .expect("ACK replay supervisor joins explicitly");
         wait_for_t17_idle(&adapter).await;
+        let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[tokio::test]

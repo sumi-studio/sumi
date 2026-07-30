@@ -1252,8 +1252,8 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
     assert_has_mount(executor, "workspace:/workspace:ro");
     assert_has_mount(broker, "broker-ipc:/run/sumi/broker");
-    assert!(!volume_sources(runtime).contains("broker-ipc"));
     assert!(!volume_sources(runtime).contains("workspace"));
+    assert!(!volume_sources(runtime).contains("broker-ipc"));
     assert!(!volume_sources(runtime).contains("artifacts"));
     assert!(!volume_sources(executor).contains("artifacts"));
     assert!(!volume_sources(executor).contains("state"));

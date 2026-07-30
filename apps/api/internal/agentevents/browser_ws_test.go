@@ -15,15 +15,55 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+type dispositionBeforeAppendReturn struct {
+	gateway *DurableGateway
+	claims  TokenClaims
+}
+
+func (a dispositionBeforeAppendReturn) Append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, error) {
+	envelope, err := a.gateway.Append(ctx, provenance, idempotencyKey, command)
+	if err != nil {
+		return CommandEnvelope{}, err
+	}
+	seq := uint64(1)
+	disposition, err := json.Marshal(map[string]any{
+		"type":        "command_disposition",
+		"command_id":  envelope.CommandID,
+		"command_seq": envelope.Seq,
+		"status":      "applied",
+	})
+	if err != nil {
+		return CommandEnvelope{}, err
+	}
+	if err := a.gateway.Receive(ctx, a.claims, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: envelope.PersonalityAgentID,
+		Event:              disposition,
+	}); err != nil {
+		return CommandEnvelope{}, err
+	}
+	// Give the event pump time to reach its serialized socket write. The
+	// receipt transaction must still keep this newly-created disposition from
+	// overtaking command_accepted on the same connection.
+	time.Sleep(25 * time.Millisecond)
+	return envelope, nil
+}
+
 func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,13 +173,351 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 }
 
+func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	gateway.PollInterval = time.Millisecond
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	const generation = uint64(7)
+	receipt := "hydrated-racing-disposition"
+	if err := gateway.PublishRuntimeState(personalityAgentID, generation, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	agentClaims := TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         generation,
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(
+		sessions,
+		dispositionBeforeAppendReturn{gateway: gateway, claims: agentClaims},
+		gateway,
+	)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionClaims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	conn := dialBrowserWS(
+		t,
+		httpServer,
+		signBrowserSession(t, testSecret, sessionClaims),
+		personalityAgentID,
+	)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "racing-disposition",
+		Command:        json.RawMessage(`{"type":"user_message","text":"race","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var accepted browserCommandAcceptedFrame
+	if err := conn.ReadJSON(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Type != "command_accepted" {
+		t.Fatalf("racing terminal disposition overtook admission: %+v", accepted)
+	}
+	assertBrowserEvent(t, conn, "command_disposition", true)
+}
+
+func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfterRestart(t *testing.T) {
+	for _, status := range []string{"applied", "superseded", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			tmp := t.TempDir()
+			storeDir := filepath.Join(tmp, "commands")
+			runtimeDir := filepath.Join(tmp, "runtime")
+			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+			const generation = uint64(7)
+			receipt := "hydrated-authoritative-disposition"
+			if err := gateway.PublishRuntimeState(personalityAgentID, generation, &receipt); err != nil {
+				t.Fatal(err)
+			}
+			claims := TokenClaims{
+				TenantID:           "tenant-1",
+				PersonalityAgentID: personalityAgentID,
+				Generation:         generation,
+			}
+			provenance := testDirectChatProvenance(personalityAgentID)
+			originalBody := json.RawMessage(`{"type":"user_message","text":"original","attachments":[]}`)
+			original, err := gateway.Append(context.Background(), provenance, "lost-receipt-key", originalBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unrelated := make([]CommandEnvelope, 0, 33)
+			for index := 0; index < 33; index++ {
+				body := json.RawMessage(fmt.Sprintf(
+					`{"type":"user_message","text":"unrelated-%d","attachments":[]}`,
+					index,
+				))
+				command, err := gateway.Append(
+					context.Background(),
+					provenance,
+					fmt.Sprintf("unrelated-key-%d", index),
+					body,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				unrelated = append(unrelated, command)
+			}
+
+			eventSeq := uint64(1)
+			originalDisposition := map[string]any{
+				"type":        "command_disposition",
+				"command_id":  original.CommandID,
+				"command_seq": original.Seq,
+				"status":      status,
+			}
+			if status == "rejected" {
+				originalDisposition["reject_reason"] = "not_allowed"
+			}
+			rawDisposition, err := json.Marshal(originalDisposition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gateway.Receive(context.Background(), claims, Envelope{
+				Seq:                &eventSeq,
+				PersonalityAgentID: personalityAgentID,
+				Event:              rawDisposition,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, command := range unrelated {
+				eventSeq++
+				raw, err := json.Marshal(map[string]any{
+					"type":        "command_disposition",
+					"command_id":  command.CommandID,
+					"command_seq": command.Seq,
+					"status":      "applied",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := gateway.Receive(context.Background(), claims, Envelope{
+					Seq:                &eventSeq,
+					PersonalityAgentID: personalityAgentID,
+					Event:              raw,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if eventSeq <= 32 {
+				t.Fatalf("counterexample requires more than 32 later dispositions, got event tail %d", eventSeq)
+			}
+
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := gateway.runtimeDir.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, gateway, err = openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			defer gateway.runtimeDir.Close()
+
+			sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := NewBrowserServer(sessions, gateway, gateway)
+			server.AllowedOrigins = []string{"https://web.example"}
+			mux := http.NewServeMux()
+			mux.Handle("GET /direct-chat/ws", server)
+			httpServer := httptest.NewServer(mux)
+			defer httpServer.Close()
+
+			sessionClaims := userSessionWireClaims{
+				TenantID:           "tenant-1",
+				UserID:             "user-1",
+				PersonalityAgentID: personalityAgentID,
+				Exp:                time.Now().Add(time.Hour).Unix(),
+				Aud:                defaultBrowserAudience,
+			}
+			conn := dialBrowserWS(
+				t,
+				httpServer,
+				signBrowserSession(t, testSecret, sessionClaims),
+				personalityAgentID,
+			)
+			defer conn.Close()
+			if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: eventSeq}); err != nil {
+				t.Fatal(err)
+			}
+			assertDirectChatStatus(t, conn, "ready")
+
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := conn.WriteJSON(browserCommandFrame{
+					Type:           "command",
+					IdempotencyKey: "lost-receipt-key",
+					Command:        originalBody,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				var accepted browserCommandAcceptedFrame
+				if err := conn.ReadJSON(&accepted); err != nil {
+					t.Fatal(err)
+				}
+				if accepted.CommandID != original.CommandID ||
+					accepted.Seq != original.Seq ||
+					string(accepted.Disposition) != string(rawDisposition) {
+					t.Fatalf("idempotent acceptance lost authoritative disposition: %+v", accepted)
+				}
+			}
+
+			if err := conn.WriteJSON(browserCommandFrame{
+				Type:           "command",
+				IdempotencyKey: "no-terminal-key",
+				Command:        json.RawMessage(`{"type":"user_message","text":"no terminal","attachments":[]}`),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var admitted browserCommandAcceptedFrame
+			if err := conn.ReadJSON(&admitted); err != nil {
+				t.Fatal(err)
+			}
+			if len(admitted.Disposition) != 0 {
+				t.Fatalf("new admission unexpectedly carried disposition: %s", admitted.Disposition)
+			}
+		})
+	}
+}
+
+func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *testing.T) {
+	injectedReceiveFailure := errors.New("injected receive failure")
+	for _, testCase := range []struct {
+		name         string
+		receiveError error
+	}{
+		{name: "success"},
+		{name: "receive failure", receiveError: injectedReceiveFailure},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			gateway := openRuntimeGateway(t)
+			gateway.PollInterval = time.Hour
+			const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+			claims := TokenClaims{
+				TenantID:           "tenant-1",
+				PersonalityAgentID: personalityAgentID,
+				Generation:         7,
+			}
+			receipt := "ready"
+			if err := gateway.PublishRuntimeState(personalityAgentID, claims.Generation, &receipt); err != nil {
+				t.Fatal(err)
+			}
+			seq := uint64(1)
+			if err := gateway.Receive(context.Background(), claims, Envelope{
+				Seq:                &seq,
+				PersonalityAgentID: personalityAgentID,
+				Event:              json.RawMessage(`{"type":"agent_start"}`),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			volatile := make(chan Envelope)
+			appendResult := make(chan error, 1)
+			var frames []browserEventFrame
+			write := func(frame any) error {
+				eventFrame, ok := frame.(browserEventFrame)
+				if !ok {
+					t.Fatalf("unexpected browser frame: %#v", frame)
+				}
+				frames = append(frames, eventFrame)
+				if eventFrame.Envelope.Seq != nil && *eventFrame.Envelope.Seq == 1 {
+					go func() {
+						next := uint64(2)
+						err := testCase.receiveError
+						if err == nil {
+							err = gateway.Receive(ctx, claims, Envelope{
+								Seq:                &next,
+								PersonalityAgentID: personalityAgentID,
+								Event:              json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"assistant","content":[],"model":"fixture","provider":"fixture","origin":{"provider_instance_id":"fixture","protocol":"open_ai_responses","model":"fixture"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"stop","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`),
+							})
+						}
+						appendResult <- err
+						if err != nil {
+							cancel()
+							return
+						}
+						select {
+						case volatile <- Envelope{
+							PersonalityAgentID: personalityAgentID,
+							Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`),
+						}:
+						case <-ctx.Done():
+						}
+					}()
+				}
+				if eventFrame.Envelope.Seq == nil {
+					cancel()
+				}
+				return nil
+			}
+
+			server := &BrowserServer{Events: gateway}
+			err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, write)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("browser event pump returned %v, want context cancellation", err)
+			}
+			appendErr := <-appendResult
+			if testCase.receiveError != nil {
+				if !errors.Is(appendErr, injectedReceiveFailure) {
+					t.Fatalf("concurrent durable append returned %v, want injected receive failure", appendErr)
+				}
+				if len(frames) != 1 || frames[0].Envelope.Seq == nil || *frames[0].Envelope.Seq != 1 {
+					t.Fatalf("browser event frames after receive failure = %+v, want only durable seq 1", frames)
+				}
+				return
+			}
+			if appendErr != nil {
+				t.Fatalf("append durable event between catch-up and volatile delivery: %v", appendErr)
+			}
+			if len(frames) != 3 {
+				t.Fatalf("browser event frames = %d, want durable seq 1, durable seq 2, volatile", len(frames))
+			}
+			if frames[0].Envelope.Seq == nil || *frames[0].Envelope.Seq != 1 ||
+				frames[1].Envelope.Seq == nil || *frames[1].Envelope.Seq != 2 ||
+				frames[2].Envelope.Seq != nil {
+				t.Fatalf("browser event order = %+v, want durable seq 1, durable seq 2, volatile", frames)
+			}
+		})
+	}
+}
+
 func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	if err := gateway.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +582,7 @@ func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 
 func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessions(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,11 +616,25 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 			}
 		})
 	}
+
+	header := http.Header{
+		"Origin": {"https://web.example"},
+		"Cookie": {
+			BrowserSessionCookie + "=one; " + BrowserSessionCookie + "=two",
+		},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected duplicate cookie rejection, response=%v err=%v", response, err)
+	}
 }
 
 func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +658,8 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err := first.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, first, "unavailable")
 	assertBrowserEvent(t, first, "agent_start", true)
+	assertDirectChatStatus(t, first, "unavailable")
 	_ = first.Close()
 	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	seq = 2
@@ -280,8 +672,329 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	if err := second.WriteJSON(browserHello{Type: "hello", LastEventSeq: 1}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, second, "unavailable")
 	assertBrowserEvent(t, second, "agent_end", true)
+	assertDirectChatStatus(t, second, "unavailable")
+}
+
+func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionClaims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+	}
+	firstSession, err := sessions.IssueSession(context.Background(), sessionClaims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSession, err := sessions.IssueSession(context.Background(), sessionClaims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := dialBrowserWS(t, httpServer, firstSession, personalityAgentID)
+	defer first.Close()
+	second := dialBrowserWS(t, httpServer, secondSession, personalityAgentID)
+	defer second.Close()
+	for _, conn := range []*websocket.Conn{first, second} {
+		if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+			t.Fatal(err)
+		}
+		assertDirectChatStatus(t, conn, "ready")
+	}
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 2, Accepted: 2})
+
+	auth, err := NewBrowserAuthServer(
+		&fakeFirebaseVerifier{},
+		&fakeBindingResolver{},
+		sessions,
+		[]string{browserAuthTestOrigin},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.Connections = browser
+	csrf, csrfCookie := obtainCSRF(t, auth)
+	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logout.Header.Set("Origin", browserAuthTestOrigin)
+	logout.Header.Set("X-CSRF-Token", csrf)
+	logout.AddCookie(csrfCookie)
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: firstSession})
+	logoutRecorder := httptest.NewRecorder()
+	auth.serveLogout(logoutRecorder, logout)
+	if logoutRecorder.Code != http.StatusNoContent {
+		t.Fatalf("logout: %d %s", logoutRecorder.Code, logoutRecorder.Body.String())
+	}
+	assertBrowserConnectionClosedBeforeFrame(t, first)
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 1, Accepted: 2})
+
+	command := browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "still-authorized",
+		Command:        json.RawMessage(`{"type":"user_message","text":"hi","attachments":[]}`),
+	}
+	if err := second.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var accepted browserCommandAcceptedFrame
+	if err := second.ReadJSON(&accepted); err != nil {
+		t.Fatalf("unrelated session was closed: %v", err)
+	}
+	if accepted.Type != "command_accepted" {
+		t.Fatalf("unexpected command result: %+v", accepted)
+	}
+
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	header := http.Header{
+		"Origin": {"https://web.example"},
+		"Cookie": {BrowserSessionCookie + "=" + firstSession},
+	}
+	reconnected, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if reconnected != nil {
+		reconnected.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked session reconnected: response=%v err=%v", response, err)
+	}
+}
+
+func TestBrowserSessionLineageLogoutStopsSuccessorOutboundFramesAcrossGateways(
+	t *testing.T,
+) {
+	tmp := t.TempDir()
+	store, firstGateway, err := openGatewayAt(
+		t,
+		filepath.Join(tmp, "commands"),
+		filepath.Join(tmp, "runtime"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	secondGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := firstGateway.PublishRuntimeState(
+		personalityAgentID,
+		1,
+		&receipt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstSessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionClaims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+	}
+	currentSession, err := firstSessions.IssueSession(
+		context.Background(),
+		sessionClaims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, successorSession, valid, err := firstSessions.RotateSession(
+		context.Background(),
+		currentSession,
+		sessionClaims,
+		2*time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("rotate browser session: valid=%v err=%v", valid, err)
+	}
+	browser := NewBrowserServer(secondSessions, secondGateway, secondGateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	conn := dialBrowserWS(
+		t,
+		httpServer,
+		successorSession,
+		personalityAgentID,
+	)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	if _, valid, err := firstSessions.RevokeSessionForLogout(
+		context.Background(),
+		currentSession,
+	); err != nil || !valid {
+		t.Fatalf("logout ancestor session: valid=%v err=%v", valid, err)
+	}
+
+	seq := uint64(1)
+	if err := firstGateway.Receive(context.Background(), TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         1,
+	}, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	waitForBrowserConnectionStats(
+		t,
+		browser,
+		BrowserConnectionStats{Active: 0, Accepted: 1},
+	)
+}
+
+func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	expires := time.Now().Add(2 * time.Second).Unix()
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Iat:                expires - int64(time.Minute/time.Second),
+		Exp:                expires,
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, session, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("session remained live past its signed expiry")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("client deadline elapsed before the server closed expired session: %v", err)
+	}
+	waitForBrowserConnectionStats(t, browser, BrowserConnectionStats{Active: 0, Accepted: 1})
+}
+
+func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	agentClaims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: personalityAgentID, Generation: 1}
+	if err := gateway.PublishRuntimeState(personalityAgentID, agentClaims.Generation, nil); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := NewBrowserServer(sessions, gateway, gateway)
+	browser.AllowedOrigins = []string{browserAuthTestOrigin}
+	writeReached := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var writeHookCalls int
+	browser.beforeWrite = func() {
+		writeHookCalls++
+		if writeHookCalls == 1 {
+			close(writeReached)
+			<-releaseWrite
+		}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", browser)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	expires := time.Now().Add(2 * time.Second).Unix()
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Iat:                expires - int64(time.Minute/time.Second),
+		Exp:                expires,
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, session, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writeReached:
+	case <-time.After(time.Second):
+		t.Fatal("durable replay did not reach its first write")
+	}
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "must-not-append-after-expiry",
+		Command:        json.RawMessage(`{"type":"user_message","text":"expired","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(time.Unix(expires, 0).Add(100 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	close(releaseWrite)
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("expiry crossing replay appended command: hasCommands=%v err=%v", hasCommands, err)
+	}
 }
 
 func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
@@ -340,22 +1053,103 @@ func assertDirectChatStatus(t *testing.T, conn *websocket.Conn, want string) {
 	}
 }
 
+func assertBrowserConnectionClosedBeforeFrame(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, raw, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected connection to close before any frame, got %s", raw)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("server hung instead of closing browser connection: %v", err)
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) &&
+		!errors.Is(err, io.EOF) &&
+		!errors.Is(err, net.ErrClosed) &&
+		!errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("expected websocket close/EOF, got %T: %v", err, err)
+	}
+}
+
 func signBrowserSession(t *testing.T, secret []byte, claims userSessionWireClaims) string {
 	t.Helper()
+	if claims.Iat == 0 && claims.Exp != 0 {
+		claims.Iat = claims.Exp - int64(maxBrowserSessionTTL/time.Second)
+	}
+	if claims.SID == "" {
+		claims.SID = base64.RawURLEncoding.EncodeToString(make([]byte, browserSessionIDBytes))
+	}
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, secret)
+	mac := hmac.New(sha256.New, deriveBrowserSessionSigningKey(secret))
 	_, _ = mac.Write([]byte(header + "." + encoded))
 	return header + "." + encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
+func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	receipt := "ready"
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         1,
+	}, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: personalityAgentID,
+		Event:              json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, cookie, personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "must-not-be-admitted",
+		Command:        json.RawMessage(`{"type":"user_message","text":"blocked by replay","attachments":[]}`),
+	})
+
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
+	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+		t.Fatalf("replay failure admitted a durable command: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
 func TestBrowserServerCommandStateGuards(t *testing.T) {
 	gateway := openRuntimeGateway(t)
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +1237,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	}
 	defer store.Close()
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +1322,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	}
 	defer store.Close()
 
-	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,20 +1351,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	// The close may win the race with this write. Either outcome is acceptable,
 	// but the following read must observe a prompt close rather than a timeout.
 	_ = conn.WriteJSON(browserCommandFrame{Type: "command", IdempotencyKey: "ignored", Command: json.RawMessage(`{"type":"abort"}`)})
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	var ignored browserCommandAcceptedFrame
-	err = conn.ReadJSON(&ignored)
-	if err == nil {
-		t.Fatal("expected connection to close after corrupt state, got a command acceptance")
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		t.Fatalf("server hung instead of closing after corrupt state: %v", err)
-	}
-	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("expected websocket close/EOF after corrupt state, got %T: %v", err, err)
-	}
+	assertBrowserConnectionClosedBeforeFrame(t, conn)
 }
 
 func TestDecodeBrowserCommandRequiresContractValidIdempotencyKey(t *testing.T) {
@@ -627,6 +1408,31 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 			target: func() any { return &browserCommandAcceptedFrame{} },
 		},
 		{
+			name:   "accepted disposition command mismatch",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000002","command_seq":1,"status":"applied"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition sequence mismatch",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":2,"status":"applied"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition is nonterminal",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"received"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition is null",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":null}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition has unknown field",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"applied","extra":true}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
 			name:   "rejected missing correlation key",
 			raw:    `{"type":"command_rejected","reject_reason":"schema_violation"}`,
 			target: func() any { return &browserCommandRejectedFrame{} },
@@ -671,5 +1477,20 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 		&unavailable,
 	); err != nil {
 		t.Fatalf("valid unavailable status rejected: %v", err)
+	}
+	for _, status := range []string{"applied", "superseded", "rejected"} {
+		rejectReason := ""
+		if status == "rejected" {
+			rejectReason = `,"reject_reason":"not_allowed"`
+		}
+		raw := fmt.Sprintf(
+			`{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":%q%s}}`,
+			status,
+			rejectReason,
+		)
+		var accepted browserCommandAcceptedFrame
+		if err := json.Unmarshal([]byte(raw), &accepted); err != nil {
+			t.Fatalf("valid %s accepted disposition rejected: %v", status, err)
+		}
 	}
 }
