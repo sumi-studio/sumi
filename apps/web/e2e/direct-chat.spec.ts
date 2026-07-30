@@ -77,31 +77,37 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
       (await page.request.get(`${fixture.url}/__e2e__/session`)).status(),
     ).toBe(204);
     await page.goto(webURL);
-    await expect(page.getByText("connected", { exact: true })).toBeVisible();
-    await expect(page.getByText("agent: Ready", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("エージェント利用可能", { exact: true }),
+    ).toBeVisible();
     await expect.poll(() => directChatSocketSeen).toBe(true);
 
-    const composer = page.getByLabel("メッセージ");
+    const composer = page.getByRole("textbox", {
+      name: "メッセージ",
+      exact: true,
+    });
     await composer.fill("initial user_message");
     await page.getByRole("button", { name: "送信" }).click();
     await expect(
       page.getByText("streamed assistant", { exact: true }),
     ).toBeVisible();
+    await page.getByText("作業中", { exact: true }).click();
     await expect(
-      page.getByText("Tool finished: call-1", { exact: true }),
+      page.getByText("read_fileを完了", { exact: true }),
     ).toBeVisible();
     expect(toolStartFrames).toBe(1);
     expect(toolEndFrames).toBe(1);
 
     await composer.fill("second message is a steer");
-    await page.getByRole("button", { name: "Steer" }).click();
+    await page.getByRole("button", { name: "割り込んで送信" }).click();
     await expect(
-      page.getByText("Steered (hard)", { exact: true }),
+      page.getByText("応答へ追加の指示を送りました (hard)", { exact: true }),
     ).toBeVisible();
-    await expect(
-      page.getByText("🔐 承認が必要です", { exact: true }),
-    ).toBeVisible();
-    await page.getByRole("button", { name: "今回のみ" }).click();
+    const approveOnce = page.getByRole("button", {
+      name: "今回のみ許可",
+    });
+    await expect(approveOnce).toBeVisible();
+    await approveOnce.click();
     await expect(
       page.getByText("abortable stream", { exact: true }),
     ).toBeVisible();
@@ -125,7 +131,9 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
         return stats.active === 1 && stats.accepted > beforeReconnect.accepted;
       })
       .toBe(true);
-    await expect(page.getByText("connected", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("エージェント利用可能", { exact: true }),
+    ).toBeVisible();
     await expect(
       page.getByText("Terminal replay", { exact: true }),
     ).toHaveCount(1);

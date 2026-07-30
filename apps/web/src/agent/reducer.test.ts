@@ -141,6 +141,7 @@ test("durable tool start and end upsert without volatile tool-call events", () =
   if (first?.type === "tool") {
     assert.equal(first.name, "read_file");
     assert.equal(first.status, "done");
+    assert.equal(first.label, "read_fileを完了");
     assert.deepEqual(first.args, { path: "README.md" });
     assert.deepEqual(first.result, { content: "ok" });
   }

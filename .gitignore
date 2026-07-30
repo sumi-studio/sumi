@@ -675,6 +675,8 @@ dist/
 .turbo/
 *.tsbuildinfo
 coverage/
+apps/web/playwright-report/
+apps/web/test-results/
 .env
 .env.*
 !.env.example

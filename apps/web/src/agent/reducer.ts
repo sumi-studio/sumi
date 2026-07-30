@@ -473,7 +473,8 @@ function applyToolEnd(
   let conversation = upsertTrace(session.conversation, runId, {
     ...tool,
     result,
-    label: resultLabel(result) ?? tool.label,
+    label:
+      resultLabel(result) ?? `${tool.name}${isError ? "でエラー" : "を完了"}`,
     status: isError ? "error" : "done",
   });
   const parsed = sduiResult(result);
