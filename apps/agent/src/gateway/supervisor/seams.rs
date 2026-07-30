@@ -25,6 +25,8 @@ use crate::agent::AgentEvent;
 use crate::gateway::Envelope;
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::ProcessGeneration;
+#[cfg(test)]
+use crate::store::DurableDeliveryPhaseHook;
 use crate::store::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
     DurableDeliveryOutcome, HydrationReceiptIdentity, PostCommitEpochCapability, Store,
@@ -59,8 +61,12 @@ pub(crate) struct DurableAdmissionHook {
     pub(crate) allow_registration: Arc<Notify>,
     pub(crate) registered: Arc<Notify>,
     pub(crate) allow_delivery: Arc<Notify>,
-    pub(crate) delivery_started: Arc<Notify>,
+    pub(crate) delivery_phases: DurableDeliveryPhaseHook,
     pub(crate) enqueued: Arc<Notify>,
+    pub(crate) pause_forwarder_before_receive: bool,
+    pub(crate) delivery_channel_capacity: Option<usize>,
+    pub(crate) forwarder_paused: Arc<Notify>,
+    pub(crate) allow_forwarder_receive: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -276,10 +282,23 @@ impl T17StoreAdapter {
         mode: DeliveryMode,
         cancel: CancellationToken,
         failure_tx: mpsc::UnboundedSender<DeliveryEpochFailure>,
+        #[cfg(test)] hook: Option<DurableAdmissionHook>,
     ) -> tokio::task::JoinHandle<()> {
         let personality_agent_id = self.store.scope().personality_agent_id.clone();
         let durable_fences = self.durable_fences.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(hook) = hook
+                .as_ref()
+                .filter(|hook| hook.pause_forwarder_before_receive)
+            {
+                hook.forwarder_paused.notify_one();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    _ = hook.allow_forwarder_receive.notified() => {}
+                }
+            }
             loop {
                 let frame = tokio::select! {
                     biased;
@@ -542,11 +561,13 @@ impl T17StoreAdapter {
         }
 
         #[cfg(test)]
-        let delivery_started = hook.as_ref().map(|hook| hook.delivery_started.clone());
+        let delivery_phases = hook.as_ref().map(|hook| hook.delivery_phases.clone());
         let mut delivery = Box::pin(async move {
             #[cfg(test)]
-            if let Some(delivery_started) = delivery_started {
-                delivery_started.notify_one();
+            if let Some(delivery_phases) = delivery_phases.as_ref() {
+                return reservation
+                    .deliver_with_cancellation_and_phase_hook(&delivery_cancel, delivery_phases)
+                    .await;
             }
             reservation
                 .deliver_with_cancellation(&delivery_cancel)
@@ -647,6 +668,20 @@ impl T17StoreAdapter {
     #[cfg(test)]
     pub(crate) fn durable_fence_count(&self) -> usize {
         self.durable_fences.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_active_durable_serial_for_test(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let pump = self
+            .pump
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.pump.clone())
+            .context("cannot hold durable serializer without an active delivery pump")?;
+        Ok(pump.hold_durable_serial_for_test().await)
     }
 }
 
@@ -871,7 +906,18 @@ impl DurableSource for T17StoreAdapter {
             DeliveryAuthorization::Raw => DeliveryMode::Raw,
             DeliveryAuthorization::RedactionOnly => DeliveryMode::RedactionOnly,
         };
-        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(mode).build();
+        #[cfg(test)]
+        let hook = self.durable_admission_hook.lock().unwrap().clone();
+        let channel_builder = DeliveryChannelBuilder::with_mode(mode);
+        #[cfg(test)]
+        let channel_builder = match hook
+            .as_ref()
+            .and_then(|hook| hook.delivery_channel_capacity)
+        {
+            Some(capacity) => channel_builder.capacity(capacity),
+            None => channel_builder,
+        };
+        let (channel, delivery_rx) = channel_builder.build();
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
         let pump = DeliveryPump::new(self.store.clone(), channel);
         pump.install_supervised_epoch(epoch, failure_tx.clone());
@@ -886,7 +932,15 @@ impl DurableSource for T17StoreAdapter {
             cancel: cancel.clone(),
         });
         drop(slot);
-        let task = self.start_forwarder(delivery_rx, sink, mode, cancel, failure_tx);
+        let task = self.start_forwarder(
+            delivery_rx,
+            sink,
+            mode,
+            cancel,
+            failure_tx,
+            #[cfg(test)]
+            hook,
+        );
         Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
     }
 

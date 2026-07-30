@@ -5,6 +5,8 @@ use std::{future::Future, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use sqlx::Row;
 use thiserror::Error;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -128,6 +130,18 @@ pub(crate) enum DurableDeliveryOutcome {
     EpochLost,
 }
 
+#[cfg(test)]
+/// Poll-level test barriers for the cancellation points in durable delivery.
+///
+/// Each notification is emitted only after its underlying future has returned
+/// `Pending`, so lifecycle tests cannot cancel merely because delivery started.
+#[derive(Clone, Default)]
+pub(crate) struct DurableDeliveryPhaseHook {
+    pub(crate) durable_serial_pending: Arc<Notify>,
+    pub(crate) store_read_pending: Arc<Notify>,
+    pub(crate) channel_send_pending: Arc<Notify>,
+}
+
 /// Proof that one durable callback belongs to the captured delivery epoch.
 ///
 /// The adapter creates this reservation while it still owns the pump slot and
@@ -170,7 +184,12 @@ impl DurableDeliveryReservation {
     }
 
     pub(crate) async fn deliver(&self) -> Result<DurableDeliveryOutcome> {
-        self.deliver_until_cancelled(None).await
+        self.deliver_until_cancelled(
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
     /// Deliver while the reservation remains owned by `cancel`'s epoch.
@@ -182,15 +201,33 @@ impl DurableDeliveryReservation {
         &self,
         cancel: &CancellationToken,
     ) -> Result<DurableDeliveryOutcome> {
-        self.deliver_until_cancelled(Some(cancel)).await
+        self.deliver_until_cancelled(
+            Some(cancel),
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn deliver_with_cancellation_and_phase_hook(
+        &self,
+        cancel: &CancellationToken,
+        hook: &DurableDeliveryPhaseHook,
+    ) -> Result<DurableDeliveryOutcome> {
+        self.deliver_until_cancelled(Some(cancel), Some(hook)).await
     }
 
     async fn deliver_until_cancelled(
         &self,
         cancel: Option<&CancellationToken>,
+        #[cfg(test)] hook: Option<&DurableDeliveryPhaseHook>,
     ) -> Result<DurableDeliveryOutcome> {
-        let Some(_serial) = await_unless_cancelled(cancel, self.pump.durable_serial.lock()).await
-        else {
+        let serial = self.pump.durable_serial.lock();
+        #[cfg(test)]
+        let serial =
+            notify_on_first_pending(serial, hook.map(|hook| hook.durable_serial_pending.clone()));
+        let Some(_serial) = await_unless_cancelled(cancel, serial).await else {
             return Ok(DurableDeliveryOutcome::EpochLost);
         };
         let (epoch, failure_tx) = match &*self.pump.lock_state() {
@@ -212,6 +249,8 @@ impl DurableDeliveryReservation {
             self.seq,
             self.seq,
             cancel,
+            #[cfg(test)]
+            hook,
         )
         .await
         {
@@ -370,6 +409,11 @@ impl DeliveryPump {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_durable_serial_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.durable_serial.clone().lock_owned().await
+    }
+
     pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
         // Direct pump users do not need to distinguish a stale epoch. The T17
         // adapter uses `reserve_durable` so it can turn that proof into a
@@ -470,24 +514,23 @@ async fn send_event_range(
     first_seq: u64,
     last_seq: u64,
     cancel: Option<&CancellationToken>,
+    #[cfg(test)] hook: Option<&DurableDeliveryPhaseHook>,
 ) -> Result<bool> {
     if first_seq > last_seq {
         return Ok(true);
     }
-    let Some(rows) = await_unless_cancelled(
-        cancel,
-        sqlx::query(
-            "SELECT seq, raw_key_ref, raw_ciphertext, envelope, redaction_version
+    let rows = sqlx::query(
+        "SELECT seq, raw_key_ref, raw_ciphertext, envelope, redaction_version
              FROM agent_events
              WHERE seq >= ? AND seq <= ?
              ORDER BY seq",
-        )
-        .bind(i64::try_from(first_seq).context("first_seq exceeds SQLite INTEGER range")?)
-        .bind(i64::try_from(last_seq).context("last_seq exceeds SQLite INTEGER range")?)
-        .fetch_all(store.pool()),
     )
-    .await
-    else {
+    .bind(i64::try_from(first_seq).context("first_seq exceeds SQLite INTEGER range")?)
+    .bind(i64::try_from(last_seq).context("last_seq exceeds SQLite INTEGER range")?)
+    .fetch_all(store.pool());
+    #[cfg(test)]
+    let rows = notify_on_first_pending(rows, hook.map(|hook| hook.store_read_pending.clone()));
+    let Some(rows) = await_unless_cancelled(cancel, rows).await else {
         return Ok(false);
     };
     let rows = rows.context("failed to fetch durable events for delivery")?;
@@ -516,17 +559,16 @@ async fn send_event_range(
             }
         };
 
-        let Some(sent) = await_unless_cancelled(
-            cancel,
-            channel.send(DeliveryFrame::Durable {
-                seq,
-                epoch: *epoch,
-                raw,
-                projection,
-            }),
-        )
-        .await
-        else {
+        let sent = channel.send(DeliveryFrame::Durable {
+            seq,
+            epoch: *epoch,
+            raw,
+            projection,
+        });
+        #[cfg(test)]
+        let sent =
+            notify_on_first_pending(sent, hook.map(|hook| hook.channel_send_pending.clone()));
+        let Some(sent) = await_unless_cancelled(cancel, sent).await else {
             return Ok(false);
         };
         sent?;
@@ -548,6 +590,28 @@ where
         }
         None => Some(future.await),
     }
+}
+
+#[cfg(test)]
+async fn notify_on_first_pending<F>(future: F, pending: Option<Arc<Notify>>) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    let mut notified = false;
+    std::future::poll_fn(|context| match future.as_mut().poll(context) {
+        std::task::Poll::Pending => {
+            if !notified {
+                if let Some(pending) = pending.as_ref() {
+                    pending.notify_one();
+                }
+                notified = true;
+            }
+            std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(value) => std::task::Poll::Ready(value),
+    })
+    .await
 }
 
 async fn decrypt_event(
