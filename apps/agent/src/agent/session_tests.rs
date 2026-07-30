@@ -1267,6 +1267,38 @@ async fn typed_worker_failures_report_recovered_ownership() {
     }
 }
 
+#[tokio::test]
+async fn rehydration_required_worker_failure_reports_lost_ownership() {
+    let (gateway, commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         mut controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let _events = events;
+            controls.close();
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(
+                    "durable transcript advanced beyond RunCore".to_owned(),
+                ),
+            }
+        },
+    );
+    let task = tokio::spawn(
+        session_with_core(gateway, worker, RunCore::fixture_with_unapproved_tools())
+            .await
+            .run(),
+    );
+    commands.send(user(1)).await.expect("command");
+    let (error, ownership) = failed(task.await.expect("session join"));
+    assert!(matches!(ownership, RunOwnership::Lost));
+    assert!(matches!(
+        error,
+        SessionFailure::Worker(WorkerFailure::Error(ref message))
+            if message == "durable transcript advanced beyond RunCore"
+    ));
+}
+
 struct RunningGuard(Arc<AtomicBool>);
 
 impl Drop for RunningGuard {

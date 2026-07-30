@@ -330,6 +330,11 @@ struct Runner {
     /// Run-wide cancellation token. Dropping the runner cancels all child
     /// operations, including in-flight reviewer calls and tool executions.
     cancel: CancellationToken,
+    /// A successful MessageEnd receipt means the authoritative life log is
+    /// ahead of RunCore until every terminal side effect and replay-state
+    /// retention step succeeds. A failure in this interval must discard the
+    /// core and force hydration instead of returning stale recoverable state.
+    durable_terminal_pending: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -403,6 +408,7 @@ impl Runner {
             hard_steer_command: None,
             abort_requested: false,
             cancel: CancellationToken::new(),
+            durable_terminal_pending: false,
         }
     }
 
@@ -418,7 +424,17 @@ impl Runner {
         self.core.provider_context = std::mem::take(&mut self.provider_context);
         self.core.mark_mutated();
         match result {
-            Ok(()) => RunCompletion::Completed(std::mem::take(&mut self.core)),
+            Ok(()) if !self.durable_terminal_pending => {
+                RunCompletion::Completed(std::mem::take(&mut self.core))
+            }
+            Ok(()) => RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(
+                    "run completed with an unreconciled durable assistant terminal".to_owned(),
+                ),
+            },
+            Err(failure) if self.durable_terminal_pending => {
+                RunCompletion::RehydrationRequired { failure }
+            }
             Err(failure) => RunCompletion::Failed {
                 core: std::mem::take(&mut self.core),
                 failure,
@@ -594,6 +610,7 @@ impl Runner {
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
                         let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                        self.durable_terminal_pending = true;
                         if let Some(ratio_bits) = receipt.calibration_ratio_bits {
                             self.driver
                                 .install_committed_calibration(ratio_bits)
@@ -609,6 +626,7 @@ impl Runner {
                             .await
                             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                         self.retain_committed(receipt, &message)?;
+                        self.durable_terminal_pending = false;
                         self.close_turn(message, Vec::new()).await?;
                         if !self.advance_followup().await? {
                             break;
@@ -627,6 +645,7 @@ impl Runner {
                         .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
                     let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                    self.durable_terminal_pending = true;
                     if let Some(ratio_bits) = receipt.calibration_ratio_bits {
                         self.driver
                             .install_committed_calibration(ratio_bits)
@@ -679,6 +698,7 @@ impl Runner {
                         self.retain_tool_results(&rejected_receipts, &rejected_results)?;
                         self.retain_tool_results(&executable_receipts, &executable_results)?;
                     }
+                    self.durable_terminal_pending = false;
                     self.emit(AgentEvent::TurnEnd {
                         message: Some(Box::new(message)),
                         tool_results: executable_results,

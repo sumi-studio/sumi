@@ -574,6 +574,12 @@ pub(crate) enum RunCompletion {
         core: RunCore,
         failure: WorkerFailure,
     },
+    /// The durable life log advanced beyond the worker's in-memory replay
+    /// state. There is deliberately no RunCore to recover: the next owner must
+    /// hydrate from the authoritative Store before another run can start.
+    RehydrationRequired {
+        failure: WorkerFailure,
+    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -706,12 +712,16 @@ where
 
 #[cfg(test)]
 fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
-    let core = match completion {
-        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
-    };
-    RunCompletion::Failed {
-        core,
-        failure: WorkerFailure::EventChannelClosed,
+    match completion {
+        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => {
+            RunCompletion::Failed {
+                core,
+                failure: WorkerFailure::EventChannelClosed,
+            }
+        }
+        RunCompletion::RehydrationRequired { .. } => RunCompletion::RehydrationRequired {
+            failure: WorkerFailure::EventChannelClosed,
+        },
     }
 }
 
@@ -829,8 +839,9 @@ pub(crate) struct Session<G: Gateway> {
     /// worker exclusively owns `RunCore`. Retain it until the next idle
     /// boundary; it is independent of a run-local overflow marker.
     maintenance_ready_pending: bool,
-    /// A bridge/Store refusal means the worker's returned core may be ahead of
-    /// the durable transcript and must never be exposed as recovered.
+    /// A bridge/Store refusal can leave a returned core ahead of durability;
+    /// a post-receipt worker failure can leave it behind. Neither state is a
+    /// recoverable life-log snapshot.
     durable_core_invalidated: bool,
 }
 
@@ -1871,14 +1882,18 @@ impl<G: Gateway + 'static> Session<G> {
             return Err(worker_join_failure(error));
         }
         let (core, worker_failure) = match completion {
-            RunCompletion::Completed(core) => (core, None),
-            RunCompletion::Failed { core, failure } => (core, Some(failure)),
+            RunCompletion::Completed(core) => (Some(core), None),
+            RunCompletion::Failed { core, failure } => (Some(core), Some(failure)),
+            RunCompletion::RehydrationRequired { failure } => {
+                self.durable_core_invalidated = true;
+                (None, Some(failure))
+            }
         };
         let delivery_failure = self.drain_disconnected_outputs(&mut active, true).await?;
         // A completed RunCore includes every output already produced by the
         // worker. Do not expose it until the disconnected bounded event lane
         // has been drained into SQLite, even when Gateway delivery was lost.
-        self.core = Some(core);
+        self.core = core;
         if let Some(failure) = delivery_failure {
             return Err(failure);
         }
@@ -1980,6 +1995,13 @@ impl<G: Gateway + 'static> Session<G> {
                     Ok(_) => self.core = Some(core),
                     Err(_) => self.durable_core_invalidated = true,
                 }
+            }
+            Ok(RunCompletion::RehydrationRequired { .. }) => {
+                if (&mut active.join).await.is_err() {
+                    return;
+                }
+                self.durable_core_invalidated = true;
+                let _ = self.drain_disconnected_outputs(&mut active, false).await;
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 let _ = (&mut active.join).await;

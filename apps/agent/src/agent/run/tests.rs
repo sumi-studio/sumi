@@ -79,6 +79,8 @@ struct FixtureDriver {
     overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
     overflow_core_epochs: Mutex<Vec<u64>>,
     overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
+    committed_calibration_failure: Option<&'static str>,
+    terminal_apply_failure: Option<&'static str>,
 }
 
 impl FixtureDriver {
@@ -101,6 +103,8 @@ impl FixtureDriver {
             overflow_recoveries: Mutex::new(Vec::new()),
             overflow_core_epochs: Mutex::new(Vec::new()),
             overflow_contexts: Mutex::new(VecDeque::new()),
+            committed_calibration_failure: None,
+            terminal_apply_failure: None,
         }
     }
 
@@ -126,6 +130,16 @@ impl FixtureDriver {
 
     fn with_overflow_contexts(self, contexts: Vec<Vec<PublicMessage>>) -> Self {
         *self.overflow_contexts.lock().expect("overflow contexts") = contexts.into();
+        self
+    }
+
+    fn failing_committed_calibration(mut self, failure: &'static str) -> Self {
+        self.committed_calibration_failure = Some(failure);
+        self
+    }
+
+    fn failing_terminal_apply(mut self, failure: &'static str) -> Self {
+        self.terminal_apply_failure = Some(failure);
         self
     }
 }
@@ -269,6 +283,22 @@ impl RunDriver for FixtureDriver {
         Ok(OverflowRecoveryOutcome::ReplacementContext(
             recovered_context_from_active(replacement, active_context),
         ))
+    }
+
+    fn install_committed_calibration(&self, _ratio_bits: [u8; 8]) -> Result<()> {
+        self.committed_calibration_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
+    }
+
+    async fn apply_terminal(
+        &self,
+        _message_id: &str,
+        _message_seq: u64,
+        _message: &AssistantMessage,
+        _provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        self.terminal_apply_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
     }
 
     async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
@@ -630,6 +660,9 @@ fn recovered_context(label: &str) -> Vec<PublicMessage> {
 fn recovered_core(completion: RunCompletion) -> RunCore {
     match completion {
         RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("rehydration-required completion has no recoverable core: {failure}")
+        }
     }
 }
 
@@ -898,9 +931,88 @@ async fn complete_with_receipts(
     completion.await.expect("worker join")
 }
 
+async fn complete_with_calibrated_receipts(
+    future: WorkerFuture,
+    mut events_rx: mpsc::Receiver<RunOutput>,
+) -> RunCompletion {
+    let completion = tokio::spawn(future);
+    let mut message_seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                calibration_ratio_bits: Some([7; 8]),
+                new_turn_id: None,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    completion.await.expect("worker join")
+}
+
+#[tokio::test]
+async fn durable_terminal_followup_failures_require_rehydration_in_both_terminal_branches() {
+    let cases = [
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::Stop,
+                vec![AssistantContent::Text {
+                    text: "durable answer".to_owned(),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_committed_calibration("calibration after durable terminal failed"),
+            "calibration after durable terminal failed",
+        ),
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::ToolUse,
+                vec![AssistantContent::ToolCall {
+                    tool_call: call("durable-tool"),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_terminal_apply("apply after durable tool terminal failed"),
+            "apply after durable tool terminal failed",
+        ),
+    ];
+
+    for (driver, expected_failure) in cases {
+        let worker = SequentialRunWorker::new(Arc::new(driver));
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let completion = complete_with_calibrated_receipts(
+            worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+            events_rx,
+        )
+        .await;
+        assert!(matches!(
+            completion,
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(ref failure),
+            } if failure == expected_failure
+        ));
+    }
+}
+
 fn assert_completed(completion: RunCompletion) {
-    if let RunCompletion::Failed { failure, .. } = completion {
-        panic!("run failed: {failure}");
+    match completion {
+        RunCompletion::Completed(_) => {}
+        RunCompletion::Failed { failure, .. } => panic!("run failed: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("run requires rehydration: {failure}")
+        }
     }
 }
 
@@ -1582,6 +1694,9 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
         RunCompletion::Failed { failure, .. } => {
             panic!("post-receipt Abort run failed: {failure}")
         }
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("post-receipt Abort unexpectedly requires rehydration: {failure}")
+        }
     };
     let hard_steer_seq = hard_steer_seq.expect("hard-steer assistant receipt");
     let fragment = cancellation_provider_context()
@@ -1912,6 +2027,9 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
     assert!(driver.tool_order.lock().expect("tool order").is_empty());
@@ -2299,6 +2417,9 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert_eq!(core.runtime_context.len(), 2);
         assert!(matches!(
@@ -2403,6 +2524,9 @@ async fn non_authoritative_projection_failure_and_eof_discard_rejected_results()
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert!(
             !core
@@ -2875,6 +2999,9 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     let recoveries = driver
         .overflow_recoveries
@@ -3156,6 +3283,9 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(
         core.pending_overflow_apply(),
@@ -3745,6 +3875,9 @@ async fn provider_streaming_abort_dropped_accept_is_no_op() {
             let completion = match completion {
                 RunCompletion::Completed(_) => "completed".to_owned(),
                 RunCompletion::Failed { failure, .. } => format!("{failure}"),
+                RunCompletion::RehydrationRequired { failure } => {
+                    format!("rehydration required: {failure}")
+                }
             };
             panic!("worker completed before assistant MessageStart: {completion}");
         }
