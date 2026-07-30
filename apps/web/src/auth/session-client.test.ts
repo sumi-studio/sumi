@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AuthAPIError,
   exchangeFirebaseIDToken,
   getSumiSession,
   logoutSumiSession,
@@ -89,5 +90,32 @@ describe("Sumi browser session client", () => {
         }),
       }),
     ]);
+  });
+
+  it("rejects a session response with an oversized declared body", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response("{}", {
+        status: 200,
+        headers: { "Content-Length": "4097" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
+  });
+
+  it("rejects a session response that exceeds the limit while streaming", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(4_097));
+        controller.close();
+      },
+    });
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(body, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
   });
 });

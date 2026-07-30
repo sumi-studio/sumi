@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifySessionFailure } from "./auth-context";
+import { classifySessionFailure, hasAllowedAuthOrigin } from "./auth-context";
 import { AuthAPIError } from "./session-client";
 
 describe("auth session failure classification", () => {
@@ -12,9 +12,9 @@ describe("auth session failure classification", () => {
     );
   });
 
-  it("supports the current pre-issued-cookie fixture when auth routes are absent", () => {
+  it("does not treat a missing production auth route as authorization", () => {
     expect(classifySessionFailure(new AuthAPIError("not found", 404))).toBe(
-      "preissued",
+      "unavailable",
     );
   });
 
@@ -25,5 +25,26 @@ describe("auth session failure classification", () => {
     expect(classifySessionFailure(new TypeError("network failed"))).toBe(
       "unavailable",
     );
+  });
+});
+
+describe("browser auth origin boundary", () => {
+  it("fails closed for a cross-origin API base outside the fixture mode", () => {
+    expect(
+      hasAllowedAuthOrigin({
+        apiBaseURL: "https://api.sumi.example",
+        pageOrigin: "https://app.sumi.example",
+      }),
+    ).toBe(false);
+  });
+
+  it("permits the isolated pre-issued fixture to use its local API server", () => {
+    expect(
+      hasAllowedAuthOrigin({
+        apiBaseURL: "http://127.0.0.1:39001",
+        authMode: "preissued",
+        pageOrigin: "http://127.0.0.1:4173",
+      }),
+    ).toBe(true);
   });
 });

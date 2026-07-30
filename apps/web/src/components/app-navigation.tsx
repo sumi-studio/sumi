@@ -12,14 +12,18 @@ import {
 import {
   Check,
   ChevronRight,
+  LogOut,
   MessageCircle,
   Monitor,
   Moon,
   Palette,
   Settings,
   Sun,
+  UserRound,
 } from "lucide-react";
 import type { ComponentType, ReactElement } from "react";
+import { useState } from "react";
+import { useAuth } from "../auth/auth-context";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
 const THEME_OPTIONS: Array<{
@@ -60,6 +64,18 @@ export function AppNavigation() {
 }
 
 function SettingsPopover() {
+  const { authenticated, user, logout } = useAuth();
+  const [logoutError, setLogoutError] = useState<string | null>(null);
+
+  const handleLogout = async () => {
+    setLogoutError(null);
+    try {
+      await logout();
+    } catch {
+      setLogoutError("ログアウトを完了できませんでした。");
+    }
+  };
+
   return (
     <Popover>
       <Tooltip>
@@ -82,7 +98,30 @@ function SettingsPopover() {
         <TooltipContent side="right">設定</TooltipContent>
       </Tooltip>
       <PopoverContent side="top" align="start" aria-label="設定">
+        {authenticated && (
+          <div className="mb-1 border-border border-b pb-1">
+            <div className="flex items-center gap-2 px-2.5 py-2 text-sm">
+              <UserRound className="size-4 shrink-0" />
+              <span className="max-w-44 truncate">
+                {user?.displayName ?? user?.email ?? user?.id ?? "アカウント"}
+              </span>
+            </div>
+            <Button
+              variant="ghost"
+              onClick={() => void handleLogout()}
+              className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
+            >
+              <LogOut className="size-4" />
+              ログアウト
+            </Button>
+          </div>
+        )}
         <ThemePicker />
+        {logoutError && (
+          <p role="alert" className="mt-1 max-w-56 px-2.5 text-red-600 text-xs">
+            {logoutError}
+          </p>
+        )}
       </PopoverContent>
     </Popover>
   );

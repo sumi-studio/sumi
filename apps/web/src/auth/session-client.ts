@@ -1,4 +1,4 @@
-const maxErrorResponseCharacters = 4_096;
+const maxAuthResponseBytes = 4_096;
 const csrfTokenPattern = /^[A-Za-z0-9_-]{43}$/;
 
 export interface SumiSessionUser {
@@ -28,7 +28,7 @@ async function fetchCSRFToken(): Promise<string> {
   if (!response.ok) {
     throw await authAPIError(response);
   }
-  const body: unknown = await response.json();
+  const body = await readAuthJSON(response);
   if (
     !isObject(body) ||
     typeof body.csrf_token !== "string" ||
@@ -69,7 +69,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
   if (!response.ok) {
     throw await authAPIError(response);
   }
-  const body: unknown = await response.json();
+  const body = await readAuthJSON(response);
   if (!isObject(body) || typeof body.authenticated !== "boolean") {
     throw new AuthAPIError("Invalid authentication response.", response.status);
   }
@@ -110,7 +110,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 async function authAPIError(response: Response): Promise<AuthAPIError> {
   let message = "Authentication request failed.";
   try {
-    const text = (await response.text()).slice(0, maxErrorResponseCharacters);
+    const text = await readAuthResponseText(response);
     const body: unknown = JSON.parse(text);
     if (isObject(body) && typeof body.error === "string" && body.error) {
       message = body.error;
@@ -119,4 +119,60 @@ async function authAPIError(response: Response): Promise<AuthAPIError> {
     // The status remains the useful, non-sensitive failure signal.
   }
   return new AuthAPIError(message, response.status);
+}
+
+async function readAuthJSON(response: Response): Promise<unknown> {
+  let text: string;
+  try {
+    text = await readAuthResponseText(response);
+  } catch {
+    throw new AuthAPIError("Invalid authentication response.", response.status);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new AuthAPIError("Invalid authentication response.", response.status);
+  }
+}
+
+/**
+ * Authentication endpoints have deliberately small JSON contracts. Bound the
+ * response before decoding it so a broken or hostile same-origin endpoint
+ * cannot make an auth-state check buffer an arbitrary response in the tab.
+ */
+async function readAuthResponseText(response: Response): Promise<string> {
+  const declaredLength = response.headers.get("content-length");
+  if (
+    declaredLength !== null &&
+    (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxAuthResponseBytes)
+  ) {
+    throw new Error("Authentication response exceeds the allowed size.");
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxAuthResponseBytes) {
+        throw new Error("Authentication response exceeds the allowed size.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }

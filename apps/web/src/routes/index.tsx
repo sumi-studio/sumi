@@ -1,4 +1,11 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ChatScreen } from "../components/chat-screen";
+import { AuthGate } from "../auth/auth-gate";
+import { DirectChatGate } from "../auth/direct-chat-gate";
 
-export const Route = createFileRoute("/")({ component: ChatScreen });
+export const Route = createFileRoute("/")({
+  component: () => (
+    <AuthGate>
+      <DirectChatGate />
+    </AuthGate>
+  ),
+});

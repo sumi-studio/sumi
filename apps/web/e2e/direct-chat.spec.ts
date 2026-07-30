@@ -227,6 +227,7 @@ function startVite(apiURL: string) {
       env: {
         ...process.env,
         VITE_API_BASE_URL: apiURL,
+        VITE_SUMI_AUTH_MODE: "preissued",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

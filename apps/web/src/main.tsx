@@ -6,6 +6,7 @@ import { routeTree } from "./routeTree.gen";
 import "gen-interface-jp/400.css";
 import "gen-interface-jp/600.css";
 import "@sumi/ui/globals.css";
+import { AuthProvider } from "./auth/auth-context";
 import { initializeTheme, ThemeProvider } from "./theme/theme-provider";
 
 const router = createRouter({ routeTree });
@@ -26,9 +27,11 @@ initializeTheme();
 createRoot(rootElement).render(
   <StrictMode>
     <ThemeProvider>
-      <TooltipProvider>
-        <RouterProvider router={router} />
-      </TooltipProvider>
+      <AuthProvider>
+        <TooltipProvider>
+          <RouterProvider router={router} />
+        </TooltipProvider>
+      </AuthProvider>
     </ThemeProvider>
   </StrictMode>,
 );
