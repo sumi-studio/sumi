@@ -1,7 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Local single-host Compose supervisor. Cloud workload identity, scheduling,
 # resource recovery, and central transport are separate deployment paths.
+# Privileged Bash startup ignores BASH_ENV. This supervisor must not inherit a
+# caller's shell hooks before it establishes its process-group invariant.
 set -euo pipefail
+# A foreground service manager must not let a caller-provided monitor setting
+# turn `setsid ... &` into a forking wrapper whose PID is not the new group.
+set +m
 
 readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
@@ -252,13 +257,34 @@ lifecycle_compose() {
 
 run_tracked_compose() {
   local compose_file="$1"
-  shift
+  local require_live_group="$2"
+  shift 2
   local status
   setsid docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${compose_file}" \
     "$@" &
   ACTIVE_COMPOSE_PID=$!
+  if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
+    # A no-op lifecycle `down` can legitimately finish before /proc is
+    # inspected. A launch must instead remain live and prove the PID/group
+    # ownership that later signal cleanup relies on.
+    if tracked_compose_child_is_zombie "${ACTIVE_COMPOSE_PID}" ||
+      ! kill -0 "${ACTIVE_COMPOSE_PID}" 2>/dev/null; then
+      if wait "${ACTIVE_COMPOSE_PID}"; then
+        status=0
+      else
+        status=$?
+      fi
+      ACTIVE_COMPOSE_PID=
+      return "${status}"
+    fi
+    if (( require_live_group )); then
+      log "ERROR: supervised Compose child did not become its own live session and process group"
+      terminate_active_compose
+      return 125
+    fi
+  fi
   if wait "${ACTIVE_COMPOSE_PID}"; then
     status=0
   else
@@ -268,6 +294,51 @@ run_tracked_compose() {
   return "${status}"
 }
 
+tracked_compose_child_isolated() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+}
+
+wait_for_tracked_compose_child_isolation() {
+  local pid="$1"
+  local attempt
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    tracked_compose_child_isolated "${pid}" && return 0
+    tracked_compose_child_is_zombie "${pid}" && return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    sleep 0.01
+  done
+  return 1
+}
+
+tracked_compose_child_is_zombie() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${state}" == Z ]]
+}
+
+tracked_compose_group_isolated() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+}
+
 terminate_active_compose() {
   local pid="${ACTIVE_COMPOSE_PID:-}"
   local attempt
@@ -275,13 +346,21 @@ terminate_active_compose() {
   ACTIVE_COMPOSE_PID=
 
   if kill -0 "${pid}" 2>/dev/null; then
-    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    if tracked_compose_group_isolated "${pid}"; then
+      kill -TERM -- "-${pid}" 2>/dev/null || true
+    else
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
     for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
       kill -0 "${pid}" 2>/dev/null || break
       sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
     done
     if kill -0 "${pid}" 2>/dev/null; then
-      kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+      if tracked_compose_group_isolated "${pid}"; then
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+      else
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
     fi
   fi
   wait "${pid}" 2>/dev/null || true
@@ -365,10 +444,10 @@ case "${action}" in
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
-    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" \
+    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     revalidate_local_control_socket
-    run_tracked_compose "${COMPOSE_FILE}" up --detach --build --wait
+    run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --build --wait
     revalidate_local_control_socket
     disarm_partial_generation_cleanup
     log "project ${SUMI_COMPOSE_PROJECT} containers started; runtime owns authenticated dependency Health and Ready"

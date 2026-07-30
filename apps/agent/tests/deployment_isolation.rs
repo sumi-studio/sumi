@@ -497,6 +497,22 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     let broker_env = environment_keys(broker);
     assert!(runtime_env.contains("SUMI_LOCAL_CONTROL_UNIX_SOCKET"));
     assert!(runtime_env.contains("SUMI_LOCAL_CONTROL_SERVER_UID"));
+    assert_eq!(
+        runtime["environment"]["SUMI_LOCAL_CONTROL_SOCKET_GID"].as_str(),
+        Some("${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}")
+    );
+    assert!(
+        runtime["group_add"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|group| {
+                group
+                    == "${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}"
+            }),
+        "runtime socket group must use the same required supervisor-validated gid"
+    );
     assert!(!runtime_env.contains("SUMI_LOCAL_CONTROL_URL"));
     for sensitive in [
         "SUMI_LOCAL_CONTROL_BEARER",
@@ -512,6 +528,10 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     assert!(
         entrypoint.matches("SUMI_LOCAL_CONTROL_SERVER_UID").count() >= 2,
         "runtime env scrubber dropped the pinned local-control server uid"
+    );
+    assert!(
+        entrypoint.matches("SUMI_LOCAL_CONTROL_SOCKET_GID").count() >= 2,
+        "runtime env scrubber dropped the supervisor-validated local-control socket gid"
     );
 }
 
@@ -1102,9 +1122,10 @@ fn interrupted_up_joins_partial_roles_and_returns_signal_status() {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&markers).unwrap();
         let fake_docker = bin.join("docker");
-        let script = r#"#!/bin/bash
-trap 'touch "$SUMI_FAKE_MARKERS/compose-child-terminated"; exit 143' TERM
-trap 'touch "$SUMI_FAKE_MARKERS/compose-child-interrupted"; exit 130' INT
+        let script = r#"#!/bin/bash -p
+background_pid=
+trap '[[ -z "$background_pid" ]] || wait "$background_pid" 2>/dev/null || true; touch "$SUMI_FAKE_MARKERS/compose-child-terminated"; exit 143' TERM
+trap '[[ -z "$background_pid" ]] || wait "$background_pid" 2>/dev/null || true; touch "$SUMI_FAKE_MARKERS/compose-child-interrupted"; exit 130' INT
 case "$*" in
   "compose version"|*"compose.yaml config --quiet")
     exit 0
@@ -1139,6 +1160,13 @@ case "$*" in
       "$SUMI_FAKE_MARKERS/runtime" \
       "$SUMI_FAKE_MARKERS/executor" \
       "$SUMI_FAKE_MARKERS/broker"
+    (
+      trap 'touch "$SUMI_FAKE_MARKERS/compose-grandchild-terminated"; exit 0' TERM
+      trap 'touch "$SUMI_FAKE_MARKERS/compose-grandchild-interrupted"; exit 0' INT
+      while true; do sleep 1; done
+    ) &
+    background_pid=$!
+    printf '%s\n' "$background_pid" > "$SUMI_FAKE_MARKERS/compose-grandchild-pid"
     while true; do sleep 1; done
     ;;
   *)
@@ -1149,6 +1177,8 @@ esac
         std::fs::write(&fake_docker, script).unwrap();
         std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        let bash_env = root.join("bash_env");
+        std::fs::write(&bash_env, "set -m\n").unwrap();
         let mut command = Command::new(deploy_dir().join("supervisor"));
         command
             .arg("up")
@@ -1156,6 +1186,7 @@ esac
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .env("PATH", format!("{}:{inherited_path}", bin.display()))
+            .env("BASH_ENV", &bash_env)
             .env("SUMI_FAKE_MARKERS", &markers)
             .env("SUMI_EXPECT_LOCK_PATH", &fixture.lock_path);
         launch_runtime_env(&mut command, &fixture);
@@ -1186,9 +1217,16 @@ esac
         };
         assert_eq!(status.code(), Some(expected_status));
         assert!(markers.join("compose-child-terminated").exists());
+        assert!(markers.join("compose-grandchild-terminated").exists());
         assert!(markers.join("cleanup-complete").exists());
         assert!(markers.join("cleanup-lock-held").exists());
         assert!(!markers.join("cleanup-lock-missing").exists());
+        let grandchild_pid = std::fs::read_to_string(markers.join("compose-grandchild-pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_ne!(unsafe { libc::kill(grandchild_pid, 0) }, 0);
         for role in ["runtime", "executor", "broker"] {
             assert!(
                 !markers.join(role).exists(),
@@ -1197,6 +1235,73 @@ esac
         }
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn tracked_launch_fails_closed_when_the_child_is_not_a_session_group_leader() {
+    let Some(fixture) = HostTrustFixture::new() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("setsid-{}", Uuid::now_v7().simple()));
+    let bin = root.join("bin");
+    let markers = root.join("markers");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::write(bin.join("setsid"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(bin.join("setsid"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_docker = bin.join("docker");
+    let script = r#"#!/bin/bash
+case "$*" in
+  "compose version"|*"compose.yaml config --quiet")
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml down --remove-orphans"*)
+    if [[ -f "$SUMI_FAKE_MARKERS/up-attempted" ]]; then
+      exec 9<>"$SUMI_EXPECT_LOCK_PATH"
+      if flock -n 9; then
+        touch "$SUMI_FAKE_MARKERS/cleanup-lock-missing"
+      else
+        touch "$SUMI_FAKE_MARKERS/cleanup-lock-held"
+      fi
+      rm -f "$SUMI_FAKE_MARKERS/runtime"
+      touch "$SUMI_FAKE_MARKERS/cleanup-complete"
+    fi
+    exit 0
+    ;;
+  *"compose.lifecycle.yaml ps --all --quiet")
+    [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]]
+    ;;
+  *"compose.yaml up --detach --build --wait")
+    touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
+    while true; do sleep 1; done
+    ;;
+  *)
+    exit 95
+    ;;
+esac
+"#;
+    std::fs::write(&fake_docker, script).unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let mut command = Command::new(deploy_dir().join("supervisor"));
+    command
+        .arg("up")
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("SUMI_FAKE_MARKERS", &markers)
+        .env("SUMI_EXPECT_LOCK_PATH", &fixture.lock_path);
+    launch_runtime_env(&mut command, &fixture);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(markers.join("up-attempted").exists());
+    assert!(markers.join("cleanup-complete").exists());
+    assert!(markers.join("cleanup-lock-held").exists());
+    assert!(!markers.join("cleanup-lock-missing").exists());
+    assert!(!markers.join("runtime").exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("did not become its own live session and process group")
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1537,6 +1642,18 @@ fn docker_compose_config_is_valid_or_cli_unavailable_is_classified() {
             rendered["services"]["runtime"]["environment"]["SUMI_LOCAL_CONTROL_SERVER_UID"]
                 .as_str(),
             Some("1000")
+        );
+        assert_eq!(
+            rendered["services"]["runtime"]["environment"]["SUMI_LOCAL_CONTROL_SOCKET_GID"]
+                .as_str(),
+            Some("10022")
+        );
+        assert!(
+            rendered["services"]["runtime"]["group_add"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group.as_str() == Some("10022"))
         );
 
         let lifecycle = Command::new("docker")
