@@ -161,6 +161,7 @@ enum Failpoint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DurableTarget {
+    OutputBinding,
     Ledger,
     Runtime,
     Executor,
@@ -170,6 +171,7 @@ enum DurableTarget {
 impl DurableTarget {
     const fn name(self) -> &'static str {
         match self {
+            Self::OutputBinding => "output_binding",
             Self::Ledger => "ledger",
             Self::Runtime => "runtime",
             Self::Executor => "executor",
@@ -206,6 +208,7 @@ struct CrashFailpoint {
 impl CrashFailpoint {
     fn parse(value: &str) -> Result<Self> {
         for target in [
+            DurableTarget::OutputBinding,
             DurableTarget::Ledger,
             DurableTarget::Runtime,
             DurableTarget::Executor,
@@ -306,8 +309,8 @@ fn allocate_with_options(
                 OUTPUT_BINDING_FILE,
                 AtomicFileSpec::state(),
                 &binding,
-                None,
-                None,
+                Some(DurableTarget::OutputBinding),
+                config.crash_failpoint,
             )
             .context("failed to durably bind the identity output root")?;
         }

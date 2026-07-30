@@ -76,10 +76,44 @@ impl Fixture {
     }
 
     fn assert_handoff(&self) {
+        self.assert_role_mode(0o550);
+    }
+
+    fn assert_role_mode(&self, mode: u32) {
         for role in ["runtime", "executor", "broker"] {
             let metadata = fs::metadata(self.output.join(role)).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o7777, 0o550);
+            assert_eq!(metadata.permissions().mode() & 0o7777, mode);
             assert_eq!(metadata.gid(), self.role_gids[role_index(role)]);
+        }
+    }
+
+    fn directory_inodes(&self) -> BTreeMap<&'static str, (u64, u64)> {
+        [
+            ("trust_root", self.root.clone()),
+            ("state", self.state.clone()),
+            ("output", self.output.clone()),
+            ("runtime", self.output.join("runtime")),
+            ("executor", self.output.join("executor")),
+            ("broker", self.output.join("broker")),
+        ]
+        .into_iter()
+        .map(|(name, path)| {
+            let metadata = fs::metadata(path).unwrap();
+            (name, (metadata.dev(), metadata.ino()))
+        })
+        .collect()
+    }
+
+    fn assert_output_binding_inodes(&self) {
+        let binding: Value =
+            serde_json::from_slice(&fs::read(self.output.join("allocator-binding.json")).unwrap())
+                .unwrap();
+        for (name, (device, inode)) in self.directory_inodes() {
+            assert_eq!(
+                binding["directories"][name]["device"].as_u64(),
+                Some(device)
+            );
+            assert_eq!(binding["directories"][name]["inode"].as_u64(), Some(inode));
         }
     }
 }
@@ -173,6 +207,20 @@ fn assert_no_strict_temps(fixture: &Fixture) {
             directory.display()
         );
     }
+}
+
+fn entries_with_prefix(directory: &Path, prefix: &str) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(prefix)
+                .then_some(path)
+        })
+        .collect()
 }
 
 fn test_role_gids() -> [libc::gid_t; 3] {
@@ -643,7 +691,68 @@ fn first_allocation_recovers_when_output_binding_precedes_ledger_commit() {
 }
 
 #[test]
-fn sigkill_at_every_durable_write_stage_recovers_without_generation_reuse() {
+fn sigkill_at_every_output_binding_stage_recovers_first_allocation() {
+    for stage in ["partial_write", "file_fsync", "rename", "parent_fsync"] {
+        let failpoint = format!("output_binding.{stage}");
+        let fixture = Fixture::new(&format!("output-binding-{stage}"));
+        let original_directories = fixture.directory_inodes();
+
+        let killed = fixture
+            .command()
+            .env("SUMI_ALLOCATOR_TEST_CRASH_AT", &failpoint)
+            .output()
+            .unwrap();
+        assert_eq!(
+            killed.status.signal(),
+            Some(libc::SIGKILL),
+            "{failpoint} did not terminate with SIGKILL: {}",
+            String::from_utf8_lossy(&killed.stderr)
+        );
+        assert_eq!(fixture.directory_inodes(), original_directories);
+        fixture.assert_role_mode(0o750);
+        assert!(!fixture.state.join("allocator-ledger.json").exists());
+
+        let binding_path = fixture.output.join("allocator-binding.json");
+        let temps = entries_with_prefix(&fixture.output, ".allocator-binding.json.tmp-");
+        let committed_binding_inode = if matches!(stage, "partial_write" | "file_fsync") {
+            assert_eq!(temps.len(), 1, "{failpoint} did not leave one stale temp");
+            assert!(!binding_path.exists());
+            let metadata = fs::symlink_metadata(&temps[0]).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+            None
+        } else {
+            assert!(temps.is_empty(), "{failpoint} left a renamed temp");
+            let metadata = fs::symlink_metadata(&binding_path).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+            fixture.assert_output_binding_inodes();
+            Some((metadata.dev(), metadata.ino()))
+        };
+
+        assert_eq!(successful_generation(&fixture.allocate()), 0);
+        assert_eq!(fixture.directory_inodes(), original_directories);
+        for role in ["runtime", "executor", "broker"] {
+            assert_eq!(fixture.identity(role)["SUMI_RPC_GENERATION"], "0");
+        }
+        fixture.assert_handoff();
+        fixture.assert_output_binding_inodes();
+        assert_no_strict_temps(&fixture);
+        if let Some(expected_inode) = committed_binding_inode {
+            let metadata = fs::metadata(&binding_path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), expected_inode);
+        }
+    }
+}
+
+#[test]
+fn sigkill_at_every_ledger_and_role_write_stage_recovers_without_generation_reuse() {
     for target in ["ledger", "runtime", "executor", "broker"] {
         for stage in ["partial_write", "file_fsync", "rename", "parent_fsync"] {
             let failpoint = format!("{target}.{stage}");
