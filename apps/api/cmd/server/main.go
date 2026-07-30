@@ -96,21 +96,46 @@ func run(ctx context.Context) (runErr error) {
 }
 
 func publicListenAddressFromEnv(port string) (string, error) {
-	address := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LOOPBACK_LISTEN"))
-	if address == "" {
+	publicAddress := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LISTEN"))
+	loopbackAddress := strings.TrimSpace(os.Getenv("SUMI_PUBLIC_LOOPBACK_LISTEN"))
+	if publicAddress != "" && loopbackAddress != "" {
+		return "", errors.New("SUMI_PUBLIC_LISTEN and SUMI_PUBLIC_LOOPBACK_LISTEN are mutually exclusive")
+	}
+	if publicAddress != "" {
+		return literalListenAddress("SUMI_PUBLIC_LISTEN", publicAddress, false)
+	}
+	if loopbackAddress == "" {
 		return ":" + port, nil
 	}
+	return literalListenAddress("SUMI_PUBLIC_LOOPBACK_LISTEN", loopbackAddress, true)
+}
+
+func literalListenAddress(name, address string, requireLoopback bool) (string, error) {
 	host, configuredPort, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", fmt.Errorf("SUMI_PUBLIC_LOOPBACK_LISTEN must be host:port: %w", err)
+		return "", fmt.Errorf("%s must be host:port: %w", name, err)
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return "", errors.New("SUMI_PUBLIC_LOOPBACK_LISTEN host must be a literal loopback IP")
+	if ip == nil {
+		return "", fmt.Errorf("%s host must be a literal IP", name)
+	}
+	if requireLoopback && !ip.IsLoopback() {
+		return "", fmt.Errorf("%s host must be a literal loopback IP", name)
+	}
+	if !requireLoopback && (ip.IsUnspecified() || ip.IsMulticast()) {
+		return "", fmt.Errorf("%s host must not be unspecified or multicast", name)
+	}
+	if configuredPort == "" {
+		return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+	}
+	for _, digit := range configuredPort {
+		if digit < '0' || digit > '9' {
+			return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+		}
 	}
 	numericPort, err := strconv.Atoi(configuredPort)
 	if err != nil || numericPort < 1 || numericPort > 65535 {
-		return "", errors.New("SUMI_PUBLIC_LOOPBACK_LISTEN port must be an integer from 1 to 65535")
+		return "", fmt.Errorf("%s port must be an integer from 1 to 65535", name)
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(numericPort)), nil
 }

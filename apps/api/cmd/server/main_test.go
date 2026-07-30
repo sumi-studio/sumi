@@ -1949,28 +1949,70 @@ func TestLocalControlTransportRequiresExactlyOneExplicitSelection(t *testing.T) 
 	}
 }
 
-func TestPublicLoopbackListenIsExplicitAndValidated(t *testing.T) {
+func TestPublicListenAddressFromEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		public   string
+		loopback string
+		want     string
+		wantErr  bool
+	}{
+		{name: "default", want: ":8080"},
+		{name: "legacy loopback", loopback: "127.0.0.1:4321", want: "127.0.0.1:4321"},
+		{name: "literal IPv4", public: "100.116.25.99:8080", want: "100.116.25.99:8080"},
+		{name: "literal IPv6 canonicalizes", public: "[2001:0db8:0:0:0:0:0:1]:8080", want: "[2001:db8::1]:8080"},
+		{name: "loopback literal allowed", public: "127.0.0.1:4321", want: "127.0.0.1:4321"},
+		{name: "wildcard IPv4", public: "0.0.0.0:4321", wantErr: true},
+		{name: "wildcard IPv6", public: "[::]:4321", wantErr: true},
+		{name: "hostname", public: "localhost:4321", wantErr: true},
+		{name: "multicast IPv4", public: "224.0.0.1:4321", wantErr: true},
+		{name: "multicast IPv6", public: "[ff02::1]:4321", wantErr: true},
+		{name: "missing port", public: "100.116.25.99", wantErr: true},
+		{name: "zero port", public: "100.116.25.99:0", wantErr: true},
+		{name: "non-numeric port", public: "100.116.25.99:not-a-port", wantErr: true},
+		{name: "signed port", public: "100.116.25.99:+8080", wantErr: true},
+		{name: "both listener environments", public: "100.116.25.99:8080", loopback: "127.0.0.1:4321", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SUMI_PUBLIC_LISTEN", tt.public)
+			t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", tt.loopback)
+			got, err := publicListenAddressFromEnv("8080")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("public listener address %q / %q was accepted", tt.public, tt.loopback)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("address=%q err=%v, want address=%q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPublicLiteralListenAddressBindsLoopback(t *testing.T) {
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve local loopback port: %v", err)
+	}
+	address := reserve.Addr().String()
+	if err := reserve.Close(); err != nil {
+		t.Fatalf("release local loopback port: %v", err)
+	}
+
+	t.Setenv("SUMI_PUBLIC_LISTEN", address)
 	t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", "")
-	if got, err := publicListenAddressFromEnv("8080"); err != nil || got != ":8080" {
-		t.Fatalf("default public listener changed: address=%q err=%v", got, err)
+	configured, err := publicListenAddressFromEnv("8080")
+	if err != nil {
+		t.Fatalf("read public literal listener: %v", err)
 	}
-
-	t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", "127.0.0.1:4321")
-	if got, err := publicListenAddressFromEnv("8080"); err != nil || got != "127.0.0.1:4321" {
-		t.Fatalf("valid loopback listener rejected: address=%q err=%v", got, err)
+	listener, err := net.Listen("tcp", configured)
+	if err != nil {
+		t.Fatalf("bind configured public literal listener %q: %v", configured, err)
 	}
-
-	for _, invalid := range []string{
-		"0.0.0.0:4321",
-		"localhost:4321",
-		"127.0.0.1:0",
-		"127.0.0.1:not-a-port",
-	} {
-		t.Setenv("SUMI_PUBLIC_LOOPBACK_LISTEN", invalid)
-		if _, err := publicListenAddressFromEnv("8080"); err == nil {
-			t.Fatalf("invalid public loopback listener %q was accepted", invalid)
-		}
-	}
+	defer listener.Close()
 }
 
 func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing.T) {
