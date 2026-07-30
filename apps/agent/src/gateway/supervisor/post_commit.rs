@@ -611,10 +611,34 @@ mod tests {
         }
     }
 
-    struct PoolBlockedAdmissionFixture {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PendingDeliveryPhase {
+        DurableSerial,
+        StoreRead,
+        ChannelSend,
+    }
+
+    enum PendingDeliveryBlocker {
+        DurableSerial(tokio::sync::OwnedMutexGuard<()>),
+        StoreConnection(sqlx::pool::PoolConnection<sqlx::Sqlite>),
+        ChannelSend,
+    }
+
+    impl PendingDeliveryBlocker {
+        fn release(self) {
+            match self {
+                Self::DurableSerial(serial) => drop(serial),
+                Self::StoreConnection(connection) => drop(connection),
+                Self::ChannelSend => {}
+            }
+        }
+    }
+
+    struct PendingAdmissionFixture {
         store: Arc<Store>,
         adapter: T17StoreAdapter,
         hook: DurableAdmissionHook,
+        phase: PendingDeliveryPhase,
         delivery_epoch: DeliveryEpoch,
         dispatcher: Option<OrderedPostCommitDispatcher>,
         delivery_runtime: Option<super::super::DeliveryEpochRuntime>,
@@ -622,13 +646,17 @@ mod tests {
         event_rx: mpsc::Receiver<(DeliveryEpoch, bool, OutboundFrame)>,
     }
 
-    impl PoolBlockedAdmissionFixture {
-        async fn start(label: &str) -> Self {
+    impl PendingAdmissionFixture {
+        async fn start(label: &str, phase: PendingDeliveryPhase) -> Self {
             let store = Arc::new(Store::session_test_store(label).await.unwrap());
             let adapter = T17StoreAdapter::new(store.clone())
                 .bind_delivery_authorization(DeliveryAuthorization::Raw)
                 .unwrap();
-            let hook = DurableAdmissionHook::default();
+            let mut hook = DurableAdmissionHook::default();
+            if phase == PendingDeliveryPhase::ChannelSend {
+                hook.pause_forwarder_before_receive = true;
+                hook.delivery_channel_capacity = Some(1);
+            }
             adapter.set_durable_admission_hook(Some(hook.clone()));
             let delivery_epoch = DeliveryEpoch::for_test(label);
             let (event_tx, event_rx) = mpsc::channel(4);
@@ -642,7 +670,25 @@ mod tests {
                 .install_delivery_epoch(delivery_epoch, 0, events, pump_cancel.child_token())
                 .await
                 .unwrap()
-                .expect("install the pool-blocked T17 delivery forwarder");
+                .expect("install the phase-blocked T17 delivery forwarder");
+            if phase == PendingDeliveryPhase::ChannelSend {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    hook.forwarder_paused.notified(),
+                )
+                .await
+                .expect("T17 forwarder pauses before receiving the channel filler");
+                DurableSource::mark_delivery_online(&adapter, delivery_epoch)
+                    .await
+                    .unwrap();
+                adapter
+                    .on_volatile(crate::agent::AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: "phase-blocker".to_owned(),
+                        partial: serde_json::json!({"stdout": "must-not-forward"}),
+                    })
+                    .await
+                    .unwrap();
+            }
             let dispatcher = OrderedPostCommitDispatcher::start(
                 store.clone(),
                 adapter.clone(),
@@ -671,6 +717,7 @@ mod tests {
                 store,
                 adapter,
                 hook,
+                phase,
                 delivery_epoch,
                 dispatcher: Some(dispatcher),
                 delivery_runtime: Some(delivery_runtime),
@@ -679,18 +726,37 @@ mod tests {
             }
         }
 
-        async fn block_delivery_on_store_connection(
-            &self,
-        ) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
-            let connection = self.store.pool().acquire().await.unwrap();
+        async fn block_delivery_at_phase(&self) -> PendingDeliveryBlocker {
+            let blocker = match self.phase {
+                PendingDeliveryPhase::DurableSerial => PendingDeliveryBlocker::DurableSerial(
+                    self.adapter
+                        .hold_active_durable_serial_for_test()
+                        .await
+                        .unwrap(),
+                ),
+                PendingDeliveryPhase::StoreRead => PendingDeliveryBlocker::StoreConnection(
+                    self.store.pool().acquire().await.unwrap(),
+                ),
+                PendingDeliveryPhase::ChannelSend => PendingDeliveryBlocker::ChannelSend,
+            };
             self.hook.allow_delivery.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                self.hook.delivery_started.notified(),
-            )
-            .await
-            .expect("T17 delivery reaches the Store read");
-            connection
+            let pending = match self.phase {
+                PendingDeliveryPhase::DurableSerial => {
+                    self.hook.delivery_phases.durable_serial_pending.notified()
+                }
+                PendingDeliveryPhase::StoreRead => {
+                    self.hook.delivery_phases.store_read_pending.notified()
+                }
+                PendingDeliveryPhase::ChannelSend => {
+                    self.hook.delivery_phases.channel_send_pending.notified()
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("T17 delivery never became pending at {:?}", self.phase)
+                });
+            blocker
         }
 
         async fn wait_for_receiver_release(&self) {
@@ -710,7 +776,7 @@ mod tests {
         fn assert_no_old_epoch_delivery(&mut self) {
             assert!(
                 self.event_rx.try_recv().is_err(),
-                "cancelled Store read must not emit into the old delivery epoch"
+                "cancelled delivery must not emit into the old delivery epoch"
             );
         }
 
@@ -732,8 +798,8 @@ mod tests {
                     .join(),
             )
             .await
-            .expect("pool-blocked T17 forwarder terminates")
-            .expect("pool-blocked T17 forwarder joins");
+            .expect("phase-blocked T17 forwarder terminates")
+            .expect("phase-blocked T17 forwarder joins");
             self.assert_no_old_epoch_delivery();
         }
     }
@@ -1575,10 +1641,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emergency_drop_cancels_a_pool_blocked_t17_delivery_read() {
-        let mut fixture =
-            PoolBlockedAdmissionFixture::start("post-commit-drop-pool-blocked-t17").await;
-        let connection = fixture.block_delivery_on_store_connection().await;
+    async fn emergency_drop_cancels_a_pending_t17_durable_serial_lock() {
+        let mut fixture = PendingAdmissionFixture::start(
+            "post-commit-drop-serial-blocked-t17",
+            PendingDeliveryPhase::DurableSerial,
+        )
+        .await;
+        let blocker = fixture.block_delivery_at_phase().await;
 
         drop(
             fixture
@@ -1590,14 +1659,17 @@ mod tests {
         assert_eq!(fixture.adapter.durable_fence_count(), 0);
         fixture.assert_no_old_epoch_delivery();
 
-        drop(connection);
+        blocker.release();
         fixture.finish().await;
     }
 
     #[tokio::test]
     async fn orderly_shutdown_cancels_a_pool_blocked_t17_delivery_read() {
-        let mut fixture =
-            PoolBlockedAdmissionFixture::start("post-commit-shutdown-pool-blocked-t17").await;
+        let mut fixture = PendingAdmissionFixture::start(
+            "post-commit-shutdown-pool-blocked-t17",
+            PendingDeliveryPhase::StoreRead,
+        )
+        .await;
         let proof = EventWriter::new(fixture.store.clone())
             .close_post_commit_admission(
                 fixture
@@ -1608,7 +1680,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let connection = fixture.block_delivery_on_store_connection().await;
+        let blocker = fixture.block_delivery_at_phase().await;
 
         let dispatcher = fixture
             .dispatcher
@@ -1624,14 +1696,17 @@ mod tests {
         assert_eq!(fixture.adapter.durable_fence_count(), 0);
         fixture.assert_no_old_epoch_delivery();
 
-        drop(connection);
+        blocker.release();
         fixture.finish().await;
     }
 
     #[tokio::test]
-    async fn hydration_rollover_cancels_a_pool_blocked_t17_delivery_read() {
-        let mut fixture =
-            PoolBlockedAdmissionFixture::start("post-commit-rollover-pool-blocked-t17").await;
+    async fn hydration_rollover_cancels_a_pending_t17_bounded_channel_send() {
+        let mut fixture = PendingAdmissionFixture::start(
+            "post-commit-rollover-channel-blocked-t17",
+            PendingDeliveryPhase::ChannelSend,
+        )
+        .await;
         let runtime_epoch = fixture
             .dispatcher
             .as_ref()
@@ -1639,19 +1714,19 @@ mod tests {
             .client()
             .epoch()
             .clone();
-        let connection = fixture.block_delivery_on_store_connection().await;
+        let blocker = fixture.block_delivery_at_phase().await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             runtime_epoch.invalidate_hydration_lifecycle_for_test(),
         )
         .await
-        .expect("hydration rollover cancels the pool-blocked Store read");
+        .expect("hydration rollover cancels the bounded delivery send");
         fixture.wait_for_receiver_release().await;
         assert_eq!(fixture.adapter.durable_fence_count(), 0);
         fixture.assert_no_old_epoch_delivery();
 
-        drop(connection);
+        blocker.release();
         fixture.finish().await;
     }
 

@@ -57,12 +57,12 @@ use self::crypto::{
     DataKeyScope, KeyWrapAad, PersonalityAgentCommandDigestFactory, WRAP_ALGORITHM,
     unwrap_data_key, wrap_data_key,
 };
-#[cfg(test)]
-pub(crate) use self::delivery::insert_test_durable_event;
 pub(crate) use self::delivery::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
     DurableDeliveryOutcome, current_event_head_seq, raw_events_after,
 };
+#[cfg(test)]
+pub(crate) use self::delivery::{DurableDeliveryPhaseHook, insert_test_durable_event};
 #[cfg(test)]
 pub(crate) use self::event_writer::{
     PostCommitPublishHook, seed_provider_context_owner_event_evidence,
