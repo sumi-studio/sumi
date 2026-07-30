@@ -619,18 +619,102 @@ struct SupervisorLifecycle {
     task: Option<JoinHandle<Result<()>>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorTermination {
+    Completed,
+    Failed(String),
+    Panicked(String),
+    Cancelled(String),
+}
+
+impl fmt::Display for SupervisorTermination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => write!(formatter, "connection supervisor completed unexpectedly"),
+            Self::Failed(reason) => write!(formatter, "connection supervisor failed: {reason}"),
+            Self::Panicked(reason) => write!(formatter, "connection supervisor panicked: {reason}"),
+            Self::Cancelled(reason) => {
+                write!(
+                    formatter,
+                    "connection supervisor task was cancelled: {reason}"
+                )
+            }
+        }
+    }
+}
+
+pub(crate) struct SupervisorRuntime {
+    lifecycle: SupervisorLifecycle,
+    completed: Option<Result<()>>,
+}
+
+impl SupervisorRuntime {
+    fn new(lifecycle: SupervisorLifecycle) -> Self {
+        Self {
+            lifecycle,
+            completed: None,
+        }
+    }
+
+    pub(crate) async fn termination(&mut self) -> Result<SupervisorTermination> {
+        let joined = self
+            .lifecycle
+            .task
+            .as_mut()
+            .context("connection supervisor completion was already observed")?
+            .await;
+        self.lifecycle.task.take();
+        let (termination, result) = match joined {
+            Ok(Ok(())) => (SupervisorTermination::Completed, Ok(())),
+            Ok(Err(error)) => (SupervisorTermination::Failed(error.to_string()), Err(error)),
+            Err(join_error) if join_error.is_panic() => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Panicked(reason.clone()),
+                    Err(anyhow!("connection supervisor task panicked: {reason}")),
+                )
+            }
+            Err(join_error) => {
+                let reason = join_error.to_string();
+                (
+                    SupervisorTermination::Cancelled(reason.clone()),
+                    Err(anyhow!(
+                        "connection supervisor task was cancelled: {reason}"
+                    )),
+                )
+            }
+        };
+        self.completed = Some(result);
+        Ok(termination)
+    }
+
+    pub(crate) async fn cancel_and_join(mut self) -> Result<()> {
+        self.lifecycle.cancel.cancel();
+        match self.completed.take() {
+            Some(result) => result,
+            None => self.lifecycle.join().await,
+        }
+    }
+}
+
 impl SupervisorHandle {
     pub fn abort(&self) {
         self.lifecycle.cancel.cancel();
     }
 
-    pub async fn join(mut self) -> Result<()> {
+    pub async fn join(self) -> Result<()> {
+        self.lifecycle.join().await
+    }
+}
+
+impl SupervisorLifecycle {
+    async fn join(mut self) -> Result<()> {
         let task = self
-            .lifecycle
             .task
             .take()
             .context("supervisor task was already consumed")?;
-        task.await?
+        task.await
+            .context("join connection supervisor owner task")?
     }
 }
 
@@ -2234,6 +2318,7 @@ impl HydrationLatch for WatchHydrationLatch {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -2267,6 +2352,104 @@ mod tests {
         EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome,
         PostCommitEpochCapability, Store, insert_test_durable_event, user_message_id,
     };
+
+    fn test_supervisor_runtime<F>(cancel: CancellationToken, run: F) -> SupervisorRuntime
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        SupervisorRuntime::new(SupervisorLifecycle {
+            cancel,
+            task: Some(tokio::spawn(run)),
+        })
+    }
+
+    async fn observed_supervisor_termination(
+        runtime: &mut SupervisorRuntime,
+    ) -> SupervisorTermination {
+        tokio::time::timeout(Duration::from_secs(1), runtime.termination())
+            .await
+            .expect("supervisor termination must be observable")
+            .expect("supervisor lifecycle join remains valid")
+    }
+
+    #[tokio::test]
+    async fn supervisor_error_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            Err(anyhow!("injected supervisor failure"))
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Failed(reason)
+                if reason.contains("injected supervisor failure")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its task error");
+        assert!(error.to_string().contains("injected supervisor failure"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_panic_is_surfaced_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async {
+            panic!("injected supervisor panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let termination = observed_supervisor_termination(&mut runtime).await;
+        assert!(matches!(
+            termination,
+            SupervisorTermination::Panicked(reason)
+                if reason.contains("injected supervisor panic")
+        ));
+        let error = runtime
+            .cancel_and_join()
+            .await
+            .expect_err("joined supervisor must retain its panic");
+        assert!(error.to_string().contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_supervisor_exit_is_observable_and_joined() {
+        let cancel = CancellationToken::new();
+        let mut runtime = test_supervisor_runtime(cancel, async { Ok(()) });
+
+        assert_eq!(
+            observed_supervisor_termination(&mut runtime).await,
+            SupervisorTermination::Completed
+        );
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("completed supervisor owner task must still be joined");
+    }
+
+    #[tokio::test]
+    async fn planned_supervisor_shutdown_cancels_and_joins_cleanly() {
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let run_finished = finished.clone();
+        let runtime = test_supervisor_runtime(cancel, async move {
+            run_cancel.cancelled().await;
+            run_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("planned shutdown must join cleanly");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "join must await the supervisor's cancellation cleanup"
+        );
+    }
 
     struct TestDigestFactory;
 

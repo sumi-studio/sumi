@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
-use super::{DeliveryEpoch, EventSender, SupervisorHandle, SupervisorLifecycle};
+#[cfg(test)]
+use super::SupervisorLifecycle;
+use super::{DeliveryEpoch, EventSender, SupervisorHandle, SupervisorRuntime};
 use crate::agent::AgentEvent;
 use crate::gateway::{
     AgentHello, ApiHello, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError,
@@ -93,12 +95,42 @@ pub struct SessionGateway {
     epochs: watch::Receiver<Option<DeliveryEpoch>>,
     online: watch::Receiver<bool>,
     session_events: Option<SessionEventSink>,
-    // Session transfers this owner to its dedicated writer task when it splits
-    // the gateway. Dropping that writer preserves the supervisor cancellation
-    // and delivery-epoch cleanup path.
+    // Production construction has no lifecycle field: bootstrap retains the
+    // SupervisorRuntime. Tests keep the old writer-owned drop backstop only as
+    // an isolated compatibility fixture.
+    #[cfg(test)]
     lifecycle: Option<SupervisorLifecycle>,
 }
 
+impl SessionGateway {
+    /// Transfer only stable gateway channels into Session. Bootstrap retains
+    /// the returned runtime owner so supervisor termination is monitored and
+    /// every teardown explicitly cancels and joins the task.
+    pub(crate) fn from_supervisor(handle: SupervisorHandle) -> (Self, SupervisorRuntime) {
+        let SupervisorHandle {
+            commands,
+            events,
+            epochs,
+            online,
+            session_events,
+            lifecycle,
+        } = handle;
+        (
+            Self {
+                commands,
+                ack_events: events,
+                epochs,
+                online,
+                session_events,
+                #[cfg(test)]
+                lifecycle: None,
+            },
+            SupervisorRuntime::new(lifecycle),
+        )
+    }
+}
+
+#[cfg(test)]
 impl From<SupervisorHandle> for SessionGateway {
     fn from(handle: SupervisorHandle) -> Self {
         let SupervisorHandle {
@@ -152,6 +184,7 @@ pub struct SessionGatewayWriter {
     online: watch::Receiver<bool>,
     session_events: Option<SessionEventSink>,
     ack_barrier: Option<DurableEventAdmission>,
+    #[cfg(test)]
     _lifecycle: Option<SupervisorLifecycle>,
 }
 
@@ -316,6 +349,7 @@ impl Gateway for SessionGateway {
                 online: self.online,
                 session_events: self.session_events,
                 ack_barrier: None,
+                #[cfg(test)]
                 _lifecycle: self.lifecycle,
             },
         )
@@ -965,6 +999,59 @@ mod tests {
             .await
             .expect_err("closed command channel");
         assert!(error.downcast_ref::<GatewayClosed>().is_some());
+    }
+
+    #[tokio::test]
+    async fn production_split_keeps_supervisor_lifecycle_out_of_session() {
+        let (gateway, _command_tx, _event_rx, _epochs_tx, _online_tx, _delivery) =
+            make_gateway(1, 1, Some(DeliveryEpoch::for_test("bootstrap-lifecycle")));
+        let SessionGateway {
+            commands,
+            ack_events,
+            epochs,
+            online,
+            session_events,
+            lifecycle: _fixture_lifecycle,
+        } = gateway;
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            let _ = finished_tx.send(());
+            Ok(())
+        });
+        let handle = SupervisorHandle {
+            commands,
+            events: ack_events,
+            epochs,
+            online,
+            session_events,
+            lifecycle: SupervisorLifecycle {
+                cancel: cancel.clone(),
+                task: Some(task),
+            },
+        };
+        let (gateway, runtime) = SessionGateway::from_supervisor(handle);
+
+        let (reader, writer) = gateway.split();
+        drop(reader);
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_cancelled(),
+            "Session owns only channels and must not control supervisor lifetime"
+        );
+
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("bootstrap-owned supervisor must cancel and join cleanly");
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("joined supervisor must run cancellation cleanup")
+            .expect("supervisor completion signal remains open");
     }
 
     #[tokio::test]

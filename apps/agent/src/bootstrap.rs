@@ -41,8 +41,9 @@ use crate::{
             LocalRuntimeComponent, first_browser_vertical_ready_gate,
         },
         supervisor::{
-            ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig,
-            post_commit::ProductionPostCommitRuntime, session::SessionGateway,
+            ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig, SupervisorRuntime,
+            SupervisorTermination, post_commit::ProductionPostCommitRuntime,
+            session::SessionGateway,
         },
         ws::WebSocketConnector,
     },
@@ -57,6 +58,9 @@ use crate::{
         executor::{ArtifactBrokerClient, ExecutorClient, remote_executor_registry},
     },
 };
+
+#[cfg(test)]
+use crate::gateway::local_runtime::LocalPublicationError;
 
 struct BootstrapContext {
     authority: RuntimeEpochAuthority,
@@ -377,10 +381,15 @@ struct IndeterminateControlPlaneState {
     source: anyhow::Error,
 }
 
-#[derive(Debug)]
-struct ReadyPublicationOutcome {
-    shutdown_requested: bool,
-    signal_failure: Option<String>,
+enum ReadyReconciliationOutcome<T> {
+    Published,
+    InterruptedBeforePublication(T),
+    InterruptedAfterReconciliation(T),
+}
+
+struct ReadyReconciliationFailure<T> {
+    control: anyhow::Error,
+    interruption: Option<T>,
 }
 
 enum PreReadyWait<T> {
@@ -392,6 +401,7 @@ enum PreReadyRuntimeExit {
     Signal(Result<()>),
     Dependency(Result<()>),
     PostCommit(Result<()>),
+    Supervisor(Result<SupervisorTermination>),
 }
 
 enum OwnedPreReadyWait<T> {
@@ -416,20 +426,30 @@ async fn wait_owned_pre_ready<T>(
     signal: &mut BoxFuture<'static, Result<()>>,
     dependency: &mut BoxFuture<'static, Result<()>>,
     post_commit: &mut BoxFuture<'static, Result<()>>,
+    supervisor: &mut SupervisorRuntime,
 ) -> OwnedPreReadyWait<T> {
     tokio::pin!(operation);
     tokio::select! {
         biased;
-        observed = signal.as_mut() => {
-            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::Signal(observed))
-        }
-        observed = dependency.as_mut() => {
-            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::Dependency(observed))
-        }
-        observed = post_commit.as_mut() => {
-            OwnedPreReadyWait::Exit(PreReadyRuntimeExit::PostCommit(observed))
+        exit = wait_required_runtime_exit(signal, dependency, post_commit, supervisor) => {
+            OwnedPreReadyWait::Exit(exit)
         }
         completed = &mut operation => OwnedPreReadyWait::Completed(completed),
+    }
+}
+
+async fn wait_required_runtime_exit(
+    signal: &mut BoxFuture<'static, Result<()>>,
+    dependency: &mut BoxFuture<'static, Result<()>>,
+    post_commit: &mut BoxFuture<'static, Result<()>>,
+    supervisor: &mut SupervisorRuntime,
+) -> PreReadyRuntimeExit {
+    tokio::select! {
+        biased;
+        observed = signal.as_mut() => PreReadyRuntimeExit::Signal(observed),
+        observed = dependency.as_mut() => PreReadyRuntimeExit::Dependency(observed),
+        observed = post_commit.as_mut() => PreReadyRuntimeExit::PostCommit(observed),
+        observed = supervisor.termination() => PreReadyRuntimeExit::Supervisor(observed),
     }
 }
 
@@ -535,6 +555,28 @@ struct PostCommitTeardownFailure {
     dispatcher: String,
     control_plane: String,
     session: SessionTerminationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "connection supervisor terminated: {supervisor}; shutdown control-plane result: {control_plane}; {session}"
+)]
+struct SupervisorTeardownFailure {
+    supervisor: String,
+    control_plane: String,
+    session: SessionTerminationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session terminated without a selected shutdown or required-runtime failure: {session}")]
+struct UnexpectedSessionTermination {
+    session: SessionTerminationReport,
+}
+
+fn unexpected_session_result(report: SessionTerminationReport) -> Result<()> {
+    Err(anyhow::Error::new(UnexpectedSessionTermination {
+        session: report,
+    }))
 }
 
 /// Validate a UDS parent with the same trust properties as executor-owned IPC:
@@ -868,8 +910,8 @@ async fn run_after_not_ready(
     ) = match wait_pre_ready_or_signal(preparation, &mut signal).await {
         PreReadyWait::Completed(result) => result?,
         PreReadyWait::Signal(result) => {
-            shutdown.cancel();
-            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            let control_result =
+                publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
             return pre_ready_signal_result(result, control_result);
         }
     };
@@ -894,7 +936,7 @@ async fn run_after_not_ready(
     );
     let supervisor_handle = supervisor.start();
     let mut supervisor_online = supervisor_handle.online.clone();
-    let gateway = SessionGateway::from(supervisor_handle);
+    let (gateway, mut supervisor_runtime) = SessionGateway::from_supervisor(supervisor_handle);
 
     // Session construction owns the sole RunCore in a retained task. A signal
     // can stop admission immediately without cancelling and dropping that
@@ -912,56 +954,51 @@ async fn run_after_not_ready(
     });
     let session = tokio::select! {
         biased;
-        observed = signal.as_mut() => {
-            shutdown.cancel();
-            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+        exit = wait_required_runtime_exit(
+            &mut signal,
+            &mut dependency_failure,
+            &mut post_commit_failure,
+            &mut supervisor_runtime,
+        ) => {
             let started = (&mut session_start)
                 .await
                 .context("join exact hydrated Session startup task");
             return match started {
                 Ok(Ok(session)) => {
-                    let report = SessionTerminationReport::from_result(
-                        session.run_until_cancelled(shutdown.clone()).await,
-                    );
-                    let primary = combine_results(
-                        pre_ready_signal_result(observed, control_result),
-                        report.into_result(),
-                        "pre-Ready Session shutdown",
-                    );
-                    finish_post_commit(primary, post_commit.shutdown_orderly().await)
+                    teardown_owned_pre_ready_runtime(
+                        publisher,
+                        session,
+                        post_commit,
+                        supervisor_runtime,
+                        shutdown,
+                        exit,
+                    )
+                    .await
                 }
-                Ok(Err(start_error)) => {
-                    let primary = combine_results(
-                        pre_ready_signal_result(observed, control_result),
-                        Err(start_error),
-                        "pre-Ready Session startup",
-                    );
-                    finish_post_commit(primary, post_commit.invalidate_and_join().await)
-                }
-                Err(join_error) => {
-                    let primary = combine_results(
-                        pre_ready_signal_result(observed, control_result),
-                        Err(join_error),
-                        "pre-Ready Session startup ownership",
-                    );
-                    finish_post_commit(primary, post_commit.invalidate_and_join().await)
+                Ok(Err(start_error)) | Err(start_error) => {
+                    teardown_failed_session_start(
+                        publisher,
+                        post_commit,
+                        supervisor_runtime,
+                        shutdown,
+                        exit,
+                        start_error,
+                    )
+                    .await
                 }
             };
         }
         started = &mut session_start => {
             match started.context("join exact hydrated Session startup task") {
                 Ok(Ok(session)) => session,
-                Ok(Err(start_error)) => {
-                    return finish_post_commit(
+                Ok(Err(start_error)) | Err(start_error) => {
+                    return finish_runtime(
                         Err(start_error),
-                        post_commit.invalidate_and_join().await,
-                    );
-                }
-                Err(join_error) => {
-                    return finish_post_commit(
-                        Err(join_error),
-                        post_commit.invalidate_and_join().await,
-                    );
+                        post_commit,
+                        supervisor_runtime,
+                        true,
+                    )
+                    .await;
                 }
             }
         }
@@ -974,6 +1011,7 @@ async fn run_after_not_ready(
         return teardown_pre_ready_operation_failure(
             session,
             post_commit,
+            supervisor_runtime,
             shutdown,
             error.context("mark exact Session component Ready"),
         )
@@ -985,6 +1023,7 @@ async fn run_after_not_ready(
         &mut signal,
         &mut dependency_failure,
         &mut post_commit_failure,
+        &mut supervisor_runtime,
     )
     .await
     {
@@ -994,6 +1033,7 @@ async fn run_after_not_ready(
                 return teardown_pre_ready_operation_failure(
                     session,
                     post_commit,
+                    supervisor_runtime,
                     shutdown,
                     error.context("wait for exact local runtime Ready proof"),
                 )
@@ -1005,6 +1045,7 @@ async fn run_after_not_ready(
                 publisher,
                 session,
                 post_commit,
+                supervisor_runtime,
                 shutdown,
                 exit,
             )
@@ -1016,6 +1057,7 @@ async fn run_after_not_ready(
         &mut signal,
         &mut dependency_failure,
         &mut post_commit_failure,
+        &mut supervisor_runtime,
     )
     .await
     {
@@ -1024,6 +1066,7 @@ async fn run_after_not_ready(
             return teardown_pre_ready_operation_failure(
                 session,
                 post_commit,
+                supervisor_runtime,
                 shutdown,
                 error.context("wait for authenticated Gateway catch-up"),
             )
@@ -1034,6 +1077,7 @@ async fn run_after_not_ready(
                 publisher,
                 session,
                 post_commit,
+                supervisor_runtime,
                 shutdown,
                 exit,
             )
@@ -1041,15 +1085,40 @@ async fn run_after_not_ready(
         }
     }
 
-    let ready_outcome = match publish_ready_reconciling(
+    let ready_outcome = publish_ready_reconciling(
         || publisher.publish_ready(&ready_proof),
-        &mut signal,
+        wait_required_runtime_exit(
+            &mut signal,
+            &mut dependency_failure,
+            &mut post_commit_failure,
+            &mut supervisor_runtime,
+        ),
         &shutdown,
     )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(control) => {
+    .await;
+    match ready_outcome {
+        Ok(ReadyReconciliationOutcome::Published) => {}
+        Ok(
+            ReadyReconciliationOutcome::InterruptedBeforePublication(exit)
+            | ReadyReconciliationOutcome::InterruptedAfterReconciliation(exit),
+        ) => {
+            // If Ready might have committed, the helper above reconciled that
+            // exact publication identity before returning. Shutdown NotReady
+            // is therefore the next legal transition.
+            return teardown_owned_pre_ready_runtime(
+                publisher,
+                session,
+                post_commit,
+                supervisor_runtime,
+                shutdown,
+                exit,
+            )
+            .await;
+        }
+        Err(failure) => {
+            let interruption = failure.interruption;
+            let control = failure.control;
+            let control_description = control.to_string();
             stop_for_control_failure(
                 &context.authority,
                 &shutdown,
@@ -1058,31 +1127,27 @@ async fn run_after_not_ready(
             );
             let report =
                 SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-            let primary =
-                Err(control_teardown_error(control, report)).context("publish exact Ready");
-            return finish_post_commit(primary, post_commit.shutdown_orderly().await);
+            let mut primary =
+                Err(control_teardown_error(control, report.clone())).context("publish exact Ready");
+            let emergency = if let Some(exit) = interruption {
+                let (exit_result, emergency) = runtime_exit_result(
+                    exit,
+                    Err(anyhow!(
+                        "Ready transition failed before shutdown NotReady: {control_description}"
+                    )),
+                    report,
+                );
+                primary = combine_results(
+                    primary,
+                    exit_result,
+                    "required runtime termination during Ready reconciliation",
+                );
+                emergency
+            } else {
+                false
+            };
+            return finish_runtime(primary, post_commit, supervisor_runtime, emergency).await;
         }
-    };
-
-    if ready_outcome.shutdown_requested {
-        // Even when the first Ready response was lost after commit, the
-        // publisher has now reconciled that exact pending publication. Only
-        // then is the subsequent shutdown NotReady transition legal.
-        let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-        if let Err(control) = control_result.as_ref() {
-            stop_for_control_failure(
-                &context.authority,
-                &shutdown,
-                control,
-                "shutdown NotReady could not be reconciled",
-            );
-        } else {
-            shutdown.cancel();
-        }
-        let report =
-            SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-        let primary = signal_teardown_result(ready_outcome.signal_failure, control_result, report);
-        return finish_post_commit(primary, post_commit.shutdown_orderly().await);
     }
 
     supervise_ready_session(
@@ -1093,51 +1158,71 @@ async fn run_after_not_ready(
         dependency_failure,
         post_commit_failure,
         post_commit,
+        supervisor_runtime,
         shutdown,
     )
     .await
 }
 
-async fn publish_ready_reconciling<'a, Publish, Published>(
+async fn publish_ready_reconciling<'a, Publish, Published, Interruption>(
     mut publish: Publish,
-    signal: &mut BoxFuture<'static, Result<()>>,
+    interrupt: impl std::future::Future<Output = Interruption>,
     shutdown: &CancellationToken,
-) -> Result<ReadyPublicationOutcome>
+) -> std::result::Result<
+    ReadyReconciliationOutcome<Interruption>,
+    ReadyReconciliationFailure<Interruption>,
+>
 where
     Publish: FnMut() -> Published,
     Published: std::future::Future<Output = LocalPublicationResult<()>> + 'a,
 {
-    let mut shutdown_requested = false;
-    let mut signal_failure = None;
+    tokio::pin!(interrupt);
+    // A required component may already have failed after the final pre-Ready
+    // check. Poll that state before constructing or polling a new Ready
+    // publication so bootstrap never initiates a known-stale transition.
+    tokio::select! {
+        biased;
+        interruption = &mut interrupt => {
+            shutdown.cancel();
+            return Ok(ReadyReconciliationOutcome::InterruptedBeforePublication(interruption));
+        }
+        _ = std::future::ready(()) => {}
+    }
+
+    let mut interruption = None;
     let mut last_error = None;
-    for attempt in 1..=CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
-        let publication = if shutdown_requested {
+    let mut completed_attempts = 0;
+    while completed_attempts < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
+        let publication = if interruption.is_some() {
             publish().await
         } else {
             tokio::select! {
-                published = publish() => published,
-                observed = signal.as_mut() => {
-                    shutdown_requested = true;
+                biased;
+                observed = &mut interrupt => {
                     shutdown.cancel();
-                    if let Err(error) = observed {
-                        signal_failure = Some(error.to_string());
-                    }
-                    Err(LocalPublicationError::indeterminate(anyhow!(
-                        "shutdown was observed while Ready publication was in flight"
-                    )))
+                    interruption = Some(observed);
+                    // The cancelled call may already have committed. It did
+                    // not produce a reconciliation result, so retry the same
+                    // retained identity without consuming the bounded result
+                    // budget.
+                    continue;
                 }
+                published = publish() => published,
             }
         };
+        completed_attempts += 1;
         match publication {
             Ok(()) => {
-                return Ok(ReadyPublicationOutcome {
-                    shutdown_requested,
-                    signal_failure,
+                return Ok(match interruption {
+                    Some(interruption) => {
+                        ReadyReconciliationOutcome::InterruptedAfterReconciliation(interruption)
+                    }
+                    None => ReadyReconciliationOutcome::Published,
                 });
             }
             Err(error) if error.is_indeterminate() => {
                 tracing::warn!(
-                    attempt,
+                    attempt = completed_attempts,
                     max_attempts = CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
                     %error,
                     "Ready publication response was indeterminate; reconciling the same publication identity"
@@ -1148,32 +1233,36 @@ where
                 last_error = Some(anyhow::Error::new(error));
             }
             Err(error) => {
-                return Err(anyhow::Error::new(error)
-                    .context("Ready publication failed terminal validation or was rejected"));
+                return Err(ReadyReconciliationFailure {
+                    control: anyhow::Error::new(error)
+                        .context("Ready publication failed terminal validation or was rejected"),
+                    interruption,
+                });
             }
         }
-        if attempt < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
-            if shutdown_requested {
+        if completed_attempts < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
+            if interruption.is_some() {
                 tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY).await;
             } else {
                 tokio::select! {
-                    _ = tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY) => {}
-                    observed = signal.as_mut() => {
-                        shutdown_requested = true;
+                    biased;
+                    observed = &mut interrupt => {
                         shutdown.cancel();
-                        if let Err(error) = observed {
-                            signal_failure = Some(error.to_string());
-                        }
+                        interruption = Some(observed);
                     }
+                    _ = tokio::time::sleep(CONTROL_PLANE_RECONCILIATION_DELAY) => {}
                 }
             }
         }
     }
-    Err(anyhow::Error::new(IndeterminateControlPlaneState {
-        transition: "Ready",
-        attempts: CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
-        source: last_error.unwrap_or_else(|| anyhow!("Ready publication produced no result")),
-    }))
+    Err(ReadyReconciliationFailure {
+        control: anyhow::Error::new(IndeterminateControlPlaneState {
+            transition: "Ready",
+            attempts: CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
+            source: last_error.unwrap_or_else(|| anyhow!("Ready publication produced no result")),
+        }),
+        interruption,
+    })
 }
 
 async fn publish_shutdown_not_ready_reconciling<P>(publisher: &P) -> Result<()>
@@ -1208,6 +1297,21 @@ where
         source: last_error
             .unwrap_or_else(|| anyhow!("shutdown NotReady publication produced no result")),
     }))
+}
+
+async fn publish_shutdown_not_ready_after_local_cancel<P>(
+    publisher: &P,
+    shutdown: &CancellationToken,
+) -> Result<()>
+where
+    P: LocalReadyPublisher,
+{
+    // CancellationToken children already held by an active run are cancelled
+    // synchronously here. The Session future also remains suspended while the
+    // control-plane transition is reconciled, so no further command admission
+    // can occur during that bounded I/O.
+    shutdown.cancel();
+    publish_shutdown_not_ready_reconciling(publisher).await
 }
 
 fn pre_ready_signal_result(signal: Result<()>, control: Result<()>) -> Result<()> {
@@ -1257,13 +1361,37 @@ fn combine_results(
     }
 }
 
-fn finish_post_commit(primary: Result<()>, post_commit: Result<()>) -> Result<()> {
-    combine_results(primary, post_commit, "post-commit teardown")
+async fn finish_runtime(
+    primary: Result<()>,
+    post_commit: ProductionPostCommitRuntime,
+    supervisor: SupervisorRuntime,
+    emergency: bool,
+) -> Result<()> {
+    let post_commit_result = if emergency {
+        post_commit.invalidate_and_join().await
+    } else {
+        post_commit.shutdown_orderly().await
+    };
+    let primary = combine_results(
+        primary,
+        post_commit_result,
+        if emergency {
+            "post-commit emergency teardown"
+        } else {
+            "post-commit teardown"
+        },
+    );
+    combine_results(
+        primary,
+        supervisor.cancel_and_join().await,
+        "connection supervisor teardown",
+    )
 }
 
 async fn teardown_pre_ready_operation_failure(
     session: Session<SessionGateway>,
     post_commit: ProductionPostCommitRuntime,
+    supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
     failure: anyhow::Error,
 ) -> Result<()> {
@@ -1275,20 +1403,29 @@ async fn teardown_pre_ready_operation_failure(
         report.into_result(),
         "pre-Ready Session shutdown",
     );
-    finish_post_commit(primary, post_commit.shutdown_orderly().await)
+    finish_runtime(primary, post_commit, supervisor, false).await
 }
 
 async fn teardown_owned_pre_ready_runtime(
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
     post_commit: ProductionPostCommitRuntime,
+    supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
     exit: PreReadyRuntimeExit,
 ) -> Result<()> {
-    shutdown.cancel();
-    let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+    let control_result = publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
     let report =
         SessionTerminationReport::from_result(session.run_until_cancelled(shutdown.clone()).await);
+    let (primary, emergency) = runtime_exit_result(exit, control_result, report);
+    finish_runtime(primary, post_commit, supervisor, emergency).await
+}
+
+fn runtime_exit_result(
+    exit: PreReadyRuntimeExit,
+    control_result: Result<()>,
+    report: SessionTerminationReport,
+) -> (Result<()>, bool) {
     match exit {
         PreReadyRuntimeExit::Signal(signal) => {
             let primary = signal_teardown_result(
@@ -1298,7 +1435,7 @@ async fn teardown_owned_pre_ready_runtime(
                 control_result,
                 report,
             );
-            finish_post_commit(primary, post_commit.shutdown_orderly().await)
+            (primary, false)
         }
         PreReadyRuntimeExit::Dependency(dependency) => {
             let failure = match dependency {
@@ -1313,7 +1450,7 @@ async fn teardown_owned_pre_ready_runtime(
                 ),
                 session: report,
             }));
-            finish_post_commit(primary, post_commit.shutdown_orderly().await)
+            (primary, false)
         }
         PreReadyRuntimeExit::PostCommit(dispatcher) => {
             let failure = match dispatcher {
@@ -1328,143 +1465,119 @@ async fn teardown_owned_pre_ready_runtime(
                 ),
                 session: report,
             }));
-            finish_post_commit(primary, post_commit.invalidate_and_join().await)
+            (primary, true)
+        }
+        PreReadyRuntimeExit::Supervisor(supervisor_exit) => {
+            let failure = match supervisor_exit {
+                Ok(termination) => termination.to_string(),
+                Err(error) => format!("connection supervisor monitor failed: {error:#}"),
+            };
+            let primary = Err(anyhow::Error::new(SupervisorTeardownFailure {
+                supervisor: failure,
+                control_plane: control_result.err().map_or_else(
+                    || "acknowledged NotReady".to_owned(),
+                    |error| error.to_string(),
+                ),
+                session: report,
+            }));
+            (primary, true)
         }
     }
 }
 
-async fn supervise_ready_session<Signal, Dependency, PostCommit>(
+async fn teardown_failed_session_start(
+    publisher: &LocalRuntimePublisher,
+    post_commit: ProductionPostCommitRuntime,
+    supervisor: SupervisorRuntime,
+    shutdown: CancellationToken,
+    exit: PreReadyRuntimeExit,
+    start_error: anyhow::Error,
+) -> Result<()> {
+    let control_result = publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
+    let report = SessionTerminationReport {
+        status: "startup failed",
+        ownership: SessionOwnershipReport::Lost,
+        failure: Some(start_error.to_string()),
+    };
+    let (primary, _) = runtime_exit_result(exit, control_result, report);
+    // Session never began admitting commands, so no orderly producer proof
+    // exists. Invalidate rather than mint quiescence on its behalf.
+    finish_runtime(primary, post_commit, supervisor, true).await
+}
+
+async fn supervise_ready_session(
     authority: &RuntimeEpochAuthority,
     publisher: &LocalRuntimePublisher,
     session: Session<SessionGateway>,
-    signal: Signal,
-    dependency_failure: Dependency,
-    post_commit_failure: PostCommit,
+    mut signal: BoxFuture<'static, Result<()>>,
+    mut dependency_failure: BoxFuture<'static, Result<()>>,
+    mut post_commit_failure: BoxFuture<'static, Result<()>>,
     post_commit: ProductionPostCommitRuntime,
+    mut supervisor: SupervisorRuntime,
     shutdown: CancellationToken,
-) -> Result<()>
-where
-    Signal: std::future::Future<Output = Result<()>>,
-    Dependency: std::future::Future<Output = Result<()>>,
-    PostCommit: std::future::Future<Output = Result<()>>,
-{
+) -> Result<()> {
     let session_run = session.run_until_cancelled(shutdown.clone());
     tokio::pin!(session_run);
-    tokio::pin!(signal);
-    tokio::pin!(dependency_failure);
-    tokio::pin!(post_commit_failure);
 
     enum Exit {
         Session(SessionResult),
-        Signal(Result<()>),
-        Dependency(Result<()>),
-        PostCommit(Result<()>),
+        Runtime(PreReadyRuntimeExit),
     }
 
     let exit = tokio::select! {
         biased;
-        result = &mut signal => Exit::Signal(result),
-        result = &mut dependency_failure => Exit::Dependency(result),
-        result = &mut post_commit_failure => Exit::PostCommit(result),
+        exit = wait_required_runtime_exit(
+            &mut signal,
+            &mut dependency_failure,
+            &mut post_commit_failure,
+            &mut supervisor,
+        ) => {
+            Exit::Runtime(exit)
+        },
         result = &mut session_run => Exit::Session(result),
     };
     match exit {
         Exit::Session(result) => {
             let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
             let report = SessionTerminationReport::from_result(result);
-            if let Err(control) = control_result {
+            if let Err(control) = control_result.as_ref() {
                 stop_for_control_failure(
                     authority,
                     &shutdown,
-                    &control,
+                    control,
                     "post-Session NotReady could not be reconciled",
                 );
-                return finish_post_commit(
+            } else {
+                shutdown.cancel();
+            }
+            let primary = unexpected_session_result(report.clone());
+            let primary = match control_result {
+                Ok(()) => primary,
+                Err(control) => combine_results(
+                    primary,
                     Err(control_teardown_error(control, report)),
-                    post_commit.shutdown_orderly().await,
-                );
-            }
-            let primary = report.into_result();
-            finish_post_commit(primary, post_commit.shutdown_orderly().await)
-        }
-        Exit::Signal(result) => {
-            // Preserve the serving runtime until the registry has durably
-            // stopped routing new commands to this generation. If the bounded
-            // transition is indeterminate, fence locally before joining.
-            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-            if let Err(control) = control_result.as_ref() {
-                stop_for_control_failure(
-                    authority,
-                    &shutdown,
-                    control,
-                    "signal shutdown NotReady could not be reconciled",
-                );
-            } else {
-                shutdown.cancel();
-            }
-            let report = SessionTerminationReport::from_result((&mut session_run).await);
-            let primary = signal_teardown_result(
-                result
-                    .err()
-                    .map(|error| format!("wait for shutdown signal: {error:#}")),
-                control_result,
-                report,
-            );
-            finish_post_commit(primary, post_commit.shutdown_orderly().await)
-        }
-        Exit::Dependency(result) => {
-            let failure = match result {
-                Ok(()) => anyhow!("authenticated runtime dependency became unavailable"),
-                Err(error) => error.context("authenticated runtime dependency monitor failed"),
-            };
-            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-            if let Err(control) = control_result.as_ref() {
-                stop_for_control_failure(
-                    authority,
-                    &shutdown,
-                    control,
-                    "dependency-failure NotReady could not be reconciled",
-                );
-            } else {
-                shutdown.cancel();
-            }
-            let report = SessionTerminationReport::from_result((&mut session_run).await);
-            let primary = Err(anyhow::Error::new(DependencyTeardownFailure {
-                dependency: failure.to_string(),
-                control_plane: control_result.err().map_or_else(
-                    || "acknowledged NotReady".to_owned(),
-                    |error| error.to_string(),
+                    "unexpected Session shutdown control-plane transition",
                 ),
-                session: report,
-            }));
-            finish_post_commit(primary, post_commit.shutdown_orderly().await)
-        }
-        Exit::PostCommit(result) => {
-            let failure = match result {
-                Ok(()) => "post-commit dispatcher stopped unexpectedly".to_owned(),
-                Err(error) => error.to_string(),
             };
-            let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+            finish_runtime(primary, post_commit, supervisor, false).await
+        }
+        Exit::Runtime(exit) => {
+            // Fail closed locally before waiting on control-plane I/O. Keep
+            // every owned task retained until the bounded NotReady transition
+            // completes or local generation fencing escalates.
+            let control_result =
+                publish_shutdown_not_ready_after_local_cancel(publisher, &shutdown).await;
             if let Err(control) = control_result.as_ref() {
                 stop_for_control_failure(
                     authority,
                     &shutdown,
                     control,
-                    "post-commit failure NotReady could not be reconciled",
+                    "required-runtime failure NotReady could not be reconciled",
                 );
-            } else {
-                shutdown.cancel();
             }
             let report = SessionTerminationReport::from_result((&mut session_run).await);
-            let primary = Err(anyhow::Error::new(PostCommitTeardownFailure {
-                dispatcher: failure,
-                control_plane: control_result.err().map_or_else(
-                    || "acknowledged NotReady".to_owned(),
-                    |error| error.to_string(),
-                ),
-                session: report,
-            }));
-            finish_post_commit(primary, post_commit.invalidate_and_join().await)
+            let (primary, emergency) = runtime_exit_result(exit, control_result, report);
+            finish_runtime(primary, post_commit, supervisor, emergency).await
         }
     }
 }
@@ -1605,6 +1718,7 @@ fn install_shutdown_signal() -> Result<BoxFuture<'static, Result<()>>> {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -1714,6 +1828,170 @@ mod tests {
                 "local control rejected shutdown publication"
             )))
         }
+    }
+
+    struct BlockingShutdownPublisher {
+        shutdown: CancellationToken,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LocalReadyPublisher for BlockingShutdownPublisher {
+        async fn publish_not_ready(&self) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_ready(
+            &self,
+            _proof: &crate::gateway::local_runtime::LocalReadyProof,
+        ) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    struct ReconciledShutdownPublisher {
+        attempts: AtomicUsize,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl LocalReadyPublisher for ReconciledShutdownPublisher {
+        async fn publish_not_ready(&self) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_ready(
+            &self,
+            _proof: &crate::gateway::local_runtime::LocalReadyProof,
+        ) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.order
+                    .lock()
+                    .unwrap()
+                    .push("shutdown_not_ready_indeterminate");
+                Err(LocalPublicationError::indeterminate(anyhow!(
+                    "shutdown NotReady committed but its ACK was lost"
+                )))
+            } else {
+                self.order
+                    .lock()
+                    .unwrap()
+                    .push("shutdown_not_ready_reconciled");
+                Ok(())
+            }
+        }
+    }
+
+    async fn assert_required_runtime_failure_reconciles_ready_then_not_ready(
+        exit: PreReadyRuntimeExit,
+        expected: &'static str,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (ready_started_tx, ready_started_rx) = tokio::sync::oneshot::channel();
+        let ready_started_tx = Arc::new(Mutex::new(Some(ready_started_tx)));
+        let interrupt = async move {
+            ready_started_rx
+                .await
+                .expect("first Ready publication starts");
+            exit
+        };
+        let shutdown = CancellationToken::new();
+
+        let outcome = publish_ready_reconciling(
+            {
+                let attempts = attempts.clone();
+                let order = order.clone();
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let order = order.clone();
+                    let ready_started_tx = ready_started_tx.clone();
+                    async move {
+                        if attempt == 0 {
+                            order
+                                .lock()
+                                .unwrap()
+                                .push("ready_same_identity_committed_ack_lost");
+                            ready_started_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("one Ready start signal")
+                                .send(())
+                                .expect("required-runtime observer remains");
+                            std::future::pending::<LocalPublicationResult<()>>().await
+                        } else {
+                            order.lock().unwrap().push("ready_same_identity_reconciled");
+                            Ok(())
+                        }
+                    }
+                }
+            },
+            interrupt,
+            &shutdown,
+        )
+        .await
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the retained Ready publication must reconcile: {:#}",
+                failure.control
+            )
+        });
+
+        let observed = match outcome {
+            ReadyReconciliationOutcome::InterruptedAfterReconciliation(observed) => observed,
+            ReadyReconciliationOutcome::InterruptedBeforePublication(_) => {
+                panic!("failure was injected after Ready began")
+            }
+            ReadyReconciliationOutcome::Published => {
+                panic!("required-runtime failure must prevent serving")
+            }
+        };
+        match (expected, observed) {
+            ("dependency", PreReadyRuntimeExit::Dependency(Err(error))) => {
+                assert!(error.to_string().contains("dependency"))
+            }
+            ("post-commit", PreReadyRuntimeExit::PostCommit(Err(error))) => {
+                assert!(error.to_string().contains("post-commit"))
+            }
+            (
+                "supervisor",
+                PreReadyRuntimeExit::Supervisor(Ok(SupervisorTermination::Failed(reason))),
+            ) => assert!(reason.contains("supervisor")),
+            (expected, _) => panic!("unexpected {expected} runtime exit shape"),
+        }
+        assert!(shutdown.is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let publisher = ReconciledShutdownPublisher {
+            attempts: AtomicUsize::new(0),
+            order: order.clone(),
+        };
+        publish_shutdown_not_ready_reconciling(&publisher)
+            .await
+            .expect("shutdown NotReady must reconcile after exact Ready");
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            [
+                "ready_same_identity_committed_ack_lost",
+                "ready_same_identity_reconciled",
+                "shutdown_not_ready_indeterminate",
+                "shutdown_not_ready_reconciled",
+            ]
+        );
     }
 
     #[test]
@@ -1936,11 +2214,6 @@ mod tests {
 
     #[tokio::test]
     async fn signal_during_lost_ready_ack_reconciles_before_shutdown() {
-        use std::sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-        };
-
         let attempts = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
         let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
@@ -1979,12 +2252,20 @@ mod tests {
                     }
                 }
             },
-            &mut signal,
+            signal.as_mut(),
             &shutdown,
         )
         .await
-        .expect("second attempt reconciles the retained Ready publication");
-        assert!(outcome.shutdown_requested);
+        .unwrap_or_else(|failure| {
+            panic!(
+                "second attempt must reconcile the retained Ready publication: {:#}",
+                failure.control
+            )
+        });
+        assert!(matches!(
+            outcome,
+            ReadyReconciliationOutcome::InterruptedAfterReconciliation(Ok(()))
+        ));
         assert!(shutdown.is_cancelled());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         order.lock().unwrap().push("shutdown_not_ready");
@@ -1995,6 +2276,92 @@ mod tests {
                 "ready_reconciled",
                 "shutdown_not_ready"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn required_runtime_failures_during_lost_ready_ack_reconcile_before_not_ready() {
+        assert_required_runtime_failure_reconciles_ready_then_not_ready(
+            PreReadyRuntimeExit::Dependency(Err(anyhow!("dependency failure"))),
+            "dependency",
+        )
+        .await;
+        assert_required_runtime_failure_reconciles_ready_then_not_ready(
+            PreReadyRuntimeExit::PostCommit(Err(anyhow!("post-commit failure"))),
+            "post-commit",
+        )
+        .await;
+        assert_required_runtime_failure_reconciles_ready_then_not_ready(
+            PreReadyRuntimeExit::Supervisor(Ok(SupervisorTermination::Failed(
+                "supervisor failure".to_owned(),
+            ))),
+            "supervisor",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn already_known_required_runtime_failure_never_initiates_ready() {
+        let attempts = AtomicUsize::new(0);
+        let shutdown = CancellationToken::new();
+        let outcome = publish_ready_reconciling(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            std::future::ready(PreReadyRuntimeExit::Supervisor(Ok(
+                SupervisorTermination::Completed,
+            ))),
+            &shutdown,
+        )
+        .await
+        .unwrap_or_else(|failure| {
+            panic!(
+                "known failure must stop before Ready: {:#}",
+                failure.control
+            )
+        });
+
+        assert!(matches!(
+            outcome,
+            ReadyReconciliationOutcome::InterruptedBeforePublication(
+                PreReadyRuntimeExit::Supervisor(Ok(SupervisorTermination::Completed))
+            )
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn local_runtime_is_cancelled_before_blocked_shutdown_not_ready_io() {
+        let shutdown = CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let publisher = Arc::new(BlockingShutdownPublisher {
+            shutdown: shutdown.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let publish = tokio::spawn({
+            let publisher = publisher.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                publish_shutdown_not_ready_after_local_cancel(publisher.as_ref(), &shutdown).await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("shutdown NotReady I/O must begin");
+        let cancelled_before_release = publisher.shutdown.is_cancelled() && shutdown.is_cancelled();
+        release.notify_one();
+        publish
+            .await
+            .expect("shutdown publication task must join")
+            .expect("shutdown NotReady publication must complete");
+        assert!(
+            cancelled_before_release,
+            "local cancellation must precede blocked control-plane I/O"
         );
     }
 
@@ -2032,18 +2399,20 @@ mod tests {
         let mut signal: BoxFuture<'static, Result<()>> =
             Box::pin(std::future::pending::<Result<()>>());
         let shutdown = CancellationToken::new();
-        let error = publish_ready_reconciling(
+        let failure = publish_ready_reconciling(
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(LocalPublicationError::indeterminate(anyhow!(
                     "local control unavailable"
                 )))
             },
-            &mut signal,
+            signal.as_mut(),
             &shutdown,
         )
         .await
-        .expect_err("reconciliation must escalate instead of serving forever");
+        .err()
+        .expect("reconciliation must escalate instead of serving forever");
+        let error = failure.control;
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             CONTROL_PLANE_RECONCILIATION_ATTEMPTS
@@ -2061,18 +2430,20 @@ mod tests {
         let mut signal: BoxFuture<'static, Result<()>> =
             Box::pin(std::future::pending::<Result<()>>());
         let shutdown = CancellationToken::new();
-        let error = publish_ready_reconciling(
+        let failure = publish_ready_reconciling(
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(LocalPublicationError::terminal(anyhow!(
                     "local control rejected Ready"
                 )))
             },
-            &mut signal,
+            signal.as_mut(),
             &shutdown,
         )
         .await
-        .expect_err("terminal rejection must fail immediately");
+        .err()
+        .expect("terminal rejection must fail immediately");
+        let error = failure.control;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(
             error
@@ -2149,6 +2520,23 @@ mod tests {
         assert!(rendered.contains("signal receiver failed"));
         assert!(rendered.contains("ownership=Lost"));
         assert!(rendered.contains("runtime shutdown"));
+    }
+
+    #[test]
+    fn clean_session_exit_without_a_selected_runtime_trigger_is_an_error() {
+        let report = SessionTerminationReport {
+            status: "completed",
+            ownership: SessionOwnershipReport::Recovered,
+            failure: None,
+        };
+        let error = unexpected_session_result(report)
+            .expect_err("unselected Session completion must never be clean bootstrap shutdown");
+        assert!(
+            error
+                .downcast_ref::<UnexpectedSessionTermination>()
+                .is_some()
+        );
+        assert!(error.to_string().contains("without a selected shutdown"));
     }
 
     #[test]
