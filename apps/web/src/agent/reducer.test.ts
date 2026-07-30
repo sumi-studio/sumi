@@ -9,7 +9,11 @@ import type {
   PublicMessage,
 } from "@sumi/api-client";
 import { projectConversation } from "./projection";
-import { createAgentSession, reduceEnvelope } from "./reducer";
+import {
+  commandDispositionKey,
+  createAgentSession,
+  reduceEnvelope,
+} from "./reducer";
 
 const id = () => "deterministic";
 
@@ -286,12 +290,39 @@ test("durable user messages materialize once under their server message id", () 
   assert.equal(session.conversation.entries[UserMessageId]?.kind, "user");
 });
 
+test("durable command disposition advances the cursor without entering conversation", () => {
+  let session = createAgentSession();
+  const envelope: BrowserEventEnvelope = {
+    seq: 30,
+    event: {
+      type: "command_disposition",
+      command_id: CommandId,
+      command_seq: 9,
+      status: "superseded",
+    },
+  };
+  session = apply(session, envelope);
+  const afterFirst = session;
+  session = apply(session, envelope);
+
+  assert.equal(session, afterFirst);
+  assert.equal(session.lastDurableSeq, 30);
+  assert.deepEqual(session.conversation.entryOrder, []);
+  assert.deepEqual(session.conversation.runOrder, []);
+  assert.deepEqual(
+    session.commandDispositions[commandDispositionKey(CommandId, 9)],
+    envelope.event,
+  );
+});
+
 function apply(
   session: ReturnType<typeof createAgentSession>,
   envelope: BrowserEventEnvelope,
 ) {
   return reduceEnvelope(session, envelope, { id }).session;
 }
+
+const CommandId = "00000000-0000-4000-8000-000000000001";
 
 function assistantMessage(text: string): PublicAssistantMessage {
   return {

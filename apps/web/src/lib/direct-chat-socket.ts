@@ -55,6 +55,13 @@ const RejectReasons = new Set([
   "idempotency_conflict",
   "unavailable",
 ]);
+const DurableCommandRejectReasons = new Set([
+  "unknown_command",
+  "schema_violation",
+  "attachments_not_empty",
+  "oversized",
+  "not_allowed",
+]);
 const UUIDPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DurableEventTypes = new Set([
@@ -71,6 +78,7 @@ const DurableEventTypes = new Set([
   "steered",
   "memory_maintenance",
   "retry_scheduled",
+  "command_disposition",
 ]);
 const VolatileEventTypes = new Set([
   "message_update",
@@ -689,6 +697,32 @@ function isSafeEventForUI(
       typeof value.error_message === "string"
     );
   }
+  if (value.type === "command_disposition") {
+    const commonShape =
+      isUUID(value.command_id) &&
+      isSafeSequence(value.command_seq) &&
+      (value.status === "applied" ||
+        value.status === "superseded" ||
+        value.status === "rejected");
+    if (!commonShape) return false;
+    if (value.status === "rejected") {
+      return (
+        hasRequiredAndOnlyKeys(
+          value,
+          ["type", "command_id", "command_seq", "status", "reject_reason"],
+          ["type", "command_id", "command_seq", "status", "reject_reason"],
+        ) &&
+        typeof value.reject_reason === "string" &&
+        DurableCommandRejectReasons.has(value.reject_reason)
+      );
+    }
+    return hasRequiredAndOnlyKeys(value, [
+      "type",
+      "command_id",
+      "command_seq",
+      "status",
+    ]);
+  }
   if (value.type === "error") {
     return (
       hasRequiredAndOnlyKeys(value, ["type", "message"]) &&
@@ -738,6 +772,7 @@ export function parseDirectChatServerFrame(
     value.type === "command_accepted" &&
     typeof value.idempotency_key === "string" &&
     value.idempotency_key.length > 0 &&
+    value.idempotency_key.length <= 1024 &&
     isUUID(value.command_id) &&
     isSafeSequence(value.seq) &&
     hasOnlyKeys(value, ["type", "idempotency_key", "command_id", "seq"])
@@ -750,11 +785,40 @@ export function parseDirectChatServerFrame(
     RejectReasons.has(value.reject_reason) &&
     hasOnlyKeys(value, ["type", "idempotency_key", "reject_reason"]) &&
     typeof value.idempotency_key === "string" &&
-    value.idempotency_key.length > 0
+    value.idempotency_key.length > 0 &&
+    value.idempotency_key.length <= 1024
   ) {
     return value as DirectChatRejectedFrame;
   }
   return undefined;
+}
+
+export function resolveDirectChatURL({
+  apiBaseURL,
+  authMode,
+  pageOrigin,
+}: {
+  apiBaseURL?: string;
+  authMode?: string;
+  pageOrigin?: string;
+}): URL {
+  if (!pageOrigin) throw new Error("direct chat page origin is unavailable");
+
+  const pageURL = new URL(pageOrigin);
+  const configuredBase = apiBaseURL?.trim();
+  const apiURL = configuredBase ? new URL(configuredBase, pageURL) : pageURL;
+  // Authentication cookies and the WebSocket upgrade are one same-origin
+  // browser contract. A cross-origin fixture is permitted only when the
+  // explicit preissued mode bypasses browser session authentication.
+  if (apiURL.origin !== pageURL.origin && authMode !== "preissued") {
+    throw new Error(
+      "cross-origin direct chat is unavailable outside preissued E2E mode",
+    );
+  }
+
+  const url = new URL("/direct-chat/ws", apiURL);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url;
 }
 
 // One screen owns one always-on browser socket. Its target and provenance are
@@ -786,10 +850,11 @@ export class DirectChatSocket {
     const env = (
       import.meta as ImportMeta & { env?: Record<string, string | undefined> }
     ).env;
-    const base = env?.VITE_API_BASE_URL ?? globalThis.location?.origin;
-    if (!base) throw new Error("direct chat API base URL is unavailable");
-    const url = new URL("/direct-chat/ws", base);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const url = resolveDirectChatURL({
+      apiBaseURL: env?.VITE_API_BASE_URL,
+      authMode: env?.VITE_SUMI_AUTH_MODE,
+      pageOrigin: globalThis.location?.origin,
+    });
     const socket = new WebSocket(url);
     this.socket = socket;
     socket.onopen = () => {

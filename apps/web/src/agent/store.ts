@@ -6,12 +6,18 @@ import {
   type DirectChatServerFrame,
   DirectChatSocket,
 } from "../lib/direct-chat-socket";
-import type { ConversationEntry, ConversationModel } from "./model";
+import type {
+  ConversationEntry,
+  ConversationModel,
+  RecoverableDraft,
+} from "./model";
+import { PrivateOutbox } from "./private-outbox";
 import {
   type AgentSession,
+  commandDispositionKey,
   createAgentSession,
-  patchEntry,
   reduceEnvelope,
+  removeEntry,
   upsertEntry,
 } from "./reducer";
 import { userMessageIdFromCommandId } from "./user-message-id";
@@ -35,21 +41,26 @@ export interface ConversationState {
   connection: DirectChatConnectionState;
   ready: DirectChatReadyState;
   lastError: string | null;
+  recoverableDrafts: RecoverableDraft[];
   connect: () => void;
   disconnect: () => void;
   sendMessage: (text: string) => boolean;
+  restoreDraft: (idempotencyKey: string) => string | undefined;
+  discardDraft: (idempotencyKey: string) => boolean;
   abort: () => boolean;
   decideApproval: (requestId: string, decision: ApprovalDecision) => boolean;
 }
 
 export interface ConversationStoreDependencies {
   transport: DirectChatTransport;
+  outbox?: PrivateOutbox;
   idempotencyKey?: () => string;
   reducerId?: () => string;
 }
 
 export function createConversationStore({
   transport,
+  outbox = new PrivateOutbox(),
   idempotencyKey = () => crypto.randomUUID(),
   reducerId = () => crypto.randomUUID(),
 }: ConversationStoreDependencies) {
@@ -68,7 +79,82 @@ export function createConversationStore({
         connection,
         ready,
         lastError: lastError === undefined ? state.lastError : lastError,
+        recoverableDrafts: outbox.recoverableDrafts(),
       }));
+    };
+
+    const removeOptimistic = (idempotencyKey: string) => {
+      const optimistic = findOptimistic(session.conversation, idempotencyKey);
+      if (!optimistic) return;
+      session = {
+        ...session,
+        conversation: removeEntry(session.conversation, optimistic.id),
+      };
+    };
+
+    const ensureOptimistic = (
+      entry: { idempotencyKey: string; text: string },
+      delivery: "pending" | "admitted",
+    ) => {
+      const optimistic = findOptimistic(
+        session.conversation,
+        entry.idempotencyKey,
+      );
+      const next: ConversationEntry = {
+        kind: "user",
+        id: optimistic?.id ?? `optimistic:${entry.idempotencyKey}`,
+        text: entry.text,
+        attachments: [],
+        timestamp: null,
+        delivery,
+        idempotencyKey: entry.idempotencyKey,
+      };
+      session = {
+        ...session,
+        conversation: upsertEntry(session.conversation, next),
+      };
+    };
+
+    const applyDisposition = (
+      disposition: Extract<
+        BrowserEventEnvelope["event"],
+        { type: "command_disposition" }
+      >,
+    ) => {
+      const entry = outbox.findByCommand(
+        disposition.command_id,
+        disposition.command_seq,
+      );
+      if (!entry) return;
+      if (disposition.status === "applied") {
+        const canonicalMessageId = userMessageIdFromCommandId(
+          disposition.command_id,
+        );
+        if (isCanonicalUserMessage(session.conversation, canonicalMessageId)) {
+          outbox.removeByIdempotencyKey(entry.idempotencyKey);
+          removeOptimistic(entry.idempotencyKey);
+        } else {
+          ensureOptimistic(entry, "admitted");
+        }
+        return;
+      }
+      outbox.recoverByCommand(
+        disposition.command_id,
+        disposition.command_seq,
+        disposition.status === "superseded"
+          ? "superseded"
+          : (disposition.reject_reason ?? "rejected"),
+      );
+      removeOptimistic(entry.idempotencyKey);
+    };
+
+    const reconcileCanonicalMessage = (messageId: string) => {
+      for (const entry of outbox.entries()) {
+        if (entry.state !== "admitted") continue;
+        if (userMessageIdFromCommandId(entry.commandId) !== messageId) continue;
+        outbox.removeByIdempotencyKey(entry.idempotencyKey);
+        removeOptimistic(entry.idempotencyKey);
+      }
     };
 
     transport.onConnection((next) => {
@@ -84,30 +170,59 @@ export function createConversationStore({
         // DirectChatSocket has already structurally validated the generated
         // browser contract before exposing this frame.
         const envelope = frame.envelope as unknown as BrowserEventEnvelope;
-        session = reduceEnvelope(session, envelope, {
+        const reduced = reduceEnvelope(session, envelope, {
           id: reducerId,
-        }).session;
+        });
+        session = reduced.session;
+        if (reduced.kind === "applied") {
+          if (envelope.event.type === "command_disposition") {
+            applyDisposition(envelope.event);
+          } else if (
+            (envelope.event.type === "message_start" ||
+              envelope.event.type === "message_end") &&
+            envelope.event.message.role === "user"
+          ) {
+            reconcileCanonicalMessage(envelope.event.message_id);
+          }
+        }
         publish(
           envelope.event.type === "error" ? envelope.event.message : undefined,
         );
         return;
       }
       if (frame.type === "command_accepted") {
-        const optimistic = findOptimistic(
-          session.conversation,
-          frame.idempotency_key,
-        );
-        if (!optimistic) return;
         try {
-          const durableId = userMessageIdFromCommandId(frame.command_id);
-          session = {
-            ...session,
-            conversation: acceptOptimistic(
-              session.conversation,
-              optimistic.id,
-              durableId,
-            ),
-          };
+          const canonicalMessageId = userMessageIdFromCommandId(
+            frame.command_id,
+          );
+          const admitted = outbox.admit(
+            frame.idempotency_key,
+            frame.command_id,
+            frame.seq,
+          );
+          if (admitted.kind === "missing") return;
+          if (admitted.kind === "already_recoverable") return;
+          if (admitted.kind === "conflict") {
+            publish("Command admission could not be reconciled");
+            return;
+          }
+          if (
+            isCanonicalUserMessage(session.conversation, canonicalMessageId)
+          ) {
+            outbox.removeByIdempotencyKey(frame.idempotency_key);
+            removeOptimistic(frame.idempotency_key);
+            publish(null);
+            return;
+          }
+          const disposition =
+            session.commandDispositions[
+              commandDispositionKey(frame.command_id, frame.seq)
+            ];
+          if (disposition) {
+            applyDisposition(disposition);
+          } else {
+            ensureOptimistic(admitted.entry, "admitted");
+          }
           publish(null);
         } catch (error) {
           publish(
@@ -119,27 +234,11 @@ export function createConversationStore({
         return;
       }
       if (frame.type === "command_rejected") {
-        const optimistic = findOptimistic(
-          session.conversation,
+        outbox.recoverByIdempotencyKey(
           frame.idempotency_key,
+          frame.reject_reason,
         );
-        if (optimistic) {
-          session = {
-            ...session,
-            conversation: patchEntry(
-              session.conversation,
-              optimistic.id,
-              (entry) =>
-                entry.kind === "user" && entry.delivery !== "durable"
-                  ? {
-                      ...entry,
-                      delivery: "rejected",
-                      rejectReason: frame.reject_reason,
-                    }
-                  : entry,
-            ),
-          };
-        }
+        removeOptimistic(frame.idempotency_key);
         publish(`Command rejected: ${frame.reject_reason}`);
       }
     });
@@ -152,6 +251,7 @@ export function createConversationStore({
       connection,
       ready,
       lastError: null,
+      recoverableDrafts: outbox.recoverableDrafts(),
       connect() {
         if (started) return;
         started = true;
@@ -159,6 +259,25 @@ export function createConversationStore({
         ready = "unknown";
         publish(null);
         transport.connect();
+        let resumeFailed = false;
+        for (const entry of outbox.entries()) {
+          if (entry.state !== "pending") continue;
+          const sent = transport.sendCommand(
+            {
+              type: "user_message",
+              text: entry.text,
+              attachments: [],
+            },
+            entry.idempotencyKey,
+          );
+          if (sent) continue;
+          outbox.recoverByIdempotencyKey(
+            entry.idempotencyKey,
+            "client_validation",
+          );
+          resumeFailed = true;
+        }
+        if (resumeFailed) publish("Message could not be requeued");
       },
       disconnect() {
         if (!started) return;
@@ -179,43 +298,34 @@ export function createConversationStore({
           return false;
         }
         const key = idempotencyKey();
-        const optimistic: ConversationEntry = {
-          kind: "user",
-          id: `optimistic:${key}`,
-          text: normalized,
-          attachments: [],
-          timestamp: null,
-          delivery: "pending",
-          idempotencyKey: key,
-        };
-        session = {
-          ...session,
-          conversation: upsertEntry(session.conversation, optimistic),
-        };
+        if (!outbox.putPending(key, normalized)) {
+          publish("Message could not be saved for recovery");
+          return false;
+        }
+        ensureOptimistic({ idempotencyKey: key, text: normalized }, "pending");
         publish(null);
         const sent = transport.sendCommand(
           { type: "user_message", text: normalized, attachments: [] },
           key,
         );
         if (!sent) {
-          session = {
-            ...session,
-            conversation: patchEntry(
-              session.conversation,
-              optimistic.id,
-              (entry) =>
-                entry.kind === "user"
-                  ? {
-                      ...entry,
-                      delivery: "rejected",
-                      rejectReason: "client_validation",
-                    }
-                  : entry,
-            ),
-          };
+          outbox.recoverByIdempotencyKey(key, "client_validation");
+          removeOptimistic(key);
           publish("Message could not be queued");
         }
         return sent;
+      },
+      restoreDraft(idempotencyKey) {
+        const text = outbox.consumeRecoverable(idempotencyKey);
+        if (text !== undefined) publish(null);
+        return text;
+      },
+      discardDraft(idempotencyKey) {
+        const entry = outbox.findByIdempotencyKey(idempotencyKey);
+        if (entry?.state !== "recoverable") return false;
+        const removed = outbox.removeByIdempotencyKey(idempotencyKey);
+        if (removed) publish();
+        return removed;
       },
       abort() {
         if (
@@ -266,32 +376,11 @@ function findOptimistic(
   );
 }
 
-function acceptOptimistic(
+function isCanonicalUserMessage(
   model: ConversationModel,
-  optimisticId: string,
-  durableId: string,
-): ConversationModel {
-  const optimistic = model.entries[optimisticId];
-  if (optimistic?.kind !== "user" || optimistic.delivery === "durable") {
-    return model;
-  }
-  const existing = model.entries[durableId];
-  const entries = { ...model.entries };
-  delete entries[optimisticId];
-  if (!existing) {
-    entries[durableId] = {
-      ...optimistic,
-      id: durableId,
-      delivery: "accepted",
-    };
-  }
-  return {
-    ...model,
-    entryOrder: model.entryOrder.flatMap((id) =>
-      id !== optimisticId ? [id] : existing ? [] : [durableId],
-    ),
-    entries,
-  };
+  messageId: string,
+): boolean {
+  return model.entries[messageId]?.kind === "user";
 }
 
 export const useConversation = createConversationStore({

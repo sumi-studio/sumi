@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   BrowserEventEnvelope,
+  CommandDispositionEvent,
   PublicAssistantMessage,
   PublicMessage,
   PublicStreamEvent,
@@ -33,6 +34,11 @@ export interface AgentSession {
   toolRunIds: Record<string, string>;
   approvalRunIds: Record<string, string>;
   messageStreams: Record<string, MessageStream>;
+  /**
+   * Durable command terminal metadata used to reconcile private browser
+   * outbox rows. It is intentionally outside ConversationModel.
+   */
+  commandDispositions: Record<string, CommandDispositionEvent>;
 }
 
 export interface ReducerContext {
@@ -57,6 +63,7 @@ export function createAgentSession(
     toolRunIds: {},
     approvalRunIds: {},
     messageStreams: {},
+    commandDispositions: {},
   };
 }
 
@@ -196,6 +203,15 @@ export function reduceEnvelope(
       }
       break;
     }
+    case "command_disposition":
+      session = {
+        ...session,
+        commandDispositions: {
+          ...session.commandDispositions,
+          [commandDispositionKey(event.command_id, event.command_seq)]: event,
+        },
+      };
+      break;
     case "turn_start":
     case "turn_end":
     case "memory_maintenance":
@@ -203,6 +219,13 @@ export function reduceEnvelope(
   }
 
   return { kind: "applied", session };
+}
+
+export function commandDispositionKey(
+  commandId: string,
+  commandSeq: number,
+): string {
+  return `${commandId}:${commandSeq}`;
 }
 
 function applyMessage(

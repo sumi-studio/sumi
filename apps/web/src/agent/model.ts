@@ -50,7 +50,18 @@ export interface AgentRun {
   trace: AgentTraceEvent[];
 }
 
-export type UserDelivery = "pending" | "accepted" | "rejected" | "durable";
+export type UserDelivery = "pending" | "admitted" | "rejected" | "durable";
+
+/**
+ * Private, recoverable composer input. This is local browser state and never a
+ * canonical conversation entry.
+ */
+export interface RecoverableDraft {
+  idempotencyKey: string;
+  text: string;
+  reason: string;
+  commandId?: string;
+}
 
 export type ConversationEntry =
   | {

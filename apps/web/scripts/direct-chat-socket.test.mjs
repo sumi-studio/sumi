@@ -180,6 +180,87 @@ test("rejects legacy target-bearing and malformed server frames", () => {
   }
   assert.equal(parseDirectChatServerFrame(accepted("k"), 0)?.type, "command_accepted");
   assert.equal(parseDirectChatServerFrame({ type: "direct_chat_status", ready: true }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame({ ...accepted("x".repeat(1025)) }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame({
+    type: "command_rejected",
+    idempotency_key: "x".repeat(1025),
+    reject_reason: "unavailable",
+  }, 0), undefined);
+});
+
+test("accepts only exact durable command disposition shapes", () => {
+  const command_id = "00000000-0000-4000-8000-000000000001";
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 7, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "superseded" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "rejected",
+      reject_reason: "not_allowed",
+    },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(event(1, disposition), 0)?.type, "event");
+  }
+
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 7, status: "rejected" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "applied",
+      reject_reason: "not_allowed",
+    },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "rejected",
+      reject_reason: "idempotency_conflict",
+    },
+    { type: "command_disposition", command_id, command_seq: -1, status: "applied" },
+    { type: "command_disposition", command_id: "not-a-uuid", command_seq: 7, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "received" },
+    { type: "command_disposition", command_id, command_seq: 7, status: "applied", extra: true },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(event(1, disposition), 0), undefined);
+  }
+  assert.equal(parseDirectChatServerFrame({
+    type: "event",
+    envelope: {
+      event: { type: "command_disposition", command_id, command_seq: 7, status: "applied" },
+    },
+  }, 0), undefined);
+  assert.equal(parseDirectChatServerFrame(event(2, {
+    type: "command_disposition",
+    command_id,
+    command_seq: 7,
+    status: "applied",
+  }), 0), undefined);
+});
+
+test("durable disposition advances the socket replay cursor", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive(event(1, {
+    type: "command_disposition",
+    command_id: "00000000-0000-4000-8000-000000000001",
+    command_seq: 1,
+    status: "applied",
+  }));
+  first.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 1 },
+  ]);
+  socket.close();
 });
 
 test("rejects identity aliases and provenance only when they are structural fields", () => {
