@@ -2173,12 +2173,31 @@ impl<G: Gateway + 'static> Session<G> {
             approval.cancel_all();
         }
         let deadline = tokio::time::Instant::now() + RUNTIME_SHUTDOWN_GRACE;
+        match tokio::time::timeout_at(deadline, self.settle_active_shutdown()).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The grace period is absolute: it includes Store commits,
+                // worker settlement, output draining, and every other await in
+                // the graceful path. Cancellation of any of those operations
+                // makes the durable/worker boundary indeterminate, so abort
+                // the retained worker and report ownership loss.
+                if let Some(active) = self.active.as_mut() {
+                    active.join.abort();
+                }
+                self.active.take();
+                self.core.take();
+                self.durable_core_invalidated = true;
+                Err(SessionFailure::RuntimeShutdownOwnershipLost)
+            }
+        }
+    }
+
+    async fn settle_active_shutdown(&mut self) -> Result<(), SessionFailure> {
         let mut events_open = true;
         loop {
             enum ShutdownSelected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Event(Option<RunOutput>),
-                Deadline,
             }
             let selected = {
                 let active = self.active.as_mut().expect("active run checked above");
@@ -2190,7 +2209,6 @@ impl<G: Gateway + 'static> Session<G> {
                     event = active.events_rx.recv(), if events_open => {
                         ShutdownSelected::Event(event)
                     }
-                    _ = tokio::time::sleep_until(deadline) => ShutdownSelected::Deadline,
                 }
             };
             match selected {
@@ -2212,16 +2230,6 @@ impl<G: Gateway + 'static> Session<G> {
                     // Disable the now-always-ready branch so the bounded
                     // deadline remains observable.
                     events_open = false;
-                }
-                ShutdownSelected::Deadline => {
-                    {
-                        let active = self.active.as_mut().expect("active run checked above");
-                        active.join.abort();
-                        let _ = (&mut active.join).await;
-                    }
-                    self.active.take();
-                    self.durable_core_invalidated = true;
-                    return Err(SessionFailure::RuntimeShutdownOwnershipLost);
                 }
             }
         }

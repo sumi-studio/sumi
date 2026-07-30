@@ -37,7 +37,8 @@ use crate::{
         local_runtime::{
             FIRST_BROWSER_VERTICAL_COMPONENTS, LocalControlCredential, LocalControlHttpClient,
             LocalControlReadyPublisher as LocalRuntimePublisher, LocalCredentialProvider,
-            LocalReadyPublisher, LocalRuntimeComponent, first_browser_vertical_ready_gate,
+            LocalPublicationError, LocalPublicationResult, LocalReadyPublisher,
+            LocalRuntimeComponent, first_browser_vertical_ready_gate,
         },
         supervisor::{
             ConnectionSupervisor, DeliveryAuthorization, SupervisorConfig, seams::T17StoreAdapter,
@@ -382,6 +383,23 @@ struct ReadyPublicationOutcome {
     signal_failure: Option<String>,
 }
 
+enum PreReadyWait<T> {
+    Completed(T),
+    Signal(Result<()>),
+}
+
+async fn wait_pre_ready_or_signal<T>(
+    operation: impl std::future::Future<Output = T>,
+    signal: &mut BoxFuture<'static, Result<()>>,
+) -> PreReadyWait<T> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        observed = signal.as_mut() => PreReadyWait::Signal(observed),
+        completed = &mut operation => PreReadyWait::Completed(completed),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionOwnershipReport {
     Recovered,
@@ -458,6 +476,24 @@ struct IndeterminateControlPlaneStateEscalation {
     session: SessionTerminationReport,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("terminal control-plane publication failure: {control}; {session}")]
+struct TerminalControlPlaneStateEscalation {
+    #[source]
+    control: anyhow::Error,
+    session: SessionTerminationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "shutdown signal monitor failed: {signal}; shutdown control-plane result: {control_plane}; {session}"
+)]
+struct SignalTeardownFailure {
+    signal: String,
+    control_plane: String,
+    session: SessionTerminationReport,
+}
+
 /// Validate a UDS parent with the same trust properties as executor-owned IPC:
 /// normalized absolute path, no symlinked directory component, current-uid
 /// ownership, owner write/execute, and no group/other write access.
@@ -530,6 +566,38 @@ fn fence_generation_locally(
     shutdown.cancel();
 }
 
+fn control_failure_is_indeterminate(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<IndeterminateControlPlaneState>()
+        .is_some()
+}
+
+fn stop_for_control_failure(
+    authority: &RuntimeEpochAuthority,
+    shutdown: &CancellationToken,
+    error: &anyhow::Error,
+    indeterminate_reason: &'static str,
+) {
+    if control_failure_is_indeterminate(error) {
+        fence_generation_locally(authority, shutdown, indeterminate_reason);
+    } else {
+        // A terminal preflight/auth/validation/rejection result is known, so
+        // stop admission without pretending its outcome needs reconciliation.
+        shutdown.cancel();
+    }
+}
+
+fn control_teardown_error(
+    control: anyhow::Error,
+    session: SessionTerminationReport,
+) -> anyhow::Error {
+    if control_failure_is_indeterminate(&control) {
+        anyhow::Error::new(IndeterminateControlPlaneStateEscalation { control, session })
+    } else {
+        anyhow::Error::new(TerminalControlPlaneStateEscalation { control, session })
+    }
+}
+
 pub(crate) async fn run_production() -> Result<()> {
     disable_process_dumping()?;
     load_explicit_env_file()?;
@@ -600,162 +668,174 @@ async fn run_after_not_ready(
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
-    validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
-    validate_trusted_ipc_socket_parent(&context.artifact_broker_socket, "artifact broker")?;
-    let config = Config::load().await.context("load production config")?;
-    if config.personality_agent_id != *context.authority.personality_agent_id() {
-        bail!("config PAID does not match the supervisor runtime allocation");
-    }
-    if config.database_path != context.state_dir.join("agent.db") {
-        bail!("config state directory does not match SUMI_STATE_DIR");
-    }
-    let model_spec = config.model_spec().context("resolve production provider")?;
-    validate_production_provider_endpoint(&model_spec.base_url)?;
-    validate_provider_credential(&model_spec.api_key_env)?;
-
-    let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
-        "SUMI_AGENT_WRAPPING_KEY",
-        &context.wrapping_key_id,
-    )?);
-    let store = Store::open(
-        &config.database_path,
-        AgentScope::new(context.authority.personality_agent_id().clone()),
-        key_provider,
-    )
-    .await
-    .context("open authenticated Store")?;
-    let hydrated = hydrate_to_fixed_point(
-        &store,
-        &context.authority,
-        &LogicalRecoveryExecutorUnavailable,
-    )
-    .await?;
-
-    let approval = Arc::new(ApprovalBroker::new(
-        Policy::new(&config.workspace),
-        SecretAwareActionProjector::new(
-            Redactor::v1(),
-            SecretDigestKey::new(context.approval_secret_digest_key),
-        ),
-        None,
-        crate::approval::ReviewerMode::User,
-        false,
-        TrustedEnvironment {
-            workspace_root: config.workspace.to_string_lossy().into_owned(),
-            sandbox: SandboxSummary::workspace(),
-            denied_paths: Vec::new(),
-            denied_network_domains: Vec::new(),
-            repo_visibility: None,
-            git_status: None,
-        },
-    ));
-
-    let executor_client = Arc::new(ExecutorClient::new(
-        &context.executor_socket,
-        context.authority.rpc_identity().clone(),
-    ));
-    wait_for_authenticated_executor_ready(
-        &executor_client,
-        &context.authority,
-        &ExecutorHealthApiUnavailable,
-    )
-    .await?;
-    let artifact_broker = artifact_broker_client(context);
-    let registry = remote_executor_registry(executor_client.clone())
-        .context("build exact remote executor registry")?;
-    let prompt = PromptContext {
-        system_prompt: config.system_prompt.clone(),
-        memory_blocks: Vec::new(),
-        messages: Vec::new(),
-        provider_context: Vec::new(),
-        tools: registry.definitions(),
-        replay_provenance: None,
-    };
-    let driver = InjectedRunDriver::new(
-        model_spec,
-        RequestOptions::default(),
-        Some(prompt),
-        Some(registry),
-        Some(WorkspacePaths::new(config.workspace.clone())?),
-        Some(context.authority.generation()),
-    )
-    .context("compose real provider RunDriver")?
-    .with_broker(artifact_broker)
-    .with_hydrated_memory(
-        Arc::new(store.clone()),
-        context.authority.lease(),
-        context.authority.fence(),
-        &hydrated,
-    )
-    .context("install authenticated memory/provider context")?;
-    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
-    let dependency_monitor =
-        authenticated_dependency_monitor(executor_client, artifact_broker_client(context))?;
-
-    let command_digest_factory = store.command_digest_factory().await?;
-    let connector = if context.allow_insecure_loopback_gateway {
-        tracing::warn!(
-            mode = "production-like-local-loopback",
-            "plaintext WebSocket gateway mode is explicitly enabled"
-        );
-        WebSocketConnector::new_loopback_insecure(&context.gateway_url, command_digest_factory)?
-    } else {
-        let connector = WebSocketConnector::new(&context.gateway_url, command_digest_factory);
-        connector.validate_configuration()?;
-        connector
-    };
-
-    let (hydration_tx, hydration_rx) = watch::channel(None);
-    let (ready_controller, ready_latch) =
-        first_browser_vertical_ready_gate(context.authority.clone(), hydration_rx);
-    // This is the sole Store/post-commit dispatcher seam. Bootstrap does not
-    // synthesize an in-process fallback while the coordinated dispatcher fix
-    // is integrated; the supervisor must receive the real adapter.
-    let store_adapter = T17StoreAdapter::new(Arc::new(store.clone()));
-    let credentials = LocalCredentialProvider::new(
-        context.authority.clone(),
-        DeliveryAuthorization::Raw,
-        control,
-    );
-    let supervisor = ConnectionSupervisor::new(
-        connector,
-        credentials,
-        store_adapter,
-        ready_latch.clone(),
-        supervisor_config(&context.authority),
-    );
-
-    for component in FIRST_BROWSER_VERTICAL_COMPONENTS {
-        if component != LocalRuntimeComponent::Session {
-            ready_controller.mark_ready(context.authority.rpc_identity(), component)?;
-        }
-    }
-    let supervisor_handle = supervisor.start();
-    let mut supervisor_online = supervisor_handle.online.clone();
-    let gateway = SessionGateway::from(supervisor_handle);
-    let (core, start_authority) =
-        SessionStartAuthority::from_hydrated(context.authority.clone(), &hydrated, approval)
-            .context("bind required ApprovalBroker before Session")?;
-    let session = Session::start_hydrated(store, gateway, core, worker, start_authority)
-        .await
-        .context("start exact hydrated Session")?;
-    ready_controller.mark_ready(
-        context.authority.rpc_identity(),
-        LocalRuntimeComponent::Session,
-    )?;
-    hydration_tx.send_replace(Some(hydrated.receipt.clone()));
-    let ready_proof = ready_latch
-        .wait_for_proof(context.authority.generation())
-        .await
-        .context("wait for exact local runtime Ready proof")?;
-    wait_for_supervisor_online(&mut supervisor_online)
-        .await
-        .context("wait for authenticated Gateway catch-up")?;
-    // Unix handlers are synchronously installed here, and the future is
-    // polled inside the very first Ready attempt. A signal cannot slip through
-    // the Ready transition before bootstrap owns the shutdown path.
+    // Own and poll the process signal before any Session construction,
+    // supervisor catch-up, or other pre-Ready await can begin.
     let mut signal = install_shutdown_signal().context("install shutdown signal handlers")?;
     let shutdown = CancellationToken::new();
+    let pre_ready = async {
+        validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
+        validate_trusted_ipc_socket_parent(&context.artifact_broker_socket, "artifact broker")?;
+        let config = Config::load().await.context("load production config")?;
+        if config.personality_agent_id != *context.authority.personality_agent_id() {
+            bail!("config PAID does not match the supervisor runtime allocation");
+        }
+        if config.database_path != context.state_dir.join("agent.db") {
+            bail!("config state directory does not match SUMI_STATE_DIR");
+        }
+        let model_spec = config.model_spec().context("resolve production provider")?;
+        validate_production_provider_endpoint(&model_spec.base_url)?;
+        validate_provider_credential(&model_spec.api_key_env)?;
+
+        let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
+            "SUMI_AGENT_WRAPPING_KEY",
+            &context.wrapping_key_id,
+        )?);
+        let store = Store::open(
+            &config.database_path,
+            AgentScope::new(context.authority.personality_agent_id().clone()),
+            key_provider,
+        )
+        .await
+        .context("open authenticated Store")?;
+        let hydrated = hydrate_to_fixed_point(
+            &store,
+            &context.authority,
+            &LogicalRecoveryExecutorUnavailable,
+        )
+        .await?;
+
+        let approval = Arc::new(ApprovalBroker::new(
+            Policy::new(&config.workspace),
+            SecretAwareActionProjector::new(
+                Redactor::v1(),
+                SecretDigestKey::new(context.approval_secret_digest_key),
+            ),
+            None,
+            crate::approval::ReviewerMode::User,
+            false,
+            TrustedEnvironment {
+                workspace_root: config.workspace.to_string_lossy().into_owned(),
+                sandbox: SandboxSummary::workspace(),
+                denied_paths: Vec::new(),
+                denied_network_domains: Vec::new(),
+                repo_visibility: None,
+                git_status: None,
+            },
+        ));
+
+        let executor_client = Arc::new(ExecutorClient::new(
+            &context.executor_socket,
+            context.authority.rpc_identity().clone(),
+        ));
+        wait_for_authenticated_executor_ready(
+            &executor_client,
+            &context.authority,
+            &ExecutorHealthApiUnavailable,
+        )
+        .await?;
+        let artifact_broker = artifact_broker_client(context);
+        let registry = remote_executor_registry(executor_client.clone())
+            .context("build exact remote executor registry")?;
+        let prompt = PromptContext {
+            system_prompt: config.system_prompt.clone(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+            replay_provenance: None,
+        };
+        let driver = InjectedRunDriver::new(
+            model_spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new(config.workspace.clone())?),
+            Some(context.authority.generation()),
+        )
+        .context("compose real provider RunDriver")?
+        .with_broker(artifact_broker)
+        .with_hydrated_memory(
+            Arc::new(store.clone()),
+            context.authority.lease(),
+            context.authority.fence(),
+            &hydrated,
+        )
+        .context("install authenticated memory/provider context")?;
+        let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
+        let dependency_monitor =
+            authenticated_dependency_monitor(executor_client, artifact_broker_client(context))?;
+
+        let command_digest_factory = store.command_digest_factory().await?;
+        let connector = if context.allow_insecure_loopback_gateway {
+            tracing::warn!(
+                mode = "production-like-local-loopback",
+                "plaintext WebSocket gateway mode is explicitly enabled"
+            );
+            WebSocketConnector::new_loopback_insecure(&context.gateway_url, command_digest_factory)?
+        } else {
+            let connector = WebSocketConnector::new(&context.gateway_url, command_digest_factory);
+            connector.validate_configuration()?;
+            connector
+        };
+
+        let (hydration_tx, hydration_rx) = watch::channel(None);
+        let (ready_controller, ready_latch) =
+            first_browser_vertical_ready_gate(context.authority.clone(), hydration_rx);
+        // This is the sole Store/post-commit dispatcher seam. Bootstrap does not
+        // synthesize an in-process fallback while the coordinated dispatcher fix
+        // is integrated; the supervisor must receive the real adapter.
+        let store_adapter = T17StoreAdapter::new(Arc::new(store.clone()));
+        let credentials = LocalCredentialProvider::new(
+            context.authority.clone(),
+            DeliveryAuthorization::Raw,
+            control,
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            credentials,
+            store_adapter,
+            ready_latch.clone(),
+            supervisor_config(&context.authority),
+        );
+
+        for component in FIRST_BROWSER_VERTICAL_COMPONENTS {
+            if component != LocalRuntimeComponent::Session {
+                ready_controller.mark_ready(context.authority.rpc_identity(), component)?;
+            }
+        }
+        let supervisor_handle = supervisor.start();
+        let mut supervisor_online = supervisor_handle.online.clone();
+        let gateway = SessionGateway::from(supervisor_handle);
+        let (core, start_authority) =
+            SessionStartAuthority::from_hydrated(context.authority.clone(), &hydrated, approval)
+                .context("bind required ApprovalBroker before Session")?;
+        let session = Session::start_hydrated(store, gateway, core, worker, start_authority)
+            .await
+            .context("start exact hydrated Session")?;
+        ready_controller.mark_ready(
+            context.authority.rpc_identity(),
+            LocalRuntimeComponent::Session,
+        )?;
+        hydration_tx.send_replace(Some(hydrated.receipt.clone()));
+        let ready_proof = ready_latch
+            .wait_for_proof(context.authority.generation())
+            .await
+            .context("wait for exact local runtime Ready proof")?;
+        wait_for_supervisor_online(&mut supervisor_online)
+            .await
+            .context("wait for authenticated Gateway catch-up")?;
+        Ok::<_, anyhow::Error>((session, ready_proof, dependency_monitor))
+    };
+    let (session, ready_proof, dependency_monitor) =
+        match wait_pre_ready_or_signal(pre_ready, &mut signal).await {
+            PreReadyWait::Completed(result) => result?,
+            PreReadyWait::Signal(result) => {
+                shutdown.cancel();
+                let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
+                return pre_ready_signal_result(result, control_result);
+            }
+        };
+
     let ready_outcome = match publish_ready_reconciling(
         || publisher.publish_ready(&ready_proof),
         &mut signal,
@@ -765,20 +845,15 @@ async fn run_after_not_ready(
     {
         Ok(outcome) => outcome,
         Err(control) => {
-            fence_generation_locally(
+            stop_for_control_failure(
                 &context.authority,
                 &shutdown,
+                &control,
                 "Ready could not be reconciled",
             );
             let report =
                 SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-            return Err(anyhow::Error::new(
-                IndeterminateControlPlaneStateEscalation {
-                    control,
-                    session: report,
-                },
-            ))
-            .context("publish exact Ready");
+            return Err(control_teardown_error(control, report)).context("publish exact Ready");
         }
     };
 
@@ -787,10 +862,11 @@ async fn run_after_not_ready(
         // publisher has now reconciled that exact pending publication. Only
         // then is the subsequent shutdown NotReady transition legal.
         let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-        if control_result.is_err() {
-            fence_generation_locally(
+        if let Err(control) = control_result.as_ref() {
+            stop_for_control_failure(
                 &context.authority,
                 &shutdown,
+                control,
                 "shutdown NotReady could not be reconciled",
             );
         } else {
@@ -798,20 +874,7 @@ async fn run_after_not_ready(
         }
         let report =
             SessionTerminationReport::from_result(session.run_until_cancelled(shutdown).await);
-        if let Err(control) = control_result {
-            return Err(anyhow::Error::new(
-                IndeterminateControlPlaneStateEscalation {
-                    control,
-                    session: report,
-                },
-            ));
-        }
-        if let Some(signal_failure) = ready_outcome.signal_failure {
-            return Err(anyhow!(
-                "shutdown signal monitor failed during Ready reconciliation: {signal_failure}; {report}"
-            ));
-        }
-        return report.into_result();
+        return signal_teardown_result(ready_outcome.signal_failure, control_result, report);
     }
 
     supervise_ready_session(
@@ -832,7 +895,7 @@ async fn publish_ready_reconciling<'a, Publish, Published>(
 ) -> Result<ReadyPublicationOutcome>
 where
     Publish: FnMut() -> Published,
-    Published: std::future::Future<Output = Result<()>> + 'a,
+    Published: std::future::Future<Output = LocalPublicationResult<()>> + 'a,
 {
     let mut shutdown_requested = false;
     let mut signal_failure = None;
@@ -849,9 +912,9 @@ where
                     if let Err(error) = observed {
                         signal_failure = Some(error.to_string());
                     }
-                    Err(anyhow!(
+                    Err(LocalPublicationError::indeterminate(anyhow!(
                         "shutdown was observed while Ready publication was in flight"
-                    ))
+                    )))
                 }
             }
         };
@@ -862,7 +925,7 @@ where
                     signal_failure,
                 });
             }
-            Err(error) => {
+            Err(error) if error.is_indeterminate() => {
                 tracing::warn!(
                     attempt,
                     max_attempts = CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
@@ -872,7 +935,11 @@ where
                 // LocalControlReadyPublisher retains its pending publication,
                 // including publication_id and expected_revision, until an
                 // exact ACK is validated. Never construct a replacement here.
-                last_error = Some(error);
+                last_error = Some(anyhow::Error::new(error));
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context("Ready publication failed terminal validation or was rejected"));
             }
         }
         if attempt < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
@@ -907,14 +974,18 @@ where
     for attempt in 1..=CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
         match publisher.publish_shutdown_not_ready().await {
             Ok(()) => return Ok(()),
-            Err(error) => {
+            Err(error) if error.is_indeterminate() => {
                 tracing::warn!(
                     attempt,
                     max_attempts = CONTROL_PLANE_RECONCILIATION_ATTEMPTS,
                     %error,
                     "shutdown NotReady response was indeterminate; bounded reconciliation remains"
                 );
-                last_error = Some(error);
+                last_error = Some(anyhow::Error::new(error));
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context("shutdown NotReady failed terminal validation or was rejected"));
             }
         }
         if attempt < CONTROL_PLANE_RECONCILIATION_ATTEMPTS {
@@ -927,6 +998,38 @@ where
         source: last_error
             .unwrap_or_else(|| anyhow!("shutdown NotReady publication produced no result")),
     }))
+}
+
+fn pre_ready_signal_result(signal: Result<()>, control: Result<()>) -> Result<()> {
+    match (signal, control) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(signal), Ok(())) => Err(signal.context("wait for pre-Ready shutdown signal")),
+        (Ok(()), Err(control)) => Err(control.context("publish pre-Ready shutdown NotReady")),
+        (Err(signal), Err(control)) => Err(anyhow!(
+            "pre-Ready shutdown signal monitor failed: {signal:#}; shutdown NotReady failed: {control:#}"
+        )),
+    }
+}
+
+fn signal_teardown_result(
+    signal_failure: Option<String>,
+    control: Result<()>,
+    session: SessionTerminationReport,
+) -> Result<()> {
+    if let Some(signal) = signal_failure {
+        return Err(anyhow::Error::new(SignalTeardownFailure {
+            signal,
+            control_plane: control.err().map_or_else(
+                || "acknowledged NotReady".to_owned(),
+                |error| error.to_string(),
+            ),
+            session,
+        }));
+    }
+    if let Err(control) = control {
+        return Err(control_teardown_error(control, session));
+    }
+    session.into_result()
 }
 
 async fn supervise_ready_session<Signal, Dependency>(
@@ -953,26 +1056,23 @@ where
     }
 
     let exit = tokio::select! {
-        result = &mut session_run => Exit::Session(result),
+        biased;
         result = &mut signal => Exit::Signal(result),
         result = &mut dependency_failure => Exit::Dependency(result),
+        result = &mut session_run => Exit::Session(result),
     };
     match exit {
         Exit::Session(result) => {
             let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
             let report = SessionTerminationReport::from_result(result);
             if let Err(control) = control_result {
-                fence_generation_locally(
+                stop_for_control_failure(
                     authority,
                     &shutdown,
+                    &control,
                     "post-Session NotReady could not be reconciled",
                 );
-                return Err(anyhow::Error::new(
-                    IndeterminateControlPlaneStateEscalation {
-                        control,
-                        session: report,
-                    },
-                ));
+                return Err(control_teardown_error(control, report));
             }
             report.into_result()
         }
@@ -981,26 +1081,24 @@ where
             // stopped routing new commands to this generation. If the bounded
             // transition is indeterminate, fence locally before joining.
             let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-            if control_result.is_err() {
-                fence_generation_locally(
+            if let Err(control) = control_result.as_ref() {
+                stop_for_control_failure(
                     authority,
                     &shutdown,
+                    control,
                     "signal shutdown NotReady could not be reconciled",
                 );
             } else {
                 shutdown.cancel();
             }
             let report = SessionTerminationReport::from_result((&mut session_run).await);
-            if let Err(control) = control_result {
-                return Err(anyhow::Error::new(
-                    IndeterminateControlPlaneStateEscalation {
-                        control,
-                        session: report,
-                    },
-                ));
-            }
-            result.context("wait for shutdown signal")?;
-            report.into_result()
+            signal_teardown_result(
+                result
+                    .err()
+                    .map(|error| format!("wait for shutdown signal: {error:#}")),
+                control_result,
+                report,
+            )
         }
         Exit::Dependency(result) => {
             let failure = match result {
@@ -1008,10 +1106,11 @@ where
                 Err(error) => error.context("authenticated runtime dependency monitor failed"),
             };
             let control_result = publish_shutdown_not_ready_reconciling(publisher).await;
-            if control_result.is_err() {
-                fence_generation_locally(
+            if let Err(control) = control_result.as_ref() {
+                stop_for_control_failure(
                     authority,
                     &shutdown,
+                    control,
                     "dependency-failure NotReady could not be reconciled",
                 );
             } else {
@@ -1233,20 +1332,47 @@ mod tests {
 
     #[async_trait]
     impl LocalReadyPublisher for UnavailableShutdownPublisher {
-        async fn publish_not_ready(&self) -> Result<()> {
+        async fn publish_not_ready(&self) -> LocalPublicationResult<()> {
             unreachable!("test exercises only shutdown NotReady")
         }
 
         async fn publish_ready(
             &self,
             _proof: &crate::gateway::local_runtime::LocalReadyProof,
-        ) -> Result<()> {
+        ) -> LocalPublicationResult<()> {
             unreachable!("test exercises only shutdown NotReady")
         }
 
-        async fn publish_shutdown_not_ready(&self) -> Result<()> {
+        async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            bail!("local control unavailable")
+            Err(LocalPublicationError::indeterminate(anyhow!(
+                "local control unavailable"
+            )))
+        }
+    }
+
+    struct RejectedShutdownPublisher {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LocalReadyPublisher for RejectedShutdownPublisher {
+        async fn publish_not_ready(&self) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_ready(
+            &self,
+            _proof: &crate::gateway::local_runtime::LocalReadyProof,
+        ) -> LocalPublicationResult<()> {
+            unreachable!("test exercises only shutdown NotReady")
+        }
+
+        async fn publish_shutdown_not_ready(&self) -> LocalPublicationResult<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(LocalPublicationError::terminal(anyhow!(
+                "local control rejected shutdown publication"
+            )))
         }
     }
 
@@ -1505,7 +1631,7 @@ mod tests {
                                 .expect("one commit signal")
                                 .send(())
                                 .expect("signal task remains");
-                            std::future::pending::<Result<()>>().await
+                            std::future::pending::<LocalPublicationResult<()>>().await
                         } else {
                             order.lock().unwrap().push("ready_reconciled");
                             Ok(())
@@ -1533,6 +1659,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_ready_signal_interrupts_a_blocked_preparation_wait() {
+        let (preparation_entered_tx, preparation_entered_rx) = tokio::sync::oneshot::channel();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            preparation_entered_rx
+                .await
+                .expect("pre-Ready preparation starts");
+            signal_tx.send(()).expect("signal future remains");
+        });
+        let preparation = async move {
+            preparation_entered_tx
+                .send(())
+                .expect("preparation observer remains");
+            std::future::pending::<Result<()>>().await
+        };
+        let mut signal: BoxFuture<'static, Result<()>> =
+            Box::pin(async move { signal_rx.await.context("test signal sender dropped") });
+
+        match wait_pre_ready_or_signal(preparation, &mut signal).await {
+            PreReadyWait::Signal(Ok(())) => {}
+            PreReadyWait::Signal(Err(error)) => panic!("signal monitor failed: {error:#}"),
+            PreReadyWait::Completed(_) => {
+                panic!("blocked preparation completed before the owned signal")
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ready_reconciliation_is_bounded_and_typed() {
         let attempts = AtomicUsize::new(0);
         let mut signal: BoxFuture<'static, Result<()>> =
@@ -1541,7 +1695,9 @@ mod tests {
         let error = publish_ready_reconciling(
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                bail!("local control unavailable")
+                Err(LocalPublicationError::indeterminate(anyhow!(
+                    "local control unavailable"
+                )))
             },
             &mut signal,
             &shutdown,
@@ -1557,6 +1713,33 @@ mod tests {
                 .downcast_ref::<IndeterminateControlPlaneState>()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn ready_terminal_rejection_is_not_retried() {
+        let attempts = AtomicUsize::new(0);
+        let mut signal: BoxFuture<'static, Result<()>> =
+            Box::pin(std::future::pending::<Result<()>>());
+        let shutdown = CancellationToken::new();
+        let error = publish_ready_reconciling(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(LocalPublicationError::terminal(anyhow!(
+                    "local control rejected Ready"
+                )))
+            },
+            &mut signal,
+            &shutdown,
+        )
+        .await
+        .expect_err("terminal rejection must fail immediately");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .downcast_ref::<IndeterminateControlPlaneState>()
+                .is_none()
+        );
+        assert!(error.to_string().contains("terminal validation"));
     }
 
     #[tokio::test]
@@ -1578,6 +1761,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shutdown_not_ready_terminal_rejection_is_not_retried() {
+        let publisher = RejectedShutdownPublisher {
+            attempts: AtomicUsize::new(0),
+        };
+        let error = publish_shutdown_not_ready_reconciling(&publisher)
+            .await
+            .expect_err("terminal shutdown rejection must fail immediately");
+        assert_eq!(publisher.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .downcast_ref::<IndeterminateControlPlaneState>()
+                .is_none()
+        );
+        assert!(error.to_string().contains("terminal validation"));
+    }
+
     #[test]
     fn dependency_teardown_error_preserves_trigger_and_ownership_loss() {
         let report = SessionTerminationReport::from_result(SessionResult::Failed {
@@ -1591,6 +1791,22 @@ mod tests {
         };
         let rendered = error.to_string();
         assert!(rendered.contains("executor Health failed"));
+        assert!(rendered.contains("ownership=Lost"));
+        assert!(rendered.contains("runtime shutdown"));
+    }
+
+    #[test]
+    fn signal_teardown_error_preserves_simultaneous_session_ownership_loss() {
+        let report = SessionTerminationReport::from_result(SessionResult::Failed {
+            failure: crate::agent::SessionFailure::RuntimeShutdownOwnershipLost,
+            ownership: crate::agent::RunOwnership::Lost,
+        });
+        let error =
+            signal_teardown_result(Some("signal receiver failed".to_owned()), Ok(()), report)
+                .expect_err("both failures must be reported");
+        assert!(error.downcast_ref::<SignalTeardownFailure>().is_some());
+        let rendered = error.to_string();
+        assert!(rendered.contains("signal receiver failed"));
         assert!(rendered.contains("ownership=Lost"));
         assert!(rendered.contains("runtime shutdown"));
     }
