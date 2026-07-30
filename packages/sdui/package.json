@@ -10,10 +10,14 @@
     "check-types": "tsc --noEmit"
   },
   "dependencies": {
+    "@sumi/ui": "workspace:*",
+    "lucide-react": "^1.24.0",
+    "react": "^19.2.7",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@sumi/typescript-config": "workspace:*",
+    "@types/react": "^19.2.17",
     "typescript": "^6.0.3"
   }
 }
