@@ -919,7 +919,7 @@ Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来�
 
 ```rust
 pub struct Session {
-    /// Idle の間だけ Some。run 開始時にワーカーへ move し、完了時に返してもらう。
+    /// Idle の間だけ Some。run 開始時にワーカーへ move し、正常完了またはrecoverable失敗時だけ返してもらう。
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     events_tx: mpsc::Sender<AgentEvent>,
@@ -937,7 +937,7 @@ pub struct RunCore {
 pub struct ActiveRun {
     control_tx: mpsc::Sender<RunControl>,
     phase: watch::Receiver<SteerPhase>, // Assistant | Tool | Approval | Retry。§10.2 の Projection::RunPhase (command 進行段階) とは別物
-    join: JoinHandle<RunCompletion>,    // RunCompletion が RunCore を返す
+    join: JoinHandle<RunCompletion>,    // 正常完了またはrecoverable失敗では RunCore を返す
 }
 
 pub enum RunControl {
@@ -966,7 +966,7 @@ pi は JS 単線スレッドで `Agent` のメソッドを直接叩くが、Rust
 
 この分岐が durable に進める `run_phase`/owner 遷移の集約は付録C(正典表)。
 
-run 中の会話可変状態は `RunCore` としてワーカー1個だけが所有し、完了時に `RunCompletion` で Session へ返す。Session は run 中に `RunCore` を直接触らず、制御メッセージだけを送るため、Rust の可変借用を跨いだ共有も mutex の await 保持も発生しない。**この二重 select が hard steer / abort / 承認応答を成立させる必須条件**であり、単に `agent_loop(...).await` してから command loop へ戻る実装は禁止する。**[推測→設計契約として確定]**
+run 中の会話可変状態は `RunCore` としてワーカー1個だけが所有し、正常完了またはrecoverable失敗では `RunCompletion` で Session へ返す。ただしdurable assistant terminal receipt後にin-memory replay stateとのreconciliationが完了しない場合、staleな`RunCore`はrecoverableとして返さず破棄し、Store上の唯一のcanonical life logからT17 hydrationをやり直す。これは人格agentや唯一のagent sessionを増やす経路ではない。Session は run 中に `RunCore` を直接触らず、制御メッセージだけを送るため、Rust の可変借用を跨いだ共有も mutex の await 保持も発生しない。**この二重 select が hard steer / abort / 承認応答を成立させる必須条件**であり、単に `agent_loop(...).await` してから command loop へ戻る実装は禁止する。**[推測→設計契約として確定]**
 
 **control command の直列化境界**: Session/Gateway は run worker が前の control command を処理中でも後続 command の `CommandReceived` を永続化して `control_tx` へ送れる。AgentLoopはdurable transaction境界ごとにcontrolを再確認し、`Abort`だけは会話処理上最優先にする。ただしcommand cursorのseq順は破らない。Abortを適用するEventBatchでは、`seq < abort.seq`かつ未終端のcommandを先にseq順で閉じる: 未注入UserMessageはclassified済みなら`CommandSuperseded(run_id=Some)`、まだ`received`ならunclassified supersede(DBのrun bindingはNULLのまま、live runがあれば投影だけ`run_id=Some`、Idleなら`None`)で入力欄へ差し戻す。分類済みの`idle_run`がまだ`user_started`前なら、それ自体を一意なstartup targetとして、開始済みの`TurnStart`/`AgentStart`を正常形で閉じる`TurnEnd`/`AgentEnd`と一緒にsupersedeする。未適用ApprovalDecisionはtoolを開始せず`run_id=None`のabort-preempted no-op Appliedへ閉じる。その後にAbort自身を、live ownerまたはstartup targetがあれば`run_id=Some`、完全なIdleなら`None`の`CommandApplied`へ同じEventBatchで進める。ownerがある場合だけ`cancel_requested`も載せる。これにより後続seqを先にACKせず、Abortより前の未処理commandを後から別runで実行もしない。
 
