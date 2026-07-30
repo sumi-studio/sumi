@@ -2138,8 +2138,14 @@ impl Store {
         self.post_commit_feed.issue_dispatcher_owner(epoch)
     }
 
-    fn reconcile_post_commit_authenticated_head(&self, durable_head: u64) -> Result<()> {
-        self.post_commit_feed.reconcile_authenticated(durable_head)
+    fn sync_post_commit_authenticated_checkpoint(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed
+            .sync_authenticated_checkpoint(durable_head)
+    }
+
+    fn recover_post_commit_authenticated_finalizer(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed
+            .recover_authenticated_finalizer(durable_head)
     }
 
     fn mint_post_commit_quiescence(

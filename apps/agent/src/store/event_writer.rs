@@ -1906,7 +1906,7 @@ impl EventWriter {
         let mut state = self.gate.lock().await;
         state.admission_open = false;
         self.settle_pending_finalizer(&mut state).await?;
-        self.reconcile_authenticated_checkpoint_and_feed(&mut state)
+        self.sync_authenticated_checkpoint_and_feed(&mut state)
             .await?;
         self.store.mint_post_commit_quiescence(
             owner,
@@ -1927,16 +1927,27 @@ impl EventWriter {
         self.gate.try_lock().is_err()
     }
 
-    async fn reconcile_authenticated_checkpoint_and_feed(
+    async fn sync_authenticated_checkpoint_and_feed(&self, state: &mut WriterState) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for feed synchronization")?;
+        self.store
+            .sync_post_commit_authenticated_checkpoint(checkpoint.event_head_seq())
+            .context("failed to synchronize post-commit feed to authenticated event-log head")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn recover_authenticated_finalizer_checkpoint_and_feed(
         &self,
         state: &mut WriterState,
     ) -> Result<()> {
         let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
             .await
-            .context("failed to authenticate EventWriter checkpoint for reconciliation")?;
+            .context("failed to authenticate EventWriter checkpoint for finalizer recovery")?;
         self.store
-            .reconcile_post_commit_authenticated_head(checkpoint.event_head_seq())
-            .context("failed to reconcile post-commit feed to authenticated event-log head")?;
+            .recover_post_commit_authenticated_finalizer(checkpoint.event_head_seq())
+            .context("failed to recover post-commit feed from authenticated finalizer outcome")?;
         state.checkpoint = Some(checkpoint);
         Ok(())
     }
@@ -1948,7 +1959,7 @@ impl EventWriter {
         };
         let outcome = finalizer.await;
         if let Err(error) = self
-            .reconcile_authenticated_checkpoint_and_feed(state)
+            .recover_authenticated_finalizer_checkpoint_and_feed(state)
             .await
         {
             return Err(match outcome {
@@ -1981,7 +1992,7 @@ impl EventWriter {
                 self.store.event_writer_finalizers().clear(id)
             }
             Err(failure) => {
-                self.reconcile_authenticated_checkpoint_and_feed(state)
+                self.recover_authenticated_finalizer_checkpoint_and_feed(state)
                     .await
                     .with_context(|| {
                         format!(
@@ -2216,8 +2227,7 @@ impl EventWriter {
 
     async fn ensure_checkpoint(&self, state: &mut WriterState) -> Result<()> {
         if state.checkpoint.is_none() {
-            state.checkpoint =
-                Some(reconstruct_authenticated_checkpoint(self.store.as_ref()).await?);
+            self.sync_authenticated_checkpoint_and_feed(state).await?;
         }
         Ok(())
     }
@@ -17829,6 +17839,92 @@ mod tests {
         assert_eq!(
             terminal.iter().map(|ack| ack.status).collect::<Vec<_>>(),
             vec![CommandAckStatus::Superseded, CommandAckStatus::Applied]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_checkpoint_publishes_authenticated_history_to_an_existing_receiver() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (mut prepared, _, _, event_seqs) = writer
+            .prepare_batch(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("pre-writer-authenticated-history")
+                                .expect("fixture maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect("prepare authenticated history");
+        assert_eq!(event_seqs, vec![1]);
+        let event = prepared
+            .pop()
+            .and_then(|write| write.event)
+            .expect("prepared history contains one event");
+        let mut transaction = store.pool().begin().await.expect("begin history seed");
+        let mut head = None;
+        append_prepared_event(&store, &mut transaction, event, &mut head)
+            .await
+            .expect("append authenticated history");
+        persist_event_head(
+            &store,
+            &mut transaction,
+            None,
+            head.as_ref().expect("history seed advances the event head"),
+        )
+        .await
+        .expect("persist authenticated history head");
+        transaction.commit().await.expect("commit history seed");
+
+        let receiver = store
+            .claim_post_commit_receiver()
+            .expect("claim receiver before writer checkpoint");
+        assert_eq!(receiver.published_through().unwrap(), 0);
+        let waiting = tokio::spawn(async move {
+            receiver
+                .wait_for_advance(0, &tokio_util::sync::CancellationToken::new())
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("authenticate existing event history");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("authenticated checkpoint wakes the existing receiver")
+                .expect("receiver task joins")
+                .expect("receiver observes a feed advance"),
+            Some(1)
+        );
+        assert_eq!(
+            store.committed_event_sequences(0, 1, 64).await.unwrap(),
+            vec![1],
+            "the awakened receiver scans the authenticated durable prefix"
+        );
+        assert_eq!(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("first-live-writer-commit")
+                                .expect("live maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("publish the exact event after authenticated history"),
+            vec![2]
         );
     }
 
