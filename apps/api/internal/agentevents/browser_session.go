@@ -69,8 +69,9 @@ type HMACUserSessionVerifier struct {
 }
 
 // BrowserSessionRevocationStore is the shared durability and serialization
-// boundary for browser-session admission and logout. Implementations must make
-// a successful RevokeBrowserSession visible across API processes and restarts.
+// boundary for browser-session admission, rotation, and logout. Implementations
+// must serialize admission against mutations and make successful revocations
+// and rotations visible across API processes and restarts.
 type BrowserSessionRevocationStore interface {
 	CheckBrowserSession(
 		ctx context.Context,
@@ -91,10 +92,12 @@ type BrowserSessionRevocationStore interface {
 		expiresAt time.Time,
 		now time.Time,
 	) error
-	RetireBrowserSession(
+	RotateBrowserSession(
 		ctx context.Context,
-		sessionID string,
-		expiresAt time.Time,
+		currentSessionID string,
+		currentExpiresAt time.Time,
+		successorSessionID string,
+		successorExpiresAt time.Time,
 		now time.Time,
 	) error
 }
@@ -130,10 +133,16 @@ type BrowserSessionLifecycle interface {
 	UserSessionAuthorizer
 	BrowserSessionIssuer
 	RevokeSession(ctx context.Context, signedCookie string) (UserSessionClaims, error)
-	RetireSessionForRotation(
+	RevokeSessionForLogout(
 		ctx context.Context,
 		signedCookie string,
 	) (UserSessionClaims, bool, error)
+	RotateSession(
+		ctx context.Context,
+		signedCookie string,
+		successorClaims UserSessionClaims,
+		ttl time.Duration,
+	) (UserSessionClaims, string, bool, error)
 }
 
 type userSessionWireClaims struct {
@@ -144,6 +153,11 @@ type userSessionWireClaims struct {
 	Exp                int64  `json:"exp"`
 	Aud                string `json:"aud"`
 	SID                string `json:"sid"`
+}
+
+type preparedBrowserSession struct {
+	claims       UserSessionClaims
+	signingInput string
 }
 
 func NewHMACUserSessionVerifier(
@@ -202,30 +216,42 @@ func (v *HMACUserSessionVerifier) IssueSession(
 	claims UserSessionClaims,
 	ttl time.Duration,
 ) (string, error) {
+	prepared, err := v.prepareSession(ctx, claims, ttl)
+	if err != nil {
+		return "", err
+	}
+	return v.signPreparedSession(prepared), nil
+}
+
+func (v *HMACUserSessionVerifier) prepareSession(
+	ctx context.Context,
+	claims UserSessionClaims,
+	ttl time.Duration,
+) (preparedBrowserSession, error) {
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return preparedBrowserSession{}, ctx.Err()
 	default:
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
 		!provenanceIDRegexp.MatchString(claims.UserID) {
-		return "", errors.New("browser session has invalid tenant or user binding")
+		return preparedBrowserSession{}, errors.New("browser session has invalid tenant or user binding")
 	}
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
-		return "", fmt.Errorf("browser session personality_agent_id: %w", err)
+		return preparedBrowserSession{}, fmt.Errorf("browser session personality_agent_id: %w", err)
 	}
 	if ttl < time.Minute || ttl > maxBrowserSessionTTL {
-		return "", errors.New("browser session TTL must be between one minute and one hour")
+		return preparedBrowserSession{}, errors.New("browser session TTL must be between one minute and one hour")
 	}
 	sessionIDBytes := make([]byte, browserSessionIDBytes)
 	if _, err := io.ReadFull(v.random, sessionIDBytes); err != nil {
-		return "", fmt.Errorf("generate browser session ID: %w", err)
+		return preparedBrowserSession{}, fmt.Errorf("generate browser session ID: %w", err)
 	}
 	now := v.now().UTC().Truncate(time.Second)
 	sessionID := base64.RawURLEncoding.EncodeToString(sessionIDBytes)
 
 	headerPart := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payload, err := json.Marshal(userSessionWireClaims{
+	wireClaims := userSessionWireClaims{
 		TenantID:           claims.TenantID,
 		UserID:             claims.UserID,
 		PersonalityAgentID: claims.PersonalityAgentID,
@@ -233,19 +259,39 @@ func (v *HMACUserSessionVerifier) IssueSession(
 		Exp:                now.Add(ttl).Unix(),
 		Aud:                v.audience,
 		SID:                sessionID,
-	})
+	}
+	payload, err := json.Marshal(wireClaims)
 	if err != nil {
-		return "", fmt.Errorf("marshal browser session claims: %w", err)
+		return preparedBrowserSession{}, fmt.Errorf("marshal browser session claims: %w", err)
 	}
 	payloadPart := base64.RawURLEncoding.EncodeToString(payload)
 	signingInput := headerPart + "." + payloadPart
-	mac := hmac.New(sha256.New, v.secret)
-	_, _ = mac.Write([]byte(signingInput))
-	signed := signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if len(signed) > maxSignedTokenBytes {
-		return "", errors.New("browser session exceeds maximum allowed size")
+	// HS256 always contributes 43 raw-base64url bytes. Validate the final
+	// token size before a rotation commits its successor lineage.
+	if len(signingInput)+1+base64.RawURLEncoding.EncodedLen(sha256.Size) >
+		maxSignedTokenBytes {
+		return preparedBrowserSession{}, errors.New("browser session exceeds maximum allowed size")
 	}
-	return signed, nil
+	return preparedBrowserSession{
+		claims: UserSessionClaims{
+			TenantID:           wireClaims.TenantID,
+			UserID:             wireClaims.UserID,
+			PersonalityAgentID: wireClaims.PersonalityAgentID,
+			sessionID:          wireClaims.SID,
+			expiresAt:          time.Unix(wireClaims.Exp, 0),
+			authorityBindingID: deriveBrowserAuthorityBindingID(v.secret, wireClaims),
+		},
+		signingInput: signingInput,
+	}, nil
+}
+
+func (v *HMACUserSessionVerifier) signPreparedSession(
+	prepared preparedBrowserSession,
+) string {
+	mac := hmac.New(sha256.New, v.secret)
+	_, _ = mac.Write([]byte(prepared.signingInput))
+	return prepared.signingInput + "." +
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
@@ -467,11 +513,11 @@ func (v *HMACUserSessionVerifier) RevokeSession(
 	return claims, nil
 }
 
-// RetireSessionForRotation atomically consumes one still-valid signed session
-// as a replacement credential. Unlike logout revocation, replay is an error:
-// exactly one API process may retire the old cookie and mint its successor.
-// The boolean reports whether the cookie itself was valid and unexpired.
-func (v *HMACUserSessionVerifier) RetireSessionForRotation(
+// RevokeSessionForLogout distinguishes a locally invalid or expired cookie
+// from a valid signed cookie that requires durable revocation. The boolean is
+// true whenever local verification succeeds, including when the durable
+// update fails, so callers can retain valid credentials for a logout retry.
+func (v *HMACUserSessionVerifier) RevokeSessionForLogout(
 	ctx context.Context,
 	signedCookie string,
 ) (UserSessionClaims, bool, error) {
@@ -484,16 +530,57 @@ func (v *HMACUserSessionVerifier) RetireSessionForRotation(
 		return UserSessionClaims{}, false, nil
 	}
 	now := v.now()
-	if err := v.revocations.RetireBrowserSession(
+	if err := v.revocations.RevokeBrowserSession(
 		ctx,
 		claims.sessionID,
 		claims.expiresAt,
 		now,
 	); err != nil {
 		return claims, true, fmt.Errorf(
-			"retire browser session for rotation: %w",
+			"revoke browser session for logout: %w",
 			err,
 		)
 	}
 	return claims, true, nil
+}
+
+// RotateSession atomically consumes one valid signed session and binds its
+// successor in shared durable lineage state before signing or returning the
+// replacement token. If logout linearizes after that store commit, it revokes
+// the successor even when the token has not yet been delivered.
+func (v *HMACUserSessionVerifier) RotateSession(
+	ctx context.Context,
+	signedCookie string,
+	successorClaims UserSessionClaims,
+	ttl time.Duration,
+) (UserSessionClaims, string, bool, error) {
+	current, err := v.verifySignedSession(ctx, signedCookie)
+	if err != nil {
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return UserSessionClaims{}, "", false, err
+		}
+		return UserSessionClaims{}, "", false, nil
+	}
+	successor, err := v.prepareSession(ctx, successorClaims, ttl)
+	if err != nil {
+		return current, "", true, err
+	}
+	if err := v.revocations.RotateBrowserSession(
+		ctx,
+		current.sessionID,
+		current.expiresAt,
+		successor.claims.sessionID,
+		successor.claims.expiresAt,
+		v.now(),
+	); err != nil {
+		return current, "", true, fmt.Errorf(
+			"rotate browser session: %w",
+			err,
+		)
+	}
+	// All potentially failing preparation completed before the store commit.
+	// HMAC signing itself is deterministic and cannot strand an untracked live
+	// successor after this point.
+	return current, v.signPreparedSession(successor), true, nil
 }

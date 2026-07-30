@@ -68,6 +68,12 @@ type DurableGateway struct {
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
 	writeAtomic           func(string, []byte, os.FileMode) error
+	// browserSessionMutationHook is test-only synchronization invoked while
+	// the shared exclusive lifecycle lock is held.
+	browserSessionMutationHook func(browserSessionMutationKind)
+	// browserSessionLockAttemptHook is test-only synchronization invoked
+	// immediately before attempting the shared lifecycle lock.
+	browserSessionLockAttemptHook func()
 
 	// stateMu protects run-in-flight and pending-approval state derived from
 	// durable events. Readers also take mu first so they cannot observe the

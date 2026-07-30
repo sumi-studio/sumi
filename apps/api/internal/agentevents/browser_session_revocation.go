@@ -13,18 +13,46 @@ import (
 )
 
 const (
-	browserSessionRevocationStateVersion  = uint64(1)
-	maxBrowserSessionRevocationStateBytes = 512 << 10
-	browserSessionRevocationLockID        = "browser-session-revocations"
+	legacyBrowserSessionRevocationStateVersion = uint64(1)
+	browserSessionRevocationStateVersion       = uint64(2)
+	maxBrowserSessionRevocationStateBytes      = 2 << 20
+	browserSessionRevocationLockID             = "browser-session-revocations"
 )
 
+type browserSessionMutationKind string
+
+const (
+	browserSessionMutationRevoke browserSessionMutationKind = "revoke"
+	browserSessionMutationRotate browserSessionMutationKind = "rotate"
+)
+
+// browserSessionLineageRecord is retained through the latest descendant
+// expiry. Entries marks revoked SIDs; lineage records bind a rotated SID to
+// its successor so logout carrying any still-valid ancestor revokes every
+// live descendant.
+type browserSessionLineageRecord struct {
+	ExpiresAt   int64  `json:"expires_at"`
+	RetainUntil int64  `json:"retain_until"`
+	Parent      string `json:"parent,omitempty"`
+	Successor   string `json:"successor,omitempty"`
+}
+
 type browserSessionRevocationState struct {
-	Version uint64           `json:"version"`
-	Entries map[string]int64 `json:"entries"`
+	Version  uint64                                 `json:"version"`
+	Entries  map[string]int64                       `json:"entries"`
+	Lineages map[string]browserSessionLineageRecord `json:"lineages"`
+}
+
+func newBrowserSessionRevocationState() browserSessionRevocationState {
+	return browserSessionRevocationState{
+		Version:  browserSessionRevocationStateVersion,
+		Entries:  make(map[string]int64),
+		Lineages: make(map[string]browserSessionLineageRecord),
+	}
 }
 
 // CheckBrowserSession checks the shared durable denylist before a signed
-// cookie is accepted. Any storage or integrity failure rejects the cookie.
+// cookie is accepted. Any storage, lineage, or integrity failure rejects it.
 func (g *DurableGateway) CheckBrowserSession(
 	ctx context.Context,
 	sessionID string,
@@ -42,15 +70,12 @@ func (g *DurableGateway) CheckBrowserSession(
 			if err != nil {
 				return err
 			}
-			if revokedUntil, revoked := state.Entries[sessionID]; revoked {
-				if revokedUntil != expiresAt.Unix() {
-					return errors.New("browser session revocation expiry changed")
-				}
-				if now.Unix() < revokedUntil {
-					return errBrowserSessionRevoked
-				}
-			}
-			return nil
+			return checkBrowserSessionState(
+				state,
+				sessionID,
+				expiresAt.Unix(),
+				now.Unix(),
+			)
 		},
 	)
 }
@@ -79,61 +104,117 @@ func (g *DurableGateway) AuthorizeBrowserSession(
 			if err != nil {
 				return err
 			}
-			if revokedUntil, revoked := state.Entries[sessionID]; revoked {
-				if revokedUntil != expiresAt.Unix() {
-					return errors.New("browser session revocation expiry changed")
-				}
-				if now.Unix() < revokedUntil {
-					return errBrowserSessionRevoked
-				}
+			if err := checkBrowserSessionState(
+				state,
+				sessionID,
+				expiresAt.Unix(),
+				now.Unix(),
+			); err != nil {
+				return err
 			}
 			return operation()
 		},
 	)
 }
 
-// RevokeBrowserSession durably records one session until its signed expiry.
-// Expired entries are reclaimed only while holding the exclusive shared lock;
-// both the scan and retained set are bounded by maxRevokedSessions.
+// RevokeBrowserSession takes the exclusive lifecycle lock and durably revokes
+// one session plus every live successor in its rotation lineage. The union of
+// lineage members and standalone revocations remains store-capacity bounded;
+// repeating logout is idempotent.
 func (g *DurableGateway) RevokeBrowserSession(
 	ctx context.Context,
 	sessionID string,
 	expiresAt time.Time,
 	now time.Time,
 ) error {
-	return g.persistBrowserSessionRevocation(
-		ctx,
+	if err := validateBrowserSessionMutation(
 		sessionID,
 		expiresAt,
 		now,
-		true,
+	); err != nil {
+		return err
+	}
+	return g.withBrowserSessionRevocationLock(
+		ctx,
+		syscall.LOCK_EX,
+		func() error {
+			g.runBrowserSessionMutationHook(browserSessionMutationRevoke)
+			state, err := g.readBrowserSessionRevocations()
+			if err != nil {
+				return err
+			}
+			cleanupBrowserSessionRevocations(&state, now.Unix())
+			if err := revokeBrowserSessionState(
+				&state,
+				sessionID,
+				expiresAt.Unix(),
+				g.maxBrowserSessionRevocations(),
+			); err != nil {
+				return err
+			}
+			return g.writeBrowserSessionRevocations(state)
+		},
 	)
 }
 
-// RetireBrowserSession atomically consumes a live session for replacement.
-// Replaying an existing revocation is deliberately rejected here while normal
-// logout remains idempotent through RevokeBrowserSession.
-func (g *DurableGateway) RetireBrowserSession(
+// RotateBrowserSession is the single shared-store linearization point for
+// replacement. It revokes currentSessionID, records the live successor, and
+// extends every ancestor's retention before the successor can be signed or
+// returned. A previously revoked or already-rotated current SID is rejected.
+func (g *DurableGateway) RotateBrowserSession(
 	ctx context.Context,
-	sessionID string,
-	expiresAt time.Time,
+	currentSessionID string,
+	currentExpiresAt time.Time,
+	successorSessionID string,
+	successorExpiresAt time.Time,
 	now time.Time,
 ) error {
-	return g.persistBrowserSessionRevocation(
-		ctx,
-		sessionID,
-		expiresAt,
+	if err := validateBrowserSessionMutation(
+		currentSessionID,
+		currentExpiresAt,
 		now,
-		false,
+	); err != nil {
+		return err
+	}
+	if err := validateBrowserSessionMutation(
+		successorSessionID,
+		successorExpiresAt,
+		now,
+	); err != nil {
+		return fmt.Errorf("successor: %w", err)
+	}
+	if currentSessionID == successorSessionID {
+		return errors.New("browser session successor must be distinct")
+	}
+	return g.withBrowserSessionRevocationLock(
+		ctx,
+		syscall.LOCK_EX,
+		func() error {
+			g.runBrowserSessionMutationHook(browserSessionMutationRotate)
+			state, err := g.readBrowserSessionRevocations()
+			if err != nil {
+				return err
+			}
+			cleanupBrowserSessionRevocations(&state, now.Unix())
+			if err := rotateBrowserSessionState(
+				&state,
+				currentSessionID,
+				currentExpiresAt.Unix(),
+				successorSessionID,
+				successorExpiresAt.Unix(),
+				g.maxBrowserSessionRevocations(),
+			); err != nil {
+				return err
+			}
+			return g.writeBrowserSessionRevocations(state)
+		},
 	)
 }
 
-func (g *DurableGateway) persistBrowserSessionRevocation(
-	ctx context.Context,
+func validateBrowserSessionMutation(
 	sessionID string,
 	expiresAt time.Time,
 	now time.Time,
-	idempotent bool,
 ) error {
 	if !validBrowserSessionID(sessionID) {
 		return errors.New("invalid browser session revocation identity")
@@ -142,46 +223,200 @@ func (g *DurableGateway) persistBrowserSessionRevocation(
 		expiresAt.Sub(now) > maxBrowserSessionTTL {
 		return errors.New("invalid browser session revocation expiry")
 	}
-	return g.withBrowserSessionRevocationLock(
-		ctx,
-		syscall.LOCK_EX,
-		func() error {
-			state, err := g.readBrowserSessionRevocations()
-			if err != nil {
-				return err
-			}
-			nowUnix := now.Unix()
-			for revokedSessionID, revokedUntil := range state.Entries {
-				if nowUnix >= revokedUntil {
-					delete(state.Entries, revokedSessionID)
-				}
-			}
-			if revokedUntil, exists := state.Entries[sessionID]; exists {
-				if revokedUntil != expiresAt.Unix() {
-					return errors.New("browser session revocation expiry changed")
-				}
-				if idempotent {
-					return nil
-				}
-				return errBrowserSessionRetired
-			}
-			if len(state.Entries) >= g.maxBrowserSessionRevocations() {
-				return errRevocationCapacity
-			}
-			state.Entries[sessionID] = expiresAt.Unix()
-			raw, err := json.Marshal(state)
-			if err != nil {
-				return fmt.Errorf("marshal browser session revocations: %w", err)
-			}
-			if len(raw) > maxBrowserSessionRevocationStateBytes {
-				return errors.New("browser session revocation state exceeds maximum allowed size")
-			}
-			if err := g.writeAtomic(g.browserSessionRevocationPath(), raw, 0o600); err != nil {
-				return fmt.Errorf("persist browser session revocation: %w", err)
-			}
-			return nil
-		},
-	)
+	return nil
+}
+
+func checkBrowserSessionState(
+	state browserSessionRevocationState,
+	sessionID string,
+	expiresAt int64,
+	now int64,
+) error {
+	if lineage, exists := state.Lineages[sessionID]; exists &&
+		lineage.ExpiresAt != expiresAt {
+		return errors.New("browser session lineage expiry changed")
+	}
+	if revokedUntil, revoked := state.Entries[sessionID]; revoked {
+		if revokedUntil != expiresAt {
+			return errors.New("browser session revocation expiry changed")
+		}
+		if now < revokedUntil {
+			return errBrowserSessionRevoked
+		}
+	}
+	return nil
+}
+
+func revokeBrowserSessionState(
+	state *browserSessionRevocationState,
+	sessionID string,
+	expiresAt int64,
+	maxEntries int,
+) error {
+	if lineage, exists := state.Lineages[sessionID]; exists &&
+		lineage.ExpiresAt != expiresAt {
+		return errors.New("browser session lineage expiry changed")
+	}
+	currentID := sessionID
+	currentExpiry := expiresAt
+	visited := make(map[string]struct{})
+	for {
+		if _, exists := visited[currentID]; exists {
+			return errors.New("browser session lineage contains a cycle")
+		}
+		visited[currentID] = struct{}{}
+		if revokedUntil, exists := state.Entries[currentID]; exists &&
+			revokedUntil != currentExpiry {
+			return errors.New("browser session revocation expiry changed")
+		}
+		state.Entries[currentID] = currentExpiry
+		lineage, exists := state.Lineages[currentID]
+		if !exists || lineage.Successor == "" {
+			break
+		}
+		successor, exists := state.Lineages[lineage.Successor]
+		if !exists {
+			return errors.New("browser session lineage successor is missing")
+		}
+		currentID = lineage.Successor
+		currentExpiry = successor.ExpiresAt
+		if len(visited) > maxEntries {
+			return errRevocationCapacity
+		}
+	}
+	if browserSessionStateCount(*state) > maxEntries {
+		return errRevocationCapacity
+	}
+	return nil
+}
+
+func rotateBrowserSessionState(
+	state *browserSessionRevocationState,
+	currentSessionID string,
+	currentExpiresAt int64,
+	successorSessionID string,
+	successorExpiresAt int64,
+	maxEntries int,
+) error {
+	if revokedUntil, revoked := state.Entries[currentSessionID]; revoked {
+		if revokedUntil != currentExpiresAt {
+			return errors.New("browser session revocation expiry changed")
+		}
+		return errBrowserSessionRetired
+	}
+	current, exists := state.Lineages[currentSessionID]
+	if exists {
+		if current.ExpiresAt != currentExpiresAt {
+			return errors.New("browser session lineage expiry changed")
+		}
+		if current.Successor != "" {
+			return errBrowserSessionRetired
+		}
+	} else {
+		current = browserSessionLineageRecord{
+			ExpiresAt:   currentExpiresAt,
+			RetainUntil: currentExpiresAt,
+		}
+	}
+	if _, exists := state.Entries[successorSessionID]; exists {
+		return errors.New("browser session successor identity already exists")
+	}
+	if _, exists := state.Lineages[successorSessionID]; exists {
+		return errors.New("browser session successor identity already exists")
+	}
+
+	additional := 1
+	if _, exists := state.Lineages[currentSessionID]; !exists {
+		additional++
+	}
+	if browserSessionStateCount(*state)+additional > maxEntries {
+		return errRevocationCapacity
+	}
+	current.Successor = successorSessionID
+	if successorExpiresAt > current.RetainUntil {
+		current.RetainUntil = successorExpiresAt
+	}
+	state.Lineages[currentSessionID] = current
+	state.Lineages[successorSessionID] = browserSessionLineageRecord{
+		ExpiresAt:   successorExpiresAt,
+		RetainUntil: successorExpiresAt,
+		Parent:      currentSessionID,
+	}
+	state.Entries[currentSessionID] = currentExpiresAt
+
+	ancestorID := current.Parent
+	for traversed := 0; ancestorID != ""; traversed++ {
+		if traversed >= maxEntries {
+			return errors.New("browser session lineage exceeds maximum depth")
+		}
+		ancestor, exists := state.Lineages[ancestorID]
+		if !exists {
+			return errors.New("browser session lineage parent is missing")
+		}
+		if successorExpiresAt > ancestor.RetainUntil {
+			ancestor.RetainUntil = successorExpiresAt
+			state.Lineages[ancestorID] = ancestor
+		}
+		ancestorID = ancestor.Parent
+	}
+	return nil
+}
+
+func cleanupBrowserSessionRevocations(
+	state *browserSessionRevocationState,
+	now int64,
+) {
+	removed := make(map[string]struct{})
+	for sessionID, lineage := range state.Lineages {
+		if now >= lineage.RetainUntil {
+			delete(state.Lineages, sessionID)
+			removed[sessionID] = struct{}{}
+		}
+	}
+	for sessionID, lineage := range state.Lineages {
+		if _, removedSuccessor := removed[lineage.Successor]; removedSuccessor {
+			lineage.Successor = ""
+			state.Lineages[sessionID] = lineage
+		}
+	}
+	for sessionID, expiresAt := range state.Entries {
+		lineage, retainedForSuccessors := state.Lineages[sessionID]
+		if now >= expiresAt &&
+			(!retainedForSuccessors || now >= lineage.RetainUntil) {
+			delete(state.Entries, sessionID)
+		}
+	}
+}
+
+func browserSessionStateCount(state browserSessionRevocationState) int {
+	count := len(state.Lineages)
+	for sessionID := range state.Entries {
+		if _, represented := state.Lineages[sessionID]; !represented {
+			count++
+		}
+	}
+	return count
+}
+
+func cloneBrowserSessionRevocationState(
+	state browserSessionRevocationState,
+) browserSessionRevocationState {
+	cloned := newBrowserSessionRevocationState()
+	for sessionID, expiresAt := range state.Entries {
+		cloned.Entries[sessionID] = expiresAt
+	}
+	for sessionID, lineage := range state.Lineages {
+		cloned.Lineages[sessionID] = lineage
+	}
+	return cloned
+}
+
+func (g *DurableGateway) runBrowserSessionMutationHook(
+	kind browserSessionMutationKind,
+) {
+	if g.browserSessionMutationHook != nil {
+		g.browserSessionMutationHook(kind)
+	}
 }
 
 func (g *DurableGateway) withBrowserSessionRevocationLock(
@@ -200,6 +435,9 @@ func (g *DurableGateway) withBrowserSessionRevocationLock(
 		return fmt.Errorf("open browser session revocation lock: %w", err)
 	}
 	defer lock.Close()
+	if g.browserSessionLockAttemptHook != nil {
+		g.browserSessionLockAttemptHook()
+	}
 	if err := flockContext(ctx, lock.Fd(), mode); err != nil {
 		return fmt.Errorf("lock browser session revocations: %w", err)
 	}
@@ -208,17 +446,14 @@ func (g *DurableGateway) withBrowserSessionRevocationLock(
 }
 
 func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocationState, error) {
-	state := browserSessionRevocationState{
-		Version: browserSessionRevocationStateVersion,
-		Entries: make(map[string]int64),
-	}
+	state := browserSessionRevocationState{}
 	file, err := os.OpenFile(
 		g.browserSessionRevocationPath(),
 		os.O_RDONLY|syscall.O_NOFOLLOW,
 		0,
 	)
 	if errors.Is(err, os.ErrNotExist) {
-		return state, nil
+		return newBrowserSessionRevocationState(), nil
 	}
 	if err != nil {
 		return browserSessionRevocationState{}, fmt.Errorf(
@@ -273,21 +508,129 @@ func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocati
 			err,
 		)
 	}
-	if state.Version != browserSessionRevocationStateVersion ||
-		state.Entries == nil ||
-		len(state.Entries) > maxRevokedSessions {
-		return browserSessionRevocationState{}, errors.New(
-			"invalid browser session revocation state",
+	var encodedFields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &encodedFields); err != nil {
+		return browserSessionRevocationState{}, fmt.Errorf(
+			"inspect browser session revocation fields: %w",
+			err,
 		)
 	}
-	for sessionID, expiresAt := range state.Entries {
-		if !validBrowserSessionID(sessionID) || expiresAt <= 0 {
+	for field := range encodedFields {
+		switch field {
+		case "version", "entries", "lineages":
+		default:
 			return browserSessionRevocationState{}, errors.New(
-				"invalid browser session revocation entry",
+				"invalid browser session revocation field",
 			)
 		}
 	}
+	_, hasLineages := encodedFields["lineages"]
+	switch state.Version {
+	case legacyBrowserSessionRevocationStateVersion:
+		if hasLineages {
+			return browserSessionRevocationState{}, errors.New(
+				"invalid legacy browser session revocation state",
+			)
+		}
+		// Version 1 persisted only Entries. Normalize it in memory so the
+		// next successful mutation atomically upgrades the durable format.
+		state.Version = browserSessionRevocationStateVersion
+		state.Lineages = make(map[string]browserSessionLineageRecord)
+	case browserSessionRevocationStateVersion:
+		if !hasLineages || state.Lineages == nil {
+			return browserSessionRevocationState{}, errors.New(
+				"invalid browser session revocation lineages",
+			)
+		}
+	default:
+		return browserSessionRevocationState{}, errors.New(
+			"invalid browser session revocation state version",
+		)
+	}
+	if err := validateBrowserSessionRevocationState(state); err != nil {
+		return browserSessionRevocationState{}, err
+	}
 	return state, nil
+}
+
+func validateBrowserSessionRevocationState(
+	state browserSessionRevocationState,
+) error {
+	if state.Version != browserSessionRevocationStateVersion ||
+		state.Entries == nil ||
+		state.Lineages == nil ||
+		browserSessionStateCount(state) > maxRevokedSessions {
+		return errors.New("invalid browser session revocation state")
+	}
+	for sessionID, expiresAt := range state.Entries {
+		if !validBrowserSessionID(sessionID) || expiresAt <= 0 {
+			return errors.New("invalid browser session revocation entry")
+		}
+		if lineage, exists := state.Lineages[sessionID]; exists &&
+			lineage.ExpiresAt != expiresAt {
+			return errors.New("browser session revocation and lineage expiry mismatch")
+		}
+	}
+	for sessionID, lineage := range state.Lineages {
+		if !validBrowserSessionID(sessionID) ||
+			lineage.ExpiresAt <= 0 ||
+			lineage.RetainUntil < lineage.ExpiresAt {
+			return errors.New("invalid browser session lineage entry")
+		}
+		if lineage.Parent != "" {
+			parent, exists := state.Lineages[lineage.Parent]
+			if !validBrowserSessionID(lineage.Parent) ||
+				!exists ||
+				parent.Successor != sessionID ||
+				parent.RetainUntil < lineage.RetainUntil {
+				return errors.New("invalid browser session lineage parent")
+			}
+		}
+		if lineage.Successor != "" {
+			successor, exists := state.Lineages[lineage.Successor]
+			_, currentRevoked := state.Entries[sessionID]
+			if !validBrowserSessionID(lineage.Successor) ||
+				!exists ||
+				successor.Parent != sessionID ||
+				!currentRevoked {
+				return errors.New("invalid browser session lineage successor")
+			}
+		}
+	}
+	for sessionID := range state.Lineages {
+		visited := make(map[string]struct{})
+		currentID := sessionID
+		for currentID != "" {
+			if _, exists := visited[currentID]; exists {
+				return errors.New("browser session lineage contains a cycle")
+			}
+			visited[currentID] = struct{}{}
+			if len(visited) > len(state.Lineages) {
+				return errors.New("browser session lineage exceeds bounded state")
+			}
+			currentID = state.Lineages[currentID].Successor
+		}
+	}
+	return nil
+}
+
+func (g *DurableGateway) writeBrowserSessionRevocations(
+	state browserSessionRevocationState,
+) error {
+	if err := validateBrowserSessionRevocationState(state); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal browser session revocations: %w", err)
+	}
+	if len(raw) > maxBrowserSessionRevocationStateBytes {
+		return errors.New("browser session revocation state exceeds maximum allowed size")
+	}
+	if err := g.writeAtomic(g.browserSessionRevocationPath(), raw, 0o600); err != nil {
+		return fmt.Errorf("persist browser session revocation: %w", err)
+	}
+	return nil
 }
 
 func (g *DurableGateway) maxBrowserSessionRevocations() int {

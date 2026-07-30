@@ -774,7 +774,9 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 	}
 }
 
-func TestBrowserSessionRevocationStopsOutboundFramesAcrossGateways(t *testing.T) {
+func TestBrowserSessionLineageLogoutStopsSuccessorOutboundFramesAcrossGateways(
+	t *testing.T,
+) {
 	tmp := t.TempDir()
 	store, firstGateway, err := openGatewayAt(
 		t,
@@ -814,17 +816,27 @@ func TestBrowserSessionRevocationStopsOutboundFramesAcrossGateways(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signedSession, err := firstSessions.IssueSession(
+	sessionClaims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+	}
+	currentSession, err := firstSessions.IssueSession(
 		context.Background(),
-		UserSessionClaims{
-			TenantID:           "tenant-1",
-			UserID:             "user-1",
-			PersonalityAgentID: personalityAgentID,
-		},
+		sessionClaims,
 		time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	_, successorSession, valid, err := firstSessions.RotateSession(
+		context.Background(),
+		currentSession,
+		sessionClaims,
+		2*time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("rotate browser session: valid=%v err=%v", valid, err)
 	}
 	browser := NewBrowserServer(secondSessions, secondGateway, secondGateway)
 	browser.AllowedOrigins = []string{browserAuthTestOrigin}
@@ -836,7 +848,7 @@ func TestBrowserSessionRevocationStopsOutboundFramesAcrossGateways(t *testing.T)
 	conn := dialBrowserWS(
 		t,
 		httpServer,
-		signedSession,
+		successorSession,
 		personalityAgentID,
 	)
 	defer conn.Close()
@@ -844,11 +856,11 @@ func TestBrowserSessionRevocationStopsOutboundFramesAcrossGateways(t *testing.T)
 		t.Fatal(err)
 	}
 	assertDirectChatStatus(t, conn, "ready")
-	if _, err := firstSessions.RevokeSession(
+	if _, valid, err := firstSessions.RevokeSessionForLogout(
 		context.Background(),
-		signedSession,
-	); err != nil {
-		t.Fatal(err)
+		currentSession,
+	); err != nil || !valid {
+		t.Fatalf("logout ancestor session: valid=%v err=%v", valid, err)
 	}
 
 	seq := uint64(1)

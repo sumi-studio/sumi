@@ -18,7 +18,7 @@ var testSessionSecret = []byte("browser-session-secret-32-bytes!!")
 
 type testBrowserSessionRevocationStore struct {
 	mu        sync.RWMutex
-	entries   map[string]int64
+	state     browserSessionRevocationState
 	max       int
 	checkErr  error
 	revokeErr error
@@ -26,8 +26,46 @@ type testBrowserSessionRevocationStore struct {
 
 func newTestBrowserSessionRevocationStore() *testBrowserSessionRevocationStore {
 	return &testBrowserSessionRevocationStore{
-		entries: make(map[string]int64),
-		max:     maxRevokedSessions,
+		state: newBrowserSessionRevocationState(),
+		max:   maxRevokedSessions,
+	}
+}
+
+func openSharedBrowserSessionGateways(
+	t *testing.T,
+) (*CommandStore, *DurableGateway, *DurableGateway) {
+	t.Helper()
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	runtimeDir := t.TempDir()
+	first, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = first.runtimeDir.Close()
+		_ = second.runtimeDir.Close()
+	})
+	return store, first, second
+}
+
+func waitBrowserSessionTestSignal(
+	t *testing.T,
+	signal <-chan struct{},
+	label string,
+) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
 	}
 }
 
@@ -42,15 +80,12 @@ func (s *testBrowserSessionRevocationStore) CheckBrowserSession(
 	if s.checkErr != nil {
 		return s.checkErr
 	}
-	if revokedUntil, revoked := s.entries[sessionID]; revoked {
-		if revokedUntil != expiresAt.Unix() {
-			return errors.New("browser session revocation expiry changed")
-		}
-		if now.Unix() < revokedUntil {
-			return errBrowserSessionRevoked
-		}
-	}
-	return nil
+	return checkBrowserSessionState(
+		s.state,
+		sessionID,
+		expiresAt.Unix(),
+		now.Unix(),
+	)
 }
 
 func (s *testBrowserSessionRevocationStore) AuthorizeBrowserSession(
@@ -65,13 +100,13 @@ func (s *testBrowserSessionRevocationStore) AuthorizeBrowserSession(
 	if s.checkErr != nil {
 		return s.checkErr
 	}
-	if revokedUntil, revoked := s.entries[sessionID]; revoked {
-		if revokedUntil != expiresAt.Unix() {
-			return errors.New("browser session revocation expiry changed")
-		}
-		if now.Unix() < revokedUntil {
-			return errBrowserSessionRevoked
-		}
+	if err := checkBrowserSessionState(
+		s.state,
+		sessionID,
+		expiresAt.Unix(),
+		now.Unix(),
+	); err != nil {
+		return err
 	}
 	return operation()
 }
@@ -82,44 +117,57 @@ func (s *testBrowserSessionRevocationStore) RevokeBrowserSession(
 	expiresAt time.Time,
 	now time.Time,
 ) error {
-	return s.persist(sessionID, expiresAt, now, true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	if err := revokeBrowserSessionState(
+		&next,
+		sessionID,
+		expiresAt.Unix(),
+		s.max,
+	); err != nil {
+		return err
+	}
+	if err := validateBrowserSessionRevocationState(next); err != nil {
+		return err
+	}
+	s.state = next
+	return nil
 }
 
-func (s *testBrowserSessionRevocationStore) RetireBrowserSession(
+func (s *testBrowserSessionRevocationStore) RotateBrowserSession(
 	_ context.Context,
-	sessionID string,
-	expiresAt time.Time,
+	currentSessionID string,
+	currentExpiresAt time.Time,
+	successorSessionID string,
+	successorExpiresAt time.Time,
 	now time.Time,
-) error {
-	return s.persist(sessionID, expiresAt, now, false)
-}
-
-func (s *testBrowserSessionRevocationStore) persist(
-	sessionID string,
-	expiresAt time.Time,
-	now time.Time,
-	idempotent bool,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.revokeErr != nil {
 		return s.revokeErr
 	}
-	for revokedSessionID, revokedUntil := range s.entries {
-		if now.Unix() >= revokedUntil {
-			delete(s.entries, revokedSessionID)
-		}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	if err := rotateBrowserSessionState(
+		&next,
+		currentSessionID,
+		currentExpiresAt.Unix(),
+		successorSessionID,
+		successorExpiresAt.Unix(),
+		s.max,
+	); err != nil {
+		return err
 	}
-	if _, exists := s.entries[sessionID]; exists {
-		if idempotent {
-			return nil
-		}
-		return errBrowserSessionRetired
+	if err := validateBrowserSessionRevocationState(next); err != nil {
+		return err
 	}
-	if len(s.entries) >= s.max {
-		return errRevocationCapacity
-	}
-	s.entries[sessionID] = expiresAt.Unix()
+	s.state = next
 	return nil
 }
 
@@ -296,6 +344,86 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRevocations(t *testing.T) {
 	}
 }
 
+func TestHMACUserSessionVerifierBoundsAndReclaimsRotationLineage(t *testing.T) {
+	revocations := newTestBrowserSessionRevocationStore()
+	revocations.max = 2
+	verifier, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		revocations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	verifier.now = func() time.Time { return now }
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	current, err := verifier.IssueSession(
+		context.Background(),
+		claims,
+		2*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, successor, valid, err := verifier.RotateSession(
+		context.Background(),
+		current,
+		claims,
+		time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("first rotation: valid=%v err=%v", valid, err)
+	}
+	successorClaims, err := verifier.VerifySession(
+		context.Background(),
+		successor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, valid, err := verifier.RotateSession(
+		context.Background(),
+		successor,
+		claims,
+		time.Minute,
+	); !valid || !errors.Is(err, errRevocationCapacity) {
+		t.Fatalf("bounded lineage rotation: valid=%v err=%v", valid, err)
+	}
+	if _, err := verifier.VerifySession(
+		context.Background(),
+		successor,
+	); err != nil {
+		t.Fatalf("failed rotation invalidated live successor: %v", err)
+	}
+
+	now = successorClaims.expiresAt.Add(2*time.Minute + time.Second)
+	unrelated, err := verifier.IssueSession(
+		context.Background(),
+		claims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.RevokeSession(
+		context.Background(),
+		unrelated,
+	); err != nil {
+		t.Fatalf("expired lineage was not reclaimed: %v", err)
+	}
+	revocations.mu.RLock()
+	count := browserSessionStateCount(revocations.state)
+	revocations.mu.RUnlock()
+	if count != 1 {
+		t.Fatalf("revocation state count = %d, want 1 after lineage cleanup", count)
+	}
+}
+
 func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T) {
 	commandDir := t.TempDir()
 	runtimeDir := t.TempDir()
@@ -365,6 +493,412 @@ func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T)
 		errBrowserSessionRevoked,
 	) {
 		t.Fatalf("restarted manager verify = %v, want revoked", err)
+	}
+}
+
+func TestDurableBrowserSessionRevocationRejectsCorruptionButAcceptsLegacyState(
+	t *testing.T,
+) {
+	_, gateway, _ := openSharedBrowserSessionGateways(t)
+	verifier, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		gateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := verifier.IssueSession(
+		context.Background(),
+		UserSessionClaims{
+			TenantID:           "tenant-1",
+			UserID:             "user-1",
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		},
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := gateway.browserSessionRevocationPath()
+	if err := os.WriteFile(
+		statePath,
+		[]byte(`{"version":2,"entries":{},"lineages":null}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.VerifySession(
+		context.Background(),
+		session,
+	); err == nil {
+		t.Fatal("explicit null lineage state accepted a signed cookie")
+	}
+	if err := os.WriteFile(
+		statePath,
+		[]byte(`{"version":2,"entries":{}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.VerifySession(
+		context.Background(),
+		session,
+	); err == nil {
+		t.Fatal("version 2 state missing lineages accepted a signed cookie")
+	}
+	if err := os.WriteFile(
+		statePath,
+		[]byte(`{"version":1,"entries":{}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.VerifySession(
+		context.Background(),
+		session,
+	); err != nil {
+		t.Fatalf("legacy revocation state rejected a valid signed cookie: %v", err)
+	}
+}
+
+func TestDurableBrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
+	t *testing.T,
+) {
+	store, firstGateway, secondGateway := openSharedBrowserSessionGateways(t)
+	first, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
+	first.now = func() time.Time { return now }
+	second.now = func() time.Time { return now }
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	ancestor, err := first.IssueSession(
+		context.Background(),
+		claims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	ancestorClaims, successor, valid, err := first.RotateSession(
+		context.Background(),
+		ancestor,
+		claims,
+		3*time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("rotate ancestor: valid=%v err=%v", valid, err)
+	}
+
+	now = now.Add(31 * time.Second)
+	if !now.After(ancestorClaims.expiresAt) {
+		t.Fatal("test clock did not advance past ancestor expiry")
+	}
+	_, latest, valid, err := second.RotateSession(
+		context.Background(),
+		successor,
+		claims,
+		3*time.Minute,
+	)
+	if err != nil || !valid {
+		t.Fatalf("rotate live successor after ancestor expiry: valid=%v err=%v", valid, err)
+	}
+
+	if err := firstGateway.runtimeDir.Close(); err != nil {
+		t.Fatalf("close first gateway runtime directory: %v", err)
+	}
+	if err := secondGateway.runtimeDir.Close(); err != nil {
+		t.Fatalf("close second gateway runtime directory: %v", err)
+	}
+	restartedGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		restartedGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.now = func() time.Time { return now }
+	if _, err := restarted.VerifySession(
+		context.Background(),
+		latest,
+	); err != nil {
+		t.Fatalf("restarted verifier rejected latest successor: %v", err)
+	}
+}
+
+func TestDurableBrowserSessionRotationThenLogoutRevokesSuccessorAcrossRestart(
+	t *testing.T,
+) {
+	store, firstGateway, secondGateway := openSharedBrowserSessionGateways(t)
+	first, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	current, err := first.IssueSession(
+		context.Background(),
+		claims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotationEntered := make(chan struct{})
+	releaseRotation := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseRotation:
+		default:
+			close(releaseRotation)
+		}
+	}()
+	firstGateway.browserSessionMutationHook = func(
+		kind browserSessionMutationKind,
+	) {
+		if kind == browserSessionMutationRotate {
+			close(rotationEntered)
+			<-releaseRotation
+		}
+	}
+	type rotationResult struct {
+		successor string
+		valid     bool
+		err       error
+	}
+	rotationDone := make(chan rotationResult, 1)
+	go func() {
+		_, successor, valid, err := first.RotateSession(
+			context.Background(),
+			current,
+			claims,
+			2*time.Minute,
+		)
+		rotationDone <- rotationResult{
+			successor: successor,
+			valid:     valid,
+			err:       err,
+		}
+	}()
+	waitBrowserSessionTestSignal(t, rotationEntered, "rotation lock")
+
+	type logoutResult struct {
+		valid bool
+		err   error
+	}
+	logoutAttempted := make(chan struct{})
+	var logoutAttemptedOnce sync.Once
+	secondGateway.browserSessionLockAttemptHook = func() {
+		logoutAttemptedOnce.Do(func() { close(logoutAttempted) })
+	}
+	logoutDone := make(chan logoutResult, 1)
+	go func() {
+		_, valid, err := second.RevokeSessionForLogout(
+			context.Background(),
+			current,
+		)
+		logoutDone <- logoutResult{valid: valid, err: err}
+	}()
+	waitBrowserSessionTestSignal(t, logoutAttempted, "concurrent logout lock attempt")
+	close(releaseRotation)
+
+	var rotated rotationResult
+	select {
+	case rotated = <-rotationDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rotation")
+	}
+	if rotated.err != nil || !rotated.valid || rotated.successor == "" {
+		t.Fatalf("rotation result = %+v", rotated)
+	}
+	select {
+	case loggedOut := <-logoutDone:
+		if loggedOut.err != nil || !loggedOut.valid {
+			t.Fatalf("logout result = %+v", loggedOut)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for logout")
+	}
+	if _, err := second.VerifySession(
+		context.Background(),
+		rotated.successor,
+	); !errors.Is(err, errBrowserSessionRevoked) {
+		t.Fatalf("successor after ancestor logout = %v, want revoked", err)
+	}
+
+	if err := firstGateway.runtimeDir.Close(); err != nil {
+		t.Fatalf("close first gateway runtime directory: %v", err)
+	}
+	if err := secondGateway.runtimeDir.Close(); err != nil {
+		t.Fatalf("close second gateway runtime directory: %v", err)
+	}
+	restartedGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		restartedGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.VerifySession(
+		context.Background(),
+		rotated.successor,
+	); !errors.Is(err, errBrowserSessionRevoked) {
+		t.Fatalf("restarted successor check = %v, want revoked", err)
+	}
+}
+
+func TestDurableBrowserSessionLogoutThenRotationRejectsSuccessor(
+	t *testing.T,
+) {
+	_, firstGateway, secondGateway := openSharedBrowserSessionGateways(t)
+	first, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		firstGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		secondGateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+	}
+	current, err := first.IssueSession(
+		context.Background(),
+		claims,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutEntered := make(chan struct{})
+	releaseLogout := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseLogout:
+		default:
+			close(releaseLogout)
+		}
+	}()
+	firstGateway.browserSessionMutationHook = func(
+		kind browserSessionMutationKind,
+	) {
+		if kind == browserSessionMutationRevoke {
+			close(logoutEntered)
+			<-releaseLogout
+		}
+	}
+	type logoutResult struct {
+		valid bool
+		err   error
+	}
+	logoutDone := make(chan logoutResult, 1)
+	go func() {
+		_, valid, err := first.RevokeSessionForLogout(
+			context.Background(),
+			current,
+		)
+		logoutDone <- logoutResult{valid: valid, err: err}
+	}()
+	waitBrowserSessionTestSignal(t, logoutEntered, "logout lock")
+
+	type rotationResult struct {
+		successor string
+		valid     bool
+		err       error
+	}
+	rotationAttempted := make(chan struct{})
+	var rotationAttemptedOnce sync.Once
+	secondGateway.browserSessionLockAttemptHook = func() {
+		rotationAttemptedOnce.Do(func() { close(rotationAttempted) })
+	}
+	rotationDone := make(chan rotationResult, 1)
+	go func() {
+		_, successor, valid, err := second.RotateSession(
+			context.Background(),
+			current,
+			claims,
+			time.Minute,
+		)
+		rotationDone <- rotationResult{
+			successor: successor,
+			valid:     valid,
+			err:       err,
+		}
+	}()
+	waitBrowserSessionTestSignal(t, rotationAttempted, "concurrent rotation lock attempt")
+	close(releaseLogout)
+
+	select {
+	case loggedOut := <-logoutDone:
+		if loggedOut.err != nil || !loggedOut.valid {
+			t.Fatalf("logout result = %+v", loggedOut)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for logout")
+	}
+	select {
+	case rotated := <-rotationDone:
+		if !rotated.valid ||
+			rotated.successor != "" ||
+			!errors.Is(rotated.err, errBrowserSessionRetired) {
+			t.Fatalf("rotation result = %+v, want retired", rotated)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rotation")
 	}
 }
 

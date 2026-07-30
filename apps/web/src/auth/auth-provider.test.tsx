@@ -163,6 +163,7 @@ describe("logout authority transition", () => {
         "authenticated",
       );
     });
+    authMocks.bindDirectChatAuthority.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
 
@@ -173,6 +174,7 @@ describe("logout authority transition", () => {
       expect(screen.getByTestId("user-id")).toHaveTextContent("none");
     });
     expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+    expect(authMocks.bindDirectChatAuthority).not.toHaveBeenCalled();
   });
 
   it("does not publish an unauthenticated refresh when private reset fails", async () => {
@@ -191,6 +193,7 @@ describe("logout authority transition", () => {
       );
     });
     expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+    expect(authMocks.bindDirectChatAuthority).not.toHaveBeenCalled();
   });
 
   it("binds the new identity before publishing a successful sign-in", async () => {

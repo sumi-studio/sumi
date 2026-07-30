@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +42,8 @@ func (f *barrierFirebaseVerifier) VerifyIDToken(
 		return FirebaseIdentity{}, ctx.Err()
 	case <-f.ready:
 		return FirebaseIdentity{UID: "firebase-user"}, nil
+	case <-time.After(2 * time.Second):
+		return FirebaseIdentity{}, errors.New("timed out waiting for concurrent Firebase verification")
 	}
 }
 
@@ -451,6 +454,100 @@ func TestBrowserAuthLogoutRevokesSessionAndClosesOnlyItsConnections(t *testing.T
 	}
 	if len(closer.sessionIDs) != 1 || closer.sessionIDs[0] != claims.sessionID {
 		t.Fatalf("closed sessions %v, want %q", closer.sessionIDs, claims.sessionID)
+	}
+}
+
+func TestBrowserAuthLogoutRetainsValidCookieWhenDurableRevocationIsUnavailable(t *testing.T) {
+	store, err := OpenCommandStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway, err := OpenDurableGateway(t.TempDir(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(
+		testSessionSecret,
+		"",
+		gateway,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewBrowserAuthServer(
+		&fakeFirebaseVerifier{},
+		&fakeBindingResolver{},
+		sessions,
+		[]string{browserAuthTestOrigin},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closer := &fakeBrowserConnectionCloser{}
+	server.Connections = closer
+	session, err := sessions.IssueSession(
+		context.Background(),
+		UserSessionClaims{
+			TenantID:           "tenant-1",
+			UserID:             "user-1",
+			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		},
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutSession := func() *httptest.ResponseRecorder {
+		t.Helper()
+		csrf, csrfCookie := obtainCSRF(t, server)
+		logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		logout.Header.Set("Origin", browserAuthTestOrigin)
+		logout.Header.Set("X-CSRF-Token", csrf)
+		logout.AddCookie(csrfCookie)
+		logout.AddCookie(&http.Cookie{
+			Name:  BrowserSessionCookie,
+			Value: session,
+		})
+		recorder := httptest.NewRecorder()
+		server.serveLogout(recorder, logout)
+		return recorder
+	}
+	assertRetained := func(label string, recorder *httptest.ResponseRecorder) {
+		t.Helper()
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s logout status = %d, want 503", label, recorder.Code)
+		}
+		if cookies := recorder.Result().Cookies(); len(cookies) != 0 {
+			t.Fatalf("%s logout mutated browser credentials: %+v", label, cookies)
+		}
+		if len(closer.sessionIDs) != 0 {
+			t.Fatalf("%s logout closed sessions: %v", label, closer.sessionIDs)
+		}
+	}
+	if err := os.WriteFile(
+		gateway.browserSessionRevocationPath(),
+		[]byte(`{"version":1,"entries":`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertRetained("corrupt-state", logoutSession())
+	if err := os.Remove(gateway.browserSessionRevocationPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.VerifySession(context.Background(), session); err != nil {
+		t.Fatalf("valid signed cookie did not recover with durable store: %v", err)
+	}
+
+	gateway.writeAtomic = func(string, []byte, os.FileMode) error {
+		return errors.New("injected revocation write failure")
+	}
+	assertRetained("write-failed", logoutSession())
+	gateway.writeAtomic = writeFileAtomic
+	if _, err := sessions.VerifySession(context.Background(), session); err != nil {
+		t.Fatalf("failed durable update invalidated signed cookie: %v", err)
 	}
 }
 

@@ -219,29 +219,35 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	ttl := s.SessionTTL
+	if ttl == 0 {
+		ttl = defaultBrowserSessionTTL
+	}
+	var session string
 	if existing, cookieErr := uniqueBrowserSessionCookie(r); cookieErr == nil {
-		retired, valid, retireErr := s.Sessions.RetireSessionForRotation(
+		retired, replacement, valid, rotateErr := s.Sessions.RotateSession(
 			r.Context(),
 			existing.Value,
+			claims,
+			ttl,
 		)
-		if retireErr != nil {
+		if rotateErr != nil {
 			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 			return
 		}
 		if valid {
+			session = replacement
 			if s.Connections != nil {
 				s.Connections.CloseBrowserSession(retired.sessionID)
 			}
 		}
 	}
-	ttl := s.SessionTTL
-	if ttl == 0 {
-		ttl = defaultBrowserSessionTTL
-	}
-	session, err := s.Sessions.IssueSession(r.Context(), claims, ttl)
-	if err != nil {
-		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-		return
+	if session == "" {
+		session, err = s.Sessions.IssueSession(r.Context(), claims, ttl)
+		if err != nil {
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			return
+		}
 	}
 	http.SetCookie(w, s.sessionCookie(session, int(ttl/time.Second)))
 	w.Header().Set("Cache-Control", "no-store")
@@ -292,22 +298,20 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	for _, cookie := range r.CookiesNamed(BrowserSessionCookie) {
-		claims, verifyErr := s.Sessions.VerifySession(r.Context(), cookie.Value)
-		if verifyErr != nil {
-			continue
+		revoked, valid, revokeErr := s.Sessions.RevokeSessionForLogout(
+			r.Context(),
+			cookie.Value,
+		)
+		if revokeErr != nil {
+			// A valid signed credential whose durable lineage cannot be
+			// checked or revoked must remain in the browser for a retry.
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			return
 		}
-		revoked, revokeErr := s.Sessions.RevokeSession(r.Context(), cookie.Value)
-		if revokeErr == nil {
-			if revoked.sessionID != claims.sessionID {
-				writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-				return
-			}
+		if valid {
 			if s.Connections != nil {
 				s.Connections.CloseBrowserSession(revoked.sessionID)
 			}
-		} else {
-			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-			return
 		}
 	}
 	http.SetCookie(w, s.sessionCookie("", -1))
