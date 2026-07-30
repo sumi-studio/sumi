@@ -34,6 +34,7 @@ const (
 	maxLocalControlDurableStateBytes       = 8 * 1024 * 1024
 	maxLocalControlRecords                 = 1024
 	localControlStateVersion               = 1
+	localControlIntegrityVersion           = 1
 	maxOpaqueRuntimeIDBytes                = 128
 )
 
@@ -132,6 +133,12 @@ type localControlDurableState struct {
 	Reason             LocalRuntimePublicationReason     `json:"reason"`
 	Publications       map[string]localPublicationRecord `json:"publications"`
 	CredentialRequests map[string]localCredentialRecord  `json:"credential_requests"`
+	Integrity          *localControlStateIntegrity       `json:"integrity,omitempty"`
+}
+
+type localControlStateIntegrity struct {
+	Version uint8  `json:"version"`
+	MAC     string `json:"mac"`
 }
 
 // LocalControlServer owns the local/CI issuer and state-publication handlers.
@@ -169,6 +176,10 @@ func NewLocalControlServer(
 		if err := validateLocalRuntimeAuthorization(authorization); err != nil {
 			return nil, fmt.Errorf("local runtime authorization %d: %w", i, err)
 		}
+		if len(signingSecret) == len(authorization.BearerToken) &&
+			subtle.ConstantTimeCompare(signingSecret, []byte(authorization.BearerToken)) == 1 {
+			return nil, errors.New("local control bearer and token signing secret must be distinct")
+		}
 		if authorization.Audience == "" {
 			authorization.Audience = defaultAgentAudience
 		}
@@ -187,6 +198,29 @@ func NewLocalControlServer(
 		seenBearer[authorization.BearerToken] = struct{}{}
 		seenEpoch[epoch] = struct{}{}
 		normalized[i] = authorization
+	}
+
+	integrityKey := deriveLocalControlIntegrityKey(signingSecret)
+	owners := make([]string, 0, len(normalized))
+	for _, authorization := range normalized {
+		owners = append(owners, authorization.PersonalityAgentID)
+	}
+	if err := gateway.installLocalControlIntegrityKey(integrityKey, owners); err != nil {
+		return nil, err
+	}
+	checkedState := make(map[string]struct{}, len(normalized))
+	for _, authorization := range normalized {
+		if _, checked := checkedState[authorization.PersonalityAgentID]; checked {
+			continue
+		}
+		state, err := gateway.state(context.Background(), authorization.PersonalityAgentID)
+		if err != nil {
+			return nil, fmt.Errorf("validate existing local control runtime state: %w", err)
+		}
+		if state.present && state.LocalControl == nil {
+			return nil, errors.New("existing runtime state is not owned by local control")
+		}
+		checkedState[authorization.PersonalityAgentID] = struct{}{}
 	}
 
 	return &LocalControlServer{
@@ -760,6 +794,14 @@ func validateLocalControlRuntimeState(personalityAgentID string, state runtimeSt
 	if control.Publications == nil || control.CredentialRequests == nil {
 		return errors.New("local control idempotency maps must be present")
 	}
+	if control.Integrity == nil ||
+		control.Integrity.Version != localControlIntegrityVersion ||
+		len(control.Integrity.MAC) != sha256.Size*2 {
+		return errors.New("invalid local control state integrity metadata")
+	}
+	if _, err := hex.DecodeString(control.Integrity.MAC); err != nil {
+		return errors.New("invalid local control state integrity metadata")
+	}
 	if len(control.Publications) > maxLocalControlRecords ||
 		len(control.CredentialRequests) > maxLocalControlRecords {
 		return errors.New("local control idempotency capacity exceeded")
@@ -920,6 +962,9 @@ func (g *DurableGateway) updateLocalControlRuntimeState(
 	if err != nil || !write {
 		return err
 	}
+	if err := g.signLocalControlRuntimeState(&state); err != nil {
+		return fmt.Errorf("sign local control runtime state: %w", err)
+	}
 	if err := validateLocalControlRuntimeState(personalityAgentID, state); err != nil {
 		return fmt.Errorf("validate local control runtime state: %w", err)
 	}
@@ -929,6 +974,111 @@ func (g *DurableGateway) updateLocalControlRuntimeState(
 	}
 	if err := writeFileAtomic(g.statePath(personalityAgentID), raw, 0o600); err != nil {
 		return fmt.Errorf("persist local control runtime state: %w", err)
+	}
+	return nil
+}
+
+func deriveLocalControlIntegrityKey(signingSecret []byte) []byte {
+	mac := hmac.New(sha256.New, signingSecret)
+	_, _ = mac.Write([]byte("sumi-local-control-state-integrity-key/v1"))
+	return mac.Sum(nil)
+}
+
+func (g *DurableGateway) installLocalControlIntegrityKey(key []byte, owners []string) error {
+	if len(key) != sha256.Size {
+		return errors.New("invalid local control integrity key")
+	}
+	g.localControlIntegrityMu.Lock()
+	defer g.localControlIntegrityMu.Unlock()
+	if len(g.localControlIntegrityKey) == 0 {
+		g.localControlIntegrityKey = append([]byte(nil), key...)
+	} else if subtle.ConstantTimeCompare(g.localControlIntegrityKey, key) != 1 {
+		return errors.New("a different local control integrity key is already installed")
+	}
+	if g.localControlOwners == nil {
+		g.localControlOwners = make(map[string]struct{}, len(owners))
+	}
+	for _, personalityAgentID := range owners {
+		g.localControlOwners[personalityAgentID] = struct{}{}
+	}
+	return nil
+}
+
+func (g *DurableGateway) localControlIntegrityKeySnapshot() ([]byte, bool) {
+	g.localControlIntegrityMu.RLock()
+	defer g.localControlIntegrityMu.RUnlock()
+	if len(g.localControlIntegrityKey) == 0 {
+		return nil, false
+	}
+	return append([]byte(nil), g.localControlIntegrityKey...), true
+}
+
+func (g *DurableGateway) localControlOwns(personalityAgentID string) bool {
+	g.localControlIntegrityMu.RLock()
+	defer g.localControlIntegrityMu.RUnlock()
+	_, owns := g.localControlOwners[personalityAgentID]
+	return owns
+}
+
+func localControlStateMAC(key []byte, state runtimeState) ([]byte, error) {
+	if state.LocalControl == nil {
+		return nil, errors.New("local control state is required")
+	}
+	unsignedControl := *state.LocalControl
+	unsignedControl.Integrity = nil
+	unsignedState := state
+	unsignedState.LocalControl = &unsignedControl
+	raw, err := json.Marshal(unsignedState)
+	if err != nil {
+		return nil, fmt.Errorf("encode local control state for integrity: %w", err)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("sumi-local-control-runtime-state/v1"))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(raw)
+	return mac.Sum(nil), nil
+}
+
+func (g *DurableGateway) signLocalControlRuntimeState(state *runtimeState) error {
+	key, ok := g.localControlIntegrityKeySnapshot()
+	if !ok {
+		return errors.New("local control integrity key is not installed")
+	}
+	mac, err := localControlStateMAC(key, *state)
+	if err != nil {
+		return err
+	}
+	state.LocalControl.Integrity = &localControlStateIntegrity{
+		Version: localControlIntegrityVersion,
+		MAC:     hex.EncodeToString(mac),
+	}
+	return nil
+}
+
+func (g *DurableGateway) verifyLocalControlRuntimeStateIntegrity(state runtimeState) error {
+	if state.LocalControl == nil {
+		return nil
+	}
+	key, ok := g.localControlIntegrityKeySnapshot()
+	if !ok {
+		return errors.New("local control integrity key is not installed")
+	}
+	integrity := state.LocalControl.Integrity
+	if integrity == nil ||
+		integrity.Version != localControlIntegrityVersion ||
+		len(integrity.MAC) != sha256.Size*2 {
+		return errors.New("invalid local control state integrity")
+	}
+	actual, err := hex.DecodeString(integrity.MAC)
+	if err != nil || len(actual) != sha256.Size {
+		return errors.New("invalid local control state integrity")
+	}
+	expected, err := localControlStateMAC(key, state)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+		return errors.New("invalid local control state integrity")
 	}
 	return nil
 }

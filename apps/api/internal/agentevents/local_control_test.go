@@ -587,6 +587,41 @@ func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
 				state.LocalControl.CredentialRequests["new-credential"] = record
 			},
 		},
+		{
+			name: "coherent forged ready revision",
+			mutate: func(state *runtimeState) {
+				forged := readyPublication(
+					"forged-ready",
+					localControlTestPAID,
+					8,
+					"boot-b",
+					3,
+					"forged-receipt",
+				)
+				state.LocalControl.Publications[forged.PublicationID] = localPublicationRecord{
+					Request: forged,
+					Ack: LocalRuntimeStateAck{
+						PublicationID:            forged.PublicationID,
+						PersonalityAgentID:       forged.PersonalityAgentID,
+						Generation:               forged.Generation,
+						RPCBootNonce:             forged.RPCBootNonce,
+						Revision:                 4,
+						State:                    forged.State,
+						HydrationReceiptIdentity: cloneStringPointer(forged.HydrationReceiptIdentity),
+					},
+				}
+				state.LocalControl.Revision = 4
+				state.LocalControl.State = LocalRuntimeReady
+				state.LocalControl.Reason = LocalRuntimeHydrated
+				state.HydrationReceiptIdentity = receipt("forged-receipt")
+			},
+		},
+		{
+			name: "integrity metadata removed",
+			mutate: func(state *runtimeState) {
+				state.LocalControl.Integrity = nil
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -632,8 +667,8 @@ func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
 		localControlNextBearer,
 		credentialRequest("new-credential", localControlTestPAID, 8, "boot-b"),
 	)
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("tampered credential metadata was re-signed: status=%d body=%s",
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("tampered credential metadata was not rejected at state load: status=%d body=%s",
 			response.StatusCode, body)
 	}
 	if err := os.WriteFile(path, original, 0o600); err != nil {
@@ -819,6 +854,18 @@ func TestNewLocalControlServerRejectsAmbiguousOrWeakAuthorization(t *testing.T) 
 	if _, err := NewLocalControlServer(gateway, []byte("short"), []LocalRuntimeAuthorization{valid}); err == nil {
 		t.Fatal("weak issuer signing key was accepted")
 	}
+	collidingSecret := []byte("runtime-signing-secret-and-bearer-collision")
+	colliding := valid
+	colliding.BearerToken = string(collidingSecret)
+	if _, err := NewLocalControlServer(
+		gateway,
+		collidingSecret,
+		[]LocalRuntimeAuthorization{valid, colliding},
+	); err == nil {
+		t.Fatal("bearer equal to the decoded token signing secret was accepted")
+	} else if strings.Contains(err.Error(), string(collidingSecret)) {
+		t.Fatal("secret-bearing constructor error exposed the colliding credential")
+	}
 	duplicateBearer := localControlAuthorization(localControlTestBearer, localControlOtherPAID, 1, "boot-other")
 	if _, err := NewLocalControlServer(
 		gateway,
@@ -835,5 +882,97 @@ func TestNewLocalControlServerRejectsAmbiguousOrWeakAuthorization(t *testing.T) 
 		[]LocalRuntimeAuthorization{valid, duplicateEpoch},
 	); err == nil {
 		t.Fatal("one runtime epoch was allowed multiple ambiguous authorizations")
+	}
+}
+
+func TestLocalControlIntegrityKeyInstallIsIdempotentAndFencesUnconfiguredReaders(t *testing.T) {
+	runtimeDir := t.TempDir()
+	store, gateway := openLocalControlTestGateway(t, runtimeDir)
+	authorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
+	_, server := newLocalControlHTTPServer(t, gateway, authorization)
+	startup := startupPublication("startup", localControlTestPAID, 7, "boot-a")
+	response, body := postLocalControl(
+		t,
+		server.URL,
+		LocalRuntimeStatePublishPath,
+		localControlTestBearer,
+		startup,
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("seed signed state: status=%d body=%s", response.StatusCode, body)
+	}
+
+	// Reinstalling the derived key on the same gateway is idempotent.
+	if _, err := NewLocalControlServer(
+		gateway,
+		localControlTestSigningSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("same integrity key was not idempotent: %v", err)
+	}
+	errs := make(chan error, 16)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, err := NewLocalControlServer(
+				gateway,
+				localControlTestSigningSecret,
+				[]LocalRuntimeAuthorization{authorization},
+			)
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			errs <- gateway.VerifyGeneration(context.Background(), localControlTestPAID, 7)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("parallel integrity-key install/read failed: %v", err)
+		}
+	}
+	if err := gateway.PublishRuntimeState(localControlTestPAID, 7, nil); err == nil {
+		t.Fatal("direct publication overwrote a local-control-owned signed state")
+	}
+	if err := gateway.PublishRuntimeState(localControlOtherPAID, 1, nil); err != nil {
+		t.Fatalf("local control affected a non-owned runtime state: %v", err)
+	}
+
+	// A freshly opened gateway cannot expose signed state through generation or
+	// readiness readers before the local control constructor installs its key.
+	unconfigured, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unconfigured.VerifyGeneration(context.Background(), localControlTestPAID, 7); err == nil {
+		t.Fatal("generation reader accepted local control state before key installation")
+	}
+	if ready, err := unconfigured.IsPersonalityAgentReady(context.Background(), localControlTestPAID); err == nil || ready {
+		t.Fatalf("readiness reader accepted local control state before key installation: ready=%v err=%v", ready, err)
+	}
+	if _, err := NewLocalControlServer(
+		unconfigured,
+		localControlTestSigningSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err != nil {
+		t.Fatalf("restart did not install and validate the state key: %v", err)
+	}
+	if err := unconfigured.VerifyGeneration(context.Background(), localControlTestPAID, 7); err != nil {
+		t.Fatalf("generation reader failed after key installation: %v", err)
+	}
+
+	otherSecret := []byte("other-local-control-signing-secret-32-bytes")
+	if _, err := NewLocalControlServer(
+		unconfigured,
+		otherSecret,
+		[]LocalRuntimeAuthorization{authorization},
+	); err == nil {
+		t.Fatal("different local control integrity key replaced the installed key")
+	} else if strings.Contains(err.Error(), string(otherSecret)) {
+		t.Fatal("integrity-key conflict exposed secret material")
 	}
 }

@@ -484,4 +484,12 @@ func TestLocalControlServerFromEnvRejectsPartialOrAmbiguousEnablement(t *testing
 		!strings.Contains(err.Error(), "must match") {
 		t.Fatalf("issuer/verifier audience split was accepted: %v", err)
 	}
+
+	t.Setenv("SUMI_LOCAL_CONTROL_AUDIENCE", "sumi:agent:events")
+	t.Setenv("SUMI_LOCAL_CONTROL_BEARER", string(testTokenSecret))
+	if _, _, err := localControlServerFromEnv(gateway); err == nil {
+		t.Fatal("decoded agent token secret was accepted as the local control bearer")
+	} else if strings.Contains(err.Error(), string(testTokenSecret)) {
+		t.Fatal("secret-separation error exposed the credential value")
+	}
 }

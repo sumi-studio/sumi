@@ -27,6 +27,13 @@ type DurableGateway struct {
 	commands *CommandStore
 	mu       sync.Mutex
 
+	// localControlIntegrityKey is installed exactly once by the explicitly
+	// enabled local control server. A separate mutex keeps state verification
+	// race-free without coupling it to the gateway's event-log lock.
+	localControlIntegrityMu  sync.RWMutex
+	localControlIntegrityKey []byte
+	localControlOwners       map[string]struct{}
+
 	// PollInterval bounds the polling interval used by WaitFor and Live.
 	// A zero value uses the safe default (50ms).
 	PollInterval time.Duration
@@ -685,6 +692,9 @@ func (g *DurableGateway) state(ctx context.Context, personalityAgentID string) (
 	if state.Generation > maxProcessGeneration {
 		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
+	if err := g.verifyLocalControlRuntimeStateIntegrity(state); err != nil {
+		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
+	}
 	if err := validateLocalControlRuntimeState(personalityAgentID, state); err != nil {
 		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
 	}
@@ -1297,6 +1307,9 @@ func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error)
 func (g *DurableGateway) publishRuntimeState(personalityAgentID string, state runtimeState) error {
 	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
 		return err
+	}
+	if g.localControlOwns(personalityAgentID) {
+		return errors.New("direct runtime state publication is disabled while local control owns the registry")
 	}
 	if state.Generation > maxProcessGeneration {
 		return fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
