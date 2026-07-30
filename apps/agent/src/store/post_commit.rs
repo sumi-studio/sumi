@@ -163,9 +163,41 @@ impl PostCommitEpochCapability {
 
 /// Unforgeable proof that EventWriter admission is closed and every admitted
 /// commit finalizer has completed publication through `through`.
+#[derive(Debug)]
 pub(crate) struct EventWriterQuiescence {
     feed: PostCommitFeed,
+    owner: PostCommitDispatcherOwner,
     through: u64,
+}
+
+#[derive(Debug, Default)]
+struct DispatcherOwnerState {
+    proof_issued: bool,
+    proof_consumed: bool,
+}
+
+#[derive(Debug)]
+struct DispatcherOwnerInner {
+    feed: PostCommitFeed,
+    epoch: PostCommitEpochCapability,
+    state: Mutex<DispatcherOwnerState>,
+}
+
+/// Exact one-dispatcher/one-epoch authority used to mint and consume the
+/// orderly EventWriter drain proof.
+#[derive(Clone, Debug)]
+pub(crate) struct PostCommitDispatcherOwner {
+    inner: Arc<DispatcherOwnerInner>,
+}
+
+impl PostCommitDispatcherOwner {
+    fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn owns_epoch(&self, epoch: &PostCommitEpochCapability) -> bool {
+        self.inner.epoch.same_instance(epoch)
+    }
 }
 
 #[derive(Debug)]
@@ -210,9 +242,9 @@ impl PostCommitFeed {
     /// EventWriter's single-writer gate makes consecutive commits contiguous.
     /// The sequences themselves remain in `agent_events`; coalescing only the
     /// wake high-water keeps this path synchronous and O(1) after COMMIT.
-    pub(super) fn publish_exact(&self, seqs: &[u64]) {
+    pub(super) fn publish_exact(&self, seqs: &[u64]) -> Result<()> {
         if seqs.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut state = self
@@ -220,18 +252,18 @@ impl PostCommitFeed {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.invariant_failure.is_some() {
+        if let Some(reason) = state.invariant_failure.as_ref() {
             self.inner.changed.notify_waiters();
-            return;
+            bail!("post-commit feed is failed: {reason}");
         }
 
         let expected_first = match state.published_through.checked_add(1) {
             Some(value) => value,
             None => {
-                state.invariant_failure =
-                    Some("post-commit event sequence high-water overflowed".to_owned());
+                let reason = "post-commit event sequence high-water overflowed".to_owned();
+                state.invariant_failure = Some(reason.clone());
                 self.inner.changed.notify_waiters();
-                return;
+                bail!("{reason}");
             }
         };
         let contiguous = seqs.iter().copied().enumerate().all(|(offset, seq)| {
@@ -241,19 +273,21 @@ impl PostCommitFeed {
                 == Some(seq)
         });
         if seqs.first().copied() != Some(expected_first) || !contiguous {
-            state.invariant_failure = Some(format!(
+            let reason = format!(
                 "post-commit receipt is not the exact next durable sequence range: \
                  published_through={}, receipt={seqs:?}",
                 state.published_through
-            ));
+            );
+            state.invariant_failure = Some(reason.clone());
             self.inner.changed.notify_waiters();
-            return;
+            bail!("{reason}");
         }
         state.published_through = *seqs
             .last()
             .expect("non-empty post-commit receipt has a last sequence");
         drop(state);
         self.inner.changed.notify_waiters();
+        Ok(())
     }
 
     pub(super) fn claim(&self) -> Result<PostCommitReceiver> {
@@ -373,15 +407,12 @@ impl PostCommitFeed {
         Ok(())
     }
 
-    pub(super) fn reconcile_and_quiesce(&self, durable_head: u64) -> Result<EventWriterQuiescence> {
+    pub(super) fn reconcile_authenticated(&self, durable_head: u64) -> Result<()> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(reason) = state.invariant_failure.as_ref() {
-            bail!("post-commit feed is failed: {reason}");
-        }
         if durable_head < state.published_through {
             bail!(
                 "durable event head {durable_head} is behind post-commit publication {}",
@@ -389,17 +420,70 @@ impl PostCommitFeed {
             );
         }
         state.published_through = durable_head;
+        state.invariant_failure = None;
         drop(state);
         self.inner.changed.notify_waiters();
-        Ok(EventWriterQuiescence {
-            feed: self.clone(),
-            through: durable_head,
+        Ok(())
+    }
+
+    pub(super) fn issue_dispatcher_owner(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<PostCommitDispatcherOwner> {
+        epoch.ensure_active()?;
+        Ok(PostCommitDispatcherOwner {
+            inner: Arc::new(DispatcherOwnerInner {
+                feed: self.clone(),
+                epoch: epoch.clone(),
+                state: Mutex::new(DispatcherOwnerState::default()),
+            }),
         })
     }
 
-    pub(super) fn validate_quiescence(&self, proof: EventWriterQuiescence) -> Result<u64> {
+    pub(super) fn mint_quiescence(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+        through: u64,
+    ) -> Result<EventWriterQuiescence> {
+        if !Arc::ptr_eq(&self.inner, &owner.inner.feed.inner) {
+            bail!("post-commit dispatcher owner belongs to another Store instance");
+        }
+        let published = self.snapshot()?;
+        if published != through {
+            bail!(
+                "authenticated event head {through} does not match post-commit high-water {published}"
+            );
+        }
+        let mut state = owner
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.proof_issued {
+            bail!("EventWriter quiescence proof was already issued for this dispatcher");
+        }
+        state.proof_issued = true;
+        Ok(EventWriterQuiescence {
+            feed: self.clone(),
+            owner: owner.clone(),
+            through,
+        })
+    }
+
+    pub(super) fn validate_quiescence(
+        &self,
+        proof: EventWriterQuiescence,
+        owner: &PostCommitDispatcherOwner,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<u64> {
         if !Arc::ptr_eq(&self.inner, &proof.feed.inner) {
             bail!("EventWriter quiescence proof belongs to another Store instance");
+        }
+        if !proof.owner.same_instance(owner) {
+            bail!("EventWriter quiescence proof belongs to another dispatcher");
+        }
+        if !owner.owns_epoch(epoch) {
+            bail!("EventWriter quiescence proof belongs to another runtime epoch");
         }
         let published = self.snapshot()?;
         if published != proof.through {
@@ -408,6 +492,18 @@ impl PostCommitFeed {
                 proof.through
             );
         }
+        let mut owner_state = owner
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owner_state.proof_issued {
+            bail!("EventWriter quiescence proof was not issued by this dispatcher");
+        }
+        if owner_state.proof_consumed {
+            bail!("EventWriter quiescence proof was already consumed");
+        }
+        owner_state.proof_consumed = true;
         Ok(proof.through)
     }
 
@@ -471,20 +567,22 @@ impl Drop for PostCommitReceiver {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
     fn exact_receipts_coalesce_to_one_bounded_high_water() {
         let feed = PostCommitFeed::new(4);
-        feed.publish_exact(&[5, 6]);
-        feed.publish_exact(&[7]);
+        feed.publish_exact(&[5, 6]).unwrap();
+        feed.publish_exact(&[7]).unwrap();
         assert_eq!(feed.published_through().unwrap(), 7);
     }
 
     #[test]
     fn a_gap_fails_the_feed_without_rewriting_durable_state() {
         let feed = PostCommitFeed::new(4);
-        feed.publish_exact(&[6]);
+        feed.publish_exact(&[6]).unwrap_err();
         let error = feed.published_through().unwrap_err();
         assert!(format!("{error:#}").contains("not the exact next durable sequence range"));
     }
@@ -499,17 +597,41 @@ mod tests {
     }
 
     #[test]
-    fn quiescence_proof_is_bound_to_one_exact_feed_high_water() {
+    fn quiescence_proof_is_bound_to_one_exact_dispatcher_owner_and_epoch() {
         let feed = PostCommitFeed::new(4);
-        let other = PostCommitFeed::new(4);
-        let wrong_store = feed.reconcile_and_quiesce(4).unwrap();
-        assert!(other.validate_quiescence(wrong_store).is_err());
+        let owner_a = feed
+            .issue_dispatcher_owner(&PostCommitEpochCapability::unbound_test(
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let owner_b = feed
+            .issue_dispatcher_owner(&PostCommitEpochCapability::unbound_test(
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let proof = feed.mint_quiescence(&owner_a, 4).unwrap();
+        assert!(
+            feed.validate_quiescence(proof, &owner_b, &owner_b.inner.epoch)
+                .is_err()
+        );
+        assert!(
+            feed.mint_quiescence(&owner_a, 4).is_err(),
+            "one dispatcher owner cannot mint a second proof"
+        );
 
-        let stale_boundary = feed.reconcile_and_quiesce(4).unwrap();
-        feed.publish_exact(&[5]);
-        assert!(feed.validate_quiescence(stale_boundary).is_err());
-
-        let exact = feed.reconcile_and_quiesce(5).unwrap();
-        assert_eq!(feed.validate_quiescence(exact).unwrap(), 5);
+        let owner_c = feed
+            .issue_dispatcher_owner(&PostCommitEpochCapability::unbound_test(
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let alien_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+        let proof = feed.mint_quiescence(&owner_c, 4).unwrap();
+        let error = feed
+            .validate_quiescence(proof, &owner_c, &alien_epoch)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("another runtime epoch"),
+            "{error:#}"
+        );
     }
 }

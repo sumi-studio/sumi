@@ -18,8 +18,8 @@ use super::post_commit::{PostCommitAdmissionTarget, PostCommitDispatcherClient};
 use super::session::{DurableEventAdmission, SessionEventDelivery, SessionEventSink};
 use super::{
     CommandCursors, CredentialProvider, DeliveryAuthorization, DeliveryEpoch, DeliveryEpochFailure,
-    DeliveryEpochRuntime, DurableSource, EventCursors, EventSender, GatewayCredential,
-    HydrationLatch, HydrationReady, OutboundFrame,
+    DeliveryEpochRuntime, DeliveryPumpSendOutcome, DurableSource, EventCursors, EventSender,
+    GatewayCredential, HydrationLatch, HydrationReady, OutboundFrame,
 };
 use crate::agent::AgentEvent;
 use crate::gateway::Envelope;
@@ -143,10 +143,16 @@ impl HydrationLatch for T17HydrationLatch {
 /// Real T17 Store adapter used by the T24 supervisor for durable cursors,
 /// catch-up pages, and the DeliveryPump epoch lifecycle.
 #[derive(Clone)]
+struct ActiveDeliveryPump {
+    pump: DeliveryPump,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone)]
 pub struct T17StoreAdapter {
     store: Arc<Store>,
     authorization: Option<DeliveryAuthorization>,
-    pump: Arc<tokio::sync::Mutex<Option<DeliveryPump>>>,
+    pump: Arc<tokio::sync::Mutex<Option<ActiveDeliveryPump>>>,
     durable_fences: DurableFences,
     post_commit_epoch: Option<PostCommitEpochCapability>,
     post_commit_dispatcher: Option<PostCommitDispatcherClient>,
@@ -351,25 +357,26 @@ impl T17StoreAdapter {
                         event,
                     },
                 };
-                let send = sink.send_from_delivery_pump((epoch, outbound));
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
+                match sink
+                    .send_from_delivery_pump_owned((epoch, outbound), &cancel)
+                    .await
+                {
+                    DeliveryPumpSendOutcome::Cancelled => {
                         if let Some(fence) = durable_fence.take() {
                             let _ = fence.send(Err(DurableForwardFailure::Transport));
                         }
                         break;
-                    },
-                    result = send => {
-                        if result.is_err() {
-                            if let Some(fence) = durable_fence.take() {
-                                let _ = fence.send(Err(DurableForwardFailure::Transport));
-                            }
-                            let _ = failure_tx.send(DeliveryEpochFailure::Reconnect(
-                                "supervisor event sink closed".to_owned()
-                            ));
-                            break;
+                    }
+                    DeliveryPumpSendOutcome::Closed => {
+                        if let Some(fence) = durable_fence.take() {
+                            let _ = fence.send(Err(DurableForwardFailure::Transport));
                         }
+                        let _ = failure_tx.send(DeliveryEpochFailure::Reconnect(
+                            "supervisor event sink closed".to_owned(),
+                        ));
+                        break;
+                    }
+                    DeliveryPumpSendOutcome::Sent => {
                         if let Some(fence) = durable_fence.take() {
                             let _ = fence.send(Ok(()));
                         }
@@ -379,9 +386,60 @@ impl T17StoreAdapter {
         })
     }
 
+    async fn cancel_delivery_epoch_if_current(&self, epoch: DeliveryEpoch) -> Result<bool> {
+        let mut slot = self.pump.lock().await;
+        let matched = match slot.as_mut() {
+            None => false,
+            Some(active) if active.pump.epoch().is_none() => {
+                active.cancel.cancel();
+                *slot = None;
+                false
+            }
+            Some(active) if active.pump.invalidate_epoch(epoch) => {
+                active.cancel.cancel();
+                *slot = None;
+                true
+            }
+            Some(_) => false,
+        };
+        let stale_fences = {
+            let mut fences = self.durable_fences.lock().unwrap();
+            let keys: Vec<_> = fences
+                .keys()
+                .copied()
+                .filter(|(fence_epoch, _)| *fence_epoch == epoch.as_u64())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| fences.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(slot);
+        for fence in stale_fences {
+            let _ = fence.send(Err(DurableForwardFailure::Transport));
+        }
+        Ok(matched)
+    }
+
+    async fn cancel_current_delivery_epoch(&self) -> Result<()> {
+        let epoch = self
+            .pump
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.pump.epoch());
+        if let Some(epoch) = epoch {
+            self.cancel_delivery_epoch_if_current(epoch).await?;
+        }
+        Ok(())
+    }
+
     /// Called only by T26's ordered post-commit dispatcher. EventWriter never
     /// awaits this bounded delivery path inside its database transaction.
-    pub(super) async fn admit_ordered_commit(&self, seq: u64) -> Result<DurableEventAdmission> {
+    pub(super) async fn admit_ordered_commit(
+        &self,
+        runtime_epoch: &PostCommitEpochCapability,
+        seq: u64,
+    ) -> Result<DurableEventAdmission> {
         #[cfg(test)]
         let hook = self.durable_admission_hook.lock().unwrap().clone();
         #[cfg(test)]
@@ -395,10 +453,10 @@ impl T17StoreAdapter {
             // slot lock before sweeping fences, so it cannot pass between the
             // epoch proof and ownership of the completion fence.
             let slot = self.pump.lock().await;
-            let Some(pump) = slot.as_ref() else {
+            let Some(active) = slot.as_ref() else {
                 return Ok(DurableEventAdmission::Deferred { after_epoch: None });
             };
-            let Some(reservation) = pump.reserve_durable(seq) else {
+            let Some(reservation) = active.pump.reserve_durable(seq) else {
                 return Ok(DurableEventAdmission::Deferred { after_epoch: None });
             };
             let epoch = reservation.epoch();
@@ -406,7 +464,15 @@ impl T17StoreAdapter {
             #[cfg(test)]
             if let Some(hook) = hook.as_ref() {
                 hook.reserved.notify_one();
-                hook.allow_registration.notified().await;
+                tokio::select! {
+                    biased;
+                    _ = runtime_epoch.cancelled() => {
+                        return Ok(DurableEventAdmission::Deferred {
+                            after_epoch: Some(epoch),
+                        });
+                    }
+                    _ = hook.allow_registration.notified() => {}
+                }
             }
 
             let key = (epoch.as_u64(), seq);
@@ -438,10 +504,26 @@ impl T17StoreAdapter {
         #[cfg(test)]
         if let Some(hook) = hook.as_ref() {
             hook.registered.notify_one();
-            hook.allow_delivery.notified().await;
+            tokio::select! {
+                biased;
+                _ = runtime_epoch.cancelled() => {
+                    return Ok(DurableEventAdmission::Deferred {
+                        after_epoch: Some(epoch),
+                    });
+                }
+                _ = hook.allow_delivery.notified() => {}
+            }
         }
 
-        let delivery = reservation.deliver().await;
+        let mut delivery = Box::pin(reservation.deliver());
+        let delivery = tokio::select! {
+            biased;
+            _ = runtime_epoch.cancelled() => {
+                self.cancel_delivery_epoch_if_current(epoch).await?;
+                delivery.await
+            }
+            result = &mut delivery => result,
+        };
         #[cfg(test)]
         if matches!(&delivery, Ok(DurableDeliveryOutcome::Enqueued))
             && let Some(hook) = hook.as_ref()
@@ -464,7 +546,16 @@ impl T17StoreAdapter {
                 return Err(error);
             }
         }
-        match fence_rx.await {
+        let mut fence_rx = fence_rx;
+        let fence = tokio::select! {
+            biased;
+            _ = runtime_epoch.cancelled() => {
+                self.cancel_delivery_epoch_if_current(epoch).await?;
+                fence_rx.await
+            }
+            result = &mut fence_rx => result,
+        };
+        match fence {
             Ok(Ok(())) => Ok(DurableEventAdmission::Enqueued { epoch }),
             Ok(Err(DurableForwardFailure::Transport)) | Err(_) => {
                 Ok(DurableEventAdmission::Deferred {
@@ -478,7 +569,12 @@ impl T17StoreAdapter {
     /// Deliver an Online-only delta through the same pump/FIFO as durable
     /// notifications. Redaction-only authorization suppresses it in the pump.
     pub(crate) async fn on_volatile(&self, event: crate::agent::AgentEvent) -> Result<()> {
-        let pump = self.pump.lock().await.as_ref().cloned();
+        let pump = self
+            .pump
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.pump.clone());
         let Some(pump) = pump else {
             return Ok(());
         };
@@ -491,7 +587,7 @@ impl T17StoreAdapter {
             .lock()
             .await
             .as_ref()
-            .and_then(DeliveryPump::epoch)
+            .and_then(|active| active.pump.epoch())
     }
 
     #[cfg(test)]
@@ -583,7 +679,12 @@ impl PostCommitAdmissionTarget for T17StoreAdapter {
                 self.store.scope().personality_agent_id,
             );
         }
-        self.admit_ordered_commit(seq).await
+        self.admit_ordered_commit(epoch, seq).await
+    }
+
+    async fn resolve_pending_admission(&self, epoch: &PostCommitEpochCapability) -> Result<()> {
+        <Self as PostCommitAdmissionTarget>::bind_post_commit_epoch(self, epoch)?;
+        self.cancel_current_delivery_epoch().await
     }
 }
 
@@ -740,11 +841,14 @@ impl DurableSource for T17StoreAdapter {
         pump.install_supervised_epoch(epoch, failure_tx.clone());
         let mut slot = self.pump.lock().await;
         if let Some(current) = slot.as_ref()
-            && current.epoch().is_some()
+            && current.pump.epoch().is_some()
         {
             bail!("delivery epoch installed while another epoch is active");
         }
-        *slot = Some(pump);
+        *slot = Some(ActiveDeliveryPump {
+            pump,
+            cancel: cancel.clone(),
+        });
         drop(slot);
         let task = self.start_forwarder(delivery_rx, sink, mode, cancel, failure_tx);
         Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
@@ -755,44 +859,19 @@ impl DurableSource for T17StoreAdapter {
         self.delivery_epoch_invalidations
             .fetch_add(1, Ordering::SeqCst);
 
-        // Keep the lock order identical to durable admission:
-        // pump slot -> pump state -> fence map. Once this slot lock is held no
-        // callback can prove this epoch and register a new fence behind the
-        // invalidation sweep.
-        let mut slot = self.pump.lock().await;
-        let mismatch = match slot.as_mut() {
-            None => false,
-            Some(pump) if pump.epoch().is_none() => {
-                *slot = None;
-                false
-            }
-            Some(pump) if pump.invalidate_epoch(epoch) => {
-                *slot = None;
-                false
-            }
-            Some(_) => true,
-        };
-        let stale_fences = {
-            let mut fences = self.durable_fences.lock().unwrap();
-            let keys: Vec<_> = fences
-                .keys()
-                .copied()
-                .filter(|(fence_epoch, _)| *fence_epoch == epoch.as_u64())
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| fences.remove(&key))
-                .collect::<Vec<_>>()
-        };
-        drop(slot);
-        for fence in stale_fences {
-            let _ = fence.send(Err(DurableForwardFailure::Transport));
-        }
-        if mismatch {
+        let active_epoch = self
+            .pump
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.pump.epoch());
+        if active_epoch.is_some_and(|active| active != epoch) {
             return Err(anyhow!(
                 "T17 DeliveryPump epoch invalidation mismatch for {}",
                 epoch.as_u64()
             ));
         }
+        self.cancel_delivery_epoch_if_current(epoch).await?;
         Ok(())
     }
 
@@ -802,7 +881,7 @@ impl DurableSource for T17StoreAdapter {
             .lock()
             .await
             .as_ref()
-            .cloned()
+            .map(|active| active.pump.clone())
             .context("delivery online barrier has no active pump")?;
         pump.mark_online(epoch)
     }

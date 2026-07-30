@@ -504,6 +504,12 @@ pub struct EventSender {
     online: watch::Receiver<bool>,
 }
 
+enum DeliveryPumpSendOutcome {
+    Sent,
+    Cancelled,
+    Closed,
+}
+
 impl EventSender {
     /// Enqueue `frame` for delivery in `epoch`. The returned future resolves
     /// once the frame has been admitted; it preserves bounded backpressure.
@@ -555,6 +561,30 @@ impl EventSender {
         );
         self.send_with_admission(epoch, frame, Some(pump_admitted_online))
             .await
+    }
+
+    /// Resolve cancellation before obtaining a bounded-lane permit. Once a
+    /// permit is obtained, enqueue and the caller's durable fence completion
+    /// are synchronous with no cancellation point between them.
+    async fn send_from_delivery_pump_owned(
+        &self,
+        (epoch, frame): (DeliveryEpoch, OutboundFrame),
+        cancel: &CancellationToken,
+    ) -> DeliveryPumpSendOutcome {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return DeliveryPumpSendOutcome::Cancelled,
+            permit = self.tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return DeliveryPumpSendOutcome::Closed,
+            }
+        };
+        let pump_admitted_online = matches!(
+            &frame,
+            OutboundFrame::Event { envelope } if envelope.seq.is_none()
+        );
+        permit.send((epoch, pump_admitted_online, frame));
+        DeliveryPumpSendOutcome::Sent
     }
 
     async fn send_with_admission(
@@ -2234,8 +2264,8 @@ mod tests {
     };
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
-        EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome, Store,
-        insert_test_durable_event, user_message_id,
+        EventBatch, EventWrite, EventWriter, EventWriterQuiescence, HydrationOutcome,
+        PostCommitEpochCapability, Store, insert_test_durable_event, user_message_id,
     };
 
     struct TestDigestFactory;
@@ -2810,9 +2840,12 @@ mod tests {
         (bound, dispatcher)
     }
 
-    async fn close_test_post_commit_writer(store: &Arc<Store>) -> EventWriterQuiescence {
+    async fn close_test_post_commit_writer(
+        store: &Arc<Store>,
+        dispatcher: &post_commit::OrderedPostCommitDispatcher,
+    ) -> EventWriterQuiescence {
         EventWriter::new(store.clone())
-            .close_post_commit_admission()
+            .close_post_commit_admission(dispatcher.shutdown_owner())
             .await
             .expect("close the test EventWriter admission boundary")
     }
@@ -7867,7 +7900,11 @@ mod tests {
         insert_test_durable_event(&store, 10, &crate::agent::AgentEvent::TurnStart)
             .await
             .unwrap();
-        adapter.admit_ordered_commit(10).await.unwrap();
+        let post_commit_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+        adapter
+            .admit_ordered_commit(&post_commit_epoch, 10)
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -7978,7 +8015,7 @@ mod tests {
         )
         .await
         .unwrap();
-        store.publish_test_committed_event_receipt(&[1]);
+        store.publish_test_committed_event_receipt(&[1]).unwrap();
         let base_adapter = seams::T17StoreAdapter::new(store.clone());
         let (adapter, dispatcher) =
             bind_test_post_commit_dispatcher(store.clone(), &base_adapter, 1);
@@ -8022,7 +8059,7 @@ mod tests {
         )
         .await
         .unwrap();
-        store.publish_test_committed_event_receipt(&[2]);
+        store.publish_test_committed_event_receipt(&[2]).unwrap();
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
@@ -8074,10 +8111,9 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store).await)
-            .await
-            .unwrap();
+        // This projection-focused fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        drop(dispatcher);
 
         let expected = [first_projection, second_projection]
             .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
@@ -8174,7 +8210,7 @@ mod tests {
         )
         .await
         .unwrap();
-        store.publish_test_committed_event_receipt(&[1]);
+        store.publish_test_committed_event_receipt(&[1]).unwrap();
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
@@ -8232,10 +8268,9 @@ mod tests {
 
         drop(session_writer);
         wait_for_t17_idle(&adapter).await;
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store).await)
-            .await
-            .unwrap();
+        // This projection-focused fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        drop(dispatcher);
 
         assert!(
             serde_json::to_string(&*raw_sent.lock().unwrap())
@@ -8312,7 +8347,7 @@ mod tests {
             insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)
                 .await
                 .unwrap();
-            store.publish_test_committed_event_receipt(&[seq]);
+            store.publish_test_committed_event_receipt(&[seq]).unwrap();
             session_writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
@@ -8366,10 +8401,9 @@ mod tests {
         drop(session_writer);
         drop(session_reader);
         wait_for_t17_idle(&adapter).await;
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store).await)
-            .await
-            .unwrap();
+        // This bounded-replay fixture inserts encrypted rows directly and
+        // intentionally has no authenticated EventWriter head to quiesce.
+        drop(dispatcher);
 
         let delivered: Vec<_> = sent
             .lock()
@@ -8528,10 +8562,8 @@ mod tests {
             .expect("durable frame and ACK send");
 
         base_adapter.set_durable_admission_hook(None);
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store).await)
-            .await
-            .unwrap();
+        let quiescence = close_test_post_commit_writer(&store, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
         pump_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), runtime.join())
             .await
@@ -8735,10 +8767,8 @@ mod tests {
             .expect("durable callback and ACK complete");
 
         adapter.set_durable_admission_hook(None);
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store).await)
-            .await
-            .unwrap();
+        let quiescence = close_test_post_commit_writer(&store, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
         adapter
             .invalidate_delivery_epoch(replacement)
             .await
@@ -8755,8 +8785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emergency_post_commit_dispatcher_drop_preserves_inflight_t17_admission_until_outcome()
-    {
+    async fn emergency_post_commit_dispatcher_drop_resolves_never_drained_t17_admission() {
         let store = Arc::new(
             Store::session_test_store("t26-emergency-fence-cleanup")
                 .await
@@ -8776,7 +8805,7 @@ mod tests {
         };
         let pump_cancel = CancellationToken::new();
         let runtime = adapter
-            .install_delivery_epoch(epoch, 0, events, pump_cancel.child_token())
+            .install_delivery_epoch(epoch, 0, events.clone(), pump_cancel.child_token())
             .await
             .unwrap()
             .expect("delivery epoch installs");
@@ -8788,6 +8817,22 @@ mod tests {
         )
         .unwrap();
 
+        events
+            .send((
+                epoch,
+                OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: None,
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
+                        event: serde_json::json!({
+                            "type": "error",
+                            "message": "lane blocker"
+                        }),
+                    },
+                },
+            ))
+            .await
+            .unwrap();
         assert_eq!(
             EventWriter::new(store.clone())
                 .apply(test_maintenance_batch("emergency-fence"))
@@ -8803,29 +8848,45 @@ mod tests {
             .await
             .expect("dispatcher owns a completion fence");
         assert_eq!(adapter.durable_fence_count(), 1);
+        hook.allow_delivery.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), hook.enqueued.notified())
+            .await
+            .expect("durable frame reaches T17 while the external lane stays full");
 
         drop(dispatcher);
-        tokio::task::yield_now().await;
-        assert_eq!(
-            adapter.durable_fence_count(),
-            1,
-            "owner drop must not cancel a target that may already have enqueued"
-        );
-        hook.allow_delivery.notify_one();
-        let delivered = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("owned T17 admission reaches the external lane")
-            .expect("external lane remains open");
-        assert_eq!(outbound_frame_event_seq(&delivered.2).unwrap(), 1);
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.durable_fence_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("completed durable outcome releases the RAII fence owner");
+        .expect("owner drop force-resolves the T17 fence");
+        let blocker = event_rx
+            .try_recv()
+            .expect("the pre-existing external lane blocker remains queued");
+        assert!(matches!(
+            blocker.2,
+            OutboundFrame::Event {
+                envelope: Envelope { seq: None, .. }
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the cancelled durable frame never reaches the external lane"
+        );
+        let receiver = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(receiver) = store.claim_post_commit_receiver() {
+                    break receiver;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dispatcher drop releases the exclusive receiver claim");
+        drop(receiver);
         assert_eq!(
-            EventWriter::new(store)
+            EventWriter::new(store.clone())
                 .apply(test_maintenance_batch("writer-after-emergency"))
                 .await
                 .unwrap(),
@@ -8886,8 +8947,9 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
+        let post_commit_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
         let error = adapter
-            .admit_ordered_commit(1)
+            .admit_ordered_commit(&post_commit_epoch, 1)
             .await
             .expect_err("invalid durable projection must fail synchronously");
         assert!(
@@ -9381,10 +9443,8 @@ mod tests {
             .expect_err("test cleanup aborts the otherwise idle Session");
         assert!(error.is_cancelled());
         wait_for_t17_idle(&adapter).await;
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store_arc).await)
-            .await
-            .unwrap();
+        let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[tokio::test]
@@ -9615,10 +9675,8 @@ mod tests {
         session_task.abort();
         assert!(session_task.await.unwrap_err().is_cancelled());
         wait_for_t17_idle(&adapter).await;
-        dispatcher
-            .shutdown(close_test_post_commit_writer(&store_arc).await)
-            .await
-            .unwrap();
+        let quiescence = close_test_post_commit_writer(&store_arc, &dispatcher).await;
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[derive(Clone)]

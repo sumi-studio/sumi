@@ -2,11 +2,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,6 +17,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 #[cfg(test)]
 use crate::provider::types::ProviderContextItem;
@@ -50,7 +54,8 @@ use crate::{
 use super::{
     BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer,
     EventWriterQuiescence, InjectionApplication, InjectionBatchSizeInput,
-    InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store, command_payload_digest,
+    InjectionCommandSizeInput, PostCommitDispatcherOwner, PublicProjectionBuilder, Redactor, Store,
+    command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
@@ -1681,6 +1686,101 @@ pub(crate) struct EventWriterAdmissionClosed;
 pub(crate) struct PostCommitPublishHook {
     pub(crate) committed: Arc<tokio::sync::Notify>,
     pub(crate) allow_publication: Arc<tokio::sync::Notify>,
+    pub(crate) return_error: Arc<AtomicBool>,
+    pub(crate) panic: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("EventWriter COMMIT finalizer {kind}: {message}")]
+pub(crate) struct EventWriterFinalizerFailure {
+    kind: &'static str,
+    message: String,
+}
+
+type CommitFinalizerOutcome = std::result::Result<(), Arc<EventWriterFinalizerFailure>>;
+type SharedCommitFinalizer = Shared<BoxFuture<'static, CommitFinalizerOutcome>>;
+
+#[derive(Default)]
+struct CommitFinalizerRegistryState {
+    next_id: u64,
+    pending: Option<(u64, SharedCommitFinalizer)>,
+}
+
+/// Store-shared ownership of the one COMMIT finalizer admitted under
+/// EventWriter's single-writer gate.
+///
+/// The shared future retains the task JoinHandle when the initiating caller is
+/// cancelled. A later writer or orderly close must observe its exact outcome
+/// before it can authenticate and reconcile the Store.
+#[derive(Clone, Default)]
+pub(super) struct CommitFinalizerRegistry {
+    inner: Arc<StdMutex<CommitFinalizerRegistryState>>,
+}
+
+impl CommitFinalizerRegistry {
+    fn register(&self, finalizer: SharedCommitFinalizer) -> Result<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_some() {
+            bail!("EventWriter attempted to replace an unsettled COMMIT finalizer");
+        }
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("EventWriter COMMIT finalizer identity exhausted"))?;
+        let id = state.next_id;
+        state.pending = Some((id, finalizer));
+        Ok(id)
+    }
+
+    fn pending(&self) -> Option<(u64, SharedCommitFinalizer)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clone()
+    }
+
+    fn clear(&self, id: u64) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.pending.as_ref() {
+            Some((pending_id, _)) if *pending_id == id => {
+                state.pending = None;
+                Ok(())
+            }
+            Some((pending_id, _)) => bail!(
+                "EventWriter COMMIT finalizer identity changed: expected {id}, found {pending_id}"
+            ),
+            None => bail!("EventWriter COMMIT finalizer {id} was already cleared"),
+        }
+    }
+}
+
+fn monitor_commit_finalizer(task: tokio::task::JoinHandle<Result<()>>) -> SharedCommitFinalizer {
+    async move {
+        match task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "returned an error",
+                message: format!("{error:#}"),
+            })),
+            Err(error) if error.is_panic() => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "panicked",
+                message: error.to_string(),
+            })),
+            Err(error) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "was cancelled",
+                message: error.to_string(),
+            })),
+        }
+    }
+    .boxed()
+    .shared()
 }
 
 #[derive(Clone)]
@@ -1689,6 +1789,12 @@ struct LifecycleCheckpoint {
     lifecycle: DurableLifecycleState,
     memory_projections: BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
     historical_rows_visited: u64,
+}
+
+impl LifecycleCheckpoint {
+    fn event_head_seq(&self) -> u64 {
+        self.event_head.as_ref().map_or(0, |head| head.last_seq)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1793,11 +1899,22 @@ impl EventWriter {
     /// maintenance, and recovery producers; call this method; pass the proof
     /// to `OrderedPostCommitDispatcher::shutdown`; then invalidate and join
     /// the T17 delivery/runtime epoch.
-    pub(crate) async fn close_post_commit_admission(&self) -> Result<EventWriterQuiescence> {
+    pub(crate) async fn close_post_commit_admission(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+    ) -> Result<EventWriterQuiescence> {
         let mut state = self.gate.lock().await;
         state.admission_open = false;
-        let _finalizers = self.store.event_writer_finalizer().lock_owned().await;
-        self.store.reconcile_post_commit_quiescence().await
+        self.settle_pending_finalizer(&mut state).await?;
+        self.reconcile_authenticated_checkpoint_and_feed(&mut state)
+            .await?;
+        self.store.mint_post_commit_quiescence(
+            owner,
+            state
+                .checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.event_head_seq()),
+        )
     }
 
     #[cfg(test)]
@@ -1808,6 +1925,73 @@ impl EventWriter {
     #[cfg(test)]
     pub(crate) fn test_writer_gate_is_locked(&self) -> bool {
         self.gate.try_lock().is_err()
+    }
+
+    async fn reconcile_authenticated_checkpoint_and_feed(
+        &self,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for reconciliation")?;
+        self.store
+            .reconcile_post_commit_authenticated_head(checkpoint.event_head_seq())
+            .context("failed to reconcile post-commit feed to authenticated event-log head")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn settle_pending_finalizer(&self, state: &mut WriterState) -> Result<()> {
+        let registry = self.store.event_writer_finalizers();
+        let Some((id, finalizer)) = registry.pending() else {
+            return Ok(());
+        };
+        let outcome = finalizer.await;
+        if let Err(error) = self
+            .reconcile_authenticated_checkpoint_and_feed(state)
+            .await
+        {
+            return Err(match outcome {
+                Ok(()) => error.context(format!(
+                    "COMMIT finalizer {id} completed but authenticated reconciliation failed"
+                )),
+                Err(failure) => error.context(format!(
+                    "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                )),
+            });
+        }
+        registry.clear(id)?;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(anyhow::Error::new((*failure).clone())),
+        }
+    }
+
+    async fn finish_registered_finalizer(
+        &self,
+        id: u64,
+        finalizer: SharedCommitFinalizer,
+        next_checkpoint: LifecycleCheckpoint,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let outcome = finalizer.await;
+        match outcome {
+            Ok(()) => {
+                state.checkpoint = Some(next_checkpoint);
+                self.store.event_writer_finalizers().clear(id)
+            }
+            Err(failure) => {
+                self.reconcile_authenticated_checkpoint_and_feed(state)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                        )
+                    })?;
+                self.store.event_writer_finalizers().clear(id)?;
+                Err(anyhow::Error::new((*failure).clone()))
+            }
+        }
     }
 
     /// Build the fixed Invalidate target set for an authenticated Error
@@ -2747,10 +2931,10 @@ impl EventWriter {
         if !state.admission_open {
             return Err(EventWriterAdmissionClosed.into());
         }
-        // A detached COMMIT finalizer from a cancelled caller owns this gate
-        // through checkpoint-independent feed publication. No subsequent
-        // mutation or close reconciliation can race that unknown outcome.
-        let commit_finalizer = self.store.event_writer_finalizer().lock_owned().await;
+        // A cancelled caller can leave one Store-owned COMMIT finalizer. Its
+        // shared outcome and the authenticated database/feed reconciliation
+        // must settle before this mutation can derive N+1.
+        self.settle_pending_finalizer(state).await?;
         self.ensure_checkpoint(state).await?;
         for command in &batch.injected_commands {
             command
@@ -3052,8 +3236,8 @@ impl EventWriter {
         };
         // From this point the database outcome is intentionally unknown to
         // WriterState until the finalizer joins. If the caller is cancelled,
-        // the detached finalizer still owns `commit_finalizer`, commits, and
-        // publishes; the next writer reconstructs its checkpoint afterwards.
+        // the Store registry retains the exact finalizer outcome; the next
+        // writer authenticates and reconciles the database before proceeding.
         state.checkpoint = None;
         #[cfg(test)]
         let publish_hook = state.post_commit_publish_hook.take();
@@ -3063,8 +3247,7 @@ impl EventWriter {
             .map(|(name, _, path)| (name.to_owned(), path.to_path_buf()));
         let finalizer_store = self.store.clone();
         let finalizer_event_seqs = event_seqs.clone();
-        let finalizer = tokio::spawn(async move {
-            let _commit_finalizer = commit_finalizer;
+        let finalizer_task = tokio::spawn(async move {
             transaction
                 .commit()
                 .await
@@ -3077,16 +3260,25 @@ impl EventWriter {
             if let Some(hook) = publish_hook {
                 hook.committed.notify_one();
                 hook.allow_publication.notified().await;
+                if hook.panic.load(AtomicOrdering::SeqCst) {
+                    panic!("injected EventWriter post-COMMIT finalizer panic");
+                }
+                if hook.return_error.load(AtomicOrdering::SeqCst) {
+                    bail!("injected EventWriter post-COMMIT finalizer error");
+                }
             }
             // COMMIT is the durability boundary. Publication is an O(1) wake
             // high-water over the canonical durable FIFO.
-            finalizer_store.publish_committed_event_seqs(&finalizer_event_seqs);
-            Ok::<(), anyhow::Error>(())
+            finalizer_store.publish_committed_event_seqs(&finalizer_event_seqs)
         });
-        finalizer
-            .await
-            .map_err(|error| anyhow!("EventWriter COMMIT finalizer failed to join: {error}"))??;
-        state.checkpoint = Some(next_checkpoint);
+        let finalizer = monitor_commit_finalizer(finalizer_task);
+        let finalizer_id = self
+            .store
+            .event_writer_finalizers()
+            .register(finalizer.clone())
+            .expect("single-writer gate settled the previous COMMIT finalizer");
+        self.finish_registered_finalizer(finalizer_id, finalizer, next_checkpoint, state)
+            .await?;
         Ok(ApplyBatchOutcome {
             seqs: event_seqs,
             receipt_outcome,
@@ -25381,15 +25573,11 @@ mod tests {
             (1..=final_seq).collect::<Vec<_>>(),
             "every producer must enter the one exact durable FIFO"
         );
-        dispatcher
-            .shutdown(
-                EventWriter::new(store.clone())
-                    .close_post_commit_admission()
-                    .await
-                    .unwrap(),
-            )
+        let quiescence = EventWriter::new(store.clone())
+            .close_post_commit_admission(dispatcher.shutdown_owner())
             .await
             .unwrap();
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[cfg(unix)]

@@ -73,7 +73,7 @@ pub(crate) use self::physical_recovery::{
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
 pub(crate) use self::post_commit::{
-    EventWriterQuiescence, PostCommitEpochCapability, PostCommitReceiver,
+    EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
 };
 #[cfg(test)]
 pub(crate) use self::provider_context::{
@@ -99,9 +99,9 @@ pub(crate) use crypto::{
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, ApprovalRuleMutation, BootstrapRecoveryGuard, DurableEvent,
     ErrorContextDisposition, EventBatch, EventWrite, EventWriter, EventWriterAdmissionClosed,
-    InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
-    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
-    MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
+    EventWriterFinalizerFailure, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
     ToolExecutionMutation, user_message_id,
 };
 #[allow(
@@ -415,7 +415,7 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
-    event_writer_finalizer: Arc<Mutex<()>>,
+    event_writer_finalizers: event_writer::CommitFinalizerRegistry,
     post_commit_feed: post_commit::PostCommitFeed,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
@@ -583,7 +583,7 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
-            event_writer_finalizer: Arc::new(Mutex::new(())),
+            event_writer_finalizers: event_writer::CommitFinalizerRegistry::default(),
             post_commit_feed: post_commit::PostCommitFeed::new(0),
             #[cfg(test)]
             _in_memory_anchor: None,
@@ -2096,8 +2096,8 @@ impl Store {
         self.event_writer_state.clone()
     }
 
-    fn event_writer_finalizer(&self) -> Arc<Mutex<()>> {
-        self.event_writer_finalizer.clone()
+    fn event_writer_finalizers(&self) -> event_writer::CommitFinalizerRegistry {
+        self.event_writer_finalizers.clone()
     }
 
     pub(crate) fn claim_post_commit_receiver(&self) -> Result<post_commit::PostCommitReceiver> {
@@ -2130,27 +2130,43 @@ impl Store {
         self.post_commit_feed.validate_epoch_capability(capability)
     }
 
-    async fn reconcile_post_commit_quiescence(&self) -> Result<EventWriterQuiescence> {
-        let durable_head = current_event_head_seq(&self.pool)
-            .await
-            .context("failed to reconcile durable event head during EventWriter close")?;
-        self.post_commit_feed.reconcile_and_quiesce(durable_head)
+    pub(crate) fn issue_post_commit_dispatcher_owner(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<PostCommitDispatcherOwner> {
+        self.validate_post_commit_epoch(epoch)?;
+        self.post_commit_feed.issue_dispatcher_owner(epoch)
+    }
+
+    fn reconcile_post_commit_authenticated_head(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed.reconcile_authenticated(durable_head)
+    }
+
+    fn mint_post_commit_quiescence(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+        through: u64,
+    ) -> Result<EventWriterQuiescence> {
+        self.post_commit_feed.mint_quiescence(owner, through)
     }
 
     pub(crate) fn validate_post_commit_quiescence(
         &self,
         proof: EventWriterQuiescence,
+        owner: &PostCommitDispatcherOwner,
+        epoch: &PostCommitEpochCapability,
     ) -> Result<u64> {
-        self.post_commit_feed.validate_quiescence(proof)
+        self.post_commit_feed
+            .validate_quiescence(proof, owner, epoch)
     }
 
-    fn publish_committed_event_seqs(&self, seqs: &[u64]) {
-        self.post_commit_feed.publish_exact(seqs);
+    fn publish_committed_event_seqs(&self, seqs: &[u64]) -> Result<()> {
+        self.post_commit_feed.publish_exact(seqs)
     }
 
     #[cfg(test)]
-    pub(crate) fn publish_test_committed_event_receipt(&self, seqs: &[u64]) {
-        self.publish_committed_event_seqs(seqs);
+    pub(crate) fn publish_test_committed_event_receipt(&self, seqs: &[u64]) -> Result<()> {
+        self.publish_committed_event_seqs(seqs)
     }
 
     /// Read one bounded exact sequence page from the canonical durable FIFO.
