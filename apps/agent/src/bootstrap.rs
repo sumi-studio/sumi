@@ -63,7 +63,7 @@ struct BootstrapContext {
 }
 
 enum LocalControlEndpoint {
-    Unix(PathBuf),
+    Unix { socket: PathBuf, server_uid: u32 },
     Loopback(String),
 }
 
@@ -131,23 +131,36 @@ fn local_control_endpoint_from_env(
 ) -> Result<LocalControlEndpoint> {
     let unix_socket = optional_value(get, "SUMI_LOCAL_CONTROL_UNIX_SOCKET")?;
     let loopback_url = optional_value(get, "SUMI_LOCAL_CONTROL_URL")?;
-    match (unix_socket, loopback_url) {
-        (Some(socket), None) => {
+    let server_uid = optional_value(get, "SUMI_LOCAL_CONTROL_SERVER_UID")?;
+    match (unix_socket, loopback_url, server_uid) {
+        (Some(socket), None, Some(server_uid)) => {
             let socket = PathBuf::from(socket);
             if !socket.is_absolute() {
                 bail!("SUMI_LOCAL_CONTROL_UNIX_SOCKET must be an absolute path");
             }
-            Ok(LocalControlEndpoint::Unix(socket))
+            let server_uid = server_uid
+                .parse::<u32>()
+                .context("SUMI_LOCAL_CONTROL_SERVER_UID must be a decimal UID")?;
+            Ok(LocalControlEndpoint::Unix { socket, server_uid })
         }
-        (None, Some(url)) => Ok(LocalControlEndpoint::Loopback(url)),
-        (Some(_), Some(_)) => {
+        (Some(_), None, None) => {
+            bail!("SUMI_LOCAL_CONTROL_SERVER_UID is required with SUMI_LOCAL_CONTROL_UNIX_SOCKET")
+        }
+        (None, Some(url), None) => Ok(LocalControlEndpoint::Loopback(url)),
+        (None, Some(_), Some(_)) => {
+            bail!("SUMI_LOCAL_CONTROL_SERVER_UID is only valid with SUMI_LOCAL_CONTROL_UNIX_SOCKET")
+        }
+        (Some(_), Some(_), _) => {
             bail!(
                 "SUMI_LOCAL_CONTROL_UNIX_SOCKET and SUMI_LOCAL_CONTROL_URL are mutually exclusive"
             )
         }
-        (None, None) => bail!(
+        (None, None, None) => bail!(
             "exactly one of SUMI_LOCAL_CONTROL_UNIX_SOCKET or SUMI_LOCAL_CONTROL_URL is required for production bootstrap"
         ),
+        (None, None, Some(_)) => {
+            bail!("SUMI_LOCAL_CONTROL_SERVER_UID requires SUMI_LOCAL_CONTROL_UNIX_SOCKET")
+        }
     }
 }
 
@@ -248,9 +261,12 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
     )
     .context("invalid local-control bearer")?;
     let control_client = match &context.local_control_endpoint {
-        LocalControlEndpoint::Unix(socket) => {
-            LocalControlHttpClient::new_unix(socket, context.authority.clone(), control_credential)
-        }
+        LocalControlEndpoint::Unix { socket, server_uid } => LocalControlHttpClient::new_unix(
+            socket,
+            *server_uid,
+            context.authority.clone(),
+            control_credential,
+        ),
         LocalControlEndpoint::Loopback(url) => {
             LocalControlHttpClient::new_loopback(url, context.authority.clone(), control_credential)
         }
@@ -579,6 +595,7 @@ mod tests {
                 "SUMI_LOCAL_CONTROL_UNIX_SOCKET".to_owned(),
                 "/run/sumi/local-control/control.sock".into(),
             ),
+            ("SUMI_LOCAL_CONTROL_SERVER_UID".to_owned(), "10001".into()),
             (
                 "SUMI_LOCAL_CONTROL_BEARER".to_owned(),
                 "local-control-secret".into(),
@@ -624,6 +641,7 @@ mod tests {
             "SUMI_EXECUTOR_SOCKET",
             "SUMI_GATEWAY_URL",
             "SUMI_LOCAL_CONTROL_UNIX_SOCKET",
+            "SUMI_LOCAL_CONTROL_SERVER_UID",
             "SUMI_LOCAL_CONTROL_BEARER",
             "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
@@ -653,6 +671,7 @@ mod tests {
     fn local_control_transport_rejects_both_or_neither() {
         let mut neither = valid_env();
         neither.remove("SUMI_LOCAL_CONTROL_UNIX_SOCKET");
+        neither.remove("SUMI_LOCAL_CONTROL_SERVER_UID");
         let error = parse(&neither).err().expect("missing transport must fail");
         assert!(error.to_string().contains("exactly one"));
 
@@ -669,6 +688,7 @@ mod tests {
     fn explicit_loopback_local_control_remains_a_developer_option() {
         let mut env = valid_env();
         env.remove("SUMI_LOCAL_CONTROL_UNIX_SOCKET");
+        env.remove("SUMI_LOCAL_CONTROL_SERVER_UID");
         env.insert(
             "SUMI_LOCAL_CONTROL_URL".to_owned(),
             "http://127.0.0.1:4321/".into(),
@@ -678,6 +698,24 @@ mod tests {
             context.local_control_endpoint,
             LocalControlEndpoint::Loopback(_)
         ));
+    }
+
+    #[test]
+    fn unix_local_control_requires_a_decimal_expected_server_uid() {
+        let mut missing = valid_env();
+        missing.remove("SUMI_LOCAL_CONTROL_SERVER_UID");
+        let error = parse(&missing).err().expect("missing server UID must fail");
+        assert!(error.to_string().contains("SUMI_LOCAL_CONTROL_SERVER_UID"));
+
+        let mut malformed = valid_env();
+        malformed.insert(
+            "SUMI_LOCAL_CONTROL_SERVER_UID".to_owned(),
+            "not-a-uid".into(),
+        );
+        let error = parse(&malformed)
+            .err()
+            .expect("malformed server UID must fail");
+        assert!(error.to_string().contains("decimal UID"));
     }
 
     #[test]

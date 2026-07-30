@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -212,6 +215,14 @@ const (
 	maxListenerLockBytes   = 4 * 1024
 )
 
+func localControlCrashFailpoint(name string) {
+	if os.Getenv("SUMI_TEST_LOCAL_CONTROL_CRASH_FAILPOINT") != name {
+		return
+	}
+	_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+	select {}
+}
+
 type localControlListenerConfig struct {
 	unixSocket         string
 	socketGID          int
@@ -418,6 +429,7 @@ func listenTrustedUnixSocket(path string, gid int, personalityAgentID string) (*
 		return nil, err
 	}
 	listener.SetUnlinkOnClose(false)
+	localControlCrashFailpoint("socket-bind-before-metadata")
 	socketInfo, err := os.Lstat(path)
 	if err != nil {
 		_ = listener.Close()
@@ -473,6 +485,14 @@ func acquireListenerOwnership(
 	gid int,
 	personalityAgentID string,
 ) (*listenerOwnershipLock, error) {
+	binding := []byte(fmt.Sprintf(
+		"sumi-local-control-listener-v1\nsocket=%s\npersonality_agent_id=%s\n",
+		socketPath,
+		personalityAgentID,
+	))
+	if len(binding) > maxListenerLockBytes {
+		return nil, errors.New("local control listener ownership binding is too large")
+	}
 	parentFD, err := syscall.Open(
 		parentPath,
 		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
@@ -505,28 +525,47 @@ func acquireListenerOwnership(
 
 	lockName := filepath.Base(socketPath) + ".owner.lock"
 	lockPath := filepath.Join(parentPath, lockName)
-	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
-	lockFD, err := syscall.Openat(parentFD, lockName, flags|syscall.O_CREAT|syscall.O_EXCL, localControlLockMode)
-	created := err == nil
-	if errors.Is(err, syscall.EEXIST) {
-		lockFD, err = syscall.Openat(parentFD, lockName, flags, 0)
+	if err := syscall.Flock(parentFD, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return failParent(errors.New("local control listener bootstrap lock is already held"))
+		}
+		return failParent(fmt.Errorf("acquire local control listener bootstrap lock: %w", err))
 	}
+	bootstrapHeld := true
+	releaseBootstrap := func() error {
+		if !bootstrapHeld {
+			return nil
+		}
+		bootstrapHeld = false
+		return syscall.Flock(parentFD, syscall.LOCK_UN)
+	}
+	failBootstrap := func(cause error) (*listenerOwnershipLock, error) {
+		unlockErr := releaseBootstrap()
+		if unlockErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("release local control listener bootstrap lock: %w", unlockErr))
+		}
+		return failParent(cause)
+	}
+	if err := ensurePublishedListenerLock(
+		parentFD,
+		parentPath,
+		lockName,
+		lockPath,
+		binding,
+		gid,
+	); err != nil {
+		return failBootstrap(err)
+	}
+
+	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	lockFD, err := syscall.Openat(parentFD, lockName, flags, 0)
 	if err != nil {
-		return failParent(fmt.Errorf("open local control listener ownership lock: %w", err))
+		return failBootstrap(fmt.Errorf("open local control listener ownership lock: %w", err))
 	}
 	lock := os.NewFile(uintptr(lockFD), lockPath)
 	failLock := func(cause error) (*listenerOwnershipLock, error) {
 		_ = lock.Close()
-		_ = parent.Close()
-		return nil, cause
-	}
-	if created {
-		if err := syscall.Fchown(lockFD, os.Geteuid(), gid); err != nil {
-			return failLock(fmt.Errorf("set local control listener lock owner: %w", err))
-		}
-		if err := syscall.Fchmod(lockFD, localControlLockMode); err != nil {
-			return failLock(fmt.Errorf("set local control listener lock mode: %w", err))
-		}
+		return failBootstrap(cause)
 	}
 	lockStat, err := validatePinnedLock(lock, lockPath, gid)
 	if err != nil {
@@ -542,20 +581,15 @@ func acquireListenerOwnership(
 		_ = syscall.Flock(lockFD, syscall.LOCK_UN)
 		return failLock(cause)
 	}
+	if err := releaseBootstrap(); err != nil {
+		return failHeldLock(fmt.Errorf("release local control listener bootstrap lock: %w", err))
+	}
 	revalidatedLock, err := validatePinnedLock(lock, lockPath, gid)
 	if err != nil {
 		return failHeldLock(err)
 	}
 	if lockStat.Dev != revalidatedLock.Dev || lockStat.Ino != revalidatedLock.Ino {
 		return failHeldLock(errors.New("local control listener ownership lock changed during acquisition"))
-	}
-	binding := fmt.Sprintf(
-		"sumi-local-control-listener-v1\nsocket=%s\npersonality_agent_id=%s\n",
-		socketPath,
-		personalityAgentID,
-	)
-	if len(binding) > maxListenerLockBytes {
-		return failHeldLock(errors.New("local control listener ownership binding is too large"))
 	}
 	if _, err := lock.Seek(0, io.SeekStart); err != nil {
 		return failHeldLock(fmt.Errorf("seek local control listener ownership lock: %w", err))
@@ -567,17 +601,7 @@ func acquireListenerOwnership(
 	if len(existing) > maxListenerLockBytes {
 		return failHeldLock(errors.New("local control listener ownership lock content is oversized"))
 	}
-	if len(existing) == 0 {
-		if err := lock.Truncate(0); err != nil {
-			return failHeldLock(fmt.Errorf("initialize local control listener ownership lock: %w", err))
-		}
-		if _, err := lock.WriteAt([]byte(binding), 0); err != nil {
-			return failHeldLock(fmt.Errorf("write local control listener ownership lock: %w", err))
-		}
-		if err := lock.Sync(); err != nil {
-			return failHeldLock(fmt.Errorf("sync local control listener ownership lock: %w", err))
-		}
-	} else if string(existing) != binding {
+	if !bytes.Equal(existing, binding) {
 		return failHeldLock(errors.New("local control listener ownership lock is bound to a different socket or personality agent"))
 	}
 
@@ -591,6 +615,283 @@ func acquireListenerOwnership(
 		socketPath: socketPath,
 		socketGID:  gid,
 	}, nil
+}
+
+func ensurePublishedListenerLock(
+	parentFD int,
+	parentPath string,
+	lockName string,
+	lockPath string,
+	binding []byte,
+	gid int,
+) error {
+	if err := cleanupListenerInitializationTemps(
+		parentFD,
+		parentPath,
+		lockName+".init-",
+		binding,
+		gid,
+	); err != nil {
+		return err
+	}
+	_, err := os.Lstat(lockPath)
+	switch {
+	case err == nil:
+		valid, validationErr := publishedListenerLockIsComplete(
+			parentFD,
+			lockName,
+			lockPath,
+			binding,
+			gid,
+		)
+		if validationErr != nil {
+			return validationErr
+		}
+		if valid {
+			return nil
+		}
+		recovered, recoveryErr := recoverListenerInitializationResidue(
+			parentFD,
+			lockName,
+			lockPath,
+			binding,
+			gid,
+		)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		if !recovered {
+			return errors.New("existing local control listener ownership lock is neither complete nor authenticated initialization residue")
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return fmt.Errorf("inspect local control listener ownership lock publication: %w", err)
+	}
+	return publishInitializedListenerLock(
+		parentFD,
+		parentPath,
+		lockName,
+		lockPath,
+		binding,
+		gid,
+	)
+}
+
+func publishedListenerLockIsComplete(
+	parentFD int,
+	lockName string,
+	lockPath string,
+	binding []byte,
+	gid int,
+) (bool, error) {
+	lockFD, err := syscall.Openat(
+		parentFD,
+		lockName,
+		syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return false, fmt.Errorf("open published local control listener ownership lock: %w", err)
+	}
+	lock := os.NewFile(uintptr(lockFD), lockPath)
+	defer lock.Close()
+	if _, err := validatePinnedLock(lock, lockPath, gid); err != nil {
+		return false, nil
+	}
+	content, err := io.ReadAll(io.LimitReader(lock, maxListenerLockBytes+1))
+	if err != nil {
+		return false, fmt.Errorf("read published local control listener ownership lock: %w", err)
+	}
+	return bytes.Equal(content, binding), nil
+}
+
+func publishInitializedListenerLock(
+	parentFD int,
+	parentPath string,
+	lockName string,
+	lockPath string,
+	binding []byte,
+	gid int,
+) error {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("generate local control listener lock initializer name: %w", err)
+	}
+	tempName := lockName + ".init-" + hex.EncodeToString(random)
+	tempPath := filepath.Join(parentPath, tempName)
+	flags := syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	tempFD, err := syscall.Openat(parentFD, tempName, flags, localControlLockMode)
+	if err != nil {
+		return fmt.Errorf("create private local control listener lock initializer: %w", err)
+	}
+	temp := os.NewFile(uintptr(tempFD), tempPath)
+	published := false
+	defer func() {
+		_ = temp.Close()
+		if !published {
+			_ = syscall.Unlinkat(parentFD, tempName)
+		}
+	}()
+	localControlCrashFailpoint("lock-create-before-metadata")
+	if err := syscall.Fchown(tempFD, os.Geteuid(), gid); err != nil {
+		return fmt.Errorf("set local control listener lock initializer owner: %w", err)
+	}
+	if err := syscall.Fchmod(tempFD, localControlLockMode); err != nil {
+		return fmt.Errorf("set local control listener lock initializer mode: %w", err)
+	}
+	if err := validatePrivateListenerInitializer(temp, tempPath, binding, gid, true); err != nil {
+		return err
+	}
+	localControlCrashFailpoint("lock-metadata-before-binding")
+	if _, err := temp.WriteAt(binding, 0); err != nil {
+		return fmt.Errorf("write local control listener lock initializer: %w", err)
+	}
+	if err := temp.Truncate(int64(len(binding))); err != nil {
+		return fmt.Errorf("truncate local control listener lock initializer: %w", err)
+	}
+	localControlCrashFailpoint("lock-binding-before-fsync")
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync local control listener lock initializer: %w", err)
+	}
+	if err := validatePrivateListenerInitializer(temp, tempPath, binding, gid, false); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("local control listener ownership lock appeared during coordinated publication")
+		}
+		return fmt.Errorf("reinspect local control listener ownership lock publication: %w", err)
+	}
+	if err := syscall.Renameat(parentFD, tempName, parentFD, lockName); err != nil {
+		return fmt.Errorf("publish initialized local control listener ownership lock: %w", err)
+	}
+	published = true
+	if err := syscall.Fsync(parentFD); err != nil {
+		return fmt.Errorf("sync local control listener ownership lock directory: %w", err)
+	}
+	return nil
+}
+
+func cleanupListenerInitializationTemps(
+	parentFD int,
+	parentPath string,
+	prefix string,
+	binding []byte,
+	gid int,
+) error {
+	entries, err := os.ReadDir(parentPath)
+	if err != nil {
+		return fmt.Errorf("list local control listener initialization residue: %w", err)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(parentPath, entry.Name())
+		recovered, err := recoverListenerInitializationResidue(
+			parentFD,
+			entry.Name(),
+			path,
+			binding,
+			gid,
+		)
+		if err != nil {
+			return err
+		}
+		if !recovered {
+			return errors.New("untrusted local control listener initialization residue blocks startup")
+		}
+	}
+	return nil
+}
+
+func recoverListenerInitializationResidue(
+	parentFD int,
+	name string,
+	path string,
+	binding []byte,
+	gid int,
+) (bool, error) {
+	fd, err := syscall.Openat(
+		parentFD,
+		name,
+		syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return false, nil
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	if err := validatePrivateListenerInitializer(file, path, binding, gid, true); err != nil {
+		return false, nil
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return false, errors.New("local control listener initialization residue is still live")
+		}
+		return false, fmt.Errorf("lock local control listener initialization residue: %w", err)
+	}
+	defer syscall.Flock(fd, syscall.LOCK_UN)
+	if err := validatePrivateListenerInitializer(file, path, binding, gid, true); err != nil {
+		return false, nil
+	}
+	if err := syscall.Unlinkat(parentFD, name); err != nil {
+		return false, fmt.Errorf("remove authenticated local control listener initialization residue: %w", err)
+	}
+	if err := syscall.Fsync(parentFD); err != nil {
+		return false, fmt.Errorf("sync removal of local control listener initialization residue: %w", err)
+	}
+	return true, nil
+}
+
+func validatePrivateListenerInitializer(
+	file *os.File,
+	path string,
+	binding []byte,
+	gid int,
+	allowPrefix bool,
+) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect local control listener lock initializer: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok ||
+		!info.Mode().IsRegular() ||
+		stat.Nlink != 1 ||
+		int(stat.Uid) != os.Geteuid() ||
+		(int(stat.Gid) != gid && int(stat.Gid) != os.Getegid()) ||
+		info.Mode().Perm()&^os.FileMode(localControlLockMode) != 0 ||
+		info.Size() > int64(len(binding)) {
+		return errors.New("local control listener lock initializer metadata is not authenticated")
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect local control listener lock initializer path: %w", err)
+	}
+	pathStat, ok := pathInfo.Sys().(*syscall.Stat_t)
+	if !ok ||
+		pathInfo.Mode()&os.ModeSymlink != 0 ||
+		pathStat.Dev != stat.Dev ||
+		pathStat.Ino != stat.Ino {
+		return errors.New("local control listener lock initializer path is not pinned")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek local control listener lock initializer: %w", err)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, int64(len(binding))+1))
+	if err != nil {
+		return fmt.Errorf("read local control listener lock initializer: %w", err)
+	}
+	if allowPrefix {
+		if !bytes.HasPrefix(binding, content) {
+			return errors.New("local control listener lock initializer content is not authenticated")
+		}
+	} else if !bytes.Equal(content, binding) {
+		return errors.New("local control listener lock initializer binding is incomplete")
+	}
+	return nil
 }
 
 func validatePinnedLock(lock *os.File, lockPath string, gid int) (syscall.Stat_t, error) {
@@ -694,7 +995,7 @@ func removeTrustedStaleSocket(path string, gid int) error {
 	if err != nil {
 		return fmt.Errorf("inspect existing local control socket: %w", err)
 	}
-	first, err := trustedSocketStat(info, gid)
+	first, err := trustedOrInitializationSocketStat(info, gid)
 	if err != nil {
 		return fmt.Errorf("refuse existing local control socket target: %w", err)
 	}
@@ -710,7 +1011,7 @@ func removeTrustedStaleSocket(path string, gid int) error {
 	if err != nil {
 		return fmt.Errorf("reinspect existing local control socket: %w", err)
 	}
-	second, err := trustedSocketStat(current, gid)
+	second, err := trustedOrInitializationSocketStat(current, gid)
 	if err != nil {
 		return fmt.Errorf("refuse replaced local control socket target: %w", err)
 	}
@@ -721,6 +1022,24 @@ func removeTrustedStaleSocket(path string, gid int) error {
 		return fmt.Errorf("remove trusted stale local control socket: %w", err)
 	}
 	return nil
+}
+
+func trustedOrInitializationSocketStat(info os.FileInfo, gid int) (*syscall.Stat_t, error) {
+	stat, trustedErr := trustedSocketStat(info, gid)
+	if trustedErr == nil {
+		return stat, nil
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok ||
+		info.Mode()&os.ModeSocket == 0 ||
+		info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm() != 0o600 ||
+		stat.Nlink != 1 ||
+		int(stat.Uid) != os.Geteuid() ||
+		(int(stat.Gid) != gid && int(stat.Gid) != os.Getegid()) {
+		return nil, trustedErr
+	}
+	return stat, nil
 }
 
 func validateSocketMetadata(path string, gid int) error {

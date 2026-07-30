@@ -4,8 +4,10 @@
 //! runtime registry. The normal Rust runtime holds only an agent/process-scoped
 //! control credential and receives opaque short-lived Gateway credentials.
 //! Production uses a least-privilege Unix socket; literal loopback HTTP remains
-//! an explicit developer fixture. This local boundary does not replace workload
-//! identity or the central cross-VM issuer/registry tracked by issue #80.
+//! an explicit developer fixture. The mount-provisioned server UID is checked
+//! against both the trusted parent and socket owner. This local boundary does
+//! not replace workload identity or the central cross-VM issuer/registry
+//! tracked by issue #80.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -144,6 +146,7 @@ impl fmt::Debug for LocalControlTransport {
 #[derive(Clone)]
 struct TrustedUnixEndpoint {
     path: PathBuf,
+    expected_server_uid: u32,
     identity: UnixEndpointIdentity,
 }
 
@@ -185,11 +188,12 @@ impl fmt::Debug for LocalControlHttpClient {
 impl LocalControlHttpClient {
     pub(crate) fn new_unix(
         socket_path: impl AsRef<Path>,
+        expected_server_uid: u32,
         authority: RuntimeEpochAuthority,
         credential: LocalControlCredential,
     ) -> Result<Self> {
         credential.validate_at(&authority, SystemTime::now())?;
-        let endpoint = validate_unix_socket_path(socket_path.as_ref())?;
+        let endpoint = validate_unix_socket_path(socket_path.as_ref(), expected_server_uid)?;
         let base_url = reqwest::Url::parse("http://local-control.invalid/")
             .context("construct local control endpoint")?;
         Ok(Self {
@@ -376,7 +380,10 @@ fn build_unix_http_client(path: &Path) -> Result<reqwest::Client> {
         .context("build one-request Unix local control HTTP client")
 }
 
-fn validate_unix_socket_path(value: &Path) -> Result<TrustedUnixEndpoint> {
+fn validate_unix_socket_path(
+    value: &Path,
+    expected_server_uid: u32,
+) -> Result<TrustedUnixEndpoint> {
     if !value.is_absolute() {
         bail!("local control Unix socket path must be absolute");
     }
@@ -389,16 +396,17 @@ fn validate_unix_socket_path(value: &Path) -> Result<TrustedUnixEndpoint> {
     {
         bail!("local control Unix socket path must be lexically clean");
     }
-    let identity = inspect_unix_socket_identity(value)?;
+    let identity = inspect_unix_socket_identity(value, expected_server_uid)?;
     Ok(TrustedUnixEndpoint {
         path: value.to_path_buf(),
+        expected_server_uid,
         identity,
     })
 }
 
 impl TrustedUnixEndpoint {
     fn revalidate(&self) -> Result<()> {
-        let current = inspect_unix_socket_identity(&self.path)?;
+        let current = inspect_unix_socket_identity(&self.path, self.expected_server_uid)?;
         if current != self.identity {
             bail!("local control Unix socket identity changed after client construction");
         }
@@ -406,7 +414,10 @@ impl TrustedUnixEndpoint {
     }
 }
 
-fn inspect_unix_socket_identity(value: &Path) -> Result<UnixEndpointIdentity> {
+fn inspect_unix_socket_identity(
+    value: &Path,
+    expected_server_uid: u32,
+) -> Result<UnixEndpointIdentity> {
     let parent = value
         .parent()
         .context("local control Unix socket must have a parent")?;
@@ -439,6 +450,9 @@ fn inspect_unix_socket_identity(value: &Path) -> Result<UnixEndpointIdentity> {
         || parent_metadata.gid() != socket_metadata.gid()
     {
         bail!("local control Unix socket parent and socket ownership must match");
+    }
+    if parent_metadata.uid() != expected_server_uid {
+        bail!("local control Unix socket owner does not match SUMI_LOCAL_CONTROL_SERVER_UID");
     }
     let euid = unsafe { libc::geteuid() };
     if euid != socket_metadata.uid() && !process_has_group(socket_metadata.gid())? {
@@ -1136,6 +1150,10 @@ mod tests {
 
     fn authority() -> RuntimeEpochAuthority {
         authority_with(PAID, 7, "boot-a")
+    }
+
+    fn current_euid() -> u32 {
+        unsafe { libc::geteuid() }
     }
 
     fn receipt(authority: &RuntimeEpochAuthority) -> HydrationReceiptIdentity {
@@ -1919,7 +1937,13 @@ mod tests {
         )
         .unwrap();
         let control = Arc::new(
-            LocalControlHttpClient::new_unix(&socket_path, expected.clone(), credential).unwrap(),
+            LocalControlHttpClient::new_unix(
+                &socket_path,
+                current_euid(),
+                expected.clone(),
+                credential,
+            )
+            .unwrap(),
         );
         let mut provider = LocalCredentialProvider::new(
             expected.clone(),
@@ -1953,8 +1977,13 @@ mod tests {
             SystemTime::now() + Duration::from_secs(30),
         )
         .unwrap();
-        let client =
-            LocalControlHttpClient::new_unix(&socket_path, expected.clone(), credential).unwrap();
+        let client = LocalControlHttpClient::new_unix(
+            &socket_path,
+            current_euid(),
+            expected.clone(),
+            credential,
+        )
+        .unwrap();
 
         drop(original);
         let old_inode = directory.socket("old-inode.sock");
@@ -2004,14 +2033,40 @@ mod tests {
             .unwrap()
         };
 
+        let wrong_uid_dir = TestSocketDir::new();
+        let wrong_uid_path = wrong_uid_dir.socket("wrong-uid.sock");
+        let _wrong_uid_listener = std::os::unix::net::UnixListener::bind(&wrong_uid_path).unwrap();
+        std::fs::set_permissions(
+            &wrong_uid_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+        let wrong_expected_uid = if current_euid() == u32::MAX {
+            current_euid() - 1
+        } else {
+            current_euid() + 1
+        };
+        let error = LocalControlHttpClient::new_unix(
+            &wrong_uid_path,
+            wrong_expected_uid,
+            expected.clone(),
+            credential(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SUMI_LOCAL_CONTROL_SERVER_UID"));
+
         let wrong_mode_dir = TestSocketDir::new();
         let wrong_mode_path = wrong_mode_dir.socket("wrong-mode.sock");
         let _wrong_mode_listener =
             std::os::unix::net::UnixListener::bind(&wrong_mode_path).unwrap();
         std::fs::set_permissions(&wrong_mode_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error =
-            LocalControlHttpClient::new_unix(&wrong_mode_path, expected.clone(), credential())
-                .unwrap_err();
+        let error = LocalControlHttpClient::new_unix(
+            &wrong_mode_path,
+            current_euid(),
+            expected.clone(),
+            credential(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("mode must be 0660"));
 
         let symlink_dir = TestSocketDir::new();
@@ -2024,8 +2079,13 @@ mod tests {
         .unwrap();
         let linked_path = symlink_dir.socket("linked.sock");
         symlink(&real_path, &linked_path).unwrap();
-        let error = LocalControlHttpClient::new_unix(&linked_path, expected.clone(), credential())
-            .unwrap_err();
+        let error = LocalControlHttpClient::new_unix(
+            &linked_path,
+            current_euid(),
+            expected.clone(),
+            credential(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("real socket"));
 
         let hardlink_dir = TestSocketDir::new();
@@ -2037,9 +2097,13 @@ mod tests {
         )
         .unwrap();
         std::fs::hard_link(&hardlink_path, hardlink_dir.socket("second-link.sock")).unwrap();
-        let error =
-            LocalControlHttpClient::new_unix(&hardlink_path, expected.clone(), credential())
-                .unwrap_err();
+        let error = LocalControlHttpClient::new_unix(
+            &hardlink_path,
+            current_euid(),
+            expected.clone(),
+            credential(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("link count"));
     }
 
