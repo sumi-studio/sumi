@@ -6,6 +6,7 @@ import {
   type DirectChatServerFrame,
   DirectChatSocket,
 } from "../lib/direct-chat-socket";
+import { secureRandomUUID } from "../lib/random-uuid";
 import type {
   ConversationEntry,
   ConversationModel,
@@ -65,8 +66,8 @@ export interface ConversationStoreDependencies {
 export function createConversationStore({
   transport,
   outbox = new PrivateOutbox(),
-  idempotencyKey = () => crypto.randomUUID(),
-  reducerId = () => crypto.randomUUID(),
+  idempotencyKey = secureRandomUUID,
+  reducerId = secureRandomUUID,
 }: ConversationStoreDependencies) {
   let session = createAgentSession();
   let connection: DirectChatConnectionState = "connecting";

@@ -1,4 +1,5 @@
 import type { BrowserEventEnvelope } from "@sumi/api-client";
+import { secureRandomUUID } from "./random-uuid";
 
 export type DirectChatCommand =
   | { type: "abort" }
@@ -911,7 +912,7 @@ export class DirectChatSocket {
     };
   }
 
-  sendCommand(command: unknown, idempotencyKey = crypto.randomUUID()): boolean {
+  sendCommand(command: unknown, idempotencyKey = secureRandomUUID()): boolean {
     if (
       !isDirectChatCommand(command) ||
       !idempotencyKey ||

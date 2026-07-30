@@ -11,6 +11,7 @@ import type {
   ToolCall,
 } from "@sumi/api-client";
 import { parseCatalogSduiNode } from "@sumi/sdui";
+import { secureRandomUUID } from "../lib/random-uuid";
 import type {
   AgentRun,
   AgentTraceEvent,
@@ -74,7 +75,7 @@ export function createAgentSession(
 export function reduceEnvelope(
   current: AgentSession,
   envelope: BrowserEventEnvelope,
-  context: ReducerContext = { id: () => crypto.randomUUID() },
+  context: ReducerContext = { id: secureRandomUUID },
 ): ReduceEnvelopeResult {
   if ("seq" in envelope && envelope.seq <= current.lastDurableSeq) {
     return { kind: "ignored", session: current };
