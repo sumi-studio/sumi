@@ -67,6 +67,9 @@ pub(crate) struct DurableAdmissionHook {
     pub(crate) delivery_channel_capacity: Option<usize>,
     pub(crate) forwarder_paused: Arc<Notify>,
     pub(crate) allow_forwarder_receive: Arc<Notify>,
+    pub(crate) pause_after_post_commit_delivery_cancel: bool,
+    pub(crate) post_commit_delivery_cancelled: Arc<Notify>,
+    pub(crate) allow_post_commit_delivery_cancel_return: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -473,6 +476,19 @@ impl T17StoreAdapter {
             .and_then(|active| active.pump.epoch());
         if let Some(epoch) = epoch {
             self.cancel_delivery_epoch_if_current(epoch).await?;
+        }
+        #[cfg(test)]
+        {
+            let hook = self.durable_admission_hook.lock().unwrap().clone();
+            if let Some(hook) = hook
+                .as_ref()
+                .filter(|hook| hook.pause_after_post_commit_delivery_cancel)
+            {
+                hook.post_commit_delivery_cancelled.notify_one();
+                hook.allow_post_commit_delivery_cancel_return
+                    .notified()
+                    .await;
+            }
         }
         Ok(())
     }

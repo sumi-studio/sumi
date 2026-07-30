@@ -2879,6 +2879,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_runtime_cancels_live_supervisor_before_orderly_post_commit_teardown() {
+        let fixture = crate::gateway::supervisor::bootstrap_finish_runtime_fixture().await;
+        let crate::gateway::supervisor::BootstrapFinishRuntimeFixture {
+            post_commit,
+            supervisor_runtime,
+            gateway,
+            observer,
+        } = fixture;
+        let finish = tokio::spawn(finish_runtime(
+            Ok(()),
+            post_commit,
+            supervisor_runtime,
+            false,
+        ));
+
+        observer.hold_post_commit_until_supervisor_settles().await;
+        tokio::time::timeout(Duration::from_secs(1), finish)
+            .await
+            .expect("production finish_runtime must remain bounded")
+            .expect("finish_runtime task must retain ownership")
+            .expect("planned DeliveryPump shutdown must not become a fatal supervisor error");
+        drop(gateway);
+        observer.assert_finished_contract().await;
+    }
+
+    #[tokio::test]
     async fn required_runtime_exit_aborts_and_joins_real_store_blocked_session_start() {
         let context = parse(&valid_env()).expect("runtime context");
         let store = Store::session_test_store(PAID)

@@ -351,6 +351,13 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Invalidate the exact delivery epoch and close every source-owned
+    /// failure-report producer for it before returning `Ok(())`.
+    ///
+    /// The corresponding [`DeliveryEpochRuntime`] task may own one final
+    /// producer until it is joined. This producer-closing contract lets the
+    /// supervisor invalidate, join, and then drain the failure receiver
+    /// without racing a late source-owned terminal report.
     async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
         Ok(())
     }
@@ -381,6 +388,20 @@ pub(crate) enum DeliveryEpochFailure {
     Fatal(String),
 }
 
+enum DeliveryTaskTerminal {
+    AlreadyObserved,
+    Clean,
+    Cancelled,
+    Panicked(String),
+    JoinError(String),
+}
+
+struct DeliveryEpochSettlement {
+    task_terminal: DeliveryTaskTerminal,
+    first_fatal: Option<String>,
+    first_reconnect: Option<String>,
+}
+
 enum DeliveryEpochCompletion {
     /// The delivery pump itself reported a recoverable channel failure.
     Reported(DeliveryEpochFailure),
@@ -393,7 +414,7 @@ enum DeliveryEpochCompletion {
 }
 
 impl DeliveryEpochCompletion {
-    fn into_supervisor_error(self) -> Option<SupervisorError> {
+    fn into_supervisor_error(self, later_report_queued: bool) -> Option<SupervisorError> {
         match self {
             Self::Reported(DeliveryEpochFailure::Reconnect(reason)) => {
                 Some(SupervisorError::EstablishedReconnect {
@@ -404,9 +425,11 @@ impl DeliveryEpochCompletion {
             Self::Reported(DeliveryEpochFailure::Fatal(reason)) => Some(SupervisorError::Fatal(
                 anyhow!("delivery epoch failed permanently: {reason}"),
             )),
+            Self::FailureChannelClosed if later_report_queued => None,
             Self::FailureChannelClosed => Some(SupervisorError::Fatal(anyhow!(
                 "delivery epoch failure channel closed without a terminal signal"
             ))),
+            Self::Task(Ok(())) if later_report_queued => None,
             Self::Task(Ok(())) => Some(SupervisorError::Fatal(anyhow!(
                 "delivery epoch task ended without a terminal signal"
             ))),
@@ -467,6 +490,42 @@ impl DeliveryEpochRuntime {
         match self.task.take() {
             Some(task) => task.await,
             None => Ok(()),
+        }
+    }
+
+    /// Join the retained task and fully drain terminal reports after exact
+    /// source invalidation has closed every non-task-owned producer.
+    async fn settle_after_invalidation(mut self) -> DeliveryEpochSettlement {
+        let task_terminal = match self.task.take() {
+            None => DeliveryTaskTerminal::AlreadyObserved,
+            Some(task) => match task.await {
+                Ok(()) => DeliveryTaskTerminal::Clean,
+                Err(join_err) if join_err.is_panic() => {
+                    DeliveryTaskTerminal::Panicked(join_err.to_string())
+                }
+                Err(join_err) if join_err.is_cancelled() => DeliveryTaskTerminal::Cancelled,
+                Err(join_err) => DeliveryTaskTerminal::JoinError(join_err.to_string()),
+            },
+        };
+        let mut first_fatal = None;
+        let mut first_reconnect = None;
+        loop {
+            match self.failure_rx.try_recv() {
+                Ok(DeliveryEpochFailure::Fatal(reason)) => {
+                    first_fatal.get_or_insert(reason);
+                }
+                Ok(DeliveryEpochFailure::Reconnect(reason)) => {
+                    first_reconnect.get_or_insert(reason);
+                }
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        DeliveryEpochSettlement {
+            task_terminal,
+            first_fatal,
+            first_reconnect,
         }
     }
 }
@@ -740,6 +799,15 @@ impl SupervisorRuntime {
         self.lifecycle.cancel.cancel();
     }
 
+    #[cfg(test)]
+    pub(crate) fn task_observer_for_test(&self) -> tokio::task::AbortHandle {
+        self.lifecycle
+            .task
+            .as_ref()
+            .expect("live supervisor test owner retains its task")
+            .abort_handle()
+    }
+
     pub(crate) async fn termination(&mut self) -> Result<SupervisorTermination> {
         let joined = self
             .lifecycle
@@ -844,6 +912,10 @@ where
     /// a full command channel.
     #[cfg(test)]
     command_send_blocked_notify: Option<Arc<Notify>>,
+    /// Deterministic both-ready settlement seam: wait until the reader future
+    /// has returned before polling the epoch select.
+    #[cfg(test)]
+    wait_for_reader_before_epoch_select: bool,
 }
 
 impl<C, P, S, L> ConnectionSupervisor<C, P, S, L>
@@ -875,12 +947,20 @@ where
             cancel: CancellationToken::new(),
             #[cfg(test)]
             command_send_blocked_notify: None,
+            #[cfg(test)]
+            wait_for_reader_before_epoch_select: false,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_command_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
         self.command_send_blocked_notify = Some(notify);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_reader_ready_before_epoch_select(mut self) -> Self {
+        self.wait_for_reader_before_epoch_select = true;
         self
     }
 
@@ -1161,7 +1241,7 @@ where
 
         #[cfg(test)]
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
-        let mut reader_handle = tokio::spawn(reader_task(
+        let reader_run = reader_task(
             reader,
             commands_tx,
             self.latch.clone(),
@@ -1170,12 +1250,30 @@ where
             epoch_token.child_token(),
             #[cfg(test)]
             command_send_blocked_notify,
-        ));
+        );
+        #[cfg(test)]
+        let reader_completed = Arc::new(Notify::new());
+        #[cfg(test)]
+        let task_reader_completed = reader_completed.clone();
+        #[cfg(not(test))]
+        let mut reader_handle = tokio::spawn(reader_run);
+        #[cfg(test)]
+        let mut reader_handle = tokio::spawn(async move {
+            let result = reader_run.await;
+            task_reader_completed.notify_one();
+            result
+        });
+        #[cfg(test)]
+        if self.wait_for_reader_before_epoch_select {
+            reader_completed.notified().await;
+        }
 
         let mut delivery_completion = None;
+        let mut planned_shutdown = false;
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                planned_shutdown = true;
                 epoch_token.cancel();
                 let _ = self.online.send(false);
                 let reader_result = reader_handle.await;
@@ -1236,40 +1334,90 @@ where
             }
         };
 
-        let delivery_join_error = if let Some(runtime) = delivery_runtime {
-            match runtime.join().await {
-                Ok(()) => None,
-                Err(join_err) if join_err.is_panic() => Some(SupervisorError::Fatal(anyhow!(
-                    "delivery epoch task panicked: {join_err}"
-                ))),
-                Err(join_err) if !join_err.is_cancelled() => Some(SupervisorError::Fatal(anyhow!(
-                    "delivery epoch task join error: {join_err}"
-                ))),
-                Err(_) => None,
-            }
+        // Exact invalidation closes every source-owned failure producer. Join
+        // the retained runtime task next, then fully drain its receiver. This
+        // ordering prevents every select branch (root, reader, writer, or
+        // delivery) from erasing a terminal report that was queued while two
+        // branches were simultaneously ready.
+        let invalidation_error = source
+            .invalidate_delivery_epoch(delivery_epoch)
+            .await
+            .err()
+            .map(|error| {
+                error.context(format!(
+                    "failed to invalidate T17 delivery epoch {}",
+                    delivery_epoch.as_u64()
+                ))
+            });
+        let settlement = if let Some(runtime) = delivery_runtime {
+            runtime.settle_after_invalidation().await
         } else {
-            None
+            DeliveryEpochSettlement {
+                task_terminal: DeliveryTaskTerminal::AlreadyObserved,
+                first_fatal: None,
+                first_reconnect: None,
+            }
+        };
+        let DeliveryEpochSettlement {
+            task_terminal,
+            first_fatal,
+            first_reconnect,
+        } = settlement;
+        let task_fatal = match task_terminal {
+            DeliveryTaskTerminal::Panicked(reason) => {
+                Some(anyhow!("delivery epoch task panicked: {reason}"))
+            }
+            DeliveryTaskTerminal::JoinError(reason) => {
+                Some(anyhow!("delivery epoch task join error: {reason}"))
+            }
+            DeliveryTaskTerminal::AlreadyObserved
+            | DeliveryTaskTerminal::Clean
+            | DeliveryTaskTerminal::Cancelled => None,
+        };
+        let queued_fatal =
+            first_fatal.map(|reason| anyhow!("delivery epoch failed permanently: {reason}"));
+        let (result_fatal, branch_result) = match result {
+            Err(SupervisorError::Fatal(error)) => (Some(error), Ok(())),
+            result => (None, result),
+        };
+        let delivery_branch = delivery_completion.is_some();
+        let later_report_queued = queued_fatal.is_some() || first_reconnect.is_some();
+        let completion_error = delivery_completion
+            .and_then(|completion| completion.into_supervisor_error(later_report_queued));
+        let (completion_fatal, completion_nonfatal) = match completion_error {
+            Some(SupervisorError::Fatal(error)) => (Some(error), None),
+            error => (None, error),
         };
 
-        if let Err(error) = source.invalidate_delivery_epoch(delivery_epoch).await {
-            return Err(SupervisorError::Fatal(error.context(format!(
-                "failed to invalidate T17 delivery epoch {}",
-                delivery_epoch.as_u64()
-            ))));
-        }
-        if let Some(error) = delivery_join_error {
-            return Err(error);
-        }
-        if matches!(&result, Err(SupervisorError::Fatal(_))) {
-            return result;
-        }
-        if let Some(completion) = delivery_completion
-            && let Some(error) = completion.into_supervisor_error()
-        {
-            return Err(error);
+        let mut fatal = invalidation_error;
+        fatal = combine_epoch_fatal(fatal, task_fatal, "delivery task settlement also failed");
+        fatal = combine_epoch_fatal(fatal, result_fatal, "epoch branch also failed");
+        fatal = combine_epoch_fatal(
+            fatal,
+            completion_fatal,
+            "observed delivery completion also failed",
+        );
+        fatal = combine_epoch_fatal(fatal, queued_fatal, "queued delivery report also failed");
+        if let Some(error) = fatal {
+            return Err(SupervisorError::Fatal(error));
         }
 
-        if let Err(SupervisorError::EstablishedReconnect { .. }) = &result {
+        if planned_shutdown {
+            return branch_result;
+        }
+        if delivery_branch {
+            if let Some(error) = completion_nonfatal {
+                return Err(error);
+            }
+            if let Some(reason) = first_reconnect {
+                return Err(SupervisorError::EstablishedReconnect {
+                    reason: format!("delivery epoch failed: {reason}"),
+                    healthy: false,
+                });
+            }
+        }
+
+        if let Err(SupervisorError::EstablishedReconnect { .. }) = &branch_result {
             tracing::debug!(
                 connection_epoch = connection_epoch.as_u64(),
                 delivery_epoch = delivery_epoch.as_u64(),
@@ -1277,7 +1425,7 @@ where
             );
         }
 
-        result
+        branch_result
     }
 
     fn inspect_epoch_results<F>(
@@ -1500,6 +1648,21 @@ enum SupervisorError {
     Fatal(anyhow::Error),
     Reconnect { reason: String },
     EstablishedReconnect { reason: String, healthy: bool },
+}
+
+fn combine_epoch_fatal(
+    primary: Option<anyhow::Error>,
+    secondary: Option<anyhow::Error>,
+    secondary_label: &'static str,
+) -> Option<anyhow::Error> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (Some(primary), Some(secondary)) => {
+            Some(anyhow!("{primary:#}; {secondary_label}: {secondary:#}"))
+        }
+    }
 }
 
 /// A permanent inconsistency in the local durable replay source.
@@ -2430,6 +2593,9 @@ impl HydrationLatch for WatchHydrationLatch {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{BootstrapFinishRuntimeFixture, bootstrap_finish_runtime_fixture};
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
@@ -2815,6 +2981,117 @@ mod tests {
 
         async fn command_cursors(&self) -> Result<CommandCursors> {
             Ok(self.command_cursor)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BothReadyDeliveryOutcome {
+        FatalBeforeRootCancellation,
+        FatalBeforeReaderCompletion,
+        FatalAndPanicBeforeRootCancellation,
+        ReconnectBeforeRootCancellation,
+        CleanAfterRootCancellation,
+    }
+
+    #[derive(Clone)]
+    struct BothReadyDeliverySource {
+        outcome: BothReadyDeliveryOutcome,
+        installs: Arc<AtomicU64>,
+        invalidations: Arc<AtomicU64>,
+        install_entered: Arc<Notify>,
+        task_settled: Arc<Notify>,
+        trigger_report: Arc<Notify>,
+        release_install: Arc<Notify>,
+    }
+
+    impl BothReadyDeliverySource {
+        fn new(outcome: BothReadyDeliveryOutcome) -> Self {
+            Self {
+                outcome,
+                installs: Arc::new(AtomicU64::new(0)),
+                invalidations: Arc::new(AtomicU64::new(0)),
+                install_entered: Arc::new(Notify::new()),
+                task_settled: Arc::new(Notify::new()),
+                trigger_report: Arc::new(Notify::new()),
+                release_install: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for BothReadyDeliverySource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            Ok(EventCursors::default())
+        }
+
+        async fn events_after(&self, _after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            Ok(Vec::new())
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(CommandCursors::default())
+        }
+
+        async fn install_delivery_epoch(
+            &self,
+            _epoch: DeliveryEpoch,
+            _catch_up_from_seq: u64,
+            _sink: EventSender,
+            cancel: CancellationToken,
+        ) -> Result<Option<DeliveryEpochRuntime>> {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+            let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+            let outcome = self.outcome;
+            let trigger_report = self.trigger_report.clone();
+            let task_settled = self.task_settled.clone();
+            let task = tokio::spawn(async move {
+                match outcome {
+                    BothReadyDeliveryOutcome::FatalBeforeRootCancellation
+                    | BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Fatal(
+                                "fatal queued before supervisor settlement".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                    }
+                    BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Reconnect(
+                                "recoverable report queued before planned shutdown".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                    }
+                    BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation => {
+                        trigger_report.notified().await;
+                        failure_tx
+                            .send(DeliveryEpochFailure::Fatal(
+                                "fatal queued alongside delivery task panic".to_owned(),
+                            ))
+                            .expect("supervisor retains the delivery failure receiver");
+                        task_settled.notify_one();
+                        panic!("delivery task panicked before planned root cancellation");
+                    }
+                    BothReadyDeliveryOutcome::CleanAfterRootCancellation => {
+                        cancel.cancelled().await;
+                    }
+                }
+                if !matches!(
+                    outcome,
+                    BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation
+                ) {
+                    task_settled.notify_one();
+                }
+            });
+            self.install_entered.notify_one();
+            self.release_install.notified().await;
+            Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+        }
+
+        async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -3248,6 +3525,82 @@ mod tests {
         }
     }
 
+    async fn run_both_ready_delivery_outcome(
+        outcome: BothReadyDeliveryOutcome,
+    ) -> (
+        Result<()>,
+        BothReadyDeliverySource,
+        Arc<AtomicU64>,
+        Arc<Mutex<Vec<AgentHello>>>,
+    ) {
+        let source = BothReadyDeliverySource::new(outcome);
+        let credentials = CountingCredentialProvider::new("both-ready");
+        let connect_attempts = credentials.counter.clone();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let commands = match outcome {
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                VecDeque::from([Err(anyhow::Error::new(GatewayClosed))])
+            }
+            _ => VecDeque::new(),
+        };
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(commands))]),
+            ),
+            credentials,
+            source.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "both-ready-delivery".to_owned(),
+            }),
+            make_config(),
+        );
+        let supervisor = if matches!(
+            outcome,
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion
+        ) {
+            supervisor.with_reader_ready_before_epoch_select()
+        } else {
+            supervisor
+        };
+        let handle = supervisor.start();
+
+        tokio::time::timeout(Duration::from_secs(1), source.install_entered.notified())
+            .await
+            .expect("delivery install must reach the pre-select barrier");
+        match outcome {
+            BothReadyDeliveryOutcome::FatalBeforeRootCancellation
+            | BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation
+            | BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation => {
+                source.trigger_report.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("delivery report must be queued before root cancellation");
+                handle.abort();
+                source.release_install.notify_one();
+            }
+            BothReadyDeliveryOutcome::FatalBeforeReaderCompletion => {
+                source.trigger_report.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("fatal delivery report must be queued before reader completion");
+                source.release_install.notify_one();
+            }
+            BothReadyDeliveryOutcome::CleanAfterRootCancellation => {
+                handle.abort();
+                source.release_install.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), source.task_settled.notified())
+                    .await
+                    .expect("delivery task must exit cleanly from root cancellation");
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("both-ready supervisor settlement must remain bounded");
+        (result, source, connect_attempts, sent_hellos)
+    }
+
     async fn wait_for_t17_idle(adapter: &seams::T17StoreAdapter) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.active_delivery_epoch().await.is_some() {
@@ -3621,6 +3974,7 @@ mod tests {
 
             async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
                 self.invalidations.fetch_add(1, Ordering::SeqCst);
+                self.failure_tx.lock().unwrap().take();
                 Ok(())
             }
         }
@@ -3704,6 +4058,7 @@ mod tests {
 
             async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
                 self.invalidations.fetch_add(1, Ordering::SeqCst);
+                self.failure_tx.lock().unwrap().take();
                 Ok(())
             }
         }
@@ -3742,6 +4097,94 @@ mod tests {
         );
         assert_eq!(installs.load(Ordering::SeqCst), 1);
         assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_preserves_a_fatal_report_queued_before_root_cancellation() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::FatalBeforeRootCancellation)
+                .await;
+
+        let error = result.expect_err("a preexisting permanent delivery failure must stay fatal");
+        assert!(
+            format!("{error:#}").contains("fatal queued before supervisor settlement"),
+            "queued fatal provenance must survive planned settlement: {error:#}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_combines_a_ready_task_panic_and_queued_fatal() {
+        let (result, source, connect_attempts, sent_hellos) = run_both_ready_delivery_outcome(
+            BothReadyDeliveryOutcome::FatalAndPanicBeforeRootCancellation,
+        )
+        .await;
+
+        let error = result.expect_err("a preexisting delivery task panic must stay fatal");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("delivery task panicked before planned root cancellation"),
+            "delivery task panic provenance must survive planned settlement: {error}"
+        );
+        assert!(
+            error.contains("fatal queued alongside delivery task panic"),
+            "queued fatal must still be drained after task panic: {error}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reader_completion_preserves_an_already_queued_delivery_fatal() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::FatalBeforeReaderCompletion)
+                .await;
+
+        let error = result.expect_err("reader completion must not erase a queued delivery fatal");
+        assert!(
+            format!("{error:#}").contains("fatal queued before supervisor settlement"),
+            "queued delivery fatal provenance must survive reader cleanup: {error:#}"
+        );
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_suppresses_a_queued_reconnect_without_reconnecting() {
+        let (result, source, connect_attempts, sent_hellos) = run_both_ready_delivery_outcome(
+            BothReadyDeliveryOutcome::ReconnectBeforeRootCancellation,
+        )
+        .await;
+
+        result.expect("planned shutdown must suppress a queued recoverable report");
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connect_attempts.load(Ordering::SeqCst),
+            1,
+            "root cancellation must prevent reconnect"
+        );
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planned_shutdown_accepts_delivery_task_clean_exit_caused_by_root_cancellation() {
+        let (result, source, connect_attempts, sent_hellos) =
+            run_both_ready_delivery_outcome(BothReadyDeliveryOutcome::CleanAfterRootCancellation)
+                .await;
+
+        result.expect("root-cancellation-induced delivery exit must be planned success");
+        assert_eq!(source.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
         assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(sent_hellos.lock().unwrap().len(), 1);
     }
@@ -8553,8 +8996,86 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn supervisor_first_orderly_post_commit_shutdown_is_not_fatal() {
+    pub(crate) struct BootstrapFinishRuntimeFixture {
+        pub(crate) post_commit: post_commit::ProductionPostCommitRuntime,
+        pub(crate) supervisor_runtime: SupervisorRuntime,
+        pub(crate) gateway: session::SessionGateway,
+        pub(crate) observer: BootstrapFinishRuntimeObserver,
+    }
+
+    pub(crate) struct BootstrapFinishRuntimeObserver {
+        store: Arc<Store>,
+        adapter: seams::T17StoreAdapter,
+        hook: seams::DurableAdmissionHook,
+        supervisor_task: tokio::task::AbortHandle,
+        connect_attempts: Arc<AtomicU64>,
+        sent_hellos: Arc<Mutex<Vec<AgentHello>>>,
+    }
+
+    impl BootstrapFinishRuntimeObserver {
+        pub(crate) async fn hold_post_commit_until_supervisor_settles(&self) {
+            let barrier = tokio::time::timeout(
+                Duration::from_secs(1),
+                self.hook.post_commit_delivery_cancelled.notified(),
+            )
+            .await;
+            if barrier.is_err() {
+                self.hook
+                    .allow_post_commit_delivery_cancel_return
+                    .notify_one();
+                panic!("production post-commit teardown must reach its cancellation barrier");
+            }
+
+            let settled = tokio::time::timeout(Duration::from_secs(1), async {
+                while !self.supervisor_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            self.hook
+                .allow_post_commit_delivery_cancel_return
+                .notify_one();
+            settled.expect("supervisor must settle while post-commit teardown remains retained");
+        }
+
+        pub(crate) async fn assert_finished_contract(&self) {
+            assert_eq!(
+                self.adapter.active_delivery_epoch().await,
+                None,
+                "supervisor cleanup must clear the active T17 epoch"
+            );
+            assert_eq!(
+                self.adapter.delivery_epoch_lifecycle_counts(),
+                (1, 1),
+                "runtime finish must install and invalidate exactly once"
+            );
+            assert_eq!(
+                self.connect_attempts.load(Ordering::SeqCst),
+                1,
+                "planned shutdown must not reconnect"
+            );
+            assert_eq!(self.sent_hellos.lock().unwrap().len(), 1);
+            let durable_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(self.store.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                durable_count, 1,
+                "the committed durable event must remain in Store after shutdown"
+            );
+            assert_eq!(
+                self.adapter.durable_fence_count(),
+                0,
+                "orderly shutdown must leave no detached durable admission"
+            );
+            assert!(
+                self.supervisor_task.is_finished(),
+                "finish_runtime must retain the supervisor through terminal cleanup"
+            );
+        }
+    }
+
+    pub(crate) async fn bootstrap_finish_runtime_fixture() -> BootstrapFinishRuntimeFixture {
         let store = Arc::new(
             Store::session_test_store("runtime-finish-supervisor-first")
                 .await
@@ -8583,13 +9104,18 @@ mod tests {
             HydrationOutcome::Complete(state) => state.receipt,
             other => panic!("empty Store must hydrate completely: {other:?}"),
         };
-        let (mut post_commit, adapter) =
+        let (post_commit, adapter) =
             post_commit::ProductionPostCommitRuntime::start(store.clone(), &authority)
                 .await
                 .unwrap();
         let adapter = adapter
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
+        let hook = seams::DurableAdmissionHook {
+            pause_after_post_commit_delivery_cancel: true,
+            ..seams::DurableAdmissionHook::default()
+        };
+        adapter.set_durable_admission_hook(Some(hook.clone()));
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let credentials = CountingCredentialProvider::new("token");
         let connect_attempts = credentials.counter.clone();
@@ -8606,8 +9132,9 @@ mod tests {
             }),
             make_config(),
         );
-        let (gateway, mut supervisor_runtime) =
+        let (gateway, supervisor_runtime) =
             session::SessionGateway::from_supervisor(supervisor.start());
+        let supervisor_task = supervisor_runtime.task_observer_for_test();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while adapter.active_delivery_epoch().await.is_none() {
@@ -8626,46 +9153,19 @@ mod tests {
             vec![1]
         );
 
-        supervisor_runtime.request_shutdown();
-        post_commit
-            .shutdown_orderly()
-            .await
-            .expect("orderly post-commit teardown must drain after supervisor cancellation");
-        supervisor_runtime
-            .cancel_and_join()
-            .await
-            .expect("planned join must not classify DeliveryPump shutdown as fatal");
-        drop(gateway);
-
-        assert_eq!(
-            adapter.active_delivery_epoch().await,
-            None,
-            "supervisor cleanup must clear the active T17 epoch"
-        );
-        assert_eq!(
-            adapter.delivery_epoch_lifecycle_counts(),
-            (1, 1),
-            "runtime finish must install and invalidate exactly once"
-        );
-        assert_eq!(
-            connect_attempts.load(Ordering::SeqCst),
-            1,
-            "planned shutdown must not reconnect"
-        );
-        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
-        let durable_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(
-            durable_count, 1,
-            "the committed durable event must remain in Store after shutdown"
-        );
-        assert_eq!(
-            adapter.durable_fence_count(),
-            0,
-            "orderly shutdown must leave no detached durable admission"
-        );
+        BootstrapFinishRuntimeFixture {
+            post_commit,
+            supervisor_runtime,
+            gateway,
+            observer: BootstrapFinishRuntimeObserver {
+                store,
+                adapter,
+                hook,
+                supervisor_task,
+                connect_attempts,
+                sent_hellos,
+            },
+        }
     }
 
     #[tokio::test]
