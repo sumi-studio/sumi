@@ -178,7 +178,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         : "unauthenticated";
       flushSync(() => {
         if (nextSession.authenticated) {
-          bindDirectChatAuthority(nextSession.user.id);
+          bindDirectChatAuthority(nextSession.authorityBindingId);
         } else {
           clearDirectChatAuthority();
         }
@@ -220,7 +220,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           // The HttpOnly authority changed even if logout claimed the UI
           // generation while this serialized exchange was in flight.
           flushSync(() => {
-            bindDirectChatAuthority(nextSession.user.id);
+            bindDirectChatAuthority(nextSession.authorityBindingId);
             serverSession.current = nextSession;
             if (!isCurrentGeneration(generation)) return;
             setSession(nextSession);

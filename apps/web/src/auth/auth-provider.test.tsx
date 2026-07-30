@@ -12,6 +12,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
 import { AuthAPIError, SumiSessionCompensatedError } from "./session-client";
 
+const authorityBindingA = "A".repeat(43);
+const authorityBindingB = `${"B".repeat(42)}E`;
+
 const authMocks = vi.hoisted(() => ({
   getSumiSession: vi.fn(),
   logoutSumiSession: vi.fn(),
@@ -81,6 +84,7 @@ describe("logout authority transition", () => {
   it("keeps the UI unauthenticated when Firebase cleanup setup throws synchronously", async () => {
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-1" },
     });
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
@@ -115,6 +119,7 @@ describe("logout authority transition", () => {
   it("preserves the current conversation authority when Sumi logout fails", async () => {
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.logoutSumiSession.mockRejectedValue(new Error("logout failed"));
@@ -144,6 +149,7 @@ describe("logout authority transition", () => {
     const firebaseAuth = {};
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
@@ -153,6 +159,7 @@ describe("logout authority transition", () => {
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.establishSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingB,
       user: { id: "user-b" },
     });
     render(
@@ -170,7 +177,9 @@ describe("logout authority transition", () => {
     fireEvent.click(screen.getByRole("button", { name: "sign in" }));
 
     await waitFor(() => {
-      expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith("user-b");
+      expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
+        authorityBindingB,
+      );
     });
     expect(authMocks.establishSumiSession).toHaveBeenCalledWith("id-token-b");
     expect(screen.getByTestId("session-state")).toHaveTextContent(
@@ -181,6 +190,7 @@ describe("logout authority transition", () => {
   it("clears old client authority after a committed exchange is compensated", async () => {
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
@@ -223,6 +233,7 @@ describe("logout authority transition", () => {
     });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
@@ -263,16 +274,19 @@ describe("logout authority transition", () => {
   it("restores the exchanged identity when a generation-racing logout fails", async () => {
     let resolveEstablishment!: (value: {
       authenticated: true;
+      authorityBindingId: string;
       user: { id: string };
     }) => void;
     const establishment = new Promise<{
       authenticated: true;
+      authorityBindingId: string;
       user: { id: string };
     }>((resolve) => {
       resolveEstablishment = resolve;
     });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
@@ -301,6 +315,7 @@ describe("logout authority transition", () => {
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
     resolveEstablishment({
       authenticated: true,
+      authorityBindingId: authorityBindingB,
       user: { id: "user-b" },
     });
 
@@ -310,7 +325,9 @@ describe("logout authority transition", () => {
       );
       expect(screen.getByTestId("user-id")).toHaveTextContent("user-b");
     });
-    expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith("user-b");
+    expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
+      authorityBindingB,
+    );
     expect(authMocks.clearDirectChatAuthority).not.toHaveBeenCalled();
   });
 
@@ -321,6 +338,7 @@ describe("logout authority transition", () => {
     });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});

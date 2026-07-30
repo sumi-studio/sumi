@@ -274,13 +274,19 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 		writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 		return
 	}
+	if !validBrowserAuthorityBindingID(claims.authorityBindingID) {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
 	writeBrowserAuthJSON(w, http.StatusOK, struct {
-		Authenticated bool `json:"authenticated"`
-		User          struct {
+		Authenticated      bool   `json:"authenticated"`
+		AuthorityBindingID string `json:"authority_binding_id"`
+		User               struct {
 			ID string `json:"id"`
 		} `json:"user"`
 	}{
-		Authenticated: true,
+		Authenticated:      true,
+		AuthorityBindingID: claims.authorityBindingID,
 		User: struct {
 			ID string `json:"id"`
 		}{ID: claims.UserID},

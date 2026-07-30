@@ -157,15 +157,50 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	statusRecorder := httptest.NewRecorder()
 	server.serveSessionStatus(statusRecorder, statusReq)
 	body := statusRecorder.Body.String()
-	if statusRecorder.Code != http.StatusOK ||
-		!strings.Contains(body, `"authenticated":true`) ||
-		!strings.Contains(body, `"id":"user-1"`) {
+	if statusRecorder.Code != http.StatusOK {
 		t.Fatalf("unexpected session status: %d %s", statusRecorder.Code, body)
+	}
+	var status struct {
+		Authenticated      bool   `json:"authenticated"`
+		AuthorityBindingID string `json:"authority_binding_id"`
+		User               struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode session status: %v", err)
+	}
+	if !status.Authenticated ||
+		status.User.ID != "user-1" ||
+		status.AuthorityBindingID != claims.authorityBindingID ||
+		!validBrowserAuthorityBindingID(status.AuthorityBindingID) {
+		t.Fatalf("unexpected session status: %+v", status)
 	}
 	if strings.Contains(body, "tenant-1") ||
 		strings.Contains(body, bindings.claims.PersonalityAgentID) ||
-		strings.Contains(body, "firebase-user") {
+		strings.Contains(body, "firebase-user") ||
+		strings.Contains(body, claims.sessionID) {
 		t.Fatalf("session status leaked authorization binding: %s", body)
+	}
+
+	repeatedStatusReq := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	repeatedStatusReq.Header.Set("Origin", browserAuthTestOrigin)
+	repeatedStatusReq.AddCookie(sessionCookie)
+	repeatedStatusRecorder := httptest.NewRecorder()
+	server.serveSessionStatus(repeatedStatusRecorder, repeatedStatusReq)
+	var repeatedStatus struct {
+		AuthorityBindingID string `json:"authority_binding_id"`
+	}
+	if err := json.Unmarshal(repeatedStatusRecorder.Body.Bytes(), &repeatedStatus); err != nil {
+		t.Fatalf("decode repeated session status: %v", err)
+	}
+	if repeatedStatusRecorder.Code != http.StatusOK ||
+		repeatedStatus.AuthorityBindingID != status.AuthorityBindingID {
+		t.Fatalf(
+			"same session status changed authority binding: %d %+v",
+			repeatedStatusRecorder.Code,
+			repeatedStatus,
+		)
 	}
 }
 
@@ -438,6 +473,13 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	secondClaims, err := sessions.VerifySession(context.Background(), second)
 	if err != nil {
 		t.Fatalf("replacement session is invalid: %v", err)
+	}
+	if secondClaims.authorityBindingID != firstClaims.authorityBindingID {
+		t.Fatalf(
+			"same authority binding changed across replacement: %q != %q",
+			secondClaims.authorityBindingID,
+			firstClaims.authorityBindingID,
+		)
 	}
 	replayedExchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"concurrent-replay"}`))
 	replayedExchange.Header.Set("Origin", browserAuthTestOrigin)

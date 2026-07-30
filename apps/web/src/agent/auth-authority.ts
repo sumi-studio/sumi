@@ -1,10 +1,11 @@
 import { useConversation } from "./store";
 
-const authorityIdentityStorageKey = "sumi.direct-chat.authority-user";
-let currentIdentity: string | null | undefined;
+const authorityBindingStorageKey = "sumi.direct-chat.authority-binding-v1";
+const legacyAuthorityIdentityStorageKey = "sumi.direct-chat.authority-user";
+let currentBindingID: string | null | undefined;
 
 /**
- * Ends all browser-owned direct-chat state at an authenticated identity
+ * Ends all browser-owned direct-chat state at an authenticated authority
  * boundary. This is intentionally separate from reconnect-oriented
  * disconnect(), which preserves replay cursor and pending delivery state.
  */
@@ -12,37 +13,42 @@ export function resetDirectChatAuthority(): void {
   useConversation.getState().resetAuthority();
 }
 
-export function bindDirectChatAuthority(identity: string): void {
-  const previous = readCurrentIdentity();
-  if (previous !== identity) {
+export function bindDirectChatAuthority(authorityBindingID: string): void {
+  const previous = readCurrentBindingID();
+  if (previous !== authorityBindingID) {
     resetDirectChatAuthority();
   }
-  currentIdentity = identity;
+  currentBindingID = authorityBindingID;
   try {
-    globalThis.sessionStorage.setItem(authorityIdentityStorageKey, identity);
+    globalThis.sessionStorage.setItem(
+      authorityBindingStorageKey,
+      authorityBindingID,
+    );
+    globalThis.sessionStorage.removeItem(legacyAuthorityIdentityStorageKey);
   } catch {
-    // In-memory identity still protects transitions in this document.
+    // In-memory binding still protects transitions in this document.
   }
 }
 
 export function clearDirectChatAuthority(): void {
   resetDirectChatAuthority();
-  currentIdentity = null;
+  currentBindingID = null;
   try {
-    globalThis.sessionStorage.removeItem(authorityIdentityStorageKey);
+    globalThis.sessionStorage.removeItem(authorityBindingStorageKey);
+    globalThis.sessionStorage.removeItem(legacyAuthorityIdentityStorageKey);
   } catch {
     // The in-memory reset already ended the active authority.
   }
 }
 
-function readCurrentIdentity(): string | null {
-  if (currentIdentity !== undefined) return currentIdentity;
+function readCurrentBindingID(): string | null {
+  if (currentBindingID !== undefined) return currentBindingID;
   try {
-    currentIdentity = globalThis.sessionStorage.getItem(
-      authorityIdentityStorageKey,
+    currentBindingID = globalThis.sessionStorage.getItem(
+      authorityBindingStorageKey,
     );
   } catch {
-    currentIdentity = null;
+    currentBindingID = null;
   }
-  return currentIdentity;
+  return currentBindingID;
 }

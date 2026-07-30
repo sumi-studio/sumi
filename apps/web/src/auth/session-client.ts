@@ -1,5 +1,6 @@
 const maxAuthResponseBytes = 4_096;
 const csrfTokenPattern = /^[A-Za-z0-9_-]{43}$/;
+const authorityBindingIDPattern = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 export const authRequestTimeoutMilliseconds = 15_000;
 
 export interface SumiSessionUser {
@@ -8,7 +9,11 @@ export interface SumiSessionUser {
 
 export type SumiSessionStatus =
   | { authenticated: false }
-  | { authenticated: true; user: SumiSessionUser };
+  | {
+      authenticated: true;
+      authorityBindingId: string;
+      user: SumiSessionUser;
+    };
 
 export class AuthAPIError extends Error {
   readonly status: number;
@@ -133,6 +138,8 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
     return { authenticated: false };
   }
   if (
+    typeof body.authority_binding_id !== "string" ||
+    !authorityBindingIDPattern.test(body.authority_binding_id) ||
     !isObject(body.user) ||
     typeof body.user.id !== "string" ||
     body.user.id.length === 0 ||
@@ -140,7 +147,11 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
   ) {
     throw new AuthAPIError("Invalid authentication response.", response.status);
   }
-  return { authenticated: true, user: { id: body.user.id } };
+  return {
+    authenticated: true,
+    authorityBindingId: body.authority_binding_id,
+    user: { id: body.user.id },
+  };
 }
 
 export async function logoutSumiSession(): Promise<void> {

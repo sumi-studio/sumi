@@ -10,6 +10,8 @@ import {
   SumiSessionCompensationFailedError,
 } from "./session-client";
 
+const authorityBindingA = "A".repeat(43);
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -51,24 +53,51 @@ describe("Sumi browser session client", () => {
   });
 
   it("uses cookie-backed session status as authorization truth", async () => {
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ authenticated: true, user: { id: "user-1" } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-      );
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          authenticated: true,
+          authority_binding_id: authorityBindingA,
+          user: { id: "user-1" },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getSumiSession()).resolves.toEqual({
       authenticated: true,
+      authorityBindingId: authorityBindingA,
       user: { id: "user-1" },
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/auth/session",
       expect.objectContaining({ credentials: "include", cache: "no-store" }),
     );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["short", "A".repeat(42)],
+    ["padded", `${"A".repeat(43)}=`],
+    ["non-canonical trailing bits", "B".repeat(43)],
+    ["invalid alphabet", `${"A".repeat(42)}!`],
+  ])("rejects a %s authority binding ID", async (_name, authorityBindingID) => {
+    const body: Record<string, unknown> = {
+      authenticated: true,
+      user: { id: "user-1" },
+    };
+    if (authorityBindingID !== undefined) {
+      body.authority_binding_id = authorityBindingID;
+    }
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(body), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
   });
 
   it("compensates a committed exchange before surfacing status failure", async () => {

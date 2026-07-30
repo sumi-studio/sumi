@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,10 +19,12 @@ import (
 )
 
 const (
-	defaultBrowserAudience = "sumi:web:direct-chat"
-	maxBrowserSessionTTL   = time.Hour
-	maxRevokedSessions     = 4096
-	browserSessionIDBytes  = 32
+	defaultBrowserAudience         = "sumi:web:direct-chat"
+	maxBrowserSessionTTL           = time.Hour
+	maxRevokedSessions             = 4096
+	browserSessionIDBytes          = 32
+	browserAuthorityBindingIDBytes = sha256.Size
+	browserAuthorityBindingDomain  = "sumi:browser-authority-binding:v1"
 	// BrowserSessionCookie is the name of the signed HttpOnly session cookie
 	// used by browser routes.
 	BrowserSessionCookie = "sumi_session"
@@ -47,6 +50,7 @@ type UserSessionClaims struct {
 	PersonalityAgentID string
 	sessionID          string
 	expiresAt          time.Time
+	authorityBindingID string
 }
 
 // UserSessionVerifier validates the signed HttpOnly browser session cookie.
@@ -263,6 +267,11 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 		PersonalityAgentID: claims.PersonalityAgentID,
 		sessionID:          claims.SID,
 		expiresAt:          time.Unix(claims.Exp, 0),
+		// Derive only after the cookie signature and claims have been
+		// validated. A future verifier key ring must use the exact key that
+		// verified this cookie; rotating the signing key then deliberately
+		// changes the ID and causes a safe browser-side authority reset.
+		authorityBindingID: deriveBrowserAuthorityBindingID(v.secret, claims),
 	}, nil
 }
 
@@ -271,6 +280,32 @@ func validBrowserSessionID(sessionID string) bool {
 	return err == nil &&
 		len(decoded) == browserSessionIDBytes &&
 		base64.RawURLEncoding.EncodeToString(decoded) == sessionID
+}
+
+func deriveBrowserAuthorityBindingID(
+	secret []byte,
+	claims userSessionWireClaims,
+) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(browserAuthorityBindingDomain))
+	var length [4]byte
+	for _, value := range []string{
+		claims.TenantID,
+		claims.UserID,
+		claims.PersonalityAgentID,
+	} {
+		binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+		_, _ = mac.Write(length[:])
+		_, _ = mac.Write([]byte(value))
+	}
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validBrowserAuthorityBindingID(bindingID string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(bindingID)
+	return err == nil &&
+		len(decoded) == browserAuthorityBindingIDBytes &&
+		base64.RawURLEncoding.EncodeToString(decoded) == bindingID
 }
 
 func uniqueBrowserSessionCookie(r *http.Request) (*http.Cookie, error) {

@@ -234,6 +234,105 @@ func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
 	}
 }
 
+func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
+	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	v, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	v.now = func() time.Time { return now }
+	binding := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
+		authorityBindingID: strings.Repeat("caller-authored", 4),
+	}
+
+	issueAndVerify := func(
+		t *testing.T,
+		verifier *HMACUserSessionVerifier,
+		claims UserSessionClaims,
+	) UserSessionClaims {
+		t.Helper()
+		session, issueErr := verifier.IssueSession(
+			context.Background(),
+			claims,
+			5*time.Minute,
+		)
+		if issueErr != nil {
+			t.Fatalf("issue session: %v", issueErr)
+		}
+		verified, verifyErr := verifier.VerifySession(
+			context.Background(),
+			session,
+		)
+		if verifyErr != nil {
+			t.Fatalf("verify session: %v", verifyErr)
+		}
+		return verified
+	}
+
+	first := issueAndVerify(t, v, binding)
+	bindingWithDifferentCallerID := binding
+	bindingWithDifferentCallerID.authorityBindingID = "different-caller-value"
+	second := issueAndVerify(t, v, bindingWithDifferentCallerID)
+	if first.authorityBindingID != second.authorityBindingID {
+		t.Fatalf(
+			"same signed authority binding changed across session issuance: %q != %q",
+			first.authorityBindingID,
+			second.authorityBindingID,
+		)
+	}
+	if first.authorityBindingID == binding.authorityBindingID {
+		t.Fatal("session issuer accepted a caller-authored authority binding ID")
+	}
+	if !validBrowserAuthorityBindingID(first.authorityBindingID) {
+		t.Fatalf("authority binding ID is not canonical: %q", first.authorityBindingID)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*UserSessionClaims)
+	}{
+		{
+			name:   "tenant",
+			mutate: func(claims *UserSessionClaims) { claims.TenantID = "tenant-2" },
+		},
+		{
+			name:   "human principal",
+			mutate: func(claims *UserSessionClaims) { claims.UserID = "user-2" },
+		},
+		{
+			name: "target personality agent",
+			mutate: func(claims *UserSessionClaims) {
+				claims.PersonalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ac"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := binding
+			tc.mutate(&changed)
+			got := issueAndVerify(t, v, changed)
+			if got.authorityBindingID == first.authorityBindingID {
+				t.Fatalf("changed %s reused authority binding ID", tc.name)
+			}
+		})
+	}
+
+	rotated, err := NewHMACUserSessionVerifier(
+		[]byte("rotated-browser-session-secret-32-bytes!"),
+		"",
+	)
+	if err != nil {
+		t.Fatalf("new rotated verifier: %v", err)
+	}
+	rotated.now = func() time.Time { return now }
+	afterRotation := issueAndVerify(t, rotated, binding)
+	if afterRotation.authorityBindingID == first.authorityBindingID {
+		t.Fatal("key rotation must cause a safe authority binding reset")
+	}
+}
+
 func TestHMACUserSessionVerifierRejectsWrongAudience(t *testing.T) {
 	v, err := NewHMACUserSessionVerifier(testSessionSecret, "sumi:web:conversation")
 	if err != nil {
