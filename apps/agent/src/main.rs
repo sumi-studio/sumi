@@ -76,6 +76,14 @@ async fn async_main(mode: Option<String>) -> Result<()> {
             );
             return tools::executor::run_tool_executor_mode().await;
         }
+        Some("--tool-executor-socket") => {
+            tracing::warn!(
+                service = "tool-executor-socket",
+                trust = "low-trust-local",
+                "starting service mode"
+            );
+            return tools::executor::run_tool_executor_socket_mode().await;
+        }
         Some("--artifact-broker") => {
             tracing::warn!(
                 service = "artifact-broker",

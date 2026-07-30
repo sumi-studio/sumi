@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -17,8 +17,22 @@ const MAX_RPC_ID_BYTES: usize = 128;
 const MAX_RPC_ERROR_CODE_BYTES: usize = 128;
 const RPC_ACTIVE_REQUEST_CAPACITY: usize = 4_096;
 const RPC_ORDINARY_ACTIVE_REQUEST_CAPACITY: usize = RPC_ACTIVE_REQUEST_CAPACITY - 1;
-const RPC_TERMINAL_HISTORY_CAPACITY: usize = 4_096;
+// Exact boot-scoped replay fencing cannot silently evict arbitrary caller
+// identities. This fixed digest budget supports roughly 500k completed
+// execution request/execution pairs per generation; exhaustion is explicit so
+// the supervisor can roll the generation before any later side effect.
+const RPC_BOOT_UNIQUENESS_CAPACITY: usize = 1_000_000;
+// Once ordinary admission exhausts the main budget, every request that was
+// already active must still be able to consume its one cancellation identity.
+const RPC_CANCEL_UNIQUENESS_RESERVE: usize = RPC_ACTIVE_REQUEST_CAPACITY;
+pub(super) const RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE: &str = "rpc_boot_uniqueness_exhausted";
 type RpcIdDigest = [u8; 32];
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorServiceRole {
+    ToolExecutor,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +111,9 @@ impl RpcError {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorOperation {
+    Health {
+        service_role: ExecutorServiceRole,
+    },
     ReadFile {
         path: String,
         offset: u64,
@@ -143,6 +160,7 @@ pub enum ExecutorOperation {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorResponse {
+    Healthy { service_role: ExecutorServiceRole },
     ReadFile { result: TruncationResult },
     Written {},
     Edited {},
@@ -210,6 +228,7 @@ pub trait RpcOperationValidation {
 impl RpcOperationValidation for ExecutorOperation {
     fn validate(&self) -> Result<(), ToolError> {
         match self {
+            Self::Health { .. } => Ok(()),
             Self::ReadFile {
                 path,
                 limit,
@@ -415,19 +434,46 @@ pub fn decode_rpc_frame<T: DeserializeOwned>(
     Ok(frame)
 }
 
-#[derive(Default)]
 pub struct RpcLifecycleTracker {
     active_requests: HashSet<String>,
     active_cancel_requests: HashSet<String>,
     completed_requests: HashSet<RpcIdDigest>,
-    completion_order: VecDeque<RpcIdDigest>,
     executions: HashMap<String, String>,
     completed_executions: HashSet<RpcIdDigest>,
-    execution_completion_order: VecDeque<RpcIdDigest>,
     cancelled_executions: HashSet<String>,
+    boot_uniqueness_capacity: usize,
+    cancel_uniqueness_reserve: usize,
+}
+
+impl Default for RpcLifecycleTracker {
+    fn default() -> Self {
+        Self::with_boot_uniqueness_budget(
+            RPC_BOOT_UNIQUENESS_CAPACITY,
+            RPC_CANCEL_UNIQUENESS_RESERVE,
+        )
+    }
 }
 
 impl RpcLifecycleTracker {
+    fn with_boot_uniqueness_budget(capacity: usize, cancel_reserve: usize) -> Self {
+        assert!(capacity > 0);
+        Self {
+            active_requests: HashSet::new(),
+            active_cancel_requests: HashSet::new(),
+            completed_requests: HashSet::new(),
+            executions: HashMap::new(),
+            completed_executions: HashSet::new(),
+            cancelled_executions: HashSet::new(),
+            boot_uniqueness_capacity: capacity,
+            cancel_uniqueness_reserve: cancel_reserve,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_boot_uniqueness_budget(capacity: usize, cancel_reserve: usize) -> Self {
+        Self::with_boot_uniqueness_budget(capacity, cancel_reserve)
+    }
+
     pub fn begin_request(&mut self, request_id: &str) -> Result<(), ToolError> {
         validate_rpc_id(request_id, "request_id")?;
         let completed_id = rpc_id_digest(request_id);
@@ -439,6 +485,7 @@ impl RpcLifecycleTracker {
             ));
         }
         self.ensure_ordinary_active_capacity()?;
+        self.ensure_boot_uniqueness_capacity(1, false)?;
         self.active_requests.insert(request_id.to_owned());
         Ok(())
     }
@@ -458,7 +505,18 @@ impl RpcLifecycleTracker {
                 "RPC execution_id must be unique".to_owned(),
             ));
         }
-        self.begin_request(request_id)?;
+        validate_rpc_id(request_id, "request_id")?;
+        let completed_request_id = rpc_id_digest(request_id);
+        if self.active_requests.contains(request_id)
+            || self.completed_requests.contains(&completed_request_id)
+        {
+            return Err(ToolError::Protocol(
+                "RPC request_id must be unique".to_owned(),
+            ));
+        }
+        self.ensure_ordinary_active_capacity()?;
+        self.ensure_boot_uniqueness_capacity(2, false)?;
+        self.active_requests.insert(request_id.to_owned());
         self.executions
             .insert(execution_id.to_owned(), request_id.to_owned());
         Ok(())
@@ -496,6 +554,7 @@ impl RpcLifecycleTracker {
             ));
         }
         self.ensure_cancel_active_capacity()?;
+        self.ensure_boot_uniqueness_capacity(1, true)?;
         self.cancelled_executions.insert(execution_id.to_owned());
         self.active_requests.insert(request_id.to_owned());
         self.active_cancel_requests.insert(request_id.to_owned());
@@ -550,17 +609,10 @@ impl RpcLifecycleTracker {
         for execution_id in completed_executions {
             self.executions.remove(&execution_id);
             self.cancelled_executions.remove(&execution_id);
-            remember_digest(
-                rpc_id_digest(&execution_id),
-                &mut self.completed_executions,
-                &mut self.execution_completion_order,
-            );
+            self.completed_executions
+                .insert(rpc_id_digest(&execution_id));
         }
-        remember_digest(
-            rpc_id_digest(request_id),
-            &mut self.completed_requests,
-            &mut self.completion_order,
-        );
+        self.completed_requests.insert(rpc_id_digest(request_id));
         Ok(())
     }
 
@@ -581,6 +633,39 @@ impl RpcLifecycleTracker {
         }
         Ok(())
     }
+
+    fn ensure_boot_uniqueness_capacity(
+        &self,
+        additional: usize,
+        cancel: bool,
+    ) -> Result<(), ToolError> {
+        let limit = if cancel {
+            self.boot_uniqueness_capacity
+                .checked_add(self.cancel_uniqueness_reserve)
+        } else {
+            Some(self.boot_uniqueness_capacity)
+        }
+        .ok_or_else(boot_uniqueness_exhausted)?;
+        if self
+            .tracked_identity_count()
+            .checked_add(additional)
+            .is_none_or(|next| next > limit)
+        {
+            return Err(boot_uniqueness_exhausted());
+        }
+        Ok(())
+    }
+
+    pub(super) fn tracked_identity_count(&self) -> usize {
+        self.active_requests.len()
+            + self.completed_requests.len()
+            + self.executions.len()
+            + self.completed_executions.len()
+    }
+}
+
+fn boot_uniqueness_exhausted() -> ToolError {
+    ToolError::Protocol(RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE.to_owned())
 }
 
 fn framed_rpc_len(unframed_len: usize) -> Option<usize> {
@@ -718,22 +803,8 @@ fn validate_artifact_handle_component(value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn rpc_id_digest(value: &str) -> RpcIdDigest {
+pub(super) fn rpc_id_digest(value: &str) -> RpcIdDigest {
     Sha256::digest(value.as_bytes()).into()
-}
-
-fn remember_digest(
-    digest: RpcIdDigest,
-    completed: &mut HashSet<RpcIdDigest>,
-    order: &mut VecDeque<RpcIdDigest>,
-) {
-    completed.insert(digest);
-    order.push_back(digest);
-    while order.len() > RPC_TERMINAL_HISTORY_CAPACITY {
-        if let Some(expired) = order.pop_front() {
-            completed.remove(&expired);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -768,6 +839,44 @@ mod tests {
 
     fn identity() -> RpcIdentity {
         RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap()
+    }
+
+    #[test]
+    fn health_requires_the_exact_tool_executor_role_without_legacy_shape() {
+        let request = |operation| {
+            json!({
+                "personality_agent_id": PAID,
+                "generation": 7,
+                "nonce": "boot-nonce",
+                "request_id": "health-request",
+                "operation": operation,
+            })
+        };
+        let exact = serde_json::to_vec(&request(json!({
+            "type": "health",
+            "service_role": "tool_executor",
+        })))
+        .unwrap();
+        assert_eq!(
+            decode_rpc_line::<ExecutorOperation>(&exact, &identity())
+                .unwrap()
+                .operation,
+            ExecutorOperation::Health {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            }
+        );
+        for rejected in [
+            json!({"type": "health"}),
+            json!({"type": "health", "service_role": "artifact_broker"}),
+            json!({
+                "type": "health",
+                "service_role": "tool_executor",
+                "legacy": true,
+            }),
+        ] {
+            let line = serde_json::to_vec(&request(rejected)).unwrap();
+            assert!(decode_rpc_line::<ExecutorOperation>(&line, &identity()).is_err());
+        }
     }
 
     #[test]
@@ -1855,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_enforces_one_terminal_and_bounded_terminal_history() {
+    fn lifecycle_enforces_one_terminal_and_exact_boot_scoped_uniqueness() {
         let mut tracker = RpcLifecycleTracker::default();
         tracker
             .begin_execution("request-1", "execution-1")
@@ -1873,7 +1982,7 @@ mod tests {
         assert!(tracker.accept_update("request-1").is_err());
         assert!(tracker.accept_terminal("request-1").is_err());
 
-        for index in 0..(RPC_TERMINAL_HISTORY_CAPACITY + 1) {
+        for index in 0..4_097 {
             let request_id = format!("request-next-{index}");
             tracker
                 .begin_request(&request_id)
@@ -1882,14 +1991,16 @@ mod tests {
                 .accept_terminal(&request_id)
                 .expect("complete replay entry");
         }
-        assert_eq!(
-            tracker.completed_requests.len(),
-            RPC_TERMINAL_HISTORY_CAPACITY
-        );
-        assert_eq!(
-            tracker.completion_order.len(),
-            RPC_TERMINAL_HISTORY_CAPACITY
-        );
+        assert_eq!(tracker.completed_requests.len(), 4_099);
+        assert!(matches!(
+            tracker.begin_request("request-next-0"),
+            Err(ToolError::Protocol(message)) if message == "RPC request_id must be unique"
+        ));
+        assert!(matches!(
+            tracker.begin_execution("request-fresh", "execution-1"),
+            Err(ToolError::Protocol(message)) if message == "RPC execution_id must be unique"
+        ));
+        assert!(!tracker.active_requests.contains("request-fresh"));
     }
 
     #[test]
