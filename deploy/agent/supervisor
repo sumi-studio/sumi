@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Local single-host Compose supervisor. Cloud workload identity, scheduling,
+# resource recovery, and central transport are separate deployment paths.
 set -euo pipefail
 
 readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +18,9 @@ if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
 fi
 
 : "${SUMI_COMPOSE_TIMEOUT:=30}"
+: "${SUMI_SUPERVISOR_LOCK_DIR:=/run/lock/sumi-agent}"
+: "${SUMI_LOCAL_CONTROL_HOST_ROOT:=/run/sumi/local-control}"
+: "${SUMI_LOCAL_CONTROL_SOCKET_GID:=10022}"
 
 log() {
   printf '[sumi-supervisor] %s\n' "$*" >&2
@@ -37,11 +42,65 @@ require_docker() {
   docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
 }
 
+acquire_supervisor_lock() {
+  local directory_owner directory_mode
+  command -v flock >/dev/null 2>&1 || fail "flock is required"
+  if [[ ! -e "${SUMI_SUPERVISOR_LOCK_DIR}" ]]; then
+    [[ "${EUID}" -eq 0 ]] ||
+      fail "trusted lock directory does not exist: ${SUMI_SUPERVISOR_LOCK_DIR}"
+    install -d -m 0700 -o root -g root "${SUMI_SUPERVISOR_LOCK_DIR}"
+  fi
+  [[ -d "${SUMI_SUPERVISOR_LOCK_DIR}" && ! -L "${SUMI_SUPERVISOR_LOCK_DIR}" ]] ||
+    fail "lock path must be a real directory"
+  directory_owner="$(stat -c '%u' -- "${SUMI_SUPERVISOR_LOCK_DIR}")"
+  directory_mode="$(stat -c '%a' -- "${SUMI_SUPERVISOR_LOCK_DIR}")"
+  [[ "${directory_owner}" == "0" || "${directory_owner}" == "${EUID}" ]] ||
+    fail "lock directory must be owned by root or the supervisor uid"
+  (( (8#${directory_mode} & 0022) == 0 )) ||
+    fail "lock directory must not be writable by group or other"
+  exec {SUPERVISOR_LOCK_FD}>"${SUMI_SUPERVISOR_LOCK_DIR}/${SUMI_COMPOSE_PROJECT}.lock" ||
+    fail "cannot open supervisor lock"
+  flock -n "${SUPERVISOR_LOCK_FD}" ||
+    fail "another supervisor invocation owns ${SUMI_COMPOSE_PROJECT}"
+}
+
+validate_local_control_socket() {
+  local directory_owner directory_gid directory_mode socket_owner socket_gid socket_mode socket_links
+  [[ "${SUMI_LOCAL_CONTROL_SOCKET_GID}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "SUMI_LOCAL_CONTROL_SOCKET_GID must be canonical decimal"
+  SUMI_LOCAL_CONTROL_HOST_DIR="${SUMI_LOCAL_CONTROL_HOST_ROOT%/}/${PAID_COMPACT}"
+  export SUMI_LOCAL_CONTROL_HOST_DIR SUMI_LOCAL_CONTROL_SOCKET_GID
+  [[ -d "${SUMI_LOCAL_CONTROL_HOST_DIR}" && ! -L "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
+    fail "local-control parent must pre-exist as a real directory"
+  directory_owner="$(stat -c '%u' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_gid="$(stat -c '%g' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_mode="$(stat -c '%a' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  [[ "${directory_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
+    fail "local-control parent gid does not match SUMI_LOCAL_CONTROL_SOCKET_GID"
+  [[ "${directory_mode}" == "750" ]] ||
+    fail "local-control parent mode must be 0750"
+
+  local socket="${SUMI_LOCAL_CONTROL_HOST_DIR}/control.sock"
+  [[ -S "${socket}" && ! -L "${socket}" ]] ||
+    fail "local-control socket must pre-exist"
+  socket_owner="$(stat -c '%u' -- "${socket}")"
+  socket_gid="$(stat -c '%g' -- "${socket}")"
+  socket_mode="$(stat -c '%a' -- "${socket}")"
+  socket_links="$(stat -c '%h' -- "${socket}")"
+  [[ "${socket_owner}" == "${directory_owner}" ]] ||
+    fail "local-control parent and socket owners must match"
+  [[ "${socket_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
+    fail "local-control socket gid does not match SUMI_LOCAL_CONTROL_SOCKET_GID"
+  [[ "${socket_mode}" == "660" ]] ||
+    fail "local-control socket mode must be 0660"
+  [[ "${socket_links}" == "1" ]] ||
+    fail "local-control socket must have exactly one link"
+}
+
 require_launch_environment() {
   local name
   for name in \
     SUMI_GATEWAY_URL \
-    SUMI_LOCAL_CONTROL_URL \
     SUMI_LOCAL_CONTROL_BEARER \
     SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
     SUMI_AGENT_WRAPPING_KEY \
@@ -51,11 +110,13 @@ require_launch_environment() {
   do
     [[ -n "${!name:-}" ]] || fail "${name} is required"
   done
+  validate_local_control_socket
 }
 
 require_paid
 readonly PAID_COMPACT="${SUMI_PERSONALITY_AGENT_ID//-/}"
 readonly SUMI_COMPOSE_PROJECT="sumi-${PAID_COMPACT}"
+declare SUPERVISOR_LOCK_FD
 
 compose() {
   docker compose \
@@ -69,21 +130,23 @@ case "${action}" in
   project-name)
     printf '%s\n' "${SUMI_COMPOSE_PROJECT}"
     ;;
-  config)
+  validate)
     require_docker
     require_launch_environment
-    compose config
+    compose config --quiet
     ;;
   up|restart)
+    acquire_supervisor_lock
     require_docker
     require_launch_environment
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
     compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     compose up --detach --build --wait
-    log "project ${SUMI_COMPOSE_PROJECT} started; authoritative Ready is published through authenticated local control"
+    log "project ${SUMI_COMPOSE_PROJECT} containers started; runtime owns authenticated dependency Health and Ready"
     ;;
   stop|down)
+    acquire_supervisor_lock
     require_docker
     compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     ;;
@@ -96,6 +159,6 @@ case "${action}" in
     compose logs "${@:2}"
     ;;
   *)
-    fail "usage: supervisor {up|restart|stop|status|logs|config|project-name}"
+    fail "usage: supervisor {up|restart|stop|status|logs|validate|project-name}"
     ;;
 esac

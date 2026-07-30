@@ -26,6 +26,8 @@ profile sumi-agent-executor flags=(attach_disconnected,mediate_deleted) {
   mount options=(rprivate) none -> /,
   mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/,
   mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/broker.sock,
+  mount options=(bind) /tmp/.sumi-identity-isolation-* -> /run/sumi/identity/,
+  mount options=(bind) /tmp/.sumi-identity-isolation-* -> /run/sumi/identity/identity.env,
   mount options=(bind) /tmp/.sumi-broker-preflight-src-* -> /tmp/.sumi-broker-preflight-tgt-*,
   umount /tmp/.sumi-broker-preflight-tgt-*,
 

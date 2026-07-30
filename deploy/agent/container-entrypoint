@@ -136,16 +136,23 @@ case "${role}" in
     install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
     install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
     install -d -m 0700 -o "${BROKER_UID}" -g "${BROKER_GID}" /var/lib/sumi-artifacts
-    install -d -m 02710 -o "${EXECUTOR_UID}" -g "${EXECUTOR_IPC_GID}" /run/sumi/executor
-    install -d -m 02710 -o "${BROKER_UID}" -g "${BROKER_IPC_GID}" /run/sumi/broker
+    # A prior generation leaves these roots owned by non-root roles with no
+    # permission for root-without-DAC_OVERRIDE to traverse. Take ownership and
+    # make them traversable before unlinking stale socket names, then restore
+    # the final connect-only ownership/mode.
+    chown root:root /run/sumi/executor /run/sumi/broker
+    chmod 0700 /run/sumi/executor /run/sumi/broker
     rm -f /run/sumi/executor/executor.sock /run/sumi/broker/broker.sock
+    install -d -m 0710 -o "${EXECUTOR_UID}" -g "${EXECUTOR_IPC_GID}" /run/sumi/executor
+    install -d -m 0710 -o "${BROKER_UID}" -g "${BROKER_IPC_GID}" /run/sumi/broker
+    chmod 02710 /run/sumi/executor /run/sumi/broker
     ;;
 
   runtime)
     load_identity runtime "${IDENTITY_FILE}"
     for name in \
       SUMI_GATEWAY_URL \
-      SUMI_LOCAL_CONTROL_URL \
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET \
       SUMI_LOCAL_CONTROL_BEARER \
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
       SUMI_AGENT_WRAPPING_KEY \
@@ -166,7 +173,7 @@ case "${role}" in
       SUMI_STATE_DIR=/var/lib/sumi \
       SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
       SUMI_GATEWAY_URL="${SUMI_GATEWAY_URL}" \
-      SUMI_LOCAL_CONTROL_URL="${SUMI_LOCAL_CONTROL_URL}" \
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET="${SUMI_LOCAL_CONTROL_UNIX_SOCKET}" \
       SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER}" \
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}" \
       SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
@@ -192,7 +199,6 @@ case "${role}" in
       SUMI_WORKSPACE=/workspace \
       SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
       SUMI_ARTIFACT_BROKER_SOCKET=/run/sumi/broker/broker.sock \
-      SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION=1 \
       /usr/local/bin/sumi-agent --tool-executor-socket
     ;;
 

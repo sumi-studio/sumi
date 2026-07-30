@@ -21,6 +21,7 @@ RUN apt-get update \
     && useradd --uid 10003 --gid 10003 --no-create-home --shell /usr/sbin/nologin sumi-broker \
     && groupadd --gid 10020 sumi-executor-ipc \
     && groupadd --gid 10021 sumi-broker-ipc \
+    && groupadd --gid 10022 sumi-local-control-ipc \
     && install -d -m 0755 /var/lib/sumi /var/lib/sumi-allocator \
        /var/lib/sumi-artifacts /workspace /run/sumi
 

@@ -1,6 +1,6 @@
-# One Compose project is one canonical global PersonalityAgentId. The host
-# supervisor supplies the PAID-derived --project-name; this file deliberately
-# has no fixed Compose `name`.
+# Local single-host deployment: one Compose project is one canonical global
+# PersonalityAgentId. The host supervisor supplies the PAID-derived
+# --project-name; this file deliberately has no fixed Compose `name`.
 
 x-long-lived-hardening: &long-lived-hardening
   read_only: true
@@ -13,6 +13,11 @@ x-long-lived-hardening: &long-lived-hardening
     - /tmp:rw,noexec,nosuid,nodev,size=32m
   stdin_open: false
   tty: false
+  init: true
+  stop_grace_period: 30s
+  # Docker must not restart one role in isolation. The authenticated runtime
+  # health monitor owns fail-stop dependency loss; the host supervisor owns
+  # explicit stop/join/reallocation of the complete generation.
   restart: "no"
 
 services:
@@ -53,7 +58,7 @@ services:
     network_mode: none
     read_only: true
     cap_drop: [ALL]
-    cap_add: [CHOWN, FOWNER]
+    cap_add: [CHOWN, FOWNER, FSETID]
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
@@ -71,11 +76,13 @@ services:
       context: ../..
       dockerfile: deploy/agent/Dockerfile
     user: "10001:10001"
-    group_add: ["10020"]
+    group_add:
+      - "10020"
+      - "${SUMI_LOCAL_CONTROL_SOCKET_GID:-10022}"
     command: [runtime]
     environment:
       SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
-      SUMI_LOCAL_CONTROL_URL: ${SUMI_LOCAL_CONTROL_URL:?SUMI_LOCAL_CONTROL_URL is required}
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_BEARER: ${SUMI_LOCAL_CONTROL_BEARER:?SUMI_LOCAL_CONTROL_BEARER is required}
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:?SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX is required}
       SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
@@ -97,6 +104,14 @@ services:
       - state:/var/lib/sumi
       - runtime-identity:/run/sumi/identity:ro
       - executor-ipc:/run/sumi/executor:ro
+      # The dedicated local-control process owns the pre-existing host
+      # directory/socket. Runtime receives connect-only access; no TCP route.
+      - type: bind
+        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}
+        target: /run/sumi/local-control
+        read_only: true
+        bind:
+          create_host_path: false
 
   executor:
     <<: *long-lived-hardening
