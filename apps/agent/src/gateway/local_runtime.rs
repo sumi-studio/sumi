@@ -1206,14 +1206,30 @@ fn validate_publication_ack(
     {
         bail!("local runtime-state acknowledgement scope or payload mismatch");
     }
-    let expected_revision = match request.expected_revision {
-        Some(previous) => previous
-            .checked_add(1)
-            .context("local runtime-state CAS revision exhausted")?,
-        None => 1,
-    };
-    if ack.revision != expected_revision {
-        bail!("local runtime-state acknowledgement revision is not the exact next CAS revision");
+    match request.expected_revision {
+        Some(previous) => {
+            let expected_revision = previous
+                .checked_add(1)
+                .context("local runtime-state CAS revision exhausted")?;
+            if ack.revision != expected_revision {
+                bail!(
+                    "local runtime-state acknowledgement revision is not the exact next CAS revision"
+                );
+            }
+        }
+        None => {
+            if request.state != LocalRuntimePublicationState::NotReady
+                || request.hydration_receipt_identity.is_some()
+                || request.reason != LocalRuntimePublicationReason::Startup
+            {
+                bail!(
+                    "null local runtime-state CAS revision is only valid for startup NotReady without a receipt"
+                );
+            }
+            if ack.revision == 0 {
+                bail!("local runtime-state startup acknowledgement revision must be nonzero");
+            }
+        }
     }
     Ok(())
 }
@@ -1353,6 +1369,7 @@ mod tests {
         publication_acks: BTreeMap<String, LocalRuntimeStateAck>,
         revision: u64,
         receipt: Option<String>,
+        accept_rollover_startup: bool,
         drop_next_publication_ack: bool,
         credential_response_nonce: Option<String>,
         credential_response_expiry: Option<i64>,
@@ -1438,11 +1455,20 @@ mod tests {
                 }
                 return Ok(ack);
             }
-            if publication.expected_revision != (state.revision > 0).then_some(state.revision) {
+            let is_rollover_startup = state.accept_rollover_startup
+                && state.revision > 0
+                && publication.expected_revision.is_none()
+                && publication.state == LocalRuntimePublicationState::NotReady
+                && publication.hydration_receipt_identity.is_none()
+                && publication.reason == LocalRuntimePublicationReason::Startup;
+            if !is_rollover_startup
+                && publication.expected_revision != (state.revision > 0).then_some(state.revision)
+            {
                 return Err(LocalPublicationError::terminal(anyhow::anyhow!(
                     "fake local registry rejected stale CAS revision"
                 )));
             }
+            state.accept_rollover_startup = false;
             match publication.state {
                 LocalRuntimePublicationState::NotReady => {
                     state.receipt = None;
@@ -1727,6 +1753,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_rollover_seeds_ready_cas_from_authoritative_startup_ack() {
+        let expected = authority();
+        let control = Arc::new(FakeControlPlane::new(expected.clone()));
+        {
+            let mut state = control.state.lock().unwrap();
+            state.revision = 2;
+            state.receipt = Some("old-generation-receipt".to_owned());
+            state.accept_rollover_startup = true;
+            state.drop_next_publication_ack = true;
+        }
+        let publisher = LocalControlReadyPublisher::new(expected.clone(), control.clone());
+        let exact = ready_proof(&expected).await;
+
+        let error = publisher
+            .publish_not_ready()
+            .await
+            .expect_err("lost rollover startup ACK is indeterminate");
+        assert!(error.is_indeterminate());
+        publisher
+            .publish_not_ready()
+            .await
+            .expect("rollover startup reconciles its authoritative revision");
+        publisher
+            .publish_ready(&exact)
+            .await
+            .expect("Ready advances from the rollover startup revision");
+
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.publication_attempts.len(), 3);
+        assert_eq!(
+            state.publication_attempts[0], state.publication_attempts[1],
+            "indeterminate startup must retry the identical publication"
+        );
+        assert_eq!(state.publication_attempts[0].expected_revision, None);
+        assert_eq!(
+            state.publication_attempts[2].expected_revision,
+            Some(3),
+            "Ready must seed its CAS from the authoritative startup ACK"
+        );
+        assert_eq!(state.revision, 4);
+    }
+
+    #[tokio::test]
     async fn publisher_rejects_a_ready_proof_from_another_boot_epoch() {
         let expected = authority();
         let control = Arc::new(FakeControlPlane::new(expected.clone()));
@@ -1839,15 +1908,17 @@ mod tests {
             hydration_receipt_identity: Some(receipt(&expected).stable_id()),
             reason: LocalRuntimePublicationReason::Hydrated,
         };
-        let exact = LocalRuntimeStateAck {
-            publication_id: request.publication_id.clone(),
-            personality_agent_id: request.personality_agent_id.clone(),
-            generation: request.generation,
-            rpc_boot_nonce: request.rpc_boot_nonce.clone(),
-            revision: 5,
-            state: request.state,
-            hydration_receipt_identity: request.hydration_receipt_identity.clone(),
-        };
+        let ack_for =
+            |request: &LocalRuntimeStatePublication, revision: u64| LocalRuntimeStateAck {
+                publication_id: request.publication_id.clone(),
+                personality_agent_id: request.personality_agent_id.clone(),
+                generation: request.generation,
+                rpc_boot_nonce: request.rpc_boot_nonce.clone(),
+                revision,
+                state: request.state,
+                hydration_receipt_identity: request.hydration_receipt_identity.clone(),
+            };
+        let exact = ack_for(&request, 5);
         validate_publication_ack(&expected, &request, &exact).unwrap();
 
         let mut mismatches = Vec::new();
@@ -1876,25 +1947,60 @@ mod tests {
             assert!(validate_publication_ack(&expected, &request, &mismatch).is_err());
         }
 
-        let mut first_request = request.clone();
-        first_request.expected_revision = None;
-        let mut first_ack = LocalRuntimeStateAck {
-            publication_id: first_request.publication_id.clone(),
-            personality_agent_id: first_request.personality_agent_id.clone(),
-            generation: first_request.generation,
-            rpc_boot_nonce: first_request.rpc_boot_nonce.clone(),
-            revision: 2,
-            state: first_request.state,
-            hydration_receipt_identity: first_request.hydration_receipt_identity.clone(),
+        let mut invalid_epoch_start = request.clone();
+        invalid_epoch_start.expected_revision = None;
+        assert!(
+            validate_publication_ack(
+                &expected,
+                &invalid_epoch_start,
+                &ack_for(&invalid_epoch_start, 1)
+            )
+            .is_err()
+        );
+
+        let startup_request = LocalRuntimeStatePublication {
+            publication_id: "0198f0f4-9b72-7000-8000-000000000021".to_owned(),
+            personality_agent_id: PAID.to_owned(),
+            generation: 7,
+            rpc_boot_nonce: "boot-a".to_owned(),
+            expected_revision: None,
+            state: LocalRuntimePublicationState::NotReady,
+            hydration_receipt_identity: None,
+            reason: LocalRuntimePublicationReason::Startup,
         };
-        assert!(validate_publication_ack(&expected, &first_request, &first_ack).is_err());
-        first_ack.revision = 1;
-        validate_publication_ack(&expected, &first_request, &first_ack).unwrap();
+        let mut startup_ack = ack_for(&startup_request, 3);
+        validate_publication_ack(&expected, &startup_request, &startup_ack).unwrap();
+        startup_ack.revision = 1;
+        validate_publication_ack(&expected, &startup_request, &startup_ack).unwrap();
+        startup_ack.revision = 0;
+        assert!(validate_publication_ack(&expected, &startup_request, &startup_ack).is_err());
+
+        let mut shutdown_epoch_start = startup_request.clone();
+        shutdown_epoch_start.reason = LocalRuntimePublicationReason::Shutdown;
+        assert!(
+            validate_publication_ack(
+                &expected,
+                &shutdown_epoch_start,
+                &ack_for(&shutdown_epoch_start, 4)
+            )
+            .is_err()
+        );
+
+        let mut receipt_epoch_start = startup_request.clone();
+        receipt_epoch_start.hydration_receipt_identity = Some(receipt(&expected).stable_id());
+        assert!(
+            validate_publication_ack(
+                &expected,
+                &receipt_epoch_start,
+                &ack_for(&receipt_epoch_start, 4)
+            )
+            .is_err()
+        );
 
         let mut exhausted = request;
         exhausted.expected_revision = Some(u64::MAX);
         assert!(
-            validate_publication_ack(&expected, &exhausted, &first_ack)
+            validate_publication_ack(&expected, &exhausted, &ack_for(&exhausted, 0))
                 .unwrap_err()
                 .to_string()
                 .contains("exhausted")
