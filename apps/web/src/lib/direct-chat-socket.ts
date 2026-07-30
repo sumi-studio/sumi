@@ -154,12 +154,16 @@ function isStringOrNull(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
+function isUUID(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && UUIDPattern.test(value);
+}
+
 function isDateTime(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const match =
     /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:Z|[+-](\d{2}):(\d{2}))$/
       .exec(value);
-  if (!match) return false;
+  if (!match || match[0] !== value) return false;
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
@@ -401,12 +405,12 @@ function isSafeEventForUI(
   }
   if (value.type === "message_start" || value.type === "message_end") {
     return hasRequiredAndOnlyKeys(value, ["type", "message_id", "message"]) &&
-      typeof value.message_id === "string" && UUIDPattern.test(value.message_id) &&
+      isUUID(value.message_id) &&
       isPublicMessage(value.message);
   }
   if (value.type === "message_update") {
     return hasRequiredAndOnlyKeys(value, ["type", "message_id", "event"]) &&
-      typeof value.message_id === "string" && UUIDPattern.test(value.message_id) &&
+      isUUID(value.message_id) &&
       isPublicStreamEvent(value.event);
   }
   if (value.type === "tool_execution_start") {
@@ -477,7 +481,7 @@ export function parseDirectChatServerFrame(
     return value as DirectChatEventFrame;
   }
   if (value.type === "command_accepted" && typeof value.idempotency_key === "string" &&
-    value.idempotency_key.length > 0 && typeof value.command_id === "string" && UUIDPattern.test(value.command_id) &&
+    value.idempotency_key.length > 0 && isUUID(value.command_id) &&
     isSafeSequence(value.seq) && hasOnlyKeys(value, ["type", "idempotency_key", "command_id", "seq"])) {
     return value as DirectChatAcceptedFrame;
   }

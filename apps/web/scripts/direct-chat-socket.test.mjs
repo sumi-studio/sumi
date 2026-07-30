@@ -351,6 +351,40 @@ test("validates RFC3339 calendar, time, fraction, and offset components exactly"
   }
 });
 
+test("rejects RFC3339 and UUID values with trailing line terminators", () => {
+  const uuid = "00000000-0000-4000-8000-000000000001";
+  const retry = (retry_at) => event(1, {
+    type: "retry_scheduled",
+    attempt: 1,
+    delay_ms: 100,
+    retry_at,
+    error_message: "retry",
+  });
+  const messageStart = (message_id) => event(1, {
+    type: "message_start",
+    message_id,
+    message: assistantMessage(),
+  });
+  for (const suffix of ["\n", "\r\n", "\u2028", "\u2029"]) {
+    assert.equal(parseDirectChatServerFrame(retry(`${timestamp}${suffix}`), 0), undefined);
+    assert.equal(parseDirectChatServerFrame(messageStart(`${uuid}${suffix}`), 0), undefined);
+    assert.equal(parseDirectChatServerFrame({
+      type: "command_accepted",
+      idempotency_key: "key-1",
+      command_id: `${uuid}${suffix}`,
+      seq: 1,
+    }, 0), undefined);
+  }
+  assert.equal(parseDirectChatServerFrame(retry(timestamp), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame(messageStart(uuid), 0)?.type, "event");
+  assert.equal(parseDirectChatServerFrame({
+    type: "command_accepted",
+    idempotency_key: "key-1",
+    command_id: uuid,
+    seq: 1,
+  }, 0)?.type, "command_accepted");
+});
+
 test("reconstructs and deduplicates durable messages and tool state after reload/replay", () => {
   const replay = [
     event(1, { type: "message_start", message_id: "user-1", message: { role: "user", content: [{ type: "text", text: "persisted user" }] } }),
