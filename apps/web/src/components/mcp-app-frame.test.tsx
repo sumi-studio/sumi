@@ -5,7 +5,10 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { IntegrityCheckedMcpAppProjection } from "../agent/mcp-app";
+import type {
+  IntegrityCheckedMcpAppProjection,
+  ProvenanceBoundMcpAppActivation,
+} from "../agent/mcp-app";
 import {
   clampMcpAppHeight,
   createMcpAppHostSession,
@@ -14,8 +17,8 @@ import {
   McpAppFrame,
 } from "./mcp-app-frame";
 
-function integrityCheckedProjection(): IntegrityCheckedMcpAppProjection {
-  return {
+function testOnlyProvenanceBoundActivation(): ProvenanceBoundMcpAppActivation {
+  const integrityChecked: IntegrityCheckedMcpAppProjection = {
     kind: "mcp_app_projection_candidate",
     claimedSource: {
       serverId: "calendar-server",
@@ -33,6 +36,9 @@ function integrityCheckedProjection(): IntegrityCheckedMcpAppProjection {
     toolResult: { content: [{ type: "text", text: "done" }] },
     html: "<!doctype html><html></html>",
   };
+  // Unit tests exercise the dormant host lifecycle directly. Production code
+  // has no cast or factory that can create the provenance brand.
+  return integrityChecked as ProvenanceBoundMcpAppActivation;
 }
 
 function fakeBridge(log: string[]) {
@@ -99,7 +105,7 @@ describe("MCP App host lifecycle", () => {
     const session = createMcpAppHostSession(
       bridge,
       {} as Transport,
-      integrityCheckedProjection(),
+      testOnlyProvenanceBoundActivation(),
       vi.fn(),
     );
 
@@ -131,7 +137,7 @@ describe("MCP App host lifecycle", () => {
     const session = createMcpAppHostSession(
       bridge,
       {} as Transport,
-      integrityCheckedProjection(),
+      testOnlyProvenanceBoundActivation(),
       vi.fn(),
     );
     await session.start();
@@ -153,7 +159,7 @@ describe("MCP App host lifecycle", () => {
     const proxySession = createMcpAppHostSession(
       proxyBridge,
       {} as Transport,
-      integrityCheckedProjection(),
+      testOnlyProvenanceBoundActivation(),
       vi.fn(),
       proxyFailure,
       { proxyReadyTimeoutMs: 10 },
@@ -172,7 +178,7 @@ describe("MCP App host lifecycle", () => {
     const initializedSession = createMcpAppHostSession(
       initializedBridge,
       {} as Transport,
-      integrityCheckedProjection(),
+      testOnlyProvenanceBoundActivation(),
       vi.fn(),
       initializedFailure,
       { proxyReadyTimeoutMs: 100, initializedTimeoutMs: 10 },
@@ -198,7 +204,7 @@ describe("MCP App host lifecycle", () => {
     const session = createMcpAppHostSession(
       bridge,
       {} as Transport,
-      integrityCheckedProjection(),
+      testOnlyProvenanceBoundActivation(),
       vi.fn(),
       vi.fn(),
       { teardownTimeoutMs: 10 },
@@ -327,23 +333,24 @@ describe("exact-origin postMessage transport", () => {
 describe("MCP App sandbox artifact", () => {
   const sandboxHtml = readFileSync("public/mcp-app-sandbox.html", "utf8");
 
-  it("places the outer CSP before executable content and never parses or sanitizes View HTML", () => {
+  it("places the deployment CSP before executable content and preserves View HTML bytes around the injected policy", () => {
     expect(
       sandboxHtml.indexOf('http-equiv="Content-Security-Policy"'),
     ).toBeLessThan(sandboxHtml.indexOf("<style>"));
     expect(sandboxHtml).not.toContain("DOMParser");
-    expect(sandboxHtml).not.toContain(".remove()");
     expect(sandboxHtml).toContain("html.slice(0, insertionIndex)");
     expect(sandboxHtml).toContain("html.slice(insertionIndex)");
-    expect(sandboxHtml).toContain("view.srcdoc = securedHtml");
+    expect(sandboxHtml).toContain("view.srcdoc = html");
   });
 
-  it("keeps the outer policy broad while injecting restrictive per-resource directives", () => {
+  it("keeps the deployment policy broad and installs a replacement-resistant resource boundary", () => {
     expect(sandboxHtml).toContain("connect-src https: wss:");
     expect(sandboxHtml).toContain("\"default-src 'none'\"");
-    expect(sandboxHtml).toContain(
-      "`frame-src $" + `{frames.length ? frames.join(" ") : "'none'"}`,
-    );
+    expect(sandboxHtml).toContain("createBoundaryDocument(params.csp)");
+    expect(sandboxHtml).toContain('["\'self\'", ...frames].join(" ")');
+    expect(sandboxHtml).toContain('"securitypolicyviolation"');
+    expect(sandboxHtml).toContain("viewLoads > 1");
+    expect(sandboxHtml).toContain("trustEpoch === epoch");
     expect(sandboxHtml).toContain(
       "`base-uri $" + `{bases.length ? bases.join(" ") : "'self'"}`,
     );

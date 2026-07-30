@@ -5,8 +5,26 @@ export {
   confirmCardSchema,
   type ListCardProps,
   listCardSchema,
+  MAX_SDUI_ACTION_LENGTH,
+  MAX_SDUI_ACTIONS,
+  MAX_SDUI_BODY_LENGTH,
+  MAX_SDUI_LABEL_LENGTH,
+  MAX_SDUI_LIST_ITEMS,
+  MAX_SDUI_TITLE_LENGTH,
+  parseCatalogSduiNode,
   type ReminderCardProps,
   reminderCardSchema,
 } from "./catalog";
 export { SduiView, type SduiViewProps } from "./renderer";
-export { type SduiNode, sduiNodeSchema } from "./schema";
+export {
+  MAX_SDUI_COLLECTION_ITEMS,
+  MAX_SDUI_DEPTH,
+  MAX_SDUI_OBJECT_KEYS,
+  MAX_SDUI_PAYLOAD_BYTES,
+  MAX_SDUI_STRING_BYTES,
+  MAX_SDUI_TYPE_LENGTH,
+  MAX_SDUI_VALUES,
+  parseSduiNode,
+  type SduiNode,
+  sduiNodeSchema,
+} from "./schema";

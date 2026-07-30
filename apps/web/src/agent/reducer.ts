@@ -10,7 +10,7 @@ import type {
   ReviewProjection,
   ToolCall,
 } from "@sumi/api-client";
-import { sduiNodeSchema } from "@sumi/sdui";
+import { parseCatalogSduiNode } from "@sumi/sdui";
 import type {
   AgentRun,
   AgentTraceEvent,
@@ -733,8 +733,7 @@ function sduiResult(result: AnyJSON) {
   ) {
     return null;
   }
-  const parsed = sduiNodeSchema.safeParse(result.sdui);
-  return parsed.success ? parsed.data : null;
+  return parseCatalogSduiNode(result.sdui);
 }
 
 function finalizeTrace(trace: AgentTraceEvent): AgentTraceEvent {

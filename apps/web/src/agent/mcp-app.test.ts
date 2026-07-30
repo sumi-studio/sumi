@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   checkMcpAppProjectionIntegrity,
+  type IntegrityCheckedMcpAppProjection,
   MAX_MCP_APP_HTML_BYTES,
+  type ProvenanceBoundMcpAppActivation,
   parseMcpAppProjectionCandidate,
   resolveMcpAppSandboxConfig,
 } from "./mcp-app";
@@ -37,6 +39,15 @@ function projection(overrides: Record<string, unknown> = {}) {
 }
 
 describe("MCP App projection candidate", () => {
+  it("keeps integrity-only values outside the provenance-bound activation type", () => {
+    type IntegrityDoesNotActivate =
+      IntegrityCheckedMcpAppProjection extends ProvenanceBoundMcpAppActivation
+        ? false
+        : true;
+    const boundaryIsDistinct: IntegrityDoesNotActivate = true;
+    expect(boundaryIsDistinct).toBe(true);
+  });
+
   it("does not activate from an unprovenanced generic tool result", () => {
     expect(
       parseMcpAppProjectionCandidate({

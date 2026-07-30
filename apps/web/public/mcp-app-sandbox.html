@@ -7,10 +7,11 @@
       This source artifact is deliberately inert. A dedicated HTTPS sandbox
       deployment must replace the marker below and serve the CSP in this meta
       element as an HTTP response header, plus an exact frame-ancestors host.
-      The broad source directives are an intentional outer-policy ceiling:
-      srcdoc inherits the outer CSP, while a second, resource-specific CSP is
-      injected before any View HTML. Tightening the outer source directives
-      would silently break domains validly declared by a View. See
+      The broad source directives permit a resource-specific policy boundary
+      to be created after the Host supplies the resource CSP. That boundary's
+      CSP is inherited by the View and limits every replacement navigation;
+      the same policy is also injected before any View HTML. Tightening this
+      deployment policy would silently break validly declared domains. See
       mcp-app-sandbox-deployment.md next to this file.
     -->
     <meta
@@ -51,12 +52,13 @@
         const MAX_MESSAGES_PER_WINDOW = 120;
         const MESSAGE_RATE_WINDOW_MS = 1000;
         const DEPLOYMENT_PATTERN = /^[a-f0-9]{64}$/;
+        const RESOURCE_BOOTSTRAP = "sumi/mcp/resource-bootstrap";
         const encoder = new TextEncoder();
-        let view = null;
+        let boundary = null;
         let loaded = false;
         const rateWindows = {
           parent: { startedAt: -1, count: 0 },
-          view: { startedAt: -1, count: 0 },
+          boundary: { startedAt: -1, count: 0 },
         };
 
         const deploymentMarker = document
@@ -171,6 +173,10 @@
         }
 
         function createPolicy(csp) {
+          return createPolicyForBoundary(csp, false);
+        }
+
+        function createPolicyForBoundary(csp, isBoundary) {
           if (
             csp === null ||
             typeof csp !== "object" ||
@@ -200,11 +206,202 @@
             `font-src 'self' data: ${resources.join(" ")}`.trim(),
             `media-src 'self' data: blob: ${resources.join(" ")}`.trim(),
             `connect-src 'self' ${connect.join(" ")}`.trim(),
-            `frame-src ${frames.length ? frames.join(" ") : "'none'"}`,
+            `frame-src ${
+              isBoundary
+                ? ["'self'", ...frames].join(" ")
+                : frames.length
+                  ? frames.join(" ")
+                  : "'none'"
+            }`,
             `base-uri ${bases.length ? bases.join(" ") : "'self'"}`,
             "object-src 'none'",
             "form-action 'none'",
           ].join("; ");
+        }
+
+        function createBoundaryDocument(csp) {
+          const policy = createPolicyForBoundary(
+            csp === undefined ? {} : csp,
+            true,
+          );
+          if (!policy) return null;
+          const escapedPolicy = policy
+            .replaceAll("&", "&amp;")
+            .replaceAll('"', "&quot;");
+          const program = `(${resourceBoundaryMain.toString()})()`;
+          return (
+            "<!doctype html><html><head>" +
+            `<meta http-equiv="Content-Security-Policy" content="${escapedPolicy}">` +
+            '<meta name="referrer" content="no-referrer">' +
+            "</head><body><script>" +
+            program +
+            "<" +
+            "/script></body></html>"
+          );
+        }
+
+        function resourceBoundaryMain() {
+          "use strict";
+
+          const RESOURCE_BOOTSTRAP = "sumi/mcp/resource-bootstrap";
+          const MAX_HTML_BYTES = 512 * 1024;
+          const MAX_MESSAGE_BYTES = 256 * 1024;
+          const MAX_MESSAGES_PER_WINDOW = 120;
+          const MESSAGE_RATE_WINDOW_MS = 1000;
+          const NAVIGATION_SETTLE_MS = 50;
+          const encoder = new TextEncoder();
+          let view = null;
+          let trusted = false;
+          let bootstrapped = false;
+          let viewLoads = 0;
+          let trustEpoch = 0;
+          const rateWindows = {
+            parent: { startedAt: -1, count: 0 },
+            view: { startedAt: -1, count: 0 },
+          };
+
+          function isJsonRpcMessage(value) {
+            return (
+              value !== null &&
+              typeof value === "object" &&
+              !Array.isArray(value) &&
+              value.jsonrpc === "2.0" &&
+              (typeof value.method === "string" ||
+                Object.hasOwn(value, "result") ||
+                Object.hasOwn(value, "error"))
+            );
+          }
+
+          function isBoundedMessage(value) {
+            try {
+              const serialized = JSON.stringify(value);
+              return (
+                serialized !== undefined &&
+                encoder.encode(serialized).byteLength <= MAX_MESSAGE_BYTES
+              );
+            } catch {
+              return false;
+            }
+          }
+
+          function consumeRateLimit(source) {
+            const current = rateWindows[source];
+            const now = Date.now();
+            if (
+              current.startedAt < 0 ||
+              now - current.startedAt >= MESSAGE_RATE_WINDOW_MS
+            ) {
+              current.startedAt = now;
+              current.count = 1;
+              return true;
+            }
+            current.count += 1;
+            return current.count <= MAX_MESSAGES_PER_WINDOW;
+          }
+
+          function revokeViewTrust() {
+            if (!trusted && !view) return;
+            trusted = false;
+            trustEpoch += 1;
+            view?.remove();
+            view = null;
+          }
+
+          function createView(html) {
+            trusted = true;
+            view = document.createElement("iframe");
+            view.title = "MCP App";
+            view.sandbox = "allow-scripts";
+            view.allow =
+              "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'";
+            view.referrerPolicy = "no-referrer";
+            view.credentialless = true;
+            view.addEventListener("load", () => {
+              viewLoads += 1;
+              if (viewLoads > 1) {
+                revokeViewTrust();
+              }
+            });
+            view.srcdoc = html;
+            document.body.replaceChildren(view);
+          }
+
+          // The boundary policy's frame-src controls navigation of its direct
+          // child. A blocked replacement reports here; accepted replacements
+          // are caught by the child's second load event.
+          document.addEventListener(
+            "securitypolicyviolation",
+            (event) => {
+              if (
+                event.violatedDirective === "frame-src" ||
+                event.effectiveDirective === "frame-src"
+              ) {
+                revokeViewTrust();
+              }
+            },
+            true,
+          );
+
+          window.addEventListener("message", (event) => {
+            if (event.source === window.parent) {
+              if (
+                !consumeRateLimit("parent") ||
+                !isBoundedMessage(event.data)
+              ) {
+                return;
+              }
+              if (
+                !bootstrapped &&
+                event.data !== null &&
+                typeof event.data === "object" &&
+                !Array.isArray(event.data) &&
+                event.data.type === RESOURCE_BOOTSTRAP &&
+                typeof event.data.html === "string" &&
+                encoder.encode(event.data.html).byteLength <= MAX_HTML_BYTES
+              ) {
+                bootstrapped = true;
+                createView(event.data.html);
+              } else if (
+                trusted &&
+                view &&
+                isJsonRpcMessage(event.data)
+              ) {
+                view.contentWindow?.postMessage(event.data, "*");
+              }
+              return;
+            }
+
+            const source = view?.contentWindow;
+            if (
+              !trusted ||
+              !source ||
+              event.source !== source ||
+              event.origin !== "null" ||
+              !consumeRateLimit("view") ||
+              !isBoundedMessage(event.data) ||
+              !isJsonRpcMessage(event.data) ||
+              String(event.data.method || "").startsWith(
+                "ui/notifications/sandbox-",
+              )
+            ) {
+              return;
+            }
+
+            // Navigation load/CSP events can be queued beside postMessage.
+            // Hold the message for a bounded settle window so revocation at
+            // the outer policy boundary wins before any post-navigation data.
+            const epoch = trustEpoch;
+            const message = event.data;
+            setTimeout(() => {
+              if (
+                trusted &&
+                view?.contentWindow === source &&
+                trustEpoch === epoch
+              ) {
+                window.parent.postMessage(message, "*");
+              }
+            }, NAVIGATION_SETTLE_MS);
+          });
         }
 
         function withPolicy(html, csp) {
@@ -277,17 +474,29 @@
           }
           const securedHtml = withPolicy(params.html, params.csp);
           if (!securedHtml) return;
+          const boundaryHtml = createBoundaryDocument(params.csp);
+          if (!boundaryHtml) return;
 
           loaded = true;
-          view = document.createElement("iframe");
-          view.title = "MCP App";
-          view.sandbox = "allow-scripts";
-          view.allow =
+          boundary = document.createElement("iframe");
+          boundary.title = "MCP App policy boundary";
+          boundary.sandbox = "allow-scripts";
+          boundary.allow =
             "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'";
-          view.referrerPolicy = "no-referrer";
-          view.credentialless = true;
-          view.srcdoc = securedHtml;
-          document.body.replaceChildren(view);
+          boundary.referrerPolicy = "no-referrer";
+          boundary.credentialless = true;
+          boundary.addEventListener(
+            "load",
+            () => {
+              boundary?.contentWindow?.postMessage(
+                { type: RESOURCE_BOOTSTRAP, html: securedHtml },
+                "*",
+              );
+            },
+            { once: true },
+          );
+          boundary.srcdoc = boundaryHtml;
+          document.body.replaceChildren(boundary);
         }
 
         window.addEventListener("message", (event) => {
@@ -304,15 +513,15 @@
             }
             if (event.data.method === RESOURCE_READY) {
               loadResource(event.data.params);
-            } else if (view) {
-              view.contentWindow?.postMessage(event.data, "*");
+            } else if (boundary) {
+              boundary.contentWindow?.postMessage(event.data, "*");
             }
             return;
           }
           if (
-            event.source === view?.contentWindow &&
+            event.source === boundary?.contentWindow &&
             event.origin === "null" &&
-            consumeRateLimit("view") &&
+            consumeRateLimit("boundary") &&
             isBoundedMessage(event.data) &&
             isJsonRpcMessage(event.data) &&
             !String(event.data.method || "").startsWith(

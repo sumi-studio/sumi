@@ -59,6 +59,24 @@ export interface IntegrityCheckedMcpAppProjection
   html: string;
 }
 
+declare const authenticatedMcpProvenance: unique symbol;
+
+/**
+ * Activation input whose tool call and resource read were bound to the same
+ * authenticated MCP server connection by a trusted backend.
+ *
+ * There is intentionally no browser factory for this type. Generic event JSON,
+ * claimed source fields, and `checkMcpAppProjectionIntegrity` can only produce
+ * an `IntegrityCheckedMcpAppProjection`.
+ */
+export type ProvenanceBoundMcpAppActivation =
+  IntegrityCheckedMcpAppProjection & {
+    readonly [authenticatedMcpProvenance]: {
+      readonly serverConnection: true;
+      readonly toolCallResourceBinding: true;
+    };
+  };
+
 export interface McpAppSandboxConfig {
   url: string;
   origin: string;

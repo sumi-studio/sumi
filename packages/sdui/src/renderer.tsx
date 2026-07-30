@@ -5,6 +5,7 @@ import {
   type ConfirmCardProps,
   cardSchemas,
   type ListCardProps,
+  parseCatalogSduiNode,
   type ReminderCardProps,
 } from "./catalog";
 import type { SduiNode } from "./schema";
@@ -21,7 +22,12 @@ export interface SduiViewProps {
  * エラーにせずフォールバックカードとして可視化する (会話を壊さない)。
  */
 export function SduiView({ node, onAction, className }: SduiViewProps) {
-  const card = renderCard(node, onAction);
+  const parsedNode = parseCatalogSduiNode(node);
+  const card = parsedNode ? (
+    renderCard(parsedNode, onAction)
+  ) : (
+    <UnknownCard reason="invalid declaration" />
+  );
   return (
     <div
       className={cn(

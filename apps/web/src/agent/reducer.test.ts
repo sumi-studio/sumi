@@ -213,6 +213,80 @@ test("durable tool start and end upsert without volatile tool-call events", () =
   if (second?.type === "tool") assert.equal(second.status, "error");
 });
 
+test("valid SDUI materializes while adversarial SDUI validation stays inert", () => {
+  const valid = {
+    type: "list",
+    props: { title: "Tasks", items: [{ text: "Bounded" }] },
+  };
+  const tooManyItems = {
+    type: "list",
+    props: {
+      items: Array.from({ length: 101 }, (_, index) => ({
+        text: `item-${index}`,
+      })),
+    },
+  };
+  const tooManyActions = {
+    type: "reminder",
+    props: {
+      title: "Reminder",
+      at: "2026-08-01T09:00:00Z",
+      actions: Array.from({ length: 9 }, (_, index) => ({
+        label: `action-${index}`,
+        action: `action:${index}`,
+      })),
+    },
+  };
+  const oversizedString = {
+    type: "confirm",
+    props: {
+      title: "x".repeat(257),
+      confirm: { label: "yes", action: "confirm" },
+      cancel: { label: "no", action: "cancel" },
+    },
+  };
+  let deeplyNested: Record<string, unknown> = {
+    type: "list",
+    props: { items: [] },
+  };
+  for (let depth = 0; depth < 10_000; depth += 1) {
+    deeplyNested = {
+      type: "list",
+      props: { items: [] },
+      children: [deeplyNested],
+    };
+  }
+
+  const payloads: Array<{ name: string; node: unknown; accepted: boolean }> = [
+    { name: "valid", node: valid, accepted: true },
+    { name: "deep children", node: deeplyNested, accepted: false },
+    { name: "wide items", node: tooManyItems, accepted: false },
+    { name: "wide actions", node: tooManyActions, accepted: false },
+    { name: "oversized string", node: oversizedString, accepted: false },
+  ];
+
+  for (const { name, node, accepted } of payloads) {
+    let session = createAgentSession();
+    session = apply(session, {
+      seq: 60,
+      event: { type: "agent_start" },
+    });
+    assert.doesNotThrow(() => {
+      session = apply(session, {
+        seq: 61,
+        event: {
+          type: "tool_execution_end",
+          tool_call_id: `call-${name}`,
+          result: { sdui: node } as never,
+          is_error: false,
+        },
+      });
+    });
+    const card = session.conversation.entries[`card:call-${name}`];
+    assert.equal(card?.kind === "card", accepted, name);
+  }
+});
+
 test("approval request and resolution preserve structured decision", () => {
   let session = createAgentSession();
   session = apply(session, {

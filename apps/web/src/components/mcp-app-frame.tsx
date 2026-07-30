@@ -9,6 +9,7 @@ import {
   boundedJsonByteLength,
   type IntegrityCheckedMcpAppProjection,
   MAX_MCP_APP_MESSAGE_BYTES,
+  type ProvenanceBoundMcpAppActivation,
 } from "../agent/mcp-app";
 
 const MIN_HEIGHT = 180;
@@ -78,7 +79,7 @@ export interface McpAppHostSessionOptions {
 export function createMcpAppHostSession(
   bridge: BridgePort,
   transport: Transport,
-  projection: IntegrityCheckedMcpAppProjection,
+  projection: ProvenanceBoundMcpAppActivation,
   onHeight: (height: number) => void,
   onFailure: (error: Error) => void = () => undefined,
   options: McpAppHostSessionOptions = {},
