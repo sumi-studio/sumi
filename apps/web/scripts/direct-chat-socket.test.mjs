@@ -120,6 +120,24 @@ test("a terminal idempotency conflict clears its pending key without reconnect r
   socket.close();
 });
 
+test("a terminal unavailable rejection clears its pending key without closing or reconnect resend", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  socket.sendCommand({ type: "abort" }, "unavailable-key");
+  first.receive({ type: "command_rejected", idempotency_key: "unavailable-key", reject_reason: "unavailable" });
+  assert.deepEqual(socket.pendingIdempotencyKeys(), []);
+  assert.equal(first.readyState, FakeWebSocket.OPEN);
+  first.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.equal(second.sent.map(JSON.parse).filter((frame) => frame.type === "command").length, 0);
+  socket.close();
+});
+
 test("tracks browser connection separately from authoritative agent readiness", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();

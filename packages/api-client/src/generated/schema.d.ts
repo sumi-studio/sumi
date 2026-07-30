@@ -574,7 +574,7 @@ export interface components {
             type: "command_rejected";
             idempotency_key: string;
             /** @enum {string} */
-            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict";
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable";
         };
         DirectChatStatusFrame: {
             /** @constant */
