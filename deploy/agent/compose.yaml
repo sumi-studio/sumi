@@ -86,6 +86,10 @@ services:
     command: [runtime]
     environment:
       SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
+      # Config must resolve the same isolated workspace mounted below. Without
+      # this explicit value, its cwd fallback is `/` in the image and overlaps
+      # the `/var/lib/sumi` state directory.
+      SUMI_WORKSPACE: /workspace
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_SERVER_UID: ${SUMI_LOCAL_CONTROL_SERVER_UID:?SUMI_LOCAL_CONTROL_SERVER_UID is required}
       SUMI_LOCAL_CONTROL_SOCKET_GID: ${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}
@@ -130,6 +134,7 @@ services:
         mode: 0o400
     volumes:
       - state:/var/lib/sumi
+      - workspace:/workspace:ro
       - runtime-identity:/run/sumi/identity:ro
       - executor-ipc:/run/sumi/executor:ro
       # Bind the checked pre-existing socket itself, not its mutable host

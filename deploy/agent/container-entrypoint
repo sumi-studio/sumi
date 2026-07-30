@@ -205,6 +205,7 @@ case "${role}" in
     load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
     for name in \
       SUMI_GATEWAY_URL \
+      SUMI_WORKSPACE \
       SUMI_LOCAL_CONTROL_UNIX_SOCKET \
       SUMI_LOCAL_CONTROL_SERVER_UID \
       SUMI_LOCAL_CONTROL_SOCKET_GID \
@@ -217,6 +218,8 @@ case "${role}" in
     do
       require_env "${name}"
     done
+    [[ "${SUMI_WORKSPACE}" == /workspace ]] ||
+      fail "SUMI_WORKSPACE must match the mounted /workspace path"
     if [[ -v SUMI_MODEL_ID ]]; then
       [[ -n "${SUMI_MODEL_ID}" ]] || fail "SUMI_MODEL_ID must not be empty when set"
     fi
@@ -230,6 +233,7 @@ case "${role}" in
       "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}"
       "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}"
       "SUMI_STATE_DIR=/var/lib/sumi"
+      "SUMI_WORKSPACE=${SUMI_WORKSPACE}"
       "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock"
       "SUMI_GATEWAY_URL=${SUMI_GATEWAY_URL}"
       "SUMI_LOCAL_CONTROL_UNIX_SOCKET=${SUMI_LOCAL_CONTROL_UNIX_SOCKET}"
