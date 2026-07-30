@@ -20,14 +20,22 @@ const SHA256_PATTERN = /^sha256:([a-f0-9]{64})$/;
 const BASE64_PATTERN =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
-export interface TrustedMcpAppProjection {
+/**
+ * A bounded, structurally valid wire candidate.
+ *
+ * None of these fields authenticate the MCP server, tool, or resource. The
+ * browser cannot establish that provenance from self-described JSON or from a
+ * content digest. A future same-origin backend producer must bind this
+ * candidate to the MCP connection that performed tools/call and resources/read
+ * before the renderer is activated.
+ */
+export interface McpAppProjectionCandidate {
   /**
-   * Backend-only projection produced after resolving `_meta.ui.resourceUri`
-   * and reading that `ui://` resource on the same MCP server connection.
-   * Generic tool-result content must never be promoted into this shape.
+   * Self-described source fields. They are useful for structural validation
+   * and diagnostics only; they are not proof that any MCP operation occurred.
    */
-  kind: "trusted_mcp_app_projection";
-  provenance: {
+  kind: "mcp_app_projection_candidate";
+  claimedSource: {
     serverId: string;
     toolName: string;
     resourceUri: string;
@@ -45,7 +53,9 @@ export interface TrustedMcpAppProjection {
   toolResult: CallToolResult;
 }
 
-export interface VerifiedMcpAppProjection extends TrustedMcpAppProjection {
+/** Content-integrity checked, but still not provenance-authenticated. */
+export interface IntegrityCheckedMcpAppProjection
+  extends McpAppProjectionCandidate {
   html: string;
 }
 
@@ -55,31 +65,31 @@ export interface McpAppSandboxConfig {
   deploymentId: string;
 }
 
-export function parseTrustedMcpAppProjection(
+export function parseMcpAppProjectionCandidate(
   value: unknown,
-): TrustedMcpAppProjection | null {
+): McpAppProjectionCandidate | null {
   if (
     !isRecord(value) ||
     !hasOnlyKeys(value, [
       "kind",
-      "provenance",
+      "claimedSource",
       "resource",
       "toolInput",
       "toolResult",
     ]) ||
-    value.kind !== "trusted_mcp_app_projection" ||
-    !isRecord(value.provenance) ||
-    !hasOnlyKeys(value.provenance, [
+    value.kind !== "mcp_app_projection_candidate" ||
+    !isRecord(value.claimedSource) ||
+    !hasOnlyKeys(value.claimedSource, [
       "serverId",
       "toolName",
       "resourceUri",
       "resourceSha256",
     ]) ||
-    !isBoundedIdentifier(value.provenance.serverId) ||
-    !isBoundedIdentifier(value.provenance.toolName) ||
-    !isResourceUri(value.provenance.resourceUri) ||
-    typeof value.provenance.resourceSha256 !== "string" ||
-    !SHA256_PATTERN.test(value.provenance.resourceSha256) ||
+    !isBoundedIdentifier(value.claimedSource.serverId) ||
+    !isBoundedIdentifier(value.claimedSource.toolName) ||
+    !isResourceUri(value.claimedSource.resourceUri) ||
+    typeof value.claimedSource.resourceSha256 !== "string" ||
+    !SHA256_PATTERN.test(value.claimedSource.resourceSha256) ||
     !isRecord(value.resource) ||
     !hasOnlyKeys(value.resource, [
       "uri",
@@ -92,7 +102,7 @@ export function parseTrustedMcpAppProjection(
       "prefersBorder",
     ]) ||
     !isResourceUri(value.resource.uri) ||
-    value.resource.uri !== value.provenance.resourceUri ||
+    value.resource.uri !== value.claimedSource.resourceUri ||
     value.resource.mimeType !== RESOURCE_MIME_TYPE ||
     !hasExactlyOneContentRepresentation(value.resource) ||
     !isRecord(value.toolInput) ||
@@ -157,12 +167,12 @@ export function parseTrustedMcpAppProjection(
   }
 
   return {
-    kind: "trusted_mcp_app_projection",
-    provenance: {
-      serverId: value.provenance.serverId,
-      toolName: value.provenance.toolName,
-      resourceUri: value.provenance.resourceUri,
-      resourceSha256: value.provenance.resourceSha256,
+    kind: "mcp_app_projection_candidate",
+    claimedSource: {
+      serverId: value.claimedSource.serverId,
+      toolName: value.claimedSource.toolName,
+      resourceUri: value.claimedSource.resourceUri,
+      resourceSha256: value.claimedSource.resourceSha256,
     },
     resource: {
       uri: resource.uri as string,
@@ -180,16 +190,16 @@ export function parseTrustedMcpAppProjection(
   };
 }
 
-export async function verifyTrustedMcpAppProjection(
-  projection: TrustedMcpAppProjection,
-): Promise<VerifiedMcpAppProjection | null> {
+export async function checkMcpAppProjectionIntegrity(
+  projection: McpAppProjectionCandidate,
+): Promise<IntegrityCheckedMcpAppProjection | null> {
   const htmlBytes = readHtmlBytes(projection.resource);
   if (!htmlBytes || htmlBytes.byteLength > MAX_MCP_APP_HTML_BYTES) {
     return null;
   }
 
   const expectedHash = SHA256_PATTERN.exec(
-    projection.provenance.resourceSha256,
+    projection.claimedSource.resourceSha256,
   )?.[1];
   if (!expectedHash || !globalThis.crypto?.subtle) {
     return null;
@@ -203,10 +213,14 @@ export async function verifyTrustedMcpAppProjection(
     return null;
   }
 
-  return {
-    ...projection,
-    html: new TextDecoder("utf-8", { fatal: true }).decode(htmlBytes),
-  };
+  try {
+    return {
+      ...projection,
+      html: new TextDecoder("utf-8", { fatal: true }).decode(htmlBytes),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function resolveMcpAppSandboxConfig(
@@ -328,7 +342,7 @@ function isAllowedCspSource(
 }
 
 function readHtmlBytes(
-  resource: TrustedMcpAppProjection["resource"],
+  resource: McpAppProjectionCandidate["resource"],
 ): Uint8Array | null {
   if (resource.text !== undefined) {
     return new TextEncoder().encode(resource.text);

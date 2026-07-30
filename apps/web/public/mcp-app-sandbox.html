@@ -5,10 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!--
       This source artifact is deliberately inert. A dedicated HTTPS sandbox
-      deployment must replace the marker below and serve an equivalent CSP as
-      an HTTP response header. The app host must configure the same marker in
-      VITE_MCP_APP_SANDBOX_DEPLOYMENT_ID.
+      deployment must replace the marker below and serve the CSP in this meta
+      element as an HTTP response header, plus an exact frame-ancestors host.
+      The broad source directives are an intentional outer-policy ceiling:
+      srcdoc inherits the outer CSP, while a second, resource-specific CSP is
+      injected before any View HTML. Tightening the outer source directives
+      would silently break domains validly declared by a View. See
+      mcp-app-sandbox-deployment.md next to this file.
     -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src * data: blob:; script-src * data: blob: 'unsafe-inline'; style-src * data: blob: 'unsafe-inline'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; connect-src https: wss:; frame-src *; worker-src * blob:; object-src 'none'; base-uri *; form-action 'none'"
+    />
     <meta
       name="sumi-mcp-sandbox-deployment"
       content="__SUMI_MCP_SANDBOX_DEPLOYMENT__"
@@ -40,10 +48,16 @@
         const MAX_HTML_BYTES = 512 * 1024;
         const MAX_MESSAGE_BYTES = 256 * 1024;
         const MAX_CSP_ORIGINS = 16;
+        const MAX_MESSAGES_PER_WINDOW = 120;
+        const MESSAGE_RATE_WINDOW_MS = 1000;
         const DEPLOYMENT_PATTERN = /^[a-f0-9]{64}$/;
         const encoder = new TextEncoder();
         let view = null;
         let loaded = false;
+        const rateWindows = {
+          parent: { startedAt: -1, count: 0 },
+          view: { startedAt: -1, count: 0 },
+        };
 
         const deploymentMarker = document
           .querySelector('meta[name="sumi-mcp-sandbox-deployment"]')
@@ -94,11 +108,29 @@
 
         function isBoundedMessage(value) {
           try {
-            return encoder.encode(JSON.stringify(value)).byteLength <=
-              MAX_MESSAGE_BYTES;
+            const serialized = JSON.stringify(value);
+            return (
+              serialized !== undefined &&
+              encoder.encode(serialized).byteLength <= MAX_MESSAGE_BYTES
+            );
           } catch {
             return false;
           }
+        }
+
+        function consumeRateLimit(source) {
+          const current = rateWindows[source];
+          const now = Date.now();
+          if (
+            current.startedAt < 0 ||
+            now - current.startedAt >= MESSAGE_RATE_WINDOW_MS
+          ) {
+            current.startedAt = now;
+            current.count = 1;
+            return true;
+          }
+          current.count += 1;
+          return current.count <= MAX_MESSAGES_PER_WINDOW;
         }
 
         function cspSources(value, allowWebSocket, allowWildcard) {
@@ -162,34 +194,70 @@
           if (!connect || !resources || !frames || !bases) return null;
           return [
             "default-src 'none'",
-            `script-src 'unsafe-inline' ${resources.join(" ")}`.trim(),
-            `style-src 'unsafe-inline' ${resources.join(" ")}`.trim(),
-            `img-src data: ${resources.join(" ")}`.trim(),
-            `font-src ${resources.length ? resources.join(" ") : "'none'"}`,
-            `media-src data: ${resources.join(" ")}`.trim(),
-            `connect-src ${connect.length ? connect.join(" ") : "'none'"}`,
+            `script-src 'self' 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `style-src 'self' 'unsafe-inline' ${resources.join(" ")}`.trim(),
+            `img-src 'self' data: blob: ${resources.join(" ")}`.trim(),
+            `font-src 'self' data: ${resources.join(" ")}`.trim(),
+            `media-src 'self' data: blob: ${resources.join(" ")}`.trim(),
+            `connect-src 'self' ${connect.join(" ")}`.trim(),
             `frame-src ${frames.length ? frames.join(" ") : "'none'"}`,
-            `base-uri ${bases.length ? bases.join(" ") : "'none'"}`,
+            `base-uri ${bases.length ? bases.join(" ") : "'self'"}`,
             "object-src 'none'",
             "form-action 'none'",
           ].join("; ");
         }
 
         function withPolicy(html, csp) {
-          const policy = createPolicy(csp || {});
+          const policy = createPolicy(csp === undefined ? {} : csp);
           if (!policy) return null;
-          const documentNode = new DOMParser().parseFromString(
-            html,
-            "text/html",
+          const escapedPolicy = policy
+            .replaceAll("&", "&amp;")
+            .replaceAll('"', "&quot;");
+          const meta =
+            `<meta http-equiv="Content-Security-Policy" content="${escapedPolicy}">`;
+          const insertionIndex = afterLeadingDoctype(html);
+          return (
+            html.slice(0, insertionIndex) +
+            meta +
+            html.slice(insertionIndex)
           );
-          documentNode
-            .querySelectorAll('meta[http-equiv="Content-Security-Policy"]')
-            .forEach((node) => node.remove());
-          const meta = documentNode.createElement("meta");
-          meta.httpEquiv = "Content-Security-Policy";
-          meta.content = policy;
-          documentNode.head.prepend(meta);
-          return `<!doctype html>${documentNode.documentElement.outerHTML}`;
+        }
+
+        // A CSP meta element must be parsed before any executable View token.
+        // This scanner preserves the resource bytes verbatim and only finds the
+        // end of a leading HTML5 doctype. It does not parse, fetch, allowlist,
+        // remove, or otherwise rewrite View content.
+        function afterLeadingDoctype(html) {
+          let cursor = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+          while (cursor < html.length) {
+            const whitespace = /^[\t\n\f\r ]+/.exec(html.slice(cursor));
+            if (whitespace) {
+              cursor += whitespace[0].length;
+              continue;
+            }
+            if (html.startsWith("<!--", cursor)) {
+              const commentEnd = html.indexOf("-->", cursor + 4);
+              if (commentEnd === -1) return 0;
+              cursor = commentEnd + 3;
+              continue;
+            }
+            break;
+          }
+          if (html.slice(cursor, cursor + 9).toLowerCase() !== "<!doctype") {
+            return 0;
+          }
+          let quote = "";
+          for (let index = cursor + 9; index < html.length; index += 1) {
+            const character = html[index];
+            if (quote) {
+              if (character === quote) quote = "";
+            } else if (character === '"' || character === "'") {
+              quote = character;
+            } else if (character === ">") {
+              return index + 1;
+            }
+          }
+          return 0;
         }
 
         function loadResource(params) {
@@ -223,13 +291,17 @@
         }
 
         window.addEventListener("message", (event) => {
-          if (!isBoundedMessage(event.data) || !isJsonRpcMessage(event.data)) {
-            return;
-          }
           if (
             event.source === window.parent &&
             event.origin === parentOrigin
           ) {
+            if (
+              !consumeRateLimit("parent") ||
+              !isBoundedMessage(event.data) ||
+              !isJsonRpcMessage(event.data)
+            ) {
+              return;
+            }
             if (event.data.method === RESOURCE_READY) {
               loadResource(event.data.params);
             } else if (view) {
@@ -240,6 +312,9 @@
           if (
             event.source === view?.contentWindow &&
             event.origin === "null" &&
+            consumeRateLimit("view") &&
+            isBoundedMessage(event.data) &&
+            isJsonRpcMessage(event.data) &&
             !String(event.data.method || "").startsWith(
               "ui/notifications/sandbox-",
             )

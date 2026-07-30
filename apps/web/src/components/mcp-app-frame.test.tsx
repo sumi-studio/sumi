@@ -1,19 +1,23 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from "node:fs";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it, vi } from "vitest";
-import type { VerifiedMcpAppProjection } from "../agent/mcp-app";
+import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { IntegrityCheckedMcpAppProjection } from "../agent/mcp-app";
 import {
   clampMcpAppHeight,
   createMcpAppHostSession,
   ExactOriginPostMessageTransport,
+  MAX_MCP_APP_MESSAGES_PER_WINDOW,
+  McpAppFrame,
 } from "./mcp-app-frame";
 
-function verifiedProjection(): VerifiedMcpAppProjection {
+function integrityCheckedProjection(): IntegrityCheckedMcpAppProjection {
   return {
-    kind: "trusted_mcp_app_projection",
-    provenance: {
+    kind: "mcp_app_projection_candidate",
+    claimedSource: {
       serverId: "calendar-server",
       toolName: "show-calendar",
       resourceUri: "ui://calendar/view",
@@ -71,6 +75,23 @@ function fakeBridge(log: string[]) {
   };
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("MCP App renderer gate", () => {
+  it("stays explicitly dormant without a backend-authenticated projection", () => {
+    render(<McpAppFrame />);
+
+    expect(
+      screen
+        .getByTestId("mcp-app-unavailable")
+        .getAttribute("data-mcp-app-state"),
+    ).toBe("dormant");
+    expect(screen.queryByTitle("MCP App")).toBeNull();
+  });
+});
+
 describe("MCP App host lifecycle", () => {
   it("sends resource, input, and result once and only after initialization", async () => {
     const log: string[] = [];
@@ -78,7 +99,7 @@ describe("MCP App host lifecycle", () => {
     const session = createMcpAppHostSession(
       bridge,
       {} as Transport,
-      verifiedProjection(),
+      integrityCheckedProjection(),
       vi.fn(),
     );
 
@@ -110,7 +131,7 @@ describe("MCP App host lifecycle", () => {
     const session = createMcpAppHostSession(
       bridge,
       {} as Transport,
-      verifiedProjection(),
+      integrityCheckedProjection(),
       vi.fn(),
     );
     await session.start();
@@ -123,6 +144,74 @@ describe("MCP App host lifecycle", () => {
     expect(bridge.teardownResource).toHaveBeenCalledTimes(1);
     expect(bridge.close).toHaveBeenCalledTimes(1);
     expect(bridge.removeEventListener).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails closed when the proxy-ready or initialized handshake times out", async () => {
+    vi.useFakeTimers();
+    const proxyFailure = vi.fn();
+    const proxyBridge = fakeBridge([]);
+    const proxySession = createMcpAppHostSession(
+      proxyBridge,
+      {} as Transport,
+      integrityCheckedProjection(),
+      vi.fn(),
+      proxyFailure,
+      { proxyReadyTimeoutMs: 10 },
+    );
+    await proxySession.start();
+    await vi.advanceTimersByTimeAsync(11);
+    expect(proxyFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "MCP App sandbox proxy did not become ready in time.",
+      }),
+    );
+    expect(proxyBridge.close).toHaveBeenCalledOnce();
+
+    const initializedFailure = vi.fn();
+    const initializedBridge = fakeBridge([]);
+    const initializedSession = createMcpAppHostSession(
+      initializedBridge,
+      {} as Transport,
+      integrityCheckedProjection(),
+      vi.fn(),
+      initializedFailure,
+      { proxyReadyTimeoutMs: 100, initializedTimeoutMs: 10 },
+    );
+    await initializedSession.start();
+    initializedBridge.emit("sandboxready");
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(11);
+    expect(initializedFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "MCP App view did not initialize in time.",
+      }),
+    );
+    expect(initializedBridge.close).toHaveBeenCalledOnce();
+  });
+
+  it("bounds teardown when an initialized view does not respond", async () => {
+    vi.useFakeTimers();
+    const bridge = fakeBridge([]);
+    bridge.teardownResource.mockImplementation(
+      () => new Promise<Record<string, unknown>>(() => undefined),
+    );
+    const session = createMcpAppHostSession(
+      bridge,
+      {} as Transport,
+      integrityCheckedProjection(),
+      vi.fn(),
+      vi.fn(),
+      { teardownTimeoutMs: 10 },
+    );
+    await session.start();
+    bridge.emit("initialized");
+
+    const closing = session.close();
+    await vi.advanceTimersByTimeAsync(11);
+    await closing;
+
+    expect(bridge.teardownResource).toHaveBeenCalledWith({}, { timeout: 10 });
+    expect(bridge.close).toHaveBeenCalledOnce();
   });
 
   it("accepts only finite bounded heights", () => {
@@ -194,5 +283,69 @@ describe("exact-origin postMessage transport", () => {
       "https://sandbox.example",
     );
     await transport.close();
+  });
+
+  it("rate-limits inbound and outbound traffic independently", async () => {
+    const source = {} as MessageEventSource;
+    const target = { postMessage: vi.fn() } as unknown as Window;
+    const transport = new ExactOriginPostMessageTransport(
+      target,
+      source,
+      "https://sandbox.example",
+    );
+    const onmessage = vi.fn();
+    const onerror = vi.fn();
+    transport.onmessage = onmessage;
+    transport.onerror = onerror;
+    await transport.start();
+
+    const data: JSONRPCMessage = { jsonrpc: "2.0", id: 1, result: {} };
+    for (let index = 0; index <= MAX_MCP_APP_MESSAGES_PER_WINDOW; index += 1) {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          data,
+          origin: "https://sandbox.example",
+          source,
+        }),
+      );
+    }
+    expect(onmessage).toHaveBeenCalledTimes(MAX_MCP_APP_MESSAGES_PER_WINDOW);
+    expect(onerror).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "MCP App message rate exceeded." }),
+    );
+
+    for (let index = 0; index < MAX_MCP_APP_MESSAGES_PER_WINDOW; index += 1) {
+      await transport.send(data);
+    }
+    await expect(transport.send(data)).rejects.toThrow(
+      "MCP App message rate exceeded.",
+    );
+    await transport.close();
+  });
+});
+
+describe("MCP App sandbox artifact", () => {
+  const sandboxHtml = readFileSync("public/mcp-app-sandbox.html", "utf8");
+
+  it("places the outer CSP before executable content and never parses or sanitizes View HTML", () => {
+    expect(
+      sandboxHtml.indexOf('http-equiv="Content-Security-Policy"'),
+    ).toBeLessThan(sandboxHtml.indexOf("<style>"));
+    expect(sandboxHtml).not.toContain("DOMParser");
+    expect(sandboxHtml).not.toContain(".remove()");
+    expect(sandboxHtml).toContain("html.slice(0, insertionIndex)");
+    expect(sandboxHtml).toContain("html.slice(insertionIndex)");
+    expect(sandboxHtml).toContain("view.srcdoc = securedHtml");
+  });
+
+  it("keeps the outer policy broad while injecting restrictive per-resource directives", () => {
+    expect(sandboxHtml).toContain("connect-src https: wss:");
+    expect(sandboxHtml).toContain("\"default-src 'none'\"");
+    expect(sandboxHtml).toContain(
+      "`frame-src $" + `{frames.length ? frames.join(" ") : "'none'"}`,
+    );
+    expect(sandboxHtml).toContain(
+      "`base-uri $" + `{bases.length ? bases.join(" ") : "'self'"}`,
+    );
   });
 });

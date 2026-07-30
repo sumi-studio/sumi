@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  checkMcpAppProjectionIntegrity,
   MAX_MCP_APP_HTML_BYTES,
-  parseTrustedMcpAppProjection,
+  parseMcpAppProjectionCandidate,
   resolveMcpAppSandboxConfig,
-  verifyTrustedMcpAppProjection,
 } from "./mcp-app";
 
 const html = "<!doctype html><html><body>trusted</body></html>";
@@ -12,8 +12,8 @@ const hash =
 
 function projection(overrides: Record<string, unknown> = {}) {
   return {
-    kind: "trusted_mcp_app_projection",
-    provenance: {
+    kind: "mcp_app_projection_candidate",
+    claimedSource: {
       serverId: "calendar-server",
       toolName: "show-calendar",
       resourceUri: "ui://calendar/view",
@@ -36,41 +36,43 @@ function projection(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe("trusted MCP App projection", () => {
+describe("MCP App projection candidate", () => {
   it("does not activate from an unprovenanced generic tool result", () => {
     expect(
-      parseTrustedMcpAppProjection({
+      parseMcpAppProjectionCandidate({
         content: [{ type: "text", text: html }],
         structuredContent: { html },
       }),
     ).toBeNull();
     expect(
-      parseTrustedMcpAppProjection({
+      parseMcpAppProjectionCandidate({
         type: "mcp_app",
         resource: { uri: "ui://calendar/view", text: html },
       }),
     ).toBeNull();
   });
 
-  it("requires matching backend provenance and verifies the resource hash", async () => {
-    const parsed = parseTrustedMcpAppProjection(projection());
+  it("treats self-described source fields as claims and checks only content integrity", async () => {
+    const parsed = parseMcpAppProjectionCandidate(projection());
     expect(parsed).not.toBeNull();
     if (!parsed) {
       throw new Error("projection should parse");
     }
-    await expect(verifyTrustedMcpAppProjection(parsed)).resolves.toMatchObject({
-      html,
-      provenance: {
-        serverId: "calendar-server",
-        toolName: "show-calendar",
-        resourceUri: "ui://calendar/view",
-        resourceSha256: hash,
+    await expect(checkMcpAppProjectionIntegrity(parsed)).resolves.toMatchObject(
+      {
+        html,
+        claimedSource: {
+          serverId: "calendar-server",
+          toolName: "show-calendar",
+          resourceUri: "ui://calendar/view",
+          resourceSha256: hash,
+        },
       },
-    });
+    );
 
-    const badHash = parseTrustedMcpAppProjection(
+    const badHash = parseMcpAppProjectionCandidate(
       projection({
-        provenance: {
+        claimedSource: {
           serverId: "calendar-server",
           toolName: "show-calendar",
           resourceUri: "ui://calendar/view",
@@ -84,11 +86,11 @@ describe("trusted MCP App projection", () => {
         "projection with a syntactically valid hash should parse",
       );
     }
-    await expect(verifyTrustedMcpAppProjection(badHash)).resolves.toBeNull();
+    await expect(checkMcpAppProjectionIntegrity(badHash)).resolves.toBeNull();
   });
 
   it("records no permission grant even when the resource requests one", () => {
-    const parsed = parseTrustedMcpAppProjection(
+    const parsed = parseMcpAppProjectionCandidate(
       projection({
         resource: {
           uri: "ui://calendar/view",
@@ -104,7 +106,7 @@ describe("trusted MCP App projection", () => {
 
   it("rejects non-exact CSP origins and oversize HTML", () => {
     expect(
-      parseTrustedMcpAppProjection(
+      parseMcpAppProjectionCandidate(
         projection({
           resource: {
             uri: "ui://calendar/view",
@@ -117,7 +119,7 @@ describe("trusted MCP App projection", () => {
     ).toBeNull();
 
     expect(
-      parseTrustedMcpAppProjection(
+      parseMcpAppProjectionCandidate(
         projection({
           resource: {
             uri: "ui://calendar/view",
@@ -131,7 +133,7 @@ describe("trusted MCP App projection", () => {
 
   it("accepts protocol-defined secure websocket and wildcard resource sources", () => {
     expect(
-      parseTrustedMcpAppProjection(
+      parseMcpAppProjectionCandidate(
         projection({
           resource: {
             uri: "ui://calendar/view",
