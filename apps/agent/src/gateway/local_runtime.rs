@@ -17,7 +17,6 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -288,7 +287,6 @@ pub(crate) struct LocalCredentialProvider {
     audience: String,
     delivery_authorization: DeliveryAuthorization,
     control: Arc<dyn LocalControlPlane>,
-    issued_token_fingerprints: BTreeSet<[u8; 32]>,
 }
 
 impl LocalCredentialProvider {
@@ -302,7 +300,6 @@ impl LocalCredentialProvider {
             audience: LOCAL_AGENT_AUDIENCE.to_owned(),
             delivery_authorization,
             control,
-            issued_token_fingerprints: BTreeSet::new(),
         }
     }
 }
@@ -342,19 +339,13 @@ impl CredentialProvider for LocalCredentialProvider {
             &response,
             SystemTime::now(),
         )?;
-        let token_fingerprint: [u8; 32] = Sha256::digest(response.token.as_bytes()).into();
-        if self.issued_token_fingerprints.contains(&token_fingerprint) {
-            bail!("local control fixture reused a prior Gateway credential");
-        }
         let mut grant = LocalCredentialGrant {
             token: Some(std::mem::take(&mut response.token)),
             identity: self.authority.rpc_identity().clone(),
             expires_at: system_time_from_unix(response.expires_at_unix)?,
             delivery_authorization: response.delivery_authorization,
         };
-        let credential = grant.consume_at(&self.authority, SystemTime::now())?;
-        self.issued_token_fingerprints.insert(token_fingerprint);
-        Ok(credential)
+        grant.consume_at(&self.authority, SystemTime::now())
     }
 }
 
@@ -1113,20 +1104,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_rejects_any_reused_gateway_credential() {
+    async fn reconnect_accepts_fresh_grants_with_identical_token_bytes() {
         let expected = authority();
         let control = Arc::new(FakeControlPlane::new(expected.clone()));
         control.state.lock().unwrap().credential_response_token =
             Some("issuer-reused-token".to_owned());
         let mut provider =
-            LocalCredentialProvider::new(expected, DeliveryAuthorization::Raw, control);
-        provider.fresh_credential().await.unwrap();
-        let error = provider
-            .fresh_credential()
-            .await
-            .expect_err("a reconnect must never accept an earlier credential");
-        assert!(error.to_string().contains("reused a prior"));
-        assert!(!error.to_string().contains("issuer-reused-token"));
+            LocalCredentialProvider::new(expected, DeliveryAuthorization::Raw, control.clone());
+        let first = provider.fresh_credential().await.unwrap();
+        let second = provider.fresh_credential().await.unwrap();
+        assert_eq!(first.token(), "issuer-reused-token");
+        assert_eq!(second.token(), "issuer-reused-token");
+
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.credential_requests.len(), 2);
+        assert_ne!(
+            state.credential_requests[0].request_id,
+            state.credential_requests[1].request_id
+        );
     }
 
     #[tokio::test]
