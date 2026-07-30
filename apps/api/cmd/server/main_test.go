@@ -892,6 +892,36 @@ func socketInode(t *testing.T, path string) (uint64, uint64) {
 	return stat.Dev, stat.Ino
 }
 
+func bindTrustedTestSocket(t *testing.T, path string, gid int) *net.UnixListener {
+	t.Helper()
+	listener, err := net.ListenUnix(
+		"unix",
+		&net.UnixAddr{Name: path, Net: "unix"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := os.Chown(path, os.Geteuid(), gid); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, localControlSocketMode); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	return listener
+}
+
+func assertUnixSocketIsLive(t *testing.T, path string) {
+	t.Helper()
+	connection, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("socket %s is not live: %v", path, err)
+	}
+	_ = connection.Close()
+}
+
 func TestUnixListenerOwnershipLockPreventsReplicaEvictionAndLateUnlink(t *testing.T) {
 	parent := trustedSocketParent(t)
 	socketPath := filepath.Join(parent, "control.sock")
@@ -1341,6 +1371,195 @@ func TestUnixListenerLockPublicationNeverReplacesNoncooperatingDestination(t *te
 	}
 	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed no-replace publication created a socket: %v", err)
+	}
+}
+
+func TestUnixListenerStaleQuarantineRestoresLiveReplacement(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	stale := bindTrustedTestSocket(t, socketPath, gid)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var replacement *net.UnixListener
+	var replacementDev uint64
+	var replacementIno uint64
+	hooks := &localControlListenerTestHooks{
+		beforeSocketQuarantine: func() {
+			if err := os.Remove(socketPath); err != nil {
+				t.Fatal(err)
+			}
+			replacement = bindTrustedTestSocket(t, socketPath, gid)
+			replacementDev, replacementIno = socketInode(t, socketPath)
+		},
+	}
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("stale cleanup accepted a socket rebound after validation")
+	}
+	if replacement == nil {
+		t.Fatal("replacement hook did not install a live socket")
+	}
+	defer func() {
+		_ = replacement.Close()
+		_ = os.Remove(socketPath)
+	}()
+	if err == nil || !strings.Contains(err.Error(), "replacement restored without overwrite") {
+		t.Fatalf("unexpected stale quarantine error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, socketPath)
+	if gotDev != replacementDev || gotIno != replacementIno {
+		t.Fatal("stale quarantine removed or replaced the live rebound socket")
+	}
+	assertUnixSocketIsLive(t, socketPath)
+}
+
+func TestUnixListenerCloseQuarantinePreservesBothLiveSocketsOnRestoreConflict(t *testing.T) {
+	parent := trustedShortSocketParent(t)
+	socketPath := filepath.Join(parent, "control.sock")
+	gid := os.Getegid()
+	var firstReplacement *net.UnixListener
+	var secondReplacement *net.UnixListener
+	var firstDev uint64
+	var firstIno uint64
+	var secondDev uint64
+	var secondIno uint64
+	var quarantinePath string
+	hooks := &localControlListenerTestHooks{
+		beforeSocketQuarantine: func() {
+			if err := os.Remove(socketPath); err != nil {
+				t.Fatal(err)
+			}
+			firstReplacement = bindTrustedTestSocket(t, socketPath, gid)
+			firstDev, firstIno = socketInode(t, socketPath)
+		},
+		afterSocketQuarantine: func(quarantineName string) {
+			quarantinePath = filepath.Join(parent, quarantineName)
+			secondReplacement = bindTrustedTestSocket(t, socketPath, gid)
+			secondDev, secondIno = socketInode(t, socketPath)
+		},
+	}
+	owned, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = owned.Close()
+	if firstReplacement == nil || secondReplacement == nil || quarantinePath == "" {
+		t.Fatal("close quarantine hooks did not install both live replacements")
+	}
+	defer func() {
+		_ = firstReplacement.Close()
+		_ = secondReplacement.Close()
+		_ = os.Remove(quarantinePath)
+		_ = os.Remove(socketPath)
+	}()
+	if err == nil || !strings.Contains(err.Error(), "both preserved") {
+		t.Fatalf("unexpected close quarantine conflict error: %v", err)
+	}
+	gotDev, gotIno := socketInode(t, quarantinePath)
+	if gotDev != firstDev || gotIno != firstIno {
+		t.Fatal("close quarantine deleted the first rebound socket")
+	}
+	gotDev, gotIno = socketInode(t, socketPath)
+	if gotDev != secondDev || gotIno != secondIno {
+		t.Fatal("close quarantine overwrote the newly published socket")
+	}
+	assertUnixSocketIsLive(t, quarantinePath)
+	assertUnixSocketIsLive(t, socketPath)
+}
+
+func TestUnixListenerRejectsAncestorSymlinkEvenWhenItResolvesToPinnedParent(t *testing.T) {
+	root, err := os.MkdirTemp("", "su-r-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	ancestor := filepath.Join(root, "ancestor")
+	parent := filepath.Join(ancestor, "parent")
+	if err := os.MkdirAll(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	gid := os.Getegid()
+	if err := os.Chown(parent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(parent, "control.sock")
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedParent, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("configured parent inode is unavailable")
+	}
+	movedAncestor := filepath.Join(root, "ancestor-pinned")
+	hooks := &localControlListenerTestHooks{
+		afterLockPublication: func() {
+			if err := os.Rename(ancestor, movedAncestor); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(movedAncestor, ancestor); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	listener, err := listenTrustedUnixSocketWithHooks(
+		socketPath,
+		gid,
+		testLocalControlPAID,
+		hooks,
+	)
+	if listener != nil {
+		_ = listener.Close()
+		t.Fatal("listener accepted an ancestor symlink back to the pinned parent")
+	}
+	if err == nil || !strings.Contains(err.Error(), "without symlinks") {
+		t.Fatalf("unexpected same-inode ancestor symlink error: %v", err)
+	}
+	movedParent := filepath.Join(movedAncestor, "parent")
+	if _, err := os.Lstat(filepath.Join(movedParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ancestor symlink race published a socket in the pinned parent: %v", err)
+	}
+
+	if err := os.Remove(ancestor); err != nil {
+		t.Fatal(err)
+	}
+	replacementAncestor := filepath.Join(root, "ancestor-replacement")
+	replacementParent := filepath.Join(replacementAncestor, "parent")
+	if err := os.MkdirAll(replacementParent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(replacementParent, os.Geteuid(), gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(replacementParent, localControlParentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(replacementAncestor, ancestor); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfiguredParentIdentity(parent, *expectedParent, gid); err == nil ||
+		!strings.Contains(err.Error(), "without symlinks") {
+		t.Fatalf("retargeted ancestor symlink was accepted: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(replacementParent, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retargeted ancestor received a socket: %v", err)
 	}
 }
 

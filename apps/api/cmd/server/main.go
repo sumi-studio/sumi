@@ -225,9 +225,11 @@ func localControlCrashFailpoint(name string) {
 }
 
 type localControlListenerTestHooks struct {
-	beforeLockPublication func()
-	afterLockPublication  func()
-	beforeListenerReturn  func()
+	beforeLockPublication  func()
+	afterLockPublication   func()
+	beforeListenerReturn   func()
+	beforeSocketQuarantine func()
+	afterSocketQuarantine  func(string)
 }
 
 type localControlListenerConfig struct {
@@ -341,6 +343,7 @@ func (c *localControlListenerConfig) handler(next http.Handler) http.Handler {
 
 type listenerOwnershipLock struct {
 	parentPath       string
+	pinnedParentPath string
 	parent           *os.File
 	parentStat       syscall.Stat_t
 	pinnedLockPath   string
@@ -349,6 +352,7 @@ type listenerOwnershipLock struct {
 	socketName       string
 	pinnedSocketPath string
 	socketGID        int
+	testHooks        *localControlListenerTestHooks
 }
 
 type ownedUnixListener struct {
@@ -442,9 +446,11 @@ func listenTrustedUnixSocketWithHooks(
 	}
 	if err := removeTrustedStaleSocket(
 		int(ownership.parent.Fd()),
+		ownership.pinnedParentPath,
 		ownership.socketName,
 		ownership.pinnedSocketPath,
 		gid,
+		hooks,
 	); err != nil {
 		return nil, err
 	}
@@ -543,13 +549,9 @@ func acquireListenerOwnership(
 	if len(binding) > maxListenerLockBytes {
 		return nil, errors.New("local control listener ownership binding is too large")
 	}
-	parentFD, err := syscall.Open(
-		parentPath,
-		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
-		0,
-	)
+	parentFD, err := openConfiguredParentNoSymlinks(parentPath)
 	if err != nil {
-		return nil, fmt.Errorf("pin local control socket parent: %w", err)
+		return nil, fmt.Errorf("pin no-symlink local control socket parent: %w", err)
 	}
 	parent := os.NewFile(uintptr(parentFD), parentPath)
 	failParent := func(cause error) (*listenerOwnershipLock, error) {
@@ -696,6 +698,7 @@ func acquireListenerOwnership(
 
 	return &listenerOwnershipLock{
 		parentPath:       parentPath,
+		pinnedParentPath: pinnedParentPath,
 		parent:           parent,
 		parentStat:       pinnedParent,
 		pinnedLockPath:   pinnedLockPath,
@@ -704,6 +707,7 @@ func acquireListenerOwnership(
 		socketName:       socketName,
 		pinnedSocketPath: pinnedSocketPath,
 		socketGID:        gid,
+		testHooks:        hooks,
 	}, nil
 }
 
@@ -999,24 +1003,42 @@ func validateConfiguredParentIdentity(
 	expected syscall.Stat_t,
 	gid int,
 ) error {
-	info, err := os.Lstat(parentPath)
+	parentFD, err := openConfiguredParentNoSymlinks(parentPath)
 	if err != nil {
-		return fmt.Errorf("reinspect configured local control socket parent: %w", err)
+		return fmt.Errorf("reopen configured local control socket parent without symlinks: %w", err)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok ||
-		!info.IsDir() ||
-		info.Mode()&os.ModeSymlink != 0 ||
+	defer syscall.Close(parentFD)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(parentFD, &stat); err != nil {
+		return fmt.Errorf("inspect reopened configured local control socket parent: %w", err)
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR ||
 		stat.Dev != expected.Dev ||
 		stat.Ino != expected.Ino ||
 		stat.Nlink != expected.Nlink ||
 		stat.Nlink == 0 ||
 		int(stat.Uid) != os.Geteuid() ||
 		int(stat.Gid) != gid ||
-		info.Mode().Perm() != localControlParentMode {
+		os.FileMode(stat.Mode).Perm() != localControlParentMode {
 		return errors.New("configured local control socket parent no longer names the pinned trusted directory")
 	}
 	return nil
+}
+
+func openConfiguredParentNoSymlinks(parentPath string) (int, error) {
+	return unix.Openat2(
+		unix.AT_FDCWD,
+		parentPath,
+		&unix.OpenHow{
+			Flags: uint64(
+				unix.O_RDONLY |
+					unix.O_DIRECTORY |
+					unix.O_CLOEXEC |
+					unix.O_NOFOLLOW,
+			),
+			Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+		},
+	)
 }
 
 func validatePinnedLock(lock *os.File, lockPath string, gid int) (syscall.Stat_t, error) {
@@ -1100,10 +1122,21 @@ func (o *listenerOwnershipLock) unlinkOwnedSocket(dev, ino uint64, requireTruste
 			return fmt.Errorf("refuse to unlink changed local control socket: %w", err)
 		}
 	}
-	if err := syscall.Unlinkat(int(o.parent.Fd()), o.socketName); err != nil {
-		return fmt.Errorf("unlink owned local control socket: %w", err)
+	var validateMoved func(os.FileInfo) error
+	if requireTrusted {
+		validateMoved = func(info os.FileInfo) error {
+			_, err := trustedSocketStat(info, o.socketGID)
+			return err
+		}
 	}
-	return nil
+	return quarantineAndRemoveSocketCandidate(
+		int(o.parent.Fd()),
+		o.pinnedParentPath,
+		o.socketName,
+		info,
+		validateMoved,
+		o.testHooks,
+	)
 }
 
 func (o *listenerOwnershipLock) release() error {
@@ -1115,9 +1148,11 @@ func (o *listenerOwnershipLock) release() error {
 
 func removeTrustedStaleSocket(
 	parentFD int,
+	pinnedParentPath string,
 	socketName string,
 	pinnedSocketPath string,
 	gid int,
+	hooks *localControlListenerTestHooks,
 ) error {
 	info, err := os.Lstat(pinnedSocketPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1149,8 +1184,175 @@ func removeTrustedStaleSocket(
 	if first.Dev != second.Dev || first.Ino != second.Ino {
 		return errors.New("local control socket changed during stale cleanup")
 	}
-	if err := syscall.Unlinkat(parentFD, socketName); err != nil {
-		return fmt.Errorf("remove trusted stale local control socket: %w", err)
+	return quarantineAndRemoveSocketCandidate(
+		parentFD,
+		pinnedParentPath,
+		socketName,
+		current,
+		func(info os.FileInfo) error {
+			_, err := trustedOrInitializationSocketStat(info, gid)
+			return err
+		},
+		hooks,
+	)
+}
+
+func quarantineAndRemoveSocketCandidate(
+	parentFD int,
+	pinnedParentPath string,
+	socketName string,
+	expectedInfo os.FileInfo,
+	validateMoved func(os.FileInfo) error,
+	hooks *localControlListenerTestHooks,
+) error {
+	expectedStat, ok := expectedInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("local control socket candidate identity is unavailable")
+	}
+	candidateFD, err := unix.Openat(
+		parentFD,
+		socketName,
+		unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("pin local control socket candidate before quarantine: %w", err)
+	}
+	defer unix.Close(candidateFD)
+	var pinnedCandidate syscall.Stat_t
+	if err := syscall.Fstat(candidateFD, &pinnedCandidate); err != nil {
+		return fmt.Errorf("inspect pinned local control socket candidate: %w", err)
+	}
+	if !sameSocketStatIdentity(*expectedStat, pinnedCandidate) {
+		return errors.New("local control socket candidate changed before it could be pinned")
+	}
+	if hooks != nil && hooks.beforeSocketQuarantine != nil {
+		hooks.beforeSocketQuarantine()
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("generate local control socket quarantine name: %w", err)
+	}
+	quarantineName := socketName + ".quarantine-" + hex.EncodeToString(random)
+	quarantinePath := filepath.Join(pinnedParentPath, quarantineName)
+	if err := unix.Renameat2(
+		parentFD,
+		socketName,
+		parentFD,
+		quarantineName,
+		unix.RENAME_NOREPLACE,
+	); err != nil {
+		return fmt.Errorf("atomically quarantine local control socket candidate: %w", err)
+	}
+	if hooks != nil && hooks.afterSocketQuarantine != nil {
+		hooks.afterSocketQuarantine(quarantineName)
+	}
+
+	movedInfo, err := os.Lstat(quarantinePath)
+	if err != nil {
+		return fmt.Errorf("inspect quarantined local control socket candidate: %w", err)
+	}
+	movedStat, ok := movedInfo.Sys().(*syscall.Stat_t)
+	matches := ok &&
+		movedInfo.Mode()&os.ModeSocket != 0 &&
+		movedInfo.Mode()&os.ModeSymlink == 0 &&
+		movedStat.Dev == pinnedCandidate.Dev &&
+		movedStat.Ino == pinnedCandidate.Ino
+	if matches && validateMoved != nil {
+		matches = validateMoved(movedInfo) == nil
+	}
+	if !matches {
+		cause := errors.New("local control socket candidate changed before atomic quarantine removal")
+		restoreErr := restoreQuarantinedSocketCandidate(
+			parentFD,
+			pinnedParentPath,
+			quarantineName,
+			socketName,
+			movedInfo,
+		)
+		if restoreErr != nil {
+			return errors.Join(cause, restoreErr)
+		}
+		return fmt.Errorf("%w; replacement restored without overwrite", cause)
+	}
+	if err := revalidateQuarantinedSocketIdentity(quarantinePath, movedInfo); err != nil {
+		return err
+	}
+	if err := syscall.Unlinkat(parentFD, quarantineName); err != nil {
+		return fmt.Errorf("remove exact quarantined local control socket candidate: %w", err)
+	}
+	if err := syscall.Fsync(parentFD); err != nil {
+		return fmt.Errorf("sync quarantined local control socket removal: %w", err)
+	}
+	return nil
+}
+
+func sameSocketStatIdentity(left syscall.Stat_t, right syscall.Stat_t) bool {
+	return left.Mode&syscall.S_IFMT == syscall.S_IFSOCK &&
+		right.Mode&syscall.S_IFMT == syscall.S_IFSOCK &&
+		left.Dev == right.Dev &&
+		left.Ino == right.Ino &&
+		left.Nlink == right.Nlink &&
+		left.Uid == right.Uid &&
+		left.Gid == right.Gid &&
+		left.Mode == right.Mode &&
+		left.Ctim.Sec == right.Ctim.Sec &&
+		left.Ctim.Nsec == right.Ctim.Nsec
+}
+
+func restoreQuarantinedSocketCandidate(
+	parentFD int,
+	pinnedParentPath string,
+	quarantineName string,
+	socketName string,
+	movedInfo os.FileInfo,
+) error {
+	quarantinePath := filepath.Join(pinnedParentPath, quarantineName)
+	if err := revalidateQuarantinedSocketIdentity(quarantinePath, movedInfo); err != nil {
+		return fmt.Errorf("preserve changed local control socket quarantine: %w", err)
+	}
+	if err := unix.Renameat2(
+		parentFD,
+		quarantineName,
+		parentFD,
+		socketName,
+		unix.RENAME_NOREPLACE,
+	); err != nil {
+		if errors.Is(err, syscall.EEXIST) {
+			syncErr := syscall.Fsync(parentFD)
+			conflictErr := fmt.Errorf(
+				"local control socket restore destination is occupied; original and quarantined replacements were both preserved at %q",
+				quarantineName,
+			)
+			if syncErr != nil {
+				return errors.Join(
+					conflictErr,
+					fmt.Errorf("sync preserved local control socket quarantine conflict: %w", syncErr),
+				)
+			}
+			return conflictErr
+		}
+		return fmt.Errorf("restore quarantined local control socket without overwrite: %w", err)
+	}
+	if err := syscall.Fsync(parentFD); err != nil {
+		return fmt.Errorf("sync restored local control socket candidate: %w", err)
+	}
+	return nil
+}
+
+func revalidateQuarantinedSocketIdentity(path string, expected os.FileInfo) error {
+	current, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reinspect quarantined local control socket candidate: %w", err)
+	}
+	currentStat, currentOK := current.Sys().(*syscall.Stat_t)
+	expectedStat, expectedOK := expected.Sys().(*syscall.Stat_t)
+	if !currentOK ||
+		!expectedOK ||
+		current.Mode()&os.ModeType != expected.Mode()&os.ModeType ||
+		currentStat.Dev != expectedStat.Dev ||
+		currentStat.Ino != expectedStat.Ino {
+		return errors.New("quarantined local control socket candidate changed")
 	}
 	return nil
 }
