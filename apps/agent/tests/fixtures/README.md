@@ -36,6 +36,9 @@ encrypted-context privacy scan after both hydrations. Provider-context row
 counts are intentionally not asserted monotonic because bounded compaction and
 retention may replace or erase old rows; the invariant is non-empty,
 authenticated, private context continuity at every segment and hydration.
+The stress probe uses `medium` reasoning effort: model selection and effort
+remain separate choices, and these deliberately simple turns do not justify
+the release gate's first-turn `high` effort.
 
 Run it with the same loopback bridge and environment as the release gate:
 

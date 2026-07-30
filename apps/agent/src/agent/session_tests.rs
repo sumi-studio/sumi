@@ -7328,7 +7328,12 @@ async fn run_canonical_live_responses_ten_turn_stress(spec: ModelSpec, api_key: 
     let first_core = run_live_responses_segment(
         store,
         first_core,
-        live_responses_driver(spec.clone(), tool.clone(), "high", Some(serde_json::json!("auto"))),
+        live_responses_driver(
+            spec.clone(),
+            tool.clone(),
+            "medium",
+            Some(serde_json::json!("auto")),
+        ),
         &[
             (1, "Reply with exactly responses-live-text-1. Do not call a tool."),
             (2, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
@@ -7385,7 +7390,12 @@ async fn run_canonical_live_responses_ten_turn_stress(spec: ModelSpec, api_key: 
     let second_core = run_live_responses_segment(
         reopened,
         second_core,
-        live_responses_driver(spec.clone(), tool.clone(), "high", Some(serde_json::json!("auto"))),
+        live_responses_driver(
+            spec.clone(),
+            tool.clone(),
+            "medium",
+            Some(serde_json::json!("auto")),
+        ),
         &[
             (5, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
             (6, "Reply with exactly responses-live-text-6. Do not call a tool."),
@@ -7447,7 +7457,7 @@ async fn run_canonical_live_responses_ten_turn_stress(spec: ModelSpec, api_key: 
     let final_core = run_live_responses_segment(
         reopened,
         third_core,
-        live_responses_driver(spec, tool, "high", Some(serde_json::json!("auto"))),
+        live_responses_driver(spec, tool, "medium", Some(serde_json::json!("auto"))),
         &[
             (8, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
             (9, "Reply with exactly responses-live-text-9. Do not call a tool."),
