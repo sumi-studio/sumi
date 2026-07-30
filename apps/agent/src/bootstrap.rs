@@ -1586,6 +1586,11 @@ async fn finish_runtime(
     mut supervisor: SupervisorRuntime,
     emergency: bool,
 ) -> Result<()> {
+    // Orderly post-commit drain cancels the active DeliveryPump. Tell the
+    // supervisor that teardown is planned before that dependent task exits so
+    // its clean completion cannot be classified as an unexpected fatal epoch
+    // failure. Keep the JoinHandle retained until post-commit teardown settles.
+    supervisor.request_shutdown();
     let post_commit_result = if emergency {
         post_commit.invalidate_and_join().await
     } else {

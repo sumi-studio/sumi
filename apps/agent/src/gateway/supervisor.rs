@@ -731,6 +731,15 @@ impl SupervisorRuntime {
         }
     }
 
+    /// Begin planned supervisor shutdown without relinquishing task ownership.
+    ///
+    /// Cancellation is idempotent and synchronous. The retained owner must
+    /// still call [`Self::cancel_and_join`] after dependent runtime teardown so
+    /// the supervisor can finish its per-epoch cleanup without detaching.
+    pub(crate) fn request_shutdown(&self) {
+        self.lifecycle.cancel.cancel();
+    }
+
     pub(crate) async fn termination(&mut self) -> Result<SupervisorTermination> {
         let joined = self
             .lifecycle
@@ -764,7 +773,7 @@ impl SupervisorRuntime {
     }
 
     pub(crate) async fn cancel_and_join(&mut self) -> Result<()> {
-        self.lifecycle.cancel.cancel();
+        self.request_shutdown();
         match self.completed.take() {
             Some(result) => result,
             None => self.lifecycle.join().await,
@@ -2546,6 +2555,12 @@ mod tests {
             Ok(())
         });
 
+        runtime.request_shutdown();
+        runtime.request_shutdown();
+        assert!(
+            runtime.lifecycle.task.is_some(),
+            "requesting shutdown must retain the supervisor JoinHandle"
+        );
         runtime
             .cancel_and_join()
             .await
@@ -3640,6 +3655,91 @@ mod tests {
             .expect_err("delivery task panic must be fatal");
 
         assert!(format!("{error:#}").contains("delivery epoch task panicked"));
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_delivery_task_exit_is_fatal_without_root_cancellation() {
+        #[derive(Clone)]
+        struct CleanExitDeliverySource {
+            installs: Arc<AtomicU64>,
+            invalidations: Arc<AtomicU64>,
+            failure_tx: Arc<Mutex<Option<mpsc::UnboundedSender<DeliveryEpochFailure>>>>,
+        }
+
+        #[async_trait]
+        impl DurableSource for CleanExitDeliverySource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors::default())
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(CommandCursors::default())
+            }
+
+            async fn install_delivery_epoch(
+                &self,
+                _epoch: DeliveryEpoch,
+                _catch_up_from_seq: u64,
+                _sink: EventSender,
+                _cancel: CancellationToken,
+            ) -> Result<Option<DeliveryEpochRuntime>> {
+                self.installs.fetch_add(1, Ordering::SeqCst);
+                let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+                *self.failure_tx.lock().unwrap() = Some(failure_tx);
+                let task = tokio::spawn(async {});
+                Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+            }
+
+            async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let source = CleanExitDeliverySource {
+            installs: Arc::new(AtomicU64::new(0)),
+            invalidations: Arc::new(AtomicU64::new(0)),
+            failure_tx: Arc::new(Mutex::new(None)),
+        };
+        let installs = source.installs.clone();
+        let invalidations = source.invalidations.clone();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let credentials = CountingCredentialProvider::new("token");
+        let connect_attempts = credentials.counter.clone();
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            ),
+            credentials,
+            source,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "unexpected-clean-delivery-exit".to_owned(),
+            }),
+            make_config(),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("clean delivery task exit must terminate the supervisor")
+            .expect_err("clean delivery task exit must remain fatal");
+
+        assert!(
+            format!("{error:#}").contains("delivery epoch task ended without a terminal signal")
+        );
         assert_eq!(installs.load(Ordering::SeqCst), 1);
         assert_eq!(invalidations.load(Ordering::SeqCst), 1);
         assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
@@ -8450,6 +8550,121 @@ mod tests {
             adapter.delivery_epoch_lifecycle_counts(),
             (1, 1),
             "explicit join must invalidate the real T17 epoch exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_first_orderly_post_commit_shutdown_is_not_fatal() {
+        let store = Arc::new(
+            Store::session_test_store("runtime-finish-supervisor-first")
+                .await
+                .unwrap(),
+        );
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "lease-runtime-finish",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "fence-runtime-finish").unwrap();
+        let rpc_identity = crate::runtime::contracts::RpcIdentity::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            crate::runtime::contracts::RpcBootNonce::new("runtime-finish-boot").unwrap(),
+        );
+        let authority = crate::runtime::authority::RuntimeEpochAuthority::new(
+            rpc_identity,
+            lease.clone(),
+            fence.clone(),
+        )
+        .unwrap();
+        let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => state.receipt,
+            other => panic!("empty Store must hydrate completely: {other:?}"),
+        };
+        let (mut post_commit, adapter) =
+            post_commit::ProductionPostCommitRuntime::start(store.clone(), &authority)
+                .await
+                .unwrap();
+        let adapter = adapter
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let credentials = CountingCredentialProvider::new("token");
+        let connect_attempts = credentials.counter.clone();
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            ),
+            credentials,
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation,
+                receipt_identity: receipt.stable_id(),
+            }),
+            make_config(),
+        );
+        let (gateway, mut supervisor_runtime) =
+            session::SessionGateway::from_supervisor(supervisor.start());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while adapter.active_delivery_epoch().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real T17 DeliveryPump must install before runtime finish");
+        assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
+
+        assert_eq!(
+            EventWriter::new(store.clone())
+                .apply(test_maintenance_batch("runtime-finish-durable"))
+                .await
+                .unwrap(),
+            vec![1]
+        );
+
+        supervisor_runtime.request_shutdown();
+        post_commit
+            .shutdown_orderly()
+            .await
+            .expect("orderly post-commit teardown must drain after supervisor cancellation");
+        supervisor_runtime
+            .cancel_and_join()
+            .await
+            .expect("planned join must not classify DeliveryPump shutdown as fatal");
+        drop(gateway);
+
+        assert_eq!(
+            adapter.active_delivery_epoch().await,
+            None,
+            "supervisor cleanup must clear the active T17 epoch"
+        );
+        assert_eq!(
+            adapter.delivery_epoch_lifecycle_counts(),
+            (1, 1),
+            "runtime finish must install and invalidate exactly once"
+        );
+        assert_eq!(
+            connect_attempts.load(Ordering::SeqCst),
+            1,
+            "planned shutdown must not reconnect"
+        );
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+        let durable_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            durable_count, 1,
+            "the committed durable event must remain in Store after shutdown"
+        );
+        assert_eq!(
+            adapter.durable_fence_count(),
+            0,
+            "orderly shutdown must leave no detached durable admission"
         );
     }
 
