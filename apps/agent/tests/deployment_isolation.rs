@@ -733,12 +733,7 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     );
     assert_eq!(
         volume_sources(executor),
-        string_set(&[
-            "broker-ipc",
-            "executor-identity",
-            "executor-ipc",
-            "workspace",
-        ])
+        string_set(&["executor-identity", "executor-ipc", "workspace",])
     );
     assert_eq!(
         volume_sources(broker),
@@ -746,13 +741,14 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     );
     assert_has_mount(runtime, "executor-ipc:/run/sumi/executor:ro");
     assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
-    assert_has_mount(executor, "broker-ipc:/run/sumi/broker:ro");
+    assert_has_mount(executor, "workspace:/workspace:ro");
     assert_has_mount(broker, "broker-ipc:/run/sumi/broker");
     assert!(!volume_sources(runtime).contains("broker-ipc"));
     assert!(!volume_sources(runtime).contains("workspace"));
     assert!(!volume_sources(runtime).contains("artifacts"));
     assert!(!volume_sources(executor).contains("artifacts"));
     assert!(!volume_sources(executor).contains("state"));
+    assert!(!volume_sources(executor).contains("broker-ipc"));
     assert!(!volume_sources(broker).contains("workspace"));
     assert!(!volume_sources(broker).contains("state"));
 
@@ -825,6 +821,69 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
 }
 
 #[test]
+fn executor_deployment_is_broker_blind_and_read_only() {
+    let compose = compose();
+    let executor = service(&compose, "executor");
+    let defaults = &compose["x-long-lived-hardening"];
+
+    assert_eq!(executor["user"].as_str(), Some("10002:10002"));
+    assert_eq!(executor["network_mode"].as_str(), Some("none"));
+    assert_has_mount(executor, "workspace:/workspace:ro");
+    assert_has_mount(executor, "executor-identity:/run/sumi/identity:ro");
+    assert_has_mount(executor, "executor-ipc:/run/sumi/executor");
+    assert!(!volume_sources(executor).contains("broker-ipc"));
+    assert!(!volume_sources(executor).contains("artifacts"));
+
+    let depends_on = executor["depends_on"].as_mapping().unwrap();
+    assert!(depends_on.contains_key("allocator"));
+    assert!(depends_on.contains_key("prepare"));
+    assert!(
+        !depends_on.contains_key("broker"),
+        "the read-only executor must not receive a broker startup dependency"
+    );
+    assert!(executor.get("group_add").is_none());
+    assert!(executor.get("cap_add").is_none());
+    assert!(executor.get("security_opt").is_none());
+    assert!(executor.get("privileged").is_none());
+    assert_eq!(
+        defaults["cap_drop"],
+        Value::Sequence(vec![Value::String("ALL".to_owned())])
+    );
+    assert_eq!(
+        defaults["security_opt"],
+        Value::Sequence(vec![
+            Value::String("no-new-privileges:true".to_owned()),
+            Value::String("seccomp:./seccomp/sidecar.json".to_owned()),
+            Value::String("apparmor:docker-default".to_owned()),
+        ])
+    );
+
+    let entrypoint = read_deploy("container-entrypoint");
+    let executor_branch = entrypoint
+        .split("  executor)")
+        .nth(1)
+        .and_then(|branch| branch.split("\n\n  broker)").next())
+        .expect("executor entrypoint branch");
+    assert!(executor_branch.contains("load_identity executor \"${IDENTITY_FILE}\""));
+    for retained in [
+        "SUMI_PERSONALITY_AGENT_ID=\"${SUMI_PERSONALITY_AGENT_ID}\"",
+        "SUMI_RPC_GENERATION=\"${SUMI_RPC_GENERATION}\"",
+        "SUMI_RPC_NONCE=\"${SUMI_RPC_NONCE}\"",
+        "SUMI_WORKSPACE=/workspace",
+        "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock",
+        "/usr/local/bin/sumi-agent --tool-executor-socket",
+    ] {
+        assert!(
+            executor_branch.contains(retained),
+            "executor lost {retained}"
+        );
+    }
+    assert!(!executor_branch.contains("SUMI_ARTIFACT_BROKER_SOCKET"));
+    assert!(!executor_branch.contains("--artifact-broker"));
+    assert!(!executor_branch.contains("--tool-executor\n"));
+}
+
+#[test]
 fn every_long_lived_role_is_non_root_read_only_and_restricted() {
     let compose = compose();
     let defaults = &compose["x-long-lived-hardening"];
@@ -870,7 +929,7 @@ fn every_long_lived_role_is_non_root_read_only_and_restricted() {
     assert!(seccomp.is_object());
     let syscalls = seccomp["syscalls"].as_array().unwrap();
     let ordinary = syscalls[0]["names"].as_array().unwrap();
-    for syscall in ["openat2", "close_range", "prctl"] {
+    for syscall in ["openat2", "close_range", "prctl", "rt_sigtimedwait"] {
         assert!(ordinary.iter().any(|name| name.as_str() == Some(syscall)));
     }
     for dormant in ["mount", "umount2", "unshare"] {
@@ -902,6 +961,42 @@ fn every_long_lived_role_is_non_root_read_only_and_restricted() {
         "executor should inherit docker-default AppArmor until masking is executable"
     );
     assert!(!deploy_dir().join("apparmor/executor").exists());
+}
+
+#[test]
+fn generic_seccomp_permits_tini_signal_wait_or_host_is_classified() {
+    if !docker_fixture_host_available() {
+        eprintln!(
+            "HOST_UNAVAILABLE: Docker and cached debian:bookworm-slim are required to prove \
+             generic seccomp admits Tini's signal wait"
+        );
+        return;
+    }
+
+    let seccomp = format!(
+        "seccomp={}",
+        deploy_dir().join("seccomp/sidecar.json").display()
+    );
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--init",
+            "--security-opt",
+            &seccomp,
+            "--entrypoint",
+            "/bin/sh",
+            "debian:bookworm-slim",
+            "-c",
+            "exit 0",
+        ])
+        .output()
+        .expect("run Tini under the generic sidecar seccomp profile");
+    assert!(
+        output.status.success(),
+        "generic seccomp blocked Tini before the sidecar could run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1793,6 +1888,12 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
     for directory in ["state", "workspace", "artifacts", "executor", "broker"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
+    // The worktree may be mode 0700, which makes a direct bind of this script
+    // non-executable to the non-root container user before the script itself
+    // runs. Exercise the exact artifact through an owned, traversable copy.
+    let entrypoint = root.join("sumi-entrypoint");
+    std::fs::copy(deploy_dir().join("container-entrypoint"), &entrypoint).unwrap();
+    std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.join("executor/executor.sock"), b"stale").unwrap();
     std::fs::write(root.join("broker/broker.sock"), b"stale").unwrap();
 
@@ -1818,10 +1919,7 @@ fn prepare_mode_cleans_prior_role_owned_sockets_with_declared_capabilities() {
         String::from_utf8_lossy(&setup.stderr)
     );
 
-    let script_mount = format!(
-        "{}:/usr/local/bin/sumi-entrypoint:ro",
-        deploy_dir().join("container-entrypoint").display()
-    );
+    let script_mount = format!("{}:/usr/local/bin/sumi-entrypoint:ro", entrypoint.display());
     let seccomp = format!(
         "seccomp={}",
         deploy_dir().join("seccomp/sidecar.json").display()

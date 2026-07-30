@@ -104,6 +104,8 @@ services:
         condition: service_completed_successfully
       prepare:
         condition: service_completed_successfully
+      # This is startup ordering only. Runtime Ready remains gated by its
+      # authenticated executor Health exchange after bootstrap.
       executor:
         condition: service_started
     volumes:
@@ -125,7 +127,6 @@ services:
       context: ../..
       dockerfile: deploy/agent/Dockerfile
     user: "10002:10002"
-    group_add: ["10021"]
     command: [executor]
     network_mode: none
     depends_on:
@@ -133,13 +134,10 @@ services:
         condition: service_completed_successfully
       prepare:
         condition: service_completed_successfully
-      broker:
-        condition: service_started
     volumes:
-      - workspace:/workspace
+      - workspace:/workspace:ro
       - executor-identity:/run/sumi/identity:ro
       - executor-ipc:/run/sumi/executor
-      - broker-ipc:/run/sumi/broker:ro
 
   broker:
     <<: *long-lived-hardening

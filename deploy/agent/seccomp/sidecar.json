@@ -30,6 +30,7 @@
         "preadv", "prlimit64", "pwrite64", "pwritev", "read", "readlink",
         "readlinkat", "readv", "recvfrom", "recvmsg", "rename", "renameat",
         "renameat2", "rmdir", "rseq", "rt_sigaction", "rt_sigprocmask",
+        "rt_sigtimedwait",
         "rt_sigreturn", "sched_getaffinity", "sched_yield", "sendmsg",
         "sendto", "set_robust_list", "setgid", "setgroups", "setpgid",
         "setregid", "setresgid", "setresuid", "setreuid", "set_tid_address",
