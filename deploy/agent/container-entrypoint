@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+role="${1:?missing deployment role}"
+shift
+
+readonly RUNTIME_UID=10001
+readonly RUNTIME_GID=10001
+readonly EXECUTOR_UID=10002
+readonly EXECUTOR_GID=10002
+readonly BROKER_UID=10003
+readonly BROKER_GID=10003
+readonly EXECUTOR_IPC_GID=10020
+readonly BROKER_IPC_GID=10021
+readonly IDENTITY_FILE=/run/sumi/identity/identity.env
+
+fail() {
+  printf '[sumi-entrypoint] %s\n' "$*" >&2
+  exit 64
+}
+
+require_env() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "missing required ${name}"
+}
+
+# Docker services are permitted only stdin/stdout/stderr. Bash keeps its script
+# descriptor at 255 with close-on-exec; close every other inherited descriptor
+# explicitly before handing control to a Rust role.
+close_unlisted_fds() {
+  local fd_path fd
+  for fd_path in /proc/$$/fd/*; do
+    fd="${fd_path##*/}"
+    if [[ "${fd}" =~ ^[0-9]+$ ]] && ((fd > 2 && fd != 255)); then
+      exec {fd}>&-
+    fi
+  done
+}
+
+valid_paid() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+}
+
+identity_key_allowed() {
+  local identity_role="$1"
+  local key="$2"
+  case "${key}" in
+    SUMI_PERSONALITY_AGENT_ID|SUMI_RPC_GENERATION|SUMI_RPC_NONCE)
+      return 0
+      ;;
+    SUMI_PROCESS_GENERATION_LEASE_ID|SUMI_GENERATION_RECOVERY_FENCE_ID)
+      [[ "${identity_role}" == runtime ]]
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Parse inert KEY=VALUE records using an exact role whitelist. Values are
+# assigned literally: identity files are never sourced or evaluated.
+load_identity() {
+  local identity_role="$1"
+  local file="$2"
+  local line key value
+  local count=0
+  declare -A seen=()
+
+  [[ -f "${file}" ]] || fail "${identity_role} identity is unavailable"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == *=* ]] || fail "malformed ${identity_role} identity record"
+    key="${line%%=*}"
+    value="${line#*=}"
+    identity_key_allowed "${identity_role}" "${key}" ||
+      fail "unexpected ${identity_role} identity key"
+    [[ -z "${seen[${key}]+set}" ]] || fail "duplicate ${identity_role} identity key"
+    [[ -n "${value}" ]] || fail "empty ${identity_role} identity value"
+    seen["${key}"]=1
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+    count=$((count + 1))
+  done < "${file}"
+
+  if [[ "${identity_role}" == runtime ]]; then
+    [[ "${count}" -eq 5 ]] || fail "runtime identity is incomplete"
+    require_env SUMI_PROCESS_GENERATION_LEASE_ID
+    require_env SUMI_GENERATION_RECOVERY_FENCE_ID
+  else
+    [[ "${count}" -eq 3 ]] || fail "${identity_role} identity is incomplete"
+  fi
+  require_env SUMI_PERSONALITY_AGENT_ID
+  require_env SUMI_RPC_GENERATION
+  require_env SUMI_RPC_NONCE
+  valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
+    fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
+  [[ "${SUMI_RPC_GENERATION}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "SUMI_RPC_GENERATION must be canonical base-10"
+}
+
+verify_identity_output() {
+  local directory="$1"
+  local gid="$2"
+  local file="${directory}/identity.env"
+  [[ -d "${directory}" && ! -L "${directory}" ]] ||
+    fail "allocator did not produce a real role directory"
+  [[ "$(stat -c '%u:%g:%a' -- "${directory}")" == "0:${gid}:550" ]] ||
+    fail "allocator produced an invalid role directory"
+  [[ -f "${file}" && ! -L "${file}" ]] ||
+    fail "allocator did not produce a regular identity file"
+  [[ "$(stat -c '%u:%g:%a:%h' -- "${file}")" == "0:${gid}:440:1" ]] ||
+    fail "allocator produced invalid identity metadata"
+}
+
+case "${role}" in
+  allocator)
+    require_env SUMI_PERSONALITY_AGENT_ID
+    require_env SUMI_ALLOCATOR_TRUST_ROOT
+    require_env SUMI_ALLOCATOR_STATE_DIR
+    require_env SUMI_IDENTITY_OUTPUT_ROOT
+    require_env SUMI_RUNTIME_IDENTITY_GID
+    require_env SUMI_EXECUTOR_IDENTITY_GID
+    require_env SUMI_BROKER_IDENTITY_GID
+    valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
+      fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
+    install -d -m 0700 "${SUMI_ALLOCATOR_STATE_DIR}"
+    close_unlisted_fds
+    env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+      SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
+      SUMI_ALLOCATOR_TRUST_ROOT="${SUMI_ALLOCATOR_TRUST_ROOT}" \
+      SUMI_ALLOCATOR_STATE_DIR="${SUMI_ALLOCATOR_STATE_DIR}" \
+      SUMI_IDENTITY_OUTPUT_ROOT="${SUMI_IDENTITY_OUTPUT_ROOT}" \
+      SUMI_RUNTIME_IDENTITY_GID="${SUMI_RUNTIME_IDENTITY_GID}" \
+      SUMI_EXECUTOR_IDENTITY_GID="${SUMI_EXECUTOR_IDENTITY_GID}" \
+      SUMI_BROKER_IDENTITY_GID="${SUMI_BROKER_IDENTITY_GID}" \
+      /usr/local/bin/sumi-agent --supervisor-allocate
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/runtime" "${RUNTIME_GID}"
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/executor" "${EXECUTOR_GID}"
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/broker" "${BROKER_GID}"
+    ;;
+
+  prepare)
+    install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
+    install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
+    install -d -m 0700 -o "${BROKER_UID}" -g "${BROKER_GID}" /var/lib/sumi-artifacts
+    # A prior generation leaves these roots owned by non-root roles with no
+    # permission for root-without-DAC_OVERRIDE to traverse. Take ownership and
+    # make them traversable before unlinking stale socket names, then restore
+    # the final connect-only ownership/mode.
+    chown root:root /run/sumi/executor /run/sumi/broker
+    chmod 0700 /run/sumi/executor /run/sumi/broker
+    rm -f /run/sumi/executor/executor.sock /run/sumi/broker/broker.sock
+    install -d -m 0710 -o "${EXECUTOR_UID}" -g "${EXECUTOR_IPC_GID}" /run/sumi/executor
+    install -d -m 0710 -o "${BROKER_UID}" -g "${BROKER_IPC_GID}" /run/sumi/broker
+    chmod 02710 /run/sumi/executor /run/sumi/broker
+    ;;
+
+  runtime)
+    load_identity runtime "${IDENTITY_FILE}"
+    for name in \
+      SUMI_GATEWAY_URL \
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET \
+      SUMI_LOCAL_CONTROL_SERVER_UID \
+      SUMI_LOCAL_CONTROL_SOCKET_GID \
+      SUMI_LOCAL_CONTROL_BEARER \
+      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
+      SUMI_AGENT_WRAPPING_KEY \
+      SUMI_AGENT_WRAPPING_KEY_ID \
+      SUMI_APPROVAL_SECRET_DIGEST_KEY \
+      SUMI_PROVIDER_API_KEY
+    do
+      require_env "${name}"
+    done
+    close_unlisted_fds
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi LANG=C.UTF-8 \
+      SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+      SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+      SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
+      SUMI_STATE_DIR=/var/lib/sumi \
+      SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
+      SUMI_GATEWAY_URL="${SUMI_GATEWAY_URL}" \
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET="${SUMI_LOCAL_CONTROL_UNIX_SOCKET}" \
+      SUMI_LOCAL_CONTROL_SERVER_UID="${SUMI_LOCAL_CONTROL_SERVER_UID}" \
+      SUMI_LOCAL_CONTROL_SOCKET_GID="${SUMI_LOCAL_CONTROL_SOCKET_GID}" \
+      SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER}" \
+      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}" \
+      SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
+      SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID}" \
+      SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY}" \
+      SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}" \
+      SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY \
+      SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY}" \
+      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY="${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}" \
+      SUMI_LOG="${SUMI_LOG:-sumi_agent=info}" \
+      /usr/local/bin/sumi-agent
+    ;;
+
+  executor)
+    load_identity executor "${IDENTITY_FILE}"
+    umask 0007
+    close_unlisted_fds
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/workspace LANG=C.UTF-8 \
+      SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+      SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_WORKSPACE=/workspace \
+      SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
+      SUMI_ARTIFACT_BROKER_SOCKET=/run/sumi/broker/broker.sock \
+      /usr/local/bin/sumi-agent --tool-executor-socket
+    ;;
+
+  broker)
+    load_identity broker "${IDENTITY_FILE}"
+    umask 0007
+    close_unlisted_fds
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi-artifacts LANG=C.UTF-8 \
+      SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+      SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_ARTIFACT_ROOT=/var/lib/sumi-artifacts \
+      SUMI_ARTIFACT_BROKER_SOCKET=/run/sumi/broker/broker.sock \
+      /usr/local/bin/sumi-agent --artifact-broker
+    ;;
+
+  *)
+    fail "unknown deployment role"
+    ;;
+esac

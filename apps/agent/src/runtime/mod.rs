@@ -3,3 +3,4 @@
 pub(crate) mod allocator;
 pub mod authority;
 pub mod contracts;
+pub(crate) mod supervisor_allocator;
