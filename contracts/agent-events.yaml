@@ -188,28 +188,41 @@ $defs:
       error_message: { type: string }
 
   CommandDispositionEvent:
-    type: object
-    required: [type, command_id, command_seq, status]
-    additionalProperties: false
-    properties:
-      type: { const: command_disposition }
-      command_id:
-        type: string
-        format: uuid
-        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-      command_seq: { $ref: '#/$defs/JsonSafeInteger' }
-      status:
-        type: string
-        enum: [applied, superseded, rejected]
-      reject_reason: { $ref: '#/$defs/CommandRejectReason' }
-    if:
-      properties:
-        status: { const: rejected }
-    then:
-      required: [reject_reason]
-    else:
-      properties:
-        reject_reason: false
+    oneOf:
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: applied }
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: superseded }
+      - type: object
+        required: [type, command_id, command_seq, status, reject_reason]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: rejected }
+          reject_reason: { $ref: '#/$defs/CommandRejectReason' }
 
   ErrorEvent:
     type: object

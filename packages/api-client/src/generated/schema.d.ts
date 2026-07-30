@@ -471,9 +471,25 @@ export interface components {
             /** Format: uuid */
             command_id: string;
             command_seq: components["schemas"]["JsonSafeInteger"];
-            /** @enum {string} */
-            status: "applied" | "superseded" | "rejected";
-            reject_reason?: components["schemas"]["CommandRejectReason"];
+            /** @constant */
+            status: "applied";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "superseded";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "rejected";
+            reject_reason: components["schemas"]["CommandRejectReason"];
         };
         DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */

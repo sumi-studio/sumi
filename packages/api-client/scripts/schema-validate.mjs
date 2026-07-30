@@ -294,6 +294,37 @@ const counterexamples = [
     },
   },
   {
+    name: "superseded command disposition rejects reject_reason",
+    def: "CommandDispositionEvent",
+    value: {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      command_seq: 1,
+      status: "superseded",
+      reject_reason: "schema_violation",
+    },
+  },
+  {
+    name: "command disposition requires a lower-case UUID",
+    def: "CommandDispositionEvent",
+    value: {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-00000000000A",
+      command_seq: 1,
+      status: "applied",
+    },
+  },
+  {
+    name: "command disposition rejects non-JSON-safe command sequence",
+    def: "CommandDispositionEvent",
+    value: {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      command_seq: 9007199254740992,
+      status: "applied",
+    },
+  },
+  {
     name: "volatile envelope with disallowed seq",
     def: "Envelope",
     value: {

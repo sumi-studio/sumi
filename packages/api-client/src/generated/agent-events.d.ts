@@ -173,6 +173,30 @@ export type ApprovalDecision =
 export type SteerMode = "hard" | "soft";
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CommandDispositionEvent".
+ */
+export type CommandDispositionEvent =
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "applied";
+    }
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "superseded";
+    }
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "rejected";
+      reject_reason: CommandRejectReason;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "CommandRejectReason".
  */
 export type CommandRejectReason =
@@ -645,17 +669,6 @@ export interface RetryScheduledEvent {
   delay_ms: JsonSafeInteger;
   retry_at: string;
   error_message: string;
-}
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "CommandDispositionEvent".
- */
-export interface CommandDispositionEvent {
-  type: "command_disposition";
-  command_id: string;
-  command_seq: JsonSafeInteger;
-  status: "applied" | "superseded" | "rejected";
-  reject_reason?: CommandRejectReason;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
