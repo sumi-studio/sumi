@@ -14,6 +14,7 @@ interface ApprovalConfirmationProps {
   reason: string;
   status?: "pending" | "allowed" | "denied" | "cancelled";
   decision?: ApprovalDecision | null;
+  sending?: boolean;
   onDecision?: (decision: ApprovalDecision) => void;
 }
 
@@ -23,6 +24,7 @@ export function ApprovalConfirmation({
   reason,
   status = "pending",
   decision = null,
+  sending = false,
   onDecision,
 }: ApprovalConfirmationProps) {
   return (
@@ -35,6 +37,7 @@ export function ApprovalConfirmation({
             : "approval-responded"
       }
       className="mb-2 shadow-[0_2px_12px_rgba(0,0,0,0.04)]"
+      aria-busy={sending}
     >
       <ConfirmationTitle>{summary}</ConfirmationTitle>
       <ConfirmationRequest>{reason}</ConfirmationRequest>
@@ -47,13 +50,20 @@ export function ApprovalConfirmation({
         {status === "cancelled" ? "キャンセルされました" : "拒否しました"}
       </ConfirmationRejected>
       <ConfirmationActions>
+        {sending && (
+          <span role="status" className="text-muted-foreground text-xs">
+            承認を送信中…
+          </span>
+        )}
         <ConfirmationAction
+          disabled={sending}
           onClick={() => onDecision?.({ type: "approve_once" })}
         >
           今回のみ許可
         </ConfirmationAction>
         <ConfirmationAction
           variant="outline"
+          disabled={sending}
           onClick={() => onDecision?.({ type: "deny" })}
         >
           拒否

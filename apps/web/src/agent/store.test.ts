@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BrowserEventEnvelope } from "@sumi/api-client";
+import type { ApprovalRequest, BrowserEventEnvelope } from "@sumi/api-client";
 import type {
   DirectChatConnectionState,
   DirectChatReadyState,
@@ -334,7 +334,7 @@ test("admitted text survives reload for applied replay but never becomes canonic
   assert.deepEqual(new PrivateOutbox(storage).entries(), []);
 });
 
-test("pending text survives reload and is safely requeued with its original key", () => {
+test("pending text from a previous page is surfaced for recovery and never replayed", () => {
   const storage = new MemoryStorage();
   const first = new PrivateOutbox(storage);
   assert.equal(first.putPending("uncertain-key", "uncertain text"), true);
@@ -346,25 +346,14 @@ test("pending text survives reload and is safely requeued with its original key"
   });
   assert.deepEqual(store.getState().conversation.entryOrder, []);
   store.getState().connect();
-  assert.deepEqual(transport.sent, [
+  assert.deepEqual(transport.sent, []);
+  assert.deepEqual(store.getState().recoverableDrafts, [
     {
-      command: {
-        type: "user_message",
-        text: "uncertain text",
-        attachments: [],
-      },
       idempotencyKey: "uncertain-key",
+      text: "uncertain text",
+      reason: "unavailable",
     },
   ]);
-  assert.deepEqual(store.getState().conversation.entryOrder, []);
-
-  transport.emit(accepted("uncertain-key", CommandId, 15));
-  const optimistic =
-    store.getState().conversation.entries["optimistic:uncertain-key"];
-  assert.equal(optimistic?.kind, "user");
-  if (optimistic?.kind === "user") {
-    assert.equal(optimistic.delivery, "admitted");
-  }
 });
 
 test("immediate rejection removes provisional history and supports restore/discard", () => {
@@ -450,6 +439,119 @@ test("client queue failure is immediately recoverable and never enters history",
   ]);
 });
 
+test("durable outbox failure keeps the composer content unsent", () => {
+  const storage: PrivateOutboxStorage = {
+    getItem: () => null,
+    setItem() {
+      throw new Error("session storage denied");
+    },
+    removeItem() {},
+  };
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(storage),
+    idempotencyKey: () => "undurable",
+  });
+  store.getState().connect();
+
+  assert.equal(store.getState().sendMessage("keep composing"), false);
+  assert.deepEqual(transport.sent, []);
+  assert.equal(
+    store.getState().lastError,
+    "Message could not be saved for recovery",
+  );
+});
+
+test("approval decision is synchronously latched until durable resolution", () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+  });
+  store.getState().connect();
+  const request = approvalRequest("approval-latch");
+  transport.emit({
+    type: "event",
+    envelope: { seq: 1, event: { type: "approval_requested", request } },
+  } as unknown as DirectChatServerFrame);
+
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "approve_once" }),
+    true,
+  );
+  assert.equal(store.getState().sendingApprovalRequestId, request.id);
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "deny" }),
+    false,
+  );
+  assert.deepEqual(transport.sent, [
+    {
+      command: {
+        type: "approval_decision",
+        request_id: request.id,
+        decision: { type: "approve_once" },
+      },
+      idempotencyKey: undefined,
+    },
+  ]);
+
+  transport.emit({
+    type: "event",
+    envelope: {
+      seq: 2,
+      event: {
+        type: "approval_resolved",
+        request_id: request.id,
+        resolution: { decision: { type: "approve_once" } },
+      },
+    },
+  } as unknown as DirectChatServerFrame);
+  assert.equal(store.getState().sendingApprovalRequestId, null);
+  assert.equal(store.getState().approval, null);
+});
+
+test("a local approval queue failure releases only that request latch", () => {
+  const transport = new FakeTransport();
+  transport.sendResult = false;
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+  });
+  store.getState().connect();
+  const request = approvalRequest("approval-retry");
+  transport.emit({
+    type: "event",
+    envelope: { seq: 1, event: { type: "approval_requested", request } },
+  } as unknown as DirectChatServerFrame);
+
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "approve_once" }),
+    false,
+  );
+  assert.equal(store.getState().sendingApprovalRequestId, null);
+  transport.sendResult = true;
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "deny" }),
+    true,
+  );
+  assert.deepEqual(
+    transport.sent.map((entry) => entry.command),
+    [
+      {
+        type: "approval_decision",
+        request_id: request.id,
+        decision: { type: "approve_once" },
+      },
+      {
+        type: "approval_decision",
+        request_id: request.id,
+        decision: { type: "deny" },
+      },
+    ],
+  );
+});
+
 function accepted(
   idempotencyKey: string,
   commandId: string,
@@ -509,6 +611,23 @@ function canonicalFrame(
       },
     },
   } as unknown as DirectChatServerFrame;
+}
+
+function approvalRequest(id: string): ApprovalRequest {
+  return {
+    id,
+    tool_call_id: `call-${id}`,
+    tool_name: "bash",
+    action: { reviewable: { command: "git status" } },
+    args_summary: { command: "git status" },
+    reason: "shell access",
+    audit: {
+      outcome: "allow",
+      risk: "low",
+      authorization: "medium",
+      rationale: "read only",
+    },
+  };
 }
 
 class MemoryStorage implements PrivateOutboxStorage {

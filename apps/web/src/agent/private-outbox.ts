@@ -101,8 +101,13 @@ export class PrivateOutbox {
       ...this.entriesValue,
       { state: "pending", idempotencyKey, text },
     ];
-    this.persist();
-    return true;
+    if (this.persist()) return true;
+    // A pending command must be durable before its composer can be cleared:
+    // an in-memory-only row disappears on reload and cannot safely be retried.
+    this.entriesValue = this.entriesValue.filter(
+      (entry) => entry.idempotencyKey !== idempotencyKey,
+    );
+    return false;
   }
 
   admit(
@@ -258,12 +263,15 @@ export class PrivateOutbox {
     }
   }
 
-  private persist() {
-    if (!this.storage) return;
+  private persist(): boolean {
+    // No browser storage is normal in non-browser runtimes. A configured
+    // storage backend that throws is different: it means durable recovery
+    // was explicitly attempted and failed.
+    if (!this.storage) return true;
     try {
       if (this.entriesValue.length === 0) {
         this.storage.removeItem(PrivateOutboxStorageKey);
-        return;
+        return true;
       }
       this.storage.setItem(
         PrivateOutboxStorageKey,
@@ -272,9 +280,9 @@ export class PrivateOutbox {
           entries: this.entriesValue,
         }),
       );
+      return true;
     } catch {
-      // The in-memory recovery path remains usable if sessionStorage is denied
-      // or temporarily full.
+      return false;
     }
   }
 }

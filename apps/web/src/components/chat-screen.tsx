@@ -45,6 +45,7 @@ function ChatScreenContent() {
   const {
     conversation,
     running,
+    sendingApprovalRequestId,
     connection,
     ready,
     lastError,
@@ -169,6 +170,12 @@ function ChatScreenContent() {
             className="scroll-fade-b scrollbar-ui scrollbar-gutter-stable size-full min-h-0 min-w-0 overscroll-contain contain-content"
             onAtEndChange={setAtEnd}
             onVisibleMessageIdsChange={onVisibleRowsChange}
+            renderTranscriptItem={(row) => {
+              const text = transcriptText(row);
+              return text === null ? null : (
+                <p className="whitespace-pre-wrap text-sm">{text}</p>
+              );
+            }}
             renderItem={(row) => {
               if (row.kind === "waiting") {
                 return (
@@ -199,6 +206,7 @@ function ChatScreenContent() {
                           : undefined
                       }
                       onApprovalDecision={decideApproval}
+                      sendingApprovalRequestId={sendingApprovalRequestId}
                     />
                   </Suspense>
                 </div>
@@ -323,6 +331,49 @@ function ChatScreenContent() {
       </main>
     </div>
   );
+}
+
+function transcriptText(row: ConversationRow): string | null {
+  if (row.kind === "waiting" || row.kind === "spacer") return null;
+  switch (row.kind) {
+    case "user":
+      return `あなた: ${row.text}`;
+    case "prose":
+      return `Sumi: ${row.text}`;
+    case "approval":
+      return [
+        `承認: ${row.summary}`,
+        row.reason,
+        row.status === "pending" ? "回答待ち" : `結果: ${row.status}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    case "steer":
+      return `応答への追加指示 (${row.mode})`;
+    case "error":
+      return `エラー: ${row.message}`;
+    case "card":
+      return `カード:\n${JSON.stringify(row.node)}`;
+    case "agent-run":
+      return [
+        "エージェントの作業:",
+        ...row.trace.map((trace) => {
+          switch (trace.type) {
+            case "reasoning":
+              return trace.text;
+            case "tool":
+              return `${trace.label} (${trace.status})`;
+            case "approval":
+              return `${trace.summary} (${trace.status})`;
+            case "artifact":
+              return trace.label;
+            case "error":
+              return `エラー: ${trace.message}`;
+          }
+          return "";
+        }),
+      ].join("\n");
+  }
 }
 
 function EmptyState({ available }: { available: boolean }) {

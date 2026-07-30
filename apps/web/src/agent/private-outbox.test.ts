@@ -189,7 +189,7 @@ test("enforces entry and aggregate text bounds before mutating", () => {
   );
 });
 
-test("storage denial does not destroy the bounded in-memory recovery path", () => {
+test("storage denial refuses an undurable pending command", () => {
   const storage: PrivateOutboxStorage = {
     getItem() {
       throw new Error("denied");
@@ -202,14 +202,8 @@ test("storage denial does not destroy the bounded in-memory recovery path", () =
     },
   };
   const outbox = new PrivateOutbox(storage);
-  assert.equal(outbox.putPending("key", "hello"), true);
-  assert.deepEqual(outbox.recoverByIdempotencyKey("key", "unavailable"), {
-    state: "recoverable",
-    idempotencyKey: "key",
-    text: "hello",
-    reason: "unavailable",
-  });
-  assert.equal(outbox.consumeRecoverable("key"), "hello");
+  assert.equal(outbox.putPending("key", "hello"), false);
+  assert.deepEqual(outbox.entries(), []);
 });
 
 class MemoryStorage implements PrivateOutboxStorage {

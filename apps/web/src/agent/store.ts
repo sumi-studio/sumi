@@ -38,6 +38,8 @@ export interface ConversationState {
   status: AgentSession["status"];
   running: boolean;
   approval: AgentSession["approval"];
+  /** The request whose decision was accepted locally and is awaiting durability. */
+  sendingApprovalRequestId: string | null;
   connection: DirectChatConnectionState;
   ready: DirectChatReadyState;
   lastError: string | null;
@@ -68,6 +70,16 @@ export function createConversationStore({
   let connection: DirectChatConnectionState = "connecting";
   let ready: DirectChatReadyState = "unknown";
   let started = false;
+  const approvalSubmissionLatches = new Set<string>();
+
+  // Pending rows restored from a prior page are intentionally not replayed:
+  // the user never saw a durable admission and an automatic retry could
+  // duplicate a command. Make the text explicit and recoverable instead.
+  for (const entry of outbox.entries()) {
+    if (entry.state === "pending") {
+      outbox.recoverByIdempotencyKey(entry.idempotencyKey, "unavailable");
+    }
+  }
 
   return create<ConversationState>((set) => {
     const publish = (lastError?: string | null) => {
@@ -76,6 +88,10 @@ export function createConversationStore({
         status: session.status,
         running: session.status === "streaming",
         approval: session.approval,
+        sendingApprovalRequestId:
+          session.approval && approvalSubmissionLatches.has(session.approval.id)
+            ? session.approval.id
+            : null,
         connection,
         ready,
         lastError: lastError === undefined ? state.lastError : lastError,
@@ -175,6 +191,9 @@ export function createConversationStore({
         });
         session = reduced.session;
         if (reduced.kind === "applied") {
+          if (envelope.event.type === "approval_resolved") {
+            approvalSubmissionLatches.delete(envelope.event.request_id);
+          }
           if (envelope.event.type === "command_disposition") {
             applyDisposition(envelope.event);
           } else if (
@@ -248,6 +267,7 @@ export function createConversationStore({
       status: session.status,
       running: false,
       approval: null,
+      sendingApprovalRequestId: null,
       connection,
       ready,
       lastError: null,
@@ -259,25 +279,6 @@ export function createConversationStore({
         ready = "unknown";
         publish(null);
         transport.connect();
-        let resumeFailed = false;
-        for (const entry of outbox.entries()) {
-          if (entry.state !== "pending") continue;
-          const sent = transport.sendCommand(
-            {
-              type: "user_message",
-              text: entry.text,
-              attachments: [],
-            },
-            entry.idempotencyKey,
-          );
-          if (sent) continue;
-          outbox.recoverByIdempotencyKey(
-            entry.idempotencyKey,
-            "client_validation",
-          );
-          resumeFailed = true;
-        }
-        if (resumeFailed) publish("Message could not be requeued");
       },
       disconnect() {
         if (!started) return;
@@ -352,12 +353,24 @@ export function createConversationStore({
           publish("Approval is no longer actionable");
           return false;
         }
+        if (approvalSubmissionLatches.has(requestId)) {
+          publish();
+          return false;
+        }
+        // This latch is set before sendCommand because transports are allowed
+        // to synchronously return or emit frames. It prevents conflicting
+        // decisions during the durable-resolution gap.
+        approvalSubmissionLatches.add(requestId);
+        publish(null);
         const sent = transport.sendCommand({
           type: "approval_decision",
           request_id: requestId,
           decision,
         });
-        if (!sent) publish("Approval decision could not be queued");
+        if (!sent) {
+          approvalSubmissionLatches.delete(requestId);
+          publish("Approval decision could not be queued");
+        }
         return sent;
       },
     };
