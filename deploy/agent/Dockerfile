@@ -22,8 +22,14 @@ RUN apt-get update \
     && groupadd --gid 10020 sumi-executor-ipc \
     && groupadd --gid 10021 sumi-broker-ipc \
     && groupadd --gid 10022 sumi-local-control-ipc \
-    && install -d -m 0755 /var/lib/sumi /var/lib/sumi-allocator \
-       /var/lib/sumi-artifacts /workspace /run/sumi
+    && install -d -m 0755 /var/lib/sumi /var/lib/sumi-artifacts /workspace \
+       /run/sumi /run/sumi/local-control \
+    && install -d -m 0700 /var/lib/sumi-allocator-root \
+       /var/lib/sumi-allocator-root/state \
+       /var/lib/sumi-allocator-root/identity-output \
+       /var/lib/sumi-allocator-root/identity-output/runtime \
+       /var/lib/sumi-allocator-root/identity-output/executor \
+       /var/lib/sumi-allocator-root/identity-output/broker
 
 COPY --from=build /src/apps/agent/target/release/sumi-agent /usr/local/bin/sumi-agent
 COPY deploy/agent/container-entrypoint /usr/local/bin/sumi-entrypoint

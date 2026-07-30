@@ -98,38 +98,46 @@ load_identity() {
     fail "SUMI_RPC_GENERATION must be canonical base-10"
 }
 
-lock_identity_output() {
+verify_identity_output() {
   local directory="$1"
   local gid="$2"
   local file="${directory}/identity.env"
-  [[ -f "${file}" && ! -L "${file}" ]] || fail "allocator did not produce ${file}"
-  chown root:"${gid}" "${file}"
-  chmod 0440 "${file}"
-  chown root:"${gid}" "${directory}"
-  chmod 0550 "${directory}"
+  [[ -d "${directory}" && ! -L "${directory}" ]] ||
+    fail "allocator did not produce a real role directory"
+  [[ "$(stat -c '%u:%g:%a' -- "${directory}")" == "0:${gid}:550" ]] ||
+    fail "allocator produced an invalid role directory"
+  [[ -f "${file}" && ! -L "${file}" ]] ||
+    fail "allocator did not produce a regular identity file"
+  [[ "$(stat -c '%u:%g:%a:%h' -- "${file}")" == "0:${gid}:440:1" ]] ||
+    fail "allocator produced invalid identity metadata"
 }
 
 case "${role}" in
   allocator)
     require_env SUMI_PERSONALITY_AGENT_ID
+    require_env SUMI_ALLOCATOR_TRUST_ROOT
     require_env SUMI_ALLOCATOR_STATE_DIR
     require_env SUMI_IDENTITY_OUTPUT_ROOT
+    require_env SUMI_RUNTIME_IDENTITY_GID
+    require_env SUMI_EXECUTOR_IDENTITY_GID
+    require_env SUMI_BROKER_IDENTITY_GID
     valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
       fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
     install -d -m 0700 "${SUMI_ALLOCATOR_STATE_DIR}"
-    for identity_role in runtime executor broker; do
-      install -d -m 0700 "${SUMI_IDENTITY_OUTPUT_ROOT}/${identity_role}"
-    done
     close_unlisted_fds
     env -i \
       PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
       SUMI_PERSONALITY_AGENT_ID="${SUMI_PERSONALITY_AGENT_ID}" \
+      SUMI_ALLOCATOR_TRUST_ROOT="${SUMI_ALLOCATOR_TRUST_ROOT}" \
       SUMI_ALLOCATOR_STATE_DIR="${SUMI_ALLOCATOR_STATE_DIR}" \
       SUMI_IDENTITY_OUTPUT_ROOT="${SUMI_IDENTITY_OUTPUT_ROOT}" \
+      SUMI_RUNTIME_IDENTITY_GID="${SUMI_RUNTIME_IDENTITY_GID}" \
+      SUMI_EXECUTOR_IDENTITY_GID="${SUMI_EXECUTOR_IDENTITY_GID}" \
+      SUMI_BROKER_IDENTITY_GID="${SUMI_BROKER_IDENTITY_GID}" \
       /usr/local/bin/sumi-agent --supervisor-allocate
-    lock_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/runtime" "${RUNTIME_GID}"
-    lock_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/executor" "${EXECUTOR_GID}"
-    lock_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/broker" "${BROKER_GID}"
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/runtime" "${RUNTIME_GID}"
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/executor" "${EXECUTOR_GID}"
+    verify_identity_output "${SUMI_IDENTITY_OUTPUT_ROOT}/broker" "${BROKER_GID}"
     ;;
 
   prepare)
@@ -153,6 +161,7 @@ case "${role}" in
     for name in \
       SUMI_GATEWAY_URL \
       SUMI_LOCAL_CONTROL_UNIX_SOCKET \
+      SUMI_LOCAL_CONTROL_SERVER_UID \
       SUMI_LOCAL_CONTROL_BEARER \
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
       SUMI_AGENT_WRAPPING_KEY \
@@ -174,6 +183,7 @@ case "${role}" in
       SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock \
       SUMI_GATEWAY_URL="${SUMI_GATEWAY_URL}" \
       SUMI_LOCAL_CONTROL_UNIX_SOCKET="${SUMI_LOCAL_CONTROL_UNIX_SOCKET}" \
+      SUMI_LOCAL_CONTROL_SERVER_UID="${SUMI_LOCAL_CONTROL_SERVER_UID}" \
       SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER}" \
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}" \
       SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \

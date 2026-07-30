@@ -1,3 +1,0 @@
-#!/bin/sh
-set -eu
-apparmor_parser -r "$(dirname "$0")/executor"

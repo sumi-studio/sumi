@@ -39,13 +39,17 @@ services:
       - apparmor:docker-default
     environment:
       SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
-      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator
-      SUMI_IDENTITY_OUTPUT_ROOT: /run/sumi/identity-output
+      SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
+      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator-root/state
+      SUMI_IDENTITY_OUTPUT_ROOT: /var/lib/sumi-allocator-root/identity-output
+      SUMI_RUNTIME_IDENTITY_GID: "10001"
+      SUMI_EXECUTOR_IDENTITY_GID: "10002"
+      SUMI_BROKER_IDENTITY_GID: "10003"
     volumes:
-      - allocator-state:/var/lib/sumi-allocator
-      - runtime-identity:/run/sumi/identity-output/runtime
-      - executor-identity:/run/sumi/identity-output/executor
-      - broker-identity:/run/sumi/identity-output/broker
+      - allocator-state:/var/lib/sumi-allocator-root/state
+      - runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
+      - executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
+      - broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
 
   # Root is confined to a short-lived ownership/setup role. It cannot see the
   # allocator ledger, identities, provider credentials, or local-control bearer.
@@ -83,6 +87,7 @@ services:
     environment:
       SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
+      SUMI_LOCAL_CONTROL_SERVER_UID: ${SUMI_LOCAL_CONTROL_SERVER_UID:?SUMI_LOCAL_CONTROL_SERVER_UID is required}
       SUMI_LOCAL_CONTROL_BEARER: ${SUMI_LOCAL_CONTROL_BEARER:?SUMI_LOCAL_CONTROL_BEARER is required}
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:?SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX is required}
       SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
@@ -104,11 +109,11 @@ services:
       - state:/var/lib/sumi
       - runtime-identity:/run/sumi/identity:ro
       - executor-ipc:/run/sumi/executor:ro
-      # The dedicated local-control process owns the pre-existing host
-      # directory/socket. Runtime receives connect-only access; no TCP route.
+      # Bind the checked pre-existing socket itself, not its mutable host
+      # directory. Runtime receives connect-only access; no TCP route.
       - type: bind
-        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}
-        target: /run/sumi/local-control
+        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock
+        target: /run/sumi/local-control/control.sock
         read_only: true
         bind:
           create_host_path: false
@@ -122,10 +127,6 @@ services:
     group_add: ["10021"]
     command: [executor]
     network_mode: none
-    security_opt:
-      - no-new-privileges:true
-      - seccomp:./seccomp/sidecar.json
-      - apparmor:sumi-agent-executor
     depends_on:
       allocator:
         condition: service_completed_successfully

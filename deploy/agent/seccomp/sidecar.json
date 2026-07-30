@@ -15,7 +15,7 @@
       "names": [
         "accept", "accept4", "access", "arch_prctl", "bind", "brk",
         "capget", "capset", "chdir", "chmod", "chown", "clock_gettime",
-        "clone", "clone3", "close", "close_range", "connect", "dup", "dup2",
+        "close", "close_range", "connect", "dup", "dup2",
         "dup3", "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_wait",
         "eventfd2", "execve", "exit", "exit_group", "faccessat", "fadvise64",
         "fallocate", "fcntl", "fdatasync", "fchmod", "fchmodat", "fchown",
@@ -25,7 +25,7 @@
         "getrlimit", "getsockname", "getsockopt", "gettid", "getuid",
         "ioctl", "kill", "listen", "lseek", "lstat", "madvise",
         "memfd_create", "mkdir", "mkdirat", "mmap", "mprotect", "mremap",
-        "msync", "mount", "munmap", "newfstatat", "open", "openat",
+        "msync", "munmap", "newfstatat", "open", "openat",
         "openat2", "pipe", "pipe2", "poll", "ppoll", "prctl", "pread64",
         "preadv", "prlimit64", "pwrite64", "pwritev", "read", "readlink",
         "readlinkat", "readv", "recvfrom", "recvmsg", "rename", "renameat",
@@ -36,34 +36,27 @@
         "setuid", "setsockopt", "shutdown", "sigaltstack", "socket",
         "socketpair", "stat", "statx", "sysinfo", "tgkill", "time",
         "timerfd_create", "timerfd_gettime", "timerfd_settime", "umask",
-        "umount2", "uname", "unlink", "unlinkat", "utimensat", "wait4",
+        "uname", "unlink", "unlinkat", "utimensat", "wait4",
         "write", "writev"
       ],
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "names": ["unshare"],
+      "names": ["clone"],
       "action": "SCMP_ACT_ALLOW",
       "args": [
         {
           "index": 0,
-          "value": 268435456,
+          "value": 2114060416,
           "valueTwo": 0,
-          "op": "SCMP_CMP_EQ"
+          "op": "SCMP_CMP_MASKED_EQ"
         }
       ]
     },
     {
-      "names": ["unshare"],
-      "action": "SCMP_ACT_ALLOW",
-      "args": [
-        {
-          "index": 0,
-          "value": 1073872896,
-          "valueTwo": 0,
-          "op": "SCMP_CMP_EQ"
-        }
-      ]
+      "names": ["clone3"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
     }
   ]
 }
