@@ -187,6 +187,30 @@ $defs:
       retry_at: { type: string, format: date-time }
       error_message: { type: string }
 
+  CommandDispositionEvent:
+    type: object
+    required: [type, command_id, command_seq, status]
+    additionalProperties: false
+    properties:
+      type: { const: command_disposition }
+      command_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+      status:
+        type: string
+        enum: [applied, superseded, rejected]
+      reject_reason: { $ref: '#/$defs/CommandRejectReason' }
+    if:
+      properties:
+        status: { const: rejected }
+    then:
+      required: [reject_reason]
+    else:
+      properties:
+        reject_reason: false
+
   ErrorEvent:
     type: object
     required: [type, message]
@@ -212,6 +236,7 @@ $defs:
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
       - { $ref: '#/$defs/ErrorEvent' }
 
   DurableAgentEvent:
@@ -229,6 +254,7 @@ $defs:
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
 
   VolatileAgentEvent:
     oneOf:
@@ -722,6 +748,10 @@ $defs:
       command: { $ref: '#/$defs/Command' }
     $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
 
+  CommandRejectReason:
+    type: string
+    enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+
   CommandAck:
     type: object
     required: [seq, command_id, personality_agent_id, status]
@@ -737,8 +767,7 @@ $defs:
         type: string
         enum: [received, applied, superseded, rejected]
       reject_reason:
-        type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+        $ref: '#/$defs/CommandRejectReason'
     if:
       properties:
         status: { const: rejected }

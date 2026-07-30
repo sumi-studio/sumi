@@ -463,7 +463,19 @@ export interface components {
             retry_at: string;
             error_message: string;
         };
-        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"];
+        /** @enum {string} */
+        CommandRejectReason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        CommandDispositionEvent: {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @enum {string} */
+            status: "applied" | "superseded" | "rejected";
+            reject_reason?: components["schemas"]["CommandRejectReason"];
+        };
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {
@@ -605,8 +617,7 @@ export interface components {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             /** @enum {string} */
             status: "received" | "applied" | "superseded" | "rejected";
-            /** @enum {string} */
-            reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+            reject_reason?: components["schemas"]["CommandRejectReason"];
         };
     };
     responses: never;

@@ -1608,7 +1608,9 @@ impl DurableBridge {
                     .await
                 }
             }
-            AgentEvent::Steered { .. } | AgentEvent::MemoryMaintenance { .. } => {
+            AgentEvent::Steered { .. }
+            | AgentEvent::MemoryMaintenance { .. }
+            | AgentEvent::CommandDisposition(_) => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
             }
         }?;

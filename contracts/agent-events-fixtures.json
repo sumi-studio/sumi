@@ -1,4 +1,32 @@
 {
+  "command_disposition_applied": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "command_disposition",
+      "command_id": "00000000-0000-4000-8000-000000000101",
+      "command_seq": 101,
+      "status": "applied"
+    }
+  },
+  "command_disposition_superseded": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "command_disposition",
+      "command_id": "00000000-0000-4000-8000-000000000102",
+      "command_seq": 102,
+      "status": "superseded"
+    }
+  },
+  "command_disposition_rejected": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "command_disposition",
+      "command_id": "00000000-0000-4000-8000-000000000103",
+      "command_seq": 103,
+      "status": "rejected",
+      "reject_reason": "schema_violation"
+    }
+  },
   "durable_agent_start": {
     "kind": "outbound_frame",
     "wire": {

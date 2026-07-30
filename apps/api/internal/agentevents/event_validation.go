@@ -162,6 +162,36 @@ func validateEvent(raw json.RawMessage) error {
 		}
 		return nil
 
+	case "command_disposition":
+		if err := requireAndAllow(
+			obj,
+			[]string{"type", "command_id", "command_seq", "status"},
+			[]string{"type", "command_id", "command_seq", "status", "reject_reason"},
+		); err != nil {
+			return err
+		}
+		if err := validateUUID(obj["command_id"]); err != nil {
+			return fmt.Errorf("command_disposition.command_id: %w", err)
+		}
+		if err := validateJSONSafeInteger(obj["command_seq"]); err != nil {
+			return fmt.Errorf("command_disposition.command_seq: %w", err)
+		}
+		status, err := requireString(obj, "status")
+		if err != nil {
+			return fmt.Errorf("command_disposition.status: %w", err)
+		}
+		if !commandDispositionStatuses[status] {
+			return fmt.Errorf("command_disposition.status %q is not valid", status)
+		}
+		if status == "rejected" {
+			if err := validateEnumString(obj["reject_reason"], rejectReasons); err != nil {
+				return fmt.Errorf("command_disposition.reject_reason: %w", err)
+			}
+		} else if _, present := obj["reject_reason"]; present {
+			return fmt.Errorf("command_disposition.reject_reason is only allowed when status is rejected")
+		}
+		return nil
+
 	case "error":
 		if err := requireAndAllow(obj, []string{"type", "message"}, []string{"type", "message"}); err != nil {
 			return err
@@ -928,11 +958,12 @@ func requireAndAllow(obj map[string]json.RawMessage, required, allowed []string)
 }
 
 var (
-	steerModes         = map[string]bool{"hard": true, "soft": true}
-	stopReasons        = map[string]bool{"stop": true, "length": true, "tool_use": true, "error": true, "aborted": true}
-	auditOutcomes      = map[string]bool{"allow": true, "deny": true}
-	riskLevels         = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
-	userAuthorizations = map[string]bool{"unknown": true, "low": true, "medium": true, "high": true}
-	toolArgumentErrors = map[string]bool{"invalid_json": true, "non_object": true, "schema_violation": true, "incomplete_response": true, "too_large": true}
-	apiProtocols       = map[string]bool{"open_ai_chat_completions": true, "open_ai_responses": true, "anthropic_messages": true}
+	steerModes                 = map[string]bool{"hard": true, "soft": true}
+	commandDispositionStatuses = map[string]bool{"applied": true, "superseded": true, "rejected": true}
+	stopReasons                = map[string]bool{"stop": true, "length": true, "tool_use": true, "error": true, "aborted": true}
+	auditOutcomes              = map[string]bool{"allow": true, "deny": true}
+	riskLevels                 = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
+	userAuthorizations         = map[string]bool{"unknown": true, "low": true, "medium": true, "high": true}
+	toolArgumentErrors         = map[string]bool{"invalid_json": true, "non_object": true, "schema_violation": true, "incomplete_response": true, "too_large": true}
+	apiProtocols               = map[string]bool{"open_ai_chat_completions": true, "open_ai_responses": true, "anthropic_messages": true}
 )

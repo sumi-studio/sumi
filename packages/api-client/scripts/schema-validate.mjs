@@ -273,6 +273,27 @@ for (const [name, fixture] of Object.entries(fixtures)) {
 
 const counterexamples = [
   {
+    name: "applied command disposition rejects reject_reason",
+    def: "CommandDispositionEvent",
+    value: {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      command_seq: 1,
+      status: "applied",
+      reject_reason: "schema_violation",
+    },
+  },
+  {
+    name: "rejected command disposition requires reject_reason",
+    def: "CommandDispositionEvent",
+    value: {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      command_seq: 1,
+      status: "rejected",
+    },
+  },
+  {
     name: "volatile envelope with disallowed seq",
     def: "Envelope",
     value: {

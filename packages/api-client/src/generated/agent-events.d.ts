@@ -29,7 +29,8 @@ export type DurableAgentEvent =
   | ApprovalResolvedEvent
   | SteeredEvent
   | MemoryMaintenanceEvent
-  | RetryScheduledEvent;
+  | RetryScheduledEvent
+  | CommandDispositionEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicMessage".
@@ -172,6 +173,12 @@ export type ApprovalDecision =
 export type SteerMode = "hard" | "soft";
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CommandRejectReason".
+ */
+export type CommandRejectReason =
+  "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "VolatileAgentEvent".
  */
 export type VolatileAgentEvent = MessageUpdateEvent | ToolExecutionUpdateEvent | ErrorEvent;
@@ -278,6 +285,7 @@ export type AgentEvent =
   | SteeredEvent
   | MemoryMaintenanceEvent
   | RetryScheduledEvent
+  | CommandDispositionEvent
   | ErrorEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -640,6 +648,17 @@ export interface RetryScheduledEvent {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CommandDispositionEvent".
+ */
+export interface CommandDispositionEvent {
+  type: "command_disposition";
+  command_id: string;
+  command_seq: JsonSafeInteger;
+  status: "applied" | "superseded" | "rejected";
+  reject_reason?: CommandRejectReason;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "VolatileEnvelope".
  */
 export interface VolatileEnvelope {
@@ -711,7 +730,7 @@ export interface CommandAck {
   command_id: string;
   personality_agent_id: PersonalityAgentId;
   status: "received" | "applied" | "superseded" | "rejected";
-  reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+  reject_reason?: CommandRejectReason;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

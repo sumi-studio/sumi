@@ -32,6 +32,10 @@ use super::{Attachment, DeferredApprovalRule};
 use crate::agent::{
     AgentEvent, ApprovalRequest, ApprovalResolution, AuditDecision, AuditOutcome, MemoryMaintKind,
     PublicStreamEvent, ReviewProjection, RiskLevel, SteerMode, UserAuthorization,
+    events::{
+        CommandDisposition as AgentCommandDisposition,
+        CommandDispositionRejectReason as AgentCommandDispositionRejectReason,
+    },
 };
 use crate::provider::types::{
     ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
@@ -629,9 +633,28 @@ pub enum WireAgentEvent {
         retry_at: DateTime<Utc>,
         error_message: String,
     },
+    CommandDisposition(WireCommandDispositionEvent),
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WireCommandDispositionEvent {
+    #[serde(deserialize_with = "deserialize_canonical_command_id")]
+    command_id: String,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
+    command_seq: u64,
+    #[serde(flatten)]
+    disposition: WireCommandDisposition,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WireCommandDisposition {
+    Applied {},
+    Superseded {},
+    Rejected { reject_reason: WireRejectReason },
 }
 
 impl WireAgentEvent {
@@ -659,6 +682,7 @@ impl WireAgentEvent {
             Self::Steered { .. } => "steered",
             Self::MemoryMaintenance { .. } => "memory_maintenance",
             Self::RetryScheduled { .. } => "retry_scheduled",
+            Self::CommandDisposition(_) => "command_disposition",
             Self::Error { .. } => "error",
         }
     }
@@ -1068,8 +1092,39 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
                 retry_at,
                 error_message,
             },
+            AgentEvent::CommandDisposition(event) => {
+                Self::CommandDisposition(WireCommandDispositionEvent {
+                    command_id: canonical_command_id(&event.command_id)?,
+                    command_seq: wire_json_safe_integer(event.command_seq)?,
+                    disposition: event.disposition.into(),
+                })
+            }
             AgentEvent::Error { message } => Self::Error { message },
         })
+    }
+}
+
+impl From<AgentCommandDisposition> for WireCommandDisposition {
+    fn from(disposition: AgentCommandDisposition) -> Self {
+        match disposition {
+            AgentCommandDisposition::Applied {} => Self::Applied {},
+            AgentCommandDisposition::Superseded {} => Self::Superseded {},
+            AgentCommandDisposition::Rejected { reject_reason } => Self::Rejected {
+                reject_reason: match reject_reason {
+                    AgentCommandDispositionRejectReason::UnknownCommand => {
+                        WireRejectReason::UnknownCommand
+                    }
+                    AgentCommandDispositionRejectReason::SchemaViolation => {
+                        WireRejectReason::SchemaViolation
+                    }
+                    AgentCommandDispositionRejectReason::AttachmentsNotEmpty => {
+                        WireRejectReason::AttachmentsNotEmpty
+                    }
+                    AgentCommandDispositionRejectReason::Oversized => WireRejectReason::Oversized,
+                    AgentCommandDispositionRejectReason::NotAllowed => WireRejectReason::NotAllowed,
+                },
+            },
+        }
     }
 }
 
@@ -1596,6 +1651,14 @@ fn canonical_command_id(value: &str) -> Result<String, WireError> {
     CommandId::parse(value)
         .map(|id| id.as_str().to_owned())
         .map_err(|_| WireError::InvalidCommandId(value.to_owned()))
+}
+
+fn deserialize_canonical_command_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    canonical_command_id(&value).map_err(de::Error::custom)
 }
 
 fn wire_content_index(value: usize) -> Result<u64, WireError> {
@@ -3120,6 +3183,84 @@ mod tests {
             passed += 1;
         }
         assert!(passed >= 10, "expected at least 10 fixtures, got {passed}");
+    }
+
+    #[test]
+    fn command_disposition_enforces_terminal_shape_and_safe_identity() {
+        for valid in [
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": 1,
+                "status": "applied"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000002",
+                "command_seq": 2,
+                "status": "superseded"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000003",
+                "command_seq": 3,
+                "status": "rejected",
+                "reject_reason": "not_allowed"
+            }),
+        ] {
+            let wire: WireAgentEvent =
+                serde_json::from_value(valid.clone()).expect("valid command disposition");
+            assert_eq!(
+                serde_json::to_value(wire).expect("serialize command disposition"),
+                valid
+            );
+        }
+
+        for invalid in [
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": 1,
+                "status": "received"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": 1,
+                "status": "rejected"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": 1,
+                "status": "applied",
+                "reject_reason": "oversized"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": MAX_JSON_SAFE_INTEGER + 1,
+                "status": "applied"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-00000000000A",
+                "command_seq": 1,
+                "status": "applied"
+            }),
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000001",
+                "command_seq": 1,
+                "status": "applied",
+                "command_body": {"type": "user_message"}
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<WireAgentEvent>(invalid.clone()).is_err(),
+                "invalid command disposition was accepted: {invalid}"
+            );
+        }
     }
 
     #[test]

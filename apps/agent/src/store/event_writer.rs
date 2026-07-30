@@ -24,7 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(test)]
 use crate::provider::types::ProviderContextItem;
 use crate::{
-    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode},
+    agent::{
+        AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode,
+        events::{CommandDisposition, CommandDispositionEvent, CommandDispositionRejectReason},
+    },
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
@@ -254,6 +257,27 @@ impl DurableEvent {
                 turn_id: Some(turn_id),
                 ..DurableEventMetadata::default()
             },
+        )
+    }
+
+    fn command_disposition(
+        command_id: impl Into<String>,
+        command_seq: u64,
+        disposition: CommandDisposition,
+    ) -> Result<Self> {
+        let command_id = command_id.into();
+        CommandId::parse(&command_id)
+            .map_err(|_| anyhow!("durable CommandDisposition command_id is not canonical"))?;
+        if command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+            bail!("durable CommandDisposition command_seq exceeds the JSON-safe integer range");
+        }
+        Self::from_parts(
+            AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }),
+            DurableEventMetadata::default(),
         )
     }
 
@@ -662,6 +686,10 @@ impl DurableEvent {
                 run_id: self.metadata.run_id.as_deref(),
                 turn_id: self.metadata.turn_id.as_deref(),
                 ..empty("retry_scheduled")
+            },
+            AgentEvent::CommandDisposition(event) => DurableEventIdentity {
+                command_id: Some(&event.command_id),
+                ..empty("command_disposition")
             },
             AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
             AgentEvent::MessageUpdate { .. }
@@ -2941,6 +2969,7 @@ impl EventWriter {
         if !state.admission_open {
             return Err(EventWriterAdmissionClosed.into());
         }
+        let batch = materialize_command_dispositions(batch)?;
         // A cancelled caller can leave one Store-owned COMMIT finalizer. Its
         // shared outcome and the authenticated database/feed reconciliation
         // must settle before this mutation can derive N+1.
@@ -6018,6 +6047,116 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn rejection_disposition(reason: &CommandRejectReason) -> CommandDisposition {
+    let reject_reason = match reason {
+        CommandRejectReason::UnknownCommand => CommandDispositionRejectReason::UnknownCommand,
+        CommandRejectReason::SchemaViolation => CommandDispositionRejectReason::SchemaViolation,
+        CommandRejectReason::AttachmentsNotEmpty => {
+            CommandDispositionRejectReason::AttachmentsNotEmpty
+        }
+        CommandRejectReason::Oversized { .. } => CommandDispositionRejectReason::Oversized,
+    };
+    CommandDisposition::Rejected { reject_reason }
+}
+
+fn projection_command_disposition(
+    projection: &Projection,
+) -> Option<(&str, u64, CommandDisposition)> {
+    match projection {
+        Projection::CommandRejected {
+            seq,
+            command_id,
+            reason,
+            ..
+        } => Some((command_id, *seq, rejection_disposition(reason))),
+        Projection::CommandApplied {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Applied {})),
+        Projection::CommandSuperseded {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Superseded {})),
+        _ => None,
+    }
+}
+
+fn validate_command_disposition_pairs(batch: &EventBatch) -> Result<()> {
+    let mut events = HashMap::new();
+    let mut terminals = HashMap::new();
+    for write in &batch.writes {
+        if let Some(event) = &write.event
+            && let AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }) = &event.value
+            && events
+                .insert((command_id.clone(), *command_seq), disposition.clone())
+                .is_some()
+        {
+            bail!(
+                "duplicate command_disposition event for command {command_id} at sequence {command_seq}"
+            );
+        }
+        for projection in &write.projections {
+            if let Some((command_id, command_seq, disposition)) =
+                projection_command_disposition(projection)
+                && terminals
+                    .insert((command_id.to_owned(), command_seq), disposition)
+                    .is_some()
+            {
+                bail!(
+                    "duplicate terminal command projection for command {command_id} at sequence {command_seq}"
+                );
+            }
+        }
+    }
+    if events != terminals {
+        bail!("command_disposition events must exactly match terminal command projections");
+    }
+    Ok(())
+}
+
+fn materialize_command_dispositions(mut batch: EventBatch) -> Result<EventBatch> {
+    if batch.writes.iter().any(|write| {
+        write
+            .event
+            .as_ref()
+            .is_some_and(|event| matches!(event.value, AgentEvent::CommandDisposition(_)))
+    }) {
+        bail!("callers cannot supply command_disposition events");
+    }
+
+    let terminal_count = batch
+        .writes
+        .iter()
+        .flat_map(|write| &write.projections)
+        .filter(|projection| projection_command_disposition(projection).is_some())
+        .count();
+    let mut writes = Vec::with_capacity(batch.writes.len().saturating_add(terminal_count));
+    for write in batch.writes.drain(..) {
+        let dispositions = write
+            .projections
+            .iter()
+            .filter_map(projection_command_disposition)
+            .map(|(command_id, command_seq, disposition)| {
+                DurableEvent::command_disposition(command_id, command_seq, disposition)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writes.push(write);
+        writes.extend(dispositions.into_iter().map(|event| EventWrite {
+            event: Some(event),
+            projections: Vec::new(),
+        }));
+    }
+    batch.writes = writes;
+    validate_command_disposition_pairs(&batch)?;
+    Ok(batch)
+}
+
 #[cfg(test)]
 fn validate_batch_shape(
     _redactor: &Redactor,
@@ -6353,6 +6492,20 @@ fn validate_batch_shape_with_recovery(
                         || error_message.is_empty()
                     {
                         bail!("durable RetryScheduled identity and fields must be non-empty");
+                    }
+                }
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    command_id,
+                    command_seq,
+                    ..
+                }) => {
+                    CommandId::parse(command_id).map_err(|_| {
+                        anyhow!("durable CommandDisposition command_id is not canonical")
+                    })?;
+                    if *command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+                        bail!(
+                            "durable CommandDisposition command_seq exceeds the JSON-safe integer range"
+                        );
                     }
                 }
                 AgentEvent::MemoryMaintenance { kind } => {
@@ -8392,23 +8545,28 @@ fn prepared_injection_bytes(
             _ => false,
         });
         let related_event = write.event.as_ref().is_some_and(|event| {
-            event
-                .message_id
-                .as_deref()
-                .is_some_and(|message_id| message_ids.contains(message_id))
-                || event
-                    .command_id
+            // Terminal dispositions are synthesized after the original T12
+            // injection write-set is sized. The complete transaction bound
+            // above still includes them; exclude them only from the exact
+            // injection-sizer drift comparison.
+            event.kind != "command_disposition"
+                && (event
+                    .message_id
                     .as_deref()
-                    .is_some_and(|command_id| command_ids.contains(command_id))
-                || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
-                    && match event.kind.as_str() {
-                        "agent_start" => sizing.application == InjectionApplication::IdleRun,
-                        "turn_start" => {
-                            sizing.application != InjectionApplication::RetrySteer
-                                && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
-                        }
-                        _ => false,
-                    })
+                    .is_some_and(|message_id| message_ids.contains(message_id))
+                    || event
+                        .command_id
+                        .as_deref()
+                        .is_some_and(|command_id| command_ids.contains(command_id))
+                    || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
+                        && match event.kind.as_str() {
+                            "agent_start" => sizing.application == InjectionApplication::IdleRun,
+                            "turn_start" => {
+                                sizing.application != InjectionApplication::RetrySteer
+                                    && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
+                            }
+                            _ => false,
+                        }))
         });
         if !related_projection && !related_event {
             continue;
@@ -14360,7 +14518,7 @@ mod tests {
             })
             .await
             .expect("commit calibration assistant terminal");
-        assert_eq!(seqs.len(), 3);
+        assert_eq!(seqs.len(), 4);
         (
             seqs[0],
             ratio_bits.expect("calibration terminal must return exact committed bits"),
@@ -15498,9 +15656,9 @@ mod tests {
                 .expect("count committed messages after reapply");
             let (expected_events, expected_messages) =
                 if application_kind == ApplicationKind::SoftSteer {
-                    (11, 3)
+                    (12, 3)
                 } else {
-                    (10, 3)
+                    (11, 3)
                 };
             assert_eq!(
                 (events, messages),
@@ -18319,6 +18477,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_command_dispositions_are_public_exact_and_replay_safe() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let rejected = InboundCommand::Invalid {
+            seq: 1,
+            command_id: CommandId::parse("00000000-0000-4000-8000-000000000101")
+                .expect("canonical rejected command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                br#"{"type":"abort",}"#.to_vec(),
+            )),
+            payload_digest: None,
+        };
+        let rejected_ack = writer
+            .persist_inbound(&rejected)
+            .await
+            .expect("persist rejected command");
+        assert_eq!(rejected_ack.status, CommandAckStatus::Rejected);
+
+        let envelope: String = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events WHERE event_type='command_disposition'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load rejected disposition");
+        let envelope: Value = serde_json::from_str(&envelope).expect("public disposition JSON");
+        assert_eq!(
+            envelope,
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000101",
+                "command_seq": 1,
+                "status": "rejected",
+                "reject_reason": "schema_violation"
+            }),
+            "public disposition must not expose provenance, personality-agent identity, or command body"
+        );
+
+        assert_eq!(
+            writer
+                .persist_inbound(&rejected)
+                .await
+                .expect("replay rejected command"),
+            rejected_ack
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count replay-safe dispositions"),
+            1,
+            "terminal ACK replay must not append another disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_abort_cutoff_materializes_superseded_and_applied_dispositions_once() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let first = user_command(
+            1,
+            "00000000-0000-4000-8000-000000000111",
+            "first pending user",
+        );
+        let second = user_command(
+            2,
+            "00000000-0000-4000-8000-000000000112",
+            "second pending user",
+        );
+        let abort = abort_command(3, "00000000-0000-4000-8000-000000000113");
+        for command in [&first, &second, &abort] {
+            writer
+                .persist_inbound(command)
+                .await
+                .expect("persist cutoff command");
+        }
+
+        let acks = writer
+            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000113", 3)
+            .await
+            .expect("apply idle Abort cutoff");
+        assert_eq!(
+            acks.iter().map(|ack| ack.status).collect::<Vec<_>>(),
+            vec![
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Applied,
+            ]
+        );
+
+        let envelopes: Vec<String> = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events
+             WHERE event_type='command_disposition' ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load cutoff dispositions");
+        let envelopes = envelopes
+            .iter()
+            .map(|envelope| serde_json::from_str::<Value>(envelope).expect("disposition JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            envelopes,
+            vec![
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000111",
+                    "command_seq": 1,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000112",
+                    "command_seq": 2,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000113",
+                    "command_seq": 3,
+                    "status": "applied"
+                }),
+            ]
+        );
+
+        for (command, status) in [
+            (&first, CommandAckStatus::Superseded),
+            (&second, CommandAckStatus::Superseded),
+            (&abort, CommandAckStatus::Applied),
+        ] {
+            assert_eq!(
+                writer
+                    .persist_inbound(command)
+                    .await
+                    .expect("replay terminal command")
+                    .status,
+                status
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count cutoff dispositions after replay"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_and_disposition_roll_back_together() {
+        let applied_store = test_store().await;
+        let applied_writer = EventWriter::new(applied_store.clone());
+        let abort_id = "00000000-0000-4000-8000-000000000121";
+        applied_writer
+            .persist_inbound(&abort_command(1, abort_id))
+            .await
+            .expect("persist Abort target");
+        let error = applied_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: abort_id.to_owned(),
+                            command_seq: 1,
+                            run_id: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between terminal projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(abort_id)
+            .fetch_one(applied_store.pool())
+            .await
+            .expect("load rolled-back Abort"),
+            "received"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(applied_store.pool())
+                .await
+                .expect("count rolled-back applied disposition"),
+            0
+        );
+
+        let rejected_store = test_store().await;
+        let rejected_writer = EventWriter::new(rejected_store.clone());
+        let rejected_id = "00000000-0000-4000-8000-000000000122";
+        let error = rejected_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandRejected {
+                            seq: 1,
+                            command_id: rejected_id.to_owned(),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
+                            reason: CommandRejectReason::SchemaViolation,
+                            raw_command: RejectedCommandPayload::Present(
+                                SensitiveCommandPayload::new(br#"{"type":"abort",}"#.to_vec()),
+                            ),
+                            payload_digest: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between rejected projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected command"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected disposition"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_null_and_missing_payloads_are_distinct_in_both_replay_directions() {
         for (first, replay) in [
             (
@@ -18546,8 +18947,8 @@ mod tests {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
                 .fetch_one(store.pool())
                 .await
-                .expect("no unstarted close events"),
-            0
+                .expect("terminal dispositions for unstarted startup and Abort"),
+            2
         );
         drop(writer);
         store.pool().close().await;
@@ -25223,7 +25624,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("startup Abort state");
-                state == (1, 1, 0)
+                state == (1, 1, 2)
             }
             "approval_pending" => {
                 let state: (i64, i64, i64) = sqlx::query_as(
@@ -25253,7 +25654,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("approval resolved state");
-                state == (1, 1, 1, 3)
+                state == (1, 1, 1, 4)
             }
             "tool_prepared" => {
                 sqlx::query_scalar::<_, i64>(
@@ -26090,8 +26491,10 @@ mod tests {
             })
             .await
             .expect("persist projected provider terminal");
-        let [terminal_message_end_seq, _, _] = terminal_sequences.as_slice() else {
-            panic!("terminal batch must persist MessageEnd, TurnEnd, and AgentEnd");
+        let [terminal_message_end_seq, _, _, _] = terminal_sequences.as_slice() else {
+            panic!(
+                "terminal batch must persist MessageEnd, TurnEnd, AgentEnd, and command disposition"
+            );
         };
         let terminal_message_end_seq = i64::try_from(*terminal_message_end_seq)
             .expect("terminal MessageEnd sequence fits SQLite INTEGER");
@@ -29090,7 +29493,7 @@ mod tests {
                 .await
                 .expect("reopen after T17 hard kill")
                 .into();
-            const SETUP_EVENTS: i64 = 3;
+            const SETUP_EVENTS: i64 = 4;
             const RECOVERY_EVENTS: i64 = 3;
 
             let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")

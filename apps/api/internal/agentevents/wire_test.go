@@ -131,6 +131,32 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidateCommandDispositionTerminalRules(t *testing.T) {
+	valid := []string{
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"applied"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000002","command_seq":2,"status":"superseded"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000003","command_seq":3,"status":"rejected","reject_reason":"oversized"}`,
+	}
+	for _, raw := range valid {
+		if err := validateEvent([]byte(raw)); err != nil {
+			t.Fatalf("valid command disposition rejected: %s: %v", raw, err)
+		}
+	}
+
+	invalid := []string{
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"received"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"rejected"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"applied","reject_reason":"oversized"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":9007199254740992,"status":"applied"}`,
+		`{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"rejected","reject_reason":"unavailable"}`,
+	}
+	for _, raw := range invalid {
+		if err := validateEvent([]byte(raw)); err == nil {
+			t.Fatalf("invalid command disposition accepted: %s", raw)
+		}
+	}
+}
+
 func roundTripJSON(t *testing.T, name string, original []byte, v any) {
 	t.Helper()
 	normalizedOriginal := normalizeJSON(t, original)
