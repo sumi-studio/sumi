@@ -22,6 +22,45 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type dispositionBeforeAppendReturn struct {
+	gateway *DurableGateway
+	claims  TokenClaims
+}
+
+func (a dispositionBeforeAppendReturn) Append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, error) {
+	envelope, err := a.gateway.Append(ctx, provenance, idempotencyKey, command)
+	if err != nil {
+		return CommandEnvelope{}, err
+	}
+	seq := uint64(1)
+	disposition, err := json.Marshal(map[string]any{
+		"type":        "command_disposition",
+		"command_id":  envelope.CommandID,
+		"command_seq": envelope.Seq,
+		"status":      "applied",
+	})
+	if err != nil {
+		return CommandEnvelope{}, err
+	}
+	if err := a.gateway.Receive(ctx, a.claims, Envelope{
+		Seq:                &seq,
+		PersonalityAgentID: envelope.PersonalityAgentID,
+		Event:              disposition,
+	}); err != nil {
+		return CommandEnvelope{}, err
+	}
+	// Give the event pump time to reach its serialized socket write. The
+	// receipt transaction must still keep this newly-created disposition from
+	// overtaking command_accepted on the same connection.
+	time.Sleep(25 * time.Millisecond)
+	return envelope, nil
+}
+
 func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
@@ -131,6 +170,241 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 	if accepted.Type != "command_accepted" || accepted.IdempotencyKey != "after-conflict" {
 		t.Fatalf("socket did not continue after conflict: %+v", accepted)
+	}
+}
+
+func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	gateway.PollInterval = time.Millisecond
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	const generation = uint64(7)
+	receipt := "hydrated-racing-disposition"
+	if err := gateway.PublishRuntimeState(personalityAgentID, generation, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	agentClaims := TokenClaims{
+		TenantID:           "tenant-1",
+		PersonalityAgentID: personalityAgentID,
+		Generation:         generation,
+	}
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(
+		sessions,
+		dispositionBeforeAppendReturn{gateway: gateway, claims: agentClaims},
+		gateway,
+	)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	sessionClaims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	conn := dialBrowserWS(
+		t,
+		httpServer,
+		signBrowserSession(t, testSecret, sessionClaims),
+		personalityAgentID,
+	)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "racing-disposition",
+		Command:        json.RawMessage(`{"type":"user_message","text":"race","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var accepted browserCommandAcceptedFrame
+	if err := conn.ReadJSON(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Type != "command_accepted" {
+		t.Fatalf("racing terminal disposition overtook admission: %+v", accepted)
+	}
+	assertBrowserEvent(t, conn, "command_disposition", true)
+}
+
+func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfterRestart(t *testing.T) {
+	for _, status := range []string{"applied", "superseded", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			tmp := t.TempDir()
+			storeDir := filepath.Join(tmp, "commands")
+			runtimeDir := filepath.Join(tmp, "runtime")
+			store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+			const generation = uint64(7)
+			receipt := "hydrated-authoritative-disposition"
+			if err := gateway.PublishRuntimeState(personalityAgentID, generation, &receipt); err != nil {
+				t.Fatal(err)
+			}
+			claims := TokenClaims{
+				TenantID:           "tenant-1",
+				PersonalityAgentID: personalityAgentID,
+				Generation:         generation,
+			}
+			provenance := testDirectChatProvenance(personalityAgentID)
+			originalBody := json.RawMessage(`{"type":"user_message","text":"original","attachments":[]}`)
+			original, err := gateway.Append(context.Background(), provenance, "lost-receipt-key", originalBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unrelated := make([]CommandEnvelope, 0, 33)
+			for index := 0; index < 33; index++ {
+				body := json.RawMessage(fmt.Sprintf(
+					`{"type":"user_message","text":"unrelated-%d","attachments":[]}`,
+					index,
+				))
+				command, err := gateway.Append(
+					context.Background(),
+					provenance,
+					fmt.Sprintf("unrelated-key-%d", index),
+					body,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				unrelated = append(unrelated, command)
+			}
+
+			eventSeq := uint64(1)
+			originalDisposition := map[string]any{
+				"type":        "command_disposition",
+				"command_id":  original.CommandID,
+				"command_seq": original.Seq,
+				"status":      status,
+			}
+			if status == "rejected" {
+				originalDisposition["reject_reason"] = "not_allowed"
+			}
+			rawDisposition, err := json.Marshal(originalDisposition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gateway.Receive(context.Background(), claims, Envelope{
+				Seq:                &eventSeq,
+				PersonalityAgentID: personalityAgentID,
+				Event:              rawDisposition,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, command := range unrelated {
+				eventSeq++
+				raw, err := json.Marshal(map[string]any{
+					"type":        "command_disposition",
+					"command_id":  command.CommandID,
+					"command_seq": command.Seq,
+					"status":      "applied",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := gateway.Receive(context.Background(), claims, Envelope{
+					Seq:                &eventSeq,
+					PersonalityAgentID: personalityAgentID,
+					Event:              raw,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if eventSeq <= 32 {
+				t.Fatalf("counterexample requires more than 32 later dispositions, got event tail %d", eventSeq)
+			}
+
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := gateway.runtimeDir.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, gateway, err = openGatewayAt(t, storeDir, runtimeDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			defer gateway.runtimeDir.Close()
+
+			sessions, err := NewHMACUserSessionVerifier(testSecret, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := NewBrowserServer(sessions, gateway, gateway)
+			server.AllowedOrigins = []string{"https://web.example"}
+			mux := http.NewServeMux()
+			mux.Handle("GET /direct-chat/ws", server)
+			httpServer := httptest.NewServer(mux)
+			defer httpServer.Close()
+
+			sessionClaims := userSessionWireClaims{
+				TenantID:           "tenant-1",
+				UserID:             "user-1",
+				PersonalityAgentID: personalityAgentID,
+				Exp:                time.Now().Add(time.Hour).Unix(),
+				Aud:                defaultBrowserAudience,
+			}
+			conn := dialBrowserWS(
+				t,
+				httpServer,
+				signBrowserSession(t, testSecret, sessionClaims),
+				personalityAgentID,
+			)
+			defer conn.Close()
+			if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: eventSeq}); err != nil {
+				t.Fatal(err)
+			}
+			assertDirectChatStatus(t, conn, "ready")
+
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := conn.WriteJSON(browserCommandFrame{
+					Type:           "command",
+					IdempotencyKey: "lost-receipt-key",
+					Command:        originalBody,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				var accepted browserCommandAcceptedFrame
+				if err := conn.ReadJSON(&accepted); err != nil {
+					t.Fatal(err)
+				}
+				if accepted.CommandID != original.CommandID ||
+					accepted.Seq != original.Seq ||
+					string(accepted.Disposition) != string(rawDisposition) {
+					t.Fatalf("idempotent acceptance lost authoritative disposition: %+v", accepted)
+				}
+			}
+
+			if err := conn.WriteJSON(browserCommandFrame{
+				Type:           "command",
+				IdempotencyKey: "no-terminal-key",
+				Command:        json.RawMessage(`{"type":"user_message","text":"no terminal","attachments":[]}`),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var admitted browserCommandAcceptedFrame
+			if err := conn.ReadJSON(&admitted); err != nil {
+				t.Fatal(err)
+			}
+			if len(admitted.Disposition) != 0 {
+				t.Fatalf("new admission unexpectedly carried disposition: %s", admitted.Disposition)
+			}
+		})
 	}
 }
 
@@ -996,6 +1270,31 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 			target: func() any { return &browserCommandAcceptedFrame{} },
 		},
 		{
+			name:   "accepted disposition command mismatch",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000002","command_seq":1,"status":"applied"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition sequence mismatch",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":2,"status":"applied"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition is nonterminal",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"received"}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition is null",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":null}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
+			name:   "accepted disposition has unknown field",
+			raw:    `{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":"applied","extra":true}}`,
+			target: func() any { return &browserCommandAcceptedFrame{} },
+		},
+		{
 			name:   "rejected missing correlation key",
 			raw:    `{"type":"command_rejected","reject_reason":"schema_violation"}`,
 			target: func() any { return &browserCommandRejectedFrame{} },
@@ -1040,5 +1339,20 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 		&unavailable,
 	); err != nil {
 		t.Fatalf("valid unavailable status rejected: %v", err)
+	}
+	for _, status := range []string{"applied", "superseded", "rejected"} {
+		rejectReason := ""
+		if status == "rejected" {
+			rejectReason = `,"reject_reason":"not_allowed"`
+		}
+		raw := fmt.Sprintf(
+			`{"type":"command_accepted","idempotency_key":"key","command_id":"00000000-0000-4000-8000-000000000001","seq":1,"disposition":{"type":"command_disposition","command_id":"00000000-0000-4000-8000-000000000001","command_seq":1,"status":%q%s}}`,
+			status,
+			rejectReason,
+		)
+		var accepted browserCommandAcceptedFrame
+		if err := json.Unmarshal([]byte(raw), &accepted); err != nil {
+			t.Fatalf("valid %s accepted disposition rejected: %v", status, err)
+		}
 	}
 }

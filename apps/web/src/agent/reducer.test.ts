@@ -9,12 +9,7 @@ import type {
   PublicMessage,
 } from "@sumi/api-client";
 import { projectConversation } from "./projection";
-import {
-  commandDispositionKey,
-  createAgentSession,
-  MaxCommandDispositionCacheEntries,
-  reduceEnvelope,
-} from "./reducer";
+import { createAgentSession, reduceEnvelope } from "./reducer";
 
 const id = () => "deterministic";
 
@@ -443,13 +438,10 @@ test("durable command disposition advances the cursor without entering conversat
   assert.equal(session.lastDurableSeq, 30);
   assert.deepEqual(session.conversation.entryOrder, []);
   assert.deepEqual(session.conversation.runOrder, []);
-  assert.deepEqual(
-    session.commandDispositions[commandDispositionKey(CommandId, 9)],
-    envelope.event,
-  );
+  assert.equal("commandDispositions" in session, false);
 });
 
-test("command dispositions remain a bounded out-of-order correlation cache", () => {
+test("lifetime command dispositions retain no reducer correlation history", () => {
   let session = createAgentSession();
   for (let sequence = 1; sequence <= 10_000; sequence++) {
     session = apply(session, {
@@ -463,19 +455,8 @@ test("command dispositions remain a bounded out-of-order correlation cache", () 
     });
   }
 
-  assert.equal(
-    Object.keys(session.commandDispositions).length,
-    MaxCommandDispositionCacheEntries,
-  );
-  assert.equal(
-    session.commandDispositions[commandDispositionKey(CommandId, 1)],
-    undefined,
-  );
-  assert.equal(
-    session.commandDispositions[commandDispositionKey(CommandId, 10_000)]
-      ?.status,
-    "applied",
-  );
+  assert.equal("commandDispositions" in session, false);
+  assert.equal(session.lastDurableSeq, 10_000);
   assert.deepEqual(session.conversation.entryOrder, []);
   assert.deepEqual(session.conversation.runOrder, []);
 });

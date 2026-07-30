@@ -612,6 +612,22 @@
       "seq": 1
     }
   },
+  "browser_command_accepted_with_disposition": {
+    "kind": "browser_command_accepted",
+    "wire": {
+      "type": "command_accepted",
+      "idempotency_key": "00000000-0000-4000-8000-000000000002",
+      "command_id": "00000000-0000-4000-8000-000000000002",
+      "seq": 2,
+      "disposition": {
+        "type": "command_disposition",
+        "command_id": "00000000-0000-4000-8000-000000000002",
+        "command_seq": 2,
+        "status": "rejected",
+        "reject_reason": "not_allowed"
+      }
+    }
+  },
   "browser_command_rejected": {
     "kind": "browser_command_rejected",
     "wire": {

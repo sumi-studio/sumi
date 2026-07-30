@@ -41,6 +41,15 @@ type browserConnection struct {
 	conn      *websocket.Conn
 }
 
+type idempotencyAwareCommandAppender interface {
+	AppendWithIdempotencyStatus(
+		ctx context.Context,
+		provenance DirectChatProvenance,
+		idempotencyKey string,
+		command json.RawMessage,
+	) (CommandEnvelope, bool, error)
+}
+
 // BrowserConnectionStats is a point-in-time view of the browser WebSocket
 // lifecycle. Accepted is monotonic for the lifetime of this server instance,
 // which lets shutdown and reconnect checks distinguish a new connection from
@@ -67,10 +76,11 @@ type browserEventFrame struct {
 }
 
 type browserCommandAcceptedFrame struct {
-	Type           string `json:"type"`
-	IdempotencyKey string `json:"idempotency_key"`
-	CommandID      string `json:"command_id"`
-	Seq            uint64 `json:"seq"`
+	Type           string          `json:"type"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	CommandID      string          `json:"command_id"`
+	Seq            uint64          `json:"seq"`
+	Disposition    json.RawMessage `json:"disposition,omitempty"`
 }
 
 type browserCommandRejectedFrame struct {
@@ -174,6 +184,24 @@ func (f *browserCommandAcceptedFrame) UnmarshalJSON(data []byte) error {
 		!canonicalUUIDRegexp.MatchString(value.CommandID) ||
 		value.Seq > maxJSONSafeInteger {
 		return errors.New("invalid browser command accepted frame")
+	}
+	if len(value.Disposition) != 0 {
+		if err := validateEvent(value.Disposition); err != nil {
+			return fmt.Errorf("browser command accepted disposition: %w", err)
+		}
+		if eventType(value.Disposition) != "command_disposition" {
+			return errors.New("browser command accepted disposition must be command_disposition")
+		}
+		var correlation struct {
+			CommandID  string `json:"command_id"`
+			CommandSeq uint64 `json:"command_seq"`
+		}
+		if err := json.Unmarshal(value.Disposition, &correlation); err != nil {
+			return fmt.Errorf("decode browser command accepted disposition correlation: %w", err)
+		}
+		if correlation.CommandID != value.CommandID || correlation.CommandSeq != value.Seq {
+			return errors.New("browser command accepted disposition correlation mismatch")
+		}
 	}
 	*f = value
 	return nil
@@ -486,9 +514,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.PersonalityAgentID)
 	defer unsubscribe()
 	var writeMu sync.Mutex
-	write := func(frame any) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
+	writeUnlocked := func(frame any) error {
 		if s.beforeWrite != nil {
 			s.beforeWrite()
 		}
@@ -503,6 +529,16 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 			return err
 		}
 		return conn.WriteJSON(frame)
+	}
+	withExclusiveWrite := func(operation func(func(any) error) error) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return operation(writeUnlocked)
+	}
+	write := func(frame any) error {
+		return withExclusiveWrite(func(write func(any) error) error {
+			return write(frame)
+		})
 	}
 	// Subscribe before replay so volatile traffic produced during catch-up stays
 	// queued, then validate and emit the complete durable suffix synchronously.
@@ -540,7 +576,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 	}()
 
-	readErr := s.browserReadPump(ctx, conn, claims, write)
+	readErr := s.browserReadPump(ctx, conn, claims, write, withExclusiveWrite)
 	cancel()
 	writerResult := <-writerErr
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
@@ -629,7 +665,13 @@ func (s *BrowserServer) browserDurableCatchUp(
 	return next, nil
 }
 
-func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, write func(any) error) error {
+func (s *BrowserServer) browserReadPump(
+	ctx context.Context,
+	conn *websocket.Conn,
+	claims UserSessionClaims,
+	write func(any) error,
+	withExclusiveWrite func(func(func(any) error) error) error,
+) error {
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -665,15 +707,60 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 			continue
 		}
 		var envelope CommandEnvelope
+		existingAcceptance := false
 		operationCalled := false
 		operationContext, cancelOperation := browserSessionOperationContext(ctx, claims)
-		err = s.Sessions.AuthorizeSession(ctx, claims, func() error {
-			operationCalled = true
-			var appendErr error
-			envelope, appendErr = s.Appender.Append(operationContext, directChatProvenance(claims), frame.IdempotencyKey, frame.Command)
-			return appendErr
+		var admissionErr error
+		writeErr := withExclusiveWrite(func(writeUnlocked func(any) error) error {
+			admissionErr = s.Sessions.AuthorizeSession(ctx, claims, func() error {
+				operationCalled = true
+				var appendErr error
+				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
+					envelope, existingAcceptance, appendErr = appender.AppendWithIdempotencyStatus(
+						operationContext,
+						directChatProvenance(claims),
+						frame.IdempotencyKey,
+						frame.Command,
+					)
+				} else {
+					envelope, appendErr = s.Appender.Append(
+						operationContext,
+						directChatProvenance(claims),
+						frame.IdempotencyKey,
+						frame.Command,
+					)
+				}
+				return appendErr
+			})
+			if admissionErr != nil {
+				return nil
+			}
+			var disposition json.RawMessage
+			found := false
+			if existingAcceptance {
+				var lookupErr error
+				disposition, found, lookupErr = s.Events.CommandDispositionFor(operationContext, envelope)
+				if lookupErr != nil {
+					admissionErr = fmt.Errorf("lookup browser command disposition: %w", lookupErr)
+					return nil
+				}
+			}
+			accepted := browserCommandAcceptedFrame{
+				Type:           "command_accepted",
+				IdempotencyKey: frame.IdempotencyKey,
+				CommandID:      envelope.CommandID,
+				Seq:            envelope.Seq,
+			}
+			if found {
+				accepted.Disposition = disposition
+			}
+			return writeUnlocked(accepted)
 		})
 		cancelOperation()
+		if writeErr != nil {
+			return writeErr
+		}
+		err = admissionErr
 		if err != nil {
 			if !operationCalled {
 				return errors.New("browser session authority ended")
@@ -699,14 +786,6 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 				continue
 			}
 			return fmt.Errorf("append browser command: %w", err)
-		}
-		if err := write(browserCommandAcceptedFrame{
-			Type:           "command_accepted",
-			IdempotencyKey: frame.IdempotencyKey,
-			CommandID:      envelope.CommandID,
-			Seq:            envelope.Seq,
-		}); err != nil {
-			return err
 		}
 	}
 }

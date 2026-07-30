@@ -502,6 +502,38 @@ const counterexamples = [
     },
   },
   {
+    name: "browser acceptance rejects a nonterminal disposition",
+    def: "BrowserCommandAcceptedFrame",
+    value: {
+      type: "command_accepted",
+      idempotency_key: "key-1",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      seq: 1,
+      disposition: {
+        type: "command_disposition",
+        command_id: "00000000-0000-4000-8000-000000000001",
+        command_seq: 1,
+        status: "received",
+      },
+    },
+  },
+  {
+    name: "browser acceptance rejects rejected disposition without reason",
+    def: "BrowserCommandAcceptedFrame",
+    value: {
+      type: "command_accepted",
+      idempotency_key: "key-1",
+      command_id: "00000000-0000-4000-8000-000000000001",
+      seq: 1,
+      disposition: {
+        type: "command_disposition",
+        command_id: "00000000-0000-4000-8000-000000000001",
+        command_seq: 1,
+        status: "rejected",
+      },
+    },
+  },
+  {
     name: "browser rejection requires its idempotency key",
     def: "BrowserCommandRejectedFrame",
     value: { type: "command_rejected", reject_reason: "idempotency_conflict" },

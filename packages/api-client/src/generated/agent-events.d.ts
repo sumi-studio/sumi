@@ -779,6 +779,30 @@ export interface BrowserCommandAcceptedFrame {
   idempotency_key: string;
   command_id: string;
   seq: JsonSafeInteger;
+  /**
+   * Exact durable terminal disposition for this command when already committed at idempotent acceptance time. Its command_id and command_seq must equal this receipt's command_id and seq.
+   *
+   */
+  disposition?:
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "applied";
+      }
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "superseded";
+      }
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "rejected";
+        reject_reason: CommandRejectReason;
+      };
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

@@ -3,7 +3,6 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   BrowserEventEnvelope,
-  CommandDispositionEvent,
   PublicAssistantMessage,
   PublicMessage,
   PublicStreamEvent,
@@ -35,20 +34,11 @@ export interface AgentSession {
   toolRunIds: Record<string, string>;
   approvalRunIds: Record<string, string>;
   messageStreams: Record<string, MessageStream>;
-  /**
-   * Durable command terminal metadata used to reconcile private browser
-   * outbox rows. It is intentionally outside ConversationModel.
-   */
-  commandDispositions: Record<string, CommandDispositionEvent>;
 }
 
 export interface ReducerContext {
   id: () => string;
 }
-
-// Dispositions are only an out-of-order correlation cache for the bounded
-// private outbox, not part of the rendered or canonical life log.
-export const MaxCommandDispositionCacheEntries = 32;
 
 export type ReduceEnvelopeResult =
   | { kind: "applied"; session: AgentSession }
@@ -68,7 +58,6 @@ export function createAgentSession(
     toolRunIds: {},
     approvalRunIds: {},
     messageStreams: {},
-    commandDispositions: {},
   };
 }
 
@@ -209,13 +198,6 @@ export function reduceEnvelope(
       break;
     }
     case "command_disposition":
-      session = {
-        ...session,
-        commandDispositions: rememberCommandDisposition(
-          session.commandDispositions,
-          event,
-        ),
-      };
       break;
     case "turn_start":
     case "turn_end":
@@ -224,25 +206,6 @@ export function reduceEnvelope(
   }
 
   return { kind: "applied", session };
-}
-
-export function commandDispositionKey(
-  commandId: string,
-  commandSeq: number,
-): string {
-  return `${commandId}:${commandSeq}`;
-}
-
-function rememberCommandDisposition(
-  current: Record<string, CommandDispositionEvent>,
-  event: CommandDispositionEvent,
-): Record<string, CommandDispositionEvent> {
-  const key = commandDispositionKey(event.command_id, event.command_seq);
-  const next = { ...current, [key]: event };
-  const keys = Object.keys(next);
-  if (keys.length <= MaxCommandDispositionCacheEntries) return next;
-  const { [keys[0]]: _oldest, ...bounded } = next;
-  return bounded;
 }
 
 function applyMessage(

@@ -867,6 +867,12 @@ $defs:
         format: uuid
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
       seq: { $ref: '#/$defs/JsonSafeInteger' }
+      disposition:
+        description: >
+          Exact durable terminal disposition for this command when already
+          committed at idempotent acceptance time. Its command_id and
+          command_seq must equal this receipt's command_id and seq.
+        $ref: '#/$defs/CommandDispositionEvent'
 
   BrowserCommandRejectedFrame:
     type: object

@@ -35,7 +35,13 @@ test.after(() => {
   Object.defineProperty(globalThis, "location", { configurable: true, value: originalLocation });
 });
 
-const accepted = (key) => ({ type: "command_accepted", idempotency_key: key, command_id: "00000000-0000-4000-8000-000000000001", seq: 1 });
+const accepted = (key, disposition) => ({
+  type: "command_accepted",
+  idempotency_key: key,
+  command_id: "00000000-0000-4000-8000-000000000001",
+  seq: 1,
+  ...(disposition ? { disposition } : {}),
+});
 const event = (seq, value) => ({ type: "event", envelope: { seq, event: value } });
 const timestamp = "2026-07-28T00:00:00Z";
 const usage = { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: 0 };
@@ -269,6 +275,58 @@ test("accepts only exact durable command disposition shapes", () => {
     command_seq: 7,
     status: "applied",
   }), 0), undefined);
+});
+
+test("acceptance permits only an exactly correlated terminal disposition", () => {
+  const command_id = "00000000-0000-4000-8000-000000000001";
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 1, status: "applied" },
+    { type: "command_disposition", command_id, command_seq: 1, status: "superseded" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "rejected",
+      reject_reason: "not_allowed",
+    },
+  ]) {
+    assert.equal(
+      parseDirectChatServerFrame(accepted("key", disposition), 0)?.type,
+      "command_accepted",
+    );
+  }
+
+  for (const disposition of [
+    { type: "command_disposition", command_id, command_seq: 2, status: "applied" },
+    {
+      type: "command_disposition",
+      command_id: "00000000-0000-4000-8000-000000000002",
+      command_seq: 1,
+      status: "applied",
+    },
+    { type: "command_disposition", command_id, command_seq: 1, status: "received" },
+    { type: "command_disposition", command_id, command_seq: 1, status: "rejected" },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "applied",
+      reject_reason: "not_allowed",
+    },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 1,
+      status: "applied",
+      extra: true,
+    },
+  ]) {
+    assert.equal(parseDirectChatServerFrame(accepted("key", disposition), 0), undefined);
+  }
+  assert.equal(
+    parseDirectChatServerFrame({ ...accepted("key"), disposition: null }, 0),
+    undefined,
+  );
 });
 
 test("durable disposition advances the socket replay cursor", () => {

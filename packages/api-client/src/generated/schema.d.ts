@@ -598,6 +598,8 @@ export interface components {
             /** Format: uuid */
             command_id: string;
             seq: components["schemas"]["JsonSafeInteger"];
+            /** @description Exact durable terminal disposition for this command when already committed at idempotent acceptance time. Its command_id and command_seq must equal this receipt's command_id and seq. */
+            disposition?: components["schemas"]["CommandDispositionEvent"];
         };
         BrowserCommandRejectedFrame: {
             /** @constant */

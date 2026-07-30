@@ -2,7 +2,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ApprovalRequest, BrowserEventEnvelope } from "@sumi/api-client";
+import type {
+  ApprovalRequest,
+  BrowserEventEnvelope,
+  CommandDispositionEvent,
+} from "@sumi/api-client";
 import type {
   DirectChatConnectionState,
   DirectChatReadyState,
@@ -140,7 +144,7 @@ test("authority reset disposes conversation and private delivery state", () => {
   assert.equal(transport.sent.length, sentBeforeReconnect);
 });
 
-test("disposition before admission is reconciled when the receipt arrives", () => {
+test("replayed disposition before admission is reconciled by its authoritative receipt", () => {
   for (const status of ["applied", "superseded", "rejected"] as const) {
     const transport = new FakeTransport();
     const store = createConversationStore({
@@ -163,7 +167,17 @@ test("disposition before admission is reconciled when the receipt arrives", () =
       store.getState().conversation.entries[`optimistic:idem-${status}`]?.kind,
       "user",
     );
-    transport.emit(accepted(`idem-${status}`, CommandId, 7));
+    transport.emit(
+      accepted(`idem-${status}`, CommandId, 7, {
+        type: "command_disposition",
+        command_id: CommandId,
+        command_seq: 7,
+        status,
+        ...(status === "rejected"
+          ? { reject_reason: "not_allowed" as const }
+          : {}),
+      } as CommandDispositionEvent),
+    );
 
     const optimistic =
       store.getState().conversation.entries[`optimistic:idem-${status}`];
@@ -247,12 +261,25 @@ test("all applied receipt, disposition, and canonical permutations converge", ()
     store.getState().connect();
     assert.equal(store.getState().sendMessage(`text-${index}`), true);
     let eventSeq = 0;
+    let dispositionSeen = false;
+    const terminalDisposition: CommandDispositionEvent = {
+      type: "command_disposition",
+      command_id: CommandId,
+      command_seq: 11,
+      status: "applied",
+    };
     for (const step of permutation) {
       if (step === "receipt") {
-        const frame = accepted(key, CommandId, 11);
+        const frame = accepted(
+          key,
+          CommandId,
+          11,
+          dispositionSeen ? terminalDisposition : undefined,
+        );
         transport.emit(frame);
         transport.emit(frame);
       } else if (step === "disposition") {
+        dispositionSeen = true;
         const frame = disposition(++eventSeq, CommandId, 11, "applied");
         transport.emit(frame);
         transport.emit(frame);
@@ -277,6 +304,65 @@ test("all applied receipt, disposition, and canonical permutations converge", ()
     }
     assert.deepEqual(outbox.entries(), []);
     assert.deepEqual(store.getState().recoverableDrafts, []);
+  }
+});
+
+test("lost receipt after more than 32 unrelated dispositions reconciles authoritatively", () => {
+  for (const status of ["applied", "superseded", "rejected"] as const) {
+    const key = `lost-receipt-${status}`;
+    const transport = new FakeTransport();
+    const outbox = new PrivateOutbox();
+    const store = createConversationStore({
+      transport,
+      outbox,
+      idempotencyKey: () => key,
+    });
+    store.getState().connect();
+    assert.equal(store.getState().sendMessage(`lost-${status}`), true);
+
+    const terminal: CommandDispositionEvent = {
+      type: "command_disposition",
+      command_id: CommandId,
+      command_seq: 17,
+      status,
+      ...(status === "rejected"
+        ? { reject_reason: "not_allowed" as const }
+        : {}),
+    } as CommandDispositionEvent;
+    transport.emit({
+      type: "event",
+      envelope: { seq: 1, event: terminal },
+    });
+    for (let index = 0; index < 33; index++) {
+      const unrelatedCommandId = `00000000-0000-4000-8000-${(index + 2)
+        .toString(16)
+        .padStart(12, "0")}`;
+      transport.emit(
+        disposition(index + 2, unrelatedCommandId, index + 100, "applied"),
+      );
+    }
+
+    transport.emit(accepted(key, CommandId, 17, terminal));
+
+    const optimistic =
+      store.getState().conversation.entries[`optimistic:${key}`];
+    if (status === "applied") {
+      assert.equal(optimistic?.kind, "user");
+      if (optimistic?.kind === "user") {
+        assert.equal(optimistic.delivery, "admitted");
+      }
+      assert.deepEqual(store.getState().recoverableDrafts, []);
+    } else {
+      assert.equal(optimistic, undefined);
+      assert.deepEqual(store.getState().recoverableDrafts, [
+        {
+          idempotencyKey: key,
+          text: `lost-${status}`,
+          reason: status === "superseded" ? "superseded" : "not_allowed",
+          commandId: CommandId,
+        },
+      ]);
+    }
   }
 });
 
@@ -589,12 +675,14 @@ function accepted(
   idempotencyKey: string,
   commandId: string,
   commandSeq: number,
+  disposition?: CommandDispositionEvent,
 ): DirectChatServerFrame {
   return {
     type: "command_accepted",
     idempotency_key: idempotencyKey,
     command_id: commandId,
     seq: commandSeq,
+    ...(disposition ? { disposition } : {}),
   };
 }
 

@@ -15,7 +15,6 @@ import type {
 import { PrivateOutbox } from "./private-outbox";
 import {
   type AgentSession,
-  commandDispositionKey,
   createAgentSession,
   reduceEnvelope,
   removeEntry,
@@ -236,12 +235,8 @@ export function createConversationStore({
             publish(null);
             return;
           }
-          const disposition =
-            session.commandDispositions[
-              commandDispositionKey(frame.command_id, frame.seq)
-            ];
-          if (disposition) {
-            applyDisposition(disposition);
+          if (frame.disposition) {
+            applyDisposition(frame.disposition);
           } else {
             ensureOptimistic(admitted.entry, "admitted");
           }

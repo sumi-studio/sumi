@@ -1,4 +1,7 @@
-import type { BrowserEventEnvelope } from "@sumi/api-client";
+import type {
+  BrowserEventEnvelope,
+  CommandDispositionEvent,
+} from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
 export type DirectChatCommand =
@@ -29,6 +32,7 @@ export type DirectChatAcceptedFrame = {
   idempotency_key: string;
   command_id: string;
   seq: number;
+  disposition?: CommandDispositionEvent;
 };
 export type DirectChatRejectedFrame = {
   type: "command_rejected";
@@ -776,7 +780,18 @@ export function parseDirectChatServerFrame(
     value.idempotency_key.length <= 1024 &&
     isUUID(value.command_id) &&
     isSafeSequence(value.seq) &&
-    hasOnlyKeys(value, ["type", "idempotency_key", "command_id", "seq"])
+    hasOnlyKeys(value, [
+      "type",
+      "idempotency_key",
+      "command_id",
+      "seq",
+      "disposition",
+    ]) &&
+    (!("disposition" in value) ||
+      (isSafeEventForUI(value.disposition) &&
+        value.disposition.type === "command_disposition" &&
+        value.disposition.command_id === value.command_id &&
+        value.disposition.command_seq === value.seq))
   ) {
     return value as DirectChatAcceptedFrame;
   }
