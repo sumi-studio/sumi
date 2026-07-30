@@ -48,9 +48,11 @@ function ChatScreenContent() {
     connection,
     ready,
     lastError,
+    recoverableDrafts,
     connect,
     disconnect,
     sendMessage,
+    restoreDraft,
     abort,
     decideApproval,
   } = useConversation();
@@ -92,13 +94,12 @@ function ChatScreenContent() {
       (lastItem.kind === "agent-run" && !hasInspectableTrace(lastItem.trace)));
   const rows = useMemo<ConversationRow[]>(() => {
     if (items.length === 0) return [];
-    return [
-      ...items,
-      ...(waitingForFirstToken
-        ? [{ id: WAITING_ROW_ID, kind: "waiting" as const }]
-        : []),
-      { id: BOTTOM_SPACER_ROW_ID, kind: "spacer" },
-    ];
+    const nextRows: ConversationRow[] = [...items];
+    if (waitingForFirstToken) {
+      nextRows.push({ id: WAITING_ROW_ID, kind: "waiting" });
+    }
+    nextRows.push({ id: BOTTOM_SPACER_ROW_ID, kind: "spacer" });
+    return nextRows;
   }, [items, waitingForFirstToken]);
   const onVisibleRowsChange = useCallback(
     (ids: string[]) => {
@@ -238,6 +239,53 @@ function ChatScreenContent() {
         </div>
 
         <div className="mx-auto w-full max-w-2xl shrink-0 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-4">
+          {recoverableDrafts.length > 0 && (
+            <section
+              aria-label="送信されなかったメッセージ"
+              aria-live="polite"
+              className="mb-2 space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3"
+            >
+              <div>
+                <h2 className="font-medium text-amber-950 text-sm">
+                  送信されなかったメッセージ
+                </h2>
+                <p className="mt-0.5 text-amber-800 text-xs">
+                  {draft.length > 0
+                    ? "現在の入力を保持するため、入力欄を空にしてから戻してください。"
+                    : "内容を確認して入力欄へ戻せます。自動では再送しません。"}
+                </p>
+              </div>
+              {recoverableDrafts.map((recoverable) => (
+                <div
+                  key={recoverable.idempotencyKey}
+                  className="rounded-lg border border-amber-200/80 bg-background p-2.5"
+                >
+                  <p className="whitespace-pre-wrap break-words text-foreground text-sm">
+                    {previewRecoverableText(recoverable.text)}
+                  </p>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground text-xs">
+                      {describeRecoveryReason(recoverable.reason)}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={draft.length > 0}
+                      onClick={() => {
+                        const restored = restoreDraft(
+                          recoverable.idempotencyKey,
+                        );
+                        if (restored !== undefined) setDraft(restored);
+                      }}
+                    >
+                      入力欄に戻す
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </section>
+          )}
           {lastError && (
             <p
               role="alert"
@@ -309,4 +357,22 @@ function composerPlaceholder(
   if (ready === "not_ready") return "現在エージェントを利用できません";
   if (ready === "unknown") return "エージェントを確認しています…";
   return "メッセージを入力…";
+}
+
+function previewRecoverableText(text: string): string {
+  const maxLength = 280;
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function describeRecoveryReason(reason: string): string {
+  switch (reason) {
+    case "superseded":
+      return "別の操作に置き換えられました";
+    case "unavailable":
+      return "エージェントへ届けられませんでした";
+    case "oversized":
+      return "送信できる長さを超えています";
+    default:
+      return "送信されませんでした";
+  }
 }

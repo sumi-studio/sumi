@@ -2,7 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { SduiView } from "@sumi/sdui";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { forwardRef, type ReactNode, useImperativeHandle } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatScreen } from "./chat-screen";
@@ -10,6 +10,12 @@ import { ChatScreen } from "./chat-screen";
 const state = vi.hoisted(() => ({
   sendMessage: vi.fn(() => true),
   scrollToEnd: vi.fn(),
+  recoverableDrafts: [] as Array<{
+    idempotencyKey: string;
+    text: string;
+    reason: string;
+  }>,
+  restoreDraft: vi.fn<(key: string) => string | undefined>(),
 }));
 
 vi.mock("../agent/store", () => ({
@@ -42,9 +48,12 @@ vi.mock("../agent/store", () => ({
     connection: "connected",
     ready: "ready",
     lastError: null,
+    recoverableDrafts: state.recoverableDrafts,
     connect: vi.fn(),
     disconnect: vi.fn(),
     sendMessage: state.sendMessage,
+    restoreDraft: state.restoreDraft,
+    discardDraft: vi.fn(),
     abort: vi.fn(),
     decideApproval: vi.fn(),
   }),
@@ -87,7 +96,19 @@ vi.mock("./app-navigation", () => ({
 }));
 
 vi.mock("./chat-prompt-input", () => ({
-  ChatPromptInput: () => null,
+  ChatPromptInput: ({
+    value,
+    onValueChange,
+  }: {
+    value: string;
+    onValueChange: (value: string) => void;
+  }) => (
+    <textarea
+      aria-label="テスト入力欄"
+      value={value}
+      onChange={(event) => onValueChange(event.target.value)}
+    />
+  ),
 }));
 
 vi.mock("./timeline-scrubber", () => ({
@@ -101,8 +122,11 @@ vi.mock("./timeline-scrubber", () => ({
 }));
 
 afterEach(() => {
+  cleanup();
   state.sendMessage.mockClear();
   state.scrollToEnd.mockClear();
+  state.recoverableDrafts = [];
+  state.restoreDraft.mockReset();
 });
 
 describe("SDUI action boundary", () => {
@@ -151,6 +175,55 @@ describe("SDUI action boundary", () => {
     expect(onAction).toHaveBeenCalledWith(
       "calendar.commit:v2/with-arbitrary-value",
       "確定",
+    );
+  });
+
+  it("returns a recoverable message to an empty composer without resending it", () => {
+    state.recoverableDrafts = [
+      {
+        idempotencyKey: "recoverable-1",
+        text: "失われてはいけない入力",
+        reason: "superseded",
+      },
+    ];
+    state.restoreDraft.mockReturnValue("失われてはいけない入力");
+
+    render(<ChatScreen />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "入力欄に戻す",
+      }),
+    );
+
+    expect(state.restoreDraft).toHaveBeenCalledWith("recoverable-1");
+    expect(screen.getByRole("textbox", { name: "テスト入力欄" })).toHaveValue(
+      "失われてはいけない入力",
+    );
+    expect(state.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite text already being composed", () => {
+    state.recoverableDrafts = [
+      {
+        idempotencyKey: "recoverable-2",
+        text: "あとで戻す入力",
+        reason: "unavailable",
+      },
+    ];
+
+    render(<ChatScreen />);
+    fireEvent.change(screen.getByRole("textbox", { name: "テスト入力欄" }), {
+      target: { value: "いま書いている入力" },
+    });
+
+    expect(
+      screen.getByRole("button", {
+        name: "入力欄に戻す",
+      }),
+    ).toBeDisabled();
+    expect(state.restoreDraft).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "テスト入力欄" })).toHaveValue(
+      "いま書いている入力",
     );
   });
 });

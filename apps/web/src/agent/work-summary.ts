@@ -18,5 +18,5 @@ export function hasInspectableTrace(trace: AgentTraceEvent[]): boolean {
 
 /** The public contract supports activity state, but not duration or outcome. */
 export function describeAgentRun(run: AgentRun): string {
-  return run.status === "running" ? "作業中" : "作業を完了しました";
+  return run.status === "running" ? "作業中" : "作業が終了しました";
 }
