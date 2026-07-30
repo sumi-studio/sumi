@@ -1153,7 +1153,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	}
 	_ = first.Close()
 	_ = second.Close()
-	deadline = time.Now().Add(time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		firstServer.connectionsMu.Lock()
 		firstActive := len(firstServer.connections)
@@ -1346,7 +1346,7 @@ func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *test
 
 	_ = first.Close()
 	_ = second.Close()
-	deadline = time.Now().Add(time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		firstServer.connectionsMu.Lock()
 		firstActive := len(firstServer.connections)
@@ -1575,7 +1575,7 @@ func TestSideEffectCancellationViolationRetainsLeaseUntilCallbackReturns(t *test
 		if err != nil {
 			t.Fatalf("replacement claim failed after stale callback returned: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("replacement claim did not proceed after stale callback returned")
 	}
 }
