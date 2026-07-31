@@ -57,6 +57,13 @@ type ResearchConsentStore interface {
 	SetResearchConsent(ctx context.Context, humanID string, granted bool) error
 }
 
+// ContentLogger observes durably appended commands for the 研究協力-gated content
+// log and always-on metadata telemetry (ADR 0009 §6). It is called after a
+// command is appended; failures must not affect the command path.
+type ContentLogger interface {
+	LogCommand(ctx context.Context, humanID, agentID, commandID string, seq uint64, content []byte) error
+}
+
 // StaticIdentityBindingResolver is the deliberately narrow hackathon binding:
 // exactly one configured Firebase UID maps to exactly one server-owned Sumi
 // principal. Every other external identity is denied.

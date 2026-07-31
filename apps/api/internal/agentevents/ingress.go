@@ -68,6 +68,9 @@ type UserCommandIngress struct {
 	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
 	// ADR 0009 §5). A nil Authorizer permits any verified session.
 	Authorizer DirectChatAuthorizer
+	// Logger optionally observes appended commands for research/telemetry
+	// (ADR 0009 §6). A nil Logger disables content logging.
+	Logger ContentLogger
 }
 
 var errCommandAppenderRequired = errors.New("CommandAppender is required")
@@ -202,6 +205,9 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CommandID:      env.CommandID,
 		Seq:            env.Seq,
 	})
+	if h.Logger != nil {
+		_ = h.Logger.LogCommand(context.Background(), claims.UserID, claims.PersonalityAgentID, env.CommandID, env.Seq, raw)
+	}
 }
 
 func directChatProvenance(claims UserSessionClaims) DirectChatProvenance {

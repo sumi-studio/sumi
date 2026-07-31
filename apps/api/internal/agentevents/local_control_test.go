@@ -873,7 +873,7 @@ func TestLocalControlRejectsNonLoopbackWrongScopeAndNonStrictJSON(t *testing.T) 
 
 func TestLocalControlIsNeverRegisteredByProductionMux(t *testing.T) {
 	store, gateway := openLocalControlTestGateway(t, t.TempDir())
-	mux, _, _, err := NewProductionMux(store, gateway, nil, nil, nil, nil, nil)
+	mux, _, _, err := NewProductionMux(store, gateway, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -25,6 +25,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/researchlog"
 	"golang.org/x/sys/unix"
 )
 
@@ -256,10 +257,17 @@ func newApplicationFromEnv() (*application, error) {
 	}
 
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
+	var contentLogger agentevents.ContentLogger
 	if database != nil {
 		directChatAuthorizer = newKosekiDirectChatAuthorizer(koseki.New(database.Pool))
+		if rl, err := researchLoggerFromEnv(koseki.New(database.Pool)); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("research log: %w", err)
+		} else {
+			contentLogger = rl
+		}
 	}
-	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins, directChatAuthorizer)
+	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins, directChatAuthorizer, contentLogger)
 	if err != nil {
 		closeOnError()
 		return nil, err
@@ -327,6 +335,22 @@ func databaseFromEnv(ctx context.Context) (*db.Pool, error) {
 	}
 	log.Printf("sumi control-plane database ready (migrations applied)")
 	return pool, nil
+}
+
+// researchLoggerFromEnv builds the 研究協力-gated content logger from
+// SUMI_RESEARCH_LOG_DIR and SUMI_TELEMETRY_LOG_DIR. When neither is set, no
+// logging is configured (nil). The consent checker is the koseki store.
+func researchLoggerFromEnv(consent researchlog.ConsentChecker) (agentevents.ContentLogger, error) {
+	researchDir := strings.TrimSpace(os.Getenv("SUMI_RESEARCH_LOG_DIR"))
+	telemetryDir := strings.TrimSpace(os.Getenv("SUMI_TELEMETRY_LOG_DIR"))
+	if researchDir == "" && telemetryDir == "" {
+		return nil, nil
+	}
+	logger, err := researchlog.New(consent, researchDir, telemetryDir)
+	if err != nil {
+		return nil, err
+	}
+	return logger, nil
 }
 
 const (
