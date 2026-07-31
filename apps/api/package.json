@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "go run ./cmd/server",
+    "migrate": "go run ./cmd/migrate",
     "build": "go build ./...",
     "lint": "go vet ./...",
     "test": "go test ./..."

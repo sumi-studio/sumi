@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
+	"github.com/sumi-studio/sumi/apps/api/internal/todo"
 )
 
 func main() {
@@ -74,7 +77,44 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, err
 	}
 	mux.HandleFunc("GET /health", handler.Health)
+
+	databaseURL := os.Getenv("SUMI_DATABASE_URL")
+	if databaseURL == "" {
+		_ = store.Close()
+		return nil, errors.New("SUMI_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("open todo database pool: %w", err)
+	}
+	todoService, err := todo.NewService(todo.NewPostgresRepository(pool), os.Getenv("SUMI_DEFAULT_TIMEZONE"))
+	if err != nil {
+		pool.Close()
+		_ = store.Close()
+		return nil, fmt.Errorf("create todo service: %w", err)
+	}
+	todo.NewHandler(todoService, todoSessionPrincipalVerifier{sessions: sv}).Register(mux)
 	return mux, nil
+}
+
+type todoSessionPrincipalVerifier struct {
+	sessions agentevents.UserSessionVerifier
+}
+
+func (v todoSessionPrincipalVerifier) VerifyRequest(ctx context.Context, request *http.Request) (todo.Principal, error) {
+	if v.sessions == nil {
+		return todo.Principal{}, errors.New("browser session verifier unavailable")
+	}
+	cookie, err := request.Cookie(agentevents.BrowserSessionCookie)
+	if err != nil {
+		return todo.Principal{}, err
+	}
+	claims, err := v.sessions.VerifySession(ctx, cookie.Value)
+	if err != nil {
+		return todo.Principal{}, err
+	}
+	return todo.Principal{UserID: claims.UserID}, nil
 }
 
 func allowedOriginsFromEnv() []string {

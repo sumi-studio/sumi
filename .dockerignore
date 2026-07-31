@@ -1,0 +1,11 @@
+.git
+.idea
+.env
+.env.*
+!.env.example
+**/node_modules
+**/.turbo
+**/target
+**/dist
+**/*.tfstate
+**/*.tfstate.*

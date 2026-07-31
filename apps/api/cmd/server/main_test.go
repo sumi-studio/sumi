@@ -76,6 +76,7 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
 	t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_DATABASE_URL", "postgres://sumi:sumi@127.0.0.1:5432/sumi?sslmode=disable")
 }
 
 func postAuthorized(t *testing.T, serverURL, conversationID string, body []byte) *http.Response {

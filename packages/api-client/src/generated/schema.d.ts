@@ -93,10 +93,157 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/todos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Todos owned by the authenticated user
+         * @description Every query is scoped by the authenticated user's ID.
+         */
+        get: operations["listTodos"];
+        put?: never;
+        /**
+         * Create a Todo owned by the authenticated user
+         * @description The owner is always derived from the authenticated `sumi_session`.
+         *     `owner_user_id` is intentionally not accepted from the request body.
+         */
+        post: operations["createTodo"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/todos/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["TodoID"];
+            };
+            cookie?: never;
+        };
+        /** Get one Todo owned by the authenticated user */
+        get: operations["getTodo"];
+        put?: never;
+        post?: never;
+        /**
+         * Permanently delete one Todo with optimistic locking
+         * @description This operation is intentionally not exposed as an agent tool.
+         */
+        delete: operations["deleteTodo"];
+        options?: never;
+        head?: never;
+        /**
+         * Update one Todo with optimistic locking
+         * @description `due` is replaced as a whole when present and is cleared by `null`.
+         *     A Todo owned by another user is indistinguishable from a missing Todo.
+         */
+        patch: operations["updateTodo"];
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @enum {string} */
+        TodoStatus: "open" | "done";
+        /** @enum {string} */
+        TodoPriority: "none" | "low" | "medium" | "high";
+        /** @description IANA timezone name such as Asia/Tokyo or UTC. */
+        IANATimezone: string;
+        TodoDueDate: {
+            /** @constant */
+            kind: "date";
+            /** Format: date */
+            date: string;
+            timezone?: components["schemas"]["IANATimezone"];
+        };
+        TodoDueDateResolved: {
+            /** @constant */
+            kind: "date";
+            /** Format: date */
+            date: string;
+            timezone: components["schemas"]["IANATimezone"];
+        };
+        TodoDueDatetime: {
+            /** @constant */
+            kind: "datetime";
+            /**
+             * Format: date-time
+             * @description RFC 3339 datetime with an explicit UTC offset.
+             */
+            at: string;
+            timezone?: components["schemas"]["IANATimezone"];
+        };
+        TodoDueDatetimeResolved: {
+            /** @constant */
+            kind: "datetime";
+            /**
+             * Format: date-time
+             * @description RFC 3339 datetime with an explicit UTC offset.
+             */
+            at: string;
+            timezone: components["schemas"]["IANATimezone"];
+        };
+        TodoDueInput: components["schemas"]["TodoDueDate"] | components["schemas"]["TodoDueDatetime"];
+        TodoDue: components["schemas"]["TodoDueDateResolved"] | components["schemas"]["TodoDueDatetimeResolved"];
+        Todo: {
+            /** Format: uuid */
+            id: string;
+            title: string;
+            description: string;
+            status: components["schemas"]["TodoStatus"];
+            priority: components["schemas"]["TodoPriority"];
+            due: components["schemas"]["TodoDue"] | null;
+            version: number;
+            via_agent: boolean;
+            completed_at: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        CreateTodoRequest: {
+            title: string;
+            description?: string;
+            status?: components["schemas"]["TodoStatus"];
+            priority?: components["schemas"]["TodoPriority"];
+            due?: components["schemas"]["TodoDueInput"] | null;
+        };
+        UpdateTodoRequest: {
+            expected_version: number;
+            title?: string;
+            description?: string;
+            status?: components["schemas"]["TodoStatus"];
+            priority?: components["schemas"]["TodoPriority"];
+            due?: components["schemas"]["TodoDueInput"] | null;
+        };
+        TodoList: {
+            items: components["schemas"]["Todo"][];
+            total: number;
+        };
+        /** @enum {string} */
+        ErrorCode: "validation_failed" | "unauthenticated" | "todo_not_found" | "version_conflict" | "internal_error";
+        ErrorResponse: {
+            error: {
+                code: components["schemas"]["ErrorCode"];
+                message: string;
+                current_version?: number;
+            };
+        };
+        VersionConflictErrorResponse: {
+            error: {
+                /** @constant */
+                code: "version_conflict";
+                message: string;
+                current_version: number;
+            };
+        };
         /** @description non-negative integer representable exactly by JavaScript number clients */
         JsonSafeInteger: number;
         /**
@@ -544,8 +691,103 @@ export interface components {
             reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
         };
     };
-    responses: never;
-    parameters: never;
+    responses: {
+        /** @description Request validation failed */
+        ValidationFailed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "validation_failed",
+                 *         "message": "request validation failed"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Missing or invalid browser session */
+        Unauthenticated: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "unauthenticated",
+                 *         "message": "authentication required"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Todo is absent or belongs to another user */
+        TodoNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "todo_not_found",
+                 *         "message": "todo not found"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description The supplied expected version is stale */
+        VersionConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "version_conflict",
+                 *         "message": "todo was updated by another request",
+                 *         "current_version": 4
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["VersionConflictErrorResponse"];
+            };
+        };
+        /** @description Internal server error */
+        InternalError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "internal_error",
+                 *         "message": "internal server error"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+    };
+    parameters: {
+        TodoID: string;
+        /**
+         * @description Informational marker set to true by the Sumi Todo tool client. It only
+         *     controls `via_agent` and never grants authority; ownership still comes
+         *     exclusively from the authenticated session.
+         */
+        ViaAgent: boolean;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -705,6 +947,164 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    listTodos: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["TodoStatus"];
+                /** @description When true, return only overdue open Todos. */
+                overdue?: boolean;
+                /** @description Case-insensitive literal substring match on title. */
+                q?: string;
+                sort?: "updated_at" | "due";
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Todo page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TodoList"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createTodo: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Informational marker set to true by the Sumi Todo tool client. It only
+                 *     controls `via_agent` and never grants authority; ownership still comes
+                 *     exclusively from the authenticated session.
+                 */
+                "X-Sumi-Via-Agent"?: components["parameters"]["ViaAgent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTodoRequest"];
+            };
+        };
+        responses: {
+            /** @description Todo created */
+            201: {
+                headers: {
+                    /** @description URI of the created Todo */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Todo"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getTodo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["TodoID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Todo found */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Todo"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["TodoNotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteTodo: {
+        parameters: {
+            query: {
+                expected_version: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["TodoID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Todo deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["TodoNotFound"];
+            409: components["responses"]["VersionConflict"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateTodo: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description Informational marker set to true by the Sumi Todo tool client. It only
+                 *     controls `via_agent` and never grants authority; ownership still comes
+                 *     exclusively from the authenticated session.
+                 */
+                "X-Sumi-Via-Agent"?: components["parameters"]["ViaAgent"];
+            };
+            path: {
+                id: components["parameters"]["TodoID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTodoRequest"];
+            };
+        };
+        responses: {
+            /** @description Todo updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Todo"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["TodoNotFound"];
+            409: components["responses"]["VersionConflict"];
+            500: components["responses"]["InternalError"];
         };
     };
 }

@@ -147,6 +147,174 @@ paths:
           description: Missing or invalid agent token
         "403":
           description: Origin not allowed
+  /v1/todos:
+    post:
+      operationId: createTodo
+      summary: Create a Todo owned by the authenticated user
+      description: |
+        The owner is always derived from the authenticated `sumi_session`.
+        `owner_user_id` is intentionally not accepted from the request body.
+      security:
+        - sumiSession: []
+      parameters:
+        - $ref: "#/components/parameters/ViaAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTodoRequest"
+      responses:
+        "201":
+          description: Todo created
+          headers:
+            Location:
+              description: URI of the created Todo
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: listTodos
+      summary: List Todos owned by the authenticated user
+      description: Every query is scoped by the authenticated user's ID.
+      security:
+        - sumiSession: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/TodoStatus"
+        - name: overdue
+          in: query
+          description: When true, return only overdue open Todos.
+          schema:
+            type: boolean
+        - name: q
+          in: query
+          description: Case-insensitive literal substring match on title.
+          schema:
+            type: string
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [updated_at, due]
+            default: updated_at
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Todo page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TodoList"
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/todos/{id}:
+    parameters:
+      - $ref: "#/components/parameters/TodoID"
+    get:
+      operationId: getTodo
+      summary: Get one Todo owned by the authenticated user
+      security:
+        - sumiSession: []
+      responses:
+        "200":
+          description: Todo found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/TodoNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: updateTodo
+      summary: Update one Todo with optimistic locking
+      description: |
+        `due` is replaced as a whole when present and is cleared by `null`.
+        A Todo owned by another user is indistinguishable from a missing Todo.
+      security:
+        - sumiSession: []
+      parameters:
+        - $ref: "#/components/parameters/ViaAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTodoRequest"
+      responses:
+        "200":
+          description: Todo updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/TodoNotFound"
+        "409":
+          $ref: "#/components/responses/VersionConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteTodo
+      summary: Permanently delete one Todo with optimistic locking
+      description: This operation is intentionally not exposed as an agent tool.
+      security:
+        - sumiSession: []
+      parameters:
+        - name: expected_version
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "204":
+          description: Todo deleted
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/TodoNotFound"
+        "409":
+          $ref: "#/components/responses/VersionConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   securitySchemes:
     bearerAuth:
@@ -158,7 +326,297 @@ components:
       in: cookie
       name: sumi_session
       description: Signed HttpOnly browser session cookie.
+  parameters:
+    TodoID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ViaAgent:
+      name: X-Sumi-Via-Agent
+      in: header
+      required: false
+      description: |
+        Informational marker set to true by the Sumi Todo tool client. It only
+        controls `via_agent` and never grants authority; ownership still comes
+        exclusively from the authenticated session.
+      schema:
+        type: boolean
+        default: false
+  responses:
+    ValidationFailed:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: validation_failed
+              message: request validation failed
+    Unauthenticated:
+      description: Missing or invalid browser session
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unauthenticated
+              message: authentication required
+    TodoNotFound:
+      description: Todo is absent or belongs to another user
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: todo_not_found
+              message: todo not found
+    VersionConflict:
+      description: The supplied expected version is stale
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/VersionConflictErrorResponse"
+          example:
+            error:
+              code: version_conflict
+              message: todo was updated by another request
+              current_version: 4
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: internal_error
+              message: internal server error
   schemas:
+    TodoStatus:
+      type: string
+      enum: [open, done]
+    TodoPriority:
+      type: string
+      enum: [none, low, medium, high]
+    IANATimezone:
+      type: string
+      minLength: 1
+      description: IANA timezone name such as Asia/Tokyo or UTC.
+      pattern: '^(?:UTC|[A-Za-z][A-Za-z0-9._+-]*(?:/[A-Za-z0-9._+-]+)+)$'
+    TodoDueDate:
+      type: object
+      required: [kind, date]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: date
+        date:
+          type: string
+          format: date
+        timezone:
+          $ref: "#/components/schemas/IANATimezone"
+    TodoDueDateResolved:
+      type: object
+      required: [kind, date, timezone]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: date
+        date:
+          type: string
+          format: date
+        timezone:
+          $ref: "#/components/schemas/IANATimezone"
+    TodoDueDatetime:
+      type: object
+      required: [kind, at]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: datetime
+        at:
+          type: string
+          format: date-time
+          description: RFC 3339 datetime with an explicit UTC offset.
+        timezone:
+          $ref: "#/components/schemas/IANATimezone"
+    TodoDueDatetimeResolved:
+      type: object
+      required: [kind, at, timezone]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: datetime
+        at:
+          type: string
+          format: date-time
+          description: RFC 3339 datetime with an explicit UTC offset.
+        timezone:
+          $ref: "#/components/schemas/IANATimezone"
+    TodoDueInput:
+      oneOf:
+        - $ref: "#/components/schemas/TodoDueDate"
+        - $ref: "#/components/schemas/TodoDueDatetime"
+    TodoDue:
+      oneOf:
+        - $ref: "#/components/schemas/TodoDueDateResolved"
+        - $ref: "#/components/schemas/TodoDueDatetimeResolved"
+    Todo:
+      type: object
+      required:
+        - id
+        - title
+        - description
+        - status
+        - priority
+        - due
+        - version
+        - via_agent
+        - completed_at
+        - created_at
+        - updated_at
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/TodoStatus"
+        priority:
+          $ref: "#/components/schemas/TodoPriority"
+        due:
+          oneOf:
+            - $ref: "#/components/schemas/TodoDue"
+            - type: "null"
+        version:
+          type: integer
+          minimum: 1
+        via_agent:
+          type: boolean
+        completed_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateTodoRequest:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/TodoStatus"
+        priority:
+          $ref: "#/components/schemas/TodoPriority"
+        due:
+          oneOf:
+            - $ref: "#/components/schemas/TodoDueInput"
+            - type: "null"
+    UpdateTodoRequest:
+      type: object
+      required: [expected_version]
+      additionalProperties: false
+      minProperties: 2
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/TodoStatus"
+        priority:
+          $ref: "#/components/schemas/TodoPriority"
+        due:
+          oneOf:
+            - $ref: "#/components/schemas/TodoDueInput"
+            - type: "null"
+    TodoList:
+      type: object
+      required: [items, total]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Todo"
+        total:
+          type: integer
+          minimum: 0
+    ErrorCode:
+      type: string
+      enum:
+        - validation_failed
+        - unauthenticated
+        - todo_not_found
+        - version_conflict
+        - internal_error
+    ErrorResponse:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          additionalProperties: false
+          properties:
+            code:
+              $ref: "#/components/schemas/ErrorCode"
+            message:
+              type: string
+            current_version:
+              type: integer
+              minimum: 1
+    VersionConflictErrorResponse:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message, current_version]
+          additionalProperties: false
+          properties:
+            code:
+              type: string
+              const: version_conflict
+            message:
+              type: string
+            current_version:
+              type: integer
+              minimum: 1
     JsonSafeInteger:
       type: integer
       minimum: 0

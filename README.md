@@ -91,6 +91,18 @@ make test    # 全テスト
 make api-dev # Go API サーバー単体起動 (PORT=8080)
 ```
 
+PostgreSQL、DB migration、Go API、Caddyをまとめて再現する場合:
+
+```sh
+make compose-env   # 初回のみ。Git管理外の .env にrandom secretを生成
+make compose-up
+curl http://localhost:8080/health
+```
+
+署名済みlocal sessionを使ったTodo APIの疎通例は
+[apps/api/README.md](apps/api/README.md)を参照。`make compose-down`はデータvolumeを
+保持し、完全初期化が必要な場合のみ`docker compose down --volumes`を実行する。
+
 API の型を変更する場合は `contracts/openapi.yaml` を編集後、`pnpm --filter @sumi/api-client generate` で TS 型を再生成する。
 
 ## CI/CD
