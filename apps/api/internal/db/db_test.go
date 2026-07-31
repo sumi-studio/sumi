@@ -2,12 +2,11 @@ package db
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
 func TestEmbeddedUpMigrationsSortedAndUnique(t *testing.T) {
@@ -40,32 +39,9 @@ func TestEmbeddedUpMigrationsSortedAndUnique(t *testing.T) {
 }
 
 func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
-	databaseURL := os.Getenv("SUMI_TEST_DB_URL")
-	if databaseURL == "" {
-		t.Skip("SUMI_TEST_DB_URL not set; skipping Postgres integration test")
-	}
+	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cfg, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		t.Fatalf("parse config: %v", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		t.Fatalf("ping: %v", err)
-	}
-	// Reset to a truly empty database so the test is reproducible against a
-	// persistent dev volume: drop the public schema and recreate it.
-	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		t.Fatalf("drop public schema: %v", err)
-	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA public"); err != nil {
-		t.Fatalf("recreate public schema: %v", err)
-	}
 
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("first migrate: %v", err)
@@ -94,28 +70,9 @@ func TestMigrateIdempotentAgainstEmptyDatabase(t *testing.T) {
 // against a migrated database: a credential cannot be rebound to a different
 // Human, and an agent has at most one active Employer at a time.
 func TestKosekiSchemaConstraints(t *testing.T) {
-	databaseURL := os.Getenv("SUMI_TEST_DB_URL")
-	if databaseURL == "" {
-		t.Skip("SUMI_TEST_DB_URL not set; skipping Postgres integration test")
-	}
+	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cfg, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		t.Fatalf("parse config: %v", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-
-	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		t.Fatalf("drop schema: %v", err)
-	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA public"); err != nil {
-		t.Fatalf("recreate schema: %v", err)
-	}
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -136,7 +93,7 @@ func TestKosekiSchemaConstraints(t *testing.T) {
 	}
 
 	// Credential rebinding to a different Human must fail.
-	_, err = pool.Exec(ctx, "UPDATE credentials SET human_id = $1 WHERE provider='firebase' AND external_subject='uid-aaa'", human2)
+	_, err := pool.Exec(ctx, "UPDATE credentials SET human_id = $1 WHERE provider='firebase' AND external_subject='uid-aaa'", human2)
 	if err == nil {
 		t.Fatal("expected credential rebinding to fail, but it succeeded")
 	}

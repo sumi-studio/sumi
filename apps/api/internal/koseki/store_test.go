@@ -3,7 +3,6 @@ package koseki
 import (
 	"context"
 	"errors"
-	"os"
 	"regexp"
 	"testing"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
 var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -31,25 +31,7 @@ func TestNewUUIDv7FormatAndUniqueness(t *testing.T) {
 
 func connectTestPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
-	databaseURL := os.Getenv("SUMI_TEST_DB_URL")
-	if databaseURL == "" {
-		t.Skip("SUMI_TEST_DB_URL not set; skipping Postgres integration test")
-	}
-	cfg, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		t.Fatalf("parse config: %v", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS public CASCADE"); err != nil {
-		t.Fatalf("drop schema: %v", err)
-	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA public"); err != nil {
-		t.Fatalf("recreate schema: %v", err)
-	}
+	pool := testdb.Create(t)
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

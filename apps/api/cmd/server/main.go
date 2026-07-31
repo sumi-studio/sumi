@@ -244,15 +244,30 @@ func newApplicationFromEnv() (*application, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("browser session configuration: %w", err)
 	}
+	database, err := databaseFromEnv(context.Background())
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("control-plane database: %w", err)
+	}
+	closeOnError := func() {
+		_ = store.Close()
+		database.Close()
+	}
 
 	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)
 	if err != nil {
-		_ = store.Close()
+		closeOnError()
 		return nil, err
 	}
-	authServer, authEnabled, err := browserAuthServerFromEnv(context.Background(), sv, browserOrigins)
+	var authServer *agentevents.BrowserAuthServer
+	var authEnabled bool
+	if database == nil {
+		authServer, authEnabled, err = browserAuthServerFromEnv(context.Background(), sv, browserOrigins)
+	} else {
+		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(context.Background(), sv, browserOrigins, database.Pool)
+	}
 	if err != nil {
-		_ = store.Close()
+		closeOnError()
 		return nil, fmt.Errorf("browser auth: %w", err)
 	}
 	if authEnabled {
@@ -261,28 +276,23 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)
 	if err != nil {
-		_ = store.Close()
+		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
 	}
 	localListener, err := localControlListenerFromEnv(enabled)
 	if err != nil {
-		_ = store.Close()
+		closeOnError()
 		return nil, fmt.Errorf("local control transport: %w", err)
 	}
 	var localMux *http.ServeMux
 	if enabled {
 		localMux = http.NewServeMux()
 		if err := localControl.RegisterRoutes(localMux); err != nil {
-			_ = store.Close()
+			closeOnError()
 			return nil, fmt.Errorf("register local control fixture: %w", err)
 		}
 	}
 	mux.HandleFunc("GET /health", handler.Health)
-	database, err := databaseFromEnv(context.Background())
-	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("control-plane database: %w", err)
-	}
 	return &application{
 		publicMux:     mux,
 		localMux:      localMux,

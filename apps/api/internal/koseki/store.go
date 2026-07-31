@@ -6,6 +6,8 @@ package koseki
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -134,6 +136,89 @@ func (s *Store) AgentForHuman(ctx context.Context, humanID string) (string, erro
 		return "", err
 	}
 	return agentID, nil
+}
+
+// Registration is the result of auto-registering a previously unbound credential
+// (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
+// and the per-agent wrapping key generated at hire time.
+type Registration struct {
+	HumanID      string
+	AgentID      string
+	WrappingKey  string
+}
+
+// AutoRegister performs first-login self-serve signup for an unbound credential:
+// it mints a HumanId, hires the default Secretary (with the Human as initial
+// Employer), generates and persists a per-agent wrapping key, and binds the
+// credential to the new Human — all in one transaction. It returns the
+// registration result. If the credential is already bound, the caller should
+// use ResolveCredential + AgentForHuman instead; AutoRegister does not check for
+// an existing binding (the unique constraint would reject a duplicate).
+func (s *Store) AutoRegister(ctx context.Context, provider, externalSubject string) (Registration, error) {
+	humanID := newUUIDv7()
+	agentID := newUUIDv7()
+	wrappingKey, err := generateWrappingKey()
+	if err != nil {
+		return Registration{}, fmt.Errorf("generate wrapping key: %w", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Registration{}, fmt.Errorf("begin auto-register: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		return Registration{}, fmt.Errorf("insert human: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)",
+		agentID, humanID); err != nil {
+		return Registration{}, fmt.Errorf("insert agent: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, $2, $3)",
+		agentID, EmployerHuman, humanID); err != nil {
+		return Registration{}, fmt.Errorf("insert initial employment: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)",
+		agentID, wrappingKey); err != nil {
+		return Registration{}, fmt.Errorf("insert agent secrets: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"INSERT INTO credentials (provider, external_subject, human_id) VALUES ($1, $2, $3)",
+		provider, externalSubject, humanID); err != nil {
+		if isUniqueViolation(err) {
+			return Registration{}, ErrCredentialAlreadyBound
+		}
+		return Registration{}, fmt.Errorf("bind credential: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Registration{}, fmt.Errorf("commit auto-register: %w", err)
+	}
+	return Registration{HumanID: humanID, AgentID: agentID, WrappingKey: wrappingKey}, nil
+}
+
+// AgentWrappingKey returns the per-agent wrapping key persisted at registration
+// time, or pgx.ErrNoRows when none exists.
+func (s *Store) AgentWrappingKey(ctx context.Context, agentID string) (string, error) {
+	var key string
+	err := s.pool.QueryRow(ctx,
+		"SELECT wrapping_key FROM agent_secrets WHERE personality_agent_id = $1",
+		agentID).Scan(&key)
+	if err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// generateWrappingKey produces a 32-byte random key, base64-rawurl encoded.
+func generateWrappingKey() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 // GrantResearchConsent registers an active 研究協力 consent for a Human. If an
