@@ -45,6 +45,8 @@ services:
       SUMI_DEFAULT_TIMEZONE: ${SUMI_DEFAULT_TIMEZONE:-Asia/Tokyo}
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?run scripts/dev/create-compose-env.sh first}
       SUMI_BROWSER_SESSION_AUDIENCE: sumi:web:conversation
+      SUMI_ENABLE_DEV_SESSION: "true"
+      SUMI_DEV_SESSION_USER_ID: 019c0000-0000-7000-8000-000000000001
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi/command-log
       SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi/agent-runtime
       SUMI_AGENT_WS_ALLOWED_ORIGINS: ${SUMI_AGENT_WS_ALLOWED_ORIGINS:-}
@@ -63,24 +65,27 @@ services:
     tmpfs:
       - /tmp
 
-  caddy:
-    image: caddy:2-alpine
+  web:
+    image: sumi-web:local
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
     restart: unless-stopped
-    environment:
-      SUMI_SITE_ADDRESS: ${SUMI_SITE_ADDRESS:-http://localhost}
     ports:
       - "${SUMI_HTTP_PORT:-80}:80"
-      - "${SUMI_HTTPS_PORT:-443}:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro,Z
-      - sumi-caddy-data:/data
-      - sumi-caddy-config:/config
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/_web/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
 
 volumes:
   sumi-postgres:
   sumi-api-state:
-  sumi-caddy-data:
-  sumi-caddy-config:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -154,6 +155,38 @@ func TestAllowedOriginsFromEnv(t *testing.T) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
+}
+
+func TestDevelopmentSessionHandlerIssuesVerifiableCookie(t *testing.T) {
+	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
+	t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
+	t.Setenv("SUMI_DEV_SESSION_USER_ID", "019c0000-0000-7000-8000-000000000001")
+	handler, err := developmentSessionHandlerFromEnv()
+	if err != nil {
+		t.Fatalf("create handler: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodPost, "/__dev__/session", nil))
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	cookies := response.Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected development cookie: %#v", cookies)
+	}
+	verifier, err := agentevents.NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	claims, err := verifier.VerifySession(context.Background(), cookies[0].Value)
+	if err != nil {
+		t.Fatalf("verify issued cookie: %v", err)
+	}
+	if claims.UserID != "019c0000-0000-7000-8000-000000000001" {
+		t.Fatalf("user id = %q", claims.UserID)
+	}
 }
 
 func TestNewRouter_RequiresCommandLogDir(t *testing.T) {

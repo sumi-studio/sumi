@@ -171,3 +171,26 @@ func TestHMACUserSessionVerifierRejectsPaddedInput(t *testing.T) {
 		t.Fatalf("padded signature must verify: %v", err)
 	}
 }
+
+func TestIssueHMACUserSessionRoundTripsThroughVerifier(t *testing.T) {
+	want := UserSessionClaims{
+		TenantID:       "tenant-1",
+		UserID:         "019c0000-0000-7000-8000-000000000001",
+		ConversationID: "local-compose",
+	}
+	session, err := IssueHMACUserSession(testSessionSecret, "", want, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	verifier, err := NewHMACUserSessionVerifier(testSessionSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	got, err := verifier.VerifySession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("verify session: %v", err)
+	}
+	if got != want {
+		t.Fatalf("claims mismatch: got %#v want %#v", got, want)
+	}
+}

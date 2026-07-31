@@ -91,7 +91,7 @@ make test    # 全テスト
 make api-dev # Go API サーバー単体起動 (PORT=8080)
 ```
 
-PostgreSQL、DB migration、Go API、Caddyをまとめて再現する場合:
+PostgreSQL、DB migration、Go API、Webをまとめて再現する場合:
 
 ```sh
 make compose-env   # 初回のみ。Git管理外の .env にrandom secretを生成

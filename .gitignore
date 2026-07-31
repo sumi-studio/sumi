@@ -675,6 +675,7 @@ dist/
 .turbo/
 *.tsbuildinfo
 coverage/
+test-results/
 .env
 .env.*
 !.env.example
