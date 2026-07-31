@@ -11,7 +11,9 @@ import (
 
 	firebase "firebase.google.com/go/v4"
 	firebaseauth "firebase.google.com/go/v4/auth"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 const (
@@ -65,16 +67,32 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 	return agentevents.FirebaseIdentity{UID: token.UID, TenantID: token.Firebase.Tenant}, nil
 }
 
-// browserAuthServerFromEnv creates the Firebase exchange boundary only when
-// SUMI_AUTH_FIREBASE_UID explicitly opts in. Partial opt-in is a startup error;
-// no authentication route is registered for an entirely absent configuration.
+// browserAuthServerFromEnv creates the Firebase exchange boundary. When a
+// control-plane database pool is unavailable it falls back to the legacy
+// StaticIdentityBindingResolver (single configured Firebase UID). Partial static
+// opt-in is a startup error; no authentication route is registered for an
+// entirely absent configuration.
 func browserAuthServerFromEnv(
 	ctx context.Context,
 	sessions *agentevents.HMACUserSessionVerifier,
 	allowedOrigins []string,
 ) (*agentevents.BrowserAuthServer, bool, error) {
+	return browserAuthServerFromEnvWithDB(ctx, sessions, allowedOrigins, nil)
+}
+
+// browserAuthServerFromEnvWithDB enables the 戸籍-backed identity resolver
+// (ADR 0009 §3) when pool is non-nil: any verified Firebase identity is
+// auto-registered on first login and resolved to its HumanId + Secretary on
+// subsequent logins. A nil pool preserves the legacy single-UID binding.
+func browserAuthServerFromEnvWithDB(
+	ctx context.Context,
+	sessions *agentevents.HMACUserSessionVerifier,
+	allowedOrigins []string,
+	pool *pgxpool.Pool,
+) (*agentevents.BrowserAuthServer, bool, error) {
 	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
-	if firebaseUID == "" {
+	kosekiMode := pool != nil
+	if !kosekiMode && firebaseUID == "" {
 		for _, name := range browserAuthEnvironmentNames {
 			if name == "SUMI_AUTH_FIREBASE_UID" {
 				continue
@@ -89,13 +107,6 @@ func browserAuthServerFromEnv(
 		return nil, false, errors.New("SUMI_BROWSER_SESSION_SECRET is required when Firebase auth is enabled")
 	}
 
-	tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
-	userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
-	personalityAgentID := strings.TrimSpace(os.Getenv("SUMI_AUTH_PERSONALITY_AGENT_ID"))
-	if tenantID == "" || userID == "" || personalityAgentID == "" {
-		return nil, false, errors.New("SUMI_AUTH_TENANT_ID, SUMI_AUTH_USER_ID, and SUMI_AUTH_PERSONALITY_AGENT_ID are required when Firebase auth is enabled")
-	}
-
 	projectID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_PROJECT_ID"))
 	if projectID == "" {
 		projectID = strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_PROJECT"))
@@ -105,17 +116,33 @@ func browserAuthServerFromEnv(
 	}
 
 	firebaseTenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_TENANT_ID"))
-	bindings, err := agentevents.NewStaticIdentityBindingResolverForTenant(
-		firebaseUID,
-		firebaseTenantID,
-		agentevents.UserSessionClaims{
-			TenantID:           tenantID,
-			UserID:             userID,
-			PersonalityAgentID: personalityAgentID,
-		},
-	)
-	if err != nil {
-		return nil, false, fmt.Errorf("Firebase identity binding: %w", err)
+	var bindings agentevents.IdentityBindingResolver
+	if kosekiMode {
+		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
+		if tenantID == "" {
+			return nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
+		}
+		bindings = newKosekiIdentityBindingResolver(koseki.New(pool), tenantID, "firebase")
+	} else {
+		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
+		userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
+		personalityAgentID := strings.TrimSpace(os.Getenv("SUMI_AUTH_PERSONALITY_AGENT_ID"))
+		if tenantID == "" || userID == "" || personalityAgentID == "" {
+			return nil, false, errors.New("SUMI_AUTH_TENANT_ID, SUMI_AUTH_USER_ID, and SUMI_AUTH_PERSONALITY_AGENT_ID are required when Firebase auth is enabled")
+		}
+		resolver, err := agentevents.NewStaticIdentityBindingResolverForTenant(
+			firebaseUID,
+			firebaseTenantID,
+			agentevents.UserSessionClaims{
+				TenantID:           tenantID,
+				UserID:             userID,
+				PersonalityAgentID: personalityAgentID,
+			},
+		)
+		if err != nil {
+			return nil, false, fmt.Errorf("Firebase identity binding: %w", err)
+		}
+		bindings = resolver
 	}
 
 	app, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: projectID})
