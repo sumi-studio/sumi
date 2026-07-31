@@ -148,6 +148,20 @@ func (s *Store) AgentForHuman(ctx context.Context, humanID string) (string, erro
 	return agentID, nil
 }
 
+// CurrentEmployer returns the active Employer of an agent (employer_type,
+// employer_id) — the employment row with ended_at IS NULL. It returns
+// pgx.ErrNoRows when the agent has no active Employer.
+func (s *Store) CurrentEmployer(ctx context.Context, agentID string) (string, string, error) {
+	var employerType, employerID string
+	err := s.pool.QueryRow(ctx,
+		"SELECT employer_type, employer_id FROM employments WHERE agent_id = $1 AND ended_at IS NULL",
+		agentID).Scan(&employerType, &employerID)
+	if err != nil {
+		return "", "", err
+	}
+	return employerType, employerID, nil
+}
+
 // Registration is the result of auto-registering a previously unbound credential
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
 // and the per-agent wrapping key generated at hire time.

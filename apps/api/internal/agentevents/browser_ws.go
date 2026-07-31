@@ -20,6 +20,9 @@ type BrowserServer struct {
 	Sessions UserSessionAuthorizer
 	Appender CommandAppender
 	Events   *DurableGateway
+	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
+	// ADR 0009 §5). A nil Authorizer permits any verified session.
+	Authorizer DirectChatAuthorizer
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration
@@ -320,6 +323,12 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
+	}
+	if s.Authorizer != nil {
+		if err := s.Authorizer.AuthorizeDirectChat(r.Context(), claims.UserID, claims.PersonalityAgentID); err != nil {
+			http.Error(w, "not authorized for this agent", http.StatusForbidden)
+			return
+		}
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
