@@ -7,6 +7,8 @@ readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly LOCAL_CONTROL_ORIGIN="http://127.0.0.1:8081"
 readonly LOOPBACK_GATEWAY_LISTEN="127.0.0.1:8082"
 readonly WEB_PORT=5173
+readonly POSTGRES_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.yaml"
+readonly POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
 CHECK_ONLY=0
@@ -349,6 +351,20 @@ wait_for_socket() {
   fail "timed out waiting for the authenticated executor socket"
 }
 
+start_postgres() {
+  log "starting control-plane Postgres via compose"
+  docker compose -f "${POSTGRES_COMPOSE_FILE}" up -d postgres >/dev/null
+  local attempt
+  for attempt in {1..300}; do
+    if docker compose -f "${POSTGRES_COMPOSE_FILE}" exec -T postgres \
+      pg_isready -U sumi -d sumi >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.2
+  done
+  fail "timed out waiting for control-plane Postgres"
+}
+
 start_loopback_gateway_relay() {
   log "starting loopback-only gateway relay"
   (
@@ -475,7 +491,7 @@ if ((CHECK_ONLY)); then
   exit 0
 fi
 
-for command in awk cargo curl flock go openssl pnpm setsid ss; do
+for command in awk cargo curl docker flock go openssl pnpm setsid ss; do
   require_command "${command}"
 done
 [[ -x "${REPOSITORY_ROOT}/apps/web/node_modules/vite/bin/vite.js" ]] ||
@@ -517,6 +533,8 @@ log "building the Go API and Rust PersonalityAgent entrypoints"
   cd "${REPOSITORY_ROOT}/apps/agent"
   cargo build --bin sumi-agent
 )
+
+start_postgres
 
 SUMI_RPC_GENERATION=0
 SUMI_RPC_NONCE="local-$(random_token)"
@@ -565,6 +583,7 @@ log "starting API"
     "SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}" \
     "SUMI_AUTH_ALLOW_INSECURE_COOKIES=true" \
     "SUMI_AUTH_SESSION_TTL=1h" \
+    "SUMI_DB_URL=${POSTGRES_DB_URL}" \
     "SUMI_LOCAL_CONTROL_ENABLED=1" \
     "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}" \
     "SUMI_LOCAL_CONTROL_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \

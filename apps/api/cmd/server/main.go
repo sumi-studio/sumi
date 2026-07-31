@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"golang.org/x/sys/unix"
 )
@@ -182,6 +183,7 @@ type application struct {
 	localListener *localControlListenerConfig
 	store         *agentevents.CommandStore
 	browser       *agentevents.BrowserServer
+	database      *db.Pool
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -198,6 +200,9 @@ func (a *application) Close() error {
 		}
 		if a.store != nil {
 			a.closeErr = errors.Join(a.closeErr, a.store.Close())
+		}
+		if a.database != nil {
+			a.database.Close()
 		}
 	})
 	return a.closeErr
@@ -273,13 +278,43 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 	mux.HandleFunc("GET /health", handler.Health)
+	database, err := databaseFromEnv(context.Background())
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("control-plane database: %w", err)
+	}
 	return &application{
 		publicMux:     mux,
 		localMux:      localMux,
 		localListener: localListener,
 		store:         store,
 		browser:       browser,
+		database:      database,
 	}, nil
+}
+
+// databaseFromEnv opens and migrates the control-plane Postgres database when
+// SUMI_DB_URL is configured. An unset variable yields a nil pool so that
+// components that do not yet require the 戸籍 (and unit tests) keep working.
+func databaseFromEnv(ctx context.Context) (*db.Pool, error) {
+	databaseURL := strings.TrimSpace(os.Getenv("SUMI_DB_URL"))
+	if databaseURL == "" {
+		return nil, nil
+	}
+	openCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	pool, err := db.Open(openCtx, databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	migrateCtx, migrateCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer migrateCancel()
+	if err := db.Migrate(migrateCtx, pool.Pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("apply migrations: %w", err)
+	}
+	log.Printf("sumi control-plane database ready (migrations applied)")
+	return pool, nil
 }
 
 const (
