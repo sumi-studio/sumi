@@ -12,7 +12,6 @@ services:
       - "127.0.0.1:${SUMI_POSTGRES_PORT:-55432}:5432"
     volumes:
       - sumi-postgres:/var/lib/postgresql/data
-      - ./apps/api/dev/postgres/001_users.sql:/docker-entrypoint-initdb.d/001_users.sql:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sumi -d sumi"]
       interval: 2s
@@ -43,6 +42,8 @@ services:
       PORT: "8080"
       SUMI_DATABASE_URL: postgres://sumi:${SUMI_POSTGRES_PASSWORD}@postgres:5432/sumi?sslmode=disable
       SUMI_DEFAULT_TIMEZONE: ${SUMI_DEFAULT_TIMEZONE:-Asia/Tokyo}
+      SUMI_TODO_ENABLED: "true"
+      SUMI_TODO_DEV_SESSION_AUTH: "true"
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?run scripts/dev/create-compose-env.sh first}
       SUMI_BROWSER_SESSION_AUDIENCE: sumi:web:conversation
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi/command-log
@@ -57,7 +58,7 @@ services:
       api-migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/ready"]
       interval: 3s
       timeout: 3s
       retries: 30

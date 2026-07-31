@@ -21,6 +21,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Dependency readiness check
+         * @description Checks the Todo database when the Todo backend is enabled.
+         */
+        get: operations["getReadiness"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/conversations/{conversation_id}/commands": {
         parameters: {
             query?: never;
@@ -108,8 +128,11 @@ export interface paths {
         put?: never;
         /**
          * Create a Todo owned by the authenticated user
-         * @description The owner is always derived from the authenticated `sumi_session`.
+         * @description The owner is always derived from the authenticated development session.
          *     `owner_user_id` is intentionally not accepted from the request body.
+         *     The server registers Todo routes only when both `SUMI_TODO_ENABLED=true`
+         *     and `SUMI_TODO_DEV_SESSION_AUTH=true`; production user-scoped auth is not
+         *     implemented yet.
          */
         post: operations["createTodo"];
         delete?: never;
@@ -726,6 +749,40 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description Missing CSRF proof or a cross-site mutation attempt */
+        CSRFRejected: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "csrf_failed",
+                 *         "message": "Todo mutation requires X-Sumi-CSRF: 1"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Todo JSON mutation did not use application/json */
+        UnsupportedMediaType: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "unsupported_media_type",
+                 *         "message": "Content-Type must be application/json"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description Todo is absent or belongs to another user */
         TodoNotFound: {
             headers: {
@@ -787,6 +844,8 @@ export interface components {
          *     exclusively from the authenticated session.
          */
         ViaAgent: boolean;
+        /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
+        TodoCSRF: "1";
     };
     requestBodies: never;
     headers: never;
@@ -812,6 +871,41 @@ export interface operations {
                     "application/json": {
                         /** @enum {string} */
                         status: "ok";
+                    };
+                };
+            };
+        };
+    };
+    getReadiness: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ready */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        status: "ready";
+                    };
+                };
+            };
+            /** @description An enabled dependency is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        status: "unavailable";
                     };
                 };
             };
@@ -984,7 +1078,9 @@ export interface operations {
     createTodo: {
         parameters: {
             query?: never;
-            header?: {
+            header: {
+                /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
+                "X-Sumi-CSRF": components["parameters"]["TodoCSRF"];
                 /**
                  * @description Informational marker set to true by the Sumi Todo tool client. It only
                  *     controls `via_agent` and never grants authority; ownership still comes
@@ -1014,6 +1110,8 @@ export interface operations {
             };
             400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["CSRFRejected"];
+            415: components["responses"]["UnsupportedMediaType"];
             500: components["responses"]["InternalError"];
         };
     };
@@ -1047,7 +1145,10 @@ export interface operations {
             query: {
                 expected_version: number;
             };
-            header?: never;
+            header: {
+                /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
+                "X-Sumi-CSRF": components["parameters"]["TodoCSRF"];
+            };
             path: {
                 id: components["parameters"]["TodoID"];
             };
@@ -1064,6 +1165,7 @@ export interface operations {
             };
             400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["CSRFRejected"];
             404: components["responses"]["TodoNotFound"];
             409: components["responses"]["VersionConflict"];
             500: components["responses"]["InternalError"];
@@ -1072,7 +1174,9 @@ export interface operations {
     updateTodo: {
         parameters: {
             query?: never;
-            header?: {
+            header: {
+                /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
+                "X-Sumi-CSRF": components["parameters"]["TodoCSRF"];
                 /**
                  * @description Informational marker set to true by the Sumi Todo tool client. It only
                  *     controls `via_agent` and never grants authority; ownership still comes
@@ -1102,8 +1206,10 @@ export interface operations {
             };
             400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["CSRFRejected"];
             404: components["responses"]["TodoNotFound"];
             409: components["responses"]["VersionConflict"];
+            415: components["responses"]["UnsupportedMediaType"];
             500: components["responses"]["InternalError"];
         };
     };

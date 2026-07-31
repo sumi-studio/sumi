@@ -13,12 +13,13 @@ PostgreSQL → migration → API stack:
 ```sh
 make compose-env
 make compose-up
-curl http://localhost:8080/health
+curl http://localhost:8080/ready
 ```
 
-The generated `.env` is mode `0600` and ignored by Git. Compose initializes a
-development `users` table and the UUID
-`019c0000-0000-7000-8000-000000000001`, then applies the embedded Todo migration.
+The generated `.env` is mode `0600` and ignored by Git. Compose applies the
+embedded Todo migration to PostgreSQL, enables the Todo backend, and explicitly
+opts into the temporary development session adapter. Production Todo routes stay
+disabled until user-scoped authentication is implemented.
 
 To exercise the authenticated Todo API:
 
@@ -26,6 +27,7 @@ To exercise the authenticated Todo API:
 cookie="$(make -s compose-session)"
 curl -sS -b "$cookie" \
   -H 'Content-Type: application/json' \
+  -H 'X-Sumi-CSRF: 1' \
   -d '{"title":"Composeで作ったTodo","due":{"kind":"date","date":"2026-08-01","timezone":"Asia/Tokyo"}}' \
   http://localhost:8080/v1/todos
 curl -sS -b "$cookie" http://localhost:8080/v1/todos
@@ -48,12 +50,6 @@ and public routing are outside this local stack; do not deploy the generated `.e
 
 ### Direct execution
 
-The Todo migration expects the identity/control-plane schema to already provide:
-
-```sql
-CREATE TABLE users (user_id UUID PRIMARY KEY);
-```
-
 Set `SUMI_DATABASE_URL` to a PostgreSQL connection string, then run:
 
 ```sh
@@ -61,9 +57,18 @@ go run ./cmd/migrate
 go run ./cmd/server
 ```
 
+Set both `SUMI_TODO_ENABLED=true` and `SUMI_TODO_DEV_SESSION_AUTH=true` only for
+local backend development. Without `SUMI_TODO_ENABLED=true`, the conversation API
+starts without PostgreSQL and does not register `/v1/todos`. The migration can run
+against a clean database; it stores the internal owner UUID without creating or
+requiring the control-plane `users` table. Production authz must validate that
+owner before Todo routes are enabled with a future user-scoped verifier.
+
 `SUMI_DEFAULT_TIMEZONE` is optional and defaults to `Asia/Tokyo`. The server derives
 `owner_user_id` only from the signed `sumi_session` and requires that claim to be an
 internal UUID. Every Todo repository operation includes that owner in its SQL predicate.
+POST, PATCH, and DELETE also require `X-Sumi-CSRF: 1`; JSON mutations require
+`Content-Type: application/json`.
 
 The Go `AgentTools` adapter exposes `list_todos`, `get_todo`, `create_todo`,
 `update_todo`, and `propose_delete`. It deliberately provides no `delete_todo`; only

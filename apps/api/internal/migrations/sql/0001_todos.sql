@@ -1,6 +1,6 @@
 CREATE TABLE todos (
   id            UUID PRIMARY KEY,
-  owner_user_id UUID NOT NULL REFERENCES users(user_id),
+  owner_user_id UUID NOT NULL,
   title         TEXT NOT NULL,
   description   TEXT NOT NULL DEFAULT '',
   status        TEXT NOT NULL DEFAULT 'open',

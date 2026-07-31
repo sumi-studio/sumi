@@ -228,6 +228,14 @@ func scanTodo(row todoScanner) (Todo, error) {
 		if dueTimezone != nil {
 			item.Due.Timezone = *dueTimezone
 		}
+		if item.Due.Kind == DueKindDatetime && item.Due.At != nil {
+			location, err := time.LoadLocation(item.Due.Timezone)
+			if err != nil {
+				return Todo{}, fmt.Errorf("load stored Todo timezone %q: %w", item.Due.Timezone, err)
+			}
+			localized := item.Due.At.In(location)
+			item.Due.At = &localized
+		}
 	}
 	return item, nil
 }

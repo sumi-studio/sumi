@@ -42,13 +42,9 @@ func TestPostgresTodoContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	if _, err := pool.Exec(ctx, "CREATE TABLE users (user_id UUID PRIMARY KEY)"); err != nil {
-		t.Fatal(err)
-	}
+	// Todo migrations must apply to a clean schema without owning or requiring
+	// the control-plane users table.
 	if err := migrations.Run(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, "INSERT INTO users (user_id) VALUES ($1), ($2)", ownerA, ownerB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,17 +55,30 @@ func TestPostgresTodoContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if item.Due == nil || item.Due.At == nil || item.Due.At.Format(time.RFC3339) != "2026-08-01T15:00:00+09:00" {
+		t.Fatalf("datetime response lost its timezone offset: %+v", item.Due)
+	}
 	if _, err := service.Get(ctx, ownerB, item.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-owner get returned %v", err)
 	}
 
+	roundTripDue := &DueInput{
+		Kind: DueKindDatetime, At: item.Due.At.Format(time.RFC3339), Timezone: item.Due.Timezone,
+	}
+	item, err = service.Update(ctx, ownerA, item.ID, UpdateInput{
+		ExpectedVersion: item.Version, DueSet: true, Due: roundTripDue,
+	}, false)
+	if err != nil {
+		t.Fatalf("round-trip datetime response through update: %v", err)
+	}
+
 	title := "current"
-	updated, err := service.Update(ctx, ownerA, item.ID, UpdateInput{ExpectedVersion: 1, Title: &title}, false)
+	updated, err := service.Update(ctx, ownerA, item.ID, UpdateInput{ExpectedVersion: item.Version, Title: &title}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stale := "stale"
-	if _, err := service.Update(ctx, ownerA, item.ID, UpdateInput{ExpectedVersion: 1, Title: &stale}, false); err == nil {
+	if _, err := service.Update(ctx, ownerA, item.ID, UpdateInput{ExpectedVersion: item.Version, Title: &stale}, false); err == nil {
 		t.Fatal("stale update unexpectedly succeeded")
 	}
 	current, err := service.Get(ctx, ownerA, item.ID)

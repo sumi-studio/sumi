@@ -294,8 +294,10 @@ CREATE TABLE todos (
 );
 ```
 
-実migrationでは内部`users(user_id)`へのforeign keyを追加する。外部identity provider
-へのforeign keyやFirebase UID columnは追加しない。
+target構成では内部`users(user_id)`との参照整合性をcontrol-plane migrationで管理する。
+現在のTodo backend prototypeはclean databaseへ単独適用できるようowner UUIDを保持する
+だけで、`users` tableの作成やforeign key追加を行わない。外部identity providerへの
+foreign keyやFirebase UID columnも追加しない。
 
 推奨index:
 
@@ -818,17 +820,19 @@ release gateとして追記する。根拠のない数値を本設計の保証�
 
 ## 16. Current repository gap and migration
 
-設計時点の既存実装には次の差がある。
+現在のbackend prototypeには次の実装と差がある。
 
-- `contracts/openapi.yaml`はhealth、conversation command、browser/agent WebSocketを
-  定義しており、Todo contractは未定義。
+- `contracts/openapi.yaml`、Go handler/service/repository、PostgreSQL migrationに
+  Todo CRUDのMVP contractを実装済みである。
 - 現行browser `UserSessionClaims`はconversation-scopedであり、
   `conversation_id`を必須とする。
 - 現行agent Bearer tokenもevent gateway用identityとaudienceを持つ。
 - Firebase login/session exchange、user-scoped opaque session、正式なauthz
   control planeは別設計にあり、現行serverへ未結線である。
-- Go APIは現在durable conversation gateway中心で、一般domain CRUDのrepository
-  compositionは未実装。
+- Todo routeは`SUMI_TODO_ENABLED=true`かつ`SUMI_TODO_DEV_SESSION_AUTH=true`の場合だけ
+  登録し、conversation-scoped cookie adapterはlocal backend developmentに限定する。
+- 正式なuser-scoped auth、agent authority、soft delete、audit event、idempotency、
+  keyset paginationは未実装である。
 
 Todo実装で行ってはいけない暫定対応:
 

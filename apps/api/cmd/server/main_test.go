@@ -76,7 +76,6 @@ func setSessionSecret(t *testing.T) {
 	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
 	t.Setenv("SUMI_BROWSER_SESSION_AUDIENCE", agentevents.DefaultBrowserAudience())
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
-	t.Setenv("SUMI_DATABASE_URL", "postgres://sumi:sumi@127.0.0.1:5432/sumi?sslmode=disable")
 }
 
 func postAuthorized(t *testing.T, serverURL, conversationID string, body []byte) *http.Response {
@@ -173,6 +172,64 @@ func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {
 	_, err := newRouter()
 	if err == nil || !strings.Contains(err.Error(), "SUMI_AGENT_RUNTIME_STATE_DIR") {
 		t.Fatalf("expected explicit runtime-state directory error, got %v", err)
+	}
+}
+
+func TestNewRouter_DefaultDisablesTodoWithoutDatabase(t *testing.T) {
+	setSessionSecret(t)
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_TODO_ENABLED", "")
+	t.Setenv("SUMI_DATABASE_URL", "")
+	mux, err := newRouter()
+	if err != nil {
+		t.Fatalf("Todo-disabled router required a database: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/todos", nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("Todo-disabled route status = %d, want 404", response.Code)
+	}
+	readyRequest := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	readyResponse := httptest.NewRecorder()
+	mux.ServeHTTP(readyResponse, readyRequest)
+	if readyResponse.Code != http.StatusOK {
+		t.Fatalf("Todo-disabled readiness status = %d, want 200", readyResponse.Code)
+	}
+}
+
+func TestNewRouter_TodoRequiresExplicitDevelopmentAuth(t *testing.T) {
+	setSessionSecret(t)
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_TODO_ENABLED", "true")
+	t.Setenv("SUMI_TODO_DEV_SESSION_AUTH", "")
+	_, err := newRouter()
+	if err == nil || !strings.Contains(err.Error(), "SUMI_TODO_DEV_SESSION_AUTH") {
+		t.Fatalf("expected explicit Todo development auth error, got %v", err)
+	}
+}
+
+func TestNewRouter_TodoRequiresDatabaseOnlyWhenEnabled(t *testing.T) {
+	setSessionSecret(t)
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_TODO_ENABLED", "true")
+	t.Setenv("SUMI_TODO_DEV_SESSION_AUTH", "true")
+	t.Setenv("SUMI_DATABASE_URL", "")
+	_, err := newRouter()
+	if err == nil || !strings.Contains(err.Error(), "SUMI_DATABASE_URL") {
+		t.Fatalf("expected Todo database error, got %v", err)
+	}
+}
+
+func TestNewRouter_TodoDevelopmentAuthRequiresSessionVerifier(t *testing.T) {
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+	t.Setenv("SUMI_TODO_ENABLED", "true")
+	t.Setenv("SUMI_TODO_DEV_SESSION_AUTH", "true")
+	t.Setenv("SUMI_BROWSER_SESSION_SECRET", "")
+	_, err := newRouter()
+	if err == nil || !strings.Contains(err.Error(), "SUMI_BROWSER_SESSION_SECRET") {
+		t.Fatalf("expected Todo session verifier error, got %v", err)
 	}
 }
 

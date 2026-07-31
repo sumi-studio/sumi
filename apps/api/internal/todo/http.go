@@ -8,11 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 )
 
-const maxRequestBodyBytes = 1024 * 1024
+const (
+	maxRequestBodyBytes = 1024 * 1024
+	todoCSRFHeaderName  = "X-Sumi-CSRF"
+	todoCSRFHeaderValue = "1"
+)
 
 type Principal struct{ UserID string }
 
@@ -61,6 +68,9 @@ type createRequest struct {
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	principal, ok := h.principal(w, r)
 	if !ok {
+		return
+	}
+	if !allowMutation(w, r, true) {
 		return
 	}
 	var request createRequest
@@ -154,6 +164,9 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !allowMutation(w, r, true) {
+		return
+	}
 	var request updateRequest
 	if err := readJSON(r, &request); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
@@ -185,6 +198,9 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !allowMutation(w, r, false) {
+		return
+	}
 	expectedVersion, err := parseIntQuery(r, "expected_version", 0)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", "expected_version must be an integer", 0)
@@ -195,6 +211,34 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func allowMutation(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
+	if r.Header.Get(todoCSRFHeaderName) != todoCSRFHeaderValue {
+		writeAPIError(w, http.StatusForbidden, "csrf_failed", "Todo mutation requires X-Sumi-CSRF: 1", 0)
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "none", "same-origin":
+	default:
+		writeAPIError(w, http.StatusForbidden, "csrf_failed", "cross-site Todo mutation rejected", 0)
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		parsed, err := url.Parse(origin)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !strings.EqualFold(parsed.Host, r.Host) {
+			writeAPIError(w, http.StatusForbidden, "csrf_failed", "cross-origin Todo mutation rejected", 0)
+			return false
+		}
+	}
+	if requireJSON {
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/json" {
+			writeAPIError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json", 0)
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) writeServiceError(w http.ResponseWriter, err error) {

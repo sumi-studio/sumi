@@ -77,6 +77,18 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, err
 	}
 	mux.HandleFunc("GET /health", handler.Health)
+	if !todoEnabled() {
+		mux.HandleFunc("GET /ready", handler.Ready())
+		return mux, nil
+	}
+	if !todoDevelopmentSessionAuthEnabled() {
+		_ = store.Close()
+		return nil, errors.New("SUMI_TODO_DEV_SESSION_AUTH must be true while production Todo auth is unavailable")
+	}
+	if sv == nil {
+		_ = store.Close()
+		return nil, errors.New("SUMI_BROWSER_SESSION_SECRET is required for Todo development session auth")
+	}
 
 	databaseURL := os.Getenv("SUMI_DATABASE_URL")
 	if databaseURL == "" {
@@ -88,21 +100,48 @@ func newRouter() (*http.ServeMux, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("open todo database pool: %w", err)
 	}
+	pingContext, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPing()
+	if err := pool.Ping(pingContext); err != nil {
+		pool.Close()
+		_ = store.Close()
+		return nil, fmt.Errorf("ping todo database: %w", err)
+	}
 	todoService, err := todo.NewService(todo.NewPostgresRepository(pool), os.Getenv("SUMI_DEFAULT_TIMEZONE"))
 	if err != nil {
 		pool.Close()
 		_ = store.Close()
 		return nil, fmt.Errorf("create todo service: %w", err)
 	}
-	todo.NewHandler(todoService, todoSessionPrincipalVerifier{sessions: sv}).Register(mux)
+	todo.NewHandler(todoService, todoDevelopmentSessionPrincipalVerifier{sessions: sv}).Register(mux)
+	mux.HandleFunc("GET /ready", handler.Ready(todoDatabaseReadiness(pool)))
 	return mux, nil
 }
 
-type todoSessionPrincipalVerifier struct {
+func todoDatabaseReadiness(pool *pgxpool.Pool) func(context.Context) error {
+	return func(ctx context.Context) error {
+		pingContext, cancelPing := context.WithTimeout(ctx, 2*time.Second)
+		defer cancelPing()
+		return pool.Ping(pingContext)
+	}
+}
+
+func todoEnabled() bool {
+	return os.Getenv("SUMI_TODO_ENABLED") == "true"
+}
+
+func todoDevelopmentSessionAuthEnabled() bool {
+	return os.Getenv("SUMI_TODO_DEV_SESSION_AUTH") == "true"
+}
+
+// todoDevelopmentSessionPrincipalVerifier deliberately adapts the existing
+// conversation-scoped cookie only for the local backend development stack.
+// Production Todo routes stay disabled until user-scoped auth is available.
+type todoDevelopmentSessionPrincipalVerifier struct {
 	sessions agentevents.UserSessionVerifier
 }
 
-func (v todoSessionPrincipalVerifier) VerifyRequest(ctx context.Context, request *http.Request) (todo.Principal, error) {
+func (v todoDevelopmentSessionPrincipalVerifier) VerifyRequest(ctx context.Context, request *http.Request) (todo.Principal, error) {
 	if v.sessions == nil {
 		return todo.Principal{}, errors.New("browser session verifier unavailable")
 	}

@@ -96,7 +96,7 @@ PostgreSQL、DB migration、Go APIをまとめて再現する場合:
 ```sh
 make compose-env   # 初回のみ。Git管理外の .env にrandom secretを生成
 make compose-up
-curl http://localhost:8080/health
+curl http://localhost:8080/ready
 ```
 
 署名済みlocal sessionを使ったTodo APIの疎通例は

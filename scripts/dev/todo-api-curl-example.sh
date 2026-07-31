@@ -42,6 +42,7 @@ jq -n \
 curl --fail --silent --show-error \
   -b "$cookie" \
   -H 'Content-Type: application/json' \
+  -H 'X-Sumi-CSRF: 1' \
   --data-binary "@$request_file" \
   "$api_base/v1/todos" >"$response_file"
 jq . "$response_file"
@@ -61,6 +62,7 @@ curl --fail --silent --show-error \
   -X PATCH \
   -b "$cookie" \
   -H 'Content-Type: application/json' \
+  -H 'X-Sumi-CSRF: 1' \
   --data-binary "@$request_file" \
   "$api_base/v1/todos/$todo_id" >"$response_file"
 jq . "$response_file"
@@ -76,6 +78,7 @@ status=$(curl --silent --show-error \
   -X PATCH \
   -b "$cookie" \
   -H 'Content-Type: application/json' \
+  -H 'X-Sumi-CSRF: 1' \
   --data-binary "@$request_file" \
   "$api_base/v1/todos/$todo_id")
 if [ "$status" != "409" ]; then
@@ -96,6 +99,7 @@ status=$(curl --silent --show-error \
   -w '%{http_code}' \
   -X DELETE \
   -b "$cookie" \
+  -H 'X-Sumi-CSRF: 1' \
   "$api_base/v1/todos/$todo_id?expected_version=$updated_version")
 if [ "$status" != "204" ]; then
   echo "expected HTTP 204, got $status" >&2

@@ -20,6 +20,36 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+  /ready:
+    get:
+      operationId: getReadiness
+      summary: Dependency readiness check
+      description: Checks the Todo database when the Todo backend is enabled.
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                additionalProperties: false
+                properties:
+                  status:
+                    type: string
+                    enum: [ready]
+        "503":
+          description: An enabled dependency is unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                additionalProperties: false
+                properties:
+                  status:
+                    type: string
+                    enum: [unavailable]
   /conversations/{conversation_id}/commands:
     post:
       operationId: createUserCommand
@@ -152,11 +182,15 @@ paths:
       operationId: createTodo
       summary: Create a Todo owned by the authenticated user
       description: |
-        The owner is always derived from the authenticated `sumi_session`.
+        The owner is always derived from the authenticated development session.
         `owner_user_id` is intentionally not accepted from the request body.
+        The server registers Todo routes only when both `SUMI_TODO_ENABLED=true`
+        and `SUMI_TODO_DEV_SESSION_AUTH=true`; production user-scoped auth is not
+        implemented yet.
       security:
         - sumiSession: []
       parameters:
+        - $ref: "#/components/parameters/TodoCSRF"
         - $ref: "#/components/parameters/ViaAgent"
       requestBody:
         required: true
@@ -180,6 +214,10 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/CSRFRejected"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalError"
     get:
@@ -265,6 +303,7 @@ paths:
       security:
         - sumiSession: []
       parameters:
+        - $ref: "#/components/parameters/TodoCSRF"
         - $ref: "#/components/parameters/ViaAgent"
       requestBody:
         required: true
@@ -283,10 +322,14 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/CSRFRejected"
         "404":
           $ref: "#/components/responses/TodoNotFound"
         "409":
           $ref: "#/components/responses/VersionConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalError"
     delete:
@@ -296,6 +339,7 @@ paths:
       security:
         - sumiSession: []
       parameters:
+        - $ref: "#/components/parameters/TodoCSRF"
         - name: expected_version
           in: query
           required: true
@@ -309,6 +353,8 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/CSRFRejected"
         "404":
           $ref: "#/components/responses/TodoNotFound"
         "409":
@@ -325,7 +371,10 @@ components:
       type: apiKey
       in: cookie
       name: sumi_session
-      description: Signed HttpOnly browser session cookie.
+      description: |
+        Signed HttpOnly conversation session cookie. Todo routes may use this
+        only in the explicitly enabled local development mode; it is not a
+        production Todo credential.
   parameters:
     TodoID:
       name: id
@@ -345,6 +394,14 @@ components:
       schema:
         type: boolean
         default: false
+    TodoCSRF:
+      name: X-Sumi-CSRF
+      in: header
+      required: true
+      description: Required on every Todo mutation to prevent cookie-based CSRF.
+      schema:
+        type: string
+        enum: ["1"]
   responses:
     ValidationFailed:
       description: Request validation failed
@@ -366,6 +423,26 @@ components:
             error:
               code: unauthenticated
               message: authentication required
+    CSRFRejected:
+      description: Missing CSRF proof or a cross-site mutation attempt
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: csrf_failed
+              message: "Todo mutation requires X-Sumi-CSRF: 1"
+    UnsupportedMediaType:
+      description: Todo JSON mutation did not use application/json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unsupported_media_type
+              message: Content-Type must be application/json
     TodoNotFound:
       description: Todo is absent or belongs to another user
       content:

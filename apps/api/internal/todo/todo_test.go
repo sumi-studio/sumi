@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,6 +176,8 @@ func TestStaleExpectedVersionReturns409WithoutMutation(t *testing.T) {
 	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
 	body := []byte(`{"expected_version":1,"title":"stale update"}`)
 	request := httptest.NewRequest(http.MethodPatch, "/v1/todos/"+item.ID, bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
 	if response.Code != http.StatusConflict {
@@ -296,6 +299,8 @@ func TestHTTPAgentMarkerSetsViaAgentWithoutChangingOwner(t *testing.T) {
 	mux := http.NewServeMux()
 	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
 	request := httptest.NewRequest(http.MethodPost, "/v1/todos", bytes.NewReader([]byte(`{"title":"agent HTTP"}`)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
 	request.Header.Set("X-Sumi-Via-Agent", "true")
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
@@ -314,5 +319,64 @@ func TestHTTPAgentMarkerSetsViaAgentWithoutChangingOwner(t *testing.T) {
 	}
 	if _, ok := repository.items[ownerB][item.ID]; ok {
 		t.Fatal("agent marker changed owner scope")
+	}
+}
+
+func TestTodoMutationsRequireCSRFHeader(t *testing.T) {
+	service := newTestService(t, newMemoryRepository())
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "create", method: http.MethodPost, path: "/v1/todos", body: `{"title":"blocked"}`},
+		{name: "update", method: http.MethodPatch, path: "/v1/todos/019c0000-0000-7000-8000-000000000010", body: `{"expected_version":1,"title":"blocked"}`},
+		{name: "delete", method: http.MethodDelete, path: "/v1/todos/019c0000-0000-7000-8000-000000000010?expected_version=1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			if test.body != "" {
+				request.Header.Set("Content-Type", "application/json")
+			}
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("got status %d, want 403: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestTodoMutationRejectsCrossOrigin(t *testing.T) {
+	service := newTestService(t, newMemoryRepository())
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
+	request := httptest.NewRequest(http.MethodPost, "http://api.example.test/v1/todos", strings.NewReader(`{"title":"blocked"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
+	request.Header.Set("Origin", "https://attacker.example")
+	request.Header.Set("Sec-Fetch-Site", "cross-site")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("got status %d, want 403: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTodoMutationRequiresJSONContentType(t *testing.T) {
+	service := newTestService(t, newMemoryRepository())
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
+	request := httptest.NewRequest(http.MethodPost, "/v1/todos", strings.NewReader(`{"title":"blocked"}`))
+	request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("got status %d, want 415: %s", response.Code, response.Body.String())
 	}
 }
