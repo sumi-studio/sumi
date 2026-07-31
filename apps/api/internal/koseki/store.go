@@ -152,6 +152,30 @@ func (s *Store) CurrentEmployer(ctx context.Context, agentID string) (string, st
 	return employerType, employerID, nil
 }
 
+// ListAgents returns the PersonalityAgentIds of all agents registered in the
+// 戸籍. The control plane uses this to provision runtime authorizations
+// dynamically instead of from a single env-configured agent.
+func (s *Store) ListAgents(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT personality_agent_id FROM agents ORDER BY created_at")
+	if err != nil {
+		return nil, fmt.Errorf("list agents: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan agent id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agents: %w", err)
+	}
+	return ids, nil
+}
+
 // Registration is the result of auto-registering a previously unbound credential
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
 // and the per-agent wrapping key generated at hire time.

@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
@@ -284,7 +285,7 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		authServer.RegisterRoutes(mux)
 	}
-	localControl, enabled, err := localControlServerFromEnv(runtime)
+	localControl, enabled, err := localControlServerFromEnvWithDB(runtime, database.Pool)
 	if err != nil {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
@@ -1663,8 +1664,20 @@ func localControlPreviousSigningSecretsFromEnv() ([][]byte, error) {
 
 // localControlServerFromEnv constructs one exact runtime authorization binding.
 // Enabling it also requires an explicit dedicated listener; these routes are
-// never registered on the public API mux.
+// never registered on the public API mux. A nil pool preserves the legacy
+// single-agent env contract for tests.
 func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevents.LocalControlServer, bool, error) {
+	return localControlServerFromEnvWithDB(runtime, nil)
+}
+
+// localControlServerFromEnvWithDB dynamically registers runtime authorizations
+// for every agent in the 戸籍 when pool is non-nil (ADR 0009 §1, issue #125).
+// The env-configured agent (if any) keeps the shared bearer so the legacy
+// single-process dev launcher keeps working without changes; additional 戸籍
+// agents get per-agent derived bearers so each can connect when spawned. The
+// single-agent SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID setting is optional in
+// this mode.
+func localControlServerFromEnvWithDB(runtime *agentevents.DurableGateway, pool *pgxpool.Pool) (*agentevents.LocalControlServer, bool, error) {
 	switch enabled := os.Getenv("SUMI_LOCAL_CONTROL_ENABLED"); enabled {
 	case "", "0":
 		return nil, false, nil
@@ -1685,10 +1698,6 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 		return nil, false, err
 	}
 	tenantID, err := required("SUMI_LOCAL_CONTROL_TENANT_ID")
-	if err != nil {
-		return nil, false, err
-	}
-	personalityAgentID, err := required("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")
 	if err != nil {
 		return nil, false, err
 	}
@@ -1727,24 +1736,104 @@ func localControlServerFromEnv(runtime *agentevents.DurableGateway) (*agentevent
 	if controlAudience != agentAudience {
 		return nil, false, errors.New("SUMI_LOCAL_CONTROL_AUDIENCE must match SUMI_AGENT_TOKEN_AUDIENCE")
 	}
+
+	authorizations, err := buildLocalControlAuthorizations(
+		bearer, tenantID, rpcBootNonce, generation, controlAudience,
+		agentevents.LocalDeliveryAuthorization(deliveryRaw), pool,
+	)
+	if err != nil {
+		return nil, false, err
+	}
 	control, err := agentevents.NewLocalControlServerWithPreviousSigningSecrets(
 		runtime,
 		signingSecret,
 		previousSigningSecrets,
-		[]agentevents.LocalRuntimeAuthorization{{
-			BearerToken:           bearer,
-			TenantID:              tenantID,
-			PersonalityAgentID:    personalityAgentID,
-			Generation:            generation,
-			RPCBootNonce:          rpcBootNonce,
-			Audience:              controlAudience,
-			DeliveryAuthorization: agentevents.LocalDeliveryAuthorization(deliveryRaw),
-		}},
+		authorizations,
 	)
 	if err != nil {
 		return nil, false, err
 	}
 	return control, true, nil
+}
+
+// buildLocalControlAuthorizations assembles the runtime authorization list. In
+// the legacy single-agent mode (pool == nil) the env-configured
+// SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID is required and uses the shared
+// bearer. In koseki mode (pool != nil) every agent in the 戸籍 is registered;
+// the env agent (if set) keeps the shared bearer, and the rest get per-agent
+// derived bearers.
+func buildLocalControlAuthorizations(
+	bearer, tenantID, rpcBootNonce string,
+	generation uint64,
+	audience string,
+	delivery agentevents.LocalDeliveryAuthorization,
+	pool *pgxpool.Pool,
+) ([]agentevents.LocalRuntimeAuthorization, error) {
+	envAgentID := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID"))
+	if pool == nil {
+		if envAgentID == "" {
+			return nil, errors.New("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID not set")
+		}
+		return []agentevents.LocalRuntimeAuthorization{{
+			BearerToken:           bearer,
+			TenantID:              tenantID,
+			PersonalityAgentID:    envAgentID,
+			Generation:            generation,
+			RPCBootNonce:          rpcBootNonce,
+			Audience:              audience,
+			DeliveryAuthorization: delivery,
+		}}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	agentIDs, err := koseki.New(pool).ListAgents(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load 戸籍 agents: %w", err)
+	}
+	seen := make(map[string]bool, len(agentIDs)+1)
+	var authorizations []agentevents.LocalRuntimeAuthorization
+	// The env-configured agent (if any) keeps the shared bearer so the legacy
+	// single-process dev launcher connects without a derived-credential change.
+	if envAgentID != "" {
+		authorizations = append(authorizations, agentevents.LocalRuntimeAuthorization{
+			BearerToken:           bearer,
+			TenantID:              tenantID,
+			PersonalityAgentID:    envAgentID,
+			Generation:            generation,
+			RPCBootNonce:          rpcBootNonce,
+			Audience:              audience,
+			DeliveryAuthorization: delivery,
+		})
+		seen[envAgentID] = true
+	}
+	for _, agentID := range agentIDs {
+		if seen[agentID] {
+			continue
+		}
+		seen[agentID] = true
+		authorizations = append(authorizations, agentevents.LocalRuntimeAuthorization{
+			BearerToken:           deriveAgentCredential(bearer, agentID),
+			TenantID:              tenantID,
+			PersonalityAgentID:    agentID,
+			Generation:            generation,
+			RPCBootNonce:          deriveAgentCredential(rpcBootNonce, agentID),
+			Audience:              audience,
+			DeliveryAuthorization: delivery,
+		})
+	}
+	if len(authorizations) == 0 {
+		return nil, errors.New("no agents registered in 戸籍 and no SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID set")
+	}
+	return authorizations, nil
+}
+
+// deriveAgentCredential produces a per-agent bearer/nonce from a shared secret
+// and the agent id. The derivation is a simple, deterministic concatenation
+// suitable for the dev control plane; each agent gets a unique credential so
+// the LocalControlServer can distinguish them.
+func deriveAgentCredential(shared, agentID string) string {
+	return shared + "/" + agentID
 }
 
 // browserSessionVerifierFromEnv is deliberately separate from the agent token
