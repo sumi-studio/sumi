@@ -209,3 +209,56 @@ func TestResearchConsentRegisterLookupAndRevoke(t *testing.T) {
 		t.Fatal("expected active consent after re-grant")
 	}
 }
+
+func TestSetResearchConsentTracksDecision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool := connectTestPool(t, ctx)
+	store := New(pool)
+
+	humanID, err := store.MintHuman(ctx)
+	if err != nil {
+		t.Fatalf("mint human: %v", err)
+	}
+	// Before any decision: not decided, not granted.
+	decided, granted, err := store.ResearchConsentState(ctx, humanID)
+	if err != nil {
+		t.Fatalf("state before decision: %v", err)
+	}
+	if decided || granted {
+		t.Fatalf("expected undecided before decision, got decided=%v granted=%v", decided, granted)
+	}
+	// Decline: decided=true, granted=false.
+	if err := store.SetResearchConsent(ctx, humanID, false); err != nil {
+		t.Fatalf("decline consent: %v", err)
+	}
+	decided, granted, err = store.ResearchConsentState(ctx, humanID)
+	if err != nil {
+		t.Fatalf("state after decline: %v", err)
+	}
+	if !decided || granted {
+		t.Fatalf("expected decided+not granted after decline, got decided=%v granted=%v", decided, granted)
+	}
+	// Change to grant: decided=true, granted=true.
+	if err := store.SetResearchConsent(ctx, humanID, true); err != nil {
+		t.Fatalf("grant consent: %v", err)
+	}
+	decided, granted, err = store.ResearchConsentState(ctx, humanID)
+	if err != nil {
+		t.Fatalf("state after grant: %v", err)
+	}
+	if !decided || !granted {
+		t.Fatalf("expected decided+granted after grant, got decided=%v granted=%v", decided, granted)
+	}
+	// Change back to decline: decided=true, granted=false.
+	if err := store.SetResearchConsent(ctx, humanID, false); err != nil {
+		t.Fatalf("decline consent again: %v", err)
+	}
+	decided, granted, err = store.ResearchConsentState(ctx, humanID)
+	if err != nil {
+		t.Fatalf("state after re-decline: %v", err)
+	}
+	if !decided || granted {
+		t.Fatalf("expected decided+not granted after re-decline, got decided=%v granted=%v", decided, granted)
+	}
+}

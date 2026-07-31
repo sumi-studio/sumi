@@ -50,6 +50,13 @@ type DirectChatAuthorizer interface {
 	AuthorizeDirectChat(ctx context.Context, humanID, personalityAgentID string) error
 }
 
+// ResearchConsentStore reads and writes a Human's 研究協力 consent decision
+// (ADR 0009 §6). "decided" distinguishes an explicit decline from "never asked".
+type ResearchConsentStore interface {
+	ResearchConsentState(ctx context.Context, humanID string) (decided bool, granted bool, err error)
+	SetResearchConsent(ctx context.Context, humanID string, granted bool) error
+}
+
 // StaticIdentityBindingResolver is the deliberately narrow hackathon binding:
 // exactly one configured Firebase UID maps to exactly one server-owned Sumi
 // principal. Every other external identity is denied.
@@ -127,8 +134,11 @@ type BrowserAuthServer struct {
 	SecureCookies  bool
 	SessionTTL     time.Duration
 	Connections    BrowserSessionConnectionCloser
-	random         io.Reader
-	sessionMu      sync.Mutex
+	// Consents optionally serves the 研究協力 consent UI contract. When nil,
+	// the consent routes are not registered.
+	Consents ResearchConsentStore
+	random   io.Reader
+	sessionMu sync.Mutex
 }
 
 func NewBrowserAuthServer(
@@ -167,6 +177,10 @@ func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/session", s.serveSessionExchange)
 	mux.HandleFunc("GET /auth/session", s.serveSessionStatus)
 	mux.HandleFunc("POST /auth/logout", s.serveLogout)
+	if s.Consents != nil {
+		mux.HandleFunc("GET /auth/consent", s.serveConsentStatus)
+		mux.HandleFunc("POST /auth/consent", s.serveConsentUpdate)
+	}
 }
 
 func (s *BrowserAuthServer) serveCSRF(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +340,83 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 	http.SetCookie(w, s.csrfCookie("", -1))
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *BrowserAuthServer) serveConsentStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.allowSafeReadOrigin(w, r) {
+		return
+	}
+	claims, ok := s.requireVerifiedClaims(w, r)
+	if !ok {
+		return
+	}
+	decided, granted, err := s.Consents.ResearchConsentState(r.Context(), claims.UserID)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "consent unavailable")
+		return
+	}
+	writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{
+		"decided":  decided,
+		"granted":  granted,
+	})
+}
+
+func (s *BrowserAuthServer) serveConsentUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
+		return
+	}
+	claims, ok := s.requireVerifiedClaims(w, r)
+	if !ok {
+		return
+	}
+	if !hasJSONContentType(r.Header.Get("Content-Type")) {
+		writeBrowserAuthError(w, http.StatusUnsupportedMediaType, "application/json required")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuthRequestBytes))
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusRequestEntityTooLarge, "request too large")
+		return
+	}
+	if err := checkDuplicateKeys(body); err != nil {
+		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	var request struct {
+		Grant bool `json:"grant"`
+	}
+	if err := unmarshalStrict(body, &request); err != nil {
+		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := s.Consents.SetResearchConsent(r.Context(), claims.UserID, request.Grant); err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "consent unavailable")
+		return
+	}
+	writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{
+		"decided": true,
+		"granted": request.Grant,
+	})
+}
+
+// requireVerifiedClaims extracts and verifies the browser session, writing an
+// unauthorized response on failure. It returns the claims and true on success.
+func (s *BrowserAuthServer) requireVerifiedClaims(w http.ResponseWriter, r *http.Request) (UserSessionClaims, bool) {
+	cookie, err := uniqueBrowserSessionCookie(r)
+	if err != nil {
+		if errors.Is(err, errBrowserSessionDuplicate) {
+			writeBrowserAuthError(w, http.StatusBadRequest, "duplicate session cookies")
+			return UserSessionClaims{}, false
+		}
+		writeBrowserAuthError(w, http.StatusUnauthorized, "missing session")
+		return UserSessionClaims{}, false
+	}
+	claims, err := s.Sessions.VerifySession(r.Context(), cookie.Value)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusUnauthorized, "invalid session")
+		return UserSessionClaims{}, false
+	}
+	return claims, true
 }
 
 func (s *BrowserAuthServer) allowOrigin(w http.ResponseWriter, r *http.Request) bool {

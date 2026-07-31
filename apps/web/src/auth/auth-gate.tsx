@@ -1,11 +1,27 @@
 import { Button } from "@sumi/ui/components/button";
 import type { ReactNode } from "react";
-import { LoginScreen } from "./login-screen";
 import { useAuth } from "./auth-context";
+import { ConsentScreen } from "./consent-screen";
+import { LoginScreen } from "./login-screen";
+import { useResearchConsent } from "./use-research-consent";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const { canUseDirectChat, loading, sessionState, refreshSession } = useAuth();
+  // The 研究協力 request is shown only for real authenticated sessions (not the
+  // preissued dev mode), and only until the Human makes an explicit decision.
+  const consent = useResearchConsent(
+    canUseDirectChat && sessionState === "authenticated",
+  );
 
+  if (canUseDirectChat && sessionState === "authenticated") {
+    if (consent.loading) {
+      return <AuthStatus title="同意状態を確認しています…" />;
+    }
+    if (!consent.decided) {
+      return <ConsentScreen onChangeComplete={() => void consent.refresh()} />;
+    }
+    return children;
+  }
   if (canUseDirectChat) {
     return children;
   }

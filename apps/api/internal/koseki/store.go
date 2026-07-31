@@ -277,6 +277,61 @@ func (s *Store) ResearchConsentActive(ctx context.Context, humanID string) (bool
 	return exists, nil
 }
 
+// ResearchConsentState reports whether a Human has made an explicit 研究協力
+// decision (decided) and whether they currently grant it (granted). "decided"
+// distinguishes an explicit decline from "never asked", so the signup UI shows
+// the request only until the Human chooses (ADR 0009 §6).
+func (s *Store) ResearchConsentState(ctx context.Context, humanID string) (decided bool, granted bool, err error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT
+		  EXISTS (SELECT 1 FROM research_consents WHERE human_id = $1),
+		  EXISTS (SELECT 1 FROM research_consents WHERE human_id = $1 AND revoked_at IS NULL)`,
+		humanID)
+	if err := row.Scan(&decided, &granted); err != nil {
+		return false, false, fmt.Errorf("query research consent state: %w", err)
+	}
+	return decided, granted, nil
+}
+
+// SetResearchConsent records a Human's explicit 研究協力 decision. When granted
+// is true an active consent is ensured. When false any active consent is
+// revoked and, if the Human has no record at all, a declined marker is left so
+// the UI can tell "decided no" from "never asked".
+func (s *Store) SetResearchConsent(ctx context.Context, humanID string, granted bool) error {
+	if err := s.humanExists(ctx, humanID); err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin set research consent: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		"UPDATE research_consents SET revoked_at = now() WHERE human_id = $1 AND revoked_at IS NULL",
+		humanID); err != nil {
+		return fmt.Errorf("revoke active consent: %w", err)
+	}
+	if granted {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO research_consents (human_id)
+			 SELECT $1::text WHERE NOT EXISTS (
+			   SELECT 1 FROM research_consents WHERE human_id = $1 AND revoked_at IS NULL
+			 )`, humanID); err != nil {
+			return fmt.Errorf("grant consent: %w", err)
+		}
+	} else if _, err := tx.Exec(ctx,
+		`INSERT INTO research_consents (human_id, granted_at, revoked_at)
+		 SELECT $1::text, now(), now()
+		 WHERE NOT EXISTS (SELECT 1 FROM research_consents WHERE human_id = $1)`,
+		humanID); err != nil {
+		return fmt.Errorf("record declined consent: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit set research consent: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) humanExists(ctx context.Context, humanID string) error {
 	var exists bool
 	err := s.pool.QueryRow(ctx,

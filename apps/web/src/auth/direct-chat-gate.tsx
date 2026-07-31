@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useConversation } from "../agent/store";
 import { ChatScreen } from "../components/chat-screen";
 import { useAuth } from "./auth-context";
+import { ConsentSettingsButton } from "./consent-settings-button";
 
 /**
  * A failed authenticated upgrade is indistinguishable from a transient close
@@ -25,5 +26,10 @@ export function DirectChatGate() {
     }
   }, [connection, refreshSession]);
 
-  return <ChatScreen />;
+  return (
+    <>
+      <ConsentSettingsButton />
+      <ChatScreen />
+    </>
+  );
 }

@@ -271,6 +271,9 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.Connections = browser
+		if database != nil {
+			authServer.Consents = koseki.New(database.Pool)
+		}
 		authServer.RegisterRoutes(mux)
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)

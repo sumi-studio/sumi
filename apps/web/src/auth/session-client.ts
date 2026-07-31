@@ -171,6 +171,62 @@ export async function logoutSumiSession(): Promise<void> {
   }
 }
 
+export interface ResearchConsentState {
+  decided: boolean;
+  granted: boolean;
+}
+
+export async function getResearchConsent(): Promise<ResearchConsentState> {
+  const response = await fetch("/auth/consent", {
+    credentials: "include",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    signal: authRequestSignal(),
+  });
+  if (!response.ok) {
+    throw await authAPIError(response);
+  }
+  const body = await readAuthJSON(response);
+  if (
+    !isObject(body) ||
+    typeof body.decided !== "boolean" ||
+    typeof body.granted !== "boolean"
+  ) {
+    throw new AuthAPIError("Invalid consent response.", response.status);
+  }
+  return { decided: body.decided, granted: body.granted };
+}
+
+export async function setResearchConsent(
+  grant: boolean,
+): Promise<ResearchConsentState> {
+  const csrfToken = await fetchCSRFToken();
+  const response = await fetch("/auth/consent", {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-CSRF-Token": csrfToken,
+    },
+    body: JSON.stringify({ grant }),
+    signal: authRequestSignal(),
+  });
+  if (!response.ok) {
+    throw await authAPIError(response);
+  }
+  const body = await readAuthJSON(response);
+  if (
+    !isObject(body) ||
+    typeof body.decided !== "boolean" ||
+    typeof body.granted !== "boolean"
+  ) {
+    throw new AuthAPIError("Invalid consent response.", response.status);
+  }
+  return { decided: body.decided, granted: body.granted };
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
