@@ -19,7 +19,7 @@ func TestNewProductionMux_NilStoreReturnsError(t *testing.T) {
 		t.Fatalf("open durable gateway: %v", err)
 	}
 
-	_, _, _, err = NewProductionMux(nil, gateway, nil, nil, nil, nil)
+	_, _, _, err = NewProductionMux(nil, gateway, nil, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected NewProductionMux to return an error for nil store")
 	}
@@ -46,6 +46,7 @@ func TestNewProductionMux_WiresBrowserOriginPolicyToCommandIngress(t *testing.T)
 		&fakeSessionVerifier{},
 		nil,
 		[]string{testBrowserOrigin},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("new production mux: %v", err)

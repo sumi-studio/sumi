@@ -24,6 +24,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"golang.org/x/sys/unix"
 )
 
@@ -254,7 +255,11 @@ func newApplicationFromEnv() (*application, error) {
 		database.Close()
 	}
 
-	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)
+	var directChatAuthorizer agentevents.DirectChatAuthorizer
+	if database != nil {
+		directChatAuthorizer = newKosekiDirectChatAuthorizer(koseki.New(database.Pool))
+	}
+	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins, directChatAuthorizer)
 	if err != nil {
 		closeOnError()
 		return nil, err

@@ -65,6 +65,9 @@ type UserCommandIngress struct {
 	Sessions       UserSessionAuthorizer
 	MaxBytes       int64
 	AllowedOrigins []string
+	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
+	// ADR 0009 §5). A nil Authorizer permits any verified session.
+	Authorizer DirectChatAuthorizer
 }
 
 var errCommandAppenderRequired = errors.New("CommandAppender is required")
@@ -107,6 +110,12 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
+	}
+	if h.Authorizer != nil {
+		if err := h.Authorizer.AuthorizeDirectChat(r.Context(), claims.UserID, claims.PersonalityAgentID); err != nil {
+			http.Error(w, "not authorized for this agent", http.StatusForbidden)
+			return
+		}
 	}
 
 	raw, err := readLimitedBody(r.Body, h.MaxBytes)
