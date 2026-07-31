@@ -95,15 +95,6 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, fmt.Errorf("create todo service: %w", err)
 	}
 	todo.NewHandler(todoService, todoSessionPrincipalVerifier{sessions: sv}).Register(mux)
-	if developmentSessionEnabled() {
-		developmentSession, err := developmentSessionHandlerFromEnv()
-		if err != nil {
-			pool.Close()
-			_ = store.Close()
-			return nil, fmt.Errorf("development session handler: %w", err)
-		}
-		mux.HandleFunc("POST /__dev__/session", developmentSession)
-	}
 	return mux, nil
 }
 
@@ -179,41 +170,4 @@ func browserSessionVerifierFromEnv() (agentevents.UserSessionVerifier, error) {
 	}
 	audience := os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")
 	return agentevents.NewHMACUserSessionVerifier(secret, audience)
-}
-
-func developmentSessionEnabled() bool {
-	return os.Getenv("SUMI_ENABLE_DEV_SESSION") == "true"
-}
-
-func developmentSessionHandlerFromEnv() (http.HandlerFunc, error) {
-	b64 := os.Getenv("SUMI_BROWSER_SESSION_SECRET")
-	secret, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, fmt.Errorf("decode browser session secret: %w", err)
-	}
-	userID := os.Getenv("SUMI_DEV_SESSION_USER_ID")
-	if !todo.IsUUID(userID) {
-		return nil, errors.New("SUMI_DEV_SESSION_USER_ID must be a UUID")
-	}
-	audience := os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")
-	return func(w http.ResponseWriter, _ *http.Request) {
-		session, err := agentevents.IssueHMACUserSession(secret, audience, agentevents.UserSessionClaims{
-			TenantID:       "local-compose",
-			UserID:         userID,
-			ConversationID: "local-compose",
-		}, time.Now().Add(24*time.Hour))
-		if err != nil {
-			http.Error(w, "failed to issue development session", http.StatusInternalServerError)
-			return
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     agentevents.BrowserSessionCookie,
-			Value:    session,
-			Path:     "/",
-			MaxAge:   86400,
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-		})
-		w.WriteHeader(http.StatusNoContent)
-	}, nil
 }

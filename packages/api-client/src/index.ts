@@ -1,2 +1,2 @@
 export * from "./agent-events";
-export type { components, paths } from "./generated/schema";
+export type { paths } from "./generated/schema";

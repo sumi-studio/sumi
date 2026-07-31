@@ -26,7 +26,7 @@ api-dev: ## Run the Go API server directly
 compose-env: ## Generate an ignored local .env with random Compose secrets
 	./scripts/dev/create-compose-env.sh
 
-compose-up: ## Build and start PostgreSQL, migrations, API, and Web
+compose-up: ## Build and start PostgreSQL, migrations, API, and Caddy
 	docker compose up --detach --build
 
 compose-down: ## Stop the Compose stack without deleting persisted data
@@ -35,5 +35,5 @@ compose-down: ## Stop the Compose stack without deleting persisted data
 compose-session: ## Print a one-day local sumi_session cookie
 	./scripts/dev/create-sumi-session.sh
 
-compose-todo-smoke: ## Exercise Todo CRUD and optimistic locking through the Web proxy
+compose-todo-smoke: ## Exercise Todo CRUD and optimistic locking through Caddy
 	./scripts/dev/todo-api-curl-example.sh

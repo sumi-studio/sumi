@@ -8,7 +8,7 @@ The Todo API is contract-first: update `../../contracts/openapi.yaml` and regene
 ### Docker Compose
 
 From the repository root, generate local-only credentials and start the complete
-PostgreSQL → migration → API → Web proxy stack:
+PostgreSQL → migration → API → Caddy stack:
 
 ```sh
 make compose-env
@@ -41,10 +41,10 @@ one Todo:
 
 Set `SUMI_KEEP_SAMPLE_TODO=1` to skip the final DELETE.
 
-`make compose-down` preserves PostgreSQL/API volumes. Use
+`make compose-down` preserves PostgreSQL/API/Caddy volumes. Use
 `docker compose down --volumes` only when intentionally resetting all local data.
-The Compose Web service is an HTTP-only local development entrypoint. Production
-TLS termination belongs to the deployment platform and is outside this stack.
+For the EC2/Caddy deployment, set `SUMI_SITE_ADDRESS` to the public hostname and
+use host ports `80`/`443`; do not deploy the generated local `.env`.
 
 ### Direct execution
 

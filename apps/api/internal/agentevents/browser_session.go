@@ -5,8 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -61,34 +59,6 @@ func NewHMACUserSessionVerifier(secret []byte, audience string) (*HMACUserSessio
 		audience = defaultBrowserAudience
 	}
 	return &HMACUserSessionVerifier{secret: append([]byte(nil), secret...), audience: audience}, nil
-}
-
-// IssueHMACUserSession creates a browser session for trusted control-plane
-// callers. Production login owns when this is called; the Compose development
-// route uses the same primitive so local browser requests exercise real session
-// verification rather than a Todo-specific authentication bypass.
-func IssueHMACUserSession(secret []byte, audience string, claims UserSessionClaims, expiresAt time.Time) (string, error) {
-	if len(secret) < 32 {
-		return "", errors.New("browser session HMAC secret must be at least 32 bytes")
-	}
-	if audience == "" {
-		audience = defaultBrowserAudience
-	}
-	if claims.TenantID == "" || claims.UserID == "" || claims.ConversationID == "" || !expiresAt.After(time.Now()) {
-		return "", errors.New("browser session missing required claims or expiration")
-	}
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	body, err := json.Marshal(userSessionWireClaims{
-		TenantID: claims.TenantID, UserID: claims.UserID, ConversationID: claims.ConversationID,
-		Exp: expiresAt.Unix(), Aud: audience,
-	})
-	if err != nil {
-		return "", fmt.Errorf("marshal browser session claims: %w", err)
-	}
-	signingInput := header + "." + base64.RawURLEncoding.EncodeToString(body)
-	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(signingInput))
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
