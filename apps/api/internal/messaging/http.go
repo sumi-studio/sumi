@@ -250,8 +250,18 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, claims agenteven
 // --- handlers ---
 
 func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
-	viewer, _, ok := s.viewer(w, r)
+	viewer, claims, ok := s.viewer(w, r)
 	if !ok {
+		return
+	}
+	done, err := s.mutate(w, r, claims, func() error {
+		return s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer)
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
 		return
 	}
 	ctx := r.Context()
