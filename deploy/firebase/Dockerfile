@@ -6,8 +6,8 @@ RUN npm install --global firebase-tools@13.35.1 \
     && npm cache clean --force
 
 WORKDIR /workspace
-COPY firebase.json /workspace/firebase.json
-COPY docker-entrypoint.sh /usr/local/bin/sumi-firebase-auth-emulator
+COPY deploy/firebase/firebase.json /workspace/firebase.json
+COPY deploy/firebase/docker-entrypoint.sh /usr/local/bin/sumi-firebase-auth-emulator
 RUN chmod 0555 /usr/local/bin/sumi-firebase-auth-emulator
 
 ENTRYPOINT ["/usr/local/bin/sumi-firebase-auth-emulator"]
