@@ -29,13 +29,24 @@ import {
   savePendingConfirmation,
 } from "./auth-confirmation-state";
 import {
-  type AuthFlowProvider,
   type AuthIntent,
   confirmAuthFlow,
   createAuthFlowNonce,
   resolveAuthFlow,
   startAuthFlow,
 } from "./auth-flow-client";
+import {
+  type AuthOutcomeNotice,
+  clearAuthOutcomeNotice,
+  hasPendingAuthOutcomeNotice,
+  publishAuthOutcomeNotice,
+  takeAuthOutcomeNotice,
+} from "./auth-outcome-notice-state";
+import {
+  beginSameEmailCredentialRecovery,
+  completeSameEmailCredentialRecovery,
+  isSameEmailCredentialCollision,
+} from "./credential-recovery";
 import {
   beginEmailLinkAuth,
   completeEmailLinkAuth,
@@ -120,13 +131,16 @@ interface AuthContextValue {
   canUseDirectChat: boolean;
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
+  outcomeNotice: AuthOutcomeNotice | null;
   emailLinkCallbackPending: boolean;
+  credentialRecoveryEmailSent: boolean;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
   sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
   completeEmailLink: () => Promise<void>;
   rejectEmailLink: () => void;
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
+  dismissOutcomeNotice: () => void;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -146,15 +160,67 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
   const [confirmation, setConfirmation] =
     useState<PendingAuthConfirmation | null>(() => loadPendingConfirmation());
+  const [outcomeNotice, setOutcomeNotice] = useState<AuthOutcomeNotice | null>(
+    null,
+  );
   const [emailLinkCallbackPending, setEmailLinkCallbackPending] = useState(() =>
     hasEmailLinkCallback(),
   );
+  const [credentialRecoveryEmailSent, setCredentialRecoveryEmailSent] =
+    useState(false);
   // Every state-changing auth operation claims a generation. Late session
   // reads must never re-authorize the chat after logout has started.
   const authGeneration = useRef(0);
   const sessionMutation = useRef<Promise<void>>(Promise.resolve());
   const signInPending = useRef(false);
   const serverSession = useRef<SumiSessionStatus>(session);
+
+  const claimSavedOutcomeNotice = useCallback(
+    (nextSession: Extract<SumiSessionStatus, { authenticated: true }>) => {
+      if (!hasPendingAuthOutcomeNotice()) return;
+      try {
+        const firebaseUID = getFirebaseAuth().currentUser?.uid;
+        if (!firebaseUID) return;
+        const saved = takeAuthOutcomeNotice({
+          firebaseUID,
+          humanId: nextSession.user.id,
+        });
+        if (saved) setOutcomeNotice(saved);
+      } catch {
+        // A notice is optional display state. Never relax identity checks when
+        // Firebase state is unavailable during restoration.
+      }
+    },
+    [],
+  );
+
+  const publishOutcomeNotice = useCallback(
+    ({
+      firebaseUID,
+      humanId,
+      outcome,
+      intent,
+      intentTransition = "none",
+      receiptId,
+    }: {
+      firebaseUID: string;
+      humanId: string;
+      outcome: "account_created" | "signed_in" | "provider_linked";
+      intent: AuthIntent;
+      intentTransition?: "none" | "confirmed" | "recovery_proved";
+      receiptId: string;
+    }) => {
+      const notice = publishAuthOutcomeNotice({
+        scope: { firebaseUID, humanId },
+        outcome,
+        intent,
+        intentTransition,
+        receiptId,
+      });
+      if (notice) setOutcomeNotice(notice);
+    },
+    [],
+  );
 
   const nextGeneration = useCallback(() => {
     authGeneration.current += 1;
@@ -220,6 +286,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSession(nextSession);
         setSessionState(nextState);
       });
+      if (nextSession.authenticated) claimSavedOutcomeNotice(nextSession);
+      else {
+        clearAuthOutcomeNotice();
+        setOutcomeNotice(null);
+      }
       return nextState;
     } catch (error) {
       if (!isCurrentGeneration(generation)) return "checking";
@@ -228,28 +299,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSessionState(nextState);
       return nextState;
     }
-  }, [isCurrentGeneration, nextGeneration]);
+  }, [claimSavedOutcomeNotice, isCurrentGeneration, nextGeneration]);
 
   useEffect(() => {
     void refreshSession();
   }, [refreshSession]);
 
   useEffect(() => {
-    if (!confirmation || preissuedSessionMode || !authOriginAllowed) return;
+    if (
+      preissuedSessionMode ||
+      !authOriginAllowed ||
+      (!confirmation && !hasPendingAuthOutcomeNotice())
+    ) {
+      return;
+    }
     let unsubscribe: () => void = () => undefined;
     try {
       unsubscribe = onAuthStateChanged(getFirebaseAuth(), (firebaseUser) => {
-        if (firebaseUser?.uid === confirmation.firebaseUID) return;
-        nextGeneration();
-        clearPendingConfirmation();
-        setConfirmation(null);
+        if (confirmation && firebaseUser?.uid !== confirmation.firebaseUID) {
+          nextGeneration();
+          clearPendingConfirmation();
+          setConfirmation(null);
+        }
+        setOutcomeNotice((current) =>
+          current && current.firebaseUID !== firebaseUser?.uid ? null : current,
+        );
+        if (firebaseUser && serverSession.current.authenticated) {
+          claimSavedOutcomeNotice(serverSession.current);
+        }
       });
     } catch {
-      clearPendingConfirmation();
-      setConfirmation(null);
+      if (confirmation) {
+        clearPendingConfirmation();
+        setConfirmation(null);
+      }
     }
     return unsubscribe;
-  }, [confirmation, nextGeneration]);
+  }, [claimSavedOutcomeNotice, confirmation, nextGeneration]);
 
   const signIn = useCallback(
     async (providerName: SignInProvider, intent: AuthIntent) => {
@@ -264,6 +350,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       let firebaseSignInCompleted = false;
       let confirmationRequired = false;
       signInPending.current = true;
+      setCredentialRecoveryEmailSent(false);
       let popup: ReturnType<typeof signInWithPopup> | null = null;
       try {
         // Firebase documents that popup auth may be blocked when invoked outside
@@ -310,6 +397,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             return;
           }
           const nextSession = await verifyCommittedSumiSession();
+          if (
+            resolved.outcome !== "signed_in" &&
+            resolved.outcome !== "account_created"
+          ) {
+            throw new AuthAPIError("Invalid authentication flow response.", 0);
+          }
+          publishOutcomeNotice({
+            firebaseUID: result.user.uid,
+            humanId: nextSession.user.id,
+            outcome: resolved.outcome,
+            intent,
+            receiptId: resolved.flowId,
+          });
           // The HttpOnly authority changed even if logout claimed the UI
           // generation while this serialized exchange was in flight.
           flushSync(() => {
@@ -329,6 +429,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!firebaseSignInCompleted && popup) {
           const popupResult = await popup.catch(() => null);
           firebaseSignInCompleted = popupResult !== null;
+        }
+        if (
+          !firebaseSignInCompleted &&
+          isSameEmailCredentialCollision(error) &&
+          isCurrentGeneration(generation)
+        ) {
+          await beginSameEmailCredentialRecovery(error, flowProvider, intent);
+          if (isCurrentGeneration(generation)) {
+            setCredentialRecoveryEmailSent(true);
+          }
+          return;
         }
         if (
           (error instanceof SumiSessionCompensatedError ||
@@ -357,7 +468,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         signInPending.current = false;
       }
     },
-    [isCurrentGeneration, nextGeneration, serializeSessionMutation],
+    [
+      isCurrentGeneration,
+      nextGeneration,
+      publishOutcomeNotice,
+      serializeSessionMutation,
+    ],
   );
 
   const sendEmailLink = useCallback(
@@ -366,6 +482,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
       }
       nextGeneration();
+      setCredentialRecoveryEmailSent(false);
       signInPending.current = true;
       try {
         await beginEmailLinkAuth(email, intent);
@@ -386,6 +503,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const completed = await completeEmailLinkAuth();
       await serializeSessionMutation(async () => {
         if (!isCurrentGeneration(generation)) return;
+        let recoveryOutcome:
+          | "provider_linked"
+          | "provider_already_linked"
+          | null = null;
+        if (completed.flow.credentialRecovery) {
+          if (completed.result.outcome !== "signed_in") {
+            throw new AuthAPIError(
+              "Provider recovery requires an existing Sumi account.",
+              0,
+            );
+          }
+          recoveryOutcome = await completeSameEmailCredentialRecovery({
+            recovery: completed.flow.credentialRecovery,
+            user: completed.firebaseUser,
+          });
+        }
         if (completed.result.outcome === "confirmation_required") {
           const pending: PendingAuthConfirmation = {
             flowId: completed.result.flowId,
@@ -406,6 +539,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
         const nextSession = await verifyCommittedSumiSession();
+        if (
+          completed.result.outcome !== "signed_in" &&
+          completed.result.outcome !== "account_created"
+        ) {
+          throw new AuthAPIError("Invalid authentication flow response.", 0);
+        }
+        const recoveryIntent =
+          completed.flow.credentialRecovery?.requestedIntent ??
+          completed.flow.intent;
+        publishOutcomeNotice({
+          firebaseUID: completed.firebaseUser.uid,
+          humanId: nextSession.user.id,
+          outcome:
+            recoveryOutcome === "provider_linked"
+              ? "provider_linked"
+              : completed.result.outcome,
+          intent: recoveryIntent,
+          intentTransition:
+            completed.flow.credentialRecovery && recoveryIntent === "sign_up"
+              ? "recovery_proved"
+              : "none",
+          receiptId: completed.result.flowId,
+        });
         flushSync(() => {
           bindDirectChatAuthority(nextSession.authorityBindingId);
           serverSession.current = nextSession;
@@ -413,19 +569,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSession(nextSession);
           setSessionState("authenticated");
           setEmailLinkCallbackPending(false);
+          setCredentialRecoveryEmailSent(false);
         });
       });
     } catch (error) {
+      if (isCurrentGeneration(generation)) {
+        let logoutCompleted = true;
+        try {
+          await logoutSumiSession();
+        } catch {
+          logoutCompleted = false;
+        }
+        let authorityCleared = true;
+        flushSync(() => {
+          authorityCleared = clearDirectChatAuthority();
+          serverSession.current = { authenticated: false };
+          setSession({ authenticated: false });
+          setSessionState(
+            logoutCompleted && authorityCleared
+              ? "unauthenticated"
+              : "unavailable",
+          );
+        });
+      }
       await signOutFirebaseBestEffort();
       throw error;
     } finally {
       signInPending.current = false;
     }
-  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
+  }, [
+    isCurrentGeneration,
+    nextGeneration,
+    publishOutcomeNotice,
+    serializeSessionMutation,
+  ]);
 
   const rejectEmailLink = useCallback(() => {
     rejectEmailLinkAuth();
     setEmailLinkCallbackPending(false);
+    setCredentialRecoveryEmailSent(false);
   }, []);
 
   const confirmIntentTransition = useCallback(async () => {
@@ -464,7 +646,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           0,
         );
       }
-      await confirmAuthFlow({
+      const confirmed = await confirmAuthFlow({
         flowId: pending.flowId,
         nonce: pending.nonce,
         action: pending.action,
@@ -504,6 +686,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new SumiSessionCompensatedError(identityError);
       }
       const nextSession = await verifyCommittedSumiSession();
+      publishOutcomeNotice({
+        firebaseUID: firebaseUser.uid,
+        humanId: nextSession.user.id,
+        outcome: confirmed.outcome,
+        intent: pending.intent,
+        intentTransition: "confirmed",
+        receiptId: confirmed.flowId,
+      });
       flushSync(() => {
         bindDirectChatAuthority(nextSession.authorityBindingId);
         serverSession.current = nextSession;
@@ -518,6 +708,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     confirmation,
     isCurrentGeneration,
     nextGeneration,
+    publishOutcomeNotice,
     serializeSessionMutation,
   ]);
 
@@ -528,10 +719,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await signOutFirebaseBestEffort();
   }, [nextGeneration]);
 
+  const dismissOutcomeNotice = useCallback(() => {
+    clearAuthOutcomeNotice();
+    setOutcomeNotice(null);
+  }, []);
+
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
     const generation = nextGeneration();
+    clearAuthOutcomeNotice();
+    setOutcomeNotice(null);
     // Commit AuthGate's unmount before the first await below. ChatScreen's
     // cleanup then closes its upgraded socket before this request clears the
     // cookie that authorized it.
@@ -589,13 +787,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         sessionState === "authenticated" || sessionState === "preissued",
       user,
       confirmation,
+      outcomeNotice,
       emailLinkCallbackPending,
+      credentialRecoveryEmailSent,
       signIn,
       sendEmailLink,
       completeEmailLink,
       rejectEmailLink,
       confirmIntentTransition,
       cancelIntentTransition,
+      dismissOutcomeNotice,
       logout,
       refreshSession,
     }),
@@ -606,12 +807,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       confirmIntentTransition,
       logout,
       emailLinkCallbackPending,
+      credentialRecoveryEmailSent,
+      dismissOutcomeNotice,
       rejectEmailLink,
       refreshSession,
       session.authenticated,
       sessionState,
       sendEmailLink,
       signIn,
+      outcomeNotice,
       user,
     ],
   );
@@ -645,7 +849,9 @@ function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
   return provider;
 }
 
-function authFlowProvider(providerName: SignInProvider): AuthFlowProvider {
+function authFlowProvider(
+  providerName: SignInProvider,
+): "google.com" | "github.com" {
   return providerName === "github" ? "github.com" : "google.com";
 }
 

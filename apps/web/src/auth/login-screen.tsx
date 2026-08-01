@@ -20,6 +20,7 @@ export function LoginScreen() {
     confirmation,
     configured,
     confirmIntentTransition,
+    credentialRecoveryEmailSent,
     emailLinkCallbackPending,
     logout,
     rejectEmailLink,
@@ -289,6 +290,14 @@ export function LoginScreen() {
                     className="mt-4 rounded-lg bg-emerald-50 px-3 py-2.5 text-emerald-800 text-sm dark:bg-emerald-950/30 dark:text-emerald-200"
                   >
                     ログインリンクを送信しました。このブラウザでメールを開いてください。
+                  </p>
+                )}
+                {credentialRecoveryEmailSent && (
+                  <p
+                    role="status"
+                    className="mt-4 rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+                  >
+                    既存アカウントを確認するメールリンクを送信しました。このブラウザでリンクを開くと、ログイン後に選択した方法を追加します。
                   </p>
                 )}
                 <div className="my-4 flex items-center gap-3 text-muted-foreground text-xs">

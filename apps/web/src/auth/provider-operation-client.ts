@@ -2,6 +2,7 @@ import { postAuthJSON } from "./session-client";
 
 export type ManagedProvider = "google.com" | "github.com";
 export type ProviderOperation = "link" | "unlink";
+export type ProviderDecisionPath = "account_settings" | "same_email_recovery";
 
 export interface ProviderOperationResult {
   operationId: string;
@@ -29,17 +30,19 @@ export async function startProviderOperation({
   operation,
   nonce,
   idToken,
+  decisionPath = "account_settings",
 }: {
   provider: ManagedProvider;
   operation: ProviderOperation;
   nonce: string;
   idToken: string;
+  decisionPath?: ProviderDecisionPath;
 }): Promise<ProviderOperationResult> {
   return parseProviderOperationResult(
     await postAuthJSON("/auth/providers/operations", {
       provider,
       operation,
-      decision_path: "account_settings",
+      decision_path: decisionPath,
       nonce,
       id_token: idToken,
     }),

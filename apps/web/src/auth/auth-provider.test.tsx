@@ -36,6 +36,11 @@ const authMocks = vi.hoisted(() => ({
   completeEmailLinkAuth: vi.fn(),
   hasEmailLinkCallback: vi.fn(() => false),
   rejectEmailLinkAuth: vi.fn(),
+  beginSameEmailCredentialRecovery: vi.fn(),
+  completeSameEmailCredentialRecovery: vi.fn(),
+  isSameEmailCredentialCollision: vi.fn<(error: unknown) => boolean>(
+    () => false,
+  ),
   getFirebaseAuth: vi.fn(),
   onAuthStateChanged: vi.fn(
     (_auth: unknown, _observer: (user: { uid: string } | null) => void) =>
@@ -69,6 +74,13 @@ vi.mock("./email-link-auth", () => ({
   rejectEmailLinkAuth: authMocks.rejectEmailLinkAuth,
 }));
 
+vi.mock("./credential-recovery", () => ({
+  beginSameEmailCredentialRecovery: authMocks.beginSameEmailCredentialRecovery,
+  completeSameEmailCredentialRecovery:
+    authMocks.completeSameEmailCredentialRecovery,
+  isSameEmailCredentialCollision: authMocks.isSameEmailCredentialCollision,
+}));
+
 vi.mock("./firebase", () => ({
   getFirebaseAuth: authMocks.getFirebaseAuth,
 }));
@@ -91,10 +103,10 @@ vi.mock("firebase/auth", () => ({
 
 afterEach(() => {
   cleanup();
-  vi.clearAllMocks();
 });
 
 beforeEach(() => {
+  vi.resetAllMocks();
   sessionStorage.clear();
   authMocks.startAuthFlow.mockResolvedValue({
     flowId: "flow-id",
@@ -114,8 +126,15 @@ beforeEach(() => {
     expiresAt: "2026-08-01T01:00:00Z",
   });
   authMocks.logoutSumiSession.mockResolvedValue(undefined);
+  authMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
+  authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
+  authMocks.completeSameEmailCredentialRecovery.mockResolvedValue(
+    "provider_linked",
+  );
   authMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
   authMocks.hasEmailLinkCallback.mockReturnValue(false);
+  authMocks.isSameEmailCredentialCollision.mockReturnValue(false);
+  authMocks.clearDirectChatAuthority.mockReturnValue(true);
   authMocks.onAuthStateChanged.mockImplementation((_auth, _observer) =>
     vi.fn(),
   );
@@ -129,6 +148,11 @@ function AuthStateProbe() {
       <div data-testid="user-id">{auth.user?.id ?? "none"}</div>
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
+      </div>
+      <div data-testid="outcome">
+        {auth.outcomeNotice
+          ? `${auth.outcomeNotice.outcome}:${auth.outcomeNotice.intent}:${auth.outcomeNotice.intentTransition}`
+          : "none"}
       </div>
       <button
         type="button"
@@ -151,6 +175,12 @@ function AuthStateProbe() {
         }
       >
         confirm transition
+      </button>
+      <button
+        type="button"
+        onClick={() => void auth.completeEmailLink().catch(() => undefined)}
+      >
+        complete email
       </button>
     </>
   );
@@ -317,6 +347,10 @@ describe("logout authority transition", () => {
     expect(screen.getByTestId("session-state")).toHaveTextContent(
       "authenticated",
     );
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "signed_in:sign_in:none",
+    );
+    expect(sessionStorage.getItem("sumi.auth.outcome-notice.v1")).toBeNull();
   });
 
   it("opens the Firebase popup synchronously before the flow start settles", async () => {
@@ -371,6 +405,111 @@ describe("logout authority transition", () => {
     await waitFor(() => {
       expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
     });
+  });
+
+  it("starts bounded magic-link recovery for a same-email provider collision", async () => {
+    const collision = new Error("credential collision");
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.signInWithPopup.mockRejectedValue(collision);
+    authMocks.isSameEmailCredentialCollision.mockImplementation(
+      (error) => error === collision,
+    );
+    authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+
+    await waitFor(() => {
+      expect(authMocks.beginSameEmailCredentialRecovery).toHaveBeenCalledWith(
+        collision,
+        "google.com",
+        "sign_in",
+      );
+    });
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(authMocks.resolveAuthFlow).not.toHaveBeenCalled();
+  });
+
+  it("links the pending provider only after email proof signed into an existing Human", async () => {
+    const firebaseUser = {
+      uid: "firebase-existing",
+      displayName: null,
+      email: "existing@example.com",
+    };
+    const recovery = {
+      version: 1 as const,
+      provider: "github.com" as const,
+      requestedIntent: "sign_up" as const,
+      expiresAt: "2099-08-01T01:00:00Z",
+      credential: {
+        providerId: "github.com" as const,
+        signInMethod: "github.com" as const,
+        pendingToken: "pending-token",
+      },
+    };
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.completeEmailLinkAuth.mockResolvedValue({
+      flow: {
+        flowId: "email-flow",
+        nonce: "n".repeat(43),
+        intent: "sign_in",
+        provider: "email_link",
+        email: "existing@example.com",
+        expiresAt: "2099-08-01T01:00:00Z",
+        stage: "firebase_complete",
+        credentialRecovery: recovery,
+      },
+      result: {
+        flowId: "email-flow",
+        outcome: "signed_in",
+        continuation: "/",
+        expiresAt: "2099-08-01T01:00:00Z",
+      },
+      firebaseUser,
+    });
+    authMocks.completeSameEmailCredentialRecovery.mockResolvedValue(
+      "provider_linked",
+    );
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "human-existing" },
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "complete email" }));
+
+    await waitFor(() => {
+      expect(
+        authMocks.completeSameEmailCredentialRecovery,
+      ).toHaveBeenCalledWith({ recovery, user: firebaseUser });
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      );
+    });
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "provider_linked:sign_up:recovery_proved",
+    );
   });
 
   it("does not mint a session for an intent mismatch until explicit confirmation", async () => {
@@ -446,6 +585,9 @@ describe("logout authority transition", () => {
       nonce: "n".repeat(43),
       idToken: "id-token-fresh",
     });
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "account_created:sign_in:confirmed",
+    );
   });
 
   it("invalidates pending confirmation when Firebase auth state changes", async () => {

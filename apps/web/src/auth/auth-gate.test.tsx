@@ -26,8 +26,10 @@ describe("AuthGate email-link callback", () => {
   it("shows the callback UI before the authenticated direct-chat fast path", () => {
     gateMocks.useAuth.mockReturnValue({
       canUseDirectChat: true,
+      dismissOutcomeNotice: vi.fn(),
       emailLinkCallbackPending: true,
       loading: false,
+      outcomeNotice: null,
       sessionState: "authenticated",
       refreshSession: vi.fn(),
     });
