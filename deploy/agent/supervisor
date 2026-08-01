@@ -10,6 +10,7 @@ set +m
 
 readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
+readonly PREPARE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.prepare.yaml"
 readonly LIFECYCLE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.lifecycle.yaml"
 readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks
 readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control
@@ -267,6 +268,13 @@ lifecycle_compose() {
     "$@"
 }
 
+prepare_compose() {
+  docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${PREPARE_COMPOSE_FILE}" \
+    "$@"
+}
+
 run_tracked_compose() {
   local compose_file="$1"
   local require_live_group="$2"
@@ -384,6 +392,103 @@ validate_compose_redacted() {
   fi
 }
 
+validate_prepare_compose_redacted() {
+  if ! prepare_compose config --quiet >/dev/null 2>&1; then
+    fail "prepare Compose validation failed (details redacted)"
+  fi
+}
+
+epoch_identity() {
+  local output line key value
+  local paid= generation= nonce=
+  declare -A seen=()
+  output="$(prepare_compose run --rm --no-deps --entrypoint /bin/bash allocator \
+    -c 'cat /var/lib/sumi-allocator-root/identity-output/runtime/identity.env' 2>/dev/null)" ||
+    return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == *=* ]] || return 1
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ -z "${seen[${key}]+set}" && -n "${value}" ]] || return 1
+    seen["${key}"]=1
+    case "${key}" in
+      SUMI_PERSONALITY_AGENT_ID) paid="${value}" ;;
+      SUMI_RPC_GENERATION) generation="${value}" ;;
+      SUMI_RPC_NONCE) nonce="${value}" ;;
+      SUMI_PROCESS_GENERATION_LEASE_ID|SUMI_GENERATION_RECOVERY_FENCE_ID) ;;
+      *) return 1 ;;
+    esac
+  done <<< "${output}"
+  [[ "${paid}" == "${SUMI_PERSONALITY_AGENT_ID}" ]] || return 1
+  [[ "${generation}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  [[ -n "${nonce}" && "${nonce}" != *'"'* && "${nonce}" != *'\\'* ]] || return 1
+  EPOCH_GENERATION="${generation}"
+  EPOCH_NONCE="${nonce}"
+}
+
+running_role_count() {
+  local role id count=0
+  for role in runtime executor broker; do
+    id="$(lifecycle_compose ps --status running --quiet "${role}" 2>/dev/null)" || return 1
+    [[ -z "${id//[[:space:]]/}" ]] || count=$((count + 1))
+  done
+  printf '%s\n' "${count}"
+}
+
+prepared_containers_exist() {
+  local allocator_id prepare_id
+  allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" || return 1
+  prepare_id="$(lifecycle_compose ps --all --quiet prepare 2>/dev/null)" || return 1
+  [[ -n "${allocator_id//[[:space:]]/}" && -n "${prepare_id//[[:space:]]/}" ]]
+}
+
+long_lived_containers_exist() {
+  local role id
+  for role in runtime executor broker; do
+    id="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || return 1
+    [[ -z "${id//[[:space:]]/}" ]] || return 0
+  done
+  return 1
+}
+
+print_epoch_json() {
+  local phase="$1"
+  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
+}
+
+print_unknown_json() {
+  printf '{"personality_agent_id":"%s","phase":"unknown"}\n' "${SUMI_PERSONALITY_AGENT_ID}"
+}
+
+inspect_epoch() {
+  local running
+  running="$(running_role_count)" || fail "cannot inspect Compose role state"
+  if [[ "${running}" == 3 ]]; then
+    epoch_identity || fail "active project has no coherent prepared epoch"
+    print_epoch_json active
+    return
+  fi
+  [[ "${running}" == 0 ]] || fail "project contains a partial active generation"
+  ! long_lived_containers_exist ||
+    fail "project contains a failed active generation; reconcile before reuse"
+  if prepared_containers_exist; then
+    epoch_identity || fail "prepared project has no coherent epoch"
+    print_epoch_json prepared
+  else
+    print_unknown_json
+  fi
+}
+
+require_expected_epoch() {
+  : "${SUMI_EXPECTED_RPC_GENERATION:?SUMI_EXPECTED_RPC_GENERATION is required}"
+  : "${SUMI_EXPECTED_RPC_NONCE:?SUMI_EXPECTED_RPC_NONCE is required}"
+  epoch_identity || fail "prepared epoch is unavailable"
+  [[ "${EPOCH_GENERATION}" == "${SUMI_EXPECTED_RPC_GENERATION}" && \
+    "${EPOCH_NONCE}" == "${SUMI_EXPECTED_RPC_NONCE}" ]] ||
+    fail "prepared epoch does not match requested activation handle"
+}
+
 cleanup_project_is_empty() {
   local containers
   containers="$(lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
@@ -435,7 +540,7 @@ disarm_partial_generation_cleanup() {
   trap - ERR EXIT INT TERM
 }
 
-action="${1:-up}"
+action="${1:-inspect-epoch}"
 case "${action}" in
   project-name)
     printf '%s\n' "${SUMI_COMPOSE_PROJECT}"
@@ -446,23 +551,48 @@ case "${action}" in
     validate_compose_redacted
     revalidate_local_control_socket
     ;;
-  up|restart)
+  prepare)
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
-    require_launch_environment
-    validate_compose_redacted
-    revalidate_local_control_socket
+    validate_prepare_compose_redacted
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
     run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
-      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
-    revalidate_local_control_socket
-    run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --build --wait
-    revalidate_local_control_socket
+      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null 2>&1
+    run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --build --wait \
+      >/dev/null 2>&1
+    epoch_identity || fail "allocator completed without a coherent epoch"
     disarm_partial_generation_cleanup
-    log "project ${SUMI_COMPOSE_PROJECT} containers started; runtime owns authenticated dependency Health and Ready"
+    print_epoch_json prepared
+    ;;
+  activate)
+    acquire_supervisor_lock
+    require_docker
+    require_tracked_compose_support
+    require_expected_epoch
+    require_launch_environment
+    validate_compose_redacted
+    revalidate_local_control_socket
+    arm_partial_generation_cleanup
+    # --no-deps is the critical phase boundary: activation must never restart
+    # the completed allocator or issue another generation.
+    run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --build --no-deps \
+      executor broker runtime >/dev/null 2>&1
+    revalidate_local_control_socket
+    require_expected_epoch
+    disarm_partial_generation_cleanup
+    log "project ${SUMI_COMPOSE_PROJECT} epoch activated; runtime owns authenticated Health and Ready"
+    ;;
+  abort)
+    acquire_supervisor_lock
+    require_docker
+    if prepared_containers_exist; then
+      require_expected_epoch
+    fi
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      >/dev/null 2>&1
     ;;
   stop|down)
     acquire_supervisor_lock
@@ -477,7 +607,25 @@ case "${action}" in
     require_docker
     lifecycle_compose logs "${@:2}"
     ;;
+  inspect-epoch)
+    acquire_supervisor_lock
+    require_docker
+    inspect_epoch
+    ;;
+  reconcile)
+    acquire_supervisor_lock
+    require_docker
+    running="$(running_role_count)" || fail "cannot inspect Compose role state"
+    if [[ "${running}" != 0 && "${running}" != 3 ]] ||
+      { [[ "${running}" == 0 ]] && long_lived_containers_exist; }; then
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1
+      print_unknown_json
+    else
+      inspect_epoch
+    fi
+    ;;
   *)
-    fail "usage: supervisor {up|restart|stop|status|logs|validate|project-name}"
+    fail "usage: supervisor {prepare|activate|abort|inspect-epoch|reconcile|stop|status|logs|validate|project-name}"
     ;;
 esac
