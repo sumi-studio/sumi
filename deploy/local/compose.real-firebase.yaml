@@ -1,0 +1,26 @@
+# Narrow override for running the local control plane against the real Firebase
+# project. Keep the emulator service available for explicit test work, but do
+# not connect the API or browser to it.
+#
+# SUMI_FIREBASE_ADC_FILE must name the existing host ADC file. It is mounted
+# directly and read-only; credentials are never copied into an image or volume.
+
+services:
+  api:
+    environment:
+      FIREBASE_AUTH_EMULATOR_HOST: !reset null
+      GOOGLE_APPLICATION_CREDENTIALS: /run/sumi/firebase/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: ${SUMI_AUTH_FIREBASE_PROJECT_ID:?SUMI_AUTH_FIREBASE_PROJECT_ID is required}
+    volumes:
+      - type: bind
+        source: ${SUMI_FIREBASE_ADC_FILE:?SUMI_FIREBASE_ADC_FILE is required}
+        target: /run/sumi/firebase/application_default_credentials.json
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      firebase-auth: !reset null
+
+  web:
+    environment:
+      VITE_FIREBASE_AUTH_EMULATOR_URL: !reset null
