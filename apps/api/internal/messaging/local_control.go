@@ -76,6 +76,10 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 		request.Limit = 50
 	}
 	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -125,6 +129,10 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		return
 	}
 	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
 	if err != nil {
 		writeStoreError(w, err)
@@ -166,6 +174,10 @@ func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, author
 		return
 	}
 	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	if err := s.Store.ReadThrough(r.Context(), request.PlaceID, viewer, request.Seq); err != nil {
 		writeStoreError(w, err)
 		return
