@@ -46,6 +46,11 @@ services:
       SUMI_EXECUTOR_IDENTITY_GID: "10002"
       SUMI_BROKER_IDENTITY_GID: "10003"
     volumes:
+      # The allocator durably binds the trust-root and identity-output parent
+      # directory identities as well as each child mount. Keep the parent on a
+      # named volume so recreating this one-shot container does not look like
+      # an attempted directory replacement.
+      - allocator-root:/var/lib/sumi-allocator-root
       - allocator-state:/var/lib/sumi-allocator-root/state
       - runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
       - executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
@@ -181,6 +186,7 @@ services:
       - broker-ipc:/run/sumi/broker
 
 volumes:
+  allocator-root: {}
   allocator-state: {}
   state: {}
   workspace: {}

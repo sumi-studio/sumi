@@ -6,8 +6,8 @@
 #   scripts/dev/compose-stack down
 #
 # The web and agent runtime share the API's network namespace so they can reach
-# the loopback public and local-control endpoints. The executor and broker are
-# network_mode=none sidecars and communicate over private IPC volumes.
+# the loopback public endpoint. Local control, executor, and broker traffic use
+# private Unix-socket volumes; executor and broker remain network_mode=none.
 
 name: sumi-dev
 
@@ -18,8 +18,7 @@ services:
       POSTGRES_USER: sumi
       POSTGRES_PASSWORD: sumi-dev
       POSTGRES_DB: sumi
-    ports:
-      - "127.0.0.1:5432:5432"
+    # No host port is published; the API reaches postgres by hostname.
     volumes:
       - sumi-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +33,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/api/Dockerfile
-    command: ["/usr/local/bin/sumi-migrate"]
+    # The image's ENTRYPOINT is sumi-api; override it to run the migrate binary.
+    entrypoint: ["/usr/local/bin/sumi-migrate"]
+    command: []
     environment:
       SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
     depends_on:
@@ -42,16 +43,24 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Prepare the local-control socket parent with the exact ownership and mode
-  # the API and runtime expect (uid 65532, gid 10001, mode 0o750).
-  local-control-init:
+  # Prepare API state and local-control socket directories with the exact
+  # ownership and modes the server expects.
+  api-state-init:
     build:
       context: ../..
       dockerfile: deploy/api/Dockerfile
     user: "0:0"
-    command: ["/busybox/sh", "-c", "install -d -m 0750 -o 65532 -g 10001 /run/sumi/local-control"]
+    entrypoint: ["/busybox/sh"]
+    command:
+      - "-c"
+      - |
+        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-command-log
+        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-runtime-state
+        install -d -m 0750 -o 65532 -g 10001 /run/sumi/local-control
     cap_add: [CHOWN, FOWNER]
     volumes:
+      - api-command-log:/var/lib/sumi-command-log
+      - api-runtime-state:/var/lib/sumi-runtime-state
       - local-control:/run/sumi/local-control
     restart: "no"
 
@@ -64,27 +73,62 @@ services:
       - "10001"
     cap_drop: [ALL]
     cap_add: [CHOWN]
+    # The image's ENTRYPOINT is sumi-api; override it so we can source the
+    # runtime identity (written by agent-allocator) and start the API with the
+    # matching personality agent ID and boot nonce.
+    entrypoint: ["/busybox/sh"]
+    command:
+      - "-c"
+      - |
+        identity=/run/sumi-identity/identity.env
+        [ -f "$$identity" ] || { echo "runtime identity not available" >&2; exit 1; }
+        while IFS='=' read -r key value; do
+          case "$$key" in
+            SUMI_PERSONALITY_AGENT_ID) SUMI_PERSONALITY_AGENT_ID="$$value" ;;
+            SUMI_RPC_GENERATION) SUMI_RPC_GENERATION="$$value" ;;
+            SUMI_RPC_NONCE) SUMI_RPC_NONCE="$$value" ;;
+          esac
+        done < "$$identity"
+        [ -n "$$SUMI_PERSONALITY_AGENT_ID" ] || { echo "missing identity PAID" >&2; exit 1; }
+        [ -n "$$SUMI_RPC_NONCE" ] || { echo "missing identity nonce" >&2; exit 1; }
+        [ -n "$$SUMI_RPC_GENERATION" ] || { echo "missing identity generation" >&2; exit 1; }
+        export SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID="$$SUMI_PERSONALITY_AGENT_ID"
+        export SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE="$$SUMI_RPC_NONCE"
+        export SUMI_LOCAL_CONTROL_GENERATION="$$SUMI_RPC_GENERATION"
+        exec /usr/local/bin/sumi-api
     environment:
       SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
-      SUMI_PUBLIC_LISTEN: 127.0.0.1:8080
+      SUMI_COMMAND_LOG_DIR: /var/lib/sumi-command-log
+      SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
+      SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
       SUMI_LOCAL_CONTROL_ENABLED: "1"
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_SOCKET_GID: "10001"
-      SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
       SUMI_LOCAL_CONTROL_BEARER: ${SUMI_LOCAL_CONTROL_BEARER:?SUMI_LOCAL_CONTROL_BEARER is required}
+      SUMI_LOCAL_CONTROL_TENANT_ID: ${SUMI_LOCAL_CONTROL_TENANT_ID:-sumi-dev}
+      SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION: ${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}
       SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}
       SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
       SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
-      SUMI_AUTH_FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:-}
       SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST: ${SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST:-}
     ports:
       - "127.0.0.1:8080:8080"
+      # The web dev server shares this network namespace, so its port is also
+      # exposed through the API service's port mappings.
+      - "127.0.0.1:5173:5173"
     volumes:
+      - api-command-log:/var/lib/sumi-command-log
+      - api-runtime-state:/var/lib/sumi-runtime-state
       - local-control:/run/sumi/local-control
+      # Read the runtime identity written by agent-allocator to pick up the
+      # generated boot nonce and generation.
+      - agent-runtime-identity:/run/sumi-identity:ro
     depends_on:
-      migrate:
+      agent-allocator:
         condition: service_completed_successfully
-      local-control-init:
+      api-state-init:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -106,12 +150,12 @@ services:
     environment:
       VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
       VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
-      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-sumi-studio}
       VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
       VITE_FIREBASE_AUTH_EMULATOR_URL: ${VITE_FIREBASE_AUTH_EMULATOR_URL:-}
       VITE_SUMI_API_ORIGIN: http://127.0.0.1:8080
-    ports:
-      - "127.0.0.1:5173:5173"
+    # Ports are published through the api service because this container shares
+    # the api network namespace.
     depends_on:
       api:
         condition: service_healthy
@@ -137,6 +181,10 @@ services:
       SUMI_EXECUTOR_IDENTITY_GID: "10002"
       SUMI_BROKER_IDENTITY_GID: "10003"
     volumes:
+      # Persist the directory identities pinned by the allocator ledger across
+      # rebuilds of this one-shot container. Child role volumes remain
+      # separately mountable by their least-privilege consumers.
+      - agent-allocator-root:/var/lib/sumi-allocator-root
       - agent-allocator-state:/var/lib/sumi-allocator-root/state
       - agent-runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
       - agent-executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
@@ -151,6 +199,8 @@ services:
     network_mode: none
     cap_drop: [ALL]
     cap_add: [CHOWN, FOWNER, FSETID]
+    environment:
+      SUMI_EXECUTOR_UID: "10001"
     volumes:
       - agent-state:/var/lib/sumi
       - agent-workspace:/workspace
@@ -169,8 +219,8 @@ services:
     group_add:
       - "10020"
     command: [runtime]
-    # Share the API's network namespace so the loopback gateway and the
-    # local-control Unix socket in the shared volume are reachable.
+    # Share the API's network namespace for the loopback gateway. Local control
+    # remains on the authenticated Unix-socket volume.
     network_mode: service:api
     environment:
       SUMI_WORKSPACE: /workspace
@@ -181,6 +231,7 @@ services:
       SUMI_LOCAL_CONTROL_SERVER_UID: "65532"
       SUMI_LOCAL_CONTROL_SOCKET_GID: "10001"
       SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:-4102444800}
+      SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}
       SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
       SUMI_LOG: ${SUMI_LOG:-sumi_agent=info}
     secrets:
@@ -223,12 +274,15 @@ services:
     build:
       context: ../..
       dockerfile: deploy/agent/Dockerfile
-    user: "10002:10002"
+    # Run the executor under the runtime UID so the IPC parent is uid-owned
+    # and group-traversable by the runtime; keep the executor identity group
+    # for reading its identity file.
+    user: "10001:10002"
     command: [executor]
     network_mode: none
     cap_drop: [ALL]
     volumes:
-      - agent-workspace:/workspace:ro
+      - agent-workspace:/workspace
       - agent-executor-identity:/run/sumi/identity:ro
       - agent-executor-ipc:/run/sumi/executor
     depends_on:
@@ -257,7 +311,10 @@ services:
 
 volumes:
   sumi-postgres: {}
+  api-command-log: {}
+  api-runtime-state: {}
   local-control: {}
+  agent-allocator-root: {}
   agent-allocator-state: {}
   agent-state: {}
   agent-workspace: {}
