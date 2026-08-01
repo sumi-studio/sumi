@@ -12,15 +12,17 @@ import (
 const ProviderOperationTTL = 10 * time.Minute
 
 type ProviderOperation struct {
-	OperationID  string
-	HumanID      string
-	FirebaseUID  string
-	Provider     string
-	Operation    string
-	Status       string
-	DecisionPath string
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
+	OperationID     string
+	HumanID         string
+	FirebaseUID     string
+	Provider        string
+	Operation       string
+	Status          string
+	DecisionPath    string
+	TerminalOutcome string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	CompletedAt     *time.Time
 }
 
 type SecurityEvent struct {
@@ -113,6 +115,82 @@ func (s *Store) PendingProviderOperation(ctx context.Context, operationID, nonce
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ProviderOperation{}, err
+	}
+	return operation, nil
+}
+
+// ProviderOperationStatus recovers a durable provider-operation result after
+// an ambiguous client response. It is deliberately read-only: terminal state
+// is accepted only when the operation and its single append-only audit event
+// agree, and expiry applies only while the operation is still pending.
+func (s *Store) ProviderOperationStatus(ctx context.Context, humanID, operationID, nonce string) (ProviderOperation, error) {
+	if humanID == "" || operationID == "" {
+		return ProviderOperation{}, ErrInvalidAuthFlow
+	}
+	nonceHash, err := validateNonce(nonce)
+	if err != nil {
+		return ProviderOperation{}, err
+	}
+
+	var operation ProviderOperation
+	var completedAt *time.Time
+	var eventCount int64
+	var eventHumanID, eventProvider, eventType, eventDecisionPath, eventOutcome string
+	err = s.pool.QueryRow(ctx, `SELECT p.operation_id, p.human_id,
+		p.provider, p.operation, p.status, p.decision_path,
+		COALESCE(p.terminal_outcome, ''), p.created_at, p.expires_at, p.completed_at,
+		count(e.event_id) OVER (PARTITION BY p.operation_id),
+		COALESCE(e.human_id::text, ''), COALESCE(e.provider, ''),
+		COALESCE(e.event_type, ''), COALESCE(e.decision_path, ''),
+		COALESCE(e.terminal_outcome, '')
+		FROM provider_operations p
+		LEFT JOIN credential_security_events e ON e.operation_id=p.operation_id
+		WHERE p.operation_id=$1 AND p.nonce_hash=$2`, operationID, nonceHash).Scan(
+		&operation.OperationID, &operation.HumanID, &operation.Provider,
+		&operation.Operation, &operation.Status,
+		&operation.DecisionPath, &operation.TerminalOutcome,
+		&operation.CreatedAt, &operation.ExpiresAt, &completedAt,
+		&eventCount, &eventHumanID, &eventProvider, &eventType,
+		&eventDecisionPath, &eventOutcome)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProviderOperation{}, ErrInvalidAuthFlow
+	}
+	if err != nil {
+		return ProviderOperation{}, fmt.Errorf("read provider operation status: %w", err)
+	}
+	if operation.HumanID != humanID {
+		return ProviderOperation{}, ErrAuthProofMismatch
+	}
+	if (operation.Provider != "google.com" && operation.Provider != "github.com") ||
+		(operation.Operation != "link" && operation.Operation != "unlink") ||
+		!validDecisionPath(operation.DecisionPath) {
+		return ProviderOperation{}, ErrInvalidAuthFlow
+	}
+	operation.CompletedAt = completedAt
+
+	switch operation.Status {
+	case "pending":
+		if eventCount != 0 || operation.TerminalOutcome != "" || operation.CompletedAt != nil {
+			return ProviderOperation{}, ErrInvalidAuthFlow
+		}
+		if !time.Now().UTC().Before(operation.ExpiresAt) {
+			return ProviderOperation{}, ErrAuthFlowExpired
+		}
+	case "completed", "failed":
+		expectedEventType := "provider_" + operation.Operation
+		if operation.Status == "failed" {
+			expectedEventType += "_failed"
+		} else {
+			expectedEventType += "ed"
+		}
+		if eventCount != 1 || operation.TerminalOutcome == "" || operation.CompletedAt == nil ||
+			eventHumanID != operation.HumanID || eventProvider != operation.Provider ||
+			eventType != expectedEventType || eventDecisionPath != operation.DecisionPath ||
+			eventOutcome != operation.TerminalOutcome {
+			return ProviderOperation{}, ErrInvalidAuthFlow
+		}
+	default:
+		return ProviderOperation{}, ErrInvalidAuthFlow
 	}
 	return operation, nil
 }

@@ -188,6 +188,7 @@ func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /auth/providers/operations", s.serveStartProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/complete", s.serveCompleteProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/fail", s.serveFailProviderOperation)
+		mux.HandleFunc("POST /auth/providers/operations/status", s.serveProviderOperationStatus)
 	}
 	mux.HandleFunc("GET /auth/session", s.serveSessionStatus)
 	mux.HandleFunc("POST /auth/logout", s.serveLogout)

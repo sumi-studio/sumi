@@ -57,6 +57,11 @@ type FailProviderOperationRequest struct {
 	Outcome     string `json:"outcome"`
 }
 
+type ProviderOperationStatusRequest struct {
+	OperationID string `json:"operation_id"`
+	Nonce       string `json:"nonce"`
+}
+
 type ProviderOperationResult struct {
 	OperationID              string    `json:"operation_id,omitempty"`
 	Outcome                  string    `json:"outcome"`
@@ -65,6 +70,20 @@ type ProviderOperationResult struct {
 	CompletionTokenNotBefore time.Time `json:"completion_token_not_before,omitempty"`
 	ExpiresAt                time.Time `json:"expires_at,omitempty"`
 	NoticeRequired           bool      `json:"notice_required,omitempty"`
+}
+
+type ProviderOperationStatusResult struct {
+	OperationID              string     `json:"operation_id"`
+	Provider                 string     `json:"provider"`
+	Operation                string     `json:"operation"`
+	Status                   string     `json:"status"`
+	Outcome                  string     `json:"outcome"`
+	ClientOperation          string     `json:"client_operation,omitempty"`
+	CreatedAt                time.Time  `json:"created_at"`
+	CompletionTokenNotBefore time.Time  `json:"completion_token_not_before"`
+	ExpiresAt                time.Time  `json:"expires_at"`
+	CompletedAt              *time.Time `json:"completed_at,omitempty"`
+	NoticeRequired           bool       `json:"notice_required"`
 }
 
 var (
@@ -88,6 +107,7 @@ type BrowserAuthFlowController interface {
 	StartProviderOperation(ctx context.Context, claims UserSessionClaims, request StartProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	CompleteProviderOperation(ctx context.Context, claims UserSessionClaims, request CompleteProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	FailProviderOperation(ctx context.Context, claims UserSessionClaims, request FailProviderOperationRequest) (ProviderOperationResult, error)
+	StatusProviderOperation(ctx context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error)
 }
 
 func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +285,30 @@ func (s *BrowserAuthServer) serveFailProviderOperation(w http.ResponseWriter, r 
 		return
 	}
 	result, err := s.Flows.FailProviderOperation(r.Context(), claims, request)
+	if err != nil {
+		writeFlowError(w, err)
+		return
+	}
+	writeBrowserAuthJSON(w, http.StatusOK, result)
+}
+
+func (s *BrowserAuthServer) serveProviderOperationStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
+		return
+	}
+	claims, ok := s.authenticatedClaims(w, r)
+	if !ok {
+		return
+	}
+	var request ProviderOperationStatusRequest
+	if !decodeAuthJSON(w, r, &request) {
+		return
+	}
+	if request.OperationID == "" || request.Nonce == "" {
+		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	result, err := s.Flows.StatusProviderOperation(r.Context(), claims, request)
 	if err != nil {
 		writeFlowError(w, err)
 		return

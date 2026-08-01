@@ -227,7 +227,7 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 	if operation.HumanID != claims.UserID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
-	if request.Outcome != "provider_already_linked" && request.Outcome != "credential_in_use" && request.Outcome != "firebase_operation_failed" && request.Outcome != "cancelled" {
+	if !validProviderFailureOutcome(request.Outcome) {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowInvalid
 	}
 	_, err = c.store.FailProviderOperation(ctx, request.OperationID, request.Nonce, request.Outcome)
@@ -239,6 +239,52 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
 		ExpiresAt: operation.ExpiresAt,
 	}, nil
+}
+
+func (c *kosekiAuthFlowController) StatusProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.ProviderOperationStatusRequest) (agentevents.ProviderOperationStatusResult, error) {
+	operation, err := c.store.ProviderOperationStatus(ctx, claims.UserID, request.OperationID, request.Nonce)
+	if err != nil {
+		return agentevents.ProviderOperationStatusResult{}, mapFlowError(err)
+	}
+	result := agentevents.ProviderOperationStatusResult{
+		OperationID: operation.OperationID, Provider: operation.Provider,
+		Operation: operation.Operation, Status: operation.Status,
+		CreatedAt:                operation.CreatedAt,
+		CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt:                operation.ExpiresAt, CompletedAt: operation.CompletedAt,
+	}
+	switch operation.Status {
+	case "pending":
+		result.Outcome = "client_operation_required"
+		result.ClientOperation = "firebase_link_with_credential"
+		if operation.Operation == "unlink" {
+			result.ClientOperation = "firebase_unlink_provider"
+		}
+	case "completed":
+		switch {
+		case operation.Operation == "link" && operation.TerminalOutcome == "linked":
+			result.Outcome, result.NoticeRequired = "provider_linked", true
+		case operation.Operation == "link" && operation.TerminalOutcome == "already_linked":
+			result.Outcome = "provider_already_linked"
+		case operation.Operation == "unlink" && operation.TerminalOutcome == "unlinked":
+			result.Outcome, result.NoticeRequired = "provider_unlinked", true
+		default:
+			return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+		}
+	case "failed":
+		if !validProviderFailureOutcome(operation.TerminalOutcome) {
+			return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+		}
+		result.Outcome = operation.TerminalOutcome
+	default:
+		return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+	}
+	return result, nil
+}
+
+func validProviderFailureOutcome(outcome string) bool {
+	return outcome == "provider_already_linked" || outcome == "credential_in_use" ||
+		outcome == "firebase_operation_failed" || outcome == "cancelled"
 }
 
 func mapFlowError(err error) error {
