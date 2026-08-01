@@ -33,6 +33,7 @@ type FirebaseIdentity struct {
 	SignInProvider   string
 	ProviderSubjects map[string][]string
 	AuthTime         time.Time
+	IssuedAt         time.Time
 }
 
 // FirebaseIDTokenVerifier verifies a Firebase client ID token server-side.

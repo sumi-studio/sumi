@@ -87,6 +87,7 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 		UID: token.UID, TenantID: token.Firebase.Tenant, Email: email,
 		EmailVerified: emailVerified, SignInProvider: token.Firebase.SignInProvider,
 		ProviderSubjects: providerSubjects, AuthTime: time.Unix(token.AuthTime, 0).UTC(),
+		IssuedAt: time.Unix(token.IssuedAt, 0).UTC(),
 	}, nil
 }
 
