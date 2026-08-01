@@ -155,6 +155,63 @@ test("late empty message_start preserves update-before-start prose until authori
   );
 });
 
+test("durable empty provider failure is visible instead of disappearing", () => {
+  let session = createAgentSession();
+  session = apply(session, {
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    seq: 2,
+    event: {
+      type: "message_start",
+      message_id: AssistantMessageId,
+      message: assistantMessage(""),
+    },
+  });
+  const failed: BrowserEventEnvelope = {
+    seq: 3,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: {
+        ...assistantMessage(""),
+        origin: {
+          provider_instance_id: "opencode-go",
+          protocol: "open_ai_chat_completions",
+          model: "kimi-k2.7-code",
+        },
+        stop_reason: "error",
+        error_message: "Provider request failed",
+        provider_code: "provider_error",
+      },
+    },
+  };
+
+  session = apply(session, failed);
+  const afterFirstEnd = session;
+  session = apply(session, failed);
+
+  assert.equal(session, afterFirstEnd);
+  assert.equal(
+    session.conversation.entries[`message:${AssistantMessageId}`],
+    undefined,
+  );
+  const error =
+    session.conversation.entries[`message-error:${AssistantMessageId}`];
+  assert.deepEqual(error, {
+    kind: "error",
+    id: `message-error:${AssistantMessageId}`,
+    runId: "run:1",
+    message: "Provider request failed (provider_error)",
+    retryable: false,
+  });
+  assert.deepEqual(
+    projectConversation(session.conversation).map((item) => item.kind),
+    ["agent-run", "error"],
+  );
+});
+
 test("durable tool start and end upsert without volatile tool-call events", () => {
   let session = createAgentSession();
   session = apply(session, {
