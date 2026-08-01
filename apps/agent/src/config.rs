@@ -989,7 +989,8 @@ id = "glm-5.2"
         assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
         let compat = spec.chat_compat().expect("Chat compat");
         assert_eq!(compat.thinking_format, ThinkingFormat::ProviderDefault);
-        assert!(!compat.requires_reasoning_content_on_assistant);
+        assert!(compat.requires_reasoning_content_on_assistant);
+        assert!(compat.requires_content_on_tool_only_assistant);
         assert!(!compat.zai_tool_stream);
         assert!(!spec.supports_images);
         assert_eq!(spec.context_window, 262_144);
