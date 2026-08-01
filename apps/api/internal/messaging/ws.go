@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -45,7 +46,9 @@ type WSServer struct {
 	PingInterval time.Duration
 	MaxReadLimit int64
 
-	upgrader websocket.Upgrader
+	upgrader      websocket.Upgrader
+	connectionsMu sync.Mutex
+	connections   map[*websocket.Conn]string
 }
 
 // NewWSServer returns the messaging WebSocket server.
@@ -59,6 +62,7 @@ func NewWSServer(store *Store, sessions agentevents.UserSessionAuthorizer, hub *
 		PongWait:     60 * time.Second,
 		PingInterval: 25 * time.Second,
 		MaxReadLimit: maxRequestBytes,
+		connections:  make(map[*websocket.Conn]string),
 	}
 	s.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
@@ -107,10 +111,31 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	var conn *websocket.Conn
+	upgradeAttempted := false
+	upgradeCtx, cancelUpgrade := context.WithTimeout(r.Context(), s.WriteTimeout)
+	err = s.Sessions.AuthorizeSession(upgradeCtx, claims, func() error {
+		upgrader := s.upgrader
+		upgrader.HandshakeTimeout = s.WriteTimeout
+		upgradeAttempted = true
+		var upgradeErr error
+		conn, upgradeErr = upgrader.Upgrade(w, r, nil)
+		if upgradeErr != nil {
+			return upgradeErr
+		}
+		s.addConnection(conn, claims.BrowserSessionID())
+		return nil
+	})
+	cancelUpgrade()
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		} else if !upgradeAttempted {
+			writeError(w, http.StatusUnauthorized, "invalid_session")
+		}
 		return
 	}
+	defer s.removeConnection(conn)
 	defer conn.Close()
 	conn.SetReadLimit(s.MaxReadLimit)
 
@@ -127,7 +152,7 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The writer owns the socket's write side: hub frames, receipts, pings.
 	writerDone := make(chan struct{})
-	go s.writePump(conn, sub, writerDone)
+	go s.writePump(r.Context(), conn, sub, claims, writerDone)
 
 	if !s.enqueueJSON(sub, map[string]string{"type": "hello_ack"}) {
 		return
@@ -275,7 +300,13 @@ func (s *WSServer) handleTyping(ctx context.Context, sub *subscriber, frame wsCl
 	s.Hub.Publish(ctx, Event{Type: EventTyping, PlaceID: frame.PlaceID, Actor: &actor})
 }
 
-func (s *WSServer) writePump(conn *websocket.Conn, sub *subscriber, done chan<- struct{}) {
+func (s *WSServer) writePump(
+	ctx context.Context,
+	conn *websocket.Conn,
+	sub *subscriber,
+	claims agentevents.UserSessionClaims,
+	done chan<- struct{},
+) {
 	defer close(done)
 	ticker := time.NewTicker(s.PingInterval)
 	defer ticker.Stop()
@@ -287,18 +318,71 @@ func (s *WSServer) writePump(conn *websocket.Conn, sub *subscriber, done chan<- 
 			_ = conn.Close()
 			return
 		case frame := <-sub.send:
-			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
-			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+			if err := s.authorizeWrite(ctx, conn, claims, websocket.TextMessage, frame); err != nil {
 				_ = conn.Close()
 				return
 			}
 		case <-ticker.C:
-			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := s.authorizeWrite(ctx, conn, claims, websocket.PingMessage, nil); err != nil {
 				_ = conn.Close()
 				return
 			}
 		}
+	}
+}
+
+func (s *WSServer) authorizeWrite(
+	ctx context.Context,
+	conn *websocket.Conn,
+	claims agentevents.UserSessionClaims,
+	messageType int,
+	payload []byte,
+) error {
+	writeCtx, cancel := context.WithTimeout(ctx, s.WriteTimeout)
+	defer cancel()
+	return s.Sessions.AuthorizeSession(writeCtx, claims, func() error {
+		_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
+		return conn.WriteMessage(messageType, payload)
+	})
+}
+
+func (s *WSServer) addConnection(conn *websocket.Conn, sessionID string) {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	if s.connections == nil {
+		s.connections = make(map[*websocket.Conn]string)
+	}
+	s.connections[conn] = sessionID
+}
+
+func (s *WSServer) removeConnection(conn *websocket.Conn) {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	delete(s.connections, conn)
+}
+
+// CloseBrowserSession eagerly terminates this process's messaging sockets for
+// one revoked browser session. authorizeWrite remains the cross-process and
+// race-safe barrier for frames already queued by the hub.
+func (s *WSServer) CloseBrowserSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	s.connectionsMu.Lock()
+	connections := make([]*websocket.Conn, 0)
+	for conn, registeredSessionID := range s.connections {
+		if registeredSessionID == sessionID {
+			connections = append(connections, conn)
+		}
+	}
+	s.connectionsMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session ended"),
+			time.Now().Add(s.WriteTimeout),
+		)
+		_ = conn.Close()
 	}
 }
 
