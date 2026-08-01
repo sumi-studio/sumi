@@ -9,9 +9,8 @@
 
 services:
   firebase-adc-init:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     entrypoint: ["/busybox/sh"]
     command:

@@ -3,9 +3,8 @@
 # personality agent's private PC processes.
 services:
   allocator:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     command: [allocator]
     network_mode: none
@@ -32,9 +31,8 @@ services:
       - broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
 
   prepare:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     command: [prepare]
     network_mode: none

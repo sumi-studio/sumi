@@ -13,6 +13,53 @@ async function source(path) {
   return readFile(resolve(repositoryRoot, path), "utf8");
 }
 
+test("Compose pulls published Sumi images from GHCR", async () => {
+  const [
+    local,
+    realFirebase,
+    agent,
+    agentPrepare,
+    firebase,
+    composeLauncher,
+    supervisor,
+    firebaseCheck,
+  ] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("deploy/local/compose.real-firebase.yaml"),
+    source("deploy/agent/compose.yaml"),
+    source("deploy/agent/compose.prepare.yaml"),
+    source("deploy/firebase/compose.yaml"),
+    source("scripts/dev/compose-stack"),
+    source("deploy/agent/supervisor"),
+    source("scripts/dev/firebase-auth-emulator-check"),
+  ]);
+
+  for (const compose of [local, realFirebase, agent, agentPrepare, firebase]) {
+    assert.doesNotMatch(compose, /^\s+build:/m);
+    const ghcrImages =
+      compose.match(/^\s+image: ghcr\.io\/sumi-studio\//gm) ?? [];
+    const alwaysPulls = compose.match(/^\s+pull_policy: always$/gm) ?? [];
+    assert.ok(ghcrImages.length > 0);
+    assert.equal(alwaysPulls.length, ghcrImages.length);
+  }
+
+  assert.match(local, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
+  assert.match(
+    local,
+    /sumi-provisioner:\$\{SUMI_PROVISIONER_IMAGE_TAG:-latest\}/,
+  );
+  assert.match(local, /sumi-web:\$\{SUMI_WEB_IMAGE_TAG:-latest\}/);
+  assert.match(local, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
+  assert.match(realFirebase, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
+  assert.match(agent, /sumi-agent:\$\{SUMI_AGENT_IMAGE_TAG:-latest\}/);
+  assert.match(firebase, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
+  assert.doesNotMatch(composeLauncher, /--build/);
+  assert.doesNotMatch(supervisor, /--build/);
+  assert.match(firebaseCheck, /docker build/);
+  assert.match(firebaseCheck, /local-check-/);
+  assert.match(firebaseCheck, /up --detach --pull never/);
+});
+
 test("Compose gives runtime only the logical executor workspace address", async () => {
   const [compose, entrypoint] = await Promise.all([
     source("deploy/agent/compose.yaml"),

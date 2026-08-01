@@ -2668,7 +2668,7 @@ case "$*" in
     done
     exit 0
     ;;
-  *"compose.prepare.yaml up --detach --build --wait")
+  *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
       "$SUMI_FAKE_MARKERS/allocator" \
@@ -2790,7 +2790,7 @@ case "$*" in
     done
     exit 0
     ;;
-  *"compose.prepare.yaml up --detach --build --wait")
+  *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
       "$SUMI_FAKE_MARKERS/allocator" \
@@ -2930,7 +2930,7 @@ case "$*" in
     done
     exit 0
     ;;
-  *"compose.prepare.yaml up --detach --build --wait")
+  *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted"
     touch \
       "$SUMI_FAKE_MARKERS/runtime" \
@@ -3047,7 +3047,7 @@ case "$*" in
   *"compose.lifecycle.yaml ps --all --quiet")
     [[ ! -f "$SUMI_FAKE_MARKERS/runtime" ]]
     ;;
-  *"compose.prepare.yaml up --detach --build --wait")
+  *"compose.prepare.yaml up --detach --wait")
     touch "$SUMI_FAKE_MARKERS/up-attempted" "$SUMI_FAKE_MARKERS/runtime"
     while true; do sleep 1; done
     ;;

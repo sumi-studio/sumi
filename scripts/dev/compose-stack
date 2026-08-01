@@ -258,6 +258,8 @@ Usage: scripts/dev/compose-stack [--firebase emulator|real] up|down|config [comp
 
 Starts or stops the local Sumi control plane in Docker Compose. PersonalityAgent
 runtimes are provisioned lazily as isolated PAID-derived Compose projects.
+Sumi service images are pulled from ghcr.io/sumi-studio; authenticate the
+Compose host first when the packages are private.
 
 Firebase Auth defaults to the integrated emulator. --firebase real selects the
 real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
@@ -417,7 +419,7 @@ case "${ACTION}" in
   up)
     configure_local_apparmor_fallback
     ensure_control_plane_network
-    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" up --build "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" up "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
     docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"

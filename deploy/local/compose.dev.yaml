@@ -15,9 +15,8 @@ name: sumi-dev
 
 services:
   firebase-auth:
-    build:
-      context: ../..
-      dockerfile: deploy/firebase/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-firebase:${SUMI_FIREBASE_IMAGE_TAG:-latest}
+    pull_policy: always
     environment:
       FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}
       FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth
@@ -60,9 +59,8 @@ services:
     restart: "no"
 
   migrate:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     # The image's ENTRYPOINT is sumi-api; override it to run the migrate binary.
     entrypoint: ["/usr/local/bin/sumi-migrate"]
     command: []
@@ -76,9 +74,8 @@ services:
   # Prepare API state and local-control socket directories with the exact
   # ownership and modes the server expects.
   api-state-init:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     entrypoint: ["/busybox/sh"]
     command:
@@ -101,9 +98,8 @@ services:
     restart: "no"
 
   api:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "65532:20000"
     group_add:
       - "20000"
@@ -174,9 +170,8 @@ services:
   # This is the sole Docker authority. API/runtime/executor/broker containers
   # have no Docker socket, client, or host-process execution capability.
   runtime-provisioner:
-    build:
-      context: ../..
-      dockerfile: deploy/provisioner/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-provisioner:${SUMI_PROVISIONER_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     command:
       - -socket
@@ -215,9 +210,8 @@ services:
     stop_grace_period: 2m
 
   web:
-    build:
-      context: ../..
-      dockerfile: deploy/web/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-web:${SUMI_WEB_IMAGE_TAG:-latest}
+    pull_policy: always
     # Vite binds the same exact host IPv4 as the public API. Host networking is
     # required because binding that address inside a private bridge namespace
     # would make Docker's published port unreachable without widening to
@@ -243,8 +237,7 @@ services:
       # which Docker has published only on a selected Tailnet address.
       SUMI_DEV_HOST: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
       SUMI_DEV_API_ORIGIN: http://${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080
-    # Ports are published through the api service because this container shares
-    # the api network namespace.
+    # The Vite server binds the selected host/Tailnet address directly.
     depends_on:
       api:
         condition: service_healthy
