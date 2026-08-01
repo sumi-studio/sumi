@@ -5,6 +5,7 @@ import {
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
 import { useNavigate } from "@tanstack/react-router";
+import { SettingsPopover } from "../components/app-navigation";
 import { LOCAL_APP_DESCRIPTORS } from "./app-descriptors";
 
 /**
@@ -41,6 +42,9 @@ export function AppRail({ activeAppId }: { activeAppId: string }) {
           );
         })}
       </nav>
+      <div className="mt-auto px-2 pb-3">
+        <SettingsPopover />
+      </div>
     </aside>
   );
 }

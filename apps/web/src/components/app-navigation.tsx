@@ -75,7 +75,7 @@ export function AppNavigation() {
   );
 }
 
-function SettingsPopover() {
+export function SettingsPopover() {
   const { authenticated, user, logout } = useAuth();
   const [logoutError, setLogoutError] = useState<string | null>(null);
 
