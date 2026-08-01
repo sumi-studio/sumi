@@ -10,6 +10,6 @@ type Backend interface {
 	Activate(context.Context, ActivateRequest) error
 	Abort(context.Context, PreparedEpoch) error
 	Inspect(context.Context, string) (Inspection, error)
-	Stop(context.Context, string) error
+	Stop(context.Context, PreparedEpoch) error
 	Reconcile(context.Context, string) (Inspection, error)
 }

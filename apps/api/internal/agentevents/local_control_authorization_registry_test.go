@@ -120,6 +120,49 @@ func TestLocalRuntimeAuthorizationCanBeInstalledReplacedAndRemoved(t *testing.T)
 	}
 }
 
+func TestFenceLocalRuntimeAuthorizationClearsExactReadyEpochEvenAfterAPIRestart(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, t.TempDir())
+	control, server := newLocalControlHTTPServer(
+		t,
+		gateway,
+		localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a"),
+	)
+	for _, publication := range []LocalRuntimeStatePublication{
+		startupPublication("startup", localControlTestPAID, 7, "boot-a"),
+		readyPublication("ready", localControlTestPAID, 7, "boot-a", 1, "receipt-a"),
+	} {
+		response, body := postLocalControl(
+			t,
+			server.URL,
+			LocalRuntimeStatePublishPath,
+			localControlTestBearer,
+			publication,
+		)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("publish %s: status=%d body=%s", publication.PublicationID, response.StatusCode, body)
+		}
+	}
+	ready, err := gateway.IsPersonalityAgentReady(context.Background(), localControlTestPAID)
+	if err != nil || !ready {
+		t.Fatalf("ready before fence=%v err=%v", ready, err)
+	}
+	// Simulate a restarted API whose in-memory authorization registry is empty
+	// while the durable Ready record and root-managed runtime survive.
+	control.authorizations.remove(localControlTestPAID)
+	if err := control.FenceLocalRuntimeAuthorization(
+		context.Background(),
+		localControlTestPAID,
+		7,
+		"boot-a",
+	); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = gateway.IsPersonalityAgentReady(context.Background(), localControlTestPAID)
+	if err != nil || ready {
+		t.Fatalf("ready after fence=%v err=%v", ready, err)
+	}
+}
+
 func TestAuthorizationReplacementWaitsForCoherentCredentialSnapshot(t *testing.T) {
 	_, gateway := openLocalControlTestGateway(t, t.TempDir())
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")

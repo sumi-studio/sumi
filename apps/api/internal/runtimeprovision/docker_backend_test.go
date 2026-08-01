@@ -54,7 +54,10 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	if err := backend.Activate(context.Background(), activate); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.actions) != 3 || runner.actions[0] != "prepare" || runner.actions[1] != "inspect-epoch" || runner.actions[2] != "activate" {
+	if err := backend.Stop(context.Background(), epoch); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.actions) != 4 || runner.actions[0] != "prepare" || runner.actions[1] != "inspect-epoch" || runner.actions[2] != "activate" || runner.actions[3] != "stop-epoch" {
 		t.Fatalf("unexpected supervisor phase calls: %#v", runner.actions)
 	}
 	joinedEnvironment := strings.Join(runner.envs[2], "\n")
@@ -66,6 +69,12 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	} {
 		if !strings.Contains(joinedEnvironment, expected) {
 			t.Fatalf("activation environment omitted %s: %s", expected, joinedEnvironment)
+		}
+	}
+	stopEnvironment := strings.Join(runner.envs[3], "\n")
+	for _, expected := range []string{"SUMI_EXPECTED_RPC_GENERATION=7", "SUMI_EXPECTED_RPC_NONCE=boot-7"} {
+		if !strings.Contains(stopEnvironment, expected) {
+			t.Fatalf("exact stop environment omitted %s: %s", expected, stopEnvironment)
 		}
 	}
 }

@@ -435,7 +435,7 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 		t.Fatalf("rollover startup: got %d, want 200; body=%s", response.StatusCode, body)
 	}
 	rolloverAck := decodeLocalControlResponse[LocalRuntimeStateAck](t, body)
-	if rolloverAck.Revision != 3 || rolloverAck.State != LocalRuntimeNotReady {
+	if rolloverAck.Revision != 4 || rolloverAck.State != LocalRuntimeNotReady {
 		t.Fatalf("rollover did not publish next NotReady revision: %+v", rolloverAck)
 	}
 	if err := gateway.VerifyGeneration(context.Background(), localControlTestPAID, 7); err == nil {
@@ -456,13 +456,13 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("old idempotent Ready escaped authorization fence: got %d", response.StatusCode)
 	}
-	lateOldReady := readyPublication("late-old-ready", localControlTestPAID, 7, "boot-a", 3, "receipt-old")
+	lateOldReady := readyPublication("late-old-ready", localControlTestPAID, 7, "boot-a", 4, "receipt-old")
 	response, _ = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, lateOldReady)
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("late old Ready was accepted: got %d", response.StatusCode)
 	}
 
-	newReady := readyPublication("new-ready", localControlTestPAID, 8, "boot-b", 3, "receipt-new")
+	newReady := readyPublication("new-ready", localControlTestPAID, 8, "boot-b", 4, "receipt-new")
 	response, body = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlNextBearer, newReady)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("new ready: got %d, want 200; body=%s", response.StatusCode, body)
@@ -504,6 +504,43 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	}
 	if ready, err := restartedGateway.IsPersonalityAgentReady(context.Background(), localControlTestPAID); err != nil || !ready {
 		t.Fatalf("restart lost authoritative Ready: ready=%v err=%v", ready, err)
+	}
+}
+
+func TestFreshControlProcessFencesSurvivingSignedReadyWithoutAuthorizationRegistry(t *testing.T) {
+	runtimeDir := t.TempDir()
+	store, firstGateway := openLocalControlTestGateway(t, runtimeDir)
+	_, server := newLocalControlHTTPServer(
+		t,
+		firstGateway,
+		localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a"),
+	)
+	startup := startupPublication("restart-fence-startup", localControlTestPAID, 7, "boot-a")
+	response, _ := postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, startup)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("startup status=%d", response.StatusCode)
+	}
+	ready := readyPublication("restart-fence-ready", localControlTestPAID, 7, "boot-a", 1, "restart-receipt")
+	response, _ = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, ready)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("ready status=%d", response.StatusCode)
+	}
+
+	restartedGateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedControl, err := NewLocalControlServer(restartedGateway, localControlTestSigningSecret, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedControl.FenceLocalRuntimeAuthorization(
+		context.Background(), localControlTestPAID, 7, "boot-a",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if isReady, err := restartedGateway.IsPersonalityAgentReady(context.Background(), localControlTestPAID); err != nil || isReady {
+		t.Fatalf("fresh empty control registry did not fence signed Ready: ready=%v err=%v", isReady, err)
 	}
 }
 

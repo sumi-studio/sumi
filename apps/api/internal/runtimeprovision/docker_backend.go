@@ -146,8 +146,12 @@ func (backend *DockerBackend) Inspect(ctx context.Context, personalityAgentID st
 	return parseSupervisorInspection(output, personalityAgentID)
 }
 
-func (backend *DockerBackend) Stop(ctx context.Context, personalityAgentID string) error {
-	_, err := backend.run(ctx, "stop", personalityAgentID, nil, nil)
+func (backend *DockerBackend) Stop(ctx context.Context, epoch PreparedEpoch) error {
+	expected := map[string]string{
+		"SUMI_EXPECTED_RPC_GENERATION": fmt.Sprint(epoch.Generation),
+		"SUMI_EXPECTED_RPC_NONCE":      epoch.RPCBootNonce,
+	}
+	_, err := backend.run(ctx, "stop-epoch", epoch.PersonalityAgentID, nil, expected)
 	return err
 }
 
@@ -167,6 +171,9 @@ func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentI
 	timeout := backend.operationTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Minute
+	}
+	if action == "abort" || action == "stop-epoch" {
+		timeout = 90 * time.Second
 	}
 	// Once accepted, a host lifecycle transition is atomic with respect to a
 	// caller disconnect. A bounded daemon-owned context lets the caller retry

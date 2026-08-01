@@ -133,6 +133,9 @@ func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspec
 	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
 		return Inspection{}, err
 	}
+	if entry.known && entry.phase == PhaseUnknown {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
 	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
 		return Inspection{}, fmt.Errorf("%w: abort does not match the prepared epoch", ErrConflict)
 	}
@@ -169,10 +172,19 @@ func (service *Service) Stop(ctx context.Context, request StopRequest) (Inspecti
 	entry := service.entry(request.PersonalityAgentID)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-	if entry.stopped {
+	if entry.known && entry.phase == PhaseUnknown && entry.epoch == request.PreparedEpoch {
 		return unknownInspection(request.PersonalityAgentID), nil
 	}
-	if err := service.backend.Stop(ctx, request.PersonalityAgentID); err != nil {
+	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
+		return Inspection{}, err
+	}
+	if entry.known && entry.phase == PhaseUnknown {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
+	if !entry.known || entry.phase != PhaseActive || entry.epoch != request.PreparedEpoch {
+		return Inspection{}, fmt.Errorf("%w: stop does not match the active epoch", ErrConflict)
+	}
+	if err := service.backend.Stop(ctx, entry.epoch); err != nil {
 		return Inspection{}, err
 	}
 	entry.phase = PhaseUnknown

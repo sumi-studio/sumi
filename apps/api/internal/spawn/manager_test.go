@@ -12,13 +12,19 @@ type fakeProcess struct {
 	stopped bool
 	waitErr error
 	stopErr error
+	done    chan struct{}
+	once    sync.Once
 }
 
-func (p *fakeProcess) Wait() error { return p.waitErr }
+func (p *fakeProcess) Wait() error {
+	<-p.done
+	return p.waitErr
+}
 func (p *fakeProcess) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.stopped = true
+	p.mu.Unlock()
+	p.once.Do(func() { close(p.done) })
 	return p.stopErr
 }
 
@@ -34,6 +40,96 @@ type fakeSpawner struct {
 	processes map[string]*fakeProcess
 }
 
+type blockingStopProcess struct {
+	done        chan struct{}
+	stopEntered chan struct{}
+	releaseStop chan struct{}
+	once        sync.Once
+}
+
+func (p *blockingStopProcess) Wait() error {
+	<-p.done
+	return nil
+}
+
+func (p *blockingStopProcess) Stop() error {
+	p.once.Do(func() {
+		close(p.stopEntered)
+		<-p.releaseStop
+		close(p.done)
+	})
+	return nil
+}
+
+type replacementRaceSpawner struct {
+	mu        sync.Mutex
+	first     *blockingStopProcess
+	processes []Process
+}
+
+type parallelStopProcess struct {
+	id      string
+	entered chan<- string
+	release <-chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (p *parallelStopProcess) Wait() error { <-p.done; return nil }
+func (p *parallelStopProcess) Stop() error {
+	p.once.Do(func() {
+		p.entered <- p.id
+		<-p.release
+		close(p.done)
+	})
+	return nil
+}
+
+type parallelStopSpawner struct {
+	entered chan string
+	release chan struct{}
+	mu      sync.Mutex
+	spawns  int
+}
+
+type blockingSpawnSpawner struct {
+	entered chan struct{}
+	release chan struct{}
+	process *fakeProcess
+}
+
+func (s *blockingSpawnSpawner) Spawn(_ context.Context, _ AgentRuntimeConfig) (Process, error) {
+	close(s.entered)
+	<-s.release
+	return s.process, nil
+}
+
+func (s *parallelStopSpawner) Spawn(_ context.Context, config AgentRuntimeConfig) (Process, error) {
+	s.mu.Lock()
+	s.spawns++
+	s.mu.Unlock()
+	return &parallelStopProcess{id: config.AgentID, entered: s.entered, release: s.release, done: make(chan struct{})}, nil
+}
+
+func (s *replacementRaceSpawner) Spawn(_ context.Context, _ AgentRuntimeConfig) (Process, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var process Process
+	if len(s.processes) == 0 {
+		process = s.first
+	} else {
+		process = &fakeProcess{done: make(chan struct{})}
+	}
+	s.processes = append(s.processes, process)
+	return process, nil
+}
+
+func (s *replacementRaceSpawner) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.processes)
+}
+
 func newFakeSpawner() *fakeSpawner {
 	return &fakeSpawner{processes: make(map[string]*fakeProcess)}
 }
@@ -41,7 +137,7 @@ func newFakeSpawner() *fakeSpawner {
 func (s *fakeSpawner) Spawn(_ context.Context, config AgentRuntimeConfig) (Process, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := &fakeProcess{}
+	p := &fakeProcess{done: make(chan struct{})}
 	s.processes[config.AgentID] = p
 	s.spawns = append(s.spawns, config)
 	return p, nil
@@ -114,6 +210,165 @@ func TestEnsureRunningSpawnsPerAgent(t *testing.T) {
 	}
 	if c1.Bearer != "bearer/a1" {
 		t.Fatalf("a1 derived bearer: got %q want bearer/a1", c1.Bearer)
+	}
+}
+
+func TestEnsureRunningSingleflightsConcurrentCallsPerPAID(t *testing.T) {
+	spawner := newFakeSpawner()
+	mgr, err := New(Config{
+		Spawner:       spawner,
+		Resolver:      fakeResolver{},
+		SharedBearer:  "bearer",
+		SharedNonce:   "nonce",
+		StateRoot:     t.TempDir(),
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 32
+	const agentID = "singleflight-agent"
+	var wait sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- mgr.EnsureRunning(context.Background(), agentID)
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	spawner.mu.Lock()
+	defer spawner.mu.Unlock()
+	if got := len(spawner.spawns); got != 1 {
+		t.Fatalf("spawned %d processes for one PAID, want 1", got)
+	}
+}
+
+func TestEnsureRunningWaitsForExactPriorStopBeforeReplacement(t *testing.T) {
+	first := &blockingStopProcess{
+		done:        make(chan struct{}),
+		stopEntered: make(chan struct{}),
+		releaseStop: make(chan struct{}),
+	}
+	spawner := &replacementRaceSpawner{first: first}
+	mgr, err := New(Config{
+		Spawner:       spawner,
+		Resolver:      fakeResolver{},
+		StateRoot:     t.TempDir(),
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const paid = "0198f0f4-9b72-7000-8000-000000000001"
+	if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
+		t.Fatal(err)
+	}
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- mgr.Stop(paid) }()
+	<-first.stopEntered
+
+	replacementDone := make(chan error, 1)
+	go func() { replacementDone <- mgr.EnsureRunning(context.Background(), paid) }()
+	select {
+	case err := <-replacementDone:
+		t.Fatalf("replacement escaped the prior stop/join: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := spawner.count(); got != 1 {
+		t.Fatalf("spawned replacement before prior stop completed: %d", got)
+	}
+
+	close(first.releaseStop)
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-replacementDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := spawner.count(); got != 2 || !mgr.Running(paid) {
+		t.Fatalf("replacement did not become the sole running epoch: spawns=%d running=%v", got, mgr.Running(paid))
+	}
+}
+
+func TestStopAllJoinsThreePAIDsConcurrentlyBeforeRestart(t *testing.T) {
+	spawner := &parallelStopSpawner{entered: make(chan string, 3), release: make(chan struct{})}
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paids := []string{"agent-a", "agent-b", "agent-c"}
+	for _, paid := range paids {
+		if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- mgr.StopAll() }()
+	seen := make(map[string]bool, 3)
+	for range paids {
+		select {
+		case paid := <-spawner.entered:
+			seen[paid] = true
+		case <-time.After(time.Second):
+			t.Fatalf("StopAll serialized or stalled before all PAIDs entered teardown: %v", seen)
+		}
+	}
+	close(spawner.release)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	for _, paid := range paids {
+		if mgr.Running(paid) {
+			t.Fatalf("%s remained running after StopAll", paid)
+		}
+		if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
+			t.Fatal(err)
+		}
+		if !mgr.Running(paid) {
+			t.Fatalf("%s did not restart after the joined shutdown", paid)
+		}
+	}
+	spawner.mu.Lock()
+	defer spawner.mu.Unlock()
+	if spawner.spawns != 6 {
+		t.Fatalf("restart spawn count=%d, want 6", spawner.spawns)
+	}
+}
+
+func TestStopAllJoinsBlockedStartAndStopsCommittedProcess(t *testing.T) {
+	process := &fakeProcess{done: make(chan struct{})}
+	spawner := &blockingSpawnSpawner{entered: make(chan struct{}), release: make(chan struct{}), process: process}
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensureDone := make(chan error, 1)
+	go func() { ensureDone <- mgr.EnsureRunning(context.Background(), "starting-agent") }()
+	<-spawner.entered
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- mgr.StopAll() }()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("StopAll returned before in-flight Spawn committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(spawner.release)
+	if err := <-ensureDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	if !process.isStopped() || mgr.Running("starting-agent") {
+		t.Fatalf("process committed after StopAll: stopped=%v running=%v", process.isStopped(), mgr.Running("starting-agent"))
 	}
 }
 

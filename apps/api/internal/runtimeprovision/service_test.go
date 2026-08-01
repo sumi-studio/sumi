@@ -2,6 +2,7 @@ package runtimeprovision
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -101,11 +102,11 @@ func (backend *fakeBackend) Inspect(_ context.Context, personalityAgentID string
 	return cloneInspection(inspection), nil
 }
 
-func (backend *fakeBackend) Stop(_ context.Context, personalityAgentID string) error {
+func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) error {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
-	backend.stopCalls[personalityAgentID]++
-	backend.state[personalityAgentID] = unknownInspection(personalityAgentID)
+	backend.stopCalls[epoch.PersonalityAgentID]++
+	backend.state[epoch.PersonalityAgentID] = unknownInspection(epoch.PersonalityAgentID)
 	return nil
 }
 
@@ -174,7 +175,7 @@ func TestServiceFakeBackendContract(t *testing.T) {
 		t.Fatalf("activate reran backend: prepare=%d activate=%d", backend.prepareCalls[testPAID], backend.activateCalls[testPAID])
 	}
 
-	stop := StopRequest{Version: ProtocolVersion, PersonalityAgentID: testPAID}
+	stop := StopRequest{Version: ProtocolVersion, PreparedEpoch: expected}
 	for range 2 {
 		if _, stopErr := service.Stop(context.Background(), stop); stopErr != nil {
 			t.Fatal(stopErr)
@@ -222,6 +223,59 @@ func TestPrepareRecoversCommittedBackendEpochWithoutAllocatingAgain(t *testing.T
 	}
 	if recovered != committed || backend.prepareCalls[testPAID] != 1 {
 		t.Fatalf("recovery allocated again: recovered=%#v committed=%#v calls=%d", recovered, committed, backend.prepareCalls[testPAID])
+	}
+}
+
+func TestStaleStopCannotTearDownReplacementEpoch(t *testing.T) {
+	backend := newFakeBackend()
+	service, err := NewService(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := PrepareRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "epoch-n",
+	}
+	first, err := service.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: first, Activation: testActivationConfig(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Stop(context.Background(), StopRequest{
+		Version: ProtocolVersion, PreparedEpoch: first,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	request.IdempotencyKey = "epoch-n-plus-one"
+	second, err := service.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Activate(context.Background(), ActivateRequest{
+		Version: ProtocolVersion, PreparedEpoch: second, Activation: testActivationConfig(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Stop(context.Background(), StopRequest{
+		Version: ProtocolVersion, PreparedEpoch: first,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale stop error=%v, want ErrConflict", err)
+	}
+	inspection, err := service.Inspect(context.Background(), InspectRequest{
+		Version: ProtocolVersion, PersonalityAgentID: testPAID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Phase != PhaseActive || inspection.Epoch == nil || *inspection.Epoch != second {
+		t.Fatalf("stale stop disturbed replacement: %#v", inspection)
+	}
+	if got := backend.stopCalls[testPAID]; got != 1 {
+		t.Fatalf("stale stop reached backend: stop calls=%d", got)
 	}
 }
 

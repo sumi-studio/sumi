@@ -82,6 +82,8 @@ type Manager struct {
 	cfg      Config
 	mu       sync.Mutex
 	running  map[string]*agentRuntime
+	starting map[string]*agentStart
+	stopping map[string]*agentStop
 	now      func() time.Time
 	idleStop time.Duration
 	skip     map[string]bool
@@ -91,6 +93,16 @@ type agentRuntime struct {
 	process    Process
 	lastActive time.Time
 	warmth     string
+}
+
+type agentStart struct {
+	done chan struct{}
+	err  error
+}
+
+type agentStop struct {
+	done chan struct{}
+	err  error
 }
 
 // New returns a Manager. A nil Spawner or Resolver is an error.
@@ -115,6 +127,8 @@ func New(cfg Config) (*Manager, error) {
 	return &Manager{
 		cfg:      cfg,
 		running:  make(map[string]*agentRuntime),
+		starting: make(map[string]*agentStart),
+		stopping: make(map[string]*agentStop),
 		now:      now,
 		idleStop: cfg.IdleTimeout,
 		skip:     skip,
@@ -128,24 +142,74 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 	if m.skip[agentID] {
 		return nil
 	}
+	for {
+		m.mu.Lock()
+		stop := m.stopping[agentID]
+		m.mu.Unlock()
+		if stop == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stop.done:
+			if stop.err != nil {
+				return stop.err
+			}
+		}
+	}
 	m.mu.Lock()
+	if stop := m.stopping[agentID]; stop != nil {
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stop.done:
+			if stop.err != nil {
+				return stop.err
+			}
+			return m.EnsureRunning(ctx, agentID)
+		}
+	}
 	if rt, ok := m.running[agentID]; ok {
 		rt.lastActive = m.now()
 		m.mu.Unlock()
 		return nil
 	}
+	if start, ok := m.starting[agentID]; ok {
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-start.done:
+			return start.err
+		}
+	}
+	start := &agentStart{done: make(chan struct{})}
+	m.starting[agentID] = start
 	m.mu.Unlock()
+	finishStart := func(err error) {
+		m.mu.Lock()
+		start.err = err
+		delete(m.starting, agentID)
+		close(start.done)
+		m.mu.Unlock()
+	}
 
 	warmth, err := m.cfg.Resolver.AgentWarmth(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("resolve warmth for %s: %w", agentID, err)
+		err = fmt.Errorf("resolve warmth for %s: %w", agentID, err)
+		finishStart(err)
+		return err
 	}
 	if warmth == "" {
 		warmth = WarmthCold
 	}
 	wrappingKey, err := m.cfg.Resolver.AgentWrappingKey(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("resolve wrapping key for %s: %w", agentID, err)
+		err = fmt.Errorf("resolve wrapping key for %s: %w", agentID, err)
+		finishStart(err)
+		return err
 	}
 	now := m.now()
 	config := AgentRuntimeConfig{
@@ -166,12 +230,31 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 	}
 	process, err := m.cfg.Spawner.Spawn(ctx, config)
 	if err != nil {
-		return fmt.Errorf("spawn agent %s: %w", agentID, err)
+		err = fmt.Errorf("spawn agent %s: %w", agentID, err)
+		finishStart(err)
+		return err
 	}
 	m.mu.Lock()
-	m.running[agentID] = &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}
+	runtime := &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}
+	m.running[agentID] = runtime
+	start.err = nil
+	delete(m.starting, agentID)
+	close(start.done)
 	m.mu.Unlock()
+	go m.watchProcess(agentID, runtime)
 	return nil
+}
+
+func (m *Manager) watchProcess(agentID string, runtime *agentRuntime) {
+	if err := runtime.process.Wait(); err != nil {
+		_ = m.stopRuntime(agentID, runtime)
+		return
+	}
+	m.mu.Lock()
+	if m.running[agentID] == runtime {
+		delete(m.running, agentID)
+	}
+	m.mu.Unlock()
 }
 
 // Touch records activity for a running agent (an open direct-chat connection).
@@ -193,15 +276,53 @@ func (m *Manager) Running(agentID string) bool {
 
 // Stop terminates a running agent.
 func (m *Manager) Stop(agentID string) error {
+	for {
+		m.mu.Lock()
+		if stop := m.stopping[agentID]; stop != nil {
+			m.mu.Unlock()
+			<-stop.done
+			return stop.err
+		}
+		if start := m.starting[agentID]; start != nil {
+			m.mu.Unlock()
+			<-start.done
+			continue
+		}
+		rt, ok := m.running[agentID]
+		if !ok {
+			m.mu.Unlock()
+			return nil
+		}
+		m.mu.Unlock()
+		return m.stopRuntime(agentID, rt)
+	}
+}
+
+func (m *Manager) stopRuntime(agentID string, runtime *agentRuntime) error {
 	m.mu.Lock()
-	rt, ok := m.running[agentID]
-	if !ok {
+	if current := m.running[agentID]; current != runtime {
 		m.mu.Unlock()
 		return nil
 	}
-	delete(m.running, agentID)
+	if stop := m.stopping[agentID]; stop != nil {
+		m.mu.Unlock()
+		<-stop.done
+		return stop.err
+	}
+	stop := &agentStop{done: make(chan struct{})}
+	m.stopping[agentID] = stop
 	m.mu.Unlock()
-	return rt.process.Stop()
+
+	err := runtime.process.Stop()
+	m.mu.Lock()
+	stop.err = err
+	if m.running[agentID] == runtime {
+		delete(m.running, agentID)
+	}
+	delete(m.stopping, agentID)
+	close(stop.done)
+	m.mu.Unlock()
+	return err
 }
 
 // StopIdleCold stops any running cold-mode agent that has been idle longer than
@@ -243,15 +364,33 @@ func (m *Manager) Warmth(agentID string) string {
 func (m *Manager) StopAll() error {
 	m.mu.Lock()
 	ids := make([]string, 0, len(m.running))
+	seen := make(map[string]bool, len(m.running)+len(m.starting))
 	for id := range m.running {
 		ids = append(ids, id)
+		seen[id] = true
+	}
+	for id := range m.starting {
+		if !seen[id] {
+			ids = append(ids, id)
+		}
 	}
 	m.mu.Unlock()
-	var errs []error
+	errCh := make(chan error, len(ids))
+	var wait sync.WaitGroup
 	for _, id := range ids {
-		if err := m.Stop(id); err != nil {
-			errs = append(errs, fmt.Errorf("stop agent %s: %w", id, err))
-		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := m.Stop(id); err != nil {
+				errCh <- fmt.Errorf("stop agent %s: %w", id, err)
+			}
+		}()
+	}
+	wait.Wait()
+	close(errCh)
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

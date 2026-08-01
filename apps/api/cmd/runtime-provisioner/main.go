@@ -64,9 +64,12 @@ func run() error {
 	server := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       2 * time.Minute,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       30 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Compose builds and synchronous teardown are bounded by the backend's
+		// 15-minute operation timeout; do not sever a committed transition and
+		// force the API into recovery before that bound expires.
+		WriteTimeout: 20 * time.Minute,
+		IdleTimeout:  30 * time.Second,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -79,14 +82,16 @@ func run() error {
 		}
 		return nil
 	case <-ctx.Done():
-		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Exact stop/abort operations are bounded at 90 seconds by the backend.
+		// Keep serving active lifecycle calls long enough to join them cleanly.
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 110*time.Second)
 		defer shutdownCancel()
 		return server.Shutdown(shutdownContext)
 	}
 }
 
 func hostEnvironment() []string {
-	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE"}
+	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK"}
 	environment := make([]string, 0, len(names))
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {

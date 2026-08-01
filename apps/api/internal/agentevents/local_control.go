@@ -374,6 +374,28 @@ func (s *LocalControlServer) InstallLocalRuntimeAuthorization(
 	if state.present && state.LocalControl == nil {
 		return errors.New("existing runtime state is not owned by local control")
 	}
+	if state.present {
+		control := state.LocalControl
+		switch {
+		case normalized.Generation < state.Generation:
+			return errors.New("local runtime authorization generation is older than durable state")
+		case normalized.Generation == state.Generation && normalized.RPCBootNonce != control.RPCBootNonce:
+			return errors.New("local runtime authorization reuses a generation with a different RPC boot nonce")
+		case normalized.Generation == state.Generation && control.Reason == LocalRuntimeShutdown:
+			return errors.New("local runtime authorization cannot revive a terminal epoch")
+		case normalized.Generation > state.Generation && control.Reason != LocalRuntimeShutdown:
+			// Fence an orphaned Ready record before the replacement epoch is
+			// reachable. This covers an API restart after the root runtime died.
+			s.authorizations.removeEpoch(
+				normalized.PersonalityAgentID,
+				state.Generation,
+				control.RPCBootNonce,
+			)
+			if err := s.publishControlPlaneShutdown(ctx, normalized.PersonalityAgentID, state); err != nil {
+				return err
+			}
+		}
+	}
 	if err := s.authorizations.install(normalized); err != nil {
 		return err
 	}
@@ -393,6 +415,83 @@ func (s *LocalControlServer) RemoveLocalRuntimeAuthorization(personalityAgentID 
 	s.authorizationMutationMu.Lock()
 	defer s.authorizationMutationMu.Unlock()
 	s.authorizations.remove(personalityAgentID)
+	return nil
+}
+
+// FenceLocalRuntimeAuthorization retires exactly one PAID/process epoch and
+// atomically drives any Ready state owned by that epoch to terminal NotReady.
+// A delayed cleanup from an older process can therefore never revoke or
+// overwrite a replacement generation.
+func (s *LocalControlServer) FenceLocalRuntimeAuthorization(
+	ctx context.Context,
+	personalityAgentID string,
+	generation uint64,
+	rpcBootNonce string,
+) error {
+	if s == nil || s.gateway == nil {
+		return errors.New("local control server is not initialized")
+	}
+	if ctx == nil {
+		return errors.New("local runtime authorization context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
+	if generation > maxProcessGeneration {
+		return errors.New("local runtime generation is outside the process-generation domain")
+	}
+	if err := validateOpaqueRuntimeID(rpcBootNonce, "RPC boot nonce"); err != nil {
+		return err
+	}
+
+	s.authorizationMutationMu.Lock()
+	defer s.authorizationMutationMu.Unlock()
+	// An API restart may have lost the in-memory authorization while the root
+	// provisioner and durable Ready state survive. Remove the exact epoch when
+	// present, but always reconcile matching durable state below.
+	s.authorizations.removeEpoch(personalityAgentID, generation, rpcBootNonce)
+	state, err := s.gateway.state(ctx, personalityAgentID)
+	if err != nil {
+		return fmt.Errorf("read local runtime state while fencing epoch: %w", err)
+	}
+	if !state.present || state.LocalControl == nil ||
+		state.Generation != generation || state.LocalControl.RPCBootNonce != rpcBootNonce ||
+		state.LocalControl.Reason == LocalRuntimeShutdown {
+		return nil
+	}
+	return s.publishControlPlaneShutdown(ctx, personalityAgentID, state)
+}
+
+func (s *LocalControlServer) publishControlPlaneShutdown(
+	ctx context.Context,
+	personalityAgentID string,
+	state runtimeState,
+) error {
+	if !state.present || state.LocalControl == nil || state.LocalControl.Reason == LocalRuntimeShutdown {
+		return nil
+	}
+	revision := state.LocalControl.Revision
+	digest := sha256.Sum256([]byte(fmt.Sprintf(
+		"sumi-control-plane-fence-v1\x00%s\x00%d\x00%s",
+		personalityAgentID,
+		state.Generation,
+		state.LocalControl.RPCBootNonce,
+	)))
+	_, err := s.publishRuntimeState(ctx, LocalRuntimeStatePublication{
+		PublicationID:      "control-plane-fence-" + hex.EncodeToString(digest[:16]),
+		PersonalityAgentID: personalityAgentID,
+		Generation:         state.Generation,
+		RPCBootNonce:       state.LocalControl.RPCBootNonce,
+		ExpectedRevision:   &revision,
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeShutdown,
+	})
+	if err != nil {
+		return fmt.Errorf("publish terminal local runtime fence: %w", err)
+	}
 	return nil
 }
 
@@ -424,6 +523,21 @@ func (r *localRuntimeAuthorizationRegistry) install(authorization LocalRuntimeAu
 	}
 	r.byPAID[authorization.PersonalityAgentID] = authorization
 	return nil
+}
+
+func (r *localRuntimeAuthorizationRegistry) removeEpoch(
+	personalityAgentID string,
+	generation uint64,
+	rpcBootNonce string,
+) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, exists := r.byPAID[personalityAgentID]
+	if !exists || current.Generation != generation || current.RPCBootNonce != rpcBootNonce {
+		return false
+	}
+	delete(r.byPAID, personalityAgentID)
+	return true
 }
 
 func (r *localRuntimeAuthorizationRegistry) remove(personalityAgentID string) {

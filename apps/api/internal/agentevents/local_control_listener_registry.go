@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -87,7 +88,7 @@ func LocalControlSocketPath(rootDir, personalityAgentID string) (string, error) 
 	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
 		return "", err
 	}
-	child := filepath.Join(rootDir, personalityAgentID)
+	child := filepath.Join(rootDir, compactPersonalityAgentID(personalityAgentID))
 	path := filepath.Join(child, localControlRegistrySocketName)
 	if filepath.Dir(path) != child || len(path) > localControlRegistryMaxSocketPath {
 		return "", errors.New("canonical local control socket path is invalid or too long")
@@ -131,7 +132,7 @@ func (r *LocalControlListenerRegistry) ensureLocked(personalityAgentID string) e
 	if err := ensureLocalControlRegistryChild(
 		r.config.RootDir,
 		r.config.SocketGID,
-		personalityAgentID,
+		compactPersonalityAgentID(personalityAgentID),
 	); err != nil {
 		return err
 	}
@@ -158,6 +159,10 @@ func (r *LocalControlListenerRegistry) ensureLocked(personalityAgentID string) e
 		entry.done <- err
 	}()
 	return nil
+}
+
+func compactPersonalityAgentID(personalityAgentID string) string {
+	return strings.ReplaceAll(personalityAgentID, "-", "")
 }
 
 // CloseLocalRuntime idempotently closes one PAID listener.
@@ -306,14 +311,14 @@ func validateLocalControlRegistryRoot(rootDir string, socketGID int) error {
 	return nil
 }
 
-func ensureLocalControlRegistryChild(rootDir string, socketGID int, personalityAgentID string) error {
+func ensureLocalControlRegistryChild(rootDir string, socketGID int, childName string) error {
 	rootFD, err := unix.Open(rootDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("pin local control listener root: %w", err)
 	}
 	defer unix.Close(rootFD)
 	created := false
-	if err := unix.Mkdirat(rootFD, personalityAgentID, localControlRegistryDirectoryMode); err != nil {
+	if err := unix.Mkdirat(rootFD, childName, localControlRegistryDirectoryMode); err != nil {
 		if !errors.Is(err, unix.EEXIST) {
 			return fmt.Errorf("create PAID local control directory: %w", err)
 		}
@@ -322,7 +327,7 @@ func ensureLocalControlRegistryChild(rootDir string, socketGID int, personalityA
 	}
 	childFD, err := unix.Openat(
 		rootFD,
-		personalityAgentID,
+		childName,
 		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
 		0,
 	)
@@ -348,7 +353,7 @@ func ensureLocalControlRegistryChild(rootDir string, socketGID int, personalityA
 		os.FileMode(stat.Mode).Perm() != localControlRegistryDirectoryMode {
 		return errors.New("PAID local control directory is not trusted")
 	}
-	childPath := filepath.Join(rootDir, personalityAgentID)
+	childPath := filepath.Join(rootDir, childName)
 	resolved, err := filepath.EvalSymlinks(childPath)
 	if err != nil {
 		return fmt.Errorf("resolve PAID local control directory: %w", err)

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createDevServerConfig,
+  SUMI_COMPOSE_API_ORIGIN,
   SUMI_DEV_API_ORIGIN,
   SUMI_DEV_HOST,
   SUMI_DEV_ORIGIN,
@@ -31,7 +32,13 @@ test("the supported dev origin is fixed and proxies auth plus direct-chat", () =
   });
 });
 
-test("the proxy target cannot silently become a hostname, wildcard, or path", () => {
+test("the proxy target accepts only literal IPv4 or the exact Compose service", () => {
+  const compose = createDevServerConfig(SUMI_COMPOSE_API_ORIGIN);
+  const composeAuth = compose.proxy?.["/auth"];
+  assert.equal(typeof composeAuth, "object");
+  if (typeof composeAuth === "object") {
+    assert.equal(composeAuth.target, SUMI_COMPOSE_API_ORIGIN);
+  }
   for (const value of [
     "https://127.0.0.1:8080",
     "http://api.example.test:8080",
@@ -40,12 +47,12 @@ test("the proxy target cannot silently become a hostname, wildcard, or path", ()
   ]) {
     assert.throws(
       () => createDevServerConfig(value),
-      /explicit literal IPv4 addresses/,
+      /exact Compose service/,
     );
   }
   assert.throws(
     () => createDevServerConfig(SUMI_DEV_API_ORIGIN, "0.0.0.0"),
-    /explicit literal IPv4 addresses/,
+    /exact Compose service/,
   );
 });
 

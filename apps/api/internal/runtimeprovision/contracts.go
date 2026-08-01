@@ -83,8 +83,8 @@ type InspectRequest struct {
 }
 
 type StopRequest struct {
-	Version            int    `json:"version"`
-	PersonalityAgentID string `json:"personality_agent_id"`
+	Version int `json:"version"`
+	PreparedEpoch
 }
 
 type ReconcileRequest struct {
@@ -238,7 +238,7 @@ func (request StopRequest) Validate() error {
 	if err := validateVersion(request.Version); err != nil {
 		return err
 	}
-	return ValidatePersonalityAgentID(request.PersonalityAgentID)
+	return request.PreparedEpoch.Validate()
 }
 
 func (request ReconcileRequest) Validate() error {

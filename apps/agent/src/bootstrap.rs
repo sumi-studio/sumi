@@ -1032,7 +1032,10 @@ async fn run_after_not_ready(
                 mode = "production-like-local-loopback",
                 "plaintext WebSocket gateway mode is explicitly enabled"
             );
-            WebSocketConnector::new_loopback_insecure(&context.gateway_url, command_digest_factory)?
+            WebSocketConnector::new_local_control_plane_insecure(
+                &context.gateway_url,
+                command_digest_factory,
+            )?
         } else {
             let connector = WebSocketConnector::new(&context.gateway_url, command_digest_factory);
             connector.validate_configuration()?;

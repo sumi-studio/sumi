@@ -138,9 +138,18 @@ local_control_snapshot() {
   local path canonical
   local directory_owner directory_gid directory_mode
   local socket_owner socket_gid socket_mode socket_links
-  for path in / /run /run/sumi "${LOCAL_CONTROL_HOST_ROOT}"; do
+  for path in / /run /run/sumi; do
     validate_root_owned_anchor "${path}"
   done
+  [[ -d "${LOCAL_CONTROL_HOST_ROOT}" && ! -L "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
+    fail "local-control registry root must be a real directory"
+  canonical="$(readlink -e -- "${LOCAL_CONTROL_HOST_ROOT}")" ||
+    fail "cannot canonicalize local-control registry root"
+  [[ "${canonical}" == "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
+    fail "local-control registry root must be canonical"
+  [[ "$(stat -c '%u:%g:%a' -- "${LOCAL_CONTROL_HOST_ROOT}")" == \
+    "${SUMI_LOCAL_CONTROL_SERVER_UID}:${SUMI_LOCAL_CONTROL_SOCKET_GID}:750" ]] ||
+    fail "local-control registry root owner, group, or mode is not trusted"
 
   [[ -d "${SUMI_LOCAL_CONTROL_HOST_DIR}" && ! -L "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
     fail "local-control parent must pre-exist as a real directory"
@@ -593,6 +602,12 @@ case "${action}" in
     fi
     lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
       >/dev/null 2>&1
+    ;;
+  stop-epoch)
+    acquire_supervisor_lock
+    require_docker
+    require_expected_epoch
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     ;;
   stop|down)
     acquire_supervisor_lock

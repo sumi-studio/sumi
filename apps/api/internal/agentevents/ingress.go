@@ -61,10 +61,15 @@ type CommandAppender interface {
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
 type UserCommandIngress struct {
-	Appender       CommandAppender
-	Sessions       UserSessionAuthorizer
-	MaxBytes       int64
-	AllowedOrigins []string
+	Appender  CommandAppender
+	Sessions  UserSessionAuthorizer
+	Spawner   DirectChatSpawner
+	Readiness interface {
+		IsPersonalityAgentReady(context.Context, string) (bool, error)
+	}
+	SpawnReadyTimeout time.Duration
+	MaxBytes          int64
+	AllowedOrigins    []string
 	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
 	// ADR 0009 §5). A nil Authorizer permits any verified session.
 	Authorizer DirectChatAuthorizer
@@ -82,7 +87,13 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 	if appender == nil {
 		return nil, errCommandAppenderRequired
 	}
-	return &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}, nil
+	ingress := &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}
+	if readiness, ok := appender.(interface {
+		IsPersonalityAgentReady(context.Context, string) (bool, error)
+	}); ok {
+		ingress.Readiness = readiness
+	}
+	return ingress, nil
 }
 
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +153,18 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRejection(w, RejectOversized)
 		return
 	}
+	if h.Spawner != nil {
+		if err := h.Spawner.EnsureRunning(r.Context(), claims.PersonalityAgentID); err != nil {
+			writeUnavailable(w, idempotencyKey)
+			return
+		}
+		if h.Readiness != nil {
+			if err := h.awaitSpawnReady(r.Context(), claims.PersonalityAgentID); err != nil {
+				writeUnavailable(w, idempotencyKey)
+				return
+			}
+		}
+	}
 
 	var env CommandEnvelope
 	operationCalled := false
@@ -160,17 +183,7 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, errBrowserRuntimeUnavailable) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(struct {
-				Error          string       `json:"error"`
-				IdempotencyKey string       `json:"idempotency_key"`
-				RejectReason   RejectReason `json:"reject_reason"`
-			}{
-				Error:          "unavailable",
-				IdempotencyKey: idempotencyKey,
-				RejectReason:   RejectUnavailable,
-			})
+			writeUnavailable(w, idempotencyKey)
 			return
 		}
 		// Idempotency conflicts are exposed as 409 so callers cannot
@@ -201,6 +214,45 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idempotencyKey,
 		CommandID:      env.CommandID,
 		Seq:            env.Seq,
+	})
+}
+
+func (h *UserCommandIngress) awaitSpawnReady(ctx context.Context, personalityAgentID string) error {
+	timeout := h.SpawnReadyTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ready, err := h.Readiness.IsPersonalityAgentReady(readyCtx, personalityAgentID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-readyCtx.Done():
+			return readyCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func writeUnavailable(w http.ResponseWriter, idempotencyKey string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(struct {
+		Error          string       `json:"error"`
+		IdempotencyKey string       `json:"idempotency_key"`
+		RejectReason   RejectReason `json:"reject_reason"`
+	}{
+		Error:          "unavailable",
+		IdempotencyKey: idempotencyKey,
+		RejectReason:   RejectUnavailable,
 	})
 }
 

@@ -89,6 +89,12 @@ services:
       - "10020"
       - "${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}"
     command: [runtime]
+    # Keep a distinct PAID runtime network namespace. The external internal-only
+    # bridge exposes the stable API gateway alias but publishes no runtime port;
+    # the PAID-private default network remains its provider egress path.
+    networks:
+      default: {}
+      control-plane: {}
     environment:
       SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
       # This is the executor's logical workspace address. Runtime uses it only
@@ -196,6 +202,11 @@ volumes:
   broker-identity: {}
   executor-ipc: {}
   broker-ipc: {}
+
+networks:
+  control-plane:
+    external: true
+    name: ${SUMI_CONTROL_PLANE_NETWORK:-sumi-control-plane}
 
 secrets:
   sumi_local_control_bearer:

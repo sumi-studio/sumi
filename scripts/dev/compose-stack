@@ -6,6 +6,7 @@ readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
 readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
+readonly CONTROL_PLANE_NETWORK=sumi-control-plane
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
 RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
@@ -22,6 +23,19 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+ensure_control_plane_network() {
+  local metadata
+  if ! docker network inspect "${CONTROL_PLANE_NETWORK}" >/dev/null 2>&1; then
+    docker network create --driver bridge --internal \
+      --label dev.sumi.network-role=agent-control-plane \
+      "${CONTROL_PLANE_NETWORK}" >/dev/null
+  fi
+  metadata="$(docker network inspect --format '{{.Name}}:{{.Driver}}:{{.Internal}}' "${CONTROL_PLANE_NETWORK}")" ||
+    fail "cannot inspect ${CONTROL_PLANE_NETWORK}"
+  [[ "${metadata}" == "${CONTROL_PLANE_NETWORK}:bridge:true" ]] ||
+    fail "${CONTROL_PLANE_NETWORK} must be an internal bridge network"
 }
 
 random_token() {
@@ -94,8 +108,6 @@ ensure_runtime_env_file() {
     (
       umask 077
       {
-        printf 'SUMI_LOCAL_CONTROL_BEARER=%s\n' "$(random_token)"
-        printf 'SUMI_AGENT_WRAPPING_KEY=%s\n' "$(random_token)"
         printf 'SUMI_APPROVAL_SECRET_DIGEST_KEY=%s\n' "$(random_token)"
         printf 'SUMI_AGENT_TOKEN_SECRET=%s\n' "$(random_base64)"
         printf 'SUMI_BROWSER_SESSION_SECRET=%s\n' "$(random_base64)"
@@ -170,8 +182,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/dev/compose-stack up|down|config
 
-Starts or stops the full local Sumi stack in Docker Compose:
-Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+Starts or stops the local Sumi control plane in Docker Compose. PersonalityAgent
+runtimes are provisioned lazily as isolated PAID-derived Compose projects.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 EOF
@@ -223,11 +235,6 @@ export FIREBASE_AUTH_EMULATOR_HOST="firebase-auth:9099"
 export VITE_FIREBASE_AUTH_EMULATOR_URL="http://${SUMI_DEV_BROWSER_HOST}:9099"
 validate_firebase_web_config
 
-# Use a stable dev PAID. The API and the agent container share it. The API
-# grants the legacy env-agent authorization so the container can connect.
-export SUMI_PERSONALITY_AGENT_ID="0198f0f4-9b72-7000-8000-00000000000d"
-export SUMI_RPC_NONCE="dev-compose-0001"
-
 # Provide compose-scoped defaults if not already set by the env file.
 export SUMI_DB_URL="${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}"
 export SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}"
@@ -245,27 +252,14 @@ export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
 # lock before Docker Compose runs so a foreground stack does not block `down`.
 unlock_runtime_env_file
 
-# Runtime secrets. These are also read by the agent container through compose
-# secrets and by the API to authorize the container.
-export SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER:-$(random_token)}"
-export SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY:-$(random_token)}"
+# Runtime activation secrets stay in the API until they cross the typed
+# provisioner activation request for one exact prepared epoch.
 export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
 
-# Agent token and local-control secrets. These are used by the API to verify
-# agent WebSocket connections and by the runtime container to authenticate its
-# local-control socket. Browser auth uses the persisted session secret above;
-# Firebase Admin uses either the configured emulator or ambient ADC.
+# Agent token and local-control signing secrets stay in the API. Browser auth
+# uses the persisted session secret; Firebase Admin uses the emulator or ADC.
 export SUMI_AGENT_TOKEN_SECRET="${SUMI_AGENT_TOKEN_SECRET:-$(random_base64)}"
 export SUMI_LOCAL_CONTROL_TENANT_ID="${SUMI_LOCAL_CONTROL_TENANT_ID:-${SUMI_AUTH_TENANT_ID:-sumi-dev}}"
-export SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION:-0}"
-export SUMI_RPC_NONCE="${SUMI_RPC_NONCE:-$(random_token)}"
-# The API's local-control fixture and the runtime identity must agree on the
-# boot nonce, so derive both from the same value.
-export SUMI_LOCAL_CONTROL_GENERATION="${SUMI_LOCAL_CONTROL_GENERATION:-$SUMI_RPC_GENERATION}"
-export SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE="${SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE:-$SUMI_RPC_NONCE}"
-export SUMI_RPC_NONCE="$SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"
-export SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID:-$(random_token)}"
-export SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID:-$(random_token)}"
 export SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION="${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}"
 
 # An explicit Firebase web configuration is forwarded as a complete set from
@@ -295,6 +289,7 @@ fi
 case "$1" in
   up)
     shift
+    ensure_control_plane_network
     docker compose -p sumi-dev -f "${COMPOSE_FILE}" up --build "$@"
     ;;
   down)
