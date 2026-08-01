@@ -178,6 +178,136 @@ func TestExecCommandRunnerBoundsInheritedPipeAndKillsProcessGroup(t *testing.T) 
 	t.Fatal("supervisor process group survived bounded cancellation")
 }
 
+func TestExecCommandRunnerHonorsCleanupBoundForDetachedSession(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	cleanedPath := filepath.Join(dir, "cleaned")
+	pidPath := filepath.Join(dir, "nested-pid")
+	scriptPath := filepath.Join(dir, "supervisor.sh")
+	script := `#!/bin/bash
+set -eu
+printf 'cleanup-bound-ms 600\n' >&3
+trap 'sleep 0.2; kill -TERM -- "-${nested}"; wait "${nested}" || true; printf "nested-done %s\n" "${nested}" >&3; printf cleaned >"${CLEANED_PATH}"; exit 143' TERM
+setsid /bin/bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' 3>&- &
+nested=$!
+printf 'nested-start %s\n' "${nested}" >&3
+printf '%s' "${nested}" >"${PID_PATH}"
+printf ready >"${READY_PATH}"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{pipeWait: 25 * time.Millisecond}).Run(
+			ctx,
+			scriptPath,
+			nil,
+			[]string{
+				"PATH=/usr/bin:/bin",
+				"READY_PATH=" + readyPath,
+				"CLEANED_PATH=" + cleanedPath,
+				"PID_PATH=" + pidPath,
+			},
+		)
+		result <- err
+	}()
+	waitForFile(t, readyPath)
+	nestedPID := readPID(t, pidPath)
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runner error = %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not return within the advertised cleanup bound")
+	}
+	if elapsed := time.Since(started); elapsed < 150*time.Millisecond {
+		t.Fatalf("runner returned before slow cleanup completed: %s", elapsed)
+	}
+	if raw, err := os.ReadFile(cleanedPath); err != nil || string(raw) != "cleaned" {
+		t.Fatalf("slow cleanup did not complete: value=%q err=%v", raw, err)
+	}
+	waitForProcessGroupGone(t, nestedPID, "detached cleanup session")
+}
+
+func TestExecCommandRunnerKillsTrackedDetachedSessionAfterCleanupBound(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	pidPath := filepath.Join(dir, "nested-pid")
+	scriptPath := filepath.Join(dir, "stuck-supervisor.sh")
+	script := `#!/bin/bash
+set -eu
+printf 'cleanup-bound-ms 100\n' >&3
+trap '' TERM
+setsid /bin/bash -c 'trap "" TERM; while :; do sleep 1; done' 3>&- &
+nested=$!
+printf 'nested-start %s\n' "${nested}" >&3
+printf '%s' "${nested}" >"${PID_PATH}"
+printf ready >"${READY_PATH}"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{pipeWait: 25 * time.Millisecond}).Run(
+			ctx,
+			scriptPath,
+			nil,
+			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "PID_PATH=" + pidPath},
+		)
+		result <- err
+	}()
+	waitForFile(t, readyPath)
+	nestedPID := readPID(t, pidPath)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runner error = %v, want context cancellation", err)
+		}
+		var commandError *supervisorCommandError
+		if !errors.As(err, &commandError) || !strings.Contains(commandError.diagnostic, "host lifecycle state is indeterminate and requires reconciliation") {
+			t.Fatalf("runner omitted indeterminate-state reconciliation diagnostic: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner exceeded the advertised cleanup bound")
+	}
+	waitForProcessGroupGone(t, nestedPID, "stuck detached session")
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+func waitForProcessGroupGone(t *testing.T, pid int, label string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s survived cancellation", label)
+}
+
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
