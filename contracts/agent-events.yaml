@@ -19,19 +19,19 @@ $comment: |
 $defs:
   DurableEnvelope:
     type: object
-    required: [conversation_id, event, seq]
+    required: [personality_agent_id, event, seq]
     additionalProperties: false
     properties:
-      conversation_id: { type: string }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       event: { $ref: '#/$defs/DurableAgentEvent' }
       seq: { $ref: '#/$defs/JsonSafeInteger' }
 
   VolatileEnvelope:
     type: object
-    required: [conversation_id, event]
+    required: [personality_agent_id, event]
     additionalProperties: false
     properties:
-      conversation_id: { type: string }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       event: { $ref: '#/$defs/VolatileAgentEvent' }
 
   Envelope:
@@ -187,6 +187,43 @@ $defs:
       retry_at: { type: string, format: date-time }
       error_message: { type: string }
 
+  CommandDispositionEvent:
+    oneOf:
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: applied }
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: superseded }
+      - type: object
+        required: [type, command_id, command_seq, status, reject_reason]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: rejected }
+          reject_reason: { $ref: '#/$defs/CommandRejectReason' }
+
   ErrorEvent:
     type: object
     required: [type, message]
@@ -212,6 +249,7 @@ $defs:
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
       - { $ref: '#/$defs/ErrorEvent' }
 
   DurableAgentEvent:
@@ -229,6 +267,7 @@ $defs:
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
 
   VolatileAgentEvent:
     oneOf:
@@ -665,9 +704,50 @@ $defs:
           request_id: { type: string }
           decision: { $ref: '#/$defs/ApprovalDecision' }
 
+  PersonalityAgentId:
+    type: string
+    pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    description: exact lower-case hyphenated UUIDv7 personality-agent identity
+
+  TenantId:
+    type: string
+    minLength: 1
+    maxLength: 256
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
+    description: opaque ASCII tenant identity
+
+  PrincipalId:
+    type: string
+    minLength: 1
+    maxLength: 256
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
+    description: opaque ASCII principal identity
+
+  DirectChatProvenanceV1:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 1 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { const: human }
+          principal_id: { $ref: '#/$defs/PrincipalId' }
+      source:
+        type: object
+        required: [surface]
+        additionalProperties: false
+        properties:
+          surface: { const: direct_chat }
+
   CommandEnvelope:
     type: object
-    required: [seq, command_id, command]
+    required: [seq, command_id, personality_agent_id, provenance, command]
     additionalProperties: false
     properties:
       seq: { $ref: '#/$defs/JsonSafeInteger' }
@@ -676,11 +756,18 @@ $defs:
         format: uuid
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         description: canonical lower-case hyphenated UUID
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
       command: { $ref: '#/$defs/Command' }
+    $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
+
+  CommandRejectReason:
+    type: string
+    enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
 
   CommandAck:
     type: object
-    required: [seq, command_id, status]
+    required: [seq, command_id, personality_agent_id, status]
     additionalProperties: false
     properties:
       seq: { $ref: '#/$defs/JsonSafeInteger' }
@@ -688,12 +775,12 @@ $defs:
         type: string
         format: uuid
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       status:
         type: string
         enum: [received, applied, superseded, rejected]
       reject_reason:
-        type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+        $ref: '#/$defs/CommandRejectReason'
     if:
       properties:
         status: { const: rejected }
@@ -734,6 +821,7 @@ $defs:
       type: { const: command }
       idempotency_key:
         type: string
+        minLength: 1
         maxLength: 1024
       command: { $ref: '#/$defs/Command' }
 
@@ -742,37 +830,80 @@ $defs:
       - { $ref: '#/$defs/BrowserHello' }
       - { $ref: '#/$defs/BrowserCommandFrame' }
 
+  BrowserEventEnvelope:
+    oneOf:
+      - type: object
+        required: [seq, event]
+        additionalProperties: false
+        properties:
+          seq: { $ref: '#/$defs/JsonSafeInteger' }
+          event: { $ref: '#/$defs/DurableAgentEvent' }
+      - type: object
+        required: [event]
+        additionalProperties: false
+        properties:
+          event: { $ref: '#/$defs/VolatileAgentEvent' }
+
   BrowserEventFrame:
     type: object
     required: [type, envelope]
     additionalProperties: false
     properties:
       type: { const: event }
-      envelope: { $ref: '#/$defs/Envelope' }
+      envelope: { $ref: '#/$defs/BrowserEventEnvelope' }
 
   BrowserCommandAcceptedFrame:
     type: object
-    required: [type, envelope]
+    required: [type, idempotency_key, command_id, seq]
     additionalProperties: false
     properties:
       type: { const: command_accepted }
-      envelope: { $ref: '#/$defs/CommandEnvelope' }
+      idempotency_key:
+        type: string
+        minLength: 1
+        maxLength: 1024
+      command_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      disposition:
+        description: >
+          Exact durable terminal disposition for this command when already
+          committed at idempotent acceptance time. Its command_id and
+          command_seq must equal this receipt's command_id and seq.
+        $ref: '#/$defs/CommandDispositionEvent'
 
   BrowserCommandRejectedFrame:
     type: object
-    required: [type, reject_reason]
+    required: [type, idempotency_key, reject_reason]
     additionalProperties: false
     properties:
       type: { const: command_rejected }
+      idempotency_key:
+        type: string
+        minLength: 1
+        maxLength: 1024
       reject_reason:
         type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable]
+
+  DirectChatStatusFrame:
+    type: object
+    required: [type, status]
+    additionalProperties: false
+    properties:
+      type: { const: direct_chat_status }
+      status:
+        type: string
+        enum: [ready, unavailable]
 
   BrowserServerFrame:
     oneOf:
       - { $ref: '#/$defs/BrowserEventFrame' }
       - { $ref: '#/$defs/BrowserCommandAcceptedFrame' }
       - { $ref: '#/$defs/BrowserCommandRejectedFrame' }
+      - { $ref: '#/$defs/DirectChatStatusFrame' }
 
   Attachment:
     type: object
@@ -793,12 +924,10 @@ $defs:
 
   AgentHello:
     type: object
-    required: [agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
+    required: [personality_agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
     additionalProperties: false
     properties:
-      agent_id:
-        type: string
-        description: agent identity from the short-lived credential claim
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       generation:
         $ref: '#/$defs/ProcessGeneration'
       last_sent_event_seq:
@@ -810,9 +939,10 @@ $defs:
 
   ApiHello:
     type: object
-    required: [accepted_generation, last_received_event_seq, next_command_seq]
+    required: [personality_agent_id, accepted_generation, last_received_event_seq, next_command_seq]
     additionalProperties: false
     properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
       accepted_generation:
         $ref: '#/$defs/ProcessGeneration'
       last_received_event_seq:

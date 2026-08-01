@@ -6,11 +6,7 @@
 //! `WebSocketGateway` performs the agent/API hello exchange and then splits into
 //! a `WsGatewayReader` / `WsGatewayWriter` pair for the epoch.
 
-// TODO(T26): Remove this once `WebSocketConnector`/`WsGatewayReader`/`WsGatewayWriter`
-// are wired into the process bootstrap. The whole module is dead-code until then.
-#![allow(dead_code, reason = "T26 production wiring not yet connected")]
-
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -23,6 +19,8 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite};
 use zeroize::Zeroizing;
 
+use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration};
+
 use super::stdio::MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES;
 use super::supervisor::{
     AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential,
@@ -34,8 +32,8 @@ use super::{
 };
 
 /// Outbound connector for `wss://` (production). `ws://` is only allowed when
-/// constructed with [`WebSocketConnector::new_insecure`], which is exposed for
-/// test fixtures that spin a local plaintext server.
+/// constructed with [`WebSocketConnector::new_loopback_insecure`], which is an
+/// explicit production-like local/CI mode restricted to literal loopback IPs.
 pub struct WebSocketConnector {
     url: String,
     digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
@@ -55,17 +53,37 @@ impl WebSocketConnector {
         }
     }
 
-    /// Create a test-only connector that permits `ws://`.
+    /// Create an explicit production-like local/CI connector.
+    ///
+    /// The URL must use `ws://` and a literal `127.0.0.0/8` or `::1` host.
+    /// Hostnames (including `localhost`) and non-loopback IPs are rejected
+    /// before any bearer credential can be added to a request.
+    pub fn new_loopback_insecure(
+        url: impl Into<String>,
+        digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    ) -> Result<Self> {
+        let url = url.into();
+        validate_loopback_insecure_url(&url)?;
+        Ok(Self {
+            url,
+            digest_factory,
+            allow_insecure: true,
+        })
+    }
+
+    /// Compatibility helper for unit fixtures. Production-like local callers
+    /// use the fallible constructor above and must handle invalid URLs.
     #[cfg(test)]
     pub fn new_insecure(
         url: impl Into<String>,
         digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
     ) -> Self {
-        Self {
-            url: url.into(),
-            digest_factory,
-            allow_insecure: true,
-        }
+        Self::new_loopback_insecure(url, digest_factory)
+            .expect("test insecure WebSocket URL must be literal loopback")
+    }
+
+    pub(crate) fn validate_configuration(&self) -> Result<()> {
+        validate_connector_url(&self.url, self.allow_insecure)
     }
 }
 
@@ -86,24 +104,8 @@ impl GatewayConnector for WebSocketConnector {
         &mut self,
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
-        let (scheme, _rest) = self.url.split_once("://").ok_or_else(|| {
-            ConnectorError::InvalidConfiguration(anyhow!("websocket url is missing a scheme"))
-        })?;
-        let scheme_lower = scheme.to_ascii_lowercase();
-        match scheme_lower.as_str() {
-            "wss" => {}
-            "ws" if self.allow_insecure => {}
-            "ws" => {
-                return Err(ConnectorError::InvalidConfiguration(anyhow!(
-                    "refusing to send bearer credential over insecure ws://"
-                )));
-            }
-            _ => {
-                return Err(ConnectorError::InvalidConfiguration(anyhow!(
-                    "unsupported websocket scheme: {scheme}"
-                )));
-            }
-        }
+        validate_connector_url(&self.url, self.allow_insecure)
+            .map_err(ConnectorError::InvalidConfiguration)?;
 
         let mut request = self.url.as_str().into_client_request().map_err(|e| {
             ConnectorError::InvalidConfiguration(anyhow!("invalid websocket url: {e}"))
@@ -132,8 +134,15 @@ impl GatewayConnector for WebSocketConnector {
         // `rustls-tls-webpki-roots` Cargo feature. Enterprise or native OS trust
         // roots require an explicit future configuration/contract and must not
         // be silently blended here.
+        let credential_personality_agent_id = credential.personality_agent_id().clone();
+        let credential_generation = credential.generation();
         match connect_async_with_config(request, Some(ws_config), true).await {
-            Ok((ws, _)) => Ok(WebSocketGateway::new(ws, self.digest_factory.clone())),
+            Ok((ws, _)) => Ok(WebSocketGateway::new(
+                ws,
+                self.digest_factory.clone(),
+                credential_personality_agent_id,
+                credential_generation,
+            )),
             Err(tungstenite::Error::Http(response))
                 if matches!(response.status().as_u16(), 401 | 403) =>
             {
@@ -144,6 +153,50 @@ impl GatewayConnector for WebSocketConnector {
             ))),
         }
     }
+}
+
+fn validate_connector_url(value: &str, allow_insecure: bool) -> Result<()> {
+    let (scheme, _) = value
+        .split_once("://")
+        .context("websocket URL is missing a scheme")?;
+    let url = reqwest::Url::parse(value).context("invalid websocket URL")?;
+    match scheme.to_ascii_lowercase().as_str() {
+        "wss" => {}
+        "ws" if allow_insecure => validate_loopback_insecure_url(value)?,
+        "ws" => bail!("refusing to send bearer credential over insecure ws://"),
+        scheme => bail!("unsupported websocket scheme: {scheme}"),
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("websocket URL must not contain credentials or a fragment");
+    }
+    url.host_str().context("websocket URL is missing a host")?;
+    Ok(())
+}
+
+fn validate_loopback_insecure_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("invalid local WebSocket URL")?;
+    if url.scheme() != "ws" {
+        bail!("production-like local WebSocket URL must use ws://");
+    }
+    let host = url
+        .host_str()
+        .and_then(parse_ip_literal)
+        .context("local WebSocket URL host must be a literal IP address")?;
+    if !host.is_loopback() {
+        bail!("local WebSocket URL host must be loopback");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("local WebSocket URL must not contain credentials or a fragment");
+    }
+    Ok(())
+}
+
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
 }
 
 fn ensure_rustls_crypto_provider() -> Result<(), ConnectorError> {
@@ -167,14 +220,23 @@ fn ensure_rustls_crypto_provider() -> Result<(), ConnectorError> {
 pub struct WebSocketGateway {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    credential_personality_agent_id: PersonalityAgentId,
+    credential_generation: ProcessGeneration,
 }
 
 impl WebSocketGateway {
     fn new(
         ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
         digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+        credential_personality_agent_id: PersonalityAgentId,
+        credential_generation: ProcessGeneration,
     ) -> Self {
-        Self { ws, digest_factory }
+        Self {
+            ws,
+            digest_factory,
+            credential_personality_agent_id,
+            credential_generation,
+        }
     }
 }
 
@@ -187,6 +249,13 @@ impl Gateway for WebSocketGateway {
         &mut self,
         hello: AgentHello,
     ) -> std::result::Result<ApiHello, HelloError> {
+        if hello.personality_agent_id != self.credential_personality_agent_id
+            || hello.generation != self.credential_generation
+        {
+            return Err(HelloError::Fatal(anyhow!(
+                "AgentHello scope does not match authenticated credential"
+            )));
+        }
         let hello_text = serde_json::to_string(&hello)
             .context("serialize agent hello")
             .map_err(HelloError::Fatal)?;
@@ -234,7 +303,10 @@ impl Gateway for WebSocketGateway {
                 read,
                 digest_factory: self.digest_factory,
             },
-            WsGatewayWriter { write },
+            WsGatewayWriter {
+                write,
+                personality_agent_id: self.credential_personality_agent_id,
+            },
         )
     }
 }
@@ -268,11 +340,23 @@ impl GatewayReader for WsGatewayReader {
 
 pub struct WsGatewayWriter {
     write: futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    personality_agent_id: PersonalityAgentId,
 }
 
 #[async_trait]
 impl GatewayWriter for WsGatewayWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        let frame_personality_agent_id = match &frame {
+            OutboundFrame::Event { envelope } => &envelope.personality_agent_id,
+            OutboundFrame::CommandAck { ack } => &ack.personality_agent_id,
+        };
+        if frame_personality_agent_id != &self.personality_agent_id {
+            bail!(
+                "outbound frame personality-agent mismatch: credential={}, frame={}",
+                self.personality_agent_id,
+                frame_personality_agent_id,
+            );
+        }
         let wire = wire::to_wire_frame(frame)
             .map_err(|e| anyhow!("frame failed wire contract validation: {e}"))?;
         let text = serde_json::to_string(&wire).context("serialize wire frame")?;
@@ -324,10 +408,10 @@ mod tests {
 
     use super::super::stdio::MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES;
     use super::super::{
-        AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope,
-        DeliveryAuthorization, Envelope, Gateway, GatewayConnector, GatewayCredential,
-        GatewayReader, GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest,
-        MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
+        AgentHello, ApiHello, Command, CommandDigestFactory, DeliveryAuthorization, Envelope,
+        Gateway, GatewayConnector, GatewayCredential, GatewayReader, GatewayWriter, HelloError,
+        InboundCommand, IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
+        OversizedFrameError,
     };
     use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;
@@ -336,7 +420,12 @@ mod tests {
     struct TestDigestFactory;
 
     fn test_credential(token: impl Into<String>) -> GatewayCredential {
-        GatewayCredential::new(token, DeliveryAuthorization::Raw)
+        GatewayCredential::new(
+            token,
+            crate::gateway::test_personality_agent_id(),
+            ProcessGeneration::from_wire(7).unwrap(),
+            DeliveryAuthorization::Raw,
+        )
     }
 
     impl CommandDigestFactory for TestDigestFactory {
@@ -367,6 +456,27 @@ mod tests {
             matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn explicit_local_mode_accepts_only_literal_loopback() {
+        for url in ["ws://127.0.0.1:1234/gateway", "ws://[::1]:1234/gateway"] {
+            assert!(
+                WebSocketConnector::new_loopback_insecure(url, Arc::new(TestDigestFactory)).is_ok(),
+                "{url}"
+            );
+        }
+        for url in [
+            "ws://localhost:1234/gateway",
+            "ws://192.168.1.20:1234/gateway",
+            "wss://127.0.0.1:1234/gateway",
+        ] {
+            assert!(
+                WebSocketConnector::new_loopback_insecure(url, Arc::new(TestDigestFactory))
+                    .is_err(),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -439,6 +549,8 @@ mod tests {
         let value = serde_json::json!({
             "seq": 42,
             "command_id": "00000000-0000-4000-8000-000000000042",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
             "command": {
                 "type": "abort"
             }
@@ -454,19 +566,29 @@ mod tests {
             result.is_ok(),
             "pretty-printed JSON should be one complete websocket command: {result:?}"
         );
-        assert!(matches!(
-            result.unwrap(),
-            InboundCommand::Valid(CommandEnvelope {
-                seq: 42,
-                command: Command::Abort {},
-                ..
-            })
-        ));
+        let InboundCommand::Valid(command) = result.unwrap() else {
+            panic!("expected valid command");
+        };
+        assert_eq!(command.seq, 42);
+        assert_eq!(
+            command.personality_agent_id,
+            crate::gateway::test_personality_agent_id()
+        );
+        assert_eq!(
+            command.provenance,
+            crate::gateway::test_direct_chat_provenance()
+        );
+        assert!(matches!(command.command, Command::Abort {}));
     }
 
     #[tokio::test]
     async fn websocket_bounded_oversize_decoder_reaches_terminal_rejection() {
-        let mut bytes = br#"{"seq":42,"command_id":"00000000-0000-4000-8000-000000000042","command":{"type":"user_message","text":"""#.to_vec();
+        let mut bytes = format!(
+            r#"{{"seq":42,"command_id":"00000000-0000-4000-8000-000000000042","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
+            crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance()).unwrap(),
+        )
+        .into_bytes();
         bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
         bytes.extend_from_slice(br#"","attachments":[]}}"#);
         assert!(bytes.len() > MAX_FRAME_BYTES);
@@ -485,7 +607,12 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_oversize_beyond_identity_window_fails_closed() {
-        let mut bytes = br#"{"seq":43,"command_id":"00000000-0000-4000-8000-000000000043","command":{"type":"user_message","text":"""#.to_vec();
+        let mut bytes = format!(
+            r#"{{"seq":43,"command_id":"00000000-0000-4000-8000-000000000043","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
+            crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance()).unwrap(),
+        )
+        .into_bytes();
         bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
         bytes.extend_from_slice(br#"","attachments":[]}}"#);
         bytes.extend(std::iter::repeat_n(
@@ -507,7 +634,7 @@ mod tests {
 
     fn test_agent_hello() -> AgentHello {
         AgentHello {
-            agent_id: "test-agent".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 1,
             last_received_command_seq: 0,
@@ -517,6 +644,7 @@ mod tests {
 
     fn test_api_hello() -> ApiHello {
         ApiHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 1,
             next_command_seq: 2,
@@ -527,7 +655,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(1),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "agent_start"}),
             },
         }
@@ -535,7 +663,14 @@ mod tests {
 
     fn test_command_message() -> tokio_tungstenite::tungstenite::Message {
         tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#.to_owned(),
+            serde_json::to_string(&serde_json::json!({
+                "seq": 2,
+                "command_id": "00000000-0000-4000-8000-000000000002",
+                "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+                "provenance": crate::gateway::test_direct_chat_provenance(),
+                "command": {"type": "abort"},
+            }))
+            .expect("serialize authenticated command fixture"),
         )
     }
 
@@ -973,9 +1108,24 @@ mod tests {
 
             // Send a bounded oversize payload; the reader must remain bounded.
             let _ = ready_tx.send(());
-            let mut oversized = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":"""#.to_vec();
-            oversized.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
-            oversized.extend_from_slice(br#"","attachments":[]}}"#);
+            let mut oversized = format!(
+                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
+                crate::gateway::TEST_PERSONALITY_AGENT_ID,
+                serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
+                    .expect("serialize direct-chat provenance fixture"),
+            )
+            .into_bytes();
+            let suffix = br#"","attachments":[]}}"#;
+            let text_bytes = (MAX_FRAME_BYTES + 1)
+                .checked_sub(oversized.len() + suffix.len())
+                .expect("authenticated command envelope must fit below the transport limit");
+            oversized.extend(std::iter::repeat_n(b'x', text_bytes));
+            oversized.extend_from_slice(suffix);
+            assert_eq!(
+                oversized.len(),
+                MAX_FRAME_BYTES + 1,
+                "fixture must exercise the first byte beyond the transport limit"
+            );
             ws.send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
                 .await
                 .unwrap();
@@ -1094,7 +1244,7 @@ mod tests {
         // the error message must not contain the secret.
         let secret_with_control = "Bearer test-token\nwith-secret";
         let mut connector = WebSocketConnector::new_insecure(
-            "ws://localhost:0".to_owned(),
+            "ws://127.0.0.1:0".to_owned(),
             Arc::new(TestDigestFactory),
         );
         let result = connector
@@ -1119,7 +1269,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(1),
-                conversation_id: "c".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({
                     "type": "retry_scheduled",
                     "attempt": 1,

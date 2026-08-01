@@ -2,9 +2,9 @@
 //!
 //! This module translates already-validated model arguments into the T13 RPC
 //! contract. It deliberately owns neither executor bootstrap nor generation
-//! rotation. The client keeps its socket and nonce private, and the bounded
-//! execution identifier below is only a retry-stable live invocation identity;
-//! it is not the durable T26 idempotency key.
+//! rotation. The registry copies the client's immutable RPC identity only for
+//! Session-start validation; the bounded execution identifier below remains a
+//! retry-stable live invocation identity, not the durable T26 idempotency key.
 
 use std::{fmt::Write as _, sync::Arc};
 
@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorResponse};
 use crate::{
     provider::types::{ToolDefinition, ValidatedToolArguments},
-    runtime::contracts::ProcessGeneration,
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolRisk,
         text_output,
@@ -54,29 +53,34 @@ impl ExecutorInvoker for ExecutorClient {
     }
 }
 
-/// Builds the complete frozen workspace tool registry from one immutable,
-/// supervisor-issued executor client. Registration is explicit and duplicate
-/// checked by [`ToolRegistryBuilder`].
+/// Builds the production executor registry from one immutable,
+/// supervisor-issued client. The critical Unix endpoint exposes only bounded,
+/// workspace-confined read and discovery operations.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
-    let generation = client.generation();
-    registry_from_invoker_for_generation(client, generation)
+    let identity = client.identity().clone();
+    let mut builder = ToolRegistryBuilder::default();
+    for kind in [
+        RemoteToolKind::WorkspaceReadFile,
+        RemoteToolKind::ListDir,
+        RemoteToolKind::Glob,
+        RemoteToolKind::WorkspaceGrep,
+    ] {
+        builder.register(Arc::new(RemoteTool {
+            kind,
+            client: client.clone(),
+        }))?;
+    }
+    Ok(builder.build_for_executor_identity(identity))
 }
 
 #[cfg(test)]
 fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker_inner(client, None)
+    broad_test_registry_from_invoker(client)
 }
 
-fn registry_from_invoker_for_generation(
+#[cfg(test)]
+fn broad_test_registry_from_invoker(
     client: Arc<dyn ExecutorInvoker>,
-    generation: ProcessGeneration,
-) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker_inner(client, Some(generation))
-}
-
-fn registry_from_invoker_inner(
-    client: Arc<dyn ExecutorInvoker>,
-    generation: Option<ProcessGeneration>,
 ) -> Result<ToolRegistry, ToolError> {
     let mut builder = ToolRegistryBuilder::default();
     for kind in [
@@ -94,14 +98,13 @@ fn registry_from_invoker_inner(
             client: client.clone(),
         }))?;
     }
-    Ok(match generation {
-        Some(generation) => builder.build_for_executor_generation(generation),
-        None => builder.build(),
-    })
+    Ok(builder.build())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteToolKind {
+    WorkspaceReadFile,
+    WorkspaceGrep,
     ReadFile,
     WriteFile,
     EditFile,
@@ -121,9 +124,17 @@ struct RemoteTool {
 impl Tool for RemoteTool {
     fn def(&self) -> ToolDefinition {
         match self.kind {
+            RemoteToolKind::WorkspaceReadFile => definition::<WorkspaceReadFileArgs>(
+                "read_file",
+                "Read UTF-8 text from a workspace path. Artifact handles are not accepted.",
+            ),
             RemoteToolKind::ReadFile => definition::<ReadFileArgs>(
                 "read_file",
                 "Read UTF-8 text from a workspace path or artifact handle.",
+            ),
+            RemoteToolKind::WorkspaceGrep => definition::<WorkspaceGrepArgs>(
+                "grep",
+                "Search a workspace path with a regular expression. Artifact handles are not accepted.",
             ),
             RemoteToolKind::WriteFile => definition::<WriteFileArgs>(
                 "write_file",
@@ -154,7 +165,9 @@ impl Tool for RemoteTool {
 
     fn risk(&self) -> ToolRisk {
         match self.kind {
-            RemoteToolKind::ReadFile
+            RemoteToolKind::WorkspaceReadFile
+            | RemoteToolKind::WorkspaceGrep
+            | RemoteToolKind::ReadFile
             | RemoteToolKind::ListDir
             | RemoteToolKind::Glob
             | RemoteToolKind::Grep => ToolRisk::ReadOnly,
@@ -177,7 +190,7 @@ impl Tool for RemoteTool {
             } => Some(ReadContext {
                 request_offset: *offset,
                 rpc_limit: *limit,
-                artifact: path.starts_with("artifact://"),
+                artifact: self.kind == RemoteToolKind::ReadFile && path.starts_with("artifact://"),
             }),
             _ => None,
         };
@@ -196,6 +209,20 @@ impl RemoteToolKind {
         execution_id: String,
     ) -> Result<ExecutorOperation, ToolError> {
         Ok(match self {
+            Self::WorkspaceReadFile => {
+                let args: WorkspaceReadFileArgs = decode(args)?;
+                if args.path.starts_with("artifact://") {
+                    return Err(ToolError::InvalidPath(
+                        "production read_file accepts workspace paths only".to_owned(),
+                    ));
+                }
+                ExecutorOperation::ReadFile {
+                    path: args.path,
+                    offset: args.offset,
+                    limit: args.limit,
+                    execution_id,
+                }
+            }
             Self::ReadFile => {
                 let args: ReadFileArgs = decode(args)?;
                 let limit = if args.path.starts_with("artifact://") {
@@ -207,6 +234,19 @@ impl RemoteToolKind {
                     path: args.path,
                     offset: args.offset,
                     limit,
+                    execution_id,
+                }
+            }
+            Self::WorkspaceGrep => {
+                let args: WorkspaceGrepArgs = decode(args)?;
+                if args.path.starts_with("artifact://") {
+                    return Err(ToolError::InvalidPath(
+                        "production grep accepts workspace paths only".to_owned(),
+                    ));
+                }
+                ExecutorOperation::Grep {
+                    path: args.path,
+                    pattern: args.pattern,
                     execution_id,
                 }
             }
@@ -260,7 +300,7 @@ impl RemoteToolKind {
         read_context: Option<ReadContext>,
     ) -> Result<ToolOutput, ToolError> {
         match (self, response) {
-            (Self::ReadFile, ExecutorResponse::ReadFile { result }) => {
+            (Self::WorkspaceReadFile | Self::ReadFile, ExecutorResponse::ReadFile { result }) => {
                 let content = render_bounded_output(&result, RetainedOutput::Head, None, &[]);
                 Ok(text_output(content, to_value(result)?))
             }
@@ -293,7 +333,7 @@ impl RemoteToolKind {
                     json!({"paths": paths, "count": paths.len()}),
                 ))
             }
-            (Self::Grep, ExecutorResponse::Grepped { matches }) => {
+            (Self::WorkspaceGrep | Self::Grep, ExecutorResponse::Grepped { matches }) => {
                 let rendered = bounded_lines(
                     matches
                         .iter()
@@ -580,6 +620,20 @@ where
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct WorkspaceReadFileArgs {
+    /// A workspace path. `artifact://` handles are not accepted.
+    #[schemars(length(min = 1))]
+    path: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "default_read_limit")]
+    #[serde(deserialize_with = "deserialize_read_limit")]
+    #[schemars(range(min = 1, max = 51200))]
+    limit: usize,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     #[schemars(length(min = 1))]
     path: String,
@@ -612,6 +666,7 @@ struct EditFileArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PathArgs {
+    /// A workspace path. Artifact handles are not accepted.
     #[schemars(length(min = 1))]
     path: String,
 }
@@ -619,6 +674,7 @@ struct PathArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GlobArgs {
+    /// A workspace-relative glob pattern. Artifact handles are not accepted.
     #[schemars(length(min = 1))]
     pattern: String,
 }
@@ -626,6 +682,16 @@ struct GlobArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GrepArgs {
+    #[schemars(length(min = 1))]
+    path: String,
+    #[schemars(length(min = 1))]
+    pattern: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceGrepArgs {
+    /// A workspace path. `artifact://` handles are not accepted.
     #[schemars(length(min = 1))]
     path: String,
     #[schemars(length(min = 1))]
@@ -656,6 +722,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
     use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
@@ -880,7 +949,7 @@ mod tests {
             Ok(ExecutorResponse::Bash {
                 result: bash_result(
                     "done",
-                    Some("artifact://conversation-1/tool-output/exec-log"),
+                    Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
                     Some(0),
                     false,
                     None,
@@ -955,7 +1024,7 @@ mod tests {
         assert_eq!(outputs[6].details["matches"][0]["line_number"], 3);
         assert_eq!(
             outputs[7].details["artifact_handle"],
-            "artifact://conversation-1/tool-output/exec-log"
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"
         );
         assert!(
             matches!(outputs[7].content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("Command exited with code 0."))
@@ -989,7 +1058,7 @@ mod tests {
             "read_file",
             "f",
             "r",
-            json!({"path":"artifact://conversation-1/attachments/a","limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","limit":100}),
             CancellationToken::new(),
             noop.clone(),
         )
@@ -1000,7 +1069,7 @@ mod tests {
             "grep",
             "f",
             "g",
-            json!({"path":"artifact://conversation-1/attachments/a","pattern":"found"}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","pattern":"found"}),
             CancellationToken::new(),
             noop,
         )
@@ -1049,7 +1118,7 @@ mod tests {
             "read_file",
             "f",
             "chunk-1",
-            json!({"path":"artifact://conversation-1/attachments/a","offset":7,"limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","offset":7,"limit":100}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1060,7 +1129,7 @@ mod tests {
             "read_file",
             "f",
             "chunk-2",
-            json!({"path":"artifact://conversation-1/attachments/a","offset":10,"limit":100}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","offset":10,"limit":100}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1104,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconstructs_over_100_kib_single_line_across_exact_pages() {
-        let path = "artifact://conversation-1/attachments/a";
+        let path = "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a";
         let source = "x".repeat(110 * 1024);
         let capacity = artifact_source_capacity();
         let fake = Arc::new(ArtifactSourceInvoker::new(path, source.as_bytes().to_vec()));
@@ -1227,7 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_eof_with_more_than_2000_lines_continues_without_loss() {
-        let path = "artifact://conversation-1/attachments/lines";
+        let path = "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/lines";
         let source = "x\n".repeat(2_100);
         let capacity = artifact_source_capacity();
         let fake = Arc::new(ArtifactSourceInvoker::new(path, source.as_bytes().to_vec()));
@@ -1298,7 +1367,7 @@ mod tests {
             "read_file",
             "f",
             "near-envelope",
-            json!({"path":"artifact://conversation-1/attachments/a"}),
+            json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a"}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1360,7 +1429,7 @@ mod tests {
                 "read_file",
                 "f",
                 "invalid-limit",
-                json!({"path":"artifact://conversation-1/attachments/a","limit":limit}),
+                json!({"path":"artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/a","limit":limit}),
                 CancellationToken::new(),
                 Arc::new(|_| {}),
             )
@@ -1457,10 +1526,13 @@ mod tests {
             let request: RpcRequest<ExecutorOperation> =
                 serde_json::from_str(line.trim_end()).unwrap();
             let forged = RpcFrame::Terminal {
+                personality_agent_id: PAID.parse().unwrap(),
                 generation: request.generation,
                 nonce: "stale-nonce".to_owned(),
                 request_id: request.request_id,
-                result: Ok(ExecutorResponse::Written {}),
+                result: Ok(ExecutorResponse::ReadFile {
+                    result: truncation("forged"),
+                }),
             };
             write
                 .write_all(&serde_json::to_vec(&forged).unwrap())
@@ -1470,16 +1542,15 @@ mod tests {
         });
         let client = Arc::new(ExecutorClient::new(
             socket,
-            RpcIdentity::from_wire(7, "current-nonce").unwrap(),
-            "conversation-1",
+            RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap(),
         ));
         let registry = remote_executor_registry(client).unwrap();
         let error = run(
             &registry,
-            "write_file",
+            "read_file",
             "flow",
             "call",
-            json!({"path":"x","content":"y"}),
+            json!({"path":"x"}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         )
@@ -1487,6 +1558,152 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ToolError::RpcIndeterminate(_)));
         service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_registry_binds_the_clients_complete_rpc_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry = remote_executor_registry(Arc::new(ExecutorClient::new(
+            "/tmp/sumi-unused-executor.sock",
+            identity.clone(),
+        )))
+        .unwrap();
+
+        registry
+            .validate_executor_identity(&identity)
+            .expect("exact identity");
+        let wrong_paid = RpcIdentity::from_wire(OTHER_PAID, 7, "current-nonce").unwrap();
+        assert!(registry.validate_executor_identity(&wrong_paid).is_err());
+        let wrong_nonce = RpcIdentity::from_wire(PAID, 7, "stale-nonce").unwrap();
+        assert!(registry.validate_executor_identity(&wrong_nonce).is_err());
+
+        let fixture_registry = registry_from_invoker(Arc::new(FakeInvoker::default())).unwrap();
+        assert!(
+            fixture_registry
+                .validate_executor_identity(&identity)
+                .is_err(),
+            "an unbound fixture registry cannot satisfy production validation"
+        );
+
+        assert_eq!(registry.len(), 4);
+        assert_eq!(
+            registry
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["glob", "grep", "list_dir", "read_file"]
+        );
+        let definition = registry.get("read_file").unwrap().def();
+        assert_eq!(
+            definition.description,
+            "Read UTF-8 text from a workspace path. Artifact handles are not accepted."
+        );
+        assert_eq!(
+            definition.parameters["properties"]["path"]["description"],
+            "A workspace path. `artifact://` handles are not accepted."
+        );
+        for forbidden in ["bash", "write_file", "edit_file", "delete"] {
+            assert!(
+                registry.get(forbidden).is_none(),
+                "{forbidden} leaked into the production registry"
+            );
+        }
+        for allowed in ["read_file", "list_dir", "glob", "grep"] {
+            assert_eq!(registry.get(allowed).unwrap().risk(), ToolRisk::ReadOnly);
+        }
+        let grep = registry.get("grep").unwrap().def();
+        assert_eq!(
+            grep.description,
+            "Search a workspace path with a regular expression. Artifact handles are not accepted."
+        );
+        assert_eq!(
+            grep.parameters["properties"]["path"]["description"],
+            "A workspace path. `artifact://` handles are not accepted."
+        );
+        let list_dir = registry.get("list_dir").unwrap().def();
+        assert_eq!(
+            list_dir.parameters["properties"]["path"]["description"],
+            "A workspace path. Artifact handles are not accepted."
+        );
+        let glob = registry.get("glob").unwrap().def();
+        assert_eq!(
+            glob.parameters["properties"]["pattern"]["description"],
+            "A workspace-relative glob pattern. Artifact handles are not accepted."
+        );
+    }
+
+    #[tokio::test]
+    async fn production_artifact_read_is_rejected_before_endpoint_interaction() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-workspace-read-only-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry =
+            remote_executor_registry(Arc::new(ExecutorClient::new(&socket, identity))).unwrap();
+
+        let error = run(
+            &registry,
+            "read_file",
+            "flow",
+            "artifact-call",
+            json!({
+                "path":
+                    "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/forbidden"
+            }),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidPath(_)));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "production artifact input contacted the executor endpoint"
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_artifact_grep_is_rejected_before_endpoint_interaction() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-workspace-grep-only-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap();
+        let registry =
+            remote_executor_registry(Arc::new(ExecutorClient::new(&socket, identity))).unwrap();
+
+        let error = run(
+            &registry,
+            "grep",
+            "flow",
+            "artifact-call",
+            json!({
+                "path":
+                    "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/forbidden",
+                "pattern": "secret",
+            }),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidPath(_)));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "production artifact input contacted the executor endpoint"
+        );
+        drop(listener);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1535,7 +1752,7 @@ mod tests {
     fn bash_resource_limit_truth_is_preserved() {
         let mut result = bash_result(
             "partial",
-            Some("artifact://conversation-1/tool-output/exec-log"),
+            Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
             None,
             false,
             Some(ResourceLimit::WallTime { limit_seconds: 120 }),
@@ -1551,7 +1768,7 @@ mod tests {
         assert_eq!(output.details["resource_limit"]["type"], "wall_time");
         assert_eq!(output.details["resource_limit"]["limit_seconds"], 120);
         assert!(
-            matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("artifact://conversation-1/tool-output/exec-log") && text.contains("WallTime"))
+            matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log") && text.contains("WallTime"))
         );
     }
 
@@ -1579,7 +1796,7 @@ mod tests {
         ] {
             let result = bash_result(
                 "output",
-                Some("artifact://conversation-1/tool-output/exec-log"),
+                Some("artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/exec-log"),
                 exit_code,
                 cancelled,
                 resource_limit.clone(),

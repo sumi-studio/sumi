@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,12 +13,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// BrowserServer is the browser-facing half of the T28 WebSocket boundary. It
-// never accepts an agent bearer token: a signed HttpOnly user-session cookie
-// authorizes exactly one conversation and all command/event traffic stays on
-// that conversation's API-side durable logs.
+// BrowserServer is the browser-facing direct-chat WebSocket boundary. It never
+// accepts an agent bearer token or public target: the signed HttpOnly session
+// supplies the target and authenticated provenance.
 type BrowserServer struct {
-	Sessions UserSessionVerifier
+	Sessions UserSessionAuthorizer
 	Appender CommandAppender
 	Events   *DurableGateway
 
@@ -30,8 +30,24 @@ type BrowserServer struct {
 
 	upgrader      websocket.Upgrader
 	connectionsMu sync.Mutex
-	connections   map[*websocket.Conn]struct{}
+	connections   map[*websocket.Conn]browserConnection
 	accepted      uint64
+	closing       bool
+	beforeWrite   func()
+}
+
+type browserConnection struct {
+	sessionID string
+	conn      *websocket.Conn
+}
+
+type idempotencyAwareCommandAppender interface {
+	AppendWithIdempotencyStatus(
+		ctx context.Context,
+		provenance DirectChatProvenance,
+		idempotencyKey string,
+		command json.RawMessage,
+	) (CommandEnvelope, bool, error)
 }
 
 // BrowserConnectionStats is a point-in-time view of the browser WebSocket
@@ -55,18 +71,192 @@ type browserCommandFrame struct {
 }
 
 type browserEventFrame struct {
-	Type     string   `json:"type"`
-	Envelope Envelope `json:"envelope"`
+	Type     string               `json:"type"`
+	Envelope browserEventEnvelope `json:"envelope"`
 }
 
 type browserCommandAcceptedFrame struct {
-	Type     string          `json:"type"`
-	Envelope CommandEnvelope `json:"envelope"`
+	Type           string          `json:"type"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	CommandID      string          `json:"command_id"`
+	Seq            uint64          `json:"seq"`
+	Disposition    json.RawMessage `json:"disposition,omitempty"`
 }
 
 type browserCommandRejectedFrame struct {
-	Type         string       `json:"type"`
-	RejectReason RejectReason `json:"reject_reason"`
+	Type           string       `json:"type"`
+	IdempotencyKey string       `json:"idempotency_key"`
+	RejectReason   RejectReason `json:"reject_reason"`
+}
+
+type browserCommandReceipt struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	CommandID      string `json:"command_id"`
+	Seq            uint64 `json:"seq"`
+}
+
+type browserEventEnvelope struct {
+	Seq   *uint64         `json:"seq,omitempty"`
+	Event json.RawMessage `json:"event"`
+}
+
+type directChatStatusFrame struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+}
+
+func (f *browserEventFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event frame: %w", err)
+	}
+	type wire struct {
+		Type     string                `json:"type"`
+		Envelope *browserEventEnvelope `json:"envelope"`
+	}
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Type != "event" || decoded.Envelope == nil {
+		return errors.New("browser event frame type must be event")
+	}
+	*f = browserEventFrame{Type: decoded.Type, Envelope: *decoded.Envelope}
+	return nil
+}
+
+func (e *browserEventEnvelope) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser event envelope: %w", err)
+	}
+	type rawEnvelope struct {
+		Seq   json.RawMessage `json:"seq"`
+		Event json.RawMessage `json:"event"`
+	}
+	var raw rawEnvelope
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
+		return errors.New("browser event envelope requires a valid event")
+	}
+	if err := validateEvent(raw.Event); err != nil {
+		return err
+	}
+	volatile := volatileEventTypes[eventType(raw.Event)]
+	var parsedSeq *uint64
+	switch {
+	case raw.Seq == nil:
+		if !volatile {
+			return errors.New("durable browser event requires seq")
+		}
+	case bytes.Equal(bytes.TrimSpace(raw.Seq), []byte("null")):
+		return errors.New("browser event seq must not be null")
+	default:
+		var seq uint64
+		if err := json.Unmarshal(raw.Seq, &seq); err != nil {
+			return fmt.Errorf("browser event seq: %w", err)
+		}
+		if seq > maxJSONSafeInteger {
+			return errors.New("browser event seq exceeds JSON-safe integer range")
+		}
+		if volatile {
+			return errors.New("volatile browser event must not have seq")
+		}
+		parsedSeq = &seq
+	}
+	*e = browserEventEnvelope{Seq: parsedSeq, Event: raw.Event}
+	return nil
+}
+
+func (f *browserCommandAcceptedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command accepted frame: %w", err)
+	}
+	type wire browserCommandAcceptedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandAcceptedFrame(decoded)
+	if value.Type != "command_accepted" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!canonicalUUIDRegexp.MatchString(value.CommandID) ||
+		value.Seq > maxJSONSafeInteger {
+		return errors.New("invalid browser command accepted frame")
+	}
+	if len(value.Disposition) != 0 {
+		if err := validateEvent(value.Disposition); err != nil {
+			return fmt.Errorf("browser command accepted disposition: %w", err)
+		}
+		if eventType(value.Disposition) != "command_disposition" {
+			return errors.New("browser command accepted disposition must be command_disposition")
+		}
+		var correlation struct {
+			CommandID  string `json:"command_id"`
+			CommandSeq uint64 `json:"command_seq"`
+		}
+		if err := json.Unmarshal(value.Disposition, &correlation); err != nil {
+			return fmt.Errorf("decode browser command accepted disposition correlation: %w", err)
+		}
+		if correlation.CommandID != value.CommandID || correlation.CommandSeq != value.Seq {
+			return errors.New("browser command accepted disposition correlation mismatch")
+		}
+	}
+	*f = value
+	return nil
+}
+
+func (f *browserCommandRejectedFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("browser command rejected frame: %w", err)
+	}
+	type wire browserCommandRejectedFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := browserCommandRejectedFrame(decoded)
+	if value.Type != "command_rejected" ||
+		value.IdempotencyKey == "" ||
+		len(value.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		!validBrowserRejectReason(value.RejectReason) {
+		return errors.New("invalid browser command rejected frame")
+	}
+	*f = value
+	return nil
+}
+
+func (f *directChatStatusFrame) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("direct chat status frame: %w", err)
+	}
+	type wire directChatStatusFrame
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := directChatStatusFrame(decoded)
+	if value.Type != "direct_chat_status" || (value.Status != "ready" && value.Status != "unavailable") {
+		return errors.New("invalid direct chat status frame")
+	}
+	*f = value
+	return nil
+}
+
+func validBrowserRejectReason(reason RejectReason) bool {
+	switch reason {
+	case RejectUnknownCommand,
+		RejectSchemaViolation,
+		RejectAttachmentsNotEmpty,
+		RejectOversized,
+		RejectNotAllowed,
+		RejectIdempotencyConflict,
+		RejectUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 type browserCommandHead struct {
@@ -74,7 +264,7 @@ type browserCommandHead struct {
 	RequestID string `json:"request_id"`
 }
 
-func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, events *DurableGateway) *BrowserServer {
+func NewBrowserServer(sessions UserSessionAuthorizer, appender CommandAppender, events *DurableGateway) *BrowserServer {
 	s := &BrowserServer{
 		Sessions:     sessions,
 		Appender:     appender,
@@ -84,21 +274,21 @@ func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, ev
 		MaxReadLimit: MaxUserCommandBytes + 16*1024,
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
-	s.connections = make(map[*websocket.Conn]struct{})
+	s.connections = make(map[*websocket.Conn]browserConnection)
 	return s
 }
 
-func (s *BrowserServer) checkCommandState(conversationID string, head browserCommandHead) (RejectReason, bool) {
+func (s *BrowserServer) checkCommandState(personalityAgentID string, head browserCommandHead) (RejectReason, bool) {
 	if s.Events == nil {
 		return "", false
 	}
 	switch head.Type {
 	case "abort":
-		if !s.Events.IsRunInFlight(conversationID) {
+		if !s.Events.IsRunInFlight(personalityAgentID) {
 			return RejectNotAllowed, true
 		}
 	case "approval_decision":
-		if !s.Events.IsApprovalPending(conversationID, head.RequestID) {
+		if !s.Events.IsApprovalPending(personalityAgentID, head.RequestID) {
 			return RejectNotAllowed, true
 		}
 	}
@@ -106,19 +296,10 @@ func (s *BrowserServer) checkCommandState(conversationID string, head browserCom
 }
 
 func (s *BrowserServer) checkOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return false
-	}
-	for _, allowed := range s.AllowedOrigins {
-		if origin == allowed {
-			return true
-		}
-	}
-	return false
+	return browserOriginAllowed(r, s.AllowedOrigins)
 }
 
-// ServeHTTP implements GET /conversations/{conversation_id}/ws. Browser
+// ServeHTTP implements targetless GET /direct-chat/ws. Browser
 // authentication happens before upgrade so a rejected session cannot consume a
 // WebSocket or leak whether an agent connection exists.
 func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -126,13 +307,12 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "browser websocket not configured", http.StatusServiceUnavailable)
 		return
 	}
-	conversationID := r.PathValue("conversation_id")
-	if conversationID == "" {
-		http.Error(w, "missing conversation_id", http.StatusBadRequest)
-		return
-	}
-	cookie, err := r.Cookie(BrowserSessionCookie)
+	cookie, err := uniqueBrowserSessionCookie(r)
 	if err != nil {
+		if errors.Is(err, errBrowserSessionDuplicate) {
+			http.Error(w, "duplicate session cookies", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "missing session", http.StatusUnauthorized)
 		return
 	}
@@ -141,34 +321,107 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
-	if claims.ConversationID != conversationID {
-		http.Error(w, "conversation authorization failed", http.StatusForbidden)
-		return
-	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	s.addConnection(conn)
+	if err := s.Sessions.AuthorizeSession(r.Context(), claims, func() error {
+		if !s.addConnection(conn, claims.sessionID) {
+			return errors.New("browser gateway is shutting down")
+		}
+		return nil
+	}); err != nil {
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session unavailable"),
+			time.Now().Add(s.writeTimeout()),
+		)
+		_ = conn.Close()
+		return
+	}
 	defer s.removeConnection(conn)
 	defer conn.Close()
 	if err := s.run(r.Context(), conn, claims); err != nil && !errors.Is(err, context.Canceled) {
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), time.Now().Add(s.writeTimeout()))
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if deadline.After(time.Now()) {
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "browser gateway closed"), deadline)
+		}
 	}
 }
 
-// CloseBrowserConnections is a bounded lifecycle operation for server
-// shutdown/replacement. Reconnecting browsers retain their durable cursor and
-// replay from the authoritative event log; no event is synthesized here.
+// CloseBrowserConnections closes the current socket generation while allowing
+// reconnect. Browsers retain their durable cursor and replay from the
+// authoritative event log; no event is synthesized here.
 func (s *BrowserServer) CloseBrowserConnections() {
+	for _, conn := range s.browserConnections(false) {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway reconnect"), time.Now().Add(s.writeTimeout()))
+		_ = conn.Close()
+	}
+}
+
+// ShutdownBrowserConnections permanently closes admission for this gateway
+// instance and waits boundedly for every hijacked handler to drain.
+func (s *BrowserServer) ShutdownBrowserConnections(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("browser shutdown context is required")
+	}
+	connections := s.browserConnections(true)
+	for _, conn := range connections {
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway shutdown"), time.Now().Add(s.writeTimeout()))
+		_ = conn.Close()
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.connectionsMu.Lock()
+		active := len(s.connections)
+		s.connectionsMu.Unlock()
+		if active == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *BrowserServer) browserConnections(shutdown bool) []*websocket.Conn {
 	s.connectionsMu.Lock()
+	if shutdown {
+		s.closing = true
+	}
 	connections := make([]*websocket.Conn, 0, len(s.connections))
 	for conn := range s.connections {
 		connections = append(connections, conn)
 	}
 	s.connectionsMu.Unlock()
+	return connections
+}
+
+// CloseBrowserSession eagerly terminates matching sockets in this process.
+// Shared AuthorizeSession leases around every data write and command append
+// provide the cross-process revocation barrier.
+func (s *BrowserServer) CloseBrowserSession(sessionID string) {
+	if !validBrowserSessionID(sessionID) {
+		return
+	}
+	s.connectionsMu.Lock()
+	connections := make([]*websocket.Conn, 0)
+	for _, connection := range s.connections {
+		if connection.sessionID == sessionID {
+			connections = append(connections, connection.conn)
+		}
+	}
+	s.connectionsMu.Unlock()
 	for _, conn := range connections {
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "browser gateway reconnect"), time.Now().Add(s.writeTimeout()))
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session ended"),
+			time.Now().Add(s.writeTimeout()),
+		)
+		_ = conn.Close()
 	}
 }
 
@@ -181,11 +434,15 @@ func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
 	}
 }
 
-func (s *BrowserServer) addConnection(conn *websocket.Conn) {
+func (s *BrowserServer) addConnection(conn *websocket.Conn, sessionID string) bool {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
-	s.connections[conn] = struct{}{}
+	if s.closing {
+		return false
+	}
+	s.connections[conn] = browserConnection{sessionID: sessionID, conn: conn}
 	s.accepted++
+	return true
 }
 
 func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
@@ -195,12 +452,12 @@ func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
 }
 
 func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims) error {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := browserSessionOperationContext(ctx, claims)
 	defer cancel()
 	if s.MaxReadLimit > 0 {
 		conn.SetReadLimit(s.MaxReadLimit)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(s.helloTimeout())); err != nil {
+	if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.helloTimeout())); err != nil {
 		return err
 	}
 	_, raw, err := conn.ReadMessage()
@@ -212,8 +469,8 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		return err
 	}
 
-	if err := s.Events.EnsureConversationStateRebuilt(ctx, claims.ConversationID); err != nil {
-		return fmt.Errorf("rebuild conversation state: %w", err)
+	if err := s.Events.EnsureAgentSessionStateRebuilt(ctx, claims.PersonalityAgentID); err != nil {
+		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
 
 	// Install pong handler before first read and schedule the initial
@@ -221,10 +478,10 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	// next PongWait interval.
 	if s.pongWait() > 0 {
 		conn.SetPongHandler(func(string) error {
-			_ = conn.SetReadDeadline(time.Now().Add(s.pongWait()))
+			_ = conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait()))
 			return nil
 		})
-		if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+		if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait())); err != nil {
 			return err
 		}
 	}
@@ -240,7 +497,12 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout())); err != nil {
+					deadline := s.sessionDeadline(claims, s.writeTimeout())
+					if ctx.Err() != nil || !deadline.After(time.Now()) {
+						cancel()
+						return
+					}
+					if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
 						cancel()
 						return
 					}
@@ -249,23 +511,68 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}()
 	}
 
-	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.ConversationID)
+	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.PersonalityAgentID)
 	defer unsubscribe()
 	var writeMu sync.Mutex
-	write := func(frame any) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout())); err != nil {
+	writeSocketUnlocked := func(frame any) error {
+		if s.beforeWrite != nil {
+			s.beforeWrite()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		deadline := s.sessionDeadline(claims, s.writeTimeout())
+		if !deadline.After(time.Now()) {
+			return context.DeadlineExceeded
+		}
+		if err := conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
 		return conn.WriteJSON(frame)
 	}
+	writeUnlocked := func(frame any) error {
+		return s.Sessions.AuthorizeSession(ctx, claims, func() error {
+			return writeSocketUnlocked(frame)
+		})
+	}
+	withExclusiveWrite := func(operation func(func(any) error) error) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return operation(writeUnlocked)
+	}
+	write := func(frame any) error {
+		return withExclusiveWrite(func(write func(any) error) error {
+			return write(frame)
+		})
+	}
+	// Subscribe before replay so volatile traffic produced during catch-up stays
+	// queued, then validate and emit the complete durable suffix synchronously.
+	// Status is the browser's command-admission barrier, so neither it nor the
+	// read pump may start while replay can still fail.
+	next, err := s.browserDurableCatchUp(
+		ctx,
+		claims.PersonalityAgentID,
+		hello.LastEventSeq,
+		write,
+	)
+	if err != nil {
+		return err
+	}
+	// Replay may block on the durable log, so sample readiness only after it
+	// completes instead of publishing a status captured before the barrier.
+	ready, err := s.Events.IsPersonalityAgentReady(ctx, claims.PersonalityAgentID)
+	if err != nil {
+		return fmt.Errorf("read direct-chat readiness: %w", err)
+	}
+	if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+		return err
+	}
 
 	writerErr := make(chan error, 1)
 	go func() {
-		err := s.browserEventPump(ctx, claims.ConversationID, hello.LastEventSeq, volatile, write)
+		err := s.browserEventPump(ctx, claims.PersonalityAgentID, next, ready, volatile, write)
 		writerErr <- err
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil {
 			cancel()
 			// A durable replay or bounded live-queue failure must terminate the
 			// blocked reader too; otherwise this browser session would remain
@@ -274,7 +581,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 		}
 	}()
 
-	readErr := s.browserReadPump(ctx, conn, claims, write)
+	readErr := s.browserReadPump(ctx, conn, claims, write, withExclusiveWrite)
 	cancel()
 	writerResult := <-writerErr
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
@@ -283,47 +590,100 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	return writerResult
 }
 
-func (s *BrowserServer) browserEventPump(ctx context.Context, conversationID string, lastConsumed uint64, volatile <-chan Envelope, write func(any) error) error {
+func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID string, lastConsumed uint64, ready bool, volatile <-chan Envelope, write func(any) error) error {
 	next := lastConsumed
 	ticker := time.NewTicker(s.Events.pollInterval())
 	defer ticker.Stop()
 	for {
-		durable, err := s.Events.EventCatchUp(ctx, conversationID, next)
+		var err error
+		next, err = s.browserDurableCatchUp(ctx, personalityAgentID, next, write)
 		if err != nil {
-			return fmt.Errorf("browser durable event catch-up: %w", err)
-		}
-		for _, envelope := range durable {
-			if envelope.Seq == nil {
-				return errors.New("durable replay returned a volatile event")
-			}
-			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
-				return err
-			}
-			next = *envelope.Seq
+			return err
 		}
 		select {
 		case envelope, ok := <-volatile:
 			if !ok {
 				return errors.New("browser volatile event queue exhausted")
 			}
-			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
+			if envelope.PersonalityAgentID != personalityAgentID {
+				return errors.New("browser volatile event target mismatch")
+			}
+			// A durable commit can land after the catch-up above while its
+			// corresponding volatile successor is already queued. Re-establish
+			// the durable cursor before emitting that live-only frame so the
+			// browser never observes the successor before its durable prefix.
+			next, err = s.browserDurableCatchUp(ctx, personalityAgentID, next, write)
+			if err != nil {
+				return err
+			}
+			projected, err := projectBrowserEvent(envelope)
+			if err != nil {
+				return fmt.Errorf("project volatile browser event: %w", err)
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			current, err := s.Events.IsPersonalityAgentReady(ctx, personalityAgentID)
+			if err != nil {
+				return fmt.Errorf("poll direct-chat readiness: %w", err)
+			}
+			if current != ready {
+				ready = current
+				if err := write(directChatStatusFrame{Type: "direct_chat_status", Status: readinessStatus(ready)}); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
 
-func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Conn, claims UserSessionClaims, write func(any) error) error {
+func (s *BrowserServer) browserDurableCatchUp(
+	ctx context.Context,
+	personalityAgentID string,
+	lastConsumed uint64,
+	write func(any) error,
+) (uint64, error) {
+	durable, err := s.Events.EventCatchUp(ctx, personalityAgentID, lastConsumed)
+	if err != nil {
+		return lastConsumed, fmt.Errorf("browser durable event catch-up: %w", err)
+	}
+	next := lastConsumed
+	for _, envelope := range durable {
+		if envelope.Seq == nil {
+			return next, errors.New("durable replay returned a volatile event")
+		}
+		if envelope.PersonalityAgentID != personalityAgentID {
+			return next, errors.New("browser event target mismatch")
+		}
+		projected, err := projectBrowserEvent(envelope)
+		if err != nil {
+			return next, fmt.Errorf("project durable browser event: %w", err)
+		}
+		if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
+			return next, err
+		}
+		next = *envelope.Seq
+	}
+	return next, nil
+}
+
+func (s *BrowserServer) browserReadPump(
+	ctx context.Context,
+	conn *websocket.Conn,
+	claims UserSessionClaims,
+	write func(any) error,
+	withExclusiveWrite func(func(func(any) error) error) error,
+) error {
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
 		}
 		if s.pongWait() > 0 {
-			if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+			if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait())); err != nil {
 				return err
 			}
 		}
@@ -333,41 +693,124 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 		}
 		reason, err := validateBrowserCommand(frame.Command)
 		if err != nil {
-			if writeErr := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: reason}); writeErr != nil {
+			if writeErr := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: reason}); writeErr != nil {
 				return writeErr
-			}
-			continue
-		}
-		if len(frame.IdempotencyKey) > MaxIdempotencyKeyBytes {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectOversized}); err != nil {
-				return err
 			}
 			continue
 		}
 		var head browserCommandHead
 		if err := json.Unmarshal(frame.Command, &head); err != nil {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectSchemaViolation}); err != nil {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: RejectSchemaViolation}); err != nil {
 				return err
 			}
 			continue
 		}
-		if reason, reject := s.checkCommandState(claims.ConversationID, head); reject {
-			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: reason}); err != nil {
+		if reason, reject := s.checkCommandState(claims.PersonalityAgentID, head); reject {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: reason}); err != nil {
 				return err
 			}
 			continue
 		}
-		envelope, err := s.Appender.Append(ctx, claims.ConversationID, frame.IdempotencyKey, frame.Command)
+		var envelope CommandEnvelope
+		existingAcceptance := false
+		operationCalled := false
+		operationContext, cancelOperation := browserSessionOperationContext(ctx, claims)
+		var admissionErr error
+		writeErr := withExclusiveWrite(func(writeUnlocked func(any) error) error {
+			admissionErr = s.Sessions.AuthorizeSession(ctx, claims, func() error {
+				operationCalled = true
+				var appendErr error
+				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
+					envelope, existingAcceptance, appendErr = appender.AppendWithIdempotencyStatus(
+						operationContext,
+						directChatProvenance(claims),
+						frame.IdempotencyKey,
+						frame.Command,
+					)
+				} else {
+					envelope, appendErr = s.Appender.Append(
+						operationContext,
+						directChatProvenance(claims),
+						frame.IdempotencyKey,
+						frame.Command,
+					)
+				}
+				return appendErr
+			})
+			if admissionErr != nil {
+				return nil
+			}
+			var disposition json.RawMessage
+			found := false
+			if existingAcceptance {
+				var lookupErr error
+				disposition, found, lookupErr = s.Events.CommandDispositionFor(operationContext, envelope)
+				if lookupErr != nil {
+					admissionErr = fmt.Errorf("lookup browser command disposition: %w", lookupErr)
+					return nil
+				}
+			}
+			accepted := browserCommandAcceptedFrame{
+				Type:           "command_accepted",
+				IdempotencyKey: frame.IdempotencyKey,
+				CommandID:      envelope.CommandID,
+				Seq:            envelope.Seq,
+			}
+			if found {
+				accepted.Disposition = disposition
+			}
+			return writeUnlocked(accepted)
+		})
+		cancelOperation()
+		if writeErr != nil {
+			return writeErr
+		}
+		err = admissionErr
 		if err != nil {
+			if !operationCalled {
+				return errors.New("browser session authority ended")
+			}
+			if errors.Is(err, errBrowserRuntimeUnavailable) {
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectUnavailable,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
 			if isIdempotencyConflict(err) {
-				return err
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectIdempotencyConflict,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
 			}
 			return fmt.Errorf("append browser command: %w", err)
 		}
-		if err := write(browserCommandAcceptedFrame{Type: "command_accepted", Envelope: envelope}); err != nil {
-			return err
-		}
 	}
+}
+
+func projectBrowserEvent(envelope Envelope) (browserEventEnvelope, error) {
+	if err := ValidatePersonalityAgentID(envelope.PersonalityAgentID); err != nil {
+		return browserEventEnvelope{}, err
+	}
+	event, err := projectEventArtifactReferences(envelope.Event, envelope.PersonalityAgentID)
+	if err != nil {
+		return browserEventEnvelope{}, err
+	}
+	return browserEventEnvelope{Seq: envelope.Seq, Event: event}, nil
+}
+
+func readinessStatus(ready bool) string {
+	if ready {
+		return "ready"
+	}
+	return "unavailable"
 }
 
 func decodeBrowserHello(raw []byte) (browserHello, error) {
@@ -386,7 +829,11 @@ func decodeBrowserCommand(raw []byte) (browserCommandFrame, error) {
 		return browserCommandFrame{}, fmt.Errorf("browser command: %w", err)
 	}
 	var frame browserCommandFrame
-	if err := unmarshalStrict(raw, &frame); err != nil || frame.Type != "command" || len(frame.Command) == 0 {
+	if err := unmarshalStrict(raw, &frame); err != nil ||
+		frame.Type != "command" ||
+		frame.IdempotencyKey == "" ||
+		len(frame.IdempotencyKey) > MaxIdempotencyKeyBytes ||
+		len(frame.Command) == 0 {
 		return browserCommandFrame{}, errors.New("invalid browser command frame")
 	}
 	if len(frame.Command) > MaxUserCommandBytes {
@@ -440,4 +887,16 @@ func (s *BrowserServer) pingInterval() time.Duration {
 		return s.PingInterval
 	}
 	return 54 * time.Second
+}
+
+func (s *BrowserServer) sessionReadDeadline(claims UserSessionClaims, interval time.Duration) time.Time {
+	return s.sessionDeadline(claims, interval)
+}
+
+func (s *BrowserServer) sessionDeadline(claims UserSessionClaims, interval time.Duration) time.Time {
+	deadline := time.Now().Add(interval)
+	if !claims.expiresAt.IsZero() && claims.expiresAt.Before(deadline) {
+		return claims.expiresAt
+	}
+	return deadline
 }

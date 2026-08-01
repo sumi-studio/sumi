@@ -24,7 +24,7 @@ paths:
     get:
       operationId: getReadiness
       summary: Dependency readiness check
-      description: Checks the Todo database when the Todo backend is enabled.
+      description: Checks the control-plane database when it is configured.
       responses:
         "200":
           description: Ready
@@ -39,7 +39,7 @@ paths:
                     type: string
                     enum: [ready]
         "503":
-          description: An enabled dependency is unavailable
+          description: A configured dependency is unavailable
           content:
             application/json:
               schema:
@@ -50,24 +50,25 @@ paths:
                   status:
                     type: string
                     enum: [unavailable]
-  /conversations/{conversation_id}/commands:
+  /direct-chat/commands:
     post:
-      operationId: createUserCommand
-      summary: Create a user command in a conversation
+      operationId: createDirectChatCommand
+      summary: Create a direct-chat user command
       description: |
-        Admits a user_message command from the web client. The caller is
-        authenticated by the signed HttpOnly `sumi_session` browser cookie; agent
-        bearer tokens are not accepted. The request is validated for UTF-8 JSON
-        shape, empty attachments, and a 1 MiB wire-size limit before any
-        command_id or seq is allocated. Rejections are returned as typed 4xx
-        responses with no command_id/seq, so they cannot create a sequence gap
-        in the durable command log.
+        Admits content from the authenticated direct-chat browser session. The
+        signed HttpOnly `sumi_session` cookie supplies the target personality
+        agent and human provenance; neither is accepted from the browser body.
+        The request Origin must exactly match the configured browser origin
+        allowlist. Origin rejection occurs before session or body processing;
+        all rejections occur before command_id or seq allocation.
       parameters:
-        - name: conversation_id
-          in: path
+        - name: Idempotency-Key
+          in: header
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 1024
       security:
         - sumiSession: []
       requestBody:
@@ -75,47 +76,31 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [type, text, attachments]
-              additionalProperties: false
-              properties:
-                type:
-                  type: string
-                  enum: [user_message]
-                text:
-                  type: string
-                attachments:
-                  type: array
-                  maxItems: 0
+              $ref: "#/components/schemas/DirectChatUserMessageCommand"
       responses:
         "201":
-          description: Command accepted and allocated a durable seq and command_id
+          description: Target-free command receipt
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CommandEnvelope"
+                $ref: "#/components/schemas/DirectChatCommandReceipt"
         "400":
           description: Command rejected before seq/command_id allocation
           content:
             application/json:
               schema:
-                type: object
-                required: [error, reject_reason]
-                additionalProperties: false
-                properties:
-                  error:
-                    type: string
-                    enum: [invalid_command]
-                  reject_reason:
-                    type: string
-                    enum:
-                      - unknown_command
-                      - schema_violation
-                      - attachments_not_empty
-                      - oversized
+                $ref: "#/components/schemas/DirectChatCommandRejectedResponse"
+        "409":
+          description: Idempotency key was already used for different content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectChatCommandIdempotencyConflictResponse"
         "401":
           description: Missing or invalid browser session cookie
-  /conversations/{conversation_id}/ws:
+        "403":
+          description: Origin not allowed
+  /direct-chat/ws:
     get:
       operationId: browserWebSocket
       summary: Browser-facing WebSocket
@@ -124,12 +109,6 @@ paths:
         client sends `BrowserClientFrame` messages and the server pushes
         `BrowserServerFrame` messages. The caller is authenticated by the signed
         HttpOnly `sumi_session` browser cookie.
-      parameters:
-        - name: conversation_id
-          in: path
-          required: true
-          schema:
-            type: string
       security:
         - sumiSession: []
       requestBody:
@@ -180,13 +159,12 @@ paths:
   /v1/todos:
     post:
       operationId: createTodo
-      summary: Create a Todo owned by the authenticated user
+      summary: Create a Todo owned by the authenticated Human
       description: |
-        The owner is always derived from the authenticated development session.
-        `owner_user_id` is intentionally not accepted from the request body.
-        The server registers Todo routes only when both `SUMI_TODO_ENABLED=true`
-        and `SUMI_TODO_DEV_SESSION_AUTH=true`; production user-scoped auth is not
-        implemented yet.
+        The owner is derived exclusively from the server-issued `sumi_session`.
+        Routes are registered only when `SUMI_TODO_ENABLED=true`; the shared
+        control-plane database and browser authentication must also be enabled.
+        Browser clients call this route through the same-origin frontend proxy.
       security:
         - sumiSession: []
       parameters:
@@ -221,8 +199,8 @@ paths:
           $ref: "#/components/responses/InternalError"
     get:
       operationId: listTodos
-      summary: List Todos owned by the authenticated user
-      description: Every query is scoped by the authenticated user's ID.
+      summary: List Todos owned by the authenticated Human
+      description: Every query is scoped by the authenticated HumanId.
       security:
         - sumiSession: []
       parameters:
@@ -277,7 +255,7 @@ paths:
       - $ref: "#/components/parameters/TodoID"
     get:
       operationId: getTodo
-      summary: Get one Todo owned by the authenticated user
+      summary: Get one Todo owned by the authenticated Human
       security:
         - sumiSession: []
       responses:
@@ -298,7 +276,7 @@ paths:
       summary: Update one Todo with optimistic locking
       description: |
         `due` is replaced as a whole when present and is cleared by `null`.
-        A Todo owned by another user is indistinguishable from a missing Todo.
+        A Todo owned by another Human is indistinguishable from a missing Todo.
       security:
         - sumiSession: []
       parameters:
@@ -369,10 +347,7 @@ components:
       type: apiKey
       in: cookie
       name: sumi_session
-      description: |
-        Signed HttpOnly conversation session cookie. Todo routes may use this
-        only in the explicitly enabled local development mode; it is not a
-        production Todo credential.
+      description: Signed HttpOnly browser session cookie.
   parameters:
     TodoID:
       name: id
@@ -401,7 +376,7 @@ components:
               code: validation_failed
               message: request validation failed
     Unauthenticated:
-      description: Missing or invalid browser session
+      description: Missing, invalid, expired, or revoked browser session
       content:
         application/json:
           schema:
@@ -431,7 +406,7 @@ components:
               code: unsupported_media_type
               message: Content-Type must be application/json
     TodoNotFound:
-      description: Todo is absent or belongs to another user
+      description: Todo is absent or belongs to another Human
       content:
         application/json:
           schema:
@@ -537,18 +512,7 @@ components:
         - $ref: "#/components/schemas/TodoDueDatetimeResolved"
     Todo:
       type: object
-      required:
-        - id
-        - title
-        - description
-        - status
-        - priority
-        - due
-        - version
-        - via_agent
-        - completed_at
-        - created_at
-        - updated_at
+      required: [id, title, description, status, priority, due, version, via_agent, completed_at, created_at, updated_at]
       additionalProperties: false
       properties:
         id:
@@ -640,14 +604,7 @@ components:
           minimum: 0
     ErrorCode:
       type: string
-      enum:
-        - validation_failed
-        - unauthenticated
-        - csrf_failed
-        - unsupported_media_type
-        - todo_not_found
-        - version_conflict
-        - internal_error
+      enum: [validation_failed, unauthenticated, csrf_failed, unsupported_media_type, todo_not_found, version_conflict, internal_error]
     ErrorResponse:
       type: object
       required: [error]
@@ -700,6 +657,10 @@ components:
       description: canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
     CommandEnvelope:
       $ref: "./agent-events.yaml#/$defs/CommandEnvelope"
+    PersonalityAgentId:
+      $ref: "./agent-events.yaml#/$defs/PersonalityAgentId"
+    DirectChatProvenanceV1:
+      $ref: "./agent-events.yaml#/$defs/DirectChatProvenanceV1"
     AgentHello:
       $ref: "./agent-events.yaml#/$defs/AgentHello"
     ApiHello:
@@ -710,3 +671,59 @@ components:
       $ref: "./agent-events.yaml#/$defs/BrowserClientFrame"
     BrowserServerFrame:
       $ref: "./agent-events.yaml#/$defs/BrowserServerFrame"
+    DirectChatUserMessageCommand:
+      type: object
+      required: [type, text, attachments]
+      additionalProperties: false
+      properties:
+        type:
+          const: user_message
+        text:
+          type: string
+        attachments:
+          type: array
+          maxItems: 0
+          items:
+            $ref: "./agent-events.yaml#/$defs/Attachment"
+    DirectChatCommandReceipt:
+      type: object
+      required: [idempotency_key, command_id, seq]
+      additionalProperties: false
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        command_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        seq:
+          $ref: "#/components/schemas/JsonSafeInteger"
+    DirectChatCommandRejectedResponse:
+      type: object
+      required: [error, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: invalid_command
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        reject_reason:
+          type: string
+          enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+    DirectChatCommandIdempotencyConflictResponse:
+      type: object
+      required: [error, idempotency_key, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: idempotency_conflict
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        reject_reason:
+          const: idempotency_conflict

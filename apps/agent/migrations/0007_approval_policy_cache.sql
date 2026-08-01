@@ -5,7 +5,8 @@
 CREATE TABLE approval_policy_cache (
   singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
   tenant_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
+  personality_agent_id TEXT NOT NULL
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   version INTEGER NOT NULL CHECK (version >= 0),
   issued_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,

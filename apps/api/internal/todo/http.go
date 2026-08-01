@@ -23,7 +23,21 @@ const (
 	todoCSRFHeaderValue = "1"
 )
 
-type Principal struct{ UserID string }
+type Principal struct {
+	UserID    string
+	authorize func(func() error) error
+}
+
+func NewPrincipal(userID string, authorize func(func() error) error) Principal {
+	return Principal{UserID: userID, authorize: authorize}
+}
+
+func (p Principal) do(operation func() error) error {
+	if p.authorize == nil {
+		return operation()
+	}
+	return p.authorize(operation)
+}
 
 type PrincipalVerifier interface {
 	VerifyRequest(ctx context.Context, request *http.Request) (Principal, error)
@@ -93,10 +107,15 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
-	item, err := h.service.Create(r.Context(), principal.UserID, CreateInput{
-		Title: request.Title, Description: request.Description, Status: request.Status,
-		Priority: request.Priority, Due: due,
-	}, false)
+	var item Todo
+	err = principal.do(func() error {
+		var createErr error
+		item, createErr = h.service.Create(r.Context(), principal.UserID, CreateInput{
+			Title: request.Title, Description: request.Description, Status: request.Status,
+			Priority: request.Priority, Due: due,
+		}, false)
+		return createErr
+	})
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -134,7 +153,12 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", "offset must be an integer", 0)
 		return
 	}
-	result, err := h.service.List(r.Context(), principal.UserID, filter)
+	var result ListResult
+	err = principal.do(func() error {
+		var listErr error
+		result, listErr = h.service.List(r.Context(), principal.UserID, filter)
+		return listErr
+	})
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -147,7 +171,12 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	item, err := h.service.Get(r.Context(), principal.UserID, r.PathValue("id"))
+	var item Todo
+	err := principal.do(func() error {
+		var getErr error
+		item, getErr = h.service.Get(r.Context(), principal.UserID, r.PathValue("id"))
+		return getErr
+	})
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -182,10 +211,15 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
-	item, err := h.service.Update(r.Context(), principal.UserID, r.PathValue("id"), UpdateInput{
-		ExpectedVersion: request.ExpectedVersion, Title: request.Title, Description: request.Description,
-		Status: request.Status, Priority: request.Priority, DueSet: dueSet, Due: due,
-	}, false)
+	var item Todo
+	err = principal.do(func() error {
+		var updateErr error
+		item, updateErr = h.service.Update(r.Context(), principal.UserID, r.PathValue("id"), UpdateInput{
+			ExpectedVersion: request.ExpectedVersion, Title: request.Title, Description: request.Description,
+			Status: request.Status, Priority: request.Priority, DueSet: dueSet, Due: due,
+		}, false)
+		return updateErr
+	})
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -206,7 +240,9 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", "expected_version must be an integer", 0)
 		return
 	}
-	if err := h.service.Delete(r.Context(), principal.UserID, r.PathValue("id"), expectedVersion); err != nil {
+	if err := principal.do(func() error {
+		return h.service.Delete(r.Context(), principal.UserID, r.PathValue("id"), expectedVersion)
+	}); err != nil {
 		h.writeServiceError(w, err)
 		return
 	}
@@ -245,6 +281,8 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, err error) {
 	var validation *ValidationError
 	var conflict *VersionConflictError
 	switch {
+	case errors.Is(err, ErrUnauthenticated):
+		writeAPIError(w, http.StatusUnauthorized, "unauthenticated", "authentication required", 0)
 	case errors.As(err, &validation):
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", validation.Message, 0)
 	case errors.Is(err, ErrNotFound):

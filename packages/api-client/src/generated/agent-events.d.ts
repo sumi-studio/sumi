@@ -6,6 +6,13 @@
  */
 
 /**
+ * exact lower-case hyphenated UUIDv7 personality-agent identity
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "PersonalityAgentId".
+ */
+export type PersonalityAgentId = string;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "DurableAgentEvent".
  */
@@ -22,7 +29,8 @@ export type DurableAgentEvent =
   | ApprovalResolvedEvent
   | SteeredEvent
   | MemoryMaintenanceEvent
-  | RetryScheduledEvent;
+  | RetryScheduledEvent
+  | CommandDispositionEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicMessage".
@@ -165,6 +173,36 @@ export type ApprovalDecision =
 export type SteerMode = "hard" | "soft";
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CommandDispositionEvent".
+ */
+export type CommandDispositionEvent =
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "applied";
+    }
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "superseded";
+    }
+  | {
+      type: "command_disposition";
+      command_id: string;
+      command_seq: JsonSafeInteger;
+      status: "rejected";
+      reject_reason: CommandRejectReason;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CommandRejectReason".
+ */
+export type CommandRejectReason =
+  "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "VolatileAgentEvent".
  */
 export type VolatileAgentEvent = MessageUpdateEvent | ToolExecutionUpdateEvent | ErrorEvent;
@@ -271,6 +309,7 @@ export type AgentEvent =
   | SteeredEvent
   | MemoryMaintenanceEvent
   | RetryScheduledEvent
+  | CommandDispositionEvent
   | ErrorEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -296,6 +335,20 @@ export type Command =
       decision: ApprovalDecision;
     };
 /**
+ * opaque ASCII tenant identity
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "TenantId".
+ */
+export type TenantId = string;
+/**
+ * opaque ASCII principal identity
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "PrincipalId".
+ */
+export type PrincipalId = string;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "OutboundFrame".
  */
@@ -315,9 +368,22 @@ export type OutboundFrame =
 export type BrowserClientFrame = BrowserHello | BrowserCommandFrame;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserEventEnvelope".
+ */
+export type BrowserEventEnvelope =
+  | {
+      seq: JsonSafeInteger;
+      event: DurableAgentEvent;
+    }
+  | {
+      event: VolatileAgentEvent;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "BrowserServerFrame".
  */
-export type BrowserServerFrame = BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame;
+export type BrowserServerFrame =
+  BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame | DirectChatStatusFrame;
 /**
  * canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
  *
@@ -341,7 +407,7 @@ export interface HttpsSumiDevContractsAgentEventsYaml {
  * via the `definition` "DurableEnvelope".
  */
 export interface DurableEnvelope {
-  conversation_id: string;
+  personality_agent_id: PersonalityAgentId;
   event: DurableAgentEvent;
   seq: JsonSafeInteger;
 }
@@ -609,7 +675,7 @@ export interface RetryScheduledEvent {
  * via the `definition` "VolatileEnvelope".
  */
 export interface VolatileEnvelope {
-  conversation_id: string;
+  personality_agent_id: PersonalityAgentId;
   event: VolatileAgentEvent;
 }
 /**
@@ -640,6 +706,22 @@ export interface ErrorEvent {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "DirectChatProvenanceV1".
+ */
+export interface DirectChatProvenanceV1 {
+  version: 1;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: {
+    kind: "human";
+    principal_id: PrincipalId;
+  };
+  source: {
+    surface: "direct_chat";
+  };
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "CommandEnvelope".
  */
 export interface CommandEnvelope {
@@ -648,6 +730,8 @@ export interface CommandEnvelope {
    * canonical lower-case hyphenated UUID
    */
   command_id: string;
+  personality_agent_id: PersonalityAgentId;
+  provenance: DirectChatProvenanceV1;
   command: Command;
 }
 /**
@@ -657,8 +741,9 @@ export interface CommandEnvelope {
 export interface CommandAck {
   seq: JsonSafeInteger;
   command_id: string;
+  personality_agent_id: PersonalityAgentId;
   status: "received" | "applied" | "superseded" | "rejected";
-  reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+  reject_reason?: CommandRejectReason;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -683,7 +768,7 @@ export interface BrowserCommandFrame {
  */
 export interface BrowserEventFrame {
   type: "event";
-  envelope: Envelope;
+  envelope: BrowserEventEnvelope;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -691,7 +776,33 @@ export interface BrowserEventFrame {
  */
 export interface BrowserCommandAcceptedFrame {
   type: "command_accepted";
-  envelope: CommandEnvelope;
+  idempotency_key: string;
+  command_id: string;
+  seq: JsonSafeInteger;
+  /**
+   * Exact durable terminal disposition for this command when already committed at idempotent acceptance time. Its command_id and command_seq must equal this receipt's command_id and seq.
+   *
+   */
+  disposition?:
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "applied";
+      }
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "superseded";
+      }
+    | {
+        type: "command_disposition";
+        command_id: string;
+        command_seq: JsonSafeInteger;
+        status: "rejected";
+        reject_reason: CommandRejectReason;
+      };
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -699,7 +810,23 @@ export interface BrowserCommandAcceptedFrame {
  */
 export interface BrowserCommandRejectedFrame {
   type: "command_rejected";
-  reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+  idempotency_key: string;
+  reject_reason:
+    | "unknown_command"
+    | "schema_violation"
+    | "attachments_not_empty"
+    | "oversized"
+    | "not_allowed"
+    | "idempotency_conflict"
+    | "unavailable";
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "DirectChatStatusFrame".
+ */
+export interface DirectChatStatusFrame {
+  type: "direct_chat_status";
+  status: "ready" | "unavailable";
 }
 /**
  * placeholder for v1; no attachments are accepted yet
@@ -715,10 +842,7 @@ export interface Attachment {
  * via the `definition` "AgentHello".
  */
 export interface AgentHello {
-  /**
-   * agent identity from the short-lived credential claim
-   */
-  agent_id: string;
+  personality_agent_id: PersonalityAgentId;
   generation: ProcessGeneration;
   last_sent_event_seq: CanonicalDecimalU64;
   last_received_command_seq: CanonicalDecimalU64;
@@ -729,6 +853,7 @@ export interface AgentHello {
  * via the `definition` "ApiHello".
  */
 export interface ApiHello {
+  personality_agent_id: PersonalityAgentId;
   accepted_generation: ProcessGeneration;
   last_received_event_seq: CanonicalDecimalU64;
   next_command_seq: CanonicalDecimalU64;

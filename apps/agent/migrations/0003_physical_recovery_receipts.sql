@@ -4,6 +4,8 @@
 CREATE TABLE physical_recovery_receipt_applications (
   receipt_id TEXT NOT NULL PRIMARY KEY,
   receipt_digest TEXT NOT NULL,
+  personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   lease_id TEXT NOT NULL,
   fence_id TEXT NOT NULL,
   generation INTEGER NOT NULL,

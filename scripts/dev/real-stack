@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
+readonly LOCAL_CONTROL_ORIGIN="http://127.0.0.1:8081"
+readonly LOOPBACK_GATEWAY_LISTEN="127.0.0.1:8082"
+readonly WEB_PORT=5173
+readonly POSTGRES_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.yaml"
+readonly POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
+
+ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+CHECK_ONLY=0
+RUNTIME_ROOT=
+PUBLIC_HOST=
+API_PORT=
+API_ORIGIN=
+WEB_ORIGIN=
+declare -a CHILD_PIDS=()
+
+log() {
+  printf '[sumi-local] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev/real-stack [--check] [--env-file PATH]
+
+Starts the real local Sumi API, tool executor, production PersonalityAgent,
+and Vite frontend. --check validates credentials and identity configuration
+without building or starting processes.
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      ;;
+    --env-file)
+      (($# >= 2)) || fail "--env-file requires a path"
+      ENV_FILE="$2"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+load_env_file() {
+  local file="$1"
+  local line key value mode
+  [[ -f "${file}" && -r "${file}" && ! -L "${file}" ]] ||
+    fail "configuration file must be a readable regular non-symlink: ${file}"
+  mode="$(stat -c '%a' -- "${file}")" ||
+    fail "cannot inspect configuration file permissions: ${file}"
+  mode="${mode: -3}"
+  [[ "${mode}" =~ ^[0-7]{3}$ ]] ||
+    fail "cannot parse configuration file permissions: ${file}"
+  [[ "${mode:1:1}" =~ ^[0-3]$ && "${mode:2:1}" =~ ^[0-3]$ ]] ||
+    fail "configuration file must not be readable by group or other: ${file}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ "${line}" =~ ^[[:space:]]*$ || "${line}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] ||
+      fail "invalid literal KEY=VALUE record in ${file}"
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    if [[ "${value}" == \"* || "${value}" == \'* ]]; then
+      fail "${file} uses quotes for ${key}; values are parsed literally and must be unquoted"
+    fi
+    if ! [[ -v "${key}" ]]; then
+      printf -v "${key}" '%s' "${value}"
+      export "${key}"
+    fi
+  done < "${file}"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+require_value() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "${name} is required"
+}
+
+valid_paid() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+}
+
+valid_binding_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$ ]]
+}
+
+validate_firebase_web_config() {
+  local configured=0 name
+  for name in \
+    VITE_FIREBASE_API_KEY \
+    VITE_FIREBASE_AUTH_DOMAIN \
+    VITE_FIREBASE_PROJECT_ID \
+    VITE_FIREBASE_APP_ID
+  do
+    [[ -n "${!name:-}" ]] && configured=1
+  done
+  if ((configured)); then
+    for name in \
+      VITE_FIREBASE_API_KEY \
+      VITE_FIREBASE_AUTH_DOMAIN \
+      VITE_FIREBASE_PROJECT_ID \
+      VITE_FIREBASE_APP_ID
+    do
+      require_value "${name}"
+    done
+  fi
+}
+
+validate_public_listen() {
+  SUMI_PUBLIC_LISTEN="${SUMI_PUBLIC_LISTEN:-127.0.0.1:8080}"
+  export SUMI_PUBLIC_LISTEN
+  [[ "${SUMI_PUBLIC_LISTEN}" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$ ]] ||
+    fail "SUMI_PUBLIC_LISTEN must be a literal IPv4 address and port"
+  PUBLIC_HOST="${BASH_REMATCH[1]}"
+  API_PORT="${BASH_REMATCH[3]}"
+  ((10#${API_PORT} > 0 && 10#${API_PORT} <= 65535)) ||
+    fail "SUMI_PUBLIC_LISTEN port is outside 1..65535"
+  [[ "${PUBLIC_HOST}" != "0.0.0.0" ]] ||
+    fail "SUMI_PUBLIC_LISTEN must not expose an all-interface wildcard"
+  [[ "${API_PORT}" != "8081" && "${API_PORT}" != "8082" && "${API_PORT}" != "${WEB_PORT}" ]] ||
+    fail "SUMI_PUBLIC_LISTEN collides with a reserved local-stack port"
+  if [[ "${PUBLIC_HOST}" != "127.0.0.1" ]]; then
+    node -e '
+      const octets = process.argv[1].split(".").map(Number);
+      if (
+        octets.length !== 4 ||
+        octets[0] !== 100 ||
+        octets[1] < 64 ||
+        octets[1] > 127
+      ) process.exit(2);
+    ' "${PUBLIC_HOST}" ||
+      fail "SUMI_PUBLIC_LISTEN must use 127.0.0.1 or an assigned Tailnet IPv4 in 100.64.0.0/10"
+  fi
+  node -e '
+    const { createServer, isIP } = require("node:net");
+    const address = process.argv[1];
+    if (isIP(address) !== 4) process.exit(2);
+    const server = createServer();
+    server.once("error", () => process.exit(3));
+    server.listen({ host: address, port: 0, exclusive: true }, () => {
+      server.close((error) => process.exit(error ? 4 : 0));
+    });
+  ' "${PUBLIC_HOST}" ||
+    fail "SUMI_PUBLIC_LISTEN address cannot be bound by a local process"
+  API_ORIGIN="http://${PUBLIC_HOST}:${API_PORT}"
+  WEB_ORIGIN="http://${PUBLIC_HOST}:${WEB_PORT}"
+}
+
+validate_adc() {
+  local credential_file credential_metadata credential_project credential_email
+  if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+    credential_file="$(realpath -- "${GOOGLE_APPLICATION_CREDENTIALS}")" ||
+      fail "cannot resolve GOOGLE_APPLICATION_CREDENTIALS"
+    [[ -f "${credential_file}" && -r "${credential_file}" && ! -L "${credential_file}" ]] ||
+      fail "GOOGLE_APPLICATION_CREDENTIALS must be a readable regular non-symlink"
+    credential_metadata="$(
+      node -e '
+        const fs = require("node:fs");
+        const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        if (
+          typeof value.project_id !== "string" ||
+          typeof value.client_email !== "string" ||
+          typeof value.private_key !== "string" ||
+          !value.project_id ||
+          !value.client_email ||
+          !value.private_key
+        ) process.exit(2);
+        process.stdout.write(`${value.project_id}\t${value.client_email}`);
+      ' "${credential_file}"
+    )" || fail "GOOGLE_APPLICATION_CREDENTIALS is not a usable service-account ADC file"
+    IFS=$'\t' read -r credential_project credential_email <<< "${credential_metadata}"
+    [[ "${credential_project}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
+      fail "Firebase Admin ADC project must match SUMI_AUTH_FIREBASE_PROJECT_ID"
+    [[ "${credential_email}" == *@*.gserviceaccount.com ]] ||
+      fail "Firebase Admin ADC client_email is not a service account"
+    GOOGLE_APPLICATION_CREDENTIALS="${credential_file}"
+    export GOOGLE_APPLICATION_CREDENTIALS
+    return
+  fi
+
+  require_command gcloud
+  gcloud auth application-default print-access-token >/dev/null 2>&1 ||
+    fail "Google Application Default Credentials are unavailable; run gcloud auth application-default login"
+  credential_project="$(gcloud config get-value project 2>/dev/null || true)"
+  [[ -n "${credential_project}" && "${credential_project}" != "(unset)" ]] ||
+    fail "gcloud has no active project for Firebase Admin ADC"
+  [[ "${credential_project}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
+    fail "gcloud project must match SUMI_AUTH_FIREBASE_PROJECT_ID"
+}
+
+validate_firebase_admin_mode() {
+  local api_emulator="${FIREBASE_AUTH_EMULATOR_HOST:-}"
+  local web_emulator="${VITE_FIREBASE_AUTH_EMULATOR_URL:-}"
+  if [[ -z "${api_emulator}" && -z "${web_emulator}" ]]; then
+    validate_adc
+    return
+  fi
+  [[ -n "${api_emulator}" && -n "${web_emulator}" ]] ||
+    fail "Firebase Auth emulator requires both FIREBASE_AUTH_EMULATOR_HOST and VITE_FIREBASE_AUTH_EMULATOR_URL"
+  node -e '
+    const { isIP } = require("node:net");
+    const api = process.argv[1];
+    const web = process.argv[2];
+    const publicHost = process.argv[3];
+    const match = api.match(/^([0-9.]+):([0-9]{1,5})$/);
+    if (!match || isIP(match[1]) !== 4 || match[1] === "0.0.0.0") process.exit(2);
+    const port = Number(match[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(3);
+    try {
+      const url = new URL(web);
+      if (
+        url.origin !== web ||
+        url.protocol !== "http:" ||
+        isIP(url.hostname) !== 4 ||
+        url.hostname === "0.0.0.0"
+      ) process.exit(4);
+      if (publicHost !== "127.0.0.1" && url.hostname !== publicHost) {
+        process.exit(6);
+      }
+    } catch {
+      process.exit(5);
+    }
+  ' "${api_emulator}" "${web_emulator}" "${PUBLIC_HOST}" ||
+    fail "Firebase Auth emulator endpoints must be exact literal-IPv4 HTTP endpoints, and the browser endpoint must use the public Tailnet host"
+}
+
+validate_configuration() {
+  local web_project provider_api_key
+  validate_public_listen
+  require_value SUMI_PERSONALITY_AGENT_ID
+  valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
+    fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
+
+  SUMI_AUTH_PERSONALITY_AGENT_ID="${SUMI_AUTH_PERSONALITY_AGENT_ID:-${SUMI_PERSONALITY_AGENT_ID}}"
+  export SUMI_AUTH_PERSONALITY_AGENT_ID
+  [[ "${SUMI_AUTH_PERSONALITY_AGENT_ID}" == "${SUMI_PERSONALITY_AGENT_ID}" ]] ||
+    fail "SUMI_AUTH_PERSONALITY_AGENT_ID must equal SUMI_PERSONALITY_AGENT_ID"
+
+  for name in \
+    SUMI_AUTH_FIREBASE_UID \
+    SUMI_AUTH_FIREBASE_PROJECT_ID \
+    SUMI_AUTH_TENANT_ID \
+    SUMI_AUTH_USER_ID \
+    SUMI_MODEL_PRESET \
+    SUMI_MODEL_API_KEY_ENV
+  do
+    require_value "${name}"
+  done
+  valid_binding_id "${SUMI_AUTH_TENANT_ID}" ||
+    fail "SUMI_AUTH_TENANT_ID is not a valid Sumi binding ID"
+  valid_binding_id "${SUMI_AUTH_USER_ID}" ||
+    fail "SUMI_AUTH_USER_ID is not a valid Sumi binding ID"
+  ((${#SUMI_AUTH_FIREBASE_UID} <= 128)) ||
+    fail "SUMI_AUTH_FIREBASE_UID exceeds 128 bytes"
+  if [[ -n "${SUMI_AUTH_FIREBASE_TENANT_ID:-}" ]]; then
+    ((${#SUMI_AUTH_FIREBASE_TENANT_ID} <= 128)) ||
+      fail "SUMI_AUTH_FIREBASE_TENANT_ID exceeds 128 bytes"
+  fi
+
+  validate_firebase_web_config
+  web_project="${VITE_FIREBASE_PROJECT_ID:-sumi-studio}"
+  [[ "${web_project}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
+    fail "Firebase web and Admin project IDs must match"
+
+  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
+  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
+  [[ -n "${provider_api_key}" ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured real model provider"
+  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
+
+  validate_firebase_admin_mode
+}
+
+process_is_running() {
+  kill -0 "$1" 2>/dev/null
+}
+
+signal_process_tree() {
+  local signal="$1"
+  local pid="$2"
+  process_is_running "${pid}" || return 0
+  kill "-${signal}" -- "-${pid}" 2>/dev/null ||
+    kill "-${signal}" "${pid}" 2>/dev/null ||
+    true
+}
+
+wait_for_http() {
+  local url="$1"
+  local pid="$2"
+  local label="$3"
+  local attempt
+  for attempt in {1..200}; do
+    process_is_running "${pid}" || fail "${label} exited before readiness"
+    if curl --fail --silent --show-error --max-time 1 "${url}" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "timed out waiting for ${label}"
+}
+
+assert_exact_tcp_listener() {
+  local expected="$1"
+  local port="$2"
+  local label="$3"
+  local listener found=0
+  while IFS= read -r listener; do
+    [[ -n "${listener}" ]] || continue
+    case "${listener}" in
+      "*:${port}" | "0.0.0.0:${port}" | "[::]:${port}")
+        fail "${label} widened to an all-interface listener"
+        ;;
+    esac
+    [[ "${listener}" == "${expected}" ]] && found=1
+  done < <(ss -H -ltn "sport = :${port}" | awk '{print $4}')
+  ((found == 1)) || fail "${label} did not bind exact address ${expected}"
+}
+
+wait_for_socket() {
+  local socket="$1"
+  local pid="$2"
+  local attempt
+  for attempt in {1..200}; do
+    process_is_running "${pid}" || fail "tool executor exited before readiness"
+    [[ -S "${socket}" ]] && return
+    sleep 0.1
+  done
+  fail "timed out waiting for the authenticated executor socket"
+}
+
+start_postgres() {
+  log "starting control-plane Postgres via compose"
+  docker compose -f "${POSTGRES_COMPOSE_FILE}" up -d postgres >/dev/null
+  local attempt
+  for attempt in {1..300}; do
+    if docker compose -f "${POSTGRES_COMPOSE_FILE}" exec -T postgres \
+      pg_isready -U sumi -d sumi >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.2
+  done
+  fail "timed out waiting for control-plane Postgres"
+}
+
+start_loopback_gateway_relay() {
+  log "starting loopback-only gateway relay"
+  (
+    exec setsid env -i \
+      "PATH=${PATH}" \
+      node -e '
+        const net = require("node:net");
+        const upstreamHost = process.argv[1];
+        const upstreamPort = Number(process.argv[2]);
+        const server = net.createServer((downstream) => {
+          const upstream = net.createConnection({
+            host: upstreamHost,
+            port: upstreamPort,
+          });
+          downstream.on("error", () => upstream.destroy());
+          upstream.on("error", () => downstream.destroy());
+          downstream.pipe(upstream);
+          upstream.pipe(downstream);
+        });
+        server.on("error", (error) => {
+          process.stderr.write(`${error.message}\n`);
+          process.exit(1);
+        });
+        server.listen({ host: "127.0.0.1", port: 8082, exclusive: true });
+      ' "${PUBLIC_HOST}" "${API_PORT}"
+  ) >"${LOG_DIR}/gateway-relay.log" 2>&1 &
+  GATEWAY_RELAY_PID=$!
+  CHILD_PIDS+=("${GATEWAY_RELAY_PID}")
+  for attempt in {1..100}; do
+    process_is_running "${GATEWAY_RELAY_PID}" ||
+      fail "loopback gateway relay exited before readiness"
+    if ss -H -ltn "sport = :8082" |
+      awk -v expected="${LOOPBACK_GATEWAY_LISTEN}" '$4 == expected { found = 1 } END { exit !found }'; then
+      assert_exact_tcp_listener \
+        "${LOOPBACK_GATEWAY_LISTEN}" \
+        8082 \
+        "loopback gateway relay"
+      return
+    fi
+    sleep 0.1
+  done
+  fail "timed out waiting for loopback gateway relay"
+}
+
+wait_for_runtime_ready() {
+  local state_file="$1"
+  local pid="$2"
+  local attempt
+  for attempt in {1..450}; do
+    process_is_running "${pid}" || fail "PersonalityAgent exited before Ready"
+    if node -e '
+      const fs = require("node:fs");
+      try {
+        const state = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        const expectedNonce = process.argv[2];
+        if (
+          state.generation === 0 &&
+          typeof state.hydration_receipt_identity === "string" &&
+          state.hydration_receipt_identity.length > 0 &&
+          state.local_control?.state === "ready" &&
+          state.local_control?.rpc_boot_nonce === expectedNonce &&
+          state.local_control?.integrity?.mac
+        ) process.exit(0);
+      } catch {}
+      process.exit(1);
+    ' "${state_file}" "${SUMI_RPC_NONCE}" 2>/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "timed out waiting for authenticated PersonalityAgent Ready"
+}
+
+random_base64() {
+  openssl rand -base64 48 | tr -d '\n'
+}
+
+random_token() {
+  openssl rand -hex 32
+}
+
+cleanup() {
+  local status=$?
+  local index pid attempt
+  trap - EXIT INT TERM
+  for ((index = ${#CHILD_PIDS[@]} - 1; index >= 0; index--)); do
+    pid="${CHILD_PIDS[index]}"
+    signal_process_tree TERM "${pid}"
+  done
+  for attempt in {1..50}; do
+    local live=0
+    for pid in "${CHILD_PIDS[@]}"; do
+      process_is_running "${pid}" && live=1
+    done
+    ((live == 0)) && break
+    sleep 0.1
+  done
+  for pid in "${CHILD_PIDS[@]}"; do
+    signal_process_tree KILL "${pid}"
+    wait "${pid}" 2>/dev/null || true
+  done
+  if [[ -n "${RUNTIME_ROOT}" && -d "${RUNTIME_ROOT}" ]]; then
+    local runtime_parent runtime_name temporary_root
+    runtime_parent="$(realpath -m -- "$(dirname -- "${RUNTIME_ROOT}")")"
+    runtime_name="$(basename -- "${RUNTIME_ROOT}")"
+    temporary_root="$(realpath -m -- "${TMPDIR:-/tmp}")"
+    if [[ "${runtime_parent}" == "${temporary_root}" && "${runtime_name}" == sumi-real-stack.* ]]; then
+      rm -rf -- "${RUNTIME_ROOT}"
+    else
+      log "refusing to remove unexpected runtime path: ${RUNTIME_ROOT}"
+      status=1
+    fi
+  fi
+  exit "${status}"
+}
+
+for command in node realpath stat; do
+  require_command "${command}"
+done
+load_env_file "${ENV_FILE}"
+validate_configuration
+if ((CHECK_ONLY)); then
+  log "configuration is valid (Firebase/provider credentials were not printed)"
+  exit 0
+fi
+
+for command in awk cargo curl docker flock go openssl pnpm setsid ss; do
+  require_command "${command}"
+done
+[[ -x "${REPOSITORY_ROOT}/apps/web/node_modules/vite/bin/vite.js" ]] ||
+  fail "web dependencies are missing; run make setup first"
+
+exec 9>"${TMPDIR:-/tmp}/sumi-real-stack-${UID}.lock"
+flock -n 9 || fail "another local Sumi stack owns the fixed development ports"
+
+RUNTIME_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sumi-real-stack.XXXXXXXX")"
+chmod 0700 "${RUNTIME_ROOT}"
+trap cleanup EXIT INT TERM
+
+readonly COMMAND_LOG_DIR="${RUNTIME_ROOT}/command-log"
+readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
+readonly AGENT_STATE_DIR="${RUNTIME_ROOT}/agent-state"
+readonly WORKSPACE_DIR="${RUNTIME_ROOT}/workspace"
+readonly IPC_DIR="${RUNTIME_ROOT}/ipc"
+readonly LOG_DIR="${RUNTIME_ROOT}/logs"
+readonly BIN_DIR="${RUNTIME_ROOT}/bin"
+mkdir -m 0700 \
+  "${COMMAND_LOG_DIR}" \
+  "${GATEWAY_STATE_DIR}" \
+  "${AGENT_STATE_DIR}" \
+  "${WORKSPACE_DIR}" \
+  "${IPC_DIR}" \
+  "${LOG_DIR}" \
+  "${BIN_DIR}"
+
+readonly API_BINARY="${BIN_DIR}/sumi-api"
+readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"
+readonly EXECUTOR_SOCKET="${IPC_DIR}/executor.sock"
+
+log "building the Go API and Rust PersonalityAgent entrypoints"
+(
+  cd "${REPOSITORY_ROOT}/apps/api"
+  go build -o "${API_BINARY}" ./cmd/server
+)
+(
+  cd "${REPOSITORY_ROOT}/apps/agent"
+  cargo build --bin sumi-agent
+)
+
+start_postgres
+
+SUMI_RPC_GENERATION=0
+SUMI_RPC_NONCE="local-$(random_token)"
+SUMI_PROCESS_GENERATION_LEASE_ID="local-lease-$(random_token)"
+SUMI_GENERATION_RECOVERY_FENCE_ID="local-fence-$(random_token)"
+SUMI_AGENT_TOKEN_SECRET="$(random_base64)"
+SUMI_BROWSER_SESSION_SECRET="$(random_base64)"
+SUMI_LOCAL_CONTROL_BEARER="$(random_token)"
+SUMI_AGENT_WRAPPING_KEY="$(random_token)"
+SUMI_APPROVAL_SECRET_DIGEST_KEY="$(random_token)"
+SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX="$(( $(date +%s) + 8 * 60 * 60 ))"
+readonly SUMI_RPC_GENERATION SUMI_RPC_NONCE
+readonly SUMI_PROCESS_GENERATION_LEASE_ID SUMI_GENERATION_RECOVERY_FENCE_ID
+readonly SUMI_AGENT_TOKEN_SECRET SUMI_BROWSER_SESSION_SECRET
+readonly SUMI_LOCAL_CONTROL_BEARER SUMI_AGENT_WRAPPING_KEY
+readonly SUMI_APPROVAL_SECRET_DIGEST_KEY
+readonly SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX
+
+declare -a adc_environment=("HOME=${HOME}" "GOOGLE_CLOUD_PROJECT=${SUMI_AUTH_FIREBASE_PROJECT_ID}")
+if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+  adc_environment+=("GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS}")
+fi
+if [[ -n "${FIREBASE_AUTH_EMULATOR_HOST:-}" ]]; then
+  adc_environment+=("FIREBASE_AUTH_EMULATOR_HOST=${FIREBASE_AUTH_EMULATOR_HOST}")
+fi
+
+log "starting API"
+(
+  cd "${REPOSITORY_ROOT}/apps/api"
+  exec setsid env -i \
+    "PATH=${PATH}" \
+    "${adc_environment[@]}" \
+    "PORT=${API_PORT}" \
+    "SUMI_PUBLIC_LISTEN=${SUMI_PUBLIC_LISTEN}" \
+    "SUMI_COMMAND_LOG_DIR=${COMMAND_LOG_DIR}" \
+    "SUMI_AGENT_RUNTIME_STATE_DIR=${GATEWAY_STATE_DIR}" \
+    "SUMI_AGENT_TOKEN_SECRET=${SUMI_AGENT_TOKEN_SECRET}" \
+    "SUMI_BROWSER_SESSION_SECRET=${SUMI_BROWSER_SESSION_SECRET}" \
+    "SUMI_BROWSER_SESSION_AUDIENCE=sumi:web:direct-chat" \
+    "SUMI_BROWSER_WS_ALLOWED_ORIGINS=${WEB_ORIGIN}" \
+    "SUMI_AUTH_FIREBASE_UID=${SUMI_AUTH_FIREBASE_UID}" \
+    "SUMI_AUTH_FIREBASE_TENANT_ID=${SUMI_AUTH_FIREBASE_TENANT_ID:-}" \
+    "SUMI_AUTH_FIREBASE_PROJECT_ID=${SUMI_AUTH_FIREBASE_PROJECT_ID}" \
+    "SUMI_AUTH_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \
+    "SUMI_AUTH_USER_ID=${SUMI_AUTH_USER_ID}" \
+    "SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}" \
+    "SUMI_AUTH_ALLOW_INSECURE_COOKIES=true" \
+    "SUMI_AUTH_SESSION_TTL=1h" \
+    "SUMI_DB_URL=${POSTGRES_DB_URL}" \
+    "SUMI_LOCAL_CONTROL_ENABLED=1" \
+    "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}" \
+    "SUMI_LOCAL_CONTROL_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \
+    "SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}" \
+    "SUMI_LOCAL_CONTROL_GENERATION=${SUMI_RPC_GENERATION}" \
+    "SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE=${SUMI_RPC_NONCE}" \
+    "SUMI_LOCAL_CONTROL_AUDIENCE=sumi:agent:events" \
+    "SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION=raw" \
+    "SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN=127.0.0.1:8081" \
+    "${API_BINARY}"
+) >"${LOG_DIR}/api.log" 2>&1 &
+API_PID=$!
+CHILD_PIDS+=("${API_PID}")
+wait_for_http "${API_ORIGIN}/health" "${API_PID}" "API"
+assert_exact_tcp_listener "${SUMI_PUBLIC_LISTEN}" "${API_PORT}" "API"
+start_loopback_gateway_relay
+
+log "starting authenticated tool executor"
+(
+  cd "${REPOSITORY_ROOT}/apps/agent"
+  exec setsid env -i \
+    "PATH=${PATH}" \
+    "HOME=${WORKSPACE_DIR}" \
+    "LANG=C.UTF-8" \
+    "SUMI_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}" \
+    "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" \
+    "SUMI_RPC_NONCE=${SUMI_RPC_NONCE}" \
+    "SUMI_WORKSPACE=${WORKSPACE_DIR}" \
+    "SUMI_EXECUTOR_SOCKET=${EXECUTOR_SOCKET}" \
+    "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}" \
+    "${AGENT_BINARY}" --tool-executor-socket
+) >"${LOG_DIR}/executor.log" 2>&1 &
+EXECUTOR_PID=$!
+CHILD_PIDS+=("${EXECUTOR_PID}")
+wait_for_socket "${EXECUTOR_SOCKET}" "${EXECUTOR_PID}"
+
+provider_api_key="${!SUMI_MODEL_API_KEY_ENV}"
+declare -a runtime_environment=(
+  "PATH=${PATH}"
+  "HOME=${AGENT_STATE_DIR}"
+  "LANG=C.UTF-8"
+  "SUMI_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}"
+  "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}"
+  "SUMI_RPC_NONCE=${SUMI_RPC_NONCE}"
+  "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}"
+  "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}"
+  "SUMI_STATE_DIR=${AGENT_STATE_DIR}"
+  "SUMI_WORKSPACE=${WORKSPACE_DIR}"
+  "SUMI_EXECUTOR_SOCKET=${EXECUTOR_SOCKET}"
+  "SUMI_GATEWAY_URL=ws://${LOOPBACK_GATEWAY_LISTEN}/agent/ws"
+  "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=true"
+  "SUMI_LOCAL_CONTROL_URL=${LOCAL_CONTROL_ORIGIN}"
+  "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}"
+  "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX=${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX}"
+  "SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1"
+  "SUMI_AGENT_WRAPPING_KEY=${SUMI_AGENT_WRAPPING_KEY}"
+  "SUMI_APPROVAL_SECRET_DIGEST_KEY=${SUMI_APPROVAL_SECRET_DIGEST_KEY}"
+  "SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET}"
+  "SUMI_MODEL_API_KEY_ENV=${SUMI_MODEL_API_KEY_ENV}"
+  "${SUMI_MODEL_API_KEY_ENV}=${provider_api_key}"
+  "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
+)
+for name in SUMI_MODEL_ID SUMI_MODEL_BASE_URL SUMI_SYSTEM_PROMPT SUMI_SYSTEM_PROMPT_FILE; do
+  if [[ -n "${!name:-}" ]]; then
+    runtime_environment+=("${name}=${!name}")
+  fi
+done
+
+log "starting production PersonalityAgent"
+(
+  cd "${REPOSITORY_ROOT}/apps/agent"
+  exec setsid env -i "${runtime_environment[@]}" "${AGENT_BINARY}"
+) >"${LOG_DIR}/agent.log" 2>&1 &
+AGENT_PID=$!
+CHILD_PIDS+=("${AGENT_PID}")
+runtime_state_name="$(
+  node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64url"))' \
+    "${SUMI_PERSONALITY_AGENT_ID}"
+)"
+wait_for_runtime_ready \
+  "${GATEWAY_STATE_DIR}/runtime-${runtime_state_name}.json" \
+  "${AGENT_PID}"
+
+declare -a vite_environment=(
+  "PATH=${PATH}"
+  "HOME=${HOME}"
+  "SUMI_DEV_HOST=${PUBLIC_HOST}"
+  "SUMI_DEV_API_ORIGIN=${API_ORIGIN}"
+)
+for name in \
+  VITE_FIREBASE_API_KEY \
+  VITE_FIREBASE_AUTH_DOMAIN \
+  VITE_FIREBASE_PROJECT_ID \
+  VITE_FIREBASE_STORAGE_BUCKET \
+  VITE_FIREBASE_MESSAGING_SENDER_ID \
+  VITE_FIREBASE_APP_ID \
+  VITE_FIREBASE_AUTH_EMULATOR_URL
+do
+  if [[ -n "${!name:-}" ]]; then
+    vite_environment+=("${name}=${!name}")
+  fi
+done
+
+log "starting Vite at ${WEB_ORIGIN}"
+(
+  cd "${REPOSITORY_ROOT}/apps/web"
+  exec setsid env -i \
+    "${vite_environment[@]}" \
+    node node_modules/vite/bin/vite.js
+) >"${LOG_DIR}/vite.log" 2>&1 &
+VITE_PID=$!
+CHILD_PIDS+=("${VITE_PID}")
+wait_for_http "${WEB_ORIGIN}/" "${VITE_PID}" "Vite"
+assert_exact_tcp_listener "${PUBLIC_HOST}:${WEB_PORT}" "${WEB_PORT}" "Vite"
+
+log "Sumi is Ready: ${WEB_ORIGIN}"
+log "Press Ctrl-C to stop; disposable state and non-production secrets will be removed."
+while true; do
+  for pid in "${CHILD_PIDS[@]}"; do
+    process_is_running "${pid}" || fail "a required Sumi process exited"
+  done
+  sleep 1
+done

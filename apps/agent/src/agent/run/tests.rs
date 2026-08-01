@@ -79,6 +79,8 @@ struct FixtureDriver {
     overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
     overflow_core_epochs: Mutex<Vec<u64>>,
     overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
+    committed_calibration_failure: Option<&'static str>,
+    terminal_apply_failure: Option<&'static str>,
 }
 
 impl FixtureDriver {
@@ -101,6 +103,8 @@ impl FixtureDriver {
             overflow_recoveries: Mutex::new(Vec::new()),
             overflow_core_epochs: Mutex::new(Vec::new()),
             overflow_contexts: Mutex::new(VecDeque::new()),
+            committed_calibration_failure: None,
+            terminal_apply_failure: None,
         }
     }
 
@@ -126,6 +130,16 @@ impl FixtureDriver {
 
     fn with_overflow_contexts(self, contexts: Vec<Vec<PublicMessage>>) -> Self {
         *self.overflow_contexts.lock().expect("overflow contexts") = contexts.into();
+        self
+    }
+
+    fn failing_committed_calibration(mut self, failure: &'static str) -> Self {
+        self.committed_calibration_failure = Some(failure);
+        self
+    }
+
+    fn failing_terminal_apply(mut self, failure: &'static str) -> Self {
+        self.terminal_apply_failure = Some(failure);
         self
     }
 }
@@ -269,6 +283,22 @@ impl RunDriver for FixtureDriver {
         Ok(OverflowRecoveryOutcome::ReplacementContext(
             recovered_context_from_active(replacement, active_context),
         ))
+    }
+
+    fn install_committed_calibration(&self, _ratio_bits: [u8; 8]) -> Result<()> {
+        self.committed_calibration_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
+    }
+
+    async fn apply_terminal(
+        &self,
+        _message_id: &str,
+        _message_seq: u64,
+        _message: &AssistantMessage,
+        _provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        self.terminal_apply_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
     }
 
     async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
@@ -548,6 +578,8 @@ fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> P
 
 fn user(seq: u64) -> CommandEnvelope {
     CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
             .expect("command id"),
@@ -556,6 +588,10 @@ fn user(seq: u64) -> CommandEnvelope {
             attachments: Vec::new(),
         },
     }
+}
+
+fn user_message_id(command_id: &CommandId) -> String {
+    crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id)
 }
 
 fn admitted_user(seq: u64) -> AdmittedCommand {
@@ -569,6 +605,8 @@ fn live_admitted_user(seq: u64) -> AdmittedCommand {
 fn admitted_abort(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                 .expect("command id"),
@@ -581,6 +619,8 @@ fn admitted_abort(seq: u64) -> AdmittedCommand {
 fn admitted_approval(seq: u64, request_id: &str) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                 .expect("command id"),
@@ -620,6 +660,9 @@ fn recovered_context(label: &str) -> Vec<PublicMessage> {
 fn recovered_core(completion: RunCompletion) -> RunCore {
     match completion {
         RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("rehydration-required completion has no recoverable core: {failure}")
+        }
     }
 }
 
@@ -639,6 +682,12 @@ fn bound_core(seq: u64) -> RunCore {
         test_executor_generation(),
     ));
     core.attempt_cancellation = Some(Arc::new(AttemptCancellation::default()));
+    core
+}
+
+fn bound_core_with_runtime_shutdown(seq: u64, shutdown: &CancellationToken) -> RunCore {
+    let mut core = bound_core(seq);
+    core.runtime_shutdown = shutdown.child_token();
     core
 }
 
@@ -888,9 +937,88 @@ async fn complete_with_receipts(
     completion.await.expect("worker join")
 }
 
+async fn complete_with_calibrated_receipts(
+    future: WorkerFuture,
+    mut events_rx: mpsc::Receiver<RunOutput>,
+) -> RunCompletion {
+    let completion = tokio::spawn(future);
+    let mut message_seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                calibration_ratio_bits: Some([7; 8]),
+                new_turn_id: None,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    completion.await.expect("worker join")
+}
+
+#[tokio::test]
+async fn durable_terminal_followup_failures_require_rehydration_in_both_terminal_branches() {
+    let cases = [
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::Stop,
+                vec![AssistantContent::Text {
+                    text: "durable answer".to_owned(),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_committed_calibration("calibration after durable terminal failed"),
+            "calibration after durable terminal failed",
+        ),
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::ToolUse,
+                vec![AssistantContent::ToolCall {
+                    tool_call: call("durable-tool"),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_terminal_apply("apply after durable tool terminal failed"),
+            "apply after durable tool terminal failed",
+        ),
+    ];
+
+    for (driver, expected_failure) in cases {
+        let worker = SequentialRunWorker::new(Arc::new(driver));
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let completion = complete_with_calibrated_receipts(
+            worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+            events_rx,
+        )
+        .await;
+        assert!(matches!(
+            completion,
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(ref failure),
+            } if failure == expected_failure
+        ));
+    }
+}
+
 fn assert_completed(completion: RunCompletion) {
-    if let RunCompletion::Failed { failure, .. } = completion {
-        panic!("run failed: {failure}");
+    match completion {
+        RunCompletion::Completed(_) => {}
+        RunCompletion::Failed { failure, .. } => panic!("run failed: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("run requires rehydration: {failure}")
+        }
     }
 }
 
@@ -1572,6 +1700,9 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
         RunCompletion::Failed { failure, .. } => {
             panic!("post-receipt Abort run failed: {failure}")
         }
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("post-receipt Abort unexpectedly requires rehydration: {failure}")
+        }
     };
     let hard_steer_seq = hard_steer_seq.expect("hard-steer assistant receipt");
     let fragment = cancellation_provider_context()
@@ -1902,6 +2033,9 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
     assert!(driver.tool_order.lock().expect("tool order").is_empty());
@@ -2124,6 +2258,7 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
 #[test]
 fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_failure_role() {
     let binding = DurableRunBinding {
+        provenance: crate::gateway::test_direct_chat_provenance(),
         command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
         command_seq: 1,
         run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
@@ -2288,6 +2423,9 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert_eq!(core.runtime_context.len(), 2);
         assert!(matches!(
@@ -2392,6 +2530,9 @@ async fn non_authoritative_projection_failure_and_eof_discard_rejected_results()
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert!(
             !core
@@ -2864,6 +3005,9 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     let recoveries = driver
         .overflow_recoveries
@@ -3145,6 +3289,9 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(
         core.pending_overflow_apply(),
@@ -3734,6 +3881,9 @@ async fn provider_streaming_abort_dropped_accept_is_no_op() {
             let completion = match completion {
                 RunCompletion::Completed(_) => "completed".to_owned(),
                 RunCompletion::Failed { failure, .. } => format!("{failure}"),
+                RunCompletion::RehydrationRequired { failure } => {
+                    format!("rehydration required: {failure}")
+                }
             };
             panic!("worker completed before assistant MessageStart: {completion}");
         }
@@ -4009,6 +4159,59 @@ struct ControlProbeDriver {
     cancelled: Arc<AtomicBool>,
 }
 
+struct RuntimeProviderProbeDriver {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for RuntimeProviderProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        self.cancelled.notify_one();
+        Err(anyhow!("runtime provider start cancelled"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        unreachable!("provider probe has no tools")
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("provider probe has no overflow recovery")
+    }
+}
+
 impl ControlProbeDriver {
     fn new() -> Self {
         Self {
@@ -4017,6 +4220,157 @@ impl ControlProbeDriver {
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+#[tokio::test]
+async fn runtime_shutdown_reaches_provider_start_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(RuntimeProviderProbeDriver {
+        started: Arc::new(Notify::new()),
+        cancelled: Arc::new(Notify::new()),
+    });
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    runner
+        .claim_ordered_initial(admitted_user(1))
+        .expect("claim initial command");
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+
+    driver.started.notified().await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), driver.cancelled.notified())
+        .await
+        .expect("provider receives runtime shutdown");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_retry_wait_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(FixtureDriver::new(Vec::new()).blocking_retry());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let task =
+        tokio::spawn(async move { runner.wait_retry_or_control(Duration::from_secs(30)).await });
+
+    driver.retry_waiting.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("retry wait observes shutdown")
+            .expect("retry task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_pending_approval_phase() {
+    let shutdown = CancellationToken::new();
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let call = ToolCall {
+        id: "runtime-shutdown-approval".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let ApprovalOutcome::Pending { mut pending } = broker
+        .start_request(
+            &call,
+            &[],
+            "runtime-run",
+            "runtime-turn",
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval")
+    else {
+        panic!("fixture must enter pending approval")
+    };
+    let request_id = pending.request().id.clone();
+    let mut core = bound_core_with_runtime_shutdown(1, &shutdown);
+    core.set_approval(broker);
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let task = tokio::spawn(async move {
+        runner
+            .wait_for_approval(request_id, pending.receiver_mut())
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("approval wait observes shutdown")
+            .expect("approval task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_tool_and_reaper_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let call = call("runtime-shutdown-probe");
+    let task =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("tool phase observes shutdown")
+            .expect("tool task join"),
+        Err(ExecuteToolError::Cancelled)
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !driver.cancelled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool driver/reaper observes the propagated cancellation");
 }
 
 #[async_trait]

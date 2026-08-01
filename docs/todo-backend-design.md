@@ -5,7 +5,7 @@
 - Scope: 個人所有TodoのバックエンドとSumi人格エージェント連携
 - Related:
   - [ADR 0008: 人格agentのidentity・所有境界・VM内execution fabric](adr/0008-personality-agent-identity-and-execution-fabric.md)
-  - [AWS本番アーキテクチャ](infra/aws-architecture.md)
+  - [ADR 0009: Human戸籍とmulti-user auth](adr/0009-human-koseki-and-multi-user-auth.md)
   - [OpenAPI契約](../contracts/openapi.yaml)
 
 ## 1. 概要
@@ -820,19 +820,26 @@ release gateとして追記する。根拠のない数値を本設計の保証�
 
 ## 16. Current repository gap and migration
 
-現在のbackend prototypeには次の実装と差がある。
+現在のbackend MVPには次の実装とtargetとの差がある。
 
 - `contracts/openapi.yaml`、Go handler/service/repository、PostgreSQL migrationに
   Todo CRUDのMVP contractを実装済みである。
-- 現行browser `UserSessionClaims`はconversation-scopedであり、
-  `conversation_id`を必須とする。
+- Todo migrationは共通control-plane runnerを使い、`owner_user_id`を戸籍の
+  `humans(human_id)`へ外部キーで結ぶ。
+- Firebaseで認証されたHumanIdをserver-issued `sumi_session`から取得し、
+  logoutとmutationが競合しないauthorization lease内でrepositoryを実行する。
+- Todo routeは`SUMI_TODO_ENABLED=true`の場合だけ登録する。DBまたはbrowser authが
+  未構成ならrouteを公開せずstartupをfail-closedにする。
+- Viteの同一origin `/v1` proxyを用意済みである。cross-origin Todo mutationは
+  意図的に拒否する。
 - 現行agent Bearer tokenもevent gateway用identityとaudienceを持つ。
-- Firebase login/session exchange、user-scoped opaque session、正式なauthz
-  control planeは別設計にあり、現行serverへ未結線である。
-- Todo routeは`SUMI_TODO_ENABLED=true`かつ`SUMI_TODO_DEV_SESSION_AUTH=true`の場合だけ
-  登録し、conversation-scoped cookie adapterはlocal backend developmentに限定する。
-- 正式なuser-scoped auth、agent authority、soft delete、audit event、idempotency、
-  keyset paginationは未実装である。
+- `AgentTools`はapplication service境界まで実装済みだが、action-scoped authorityと
+  idempotency receiptがないためagent runtimeへ未登録である。
+- soft delete、restore、audit event、全mutationのidempotency、keyset pagination、
+  no-op update、purgeは未実装である。
+- 現MVP OpenAPIは`open | done`、body内`expected_version`、offset pagination、
+  physical deleteを採用する。4 status、`If-Match`、cursor、soft deleteを含む本章前半の
+  targetとは意図的に未到達であり、frontendは現OpenAPIを正典とする。
 
 Todo実装で行ってはいけない暫定対応:
 
@@ -843,10 +850,10 @@ Todo実装で行ってはいけない暫定対応:
 - 認証実装がない間だけ全Todoを共通ownerとして扱う。
 - local file storeを本番の認可正本として扱う。
 
-実装順序として、HTTP handlerが具体cookie形式を直接解釈せず、user-scoped
-`HumanPrincipal`を返すinterfaceへ依存させる。これにより、Todo domain/APIの実装と
-opaque session control planeの結線を分離して進められる。ただしproduction routeを
-公開するのはuser-scoped sessionとauthzがfail-closedで結線された後とする。
+HTTP handlerは具体cookie形式を直接解釈せず、認証済みHuman principalを返すinterfaceへ
+依存する。Human HTTP routeのsession/authz結線は完了した。Agent toolを公開するのは、
+個別action authority、delegation、request identity、generation、expiry、idempotencyを
+fail-closedで結線した後とする。
 
 ## 17. Proposed Go module boundary
 

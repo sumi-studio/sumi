@@ -1,0 +1,202 @@
+# Local single-host deployment: one Compose project is one canonical global
+# PersonalityAgentId. The host supervisor supplies the PAID-derived
+# --project-name; this file deliberately has no fixed Compose `name`.
+
+x-long-lived-hardening: &long-lived-hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:./seccomp/sidecar.json
+    - apparmor:docker-default
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m
+  stdin_open: false
+  tty: false
+  init: true
+  stop_grace_period: 30s
+  # Docker must not restart one role in isolation. The authenticated runtime
+  # health monitor owns fail-stop dependency loss; the host supervisor owns
+  # explicit stop/join/reallocation of the complete generation.
+  restart: "no"
+
+services:
+  # The allocator is the only service that can mutate the generation ledger.
+  # It distributes role-minimal identity.env files atomically and exits.
+  allocator:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [allocator]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:docker-default
+    environment:
+      SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
+      SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
+      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator-root/state
+      SUMI_IDENTITY_OUTPUT_ROOT: /var/lib/sumi-allocator-root/identity-output
+      SUMI_RUNTIME_IDENTITY_GID: "10001"
+      SUMI_EXECUTOR_IDENTITY_GID: "10002"
+      SUMI_BROKER_IDENTITY_GID: "10003"
+    volumes:
+      - allocator-state:/var/lib/sumi-allocator-root/state
+      - runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
+      - executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
+      - broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
+
+  # Root is confined to a short-lived ownership/setup role. It cannot see the
+  # allocator ledger, identities, provider credentials, or local-control bearer.
+  prepare:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [prepare]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, FSETID]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:docker-default
+    volumes:
+      - state:/var/lib/sumi
+      - workspace:/workspace
+      - artifacts:/var/lib/sumi-artifacts
+      - executor-ipc:/run/sumi/executor
+      - broker-ipc:/run/sumi/broker
+
+  runtime:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10001:10001"
+    group_add:
+      - "10020"
+      - "${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}"
+    command: [runtime]
+    environment:
+      SUMI_GATEWAY_URL: ${SUMI_GATEWAY_URL:?SUMI_GATEWAY_URL is required}
+      # This is the executor's logical workspace address. Runtime uses it only
+      # for lexical policy/action projection and receives no workspace volume.
+      SUMI_WORKSPACE: /workspace
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
+      SUMI_LOCAL_CONTROL_SERVER_UID: ${SUMI_LOCAL_CONTROL_SERVER_UID:?SUMI_LOCAL_CONTROL_SERVER_UID is required}
+      SUMI_LOCAL_CONTROL_SOCKET_GID: ${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}
+      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:?SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX is required}
+      SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:?SUMI_AGENT_WRAPPING_KEY_ID is required}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      # Null mapping means exact host pass-through when set and omission from
+      # Config.Env when unset; the entrypoint does not invent a model ID.
+      SUMI_MODEL_ID:
+      SUMI_MODEL_API_KEY_ENV: SUMI_PROVIDER_API_KEY
+      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: ${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}
+      SUMI_LOG: ${SUMI_LOG:-sumi_agent=info}
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+      # This is startup ordering only. Runtime Ready remains gated by its
+      # authenticated executor Health exchange after bootstrap.
+      executor:
+        condition: service_started
+    secrets:
+      - source: sumi_local_control_bearer
+        target: sumi_local_control_bearer
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_agent_wrapping_key
+        target: sumi_agent_wrapping_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_approval_secret_digest_key
+        target: sumi_approval_secret_digest_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_provider_api_key
+        target: sumi_provider_api_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+    volumes:
+      - state:/var/lib/sumi
+      - runtime-identity:/run/sumi/identity:ro
+      - executor-ipc:/run/sumi/executor:ro
+      # Bind the checked pre-existing socket itself, not its mutable host
+      # directory. Runtime receives connect-only access; no TCP route.
+      - type: bind
+        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock
+        target: /run/sumi/local-control/control.sock
+        read_only: true
+        bind:
+          create_host_path: false
+
+  executor:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10002:10002"
+    command: [executor]
+    network_mode: none
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+    volumes:
+      - workspace:/workspace:ro
+      - executor-identity:/run/sumi/identity:ro
+      - executor-ipc:/run/sumi/executor
+
+  broker:
+    <<: *long-lived-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10003:10003"
+    command: [broker]
+    network_mode: none
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+      prepare:
+        condition: service_completed_successfully
+    volumes:
+      - artifacts:/var/lib/sumi-artifacts
+      - broker-identity:/run/sumi/identity:ro
+      - broker-ipc:/run/sumi/broker
+
+volumes:
+  allocator-state: {}
+  state: {}
+  workspace: {}
+  artifacts: {}
+  runtime-identity: {}
+  executor-identity: {}
+  broker-identity: {}
+  executor-ipc: {}
+  broker-ipc: {}
+
+secrets:
+  sumi_local_control_bearer:
+    environment: SUMI_LOCAL_CONTROL_BEARER
+  sumi_agent_wrapping_key:
+    environment: SUMI_AGENT_WRAPPING_KEY
+  sumi_approval_secret_digest_key:
+    environment: SUMI_APPROVAL_SECRET_DIGEST_KEY
+  sumi_provider_api_key:
+    environment: SUMI_PROVIDER_API_KEY

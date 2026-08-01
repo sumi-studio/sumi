@@ -3,48 +3,23 @@ package todo
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/sumi-studio/sumi/apps/api/internal/migrations"
+	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
 func TestPostgresTodoContract(t *testing.T) {
-	databaseURL := os.Getenv("SUMI_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("SUMI_TEST_DATABASE_URL is not set")
-	}
 	ctx := context.Background()
-	admin, err := pgxpool.New(ctx, databaseURL)
-	if err != nil {
+	pool := testdb.Create(t)
+	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
-	schema := fmt.Sprintf("todo_test_%d", time.Now().UnixNano())
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _, _ = admin.Exec(ctx, "DROP SCHEMA "+identifier+" CASCADE") }()
-
-	config, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	// Todo migrations must apply to a clean schema without owning or requiring
-	// the control-plane users table.
-	if err := migrations.Run(ctx, pool); err != nil {
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO humans (human_id) VALUES ($1), ($2)", ownerA, ownerB,
+	); err != nil {
 		t.Fatal(err)
 	}
 

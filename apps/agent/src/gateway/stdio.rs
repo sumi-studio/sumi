@@ -21,6 +21,7 @@ use super::{
     MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
     SensitiveCommandPayload,
 };
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
@@ -231,6 +232,7 @@ pub(crate) fn stdio_hello(hello: &AgentHello) -> std::result::Result<ApiHello, H
             ))
         })?;
     Ok(ApiHello {
+        personality_agent_id: hello.personality_agent_id.clone(),
         accepted_generation: hello.generation,
         last_received_event_seq: hello.last_sent_event_seq,
         next_command_seq,
@@ -242,6 +244,8 @@ pub(crate) fn stdio_hello(hello: &AgentHello) -> std::result::Result<ApiHello, H
 struct RawCommandIdentityEnvelope {
     seq: u64,
     command_id: CommandId,
+    personality_agent_id: PersonalityAgentId,
+    provenance: DirectChatProvenanceV1,
     #[serde(default)]
     command: CommandFieldPresence,
 }
@@ -287,10 +291,15 @@ where
 
 fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
     let raw = parse_outer_identity(&frame.identity).map_err(InvalidCommand)?;
+    raw.provenance
+        .validate(&raw.personality_agent_id)
+        .context("invalid command provenance")?;
     if matches!(raw.command, CommandFieldPresence::Missing) || !frame.command_found {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::SchemaViolation,
             raw_command: RejectedCommandPayload::Missing,
             payload_digest: None,
@@ -301,6 +310,8 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::Oversized {
                 actual_bytes: command_bytes as u64,
             },
@@ -320,6 +331,8 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
             return Ok(InboundCommand::Invalid {
                 seq: raw.seq,
                 command_id: raw.command_id,
+                personality_agent_id: raw.personality_agent_id,
+                provenance: raw.provenance,
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(sensitive_payload),
                 payload_digest: None,
@@ -349,6 +362,8 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason,
             raw_command: RejectedCommandPayload::Present(sensitive_payload),
             payload_digest: None,
@@ -359,11 +374,15 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
         Ok(command) => Ok(InboundCommand::Valid(CommandEnvelope {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             command,
         })),
         Err(_) => Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::SchemaViolation,
             raw_command: RejectedCommandPayload::Present(sensitive_payload),
             payload_digest: None,
@@ -1048,7 +1067,24 @@ mod tests {
     use crate::gateway::{
         AgentHello, Command, ConnectorError, DeliveryAuthorization, GatewayCredential,
     };
-    use crate::runtime::contracts::ProcessGeneration;
+    use crate::runtime::contracts::{
+        DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration,
+    };
+
+    const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
+
+    fn test_personality_agent_id() -> PersonalityAgentId {
+        PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical UUIDv7")
+    }
+
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+            .expect("valid direct-chat provenance")
+    }
+
+    fn test_provenance_value() -> serde_json::Value {
+        serde_json::to_value(test_provenance()).expect("serialize test provenance")
+    }
 
     struct TestDigestFactory;
 
@@ -1083,7 +1119,7 @@ mod tests {
         let invalid = OutboundFrame::Event {
             envelope: super::super::Envelope {
                 seq: Some(1),
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "error", "message": "volatile"}),
             },
         };
@@ -1098,7 +1134,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: super::super::Envelope {
                 seq: Some(1),
-                conversation_id: "c".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({
                     "type": "retry_scheduled",
                     "attempt": 1,
@@ -1132,12 +1168,14 @@ mod tests {
     }
 
     fn frame_with_total_bytes(total_bytes: usize) -> Vec<u8> {
-        let prefix =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":""#;
+        let prefix = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{"type":"user_message","text":""#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
         let suffix = br#"","attachments":[]}}"#;
         assert!(total_bytes >= prefix.len() + suffix.len());
         let mut frame = Vec::with_capacity(total_bytes);
-        frame.extend_from_slice(prefix);
+        frame.extend_from_slice(prefix.as_bytes());
         frame.resize(total_bytes - suffix.len(), b'x');
         frame.extend_from_slice(suffix);
         frame
@@ -1145,23 +1183,27 @@ mod tests {
 
     fn frame_with_identity_after_command(total_bytes: usize) -> Vec<u8> {
         let prefix = br#"{"command":{"type":"user_message","text":""#;
-        let suffix =
-            br#"","attachments":[]},"seq":1,"command_id":"00000000-0000-4000-8000-000000000001"}"#;
+        let suffix = format!(
+            r#"","attachments":[]}},"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
         assert!(total_bytes >= prefix.len() + suffix.len());
         let mut frame = Vec::with_capacity(total_bytes);
         frame.extend_from_slice(prefix);
         frame.resize(total_bytes - suffix.len(), b'x');
-        frame.extend_from_slice(suffix);
+        frame.extend_from_slice(suffix.as_bytes());
         frame
     }
 
     fn oversized_frame_with_duplicate_seq(total_bytes: usize) -> Vec<u8> {
-        let prefix =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":""#;
+        let prefix = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{"type":"user_message","text":""#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
         let suffix = br#"","attachments":[]},"seq":2}"#;
         assert!(total_bytes >= prefix.len() + suffix.len());
         let mut frame = Vec::with_capacity(total_bytes);
-        frame.extend_from_slice(prefix);
+        frame.extend_from_slice(prefix.as_bytes());
         frame.resize(total_bytes - suffix.len(), b'x');
         frame.extend_from_slice(suffix);
         frame
@@ -1171,14 +1213,24 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "seq": 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
+            "provenance": test_provenance_value(),
             "command": command,
         }))
         .expect("serialize fixture")
     }
 
     fn raw_envelope(command: &str) -> Vec<u8> {
+        raw_envelope_for(1, "00000000-0000-4000-8000-000000000001", Some(command))
+    }
+
+    fn raw_envelope_for(seq: u64, command_id: &str, command: Option<&str>) -> Vec<u8> {
+        let command = command
+            .map(|command| format!(r#","command":{command}"#))
+            .unwrap_or_default();
         format!(
-            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{command}}}"#
+            r#"{{"seq":{seq},"command_id":"{command_id}","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}{command}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
         )
         .into_bytes()
     }
@@ -1193,6 +1245,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
@@ -1214,6 +1268,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_invalid_provenance_and_legacy_identity_before_command_admission() {
+        let valid = serde_json::json!({
+            "seq": 1,
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
+            "provenance": test_provenance_value(),
+            "command": {"type": "abort"},
+        });
+
+        let mut cases = Vec::new();
+
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("provenance");
+        cases.push(serde_json::to_vec(&missing).unwrap());
+
+        let mut unknown = valid.clone();
+        unknown["provenance"]["unknown"] = serde_json::json!(true);
+        cases.push(serde_json::to_vec(&unknown).unwrap());
+
+        let mut wrong_version = valid.clone();
+        wrong_version["provenance"]["version"] = serde_json::json!(2);
+        cases.push(serde_json::to_vec(&wrong_version).unwrap());
+
+        let mut target_mismatch = valid.clone();
+        target_mismatch["provenance"]["personality_agent_id"] =
+            serde_json::json!("018f3f8d-7b2c-7a10-8f9e-123456789abd");
+        cases.push(serde_json::to_vec(&target_mismatch).unwrap());
+
+        for legacy_field in ["agent_id", "conversation_id"] {
+            let mut legacy = valid.clone();
+            legacy[legacy_field] = serde_json::json!(TEST_PERSONALITY_AGENT_ID);
+            cases.push(serde_json::to_vec(&legacy).unwrap());
+        }
+
+        cases.push(
+            format!(
+                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{{"version":1,"version":1,"tenant_id":"tenant-test","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","actor":{{"kind":"human","principal_id":"human-test"}},"source":{{"surface":"direct_chat"}}}},"command":{{"type":"abort"}}}}"#
+            )
+            .into_bytes(),
+        );
+
+        for bytes in cases {
+            let mut input = BufReader::new(bytes.as_slice());
+            let error = read_test_command(&mut input)
+                .await
+                .expect_err("invalid authenticated envelope must fail before Store admission");
+            assert!(
+                error.is::<InvalidCommand>()
+                    || error.to_string().contains("invalid command provenance"),
+                "unexpected envelope rejection: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reads_crlf_split_across_reader_buffers() {
         let mut bytes = envelope(serde_json::json!({"type": "abort"}));
         bytes.extend_from_slice(b"\r\n");
@@ -1224,6 +1333,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
@@ -1252,6 +1363,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::Oversized {
                     actual_bytes: command_bytes.len() as u64,
                 },
@@ -1273,8 +1386,13 @@ mod tests {
         let mut frame = Vec::with_capacity(command.len() + 64);
         frame.extend_from_slice(br#"{"command":"#);
         frame.extend_from_slice(&command);
-        frame
-            .extend_from_slice(br#","command_id":"00000000-0000-4000-8000-000000000008","seq":7}"#);
+        frame.extend_from_slice(
+            format!(
+                r#","command_id":"00000000-0000-4000-8000-000000000008","seq":7,"personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}}}"#,
+                serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+            )
+            .as_bytes(),
+        );
         let mut input = BufReader::with_capacity(13, frame.as_slice());
 
         let inbound = read_test_command(&mut input)
@@ -1286,12 +1404,16 @@ mod tests {
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command,
             payload_digest,
+            personality_agent_id,
+            provenance,
         } = inbound
         else {
             panic!("oversized command must be a typed rejection");
         };
         assert_eq!(seq, 7);
         assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000008");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
         assert_eq!(actual_bytes, command.len() as u64);
         assert!(matches!(
             raw_command,
@@ -1321,6 +1443,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::AttachmentsNotEmpty,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     serde_json::to_vec(&serde_json::json!({
@@ -1351,6 +1475,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     serde_json::to_vec(&serde_json::json!({
@@ -1383,6 +1509,8 @@ mod tests {
                     seq: 1,
                     command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                         .expect("canonical test UUID"),
+                    personality_agent_id: test_personality_agent_id(),
+                    provenance: test_provenance(),
                     reason: CommandRejectReason::SchemaViolation,
                     raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                         command.as_bytes().to_vec(),
@@ -1422,7 +1550,11 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_command_value_with_readable_identity_is_a_schema_violation() {
-        let bytes = br#"{"seq":7,"command_id":"00000000-0000-4000-8000-000000000009","command":{"type":"abort",}}"#;
+        let bytes = raw_envelope_for(
+            7,
+            "00000000-0000-4000-8000-000000000009",
+            Some(r#"{"type":"abort",}"#),
+        );
         let mut input = BufReader::with_capacity(3, bytes.as_slice());
 
         assert_eq!(
@@ -1433,6 +1565,8 @@ mod tests {
                 seq: 7,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000009")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     br#"{"type":"abort",}"#.to_vec(),
@@ -1454,6 +1588,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::UnknownCommand,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     br#"{"type":"future_command"}"#.to_vec(),
@@ -1462,7 +1598,7 @@ mod tests {
             }
         );
 
-        let missing = br#"{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002"}"#;
+        let missing = raw_envelope_for(2, "00000000-0000-4000-8000-000000000002", None);
         let mut input = BufReader::new(missing.as_slice());
         assert_eq!(
             read_test_command(&mut input)
@@ -1472,6 +1608,8 @@ mod tests {
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Missing,
                 payload_digest: None,
@@ -1481,8 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn present_null_is_not_collapsed_into_a_missing_command_field() {
-        let bytes =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":null}"#;
+        let bytes = raw_envelope("null");
         let mut input = BufReader::new(bytes.as_slice());
         assert_eq!(
             read_test_command(&mut input)
@@ -1492,6 +1629,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     b"null".to_vec(),
@@ -1521,7 +1660,8 @@ mod tests {
     async fn measures_the_raw_command_bytes_before_json_compaction() {
         let whitespace = " ".repeat(MAX_USER_COMMAND_BYTES);
         let input = format!(
-            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{{{whitespace}"type":"user_message","text":"small","attachments":[]}}}}"#
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{{whitespace}"type":"user_message","text":"small","attachments":[]}}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
         );
         assert!(input.len() < MAX_FRAME_BYTES);
         let mut input = BufReader::new(input.as_bytes());
@@ -1555,12 +1695,16 @@ mod tests {
             reason,
             raw_command,
             payload_digest,
+            personality_agent_id,
+            provenance,
         } = inbound
         else {
             panic!("oversized command line must produce a typed rejection");
         };
         assert_eq!(seq, 1);
         assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000001");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
         let CommandRejectReason::Oversized { actual_bytes } = reason else {
             panic!("expected Oversized rejection, got {reason:?}");
         };
@@ -1583,6 +1727,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
@@ -1727,6 +1873,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
@@ -1735,7 +1883,7 @@ mod tests {
     #[test]
     fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
         let hello = AgentHello {
-            agent_id: "test-agent".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 42,
             last_received_command_seq: 10,
@@ -1753,7 +1901,7 @@ mod tests {
     #[test]
     fn stdio_hello_fails_closed_when_the_applied_cursor_cannot_advance() {
         let hello = AgentHello {
-            agent_id: "test-agent".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 42,
             last_received_command_seq: u64::MAX,
@@ -1776,7 +1924,12 @@ mod tests {
         );
         let mut connector = SingleConnectionConnector::new(gateway);
 
-        let credential = GatewayCredential::new("test-token", DeliveryAuthorization::Raw);
+        let credential = GatewayCredential::new(
+            "test-token",
+            test_personality_agent_id(),
+            ProcessGeneration::from_wire(7).unwrap(),
+            DeliveryAuthorization::Raw,
+        );
         assert!(connector.connect(credential.clone()).await.is_ok());
 
         let result = connector.connect(credential).await;

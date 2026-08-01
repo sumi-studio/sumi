@@ -349,9 +349,7 @@ mod tests {
             [5; DATA_KEY_BYTES],
         );
         let aad = RowAad {
-            tenant_id: "tenant".to_owned(),
-            agent_id: "agent".to_owned(),
-            conversation_id: "conversation".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             table: "messages".to_owned(),
             row_id: "message-1".to_owned(),
             purpose: "transcript".to_owned(),

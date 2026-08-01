@@ -122,10 +122,13 @@ func (r *memoryRepository) Delete(_ context.Context, owner, id string, expectedV
 	return nil
 }
 
-type fixedPrincipal struct{ userID string }
+type fixedPrincipal struct {
+	userID    string
+	authorize func(func() error) error
+}
 
 func (p fixedPrincipal) VerifyRequest(context.Context, *http.Request) (Principal, error) {
-	return Principal{UserID: p.userID}, nil
+	return NewPrincipal(p.userID, p.authorize), nil
 }
 
 func newTestService(t *testing.T, repository Repository) *Service {
@@ -437,5 +440,28 @@ func TestTodoResponsesAreNotCacheable(t *testing.T) {
 	}
 	if got := response.Header().Get("Vary"); got != "Cookie" {
 		t.Fatalf("Vary = %q", got)
+	}
+}
+
+func TestTodoMutationFailsWhenSessionAuthorizationLeaseIsDenied(t *testing.T) {
+	repository := newMemoryRepository()
+	service := newTestService(t, repository)
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{
+		userID: ownerA,
+		authorize: func(func() error) error {
+			return ErrUnauthenticated
+		},
+	}).Register(mux)
+	request := httptest.NewRequest(http.MethodPost, "/v1/todos", strings.NewReader(`{"title":"blocked"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("got status %d, want 401: %s", response.Code, response.Body.String())
+	}
+	if len(repository.items[ownerA]) != 0 {
+		t.Fatal("Todo mutation ran outside the session authorization lease")
 	}
 }

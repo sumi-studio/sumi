@@ -56,7 +56,7 @@ func objectSchemaWithMinimumProperties(minimum int, properties map[string]any) m
 }
 
 func agentDueSchema() map[string]any {
-	timezone := map[string]any{"type": "string", "description": "IANA timezone; omitted values use the user setting or Asia/Tokyo"}
+	timezone := map[string]any{"type": "string", "description": "IANA timezone; omitted values use the server-configured default timezone"}
 	return map[string]any{"oneOf": []any{
 		objectSchema([]string{"kind", "date"}, map[string]any{
 			"kind": map[string]any{"type": "string", "const": "date"}, "date": map[string]any{"type": "string", "format": "date"}, "timezone": timezone,

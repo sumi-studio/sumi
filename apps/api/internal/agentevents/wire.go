@@ -31,7 +31,7 @@ const maxProcessGeneration uint64 = 9_223_372_036_854_775_807
 // the full u64 cursor domain and i64::MAX generation domain lossless for web
 // clients while keeping the API's internal representation ergonomic.
 type AgentHello struct {
-	AgentID                string `json:"agent_id"`
+	PersonalityAgentID     string `json:"personality_agent_id"`
 	Generation             uint64 `json:"generation"`
 	LastSentEventSeq       uint64 `json:"last_sent_event_seq"`
 	LastReceivedCommandSeq uint64 `json:"last_received_command_seq"`
@@ -46,7 +46,7 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("agent hello json: %w", err)
 	}
 	type rawHello struct {
-		AgentID                *string `json:"agent_id"`
+		PersonalityAgentID     *string `json:"personality_agent_id"`
 		Generation             *string `json:"generation"`
 		LastSentEventSeq       *string `json:"last_sent_event_seq"`
 		LastReceivedCommandSeq *string `json:"last_received_command_seq"`
@@ -56,8 +56,11 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
 	}
-	if raw.AgentID == nil {
-		return fmt.Errorf("agent_id is required")
+	if raw.PersonalityAgentID == nil {
+		return fmt.Errorf("personality_agent_id is required")
+	}
+	if err := ValidatePersonalityAgentID(*raw.PersonalityAgentID); err != nil {
+		return err
 	}
 	if raw.Generation == nil {
 		return fmt.Errorf("generation is required")
@@ -88,7 +91,7 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("last_applied_command_seq: %w", err)
 	}
 	*h = AgentHello{
-		AgentID:                *raw.AgentID,
+		PersonalityAgentID:     *raw.PersonalityAgentID,
 		Generation:             generation,
 		LastSentEventSeq:       lastSentEventSeq,
 		LastReceivedCommandSeq: lastReceivedCommandSeq,
@@ -98,21 +101,25 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 }
 
 func (h AgentHello) MarshalJSON() ([]byte, error) {
+	if err := ValidatePersonalityAgentID(h.PersonalityAgentID); err != nil {
+		return nil, err
+	}
 	if h.Generation > maxProcessGeneration {
 		return nil, fmt.Errorf("generation %d exceeds process generation range", h.Generation)
 	}
 	return json.Marshal(struct {
-		AgentID                string `json:"agent_id"`
+		PersonalityAgentID     string `json:"personality_agent_id"`
 		Generation             string `json:"generation"`
 		LastSentEventSeq       string `json:"last_sent_event_seq"`
 		LastReceivedCommandSeq string `json:"last_received_command_seq"`
 		LastAppliedCommandSeq  string `json:"last_applied_command_seq"`
-	}{h.AgentID, strconv.FormatUint(h.Generation, 10), strconv.FormatUint(h.LastSentEventSeq, 10), strconv.FormatUint(h.LastReceivedCommandSeq, 10), strconv.FormatUint(h.LastAppliedCommandSeq, 10)})
+	}{h.PersonalityAgentID, strconv.FormatUint(h.Generation, 10), strconv.FormatUint(h.LastSentEventSeq, 10), strconv.FormatUint(h.LastReceivedCommandSeq, 10), strconv.FormatUint(h.LastAppliedCommandSeq, 10)})
 }
 
 // ApiHello is returned by the API after verifying the token and generation.
 // accepted_generation and cursor values are canonical decimal strings.
 type ApiHello struct {
+	PersonalityAgentID   string `json:"personality_agent_id"`
 	AcceptedGeneration   uint64 `json:"accepted_generation"`
 	LastReceivedEventSeq uint64 `json:"last_received_event_seq"`
 	NextCommandSeq       uint64 `json:"next_command_seq"`
@@ -126,12 +133,19 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("api hello json: %w", err)
 	}
 	type rawHello struct {
+		PersonalityAgentID   *string `json:"personality_agent_id"`
 		AcceptedGeneration   *string `json:"accepted_generation"`
 		LastReceivedEventSeq *string `json:"last_received_event_seq"`
 		NextCommandSeq       *string `json:"next_command_seq"`
 	}
 	var raw rawHello
 	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if raw.PersonalityAgentID == nil {
+		return fmt.Errorf("personality_agent_id is required")
+	}
+	if err := ValidatePersonalityAgentID(*raw.PersonalityAgentID); err != nil {
 		return err
 	}
 	if raw.AcceptedGeneration == nil {
@@ -156,6 +170,7 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("next_command_seq: %w", err)
 	}
 	*h = ApiHello{
+		PersonalityAgentID:   *raw.PersonalityAgentID,
 		AcceptedGeneration:   acceptedGeneration,
 		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextCommandSeq,
@@ -164,14 +179,18 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 }
 
 func (h ApiHello) MarshalJSON() ([]byte, error) {
+	if err := ValidatePersonalityAgentID(h.PersonalityAgentID); err != nil {
+		return nil, err
+	}
 	if h.AcceptedGeneration > maxProcessGeneration {
 		return nil, fmt.Errorf("accepted_generation %d exceeds process generation range", h.AcceptedGeneration)
 	}
 	return json.Marshal(struct {
+		PersonalityAgentID   string `json:"personality_agent_id"`
 		AcceptedGeneration   string `json:"accepted_generation"`
 		LastReceivedEventSeq string `json:"last_received_event_seq"`
 		NextCommandSeq       string `json:"next_command_seq"`
-	}{strconv.FormatUint(h.AcceptedGeneration, 10), strconv.FormatUint(h.LastReceivedEventSeq, 10), strconv.FormatUint(h.NextCommandSeq, 10)})
+	}{h.PersonalityAgentID, strconv.FormatUint(h.AcceptedGeneration, 10), strconv.FormatUint(h.LastReceivedEventSeq, 10), strconv.FormatUint(h.NextCommandSeq, 10)})
 }
 
 // parseCanonicalDecimal accepts only the wire's lossless decimal form: 0 or a
@@ -199,11 +218,94 @@ func parseCanonicalDecimal(value string, max uint64) (uint64, error) {
 	return parsed, nil
 }
 
-// CommandEnvelope is a durable command sent from the API to the agent.
+// DirectChatProvenance is immutable server-authored admission metadata. It is
+// kept separate from caller-authored Command bytes and persists with them.
+type DirectChatProvenance struct {
+	Version            uint8            `json:"version"`
+	TenantID           string           `json:"tenant_id"`
+	PersonalityAgentID string           `json:"personality_agent_id"`
+	Actor              ProvenanceActor  `json:"actor"`
+	Source             ProvenanceSource `json:"source"`
+}
+
+type ProvenanceActor struct {
+	Kind        string `json:"kind"`
+	PrincipalID string `json:"principal_id"`
+}
+
+type ProvenanceSource struct {
+	Surface string `json:"surface"`
+}
+
+var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
+
+func (p DirectChatProvenance) Validate() error {
+	if p.Version != 1 {
+		return errors.New("provenance version must be 1")
+	}
+	if !provenanceIDRegexp.MatchString(p.TenantID) {
+		return errors.New("provenance tenant_id must be 1..256 ASCII identifier bytes")
+	}
+	if err := ValidatePersonalityAgentID(p.PersonalityAgentID); err != nil {
+		return fmt.Errorf("provenance: %w", err)
+	}
+	if p.Actor.Kind != "human" || !provenanceIDRegexp.MatchString(p.Actor.PrincipalID) {
+		return errors.New("provenance actor must be an authenticated human principal")
+	}
+	if p.Source.Surface != "direct_chat" {
+		return errors.New("provenance source surface must be direct_chat")
+	}
+	return nil
+}
+
+func (p *DirectChatProvenance) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("provenance json: %w", err)
+	}
+	type wire DirectChatProvenance
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	value := DirectChatProvenance(decoded)
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	*p = value
+	return nil
+}
+
+// CommandEnvelope is the complete authenticated durable command sent from the
+// API to the agent. The top-level target is intentionally repeated so internal
+// routing can verify it exactly matches authenticated provenance.
 type CommandEnvelope struct {
-	Seq       uint64          `json:"seq"`
-	CommandID string          `json:"command_id"`
-	Command   json.RawMessage `json:"command"`
+	Seq                uint64               `json:"seq"`
+	CommandID          string               `json:"command_id"`
+	PersonalityAgentID string               `json:"personality_agent_id"`
+	Provenance         DirectChatProvenance `json:"provenance"`
+	Command            json.RawMessage      `json:"command"`
+}
+
+func (c CommandEnvelope) Validate() error {
+	if c.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("seq %d exceeds JSON-safe integer range", c.Seq)
+	}
+	if !canonicalUUIDRegexp.MatchString(c.CommandID) {
+		return errors.New("command_id must be a canonical UUID")
+	}
+	if err := ValidatePersonalityAgentID(c.PersonalityAgentID); err != nil {
+		return err
+	}
+	if err := c.Provenance.Validate(); err != nil {
+		return err
+	}
+	if c.PersonalityAgentID != c.Provenance.PersonalityAgentID {
+		return errors.New("command target does not match provenance target")
+	}
+	if err := ValidateCommand(c.Command); err != nil {
+		return fmt.Errorf("invalid command: %w", err)
+	}
+	return nil
 }
 
 // UnmarshalJSON is deliberately strict because command envelopes cross both
@@ -213,27 +315,30 @@ func (c *CommandEnvelope) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("command envelope json: %w", err)
 	}
 	type rawEnvelope struct {
-		Seq       *uint64         `json:"seq"`
-		CommandID *string         `json:"command_id"`
-		Command   json.RawMessage `json:"command"`
+		Seq                *uint64               `json:"seq"`
+		CommandID          *string               `json:"command_id"`
+		PersonalityAgentID *string               `json:"personality_agent_id"`
+		Provenance         *DirectChatProvenance `json:"provenance"`
+		Command            json.RawMessage       `json:"command"`
 	}
 	var raw rawEnvelope
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
 	}
-	if raw.Seq == nil || raw.CommandID == nil || len(raw.Command) == 0 {
-		return errors.New("seq, command_id, and command are required")
+	if raw.Seq == nil || raw.CommandID == nil || raw.PersonalityAgentID == nil || raw.Provenance == nil || len(raw.Command) == 0 {
+		return errors.New("seq, command_id, personality_agent_id, provenance, and command are required")
 	}
-	if *raw.Seq > maxJSONSafeInteger {
-		return fmt.Errorf("seq %d exceeds JSON-safe integer range", *raw.Seq)
+	value := CommandEnvelope{
+		Seq:                *raw.Seq,
+		CommandID:          *raw.CommandID,
+		PersonalityAgentID: *raw.PersonalityAgentID,
+		Provenance:         *raw.Provenance,
+		Command:            raw.Command,
 	}
-	if !canonicalUUIDRegexp.MatchString(*raw.CommandID) {
-		return fmt.Errorf("command_id must be a canonical UUID")
+	if err := value.Validate(); err != nil {
+		return err
 	}
-	if err := ValidateCommand(raw.Command); err != nil {
-		return fmt.Errorf("invalid command: %w", err)
-	}
-	*c = CommandEnvelope{Seq: *raw.Seq, CommandID: *raw.CommandID, Command: raw.Command}
+	*c = value
 	return nil
 }
 
@@ -414,10 +519,11 @@ func validateApprovalDecision(raw json.RawMessage) error {
 
 // CommandAck is sent by the agent when a command reaches a terminal state.
 type CommandAck struct {
-	Seq          uint64  `json:"seq"`
-	CommandID    string  `json:"command_id"`
-	Status       string  `json:"status"`
-	RejectReason *string `json:"reject_reason,omitempty"`
+	Seq                uint64  `json:"seq"`
+	CommandID          string  `json:"command_id"`
+	PersonalityAgentID string  `json:"personality_agent_id"`
+	Status             string  `json:"status"`
+	RejectReason       *string `json:"reject_reason,omitempty"`
 }
 
 // OutboundFrame is the agent -> API frame. Exactly one of Envelope or Ack is
@@ -494,9 +600,10 @@ func assembleCommandAck(raw rawCommandAck) (*CommandAck, error) {
 	}
 
 	ack := CommandAck{
-		Seq:       *raw.Seq,
-		CommandID: raw.CommandID,
-		Status:    raw.Status,
+		Seq:                *raw.Seq,
+		CommandID:          raw.CommandID,
+		PersonalityAgentID: raw.PersonalityAgentID,
+		Status:             raw.Status,
 	}
 
 	switch len(raw.RejectReason) {
@@ -520,10 +627,11 @@ func assembleCommandAck(raw rawCommandAck) (*CommandAck, error) {
 
 // rawCommandAck uses a pointer Seq so we can tell "missing" from "zero".
 type rawCommandAck struct {
-	Seq          *uint64         `json:"seq"`
-	CommandID    string          `json:"command_id"`
-	Status       string          `json:"status"`
-	RejectReason json.RawMessage `json:"reject_reason,omitempty"`
+	Seq                *uint64         `json:"seq"`
+	CommandID          string          `json:"command_id"`
+	PersonalityAgentID string          `json:"personality_agent_id"`
+	Status             string          `json:"status"`
+	RejectReason       json.RawMessage `json:"reject_reason,omitempty"`
 }
 
 // Validate returns an error if the frame does not match the public contract.
@@ -581,6 +689,9 @@ func validateCommandAck(ack CommandAck) error {
 	if !canonicalUUIDRegexp.MatchString(ack.CommandID) {
 		return fmt.Errorf("command_ack command_id must be a canonical lowercase UUID")
 	}
+	if err := ValidatePersonalityAgentID(ack.PersonalityAgentID); err != nil {
+		return fmt.Errorf("command_ack: %w", err)
+	}
 	if !commandAckStatuses[ack.Status] {
 		return fmt.Errorf("command_ack status %q is not valid", ack.Status)
 	}
@@ -601,14 +712,14 @@ func validateCommandAck(ack CommandAck) error {
 // the API can forward it without re-interpreting the event variant vocabulary;
 // T17 owns the authoritative event type system.
 type Envelope struct {
-	Seq            *uint64         `json:"seq,omitempty"`
-	ConversationID string          `json:"conversation_id"`
-	Event          json.RawMessage `json:"event"`
+	Seq                *uint64         `json:"seq,omitempty"`
+	PersonalityAgentID string          `json:"personality_agent_id"`
+	Event              json.RawMessage `json:"event"`
 }
 
 func validateEnvelope(e Envelope) error {
-	if e.ConversationID == "" {
-		return fmt.Errorf("envelope conversation_id is required")
+	if err := ValidatePersonalityAgentID(e.PersonalityAgentID); err != nil {
+		return fmt.Errorf("envelope: %w", err)
 	}
 	if len(e.Event) == 0 || !json.Valid(e.Event) {
 		return fmt.Errorf("envelope event must be valid JSON")
@@ -633,7 +744,10 @@ func validateEnvelope(e Envelope) error {
 	if e.Seq != nil && *e.Seq > maxJSONSafeInteger {
 		return fmt.Errorf("envelope seq exceeds JSON-safe integer range")
 	}
-	return validateEvent(e.Event)
+	if err := validateEvent(e.Event); err != nil {
+		return err
+	}
+	return validateInternalEventArtifactReferences(e.Event, e.PersonalityAgentID)
 }
 
 // UnmarshalJSON decodes an Envelope and rejects an explicit JSON null in the
@@ -644,17 +758,17 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("envelope json: %w", err)
 	}
 	type envelopeRaw struct {
-		Seq            json.RawMessage `json:"seq"`
-		ConversationID string          `json:"conversation_id"`
-		Event          json.RawMessage `json:"event"`
+		Seq                json.RawMessage `json:"seq"`
+		PersonalityAgentID string          `json:"personality_agent_id"`
+		Event              json.RawMessage `json:"event"`
 	}
 	var raw envelopeRaw
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
 	}
 
-	if raw.ConversationID == "" {
-		return fmt.Errorf("envelope conversation_id is required")
+	if err := ValidatePersonalityAgentID(raw.PersonalityAgentID); err != nil {
+		return fmt.Errorf("envelope: %w", err)
 	}
 	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
 		return fmt.Errorf("envelope event must be valid JSON")
@@ -688,7 +802,7 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 		e.Seq = &seq
 	}
 
-	e.ConversationID = raw.ConversationID
+	e.PersonalityAgentID = raw.PersonalityAgentID
 	e.Event = raw.Event
 	return validateEnvelope(*e)
 }

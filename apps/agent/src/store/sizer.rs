@@ -13,9 +13,10 @@ const ENVELOPE_OVERHEAD: usize = 1 + 24 + 16;
 use crate::{
     gateway::CommandId,
     provider::types::{PublicMessage, UserContent, UserMessage},
+    runtime::contracts::DirectChatProvenanceV1,
 };
 
-use super::{Redactor, redactor::search_text_from_projection};
+use super::{Redactor, event_writer::DurableEventMetadata, redactor::search_text_from_projection};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchBounds {
@@ -59,6 +60,7 @@ pub(crate) struct InjectionCommandSizeInput<'a> {
     pub message_id: &'a str,
     pub text: &'a str,
     pub timestamp: &'a DateTime<Utc>,
+    pub provenance: &'a DirectChatProvenanceV1,
 }
 
 #[allow(dead_code, reason = "T12 boundary is consumed by the T15 run loop")]
@@ -119,6 +121,27 @@ impl EventBatchSizer {
                 timestamp: command.timestamp,
             }),
         )?;
+        let empty_metadata_bytes = serde_json::to_vec(&DurableEventMetadata::default())
+            .map_err(|error| anyhow::anyhow!("failed to size empty user event metadata: {error}"))?
+            .len();
+        for command in input.commands {
+            let authenticated_metadata_bytes = serde_json::to_vec(&DurableEventMetadata {
+                direct_chat_provenance: Some(command.provenance.clone()),
+                ..DurableEventMetadata::default()
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("failed to size authenticated user event metadata: {error}")
+            })?
+            .len();
+            let metadata_growth = authenticated_metadata_bytes
+                .checked_sub(empty_metadata_bytes)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(|| anyhow::anyhow!("user event metadata byte count overflow"))?;
+            size.transaction_bytes = size
+                .transaction_bytes
+                .checked_add(metadata_growth)
+                .ok_or_else(|| anyhow::anyhow!("injection transaction byte count overflow"))?;
+        }
 
         let event_bytes =
             |value: serde_json::Value, metadata: serde_json::Value| -> Result<usize> {
@@ -507,6 +530,7 @@ mod tests {
             message_id,
             text,
             timestamp: &timestamp,
+            provenance: &crate::gateway::test_direct_chat_provenance(),
         }];
         let message_only = size_one(text);
         let idle = EventBatchSizer::injection_batch(

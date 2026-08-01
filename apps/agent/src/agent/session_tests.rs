@@ -20,7 +20,10 @@ use super::*;
 use crate::store::KeyProvider;
 use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
-    gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
+    gateway::{
+        AgentHello, ApiHello, CommandAck, CommandId, CommandRejectReason, HelloError,
+        RejectedCommandPayload, SensitiveCommandPayload,
+    },
     memory::estimate::ProviderContextItemWithFootprint,
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
@@ -33,7 +36,7 @@ use crate::{
     runtime::contracts::{
         GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
     },
-    store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey, user_message_id},
+    store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey},
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
         text_output,
@@ -55,6 +58,10 @@ fn test_executor_generation() -> ProcessGeneration {
     ProcessGeneration::from_wire(73).expect("valid test generation")
 }
 
+fn user_message_id(command_id: &CommandId) -> String {
+    crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id)
+}
+
 fn validate_test_generation(generation: ProcessGeneration) -> Result<()> {
     (generation == test_executor_generation())
         .then_some(())
@@ -62,13 +69,19 @@ fn validate_test_generation(generation: ProcessGeneration) -> Result<()> {
 }
 
 #[test]
-fn session_start_composition_boundary_requires_process_generation() {
+fn hydrated_session_start_composition_boundary_requires_typed_authority() {
     fn assert_signature<Future>(
-        _start: fn(Store, MockGateway, RunCore, Arc<dyn RunWorker>, ProcessGeneration) -> Future,
+        _start: fn(
+            Store,
+            MockGateway,
+            RunCore,
+            Arc<dyn RunWorker>,
+            SessionStartAuthority,
+        ) -> Future,
     ) {
     }
 
-    assert_signature(Session::<MockGateway>::start);
+    assert_signature(Session::<MockGateway>::start_hydrated);
 }
 
 fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
@@ -82,6 +95,7 @@ fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage
 
 fn test_api_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
+        personality_agent_id: hello.personality_agent_id.clone(),
         accepted_generation: hello.generation,
         last_received_event_seq: 0,
         next_command_seq: hello.last_applied_command_seq.saturating_add(1),
@@ -413,6 +427,14 @@ impl Drop for DropNotifier {
     }
 }
 
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl Drop for EofBlockingWriter {
     fn drop(&mut self) {
         self.dropped.notify_one();
@@ -496,6 +518,8 @@ fn failed(result: SessionResult) -> (SessionFailure, RunOwnership) {
 fn user(seq: u64) -> InboundCommand {
     let command_id = format!("00000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::UserMessage {
@@ -508,6 +532,8 @@ fn user(seq: u64) -> InboundCommand {
 fn abort(seq: u64) -> InboundCommand {
     let command_id = format!("10000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::Abort {},
@@ -567,6 +593,141 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
         .collect()
 }
 
+fn assert_terminal_ack_follows_disposition(
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    command_id: &str,
+) {
+    let frames = frames.lock().expect("frame mutex");
+    let disposition = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.seq.is_some()
+                    && envelope.event["type"] == "command_disposition"
+                    && envelope.event["command_id"] == command_id)
+        })
+        .unwrap_or_else(|| panic!("missing durable disposition for {command_id}"));
+    let terminal_ack = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::CommandAck { ack }
+            if ack.command_id == command_id
+                && matches!(
+                    ack.status,
+                    CommandAckStatus::Applied
+                        | CommandAckStatus::Superseded
+                        | CommandAckStatus::Rejected
+                ))
+        })
+        .unwrap_or_else(|| panic!("missing terminal ACK for {command_id}"));
+    assert!(
+        disposition < terminal_ack,
+        "terminal ACK for {command_id} preceded its durable disposition"
+    );
+}
+
+#[tokio::test]
+async fn newly_rejected_admission_publishes_disposition_before_terminal_ack() {
+    let store = Store::session_test_store("rejected-admission-disposition-order")
+        .await
+        .expect("test store");
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move {
+            panic!("rejected admission must not start a worker")
+        },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let command_id =
+        CommandId::parse("00000000-0000-4000-8000-000000000091").expect("canonical UUID");
+    session
+        .admit_and_route(InboundCommand::Invalid {
+            seq: 1,
+            command_id: command_id.clone(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                br#"{"type":"abort",}"#.to_vec(),
+            )),
+            payload_digest: None,
+        })
+        .await
+        .expect("reject invalid command durably");
+    session.wait_outbound_idle().await;
+
+    let frames = frames.lock().expect("frames");
+    let disposition = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.seq.is_some()
+                    && envelope.event["type"] == "command_disposition"
+                    && envelope.event["command_id"] == command_id.as_str()
+                    && envelope.event["status"] == "rejected")
+        })
+        .expect("durable rejected disposition frame");
+    let terminal_ack = frames
+        .iter()
+        .position(|frame| {
+            matches!(frame, OutboundFrame::CommandAck { ack }
+                if ack.command_id == command_id.as_str()
+                    && ack.status == CommandAckStatus::Rejected)
+        })
+        .expect("Rejected ACK");
+    assert!(
+        disposition < terminal_ack,
+        "terminal ACK must be admitted behind its durable disposition"
+    );
+}
+
+#[tokio::test]
+async fn idle_approval_noop_publishes_disposition_before_terminal_ack() {
+    let store = Store::session_test_store("idle-approval-disposition-order")
+        .await
+        .expect("test store");
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move {
+            panic!("idle approval no-op must not start a worker")
+        },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let decision = approval_decision(1, "already-terminal-request");
+    let command_id = match &decision {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        InboundCommand::Invalid { .. } => unreachable!("approval decision is valid"),
+    };
+    session
+        .admit_and_route(decision)
+        .await
+        .expect("apply idle approval no-op");
+    session.wait_outbound_idle().await;
+    assert_terminal_ack_follows_disposition(&frames, &command_id);
+}
+
 async fn close_mock_gateway_after_idle_boundary(
     commands: mpsc::Sender<InboundCommand>,
     frames: &Arc<Mutex<Vec<OutboundFrame>>>,
@@ -599,6 +760,7 @@ async fn close_mock_gateway_after_idle_boundary(
     })
     .await
     .expect("idle-boundary sentinel applied");
+    assert_terminal_ack_follows_disposition(frames, &sentinel_command_id);
     drop(commands);
 }
 
@@ -633,6 +795,39 @@ async fn finish_active(session: &mut Session<MockGateway>) {
         .finish_run(completion)
         .await
         .expect("worker completion");
+}
+
+async fn replace_finished_active_join_with_gate(session: &mut Session<MockGateway>) -> Arc<Notify> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if session
+                .active
+                .as_ref()
+                .expect("active worker")
+                .join
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker task finished after publishing completion");
+
+    let release = Arc::new(Notify::new());
+    let replacement = tokio::spawn({
+        let release = release.clone();
+        async move {
+            release.notified().await;
+        }
+    });
+    let original = {
+        let active = session.active.as_mut().expect("active worker");
+        std::mem::replace(&mut active.join, replacement)
+    };
+    original.await.expect("completed worker task");
+    release
 }
 
 async fn drive_active_to_completion<G: Gateway>(
@@ -1252,6 +1447,38 @@ async fn typed_worker_failures_report_recovered_ownership() {
     }
 }
 
+#[tokio::test]
+async fn rehydration_required_worker_failure_reports_lost_ownership() {
+    let (gateway, commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         mut controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let _events = events;
+            controls.close();
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(
+                    "durable transcript advanced beyond RunCore".to_owned(),
+                ),
+            }
+        },
+    );
+    let task = tokio::spawn(
+        session_with_core(gateway, worker, RunCore::fixture_with_unapproved_tools())
+            .await
+            .run(),
+    );
+    commands.send(user(1)).await.expect("command");
+    let (error, ownership) = failed(task.await.expect("session join"));
+    assert!(matches!(ownership, RunOwnership::Lost));
+    assert!(matches!(
+        error,
+        SessionFailure::Worker(WorkerFailure::Error(ref message))
+            if message == "durable transcript advanced beyond RunCore"
+    ));
+}
+
 struct RunningGuard(Arc<AtomicBool>);
 
 impl Drop for RunningGuard {
@@ -1552,11 +1779,14 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
         .expect("durable message count");
     assert_eq!(durable_messages, 2);
     let durable_tail: Vec<String> =
-        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 3")
             .fetch_all(&pool)
             .await
             .expect("durable shutdown tail");
-    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
+    assert_eq!(
+        durable_tail,
+        vec!["command_disposition", "agent_end", "turn_end"]
+    );
 }
 
 #[tokio::test]
@@ -1696,11 +1926,14 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
         .expect("durable message count");
     assert_eq!(durable_messages, 2);
     let durable_tail: Vec<String> =
-        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 3")
             .fetch_all(&pool)
             .await
             .expect("durable completion tail");
-    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
+    assert_eq!(
+        durable_tail,
+        vec!["command_disposition", "agent_end", "turn_end"]
+    );
 }
 
 #[tokio::test]
@@ -1776,10 +2009,7 @@ async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
         DataKeyPurpose::Event,
         DataKeyPurpose::Transcript,
     ] {
-        store
-            .conversation_key(purpose)
-            .await
-            .expect("conversation key");
+        store.private_key(purpose).await.expect("private key");
     }
     let writer = EventWriter::new(store.clone());
     writer
@@ -2534,8 +2764,12 @@ async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved
             .await
             .expect("saved steer turn binding");
 
-    let lease = ProcessGenerationLease::new(test_executor_generation(), "approval-recovery-lease")
-        .expect("valid recovery lease");
+    let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "approval-recovery-lease",
+    )
+    .expect("valid recovery lease");
     let fence = GenerationRecoveryFence::new(&lease, "approval-recovery-fence")
         .expect("valid recovery fence");
     let hydrated = store
@@ -2675,8 +2909,12 @@ async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_
     drop(store);
 
     let store = open_kill_restart_store(&database_path).await;
-    let lease = ProcessGenerationLease::new(test_executor_generation(), "abort-approval-lease")
-        .expect("valid recovery lease");
+    let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "abort-approval-lease",
+    )
+    .expect("valid recovery lease");
     let fence =
         GenerationRecoveryFence::new(&lease, "abort-approval-fence").expect("valid recovery fence");
     let hydrated = store
@@ -3038,6 +3276,13 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
     assert_eq!(states[1], (2, "superseded".to_owned(), None));
     assert_eq!(states[2], (3, "applied".to_owned(), None));
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 #[tokio::test]
@@ -3086,6 +3331,13 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     })
     .await
     .expect("later user run");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while applied_acks(&frames).len() < 3 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all applied outcomes delivered");
     drop(commands);
     completed(task.await.expect("session join"));
 
@@ -3098,6 +3350,13 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     assert_eq!(states[2].1, "applied");
     assert!(states[2].2.is_some());
     assert_eq!(run_count.load(Ordering::SeqCst), 2);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 #[tokio::test]
@@ -3246,6 +3505,13 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
     assert_eq!(states[2].1, "applied");
     assert_eq!(states[2].2, None);
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    for command_id in [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+    ] {
+        assert_terminal_ack_follows_disposition(&frames, command_id);
+    }
 }
 
 struct OpaqueContextDriver {
@@ -4306,7 +4572,7 @@ async fn aborting_session_drops_blocked_writer_and_active_worker() {
 }
 
 #[tokio::test]
-async fn cancelling_shutdown_active_aborts_the_taken_worker() {
+async fn cancelling_shutdown_active_before_settlement_retains_worker_ownership() {
     let (gateway, _commands, _frames) = gateway();
     let worker_entered = Arc::new(Notify::new());
     let worker_dropped = Arc::new(Notify::new());
@@ -4342,10 +4608,255 @@ async fn cancelling_shutdown_active_aborts_the_taken_worker() {
     ));
     drop(shutdown);
 
-    assert!(session.active.is_none(), "shutdown took the active run");
+    assert!(
+        session.active.is_some(),
+        "a cancelled shutdown handler must leave ActiveRun owned by Session"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            worker_dropped.notified()
+        )
+        .await
+        .is_err(),
+        "worker must remain owned until Session resumes shutdown"
+    );
+    session.shutdown_active().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), worker_dropped.notified())
         .await
-        .expect("cancellation during shutdown aborts the taken worker");
+        .expect("resumed shutdown aborts the still-owned worker");
+}
+
+#[tokio::test]
+async fn cancelling_finish_after_completion_before_join_retains_returned_core() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let core = RunCore::fixture_with_unapproved_tools();
+    let ownership_id = core.ownership_id();
+    let mut session = session_with_core(gateway, worker, core).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let release_join = replace_finished_active_join_with_gate(&mut session).await;
+    let completion = session
+        .active
+        .as_mut()
+        .expect("active worker")
+        .completion_rx
+        .try_recv()
+        .expect("published completion");
+
+    let mut finish = Box::pin(session.finish_run(Ok(completion)));
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(finish.as_mut().poll(&mut context), Poll::Pending));
+    drop(finish);
+
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id),
+        "a cancelled completion handler must leave the returned RunCore in Session"
+    );
+    assert!(
+        session.active.is_some(),
+        "ActiveRun must remain installed until its join and output drain settle"
+    );
+
+    release_join.notify_one();
+    session.shutdown_active().await;
+    assert!(session.active.is_none());
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_shutdown_after_completion_before_join_retains_returned_core() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let core = RunCore::fixture_with_unapproved_tools();
+    let ownership_id = core.ownership_id();
+    let mut session = session_with_core(gateway, worker, core).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let release_join = replace_finished_active_join_with_gate(&mut session).await;
+
+    let mut shutdown = Box::pin(session.shutdown_active());
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        shutdown.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        shutdown.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(shutdown);
+
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id),
+        "a cancelled shutdown handler must leave the returned RunCore in Session"
+    );
+    assert!(
+        session.active.is_some(),
+        "ActiveRun must remain installed until its join and output drain settle"
+    );
+
+    release_join.notify_one();
+    session.shutdown_active().await;
+    assert!(session.active.is_none());
+    assert_eq!(
+        session.core.as_ref().map(RunCore::ownership_id),
+        Some(ownership_id)
+    );
+}
+
+#[tokio::test]
+async fn runtime_shutdown_cancels_active_attempt_and_joins_returned_core() {
+    let (gateway, commands, _frames) = gateway();
+    let attempt_entered = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let attempt_entered = attempt_entered.clone();
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let attempt_entered = attempt_entered.clone();
+            async move {
+                let runtime_shutdown = core.runtime_shutdown.clone();
+                attempt_entered.notify_one();
+                runtime_shutdown.cancelled().await;
+                drop(events);
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = session(gateway, worker).await;
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+
+    commands.send(user(1)).await.expect("start active run");
+    tokio::time::timeout(Duration::from_secs(2), attempt_entered.notified())
+        .await
+        .expect("worker registered cancellation");
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("graceful shutdown timeout")
+        .expect("Session task join");
+    assert!(
+        matches!(result, SessionResult::Completed(_)),
+        "runtime shutdown must recover ownership: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_shutdown_deadline_joins_aborted_worker_before_reporting_ownership_loss() {
+    let store = Store::session_test_store("runtime-shutdown-blocked-store")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, _frames) = gateway();
+    let worker_entered = Arc::new(Notify::new());
+    let event_sent = Arc::new(Notify::new());
+    let worker_dropped = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let worker_entered = worker_entered.clone();
+        let event_sent = event_sent.clone();
+        let worker_dropped = worker_dropped.clone();
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let worker_entered = worker_entered.clone();
+            let event_sent = event_sent.clone();
+            let worker_dropped = worker_dropped.clone();
+            async move {
+                let _drop_flag = DropFlag(worker_dropped);
+                worker_entered.notify_one();
+                core.runtime_shutdown.cancelled().await;
+                events
+                    .send(AgentEvent::AgentStart)
+                    .await
+                    .expect("shutdown event receiver remains");
+                event_sent.notify_one();
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+
+    commands.send(user(1)).await.expect("start active run");
+    worker_entered.notified().await;
+    let store_guard = pool.acquire().await.expect("reserve sole Store connection");
+    tokio::time::pause();
+    shutdown.cancel();
+    event_sent.notified().await;
+
+    let (failure, ownership) = failed(task.await.expect("Session join"));
+    assert!(matches!(
+        failure,
+        SessionFailure::RuntimeShutdownOwnershipLost
+    ));
+    assert!(matches!(ownership, RunOwnership::Lost));
+    assert!(
+        worker_dropped.load(Ordering::SeqCst),
+        "Session must join the aborted worker before returning ownership loss"
+    );
+    drop(store_guard);
+}
+
+#[tokio::test]
+async fn completion_installs_core_before_active_take_hook() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let mut session = session(gateway, worker).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    let (observed_tx, observed_rx) = oneshot::channel();
+    session.active_take_observer = Some(observed_tx);
+
+    finish_active(&mut session).await;
+
+    assert!(
+        observed_rx.await.expect("active-take hook"),
+        "the unique RunCore must already be installed when ActiveRun is taken"
+    );
+    assert!(session.active.is_none());
+    assert!(session.core.is_some());
 }
 
 #[test]
@@ -4360,6 +4871,7 @@ fn reliable_outbound_admission_fails_explicitly_when_full_or_closed() {
         ack: CommandAck {
             seq: 1,
             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             status: CommandAckStatus::Received,
             reject_reason: None,
         },
@@ -4621,7 +5133,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     commands_tx.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if observed.lock().expect("observed mutex").len() == 8 {
+            if observed.lock().expect("observed mutex").len() == 9 {
                 break;
             }
             if task.is_finished() {
@@ -4636,13 +5148,32 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     completed(task.await.expect("session join"));
 
     let observed = observed.lock().expect("observed mutex").clone();
-    assert_eq!(observed.len(), 8);
-    assert!(observed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(
+        observed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        (1..=9).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .map(|(_, kind)| kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "command_disposition",
+        ]
+    );
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
         .fetch_one(&pool)
         .await
         .expect("stored events");
-    assert_eq!(stored, 8);
+    assert_eq!(stored, 9);
     let projected: String = sqlx::query_scalar(
         "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='assistant-bridge'",
     )
@@ -6052,14 +6583,19 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 4,
+        kinds.len() > retry + 5,
         "retry suffix must contain injection and the next assistant start"
     );
     assert_eq!(
-        &kinds[retry + 1..retry + 4],
-        ["steered", "message_start", "message_end"]
+        &kinds[retry + 1..retry + 5],
+        [
+            "steered",
+            "message_start",
+            "command_disposition",
+            "message_end",
+        ]
     );
-    assert_eq!(kinds[retry + 4], "message_start");
+    assert_eq!(kinds[retry + 5], "message_start");
 
     let steer_command_id = match user(2) {
         InboundCommand::Valid(envelope) => envelope.command_id,
@@ -6897,6 +7433,8 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
 fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
     let command_id = format!("25000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical live Responses command id"),
         command: Command::UserMessage {
@@ -6913,7 +7451,27 @@ async fn run_live_responses_session(
     seq: u64,
     text: &str,
 ) -> RunCore {
-    let phase = format!("run_live_responses_session(seq={seq})");
+    run_live_responses_segment(store, core, driver, &[(seq, text)]).await
+}
+
+/// Drives several ordinary commands through one live Session.  Waiting for the
+/// matching Applied ACK, rather than any prior Applied ACK, makes this useful
+/// for state-transition probes as well as the single-command release gate.
+async fn run_live_responses_segment(
+    store: Store,
+    core: RunCore,
+    driver: Arc<InjectedRunDriver>,
+    turns: &[(u64, &str)],
+) -> RunCore {
+    assert!(
+        !turns.is_empty(),
+        "live Responses segment requires at least one turn"
+    );
+    let phase = format!(
+        "run_live_responses_segment(turns={}-{})",
+        turns.first().expect("non-empty turns").0,
+        turns.last().expect("non-empty turns").0
+    );
     eprintln!("[{phase}] starting session");
     let (session_gateway, commands, frames) = gateway();
     let session = tokio::time::timeout(
@@ -6931,28 +7489,39 @@ async fn run_live_responses_session(
     .expect("start canonical live Responses Session");
     eprintln!("[{phase}] session started; spawning run task");
     let task = tokio::spawn(session.run());
-    eprintln!("[{phase}] sending user command");
-    commands
-        .send(live_responses_user(seq, text))
-        .await
-        .expect("send live Responses user command");
-    eprintln!("[{phase}] waiting for durable Applied ACK");
-    tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            if frames.lock().expect("frame mutex").iter().any(|frame| {
-                matches!(frame, OutboundFrame::CommandAck { ack }
-                    if ack.status == CommandAckStatus::Applied)
-            }) || task.is_finished()
-            {
-                break;
+    for (seq, text) in turns {
+        eprintln!("[{phase}] sending user command seq={seq}");
+        commands
+            .send(live_responses_user(*seq, text))
+            .await
+            .expect("send live Responses user command");
+        eprintln!("[{phase}] waiting for durable Applied ACK seq={seq}");
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if frames.lock().expect("frame mutex").iter().any(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                        if ack.seq == *seq && ack.status == CommandAckStatus::Applied)
+                }) || task.is_finished()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("[{phase}] timed out waiting for durable Applied ACK (phase: applied_ack)")
-    });
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "[{phase}] timed out waiting for durable Applied ACK seq={seq} (phase: applied_ack)"
+            )
+        });
+        assert!(
+            frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::CommandAck { ack }
+                    if ack.seq == *seq && ack.status == CommandAckStatus::Applied)
+            }),
+            "[{phase}] session ended before Applied ACK for seq={seq}"
+        );
+    }
     eprintln!("[{phase}] Applied ACK received; dropping commands and awaiting session completion");
     drop(commands);
     let core = tokio::time::timeout(Duration::from_secs(120), task)
@@ -7073,7 +7642,28 @@ async fn assert_live_provider_context_private(
     }
 }
 
+fn live_responses_turn_count() -> usize {
+    match std::env::var("SUMI_LIVE_TEST_TURNS") {
+        Err(std::env::VarError::NotPresent) => 2,
+        Ok(value) if value == "10" => 10,
+        Ok(value) => panic!(
+            "SUMI_LIVE_TEST_TURNS must be unset (the two-turn release gate) or exactly 10, got {value:?}"
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SUMI_LIVE_TEST_TURNS must be unset or UTF-8 value exactly 10")
+        }
+    }
+}
+
 pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_key: String) {
+    if live_responses_turn_count() == 10 {
+        assert_eq!(
+            spec.id, "gpt-5.6-terra",
+            "the ten-turn stress harness is intentionally pinned to gpt-5.6-terra"
+        );
+        run_canonical_live_responses_ten_turn_stress(spec, api_key).await;
+        return;
+    }
     eprintln!(
         "run_canonical_live_responses_roundtrip: starting turn 1 with spec.id={}",
         spec.id
@@ -7139,9 +7729,12 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     first_pool.close().await;
 
     let reopened = open_kill_restart_store(&path).await;
-    let lease =
-        ProcessGenerationLease::new(test_executor_generation(), "live-responses-restart-lease")
-            .expect("live Responses restart lease");
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-responses-restart-lease",
+    )
+    .expect("live Responses restart lease");
     let fence = GenerationRecoveryFence::new(&lease, "live-responses-restart-fence")
         .expect("live Responses restart fence");
     let hydrated = match reopened
@@ -7225,6 +7818,201 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
+/// An explicitly opt-in, state-transition probe.  It deliberately keeps three
+/// Sessions (rather than ten one-command Sessions): commands 1-4, 5-7, and
+/// 8-10 exercise normal sequential operation, while the two close/reopen
+/// boundaries exercise authenticated provider-context hydration.
+async fn run_canonical_live_responses_ten_turn_stress(spec: ModelSpec, api_key: String) {
+    eprintln!("ten-turn Terra Responses stress: starting (three Session segments)");
+    assert!(
+        std::env::var(&spec.api_key_env).is_ok_and(|configured| configured == api_key),
+        "live proxy secret must be available to the canonical provider driver"
+    );
+    let path = std::env::current_dir()
+        .expect("agent package directory")
+        .join("target")
+        .join(format!(
+            "sumi-live-responses-ten-turn-{}.sqlite",
+            Uuid::now_v7()
+        ));
+    let tool = live_responses_tool();
+    let store = open_kill_restart_store(&path).await;
+    let first_pool = store.pool().clone();
+    let mut first_core = RunCore::new();
+    first_core.set_approval(live_responses_approval_broker());
+    let first_core = run_live_responses_segment(
+        store,
+        first_core,
+        live_responses_driver(
+            spec.clone(),
+            tool.clone(),
+            "medium",
+            Some(serde_json::json!("auto")),
+        ),
+        &[
+            (1, "Reply with exactly responses-live-text-1. Do not call a tool."),
+            (2, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (3, "Reply with exactly responses-live-text-3. Do not call a tool."),
+            (4, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let first_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&first_pool)
+        .await
+        .expect("first context-row count");
+    assert!(
+        first_context_rows > 0 && !first_core.provider_context.is_empty(),
+        "first segment must retain durable provider context"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&first_pool)
+            .await
+            .expect("first tool-result count"),
+        2,
+        "turns 2 and 4 must be the only first-segment tool effects"
+    );
+    first_pool.close().await;
+
+    let reopened = open_kill_restart_store(&path).await;
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-ten-turn-restart-one-lease",
+    )
+    .expect("first stress restart lease");
+    let fence = GenerationRecoveryFence::new(&lease, "live-ten-turn-restart-one-fence")
+        .expect("first stress restart fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("first stress hydration")
+    {
+        HydrationOutcome::Complete(state) => state,
+        other => panic!("completed first stress segment unexpectedly requires recovery: {other:?}"),
+    };
+    let markers = live_opaque_markers(&hydrated.provider_context);
+    assert!(
+        !markers.is_empty(),
+        "first stress hydration must recover encrypted reasoning context"
+    );
+    assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
+    let mut second_core = RunCore::new();
+    second_core.set_approval(live_responses_approval_broker());
+    second_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+    let second_pool = reopened.pool().clone();
+    let second_core = run_live_responses_segment(
+        reopened,
+        second_core,
+        live_responses_driver(
+            spec.clone(),
+            tool.clone(),
+            "medium",
+            Some(serde_json::json!("auto")),
+        ),
+        &[
+            (5, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (6, "Reply with exactly responses-live-text-6. Do not call a tool."),
+            (7, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let second_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&second_pool)
+        .await
+        .expect("second context-row count");
+    // Provider context is allowed to be compacted or retained under a bounded
+    // policy, so a raw row count is not a monotonic contract.  The durable
+    // invariant is non-empty authenticated continuity at every segment and
+    // privacy after each rehydration (asserted above).
+    assert!(
+        second_context_rows > 0 && !second_core.provider_context.is_empty(),
+        "provider context must remain durable and live after the first restart"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&second_pool)
+            .await
+            .expect("second tool-result count"),
+        4,
+        "turns 2, 4, 5, and 7 must be the only tool effects before second restart"
+    );
+    second_pool.close().await;
+
+    let reopened = open_kill_restart_store(&path).await;
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "live-ten-turn-restart-two-lease",
+    )
+    .expect("second stress restart lease");
+    let fence = GenerationRecoveryFence::new(&lease, "live-ten-turn-restart-two-fence")
+        .expect("second stress restart fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("second stress hydration")
+    {
+        HydrationOutcome::Complete(state) => state,
+        other => {
+            panic!("completed second stress segment unexpectedly requires recovery: {other:?}")
+        }
+    };
+    let markers = live_opaque_markers(&hydrated.provider_context);
+    assert!(
+        !markers.is_empty(),
+        "second stress hydration must recover encrypted reasoning context"
+    );
+    assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
+    let mut third_core = RunCore::new();
+    third_core.set_approval(live_responses_approval_broker());
+    third_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+    let final_pool = reopened.pool().clone();
+    let final_core = run_live_responses_segment(
+        reopened,
+        third_core,
+        live_responses_driver(spec, tool, "medium", Some(serde_json::json!("auto"))),
+        &[
+            (8, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+            (9, "Reply with exactly responses-live-text-9. Do not call a tool."),
+            (10, "Call echo_value exactly once with value responses-live-ok, then reply with that value."),
+        ],
+    )
+    .await;
+    let final_context_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+        .fetch_one(&final_pool)
+        .await
+        .expect("final context-row count");
+    assert!(
+        final_context_rows > 0 && !final_core.provider_context.is_empty(),
+        "provider context must remain durable and live across all stress segments"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&final_pool)
+            .await
+            .expect("final tool-result count"),
+        6,
+        "exactly the six requested tool turns may produce durable effects"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='user'")
+            .fetch_one(&final_pool)
+            .await
+            .expect("final user count"),
+        10,
+        "all ten sequential user commands must persist exactly once"
+    );
+    eprintln!(
+        "ten-turn Terra Responses stress complete: sessions=3; turns=10; tool_results=6; context_rows={final_context_rows}"
+    );
+    final_pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
 #[tokio::test]
 async fn successful_provider_context_survives_session_restart_and_reaches_turn_two() {
     let path = std::env::current_dir()
@@ -7291,9 +8079,12 @@ async fn successful_provider_context_survives_session_restart_and_reaches_turn_t
 
     pool.close().await;
     let reopened = open_kill_restart_store(&path).await;
-    let lease =
-        ProcessGenerationLease::new(test_executor_generation(), "provider-context-session-lease")
-            .expect("lease");
+    let lease = ProcessGenerationLease::new(
+        reopened.scope().personality_agent_id.clone(),
+        test_executor_generation(),
+        "provider-context-session-lease",
+    )
+    .expect("lease");
     let fence =
         GenerationRecoveryFence::new(&lease, "provider-context-session-fence").expect("fence");
     let hydrated = match reopened
@@ -7815,22 +8606,22 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 8,
+        kinds.len() > retry + 12,
         "retry suffix contains group injection and assistant"
     );
     assert_eq!(&kinds[retry + 1..retry + 3], ["steered", "steered"]);
     assert_eq!(
-        &kinds[retry + 3..retry + 5],
-        ["message_start", "message_end"]
+        &kinds[retry + 3..retry + 6],
+        ["message_start", "command_disposition", "message_end"]
     );
     assert_eq!(
-        &kinds[retry + 5..retry + 7],
-        ["message_start", "message_end"]
+        &kinds[retry + 6..retry + 9],
+        ["message_start", "command_disposition", "message_end"]
     );
-    assert_eq!(kinds[retry + 7], "message_start");
-    assert_eq!(kinds[retry + 8], "message_end");
-    assert_eq!(kinds[retry + 9], "turn_end");
-    assert_eq!(kinds[retry + 10], "agent_end");
+    assert_eq!(kinds[retry + 9], "message_start");
+    assert_eq!(kinds[retry + 10], "message_end");
+    assert_eq!(kinds[retry + 11], "turn_end");
+    assert_eq!(kinds[retry + 12], "agent_end");
 
     let steer_command_ids: Vec<String> = [user(2), user(3)]
         .iter()
@@ -7868,7 +8659,12 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .collect();
     let expected_ids: Vec<String> = steer_command_ids
         .iter()
-        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .map(|command_id| {
+            crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                command_id.as_str(),
+            )
+        })
         .collect();
     assert!(
         context_ids.ends_with(&expected_ids),
@@ -7943,7 +8739,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
     assert!(
-        kinds.len() > retry + 13,
+        kinds.len() > retry + 16,
         "retry suffix contains group injection and assistant"
     );
     assert_eq!(
@@ -7951,20 +8747,23 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         ["steered", "steered", "steered"]
     );
     assert_eq!(
-        &kinds[retry + 4..retry + 10],
+        &kinds[retry + 4..retry + 13],
         [
             "message_start",
+            "command_disposition",
             "message_end",
             "message_start",
+            "command_disposition",
             "message_end",
             "message_start",
+            "command_disposition",
             "message_end",
         ]
     );
-    assert_eq!(kinds[retry + 10], "message_start");
-    assert_eq!(kinds[retry + 11], "message_end");
-    assert_eq!(kinds[retry + 12], "turn_end");
-    assert_eq!(kinds[retry + 13], "agent_end");
+    assert_eq!(kinds[retry + 13], "message_start");
+    assert_eq!(kinds[retry + 14], "message_end");
+    assert_eq!(kinds[retry + 15], "turn_end");
+    assert_eq!(kinds[retry + 16], "agent_end");
 
     let steer_command_ids: Vec<String> = [user(2), user(3), user(4)]
         .iter()
@@ -8002,7 +8801,12 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         .collect();
     let expected_ids: Vec<String> = steer_command_ids
         .iter()
-        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .map(|command_id| {
+            crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                command_id.as_str(),
+            )
+        })
         .collect();
     assert!(
         context_ids.ends_with(&expected_ids),
@@ -8029,9 +8833,10 @@ impl KeyProvider for KillRestartKeyProvider {
 
 async fn open_kill_restart_store(path: &std::path::Path) -> Store {
     let scope = AgentScope {
-        tenant_id: "kill-restart-tenant".to_owned(),
-        agent_id: "kill-restart-agent".to_owned(),
-        conversation_id: "kill-restart-conversation".to_owned(),
+        personality_agent_id: crate::runtime::contracts::PersonalityAgentId::parse(
+            "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+        )
+        .expect("canonical test UUIDv7"),
     };
     let key = WrappingKey::new("kill-restart-key/v1", [0x5a; DATA_KEY_BYTES]);
     Store::open(path, scope, Arc::new(KillRestartKeyProvider(key)))
@@ -9882,6 +10687,7 @@ async fn ask_only_policy(store: &Store) -> crate::approval::Policy {
         .load_approval_policy(
             "/workspace",
             &ApprovalPolicyTrustStore::default(),
+            "tenant-test",
             0,
             chrono::Utc::now(),
         )
@@ -9976,7 +10782,7 @@ async fn expired_policy_grant_reenters_approval_before_stalled_tool_start() {
         &ApprovalPolicyBundle {
             schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
             version: 7,
             issued_at: now - chrono::Duration::seconds(10),
             expires_at,
@@ -10139,6 +10945,8 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
 
 fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),
@@ -10169,6 +10977,8 @@ fn approval_always_decision_with_rule(seq: u64, request_id: &str, rule: Value) -
     let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(rule)
         .expect("object deferred ApproveAlways rule");
     InboundCommand::Valid(CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),
@@ -11046,6 +11856,7 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
     pool.close().await;
     let store = open_kill_restart_store(&database_path).await;
     let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
         test_executor_generation(),
         "duplicate-approval-restart-lease",
     )

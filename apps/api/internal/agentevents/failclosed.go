@@ -20,7 +20,7 @@ func (failClosedTokenVerifier) Verify(ctx context.Context, token string) (TokenC
 
 type failClosedGenerationVerifier struct{}
 
-func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
+func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, personalityAgentID string, generation uint64) error {
 	return errNotWired
 }
 
@@ -64,6 +64,14 @@ type failClosedHydrationLatch struct{}
 
 func (failClosedHydrationLatch) WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error {
 	return errNotWired
+}
+
+func (failClosedHydrationLatch) Observe(
+	ctx context.Context,
+	claims TokenClaims,
+	generation uint64,
+) (HydrationObservation, error) {
+	return HydrationObservation{}, errNotWired
 }
 
 // NewFailClosedServer returns a Server whose seams all reject. It is suitable

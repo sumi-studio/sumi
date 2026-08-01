@@ -16,7 +16,7 @@ use crate::{
             ToolResultMessage,
         },
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{DirectChatProvenanceV1, ProcessGeneration},
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent,
         ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
@@ -46,6 +46,7 @@ use super::{AdmittedCommand, AgentEvent, ApprovalResolution, run::LENGTH_LOOP_CO
 pub(crate) struct DurableRunBinding {
     pub command_id: String,
     pub command_seq: u64,
+    pub provenance: DirectChatProvenanceV1,
     pub run_id: String,
     pub turn_id: String,
     pub executor_generation: ProcessGeneration,
@@ -56,6 +57,7 @@ impl DurableRunBinding {
         Self {
             command_id: command.envelope().command_id.to_string(),
             command_seq: command.envelope().seq,
+            provenance: command.envelope().provenance.clone(),
             run_id: Uuid::now_v7().to_string(),
             turn_id: Uuid::now_v7().to_string(),
             executor_generation,
@@ -571,7 +573,7 @@ impl DurableBridge {
         &mut self,
         writer: &EventWriter,
         command: AdmittedCommand,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<(Vec<CommittedOutput>, Vec<CommandAck>)> {
         if !self.can_bind_abort() {
             bail!("abort no longer matches an active run boundary");
         }
@@ -581,9 +583,9 @@ impl DurableBridge {
 
         let error_context_disposition =
             self.build_pending_error_context_disposition(writer).await?;
-        let mut acks = if let Some(disposition) = error_context_disposition.as_ref() {
+        let cutoff = if let Some(disposition) = error_context_disposition.as_ref() {
             writer
-                .apply_active_abort_cutoff_with_error_context_disposition(
+                .apply_active_abort_cutoff_with_error_context_disposition_and_events(
                     command.envelope().command_id.as_str(),
                     command.envelope().seq,
                     &self.binding.run_id,
@@ -592,13 +594,22 @@ impl DurableBridge {
                 .await?
         } else {
             writer
-                .apply_active_abort_cutoff(
+                .apply_active_abort_cutoff_with_events(
                     command.envelope().command_id.as_str(),
                     command.envelope().seq,
                     &self.binding.run_id,
                 )
                 .await?
         };
+        let mut acks = cutoff.acks;
+        let outputs = cutoff
+            .events
+            .into_iter()
+            .map(|(seq, event)| CommittedOutput {
+                event,
+                seq: Some(seq),
+            })
+            .collect();
         self.apply_pending_error_context_disposition(writer, error_context_disposition.as_ref())
             .await?;
 
@@ -639,7 +650,7 @@ impl DurableBridge {
         self.binding.command_seq = command.envelope().seq;
         self.phase = RunPhase::CancelRequested;
 
-        Ok(acks)
+        Ok((outputs, acks))
     }
 
     pub(super) fn can_bind_soft_steer(
@@ -1164,13 +1175,19 @@ impl DurableBridge {
                     let state = approval_state(&resolution);
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
                     let mut resolution_projections = vec![
                         Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
-                            actor: "user".to_owned(),
+                            actor: actor.clone(),
                         }),
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
@@ -1186,7 +1203,7 @@ impl DurableBridge {
                             event: Some(DurableEvent::approval_resolved(
                                 request_id.clone(),
                                 resolution,
-                                "user".to_owned(),
+                                actor,
                             )?),
                             projections: resolution_projections,
                         },
@@ -1564,12 +1581,18 @@ impl DurableBridge {
                 } else {
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let projections = vec![
                         Projection::Approval(ApprovalMutation::Resolve {
                             request_id: request_id.clone(),
                             state,
-                            actor: "user".to_owned(),
+                            actor: actor.clone(),
                         }),
                         Projection::CommandApplied {
                             command_id: command_id.clone(),
@@ -1583,7 +1606,7 @@ impl DurableBridge {
                         DurableEvent::approval_resolved(
                             request_id.clone(),
                             resolution.clone(),
-                            "user".to_owned(),
+                            actor,
                         )?,
                         projections,
                         AgentEvent::ApprovalResolved {
@@ -1594,7 +1617,9 @@ impl DurableBridge {
                     .await
                 }
             }
-            AgentEvent::Steered { .. } | AgentEvent::MemoryMaintenance { .. } => {
+            AgentEvent::Steered { .. }
+            | AgentEvent::MemoryMaintenance { .. }
+            | AgentEvent::CommandDisposition(_) => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
             }
         }?;
@@ -1776,6 +1801,7 @@ impl DurableBridge {
                 self.binding.command_seq,
                 crate::gateway::CommandId::parse(&self.binding.command_id)
                     .map_err(anyhow::Error::msg)?,
+                self.binding.provenance.clone(),
             ));
         } else if let PublicMessage::ToolResult(result) = &message {
             let tool_call_id = result.tool_call_id.clone();
@@ -2138,18 +2164,10 @@ impl DurableBridge {
         }
 
         self.collect_terminal_command_ids(&batch);
-        let (seqs, calibration_ratio_bits) = writer.apply_with_calibration_receipt(batch).await?;
-        if seqs.len() != public.len() {
-            bail!("durable EventBatch/public event cardinality mismatch");
-        }
-        let outputs: Vec<_> = public
-            .into_iter()
-            .zip(seqs)
-            .map(|(event, seq)| CommittedOutput {
-                event,
-                seq: Some(seq),
-            })
-            .collect();
+        let (events, calibration_ratio_bits) = writer
+            .apply_with_events_and_calibration_receipt(batch)
+            .await?;
+        let outputs = reconcile_committed_events(events, public)?;
         let calibration_receipt_count = receipt_requests
             .iter()
             .filter(|(_, barrier)| barrier.calibration_estimate().is_some())
@@ -2268,18 +2286,6 @@ impl DurableBridge {
         let inject_batch = batches.remove(1);
         let close_batch = batches.remove(0);
 
-        let close_seqs = writer.apply(close_batch).await?;
-        if close_seqs.len() != 2 {
-            bail!("hard-steer close batch did not commit exactly two durable events");
-        }
-        let partial_message_seq = close_seqs[0];
-        barrier.resolve(MessageCommitReceipt {
-            message_id: message_id.clone(),
-            message_seq: partial_message_seq,
-            calibration_ratio_bits: None,
-            new_turn_id: Some(new_turn_id.clone()),
-        });
-
         let close_public = vec![
             AgentEvent::MessageEnd {
                 message_id: message_id.clone(),
@@ -2290,20 +2296,22 @@ impl DurableBridge {
                 tool_results: Vec::new(),
             },
         ];
-        let outputs = close_public
-            .into_iter()
-            .zip(close_seqs)
-            .map(|(event, seq)| CommittedOutput {
-                event,
-                seq: Some(seq),
-            })
-            .collect();
+        let close_events = writer.apply_with_events(close_batch).await?;
+        let outputs = reconcile_committed_events(close_events, close_public)?;
+        let partial_message_seq = committed_message_end_seq(&outputs, &message_id)?;
+        barrier.resolve(MessageCommitReceipt {
+            message_id: message_id.clone(),
+            message_seq: partial_message_seq,
+            calibration_ratio_bits: None,
+            new_turn_id: Some(new_turn_id.clone()),
+        });
 
         self.binding.turn_id = new_turn_id;
         self.turn_open = true;
         self.assistant_open = None;
         self.pending_hard_steer_inject_batch = Some(inject_batch);
         self.pending_hard_steer_user_message_id = Some(crate::store::user_message_id(
+            &command.envelope().personality_agent_id,
             &command.envelope().command_id,
         ));
         self.pending_hard_steer = Some(command);
@@ -2357,11 +2365,6 @@ impl DurableBridge {
             bail!("hard-steer user message does not match durable command plaintext");
         }
 
-        let seqs = writer.apply(inject_batch).await?;
-        if seqs.len() != 4 {
-            bail!("hard-steer inject batch did not commit exactly four durable events");
-        }
-        let user_message_seq = seqs[3];
         let inject_public = vec![
             AgentEvent::Steered {
                 mode: super::SteerMode::Hard,
@@ -2376,18 +2379,14 @@ impl DurableBridge {
                 message: Box::new(message),
             },
         ];
+        let inject_events = writer.apply_with_events(inject_batch).await?;
+        let outputs = reconcile_committed_events(inject_events, inject_public)?;
+        let user_message_seq = committed_message_end_seq(&outputs, &message_id)?;
         self.binding.command_id = command.envelope().command_id.to_string();
         self.binding.command_seq = command.envelope().seq;
         self.phase = RunPhase::UserCommitted;
         Ok((
-            inject_public
-                .into_iter()
-                .zip(seqs)
-                .map(|(event, seq)| CommittedOutput {
-                    event,
-                    seq: Some(seq),
-                })
-                .collect(),
+            outputs,
             vec![(
                 barrier,
                 MessageCommitReceipt {
@@ -2431,7 +2430,10 @@ impl DurableBridge {
             .as_ref()
             .and_then(|group| group.commands().get(index))
             .ok_or_else(|| anyhow!("steer group member disappeared before MessageEnd"))?;
-        let expected_message_id = crate::store::user_message_id(&command.envelope().command_id);
+        let expected_message_id = crate::store::user_message_id(
+            &command.envelope().personality_agent_id,
+            &command.envelope().command_id,
+        );
         if message_id != expected_message_id {
             bail!("steer group message identity does not derive from its command");
         }
@@ -2478,92 +2480,62 @@ impl DurableBridge {
         snapshot.closing_tool_results = closing_tool_results.clone();
         let batch = steer_group_injection_batch(snapshot)?;
         self.collect_terminal_command_ids(&batch);
-        let seqs = writer.apply(batch).await?;
-
         let expected_writes = if is_soft {
             1 + group_len + 1 + 2 * group_len
         } else {
             group_len + 2 * group_len
         };
-        if seqs.len() != expected_writes {
-            bail!(
-                "steer group injection committed {} durable events, expected {}",
-                seqs.len(),
-                expected_writes
-            );
-        }
 
-        // Build public events in batch order.
-        let mut public = Vec::with_capacity(expected_writes);
-        let mut seq_iter = seqs.into_iter();
-        let mut next_seq = || {
-            seq_iter
-                .next()
-                .ok_or_else(|| anyhow!("steer group committed fewer durable seqs than expected"))
-        };
+        // Build the caller-owned public events in batch order. EventWriter's
+        // exact receipt adds writer-owned dispositions in their durable slots.
+        let mut expected_public = Vec::with_capacity(expected_writes);
         if is_soft {
-            let turn_end_seq = next_seq()?;
-            public.push(CommittedOutput {
-                event: AgentEvent::TurnEnd {
-                    message: closing_turn_message.map(Box::new),
-                    tool_results: closing_tool_results.clone(),
-                },
-                seq: Some(turn_end_seq),
+            expected_public.push(AgentEvent::TurnEnd {
+                message: closing_turn_message.map(Box::new),
+                tool_results: closing_tool_results.clone(),
             });
         }
         for _ in 0..group_len {
-            let seq = next_seq()?;
-            public.push(CommittedOutput {
-                event: AgentEvent::Steered {
-                    mode: super::SteerMode::Soft,
-                },
-                seq: Some(seq),
+            expected_public.push(AgentEvent::Steered {
+                mode: super::SteerMode::Soft,
             });
         }
         if is_soft {
-            let turn_start_seq = next_seq()?;
-            public.push(CommittedOutput {
-                event: AgentEvent::TurnStart,
-                seq: Some(turn_start_seq),
-            });
+            expected_public.push(AgentEvent::TurnStart);
         }
-        let message_start_base = public.len();
         for (index, command) in commands.iter().enumerate() {
             let user_message = super::steer::build_user_message(command)?;
-            let user_message_id = crate::store::user_message_id(&command.envelope().command_id);
-            let start_seq = next_seq()?;
-            let end_seq = next_seq()?;
-            public.push(CommittedOutput {
-                event: AgentEvent::MessageStart {
-                    message_id: user_message_id.clone(),
-                    message: Box::new(user_message.clone()),
-                },
-                seq: Some(start_seq),
+            let user_message_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
+            expected_public.push(AgentEvent::MessageStart {
+                message_id: user_message_id.clone(),
+                message: Box::new(user_message.clone()),
             });
-            public.push(CommittedOutput {
-                event: AgentEvent::MessageEnd {
-                    message_id: user_message_id,
-                    message: Box::new(user_message),
-                },
-                seq: Some(end_seq),
+            expected_public.push(AgentEvent::MessageEnd {
+                message_id: user_message_id,
+                message: Box::new(user_message),
             });
             // Receipts are resolved in command order.
             let pending = messages.get(index).ok_or_else(|| {
                 anyhow!("steer group committed without a matching MessageEnd receipt request")
             })?;
-            let expected_id = crate::store::user_message_id(&command.envelope().command_id);
+            let expected_id = crate::store::user_message_id(
+                &command.envelope().personality_agent_id,
+                &command.envelope().command_id,
+            );
             if pending.message_id != expected_id {
                 bail!("steer group receipt message id mismatch");
             }
         }
+        let events = writer.apply_with_events(batch).await?;
+        let public = reconcile_committed_events(events, expected_public)?;
 
         // Resolve all MessageEnd barriers with their durable seqs.
         let mut receipts = Vec::with_capacity(messages.len());
-        for (index, pending) in messages.into_iter().enumerate() {
-            let end_position = message_start_base + 2 * index + 1;
-            let message_seq = public[end_position]
-                .seq
-                .ok_or_else(|| anyhow!("steer group MessageEnd has no seq"))?;
+        for pending in messages {
+            let message_seq = committed_message_end_seq(&public, &pending.message_id)?;
             receipts.push((
                 pending.barrier,
                 MessageCommitReceipt {
@@ -2576,7 +2548,10 @@ impl DurableBridge {
         }
 
         assert_eq!(
-            public.len(),
+            public
+                .iter()
+                .filter(|output| !matches!(output.event, AgentEvent::CommandDisposition(_)))
+                .count(),
             expected_writes,
             "steer group public event count mismatch"
         );
@@ -2639,19 +2614,48 @@ impl DurableBridge {
         public: Vec<AgentEvent>,
     ) -> Result<Vec<CommittedOutput>> {
         self.collect_terminal_command_ids(&batch);
-        let seqs = writer.apply(batch).await?;
-        if seqs.len() != public.len() {
-            bail!("durable EventBatch/public event cardinality mismatch");
-        }
-        Ok(public
-            .into_iter()
-            .zip(seqs)
-            .map(|(event, seq)| CommittedOutput {
-                event,
-                seq: Some(seq),
-            })
-            .collect())
+        let events = writer.apply_with_events(batch).await?;
+        reconcile_committed_events(events, public)
     }
+}
+
+fn reconcile_committed_events(
+    events: Vec<(u64, AgentEvent)>,
+    public: Vec<AgentEvent>,
+) -> Result<Vec<CommittedOutput>> {
+    let mut expected = public.into_iter();
+    let mut outputs = Vec::with_capacity(events.len());
+    for (seq, event) in events {
+        if !matches!(event, AgentEvent::CommandDisposition(_)) {
+            let caller_event = expected.next().ok_or_else(|| {
+                anyhow!("EventWriter committed an unexpected caller-owned public event")
+            })?;
+            if caller_event != event {
+                bail!("EventWriter committed a public event in an unexpected durable position");
+            }
+        }
+        outputs.push(CommittedOutput {
+            event,
+            seq: Some(seq),
+        });
+    }
+    if expected.next().is_some() {
+        bail!("EventWriter committed fewer caller-owned public events than supplied");
+    }
+    Ok(outputs)
+}
+
+fn committed_message_end_seq(outputs: &[CommittedOutput], message_id: &str) -> Result<u64> {
+    outputs
+        .iter()
+        .find_map(|output| match &output.event {
+            AgentEvent::MessageEnd {
+                message_id: committed_id,
+                ..
+            } if committed_id == message_id => output.seq,
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("committed MessageEnd {message_id} has no durable sequence"))
 }
 
 fn approval_state(resolution: &ApprovalResolution) -> &'static str {
@@ -2695,7 +2699,10 @@ mod tests {
     use crate::{
         agent::{
             AdmittedCommand,
-            events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
+            events::{
+                ApprovalRequest, ApprovalResolution, CommandDisposition, CommandDispositionEvent,
+                ReviewProjection,
+            },
         },
         gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
         memory::estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
@@ -2723,6 +2730,8 @@ mod tests {
 
     fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::UserMessage {
@@ -2735,6 +2744,8 @@ mod tests {
     fn test_admitted(seq: u64, command_id: &str, text: &str) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::UserMessage {
@@ -2748,6 +2759,8 @@ mod tests {
 
     fn test_abort_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::Abort {},
@@ -2757,6 +2770,8 @@ mod tests {
     fn test_admitted_abort(seq: u64, command_id: &str) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::Abort {},
@@ -2773,6 +2788,8 @@ mod tests {
     ) -> AdmittedCommand {
         AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::ApprovalDecision {
@@ -2846,6 +2863,7 @@ mod tests {
         assistant_origin: ProviderOrigin,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -2872,7 +2890,8 @@ mod tests {
             .await
             .expect("classify owner");
 
-        let message_id = crate::store::user_message_id(command_id);
+        let message_id =
+            crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "owner".to_owned(),
@@ -2939,6 +2958,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
+                    crate::gateway::test_direct_chat_provenance(),
                 )],
             })
             .await
@@ -3177,6 +3197,7 @@ mod tests {
 
     fn binding(command_id: &str) -> DurableRunBinding {
         DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: "run-a".to_owned(),
@@ -3310,6 +3331,8 @@ mod tests {
 
         let command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test command id"),
@@ -3455,7 +3478,24 @@ mod tests {
             )
             .await
             .expect("close aborted run");
-        assert_eq!(end_output.outputs.len(), 1);
+        assert_eq!(end_output.outputs.len(), 2);
+        assert!(matches!(
+            end_output.outputs.as_slice(),
+            [
+                CommittedOutput {
+                    event: AgentEvent::AgentEnd,
+                    ..
+                },
+                CommittedOutput {
+                    event: AgentEvent::CommandDisposition(CommandDispositionEvent {
+                        command_id,
+                        disposition: CommandDisposition::Applied {},
+                        ..
+                    }),
+                    ..
+                }
+            ] if command_id == owner_id
+        ));
         assert_eq!(bridge.phase, RunPhase::Finished);
 
         let events: Vec<String> =
@@ -3472,7 +3512,10 @@ mod tests {
                 "SELECT COUNT(*) FROM agent_events
                  WHERE json_extract(envelope, '$.message_id')=?",
             )
-            .bind(crate::store::user_message_id(steer_id))
+            .bind(crate::store::user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                steer_id,
+            ))
             .fetch_one(store.pool())
             .await
             .expect("count staged steer injection events"),
@@ -3576,7 +3619,10 @@ mod tests {
             .expect("commit hard-steer partial assistant");
         committed.resolve_message_receipts();
 
-        let user_message_id = crate::store::user_message_id(&steer_command.envelope().command_id);
+        let user_message_id = crate::store::user_message_id(
+            &steer_command.envelope().personality_agent_id,
+            &steer_command.envelope().command_id,
+        );
         let user_message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
@@ -3638,6 +3684,7 @@ mod tests {
             timestamp: test_timestamp(),
         });
         let tool_binding = DurableRunBinding {
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: owner_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -4442,7 +4489,8 @@ mod tests {
             .await
             .expect("buffer new turn start while steer group is pending");
 
-        let user_message_id = crate::store::user_message_id(steer_id);
+        let user_message_id =
+            crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), steer_id);
         let user_message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
@@ -4970,6 +5018,8 @@ mod tests {
 
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),
@@ -5019,6 +5069,8 @@ mod tests {
         let decision_command = |seq: u64, request_id: &str| {
             AdmittedCommand::new(
                 CommandEnvelope {
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
+                    provenance: crate::gateway::test_direct_chat_provenance(),
                     seq,
                     command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                         .expect("canonical test UUID"),
@@ -5088,6 +5140,8 @@ mod tests {
 
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 3,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000003")
                     .expect("canonical test UUID"),
@@ -5120,6 +5174,8 @@ mod tests {
 
         let steer_command = AdmittedCommand::new(
             CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),

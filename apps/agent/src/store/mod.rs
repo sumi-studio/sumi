@@ -6,6 +6,7 @@ mod event_log;
 mod event_writer;
 mod memory_state;
 mod physical_recovery;
+mod post_commit;
 mod provider_context;
 mod recovery;
 mod redactor;
@@ -47,26 +48,32 @@ use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
     PublicMessage, StopReason, validate_native_suffix_for_hydration,
 };
+use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{
-    GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+    GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
 };
 
 use self::crypto::{
-    ConversationCommandDigestFactory, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, unwrap_data_key,
-    wrap_data_key,
+    DataKeyScope, KeyWrapAad, PersonalityAgentCommandDigestFactory, WRAP_ALGORITHM,
+    unwrap_data_key, wrap_data_key,
 };
-#[cfg(test)]
-pub(crate) use self::delivery::insert_test_durable_event;
 pub(crate) use self::delivery::{
     DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DeliveryTransportError,
     DurableDeliveryOutcome, current_event_head_seq, raw_events_after,
 };
 #[cfg(test)]
-pub(crate) use self::event_writer::seed_provider_context_owner_event_evidence;
+pub(crate) use self::delivery::{DurableDeliveryPhaseHook, insert_test_durable_event};
+#[cfg(test)]
+pub(crate) use self::event_writer::{
+    PostCommitPublishHook, seed_provider_context_owner_event_evidence,
+};
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
+};
+pub(crate) use self::post_commit::{
+    EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
 };
 #[cfg(test)]
 pub(crate) use self::provider_context::{
@@ -91,10 +98,11 @@ pub(crate) use crypto::{
 )]
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, ApprovalRuleMutation, BootstrapRecoveryGuard, DurableEvent,
-    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt,
-    InboundReceiptOrigin, InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation,
-    MemoryJobMutation, MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter,
-    RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    ErrorContextDisposition, EventBatch, EventWrite, EventWriter, EventWriterAdmissionClosed,
+    EventWriterFinalizerFailure, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -227,11 +235,87 @@ fn pending_error_context_recovery(
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+mod sqlite_uuid {
+    use std::{
+        ffi::c_int,
+        panic::{AssertUnwindSafe, catch_unwind},
+        slice, str,
+    };
+
+    use libsqlite3_sys as ffi;
+    use sqlx::{Error, Result, sqlite::SqliteConnection};
+
+    use crate::runtime::contracts::PersonalityAgentId;
+    const FUNCTION_NAME: &[u8] = b"sumi_is_canonical_uuid_v7\0";
+
+    pub(super) async fn register(connection: &mut SqliteConnection) -> Result<()> {
+        let mut handle = connection.lock_handle().await?;
+        let result = unsafe {
+            // The locked SQLx handle excludes concurrent SQLite access for the
+            // duration of registration. The callback owns no application data
+            // and SQLite retains only the static function name and function
+            // pointer.
+            ffi::sqlite3_create_function_v2(
+                handle.as_raw_handle().as_ptr().cast(),
+                FUNCTION_NAME.as_ptr().cast(),
+                1,
+                ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC | ffi::SQLITE_INNOCUOUS,
+                std::ptr::null_mut(),
+                Some(is_canonical_uuid_v7),
+                None,
+                None,
+                None,
+            )
+        };
+        if result != ffi::SQLITE_OK {
+            return Err(Error::Protocol(format!(
+                "failed to register canonical UUIDv7 SQLite scalar: code {result}"
+            )));
+        }
+        Ok(())
+    }
+
+    unsafe extern "C" fn is_canonical_uuid_v7(
+        context: *mut ffi::sqlite3_context,
+        argument_count: c_int,
+        arguments: *mut *mut ffi::sqlite3_value,
+    ) {
+        let valid = catch_unwind(AssertUnwindSafe(|| {
+            if argument_count != 1 || arguments.is_null() {
+                return None;
+            }
+            let value = unsafe { *arguments };
+            if value.is_null() || unsafe { ffi::sqlite3_value_type(value) } != ffi::SQLITE_TEXT {
+                return Some(false);
+            }
+            let length = unsafe { ffi::sqlite3_value_bytes(value) };
+            if length < 0 {
+                return None;
+            }
+            let text = unsafe { ffi::sqlite3_value_text(value) };
+            if text.is_null() {
+                return None;
+            }
+            let bytes = unsafe { slice::from_raw_parts(text, length as usize) };
+            Some(
+                str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|raw| raw.parse::<PersonalityAgentId>().ok())
+                    .is_some(),
+            )
+        }));
+        match valid {
+            Ok(Some(valid)) => unsafe { ffi::sqlite3_result_int(context, c_int::from(valid)) },
+            Ok(None) | Err(_) => unsafe {
+                ffi::sqlite3_result_error_code(context, ffi::SQLITE_CONSTRAINT_FUNCTION)
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentScope {
-    pub tenant_id: String,
-    pub agent_id: String,
-    pub conversation_id: String,
+    pub personality_agent_id: PersonalityAgentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,17 +324,72 @@ pub(crate) struct AgentScope {
     reason = "T11 freezes the per-anchor key boundary before provider-context persistence is wired"
 )]
 pub(crate) struct ProviderContextKeyAnchor {
-    pub conversation_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub anchor_id: String,
 }
 
-impl AgentScope {
-    fn validate(&self) -> Result<()> {
-        if self.tenant_id.is_empty() || self.agent_id.is_empty() || self.conversation_id.is_empty()
-        {
-            bail!("agent scope identifiers must not be empty");
+#[allow(
+    dead_code,
+    reason = "artifact broker wiring consumes the per-artifact key boundary"
+)]
+pub(crate) struct ArtifactKeyAnchor {
+    pub personality_agent_id: PersonalityAgentId,
+    pub artifact_handle: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DerivedRetentionEraseAuthority {
+    ProviderContextInvalidation,
+    MemorySummaryDeletion,
+    ArtifactDeletion,
+}
+
+impl DerivedRetentionEraseAuthority {
+    const fn purpose(self) -> DataKeyPurpose {
+        match self {
+            Self::ProviderContextInvalidation => DataKeyPurpose::ProviderContext,
+            Self::MemorySummaryDeletion => DataKeyPurpose::MemorySummary,
+            Self::ArtifactDeletion => DataKeyPurpose::Artifact,
         }
-        Ok(())
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderContextInvalidation => "provider_context_invalidation",
+            Self::MemorySummaryDeletion => "memory_summary_deletion",
+            Self::ArtifactDeletion => "artifact_deletion",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DerivedRetentionEraseTarget {
+    key_ref: String,
+    authority: DerivedRetentionEraseAuthority,
+}
+
+impl DerivedRetentionEraseTarget {
+    pub(crate) fn new(
+        key_ref: impl Into<String>,
+        authority: DerivedRetentionEraseAuthority,
+    ) -> Result<Self> {
+        let key_ref = key_ref.into();
+        if key_ref.is_empty() {
+            bail!("derived-retention crypto-erase key_ref must not be empty");
+        }
+        Ok(Self { key_ref, authority })
+    }
+}
+
+impl AgentScope {
+    pub(crate) const fn new(personality_agent_id: PersonalityAgentId) -> Self {
+        Self {
+            personality_agent_id,
+        }
+    }
+
+    pub(crate) const fn personality_agent_id(&self) -> &PersonalityAgentId {
+        &self.personality_agent_id
     }
 
     pub(crate) fn row_aad(
@@ -260,13 +399,11 @@ impl AgentScope {
         purpose: DataKeyPurpose,
     ) -> RowAad {
         RowAad {
-            tenant_id: self.tenant_id.clone(),
-            agent_id: self.agent_id.clone(),
-            conversation_id: self.conversation_id.clone(),
+            personality_agent_id: self.personality_agent_id.to_string(),
             table: table.into(),
             row_id: row_id.into(),
             purpose: purpose.as_str().to_owned(),
-            schema_version: 1,
+            schema_version: 2,
         }
     }
 }
@@ -278,6 +415,8 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
+    event_writer_finalizers: event_writer::CommitFinalizerRegistry,
+    post_commit_feed: post_commit::PostCommitFeed,
     #[cfg(test)]
     _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
@@ -295,7 +434,6 @@ impl Store {
         scope: AgentScope,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self> {
-        scope.validate()?;
         prepare_state_path(path).await?;
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -304,6 +442,9 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move { sqlite_uuid::register(connection).await })
+            })
             .connect_with(options)
             .await
             .with_context(|| format!("failed to open SQLite database {}", path.display()))?;
@@ -326,11 +467,17 @@ impl Store {
             .shared_cache(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Memory);
-        let anchor = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&options)
+        let mut anchor = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&options)
             .await
             .context("failed to open in-memory database anchor")?;
+        sqlite_uuid::register(&mut anchor)
+            .await
+            .context("failed to register SQLite identity validator on test anchor")?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move { sqlite_uuid::register(connection).await })
+            })
             .connect_with(options)
             .await?;
         let mut store = Self::finish_open(pool, scope, key_provider).await?;
@@ -339,7 +486,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub(crate) async fn session_test_store(conversation_id: &str) -> Result<Self> {
+    pub(crate) async fn session_test_store(identity_fixture: &str) -> Result<Self> {
         #[derive(Clone)]
         struct SessionTestKeyProvider(WrappingKey);
 
@@ -357,15 +504,52 @@ impl Store {
             }
         }
 
+        // Most historical callers pass a descriptive store-instance label,
+        // not an identity. Keep those fixtures on the one shared test person;
+        // tests that intentionally exercise another person pass a canonical
+        // UUIDv7 explicitly.
+        let personality_agent_id = PersonalityAgentId::parse(identity_fixture)
+            .unwrap_or_else(|_| crate::gateway::test_personality_agent_id());
         Self::in_memory(
-            AgentScope {
-                tenant_id: "session-test-tenant".to_owned(),
-                agent_id: "session-test-agent".to_owned(),
-                conversation_id: conversation_id.to_owned(),
-            },
+            AgentScope::new(personality_agent_id),
             Arc::new(SessionTestKeyProvider(WrappingKey::new(
                 "session-test-key/v1",
                 [0x5a; 32],
+            ))),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn session_test_file_store(
+        path: &Path,
+        identity_fixture: &str,
+    ) -> Result<Self> {
+        #[derive(Clone)]
+        struct SessionFileTestKeyProvider(WrappingKey);
+
+        #[async_trait::async_trait]
+        impl KeyProvider for SessionFileTestKeyProvider {
+            async fn current_key(&self) -> Result<WrappingKey> {
+                Ok(self.0.clone())
+            }
+
+            async fn key_by_id(&self, key_id: &str) -> Result<WrappingKey> {
+                if key_id != self.0.key_id() {
+                    bail!("unknown session file-test wrapping key {key_id}");
+                }
+                Ok(self.0.clone())
+            }
+        }
+
+        let personality_agent_id = PersonalityAgentId::parse(identity_fixture)
+            .unwrap_or_else(|_| crate::gateway::test_personality_agent_id());
+        Self::open(
+            path,
+            AgentScope::new(personality_agent_id),
+            Arc::new(SessionFileTestKeyProvider(WrappingKey::new(
+                "session-file-test-key/v1",
+                [0x5b; 32],
             ))),
         )
         .await
@@ -383,13 +567,11 @@ impl Store {
 
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO agent_scope(singleton, tenant_id, agent_id, conversation_id, created_at)
-             VALUES(1, ?, ?, ?, ?)
+            "INSERT INTO agent_scope(singleton, personality_agent_id, created_at)
+             VALUES(1, ?, ?)
              ON CONFLICT(singleton) DO NOTHING",
         )
-        .bind(&scope.tenant_id)
-        .bind(&scope.agent_id)
-        .bind(&scope.conversation_id)
+        .bind(scope.personality_agent_id.as_str())
         .bind(now)
         .execute(&pool)
         .await
@@ -401,6 +583,8 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
+            event_writer_finalizers: event_writer::CommitFinalizerRegistry::default(),
+            post_commit_feed: post_commit::PostCommitFeed::new(0),
             #[cfg(test)]
             _in_memory_anchor: None,
         });
@@ -414,7 +598,17 @@ impl Store {
         // Also cover the newly minted projection key and the rest of startup
         // invariants after initialization.
         store.validate_startup().await?;
-        Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
+        let mut store = Arc::try_unwrap(store)
+            .map_err(|_| anyhow!("recovery must not retain Store references"))?;
+        let initial_event_head: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM agent_events")
+                .fetch_one(&store.pool)
+                .await
+                .context("failed to initialize post-commit event high-water")?;
+        let initial_event_head = u64::try_from(initial_event_head)
+            .context("persisted event head is negative during Store open")?;
+        store.post_commit_feed = post_commit::PostCommitFeed::new(initial_event_head);
+        Ok(store)
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
@@ -435,6 +629,16 @@ impl Store {
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
     ) -> Result<HydrationOutcome> {
+        lease
+            .validate_exact(
+                &self.scope.personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| anyhow!("hydration lease is not bound to this Store PAID: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid hydration recovery fence: {error}"))?;
         self.validate_startup().await?;
 
         let writer = EventWriter::new(Arc::new(self.clone()));
@@ -536,6 +740,7 @@ impl Store {
         }
 
         let receipt = HydrationReceiptIdentity {
+            personality_agent_id: self.scope.personality_agent_id.clone(),
             lease_id: lease.lease_id().to_owned(),
             generation: lease.generation(),
             fence_id: fence.fence_id().to_owned(),
@@ -548,6 +753,10 @@ impl Store {
             });
         }
 
+        self.post_commit_feed
+            .record_hydrated_epoch(lease, fence)
+            .await
+            .context("failed to bind post-commit feed to completed Store hydration")?;
         Ok(HydrationOutcome::Complete(HydratedRunState {
             scope: self.scope.clone(),
             lease: lease.clone(),
@@ -937,10 +1146,37 @@ impl Store {
                         "provider-context record {id} row id does not match authenticated retention owner"
                     );
                 }
-                let expected_key_ref = self::provider_context::provider_context_owner_key_ref(
+                let native_coordinates = match &item.payload {
+                    ProviderContextPayload::EncryptedReasoning { .. } => None,
+                    ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    | ProviderContextPayload::AnthropicCompaction { .. } => {
+                        let coordinates: Option<(i64, i64)> = sqlx::query_as(
+                            "SELECT max_config_generation, max_window_ordinal
+                             FROM provider_context_replace_heads
+                             WHERE latest_insert_id=?",
+                        )
+                        .bind(&id)
+                        .fetch_optional(&mut **transaction)
+                        .await
+                        .context("failed to load native provider-context retention coordinates")?;
+                        match coordinates {
+                            Some((generation, ordinal)) => Some((
+                                u64::try_from(generation).context(
+                                    "native provider-context config generation is negative",
+                                )?,
+                                u64::try_from(ordinal).context(
+                                    "native provider-context window ordinal is negative",
+                                )?,
+                            )),
+                            None => Some((0, u64::from(item.ordinal))),
+                        }
+                    }
+                };
+                let expected_key_ref = self::provider_context::provider_context_item_key_ref(
                     &self.scope,
-                    &item.retention_owner,
-                );
+                    &item,
+                    native_coordinates,
+                )?;
                 if key_ref != expected_key_ref {
                     bail!(
                         "provider-context record {id} key_ref does not match authenticated retention owner"
@@ -1616,6 +1852,17 @@ impl Store {
         table: &str,
         row_id: &str,
     ) -> Result<HydratedMemorySummary> {
+        let retention_kind = match table {
+            "memory_batches" => "batch",
+            "memory_jobs" => "job",
+            _ => bail!("unsupported memory-summary table {table}"),
+        };
+        let expected_key_ref = memory_summary_key_ref(&self.scope, retention_kind, row_id);
+        if key_ref != expected_key_ref {
+            bail!(
+                "{table} projection for {row_id} uses a memory-summary key outside its exact retention unit"
+            );
+        }
         let redaction_version = u32::try_from(stored_redaction_version).with_context(|| {
             format!("{table} projection for {row_id} has redaction version out of u32 range")
         })?;
@@ -1702,6 +1949,7 @@ impl Store {
         &self,
         workspace_root: impl Into<std::path::PathBuf>,
         trust: &crate::approval::policy::ApprovalPolicyTrustStore,
+        authority_tenant_id: &str,
         minimum_version: u64,
         now: chrono::DateTime<Utc>,
     ) -> Result<crate::approval::policy::LoadedApprovalPolicy> {
@@ -1712,7 +1960,7 @@ impl Store {
 
         let workspace_root = workspace_root.into();
         let row = sqlx::query(
-            "SELECT tenant_id, agent_id, version, issued_at, expires_at, key_id,
+            "SELECT tenant_id, personality_agent_id, version, issued_at, expires_at, key_id,
                     payload_json, signature
              FROM approval_policy_cache WHERE singleton = 1",
         )
@@ -1739,7 +1987,8 @@ impl Store {
         let denormalized_matches = stored_version >= 0
             && u64::try_from(stored_version).ok() == Some(payload.version)
             && row.try_get::<String, _>("tenant_id")? == payload.tenant_id
-            && row.try_get::<String, _>("agent_id")? == payload.agent_id
+            && row.try_get::<String, _>("personality_agent_id")?
+                == payload.personality_agent_id.as_str()
             && row.try_get::<String, _>("issued_at")? == payload.issued_at.to_rfc3339()
             && row.try_get::<String, _>("expires_at")? == payload.expires_at.to_rfc3339();
         if !denormalized_matches {
@@ -1754,8 +2003,8 @@ impl Store {
         };
         if let Err(error) = trust.verify(
             &signed,
-            &self.scope.tenant_id,
-            &self.scope.agent_id,
+            authority_tenant_id,
+            self.scope.personality_agent_id(),
             minimum_version,
             now,
         ) {
@@ -1777,9 +2026,16 @@ impl Store {
         &self,
         signed: &crate::approval::policy::SignedApprovalPolicyBundle,
         trust: &crate::approval::policy::ApprovalPolicyTrustStore,
+        authority_tenant_id: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<()> {
-        trust.verify(signed, &self.scope.tenant_id, &self.scope.agent_id, 0, now)?;
+        trust.verify(
+            signed,
+            authority_tenant_id,
+            self.scope.personality_agent_id(),
+            0,
+            now,
+        )?;
         let version = i64::try_from(signed.payload.version)
             .context("approval policy version exceeds SQLite INTEGER")?;
         let payload_json =
@@ -1807,12 +2063,12 @@ impl Store {
         }
         sqlx::query(
             "INSERT INTO approval_policy_cache(
-                singleton, tenant_id, agent_id, version, issued_at, expires_at,
+                singleton, tenant_id, personality_agent_id, version, issued_at, expires_at,
                 key_id, payload_json, signature, installed_at
              ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(singleton) DO UPDATE SET
                 tenant_id=excluded.tenant_id,
-                agent_id=excluded.agent_id,
+                personality_agent_id=excluded.personality_agent_id,
                 version=excluded.version,
                 issued_at=excluded.issued_at,
                 expires_at=excluded.expires_at,
@@ -1822,7 +2078,7 @@ impl Store {
                 installed_at=excluded.installed_at",
         )
         .bind(&signed.payload.tenant_id)
-        .bind(&signed.payload.agent_id)
+        .bind(signed.payload.personality_agent_id.as_str())
         .bind(version)
         .bind(signed.payload.issued_at.to_rfc3339())
         .bind(signed.payload.expires_at.to_rfc3339())
@@ -1838,6 +2094,131 @@ impl Store {
 
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
         self.event_writer_state.clone()
+    }
+
+    fn event_writer_finalizers(&self) -> event_writer::CommitFinalizerRegistry {
+        self.event_writer_finalizers.clone()
+    }
+
+    pub(crate) fn claim_post_commit_receiver(&self) -> Result<post_commit::PostCommitReceiver> {
+        self.post_commit_feed.claim()
+    }
+
+    /// Authenticated EventWriter high-water for this exact Store-local epoch.
+    /// Production bootstrap captures it before starting any runtime producer.
+    pub(crate) fn post_commit_published_through(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<u64> {
+        self.validate_post_commit_epoch(epoch)?;
+        self.post_commit_feed.published_through()
+    }
+
+    /// Issue the one shared dispatcher/client/target capability only after the
+    /// exact runtime authority has completed Store hydration.
+    pub(crate) fn issue_post_commit_epoch(
+        &self,
+        authority: RuntimeEpochAuthority,
+        runtime_invalidated: tokio_util::sync::CancellationToken,
+    ) -> Result<PostCommitEpochCapability> {
+        self.post_commit_feed
+            .issue_epoch_capability(authority, runtime_invalidated)
+    }
+
+    pub(crate) fn validate_post_commit_epoch(
+        &self,
+        capability: &PostCommitEpochCapability,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if capability.is_unbound_test() {
+            return capability.ensure_active();
+        }
+        self.post_commit_feed.validate_epoch_capability(capability)
+    }
+
+    pub(crate) fn issue_post_commit_dispatcher_owner(
+        &self,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<PostCommitDispatcherOwner> {
+        self.validate_post_commit_epoch(epoch)?;
+        self.post_commit_feed.issue_dispatcher_owner(epoch)
+    }
+
+    fn sync_post_commit_authenticated_checkpoint(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed
+            .sync_authenticated_checkpoint(durable_head)
+    }
+
+    fn recover_post_commit_authenticated_finalizer(&self, durable_head: u64) -> Result<()> {
+        self.post_commit_feed
+            .recover_authenticated_finalizer(durable_head)
+    }
+
+    fn mint_post_commit_quiescence(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+        through: u64,
+    ) -> Result<EventWriterQuiescence> {
+        self.post_commit_feed.mint_quiescence(owner, through)
+    }
+
+    pub(crate) fn validate_post_commit_quiescence(
+        &self,
+        proof: EventWriterQuiescence,
+        owner: &PostCommitDispatcherOwner,
+        epoch: &PostCommitEpochCapability,
+    ) -> Result<u64> {
+        self.post_commit_feed
+            .validate_quiescence(proof, owner, epoch)
+    }
+
+    fn publish_committed_event_seqs(&self, seqs: &[u64]) -> Result<()> {
+        self.post_commit_feed.publish_exact(seqs)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_committed_event_receipt(&self, seqs: &[u64]) -> Result<()> {
+        self.publish_committed_event_seqs(seqs)
+    }
+
+    /// Read one bounded exact sequence page from the canonical durable FIFO.
+    ///
+    /// T26 invokes this only after T17 hydration authenticated the retained
+    /// prefix. EventWriter authenticates and extends that prefix for every
+    /// later commit. A missing or non-contiguous row is therefore a permanent
+    /// dispatcher invariant failure rather than a transport retry.
+    pub(crate) async fn committed_event_sequences(
+        &self,
+        after_seq: u64,
+        through_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        if limit == 0 {
+            bail!("post-commit dispatcher page size must be positive");
+        }
+        if through_seq <= after_seq {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq
+             FROM agent_events
+             WHERE seq > ? AND seq <= ?
+             ORDER BY seq
+             LIMIT ?",
+        )
+        .bind(i64::try_from(after_seq).context("post-commit cursor exceeds SQLite INTEGER range")?)
+        .bind(
+            i64::try_from(through_seq)
+                .context("post-commit high-water exceeds SQLite INTEGER range")?,
+        )
+        .bind(i64::try_from(limit).context("post-commit page limit exceeds SQLite range")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to read committed post-commit sequence page")?;
+
+        rows.into_iter()
+            .map(|seq| u64::try_from(seq).context("committed event sequence is negative"))
+            .collect()
     }
 
     async fn validate_startup(&self) -> Result<()> {
@@ -1857,21 +2238,19 @@ impl Store {
             bail!("SQLite foreign_key_check found a violation");
         }
 
-        let rows = sqlx::query(
-            "SELECT tenant_id, agent_id, conversation_id FROM agent_scope ORDER BY singleton",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to read agent scope")?;
+        let rows = sqlx::query("SELECT personality_agent_id FROM agent_scope ORDER BY singleton")
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to read agent scope")?;
         if rows.len() != 1 {
             bail!("agent_scope must contain exactly one row");
         }
         let row = &rows[0];
-        let stored = AgentScope {
-            tenant_id: row.try_get("tenant_id")?,
-            agent_id: row.try_get("agent_id")?,
-            conversation_id: row.try_get("conversation_id")?,
-        };
+        let stored = AgentScope::new(
+            row.try_get::<String, _>("personality_agent_id")?
+                .parse()
+                .context("stored personality agent id is invalid")?,
+        );
         if stored != self.scope {
             bail!(
                 "database scope does not match authenticated runtime scope: expected {:?}, found {:?}",
@@ -1907,7 +2286,7 @@ impl Store {
         }
 
         let active_keys = sqlx::query(
-            "SELECT key_ref, scope, purpose, conversation_id, algorithm,
+            "SELECT key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm,
                     wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys WHERE state = 'active' ORDER BY key_ref",
         )
@@ -1922,27 +2301,14 @@ impl Store {
                 bail!("active data key {key_ref} has unsupported algorithm {algorithm}");
             }
             let key_scope = match row.try_get::<String, _>("scope")?.as_str() {
-                "conversation" => DataKeyScope::Conversation,
-                "agent" => DataKeyScope::Agent,
+                "personality_agent" => DataKeyScope::PersonalityAgent,
                 value => bail!("active data key {key_ref} has unknown scope {value}"),
             };
-            let conversation_id: Option<String> = row.try_get("conversation_id")?;
-            match key_scope {
-                DataKeyScope::Conversation
-                    if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) =>
-                {
-                    bail!("active conversation key {key_ref} is bound to the wrong conversation");
-                }
-                DataKeyScope::Agent if conversation_id.is_some() => {
-                    bail!("active agent key {key_ref} unexpectedly has a conversation");
-                }
-                DataKeyScope::Agent if purpose != DataKeyPurpose::Workspace => {
-                    bail!(
-                        "active agent key {key_ref} has purpose {purpose} but agent scope only permits workspace",
-                        purpose = purpose.as_str()
-                    );
-                }
-                _ => {}
+            let personality_agent_id: String = row.try_get("personality_agent_id")?;
+            let retention_unit: String = row.try_get("retention_unit")?;
+            validate_retention_unit(purpose, &retention_unit)?;
+            if personality_agent_id != self.scope.personality_agent_id.as_str() {
+                bail!("active private key {key_ref} is bound to another personality agent");
             }
             let wrap_key_id: String = row.try_get("wrap_key_id")?;
             let wrapping_key = self
@@ -1954,7 +2320,8 @@ impl Store {
                 key_ref: key_ref.clone(),
                 scope: key_scope,
                 purpose,
-                conversation_id,
+                personality_agent_id,
+                retention_unit,
                 wrap_key_id,
             };
             unwrap_data_key(
@@ -1970,18 +2337,35 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) async fn conversation_key(
-        &self,
-        purpose: DataKeyPurpose,
-    ) -> Result<DataKeyMaterial> {
-        if purpose == DataKeyPurpose::Workspace {
-            bail!("workspace keys are agent-scoped");
+    pub(crate) async fn private_key(&self, purpose: DataKeyPurpose) -> Result<DataKeyMaterial> {
+        if matches!(
+            purpose,
+            DataKeyPurpose::ProviderContext
+                | DataKeyPurpose::MemorySummary
+                | DataKeyPurpose::Artifact
+        ) {
+            bail!(
+                "provider-context, memory-summary, and artifact keys require caller-stable retention anchors"
+            );
         }
-        if purpose == DataKeyPurpose::ProviderContext {
-            bail!("provider-context keys require a caller-stable authenticated anchor");
-        }
-        if let Some(key) = self.load_active_conversation_key(purpose).await? {
+        if let Some(key) = self.load_active_private_key(purpose).await? {
             return Ok(key);
+        }
+        let prior_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM data_keys
+             WHERE scope='personality_agent' AND personality_agent_id=? AND purpose=?
+               AND retention_unit='agent'",
+        )
+        .bind(self.scope.personality_agent_id.as_str())
+        .bind(purpose.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to inspect canonical agent-unit key history")?;
+        if prior_rows != 0 {
+            bail!(
+                "canonical {} agent-unit key is unavailable and cannot be recreated",
+                purpose.as_str()
+            );
         }
 
         let wrapping_key = self.key_provider.current_key().await?;
@@ -1989,21 +2373,22 @@ impl Store {
         let data_key = DataKeyMaterial::generate(&key_ref, purpose)?;
         let aad = KeyWrapAad {
             key_ref: key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: "agent".to_owned(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
         let result = sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id,
                 wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES(?, 'conversation', ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
+             ) VALUES(?, 'personality_agent', ?, ?, 'agent', ?, ?, ?, ?, 'active', ?, NULL)",
         )
         .bind(&key_ref)
         .bind(purpose.as_str())
-        .bind(&self.scope.conversation_id)
+        .bind(self.scope.personality_agent_id.as_str())
         .bind(WRAP_ALGORITHM)
         .bind(wrapping_key.key_id())
         .bind(wrap_nonce.as_slice())
@@ -2014,38 +2399,45 @@ impl Store {
         match result {
             Ok(_) => Ok(data_key),
             Err(error) if is_unique_violation(&error) => self
-                .load_active_conversation_key(purpose)
+                .load_active_private_key(purpose)
                 .await?
                 .ok_or_else(|| anyhow!("active data key disappeared after creation race")),
-            Err(error) => Err(error).context("failed to persist wrapped conversation data key"),
+            Err(error) => Err(error).context("failed to persist wrapped private data key"),
         }
     }
 
     pub(crate) async fn command_digest_factory(
         &self,
     ) -> Result<Arc<dyn crate::gateway::CommandDigestFactory>> {
-        let key = self.conversation_key(DataKeyPurpose::Command).await?;
-        Ok(Arc::new(ConversationCommandDigestFactory::new(&key)?))
+        let key = self.private_key(DataKeyPurpose::Command).await?;
+        Ok(Arc::new(PersonalityAgentCommandDigestFactory::new(&key)?))
     }
 
-    async fn load_active_conversation_key(
+    async fn load_active_private_key(
         &self,
         purpose: DataKeyPurpose,
     ) -> Result<Option<DataKeyMaterial>> {
-        if purpose == DataKeyPurpose::ProviderContext {
-            bail!("provider-context keys are not conversation-shared");
+        if matches!(
+            purpose,
+            DataKeyPurpose::ProviderContext
+                | DataKeyPurpose::MemorySummary
+                | DataKeyPurpose::Artifact
+        ) {
+            bail!(
+                "provider-context, memory-summary, and artifact keys require authenticated retention anchors"
+            );
         }
         let row = sqlx::query(
-            "SELECT key_ref, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT key_ref, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
-             WHERE scope = 'conversation' AND conversation_id = ? AND purpose = ?
-               AND state = 'active'",
+             WHERE scope = 'personality_agent' AND personality_agent_id = ? AND purpose = ?
+               AND retention_unit = 'agent' AND state = 'active'",
         )
-        .bind(&self.scope.conversation_id)
+        .bind(self.scope.personality_agent_id.as_str())
         .bind(purpose.as_str())
         .fetch_optional(&self.pool)
         .await
-        .context("failed to load conversation data key")?;
+        .context("failed to load private data key")?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -2054,9 +2446,10 @@ impl Store {
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
         let aad = KeyWrapAad {
             key_ref: key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: row.try_get("retention_unit")?,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2078,14 +2471,89 @@ impl Store {
         &self,
         anchor: &ProviderContextKeyAnchor,
     ) -> Result<DataKeyMaterial> {
-        if anchor.conversation_id != self.scope.conversation_id {
-            bail!("provider-context anchor belongs to a different authenticated conversation");
+        if anchor.personality_agent_id != self.scope.personality_agent_id {
+            bail!("provider-context anchor belongs to a different personality agent");
         }
-        if anchor.anchor_id.is_empty() {
-            bail!("provider-context anchor identity must not be empty");
+        if anchor.anchor_id.is_empty() || anchor.anchor_id.len() > 1024 {
+            bail!("provider-context anchor identity must be 1..=1024 bytes");
         }
 
-        let key_ref = provider_context_key_ref(&self.scope, &anchor.anchor_id);
+        self.anchored_private_key(
+            DataKeyPurpose::ProviderContext,
+            "provider_context",
+            &anchor.anchor_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn provider_context_item_key(
+        &self,
+        item: &ProviderContextItem,
+        native_coordinates: Option<(u64, u64)>,
+    ) -> Result<DataKeyMaterial> {
+        let anchor_id =
+            self::provider_context::provider_context_retention_anchor_id(item, native_coordinates)?;
+        self.provider_context_key(&ProviderContextKeyAnchor {
+            personality_agent_id: self.scope.personality_agent_id.clone(),
+            anchor_id,
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "artifact broker wiring consumes this key boundary"
+    )]
+    pub(crate) async fn artifact_key(&self, anchor: &ArtifactKeyAnchor) -> Result<DataKeyMaterial> {
+        if anchor.personality_agent_id != self.scope.personality_agent_id {
+            bail!("artifact anchor belongs to a different personality agent");
+        }
+        validate_artifact_retention_handle(
+            &self.scope.personality_agent_id,
+            &anchor.artifact_handle,
+        )?;
+        self.anchored_private_key(
+            DataKeyPurpose::Artifact,
+            "artifact",
+            &anchor.artifact_handle,
+        )
+        .await
+    }
+
+    pub(crate) async fn memory_summary_key(
+        &self,
+        unit_kind: &'static str,
+        unit_id: &str,
+    ) -> Result<DataKeyMaterial> {
+        if !matches!(unit_kind, "batch" | "job") {
+            bail!("memory-summary retention kind must be batch or job");
+        }
+        if unit_id.is_empty() || unit_id.len() > 1024 {
+            bail!("memory-summary retention identity must be 1..=1024 bytes");
+        }
+        self.anchored_private_key(
+            DataKeyPurpose::MemorySummary,
+            "memory_summary",
+            &format!("{unit_kind}:{unit_id}"),
+        )
+        .await
+    }
+
+    async fn anchored_private_key(
+        &self,
+        purpose: DataKeyPurpose,
+        retention_kind: &str,
+        anchor_id: &str,
+    ) -> Result<DataKeyMaterial> {
+        let retention_unit = anchored_retention_unit(retention_kind, &self.scope, anchor_id);
+        let key_ref = format!(
+            "{}-{}",
+            purpose.as_str(),
+            retention_unit
+                .split_once(':')
+                .expect("anchored retention unit has a kind separator")
+                .1
+        );
         let existing_state: Option<String> =
             sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
                 .bind(&key_ref)
@@ -2094,34 +2562,36 @@ impl Store {
                 .context("failed to inspect provider-context anchor key")?;
         if let Some(state) = existing_state {
             if state != "active" {
-                bail!("provider-context anchor key has been crypto-erased");
+                bail!("{retention_kind} retention key has been crypto-erased");
             }
             let key = self.data_key_by_ref(&key_ref).await?;
-            if key.purpose != DataKeyPurpose::ProviderContext {
-                bail!("provider-context anchor resolved to a key with the wrong purpose");
+            if key.purpose != purpose {
+                bail!("{retention_kind} anchor resolved to a key with the wrong purpose");
             }
             return Ok(key);
         }
 
         let wrapping_key = self.key_provider.current_key().await?;
-        let purpose = DataKeyPurpose::ProviderContext;
         let data_key = DataKeyMaterial::generate(&key_ref, purpose)?;
         let aad = KeyWrapAad {
             key_ref: key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            personality_agent_id: self.scope.personality_agent_id.to_string(),
+            retention_unit: retention_unit.clone(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
         let result = sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id,
                 wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES(?, 'conversation', 'provider_context', ?, ?, ?, ?, ?, 'active', ?, NULL)",
+             ) VALUES(?, 'personality_agent', ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
         )
         .bind(&key_ref)
-        .bind(&self.scope.conversation_id)
+        .bind(purpose.as_str())
+        .bind(self.scope.personality_agent_id.as_str())
+        .bind(&retention_unit)
         .bind(WRAP_ALGORITHM)
         .bind(wrapping_key.key_id())
         .bind(wrap_nonce.as_slice())
@@ -2132,24 +2602,25 @@ impl Store {
         match result {
             Ok(_) => Ok(data_key),
             Err(error) if is_unique_violation(&error) => {
-                let key = self
-                    .data_key_by_ref(&key_ref)
-                    .await
-                    .context("provider-context anchor key is not active after creation race")?;
-                if key.purpose != DataKeyPurpose::ProviderContext {
-                    bail!("provider-context anchor resolved to a key with the wrong purpose");
+                let key = self.data_key_by_ref(&key_ref).await.with_context(|| {
+                    format!("{retention_kind} anchor key is not active after creation race")
+                })?;
+                if key.purpose != purpose {
+                    bail!("{retention_kind} anchor resolved to a key with the wrong purpose");
                 }
                 Ok(key)
             }
-            Err(error) => Err(error).context("failed to persist provider-context anchor key"),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to persist {retention_kind} anchor key"))
+            }
         }
     }
 
     pub(crate) async fn data_key_by_ref(&self, key_ref: &str) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, conversation_id, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
-             WHERE key_ref = ? AND scope = 'conversation' AND state = 'active'",
+             WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
         .bind(key_ref)
         .fetch_optional(&self.pool)
@@ -2157,17 +2628,20 @@ impl Store {
         .context("failed to load data key by reference")?
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
-        let conversation_id: Option<String> = row.try_get("conversation_id")?;
-        if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) {
-            bail!("data key {key_ref} belongs to a different conversation");
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
+        if personality_agent_id != self.scope.personality_agent_id.as_str() {
+            bail!("data key {key_ref} belongs to another personality agent");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
         let aad = KeyWrapAad {
             key_ref: key_ref.to_owned(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose,
-            conversation_id,
+            personality_agent_id,
+            retention_unit,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2186,9 +2660,9 @@ impl Store {
         key_ref: &str,
     ) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, conversation_id, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
-             WHERE key_ref = ? AND scope = 'conversation' AND state = 'active'",
+             WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
         .bind(key_ref)
         .fetch_optional(&mut **transaction)
@@ -2196,17 +2670,20 @@ impl Store {
         .context("failed to load data key by reference in EventBatch")?
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
-        let conversation_id: Option<String> = row.try_get("conversation_id")?;
-        if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) {
-            bail!("data key {key_ref} belongs to a different conversation");
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
+        if personality_agent_id != self.scope.personality_agent_id.as_str() {
+            bail!("data key {key_ref} belongs to another personality agent");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
         let aad = KeyWrapAad {
             key_ref: key_ref.to_owned(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose,
-            conversation_id,
+            personality_agent_id,
+            retention_unit,
             wrap_key_id,
         };
         unwrap_data_key(
@@ -2219,18 +2696,17 @@ impl Store {
         )
     }
 
-    /// Destroys one conversation-owned data key inside an existing transaction.
+    /// Destroys one PAID-owned derived data key inside an existing transaction.
     /// The caller is responsible for committing the transaction.
-    pub(crate) async fn destroy_conversation_key_ref_in_transaction(
+    pub(crate) async fn destroy_private_key_ref_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
-        key_ref: &str,
+        target: &DerivedRetentionEraseTarget,
     ) -> Result<()> {
-        if key_ref.is_empty() {
-            bail!("crypto-erase key_ref must not be empty");
-        }
+        let key_ref = target.key_ref.as_str();
         let row = sqlx::query(
-            "SELECT scope, purpose, conversation_id, state, wrapped_key, wrap_nonce, destroyed_at
+            "SELECT scope, purpose, personality_agent_id, retention_unit,
+                    state, wrapped_key, wrap_nonce, destroyed_at
              FROM data_keys WHERE key_ref = ?",
         )
         .bind(key_ref)
@@ -2241,12 +2717,23 @@ impl Store {
 
         let scope: String = row.try_get("scope")?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
-        let conversation_id: Option<String> = row.try_get("conversation_id")?;
-        if scope != DataKeyScope::Conversation.as_str()
-            || conversation_id.as_deref() != Some(self.scope.conversation_id.as_str())
-            || purpose == DataKeyPurpose::Workspace
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        let retention_unit: String = row.try_get("retention_unit")?;
+        validate_retention_unit(purpose, &retention_unit)?;
+        if scope != DataKeyScope::PersonalityAgent.as_str()
+            || personality_agent_id != self.scope.personality_agent_id.as_str()
+            || purpose != target.authority.purpose()
+            || retention_unit == "agent"
+            || !matches!(
+                purpose,
+                DataKeyPurpose::ProviderContext
+                    | DataKeyPurpose::MemorySummary
+                    | DataKeyPurpose::Artifact
+            )
         {
-            bail!("crypto-erase key_ref {key_ref} is outside the active conversation scope");
+            bail!(
+                "crypto-erase key_ref {key_ref} is not an authorized derived retention-unit target"
+            );
         }
 
         let state: String = row.try_get("state")?;
@@ -2258,16 +2745,23 @@ impl Store {
                 {
                     bail!("active key_ref {key_ref} has incomplete wrapped key material");
                 }
+                tracing::info!(
+                    personality_agent_id = %self.scope.personality_agent_id,
+                    key_ref,
+                    authority = target.authority.as_str(),
+                    purpose = purpose.as_str(),
+                    "crypto-erasing derived retention-unit key"
+                );
                 let result = sqlx::query(
                     "UPDATE data_keys
                      SET state = 'destroyed', wrapped_key = NULL, wrap_nonce = NULL,
                          destroyed_at = ?
-                     WHERE key_ref = ? AND scope = 'conversation'
-                       AND conversation_id = ? AND state = 'active'",
+                     WHERE key_ref = ? AND scope = 'personality_agent'
+                       AND personality_agent_id = ? AND state = 'active'",
                 )
                 .bind(Utc::now().to_rfc3339())
                 .bind(key_ref)
-                .bind(&self.scope.conversation_id)
+                .bind(self.scope.personality_agent_id.as_str())
                 .execute(&mut **transaction)
                 .await?;
                 if result.rows_affected() != 1 {
@@ -2286,16 +2780,18 @@ impl Store {
         Ok(())
     }
 
-    /// Transactionally destroys one conversation-owned data key by its durable
-    /// reference. This is the narrow product boundary used by conversation
-    /// reset and provider-context anchor eviction.
+    /// Transactionally destroys one PAID-owned derived key by durable reference.
+    /// This does not erase the canonical life log or reset the personality.
     #[allow(
         dead_code,
         reason = "T11 product crypto-erase boundary is wired to lifecycle callers in M3"
     )]
-    pub(crate) async fn destroy_conversation_key_ref(&self, key_ref: &str) -> Result<()> {
+    pub(crate) async fn destroy_derived_retention_key(
+        &self,
+        target: &DerivedRetentionEraseTarget,
+    ) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
-        self.destroy_conversation_key_ref_in_transaction(&mut transaction, key_ref)
+        self.destroy_private_key_ref_in_transaction(&mut transaction, target)
             .await?;
         transaction.commit().await?;
         Ok(())
@@ -2306,19 +2802,97 @@ impl Store {
     dead_code,
     reason = "used by the T11 per-anchor key boundary before its production caller exists"
 )]
-fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
+fn anchored_retention_unit(kind: &str, scope: &AgentScope, anchor_id: &str) -> String {
+    debug_assert!(matches!(
+        kind,
+        "provider_context" | "memory_summary" | "artifact"
+    ));
     let mut digest = Sha256::new();
-    digest.update(b"sumi-provider-context-anchor/v1");
+    digest.update(b"sumi-retention-unit/v1");
     for field in [
-        scope.tenant_id.as_bytes(),
-        scope.agent_id.as_bytes(),
-        scope.conversation_id.as_bytes(),
+        kind.as_bytes(),
+        scope.personality_agent_id.as_str().as_bytes(),
         anchor_id.as_bytes(),
     ] {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field);
     }
-    format!("provider_context-{:x}", digest.finalize())
+    format!("{kind}:{:x}", digest.finalize())
+}
+
+fn validate_retention_unit(purpose: DataKeyPurpose, retention_unit: &str) -> Result<()> {
+    let valid_hash_unit = |prefix: &str| {
+        retention_unit.strip_prefix(prefix).is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        })
+    };
+    let valid = match purpose {
+        DataKeyPurpose::ProviderContext => valid_hash_unit("provider_context:"),
+        DataKeyPurpose::MemorySummary => valid_hash_unit("memory_summary:"),
+        DataKeyPurpose::Artifact => valid_hash_unit("artifact:"),
+        _ => retention_unit == "agent",
+    };
+    if !valid {
+        bail!(
+            "data-key retention unit {retention_unit:?} is invalid for purpose {}",
+            purpose.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn validate_artifact_retention_handle(
+    personality_agent_id: &PersonalityAgentId,
+    handle: &str,
+) -> Result<()> {
+    let prefix = format!("artifact://{personality_agent_id}/");
+    let suffix = handle
+        .strip_prefix(&prefix)
+        .ok_or_else(|| anyhow!("artifact handle must target the authenticated PAID"))?;
+    let mut components = suffix.split('/');
+    let kind = components.next().unwrap_or_default();
+    let artifact_id = components.next().unwrap_or_default();
+    if !matches!(kind, "attachments" | "tool-output") || components.next().is_some() {
+        bail!("artifact handle must use one canonical kind and one artifact ID");
+    }
+    if artifact_id.is_empty()
+        || artifact_id.len() > 200
+        || artifact_id == "."
+        || artifact_id == ".."
+        || !artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("artifact handle contains an invalid artifact ID");
+    }
+    Ok(())
+}
+
+fn provider_context_key_ref(scope: &AgentScope, anchor_id: &str) -> String {
+    let retention_unit = anchored_retention_unit("provider_context", scope, anchor_id);
+    format!(
+        "provider_context-{}",
+        retention_unit
+            .split_once(':')
+            .expect("provider-context retention unit has a separator")
+            .1
+    )
+}
+
+pub(super) fn memory_summary_key_ref(scope: &AgentScope, unit_kind: &str, unit_id: &str) -> String {
+    let retention_unit =
+        anchored_retention_unit("memory_summary", scope, &format!("{unit_kind}:{unit_id}"));
+    format!(
+        "memory_summary-{}",
+        retention_unit
+            .split_once(':')
+            .expect("memory-summary retention unit has a kind separator")
+            .1
+    )
 }
 
 #[cfg(unix)]
@@ -2464,14 +3038,13 @@ mod tests {
         StopReason, Usage, UserContent, UserMessage,
     };
     use crate::runtime::contracts::{
-        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
     use crate::store::transcript::TranscriptRecord;
     use chrono::{Duration as ChronoDuration, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
-    use sha2::Sha384;
     use tokio_util::sync::CancellationToken;
 
     struct TestKeyProvider {
@@ -2494,10 +3067,13 @@ mod tests {
 
     fn scope() -> AgentScope {
         AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         }
+    }
+
+    fn direct_chat_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+            .expect("valid direct-chat provenance")
     }
 
     fn provider() -> Arc<dyn KeyProvider> {
@@ -2532,8 +3108,8 @@ mod tests {
     ) -> crate::approval::SignedApprovalPolicyBundle {
         let payload = crate::approval::ApprovalPolicyBundle {
             schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
-            tenant_id: scope().tenant_id,
-            agent_id: scope().agent_id,
+            tenant_id: "tenant-1".to_owned(),
+            personality_agent_id: scope().personality_agent_id,
             version,
             issued_at,
             expires_at,
@@ -2551,28 +3127,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shipped_0001_upgrades_without_checksum_drift_and_backfills_fts() {
-        const SHIPPED_0001_SHA384: &str = "11c6ab3e0d06b6cd663810c0607e7d01f5ec9ab1ec42894e651b807216bd451370fc2c8ee54f4d79f215aec46bdc2989";
-        let shipped_0001 = include_bytes!("../../migrations/0001_init.sql");
-        let digest = Sha384::digest(shipped_0001)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(
-            digest, SHIPPED_0001_SHA384,
-            "migration 0001 is immutable after release"
-        );
-
-        let root = std::env::temp_dir().join(format!("sumi-store-migration-{}", Uuid::now_v7()));
-        let old_migrations = root.join("old-migrations");
+    async fn legacy_contract_database_is_rejected_without_compatibility_migration() {
+        let root = std::env::temp_dir().join(format!("sumi-store-legacy-{}", Uuid::now_v7()));
         let database = root.join("conversation.sqlite");
-        std::fs::create_dir_all(&old_migrations).expect("create old migration directory");
-        std::fs::write(old_migrations.join("0001_init.sql"), shipped_0001)
-            .expect("write shipped migration fixture");
-
-        let old_migrator = sqlx::migrate::Migrator::new(old_migrations.clone())
-            .await
-            .expect("load shipped migration");
+        std::fs::create_dir_all(&root).expect("create legacy fixture directory");
         let options = SqliteConnectOptions::new()
             .filename(&database)
             .create_if_missing(true)
@@ -2582,92 +3140,93 @@ mod tests {
             .connect_with(options)
             .await
             .expect("open legacy database");
-        old_migrator
-            .run(&pool)
-            .await
-            .expect("apply shipped migration");
-        let wrapping_key = WrappingKey::new("test-wrap-v1", [0x42; DATA_KEY_BYTES]);
-        let legacy_key = DataKeyMaterial::from_bytes(
-            "legacy-transcript-key",
-            DataKeyPurpose::Transcript,
-            [0x24; DATA_KEY_BYTES],
-        );
-        let wrap_aad = KeyWrapAad {
-            key_ref: legacy_key.key_ref.clone(),
-            scope: DataKeyScope::Conversation,
-            purpose: DataKeyPurpose::Transcript,
-            conversation_id: Some("conversation-1".to_owned()),
-            wrap_key_id: wrapping_key.key_id().to_owned(),
-        };
-        let (wrap_nonce, wrapped_key) =
-            wrap_data_key(&legacy_key, &wrapping_key, &wrap_aad).expect("wrap legacy data key");
+        sqlx::query(
+            "CREATE TABLE agent_scope(
+                singleton INTEGER PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                personality_agent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy scope schema");
+        sqlx::query(
+            "CREATE TABLE data_keys(
+                key_ref TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                personality_agent_id TEXT,
+                algorithm TEXT NOT NULL,
+                wrap_key_id TEXT NOT NULL,
+                wrap_nonce BLOB,
+                wrapped_key BLOB,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                destroyed_at TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy credential schema");
         sqlx::query(
             "INSERT INTO agent_scope(
-                singleton, tenant_id, agent_id, conversation_id, created_at
+                singleton, tenant_id, agent_id, personality_agent_id, created_at
              ) VALUES(1, 'tenant-1', 'agent-1', 'conversation-1', 'now')",
         )
         .execute(&pool)
         .await
-        .expect("insert legacy scope");
+        .expect("insert legacy scope identity");
         sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at
+                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
+                wrap_nonce, wrapped_key, state, created_at, destroyed_at
              ) VALUES(
                 'legacy-transcript-key', 'conversation', 'transcript',
-                'conversation-1', ?, 'test-wrap-v1', ?, ?, 'active', 'now'
-             )",
-        )
-        .bind(WRAP_ALGORITHM)
-        .bind(wrap_nonce.as_slice())
-        .bind(wrapped_key)
-        .execute(&pool)
-        .await
-        .expect("insert legacy data key");
-        sqlx::query(
-            "INSERT INTO messages(
-                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
-                redaction_version, interrupted, created_at
-             ) VALUES(
-                'legacy-message', 1, 'user', 'legacy-transcript-key', X'00',
-                '{}', 'legacy searchable text', 1, 0, 'now'
+                'conversation-1', 'xchacha20-poly1305/v2', 'test-wrap-v1',
+                zeroblob(24), zeroblob(48), 'active', 'now', NULL
              )",
         )
         .execute(&pool)
         .await
-        .expect("insert legacy message");
+        .expect("insert legacy credential fixture");
         pool.close().await;
 
-        let upgraded = Store::open(&database, scope(), provider())
-            .await
-            .expect("current migrator upgrades shipped database");
-        let search_text: String =
-            sqlx::query_scalar("SELECT search_text FROM messages WHERE id = 'legacy-message'")
-                .fetch_one(upgraded.pool())
-                .await
-                .expect("legacy message remains readable");
-        assert_eq!(search_text, "legacy searchable text");
-        let indexed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages_fts
-             WHERE rowid = (SELECT rowid FROM messages WHERE id = 'legacy-message')
-               AND search_text = 'legacy searchable text'",
-        )
-        .fetch_one(upgraded.pool())
-        .await
-        .expect("query backfilled FTS row");
-        assert_eq!(indexed, 1, "pre-upgrade message must be indexed");
-        let t17_tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN ('provider_context', 'memory_batches', 'approval_rules')",
-        )
-        .fetch_one(upgraded.pool())
-        .await
-        .expect("query T17 schema");
-        assert_eq!(t17_tables, 3, "all representative T17 tables must exist");
+        let error = match Store::open(&database, scope(), provider()).await {
+            Ok(_) => panic!("legacy schema and credentials must fail closed"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("migration") || rendered.contains("already exists"),
+            "unexpected legacy rejection: {rendered}"
+        );
 
-        drop(upgraded);
-        std::fs::remove_dir_all(root).expect("remove migration test directory");
+        let options = SqliteConnectOptions::new()
+            .filename(&database)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("reopen rejected legacy fixture");
+        let legacy_identity: String =
+            sqlx::query_scalar("SELECT personality_agent_id FROM agent_scope WHERE singleton=1")
+                .fetch_one(&pool)
+                .await
+                .expect("legacy identity remains intact");
+        assert_eq!(legacy_identity, "conversation-1");
+        let legacy_algorithm: String = sqlx::query_scalar(
+            "SELECT algorithm FROM data_keys WHERE key_ref='legacy-transcript-key'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("legacy credential remains intact");
+        assert_eq!(legacy_algorithm, "xchacha20-poly1305/v2");
+        pool.close().await;
+
+        std::fs::remove_dir_all(root).expect("remove legacy fixture directory");
     }
 
     fn assert_not_null_violation(error: &sqlx::Error) {
@@ -2684,17 +3243,17 @@ mod tests {
     async fn migration_rejects_null_text_primary_key_identities() {
         let store = store().await;
         let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
         let data_key_error = sqlx::query(
             "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                key_ref, scope, purpose, personality_agent_id, algorithm, wrap_key_id,
                 wrap_nonce, wrapped_key, state, created_at, destroyed_at
              ) VALUES(NULL, 'conversation', 'artifact', 'conversation-1', ?, 'wrap',
                 X'00', X'00', 'active', 'now', NULL)",
@@ -2719,14 +3278,14 @@ mod tests {
 
         let head_error = sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref,
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref,
                 head_hmac, updated_at
              ) VALUES(NULL, 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
         )
         .bind(&event_key.key_ref)
         .execute(store.pool())
         .await
-        .expect_err("event_log_heads.conversation_id NULL must be rejected");
+        .expect_err("event_log_heads.personality_agent_id NULL must be rejected");
         assert_not_null_violation(&head_error);
 
         let tool_execution_error = sqlx::query(
@@ -2754,9 +3313,15 @@ mod tests {
         assert_not_null_violation(&approval_error);
 
         store
-            .conversation_key(DataKeyPurpose::Artifact)
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/attachments/null-identity-test",
+                    scope().personality_agent_id
+                ),
+            })
             .await
-            .expect("valid data_keys identity still inserts");
+            .expect("valid anchored artifact key still inserts");
         sqlx::query(
             "INSERT INTO messages(
                 id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
@@ -2769,10 +3334,11 @@ mod tests {
         .expect("valid messages identity still inserts");
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref,
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref,
                 head_hmac, updated_at
-             ) VALUES('conversation-1', 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
+             ) VALUES(?, 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
         )
+        .bind(scope().personality_agent_id.as_str())
         .bind(&event_key.key_ref)
         .execute(store.pool())
         .await
@@ -2815,39 +3381,112 @@ mod tests {
     #[tokio::test]
     async fn migration_rejects_invalid_data_key_check_fixtures() {
         let store = store().await;
-        let mut invalid = vec![
-            ("unknown", "transcript", Some("conversation-1")),
-            ("conversation", "unknown", Some("conversation-1")),
-            ("conversation", "workspace", Some("conversation-1")),
-            ("conversation", "transcript", None),
-            ("agent", "workspace", Some("conversation-1")),
+        let paid = scope().personality_agent_id.to_string();
+        let invalid = vec![
+            (
+                "invalid-scope",
+                "conversation",
+                "transcript",
+                Some(paid.as_str()),
+                "agent".to_owned(),
+            ),
+            (
+                "invalid-purpose",
+                "personality_agent",
+                "unknown",
+                Some(paid.as_str()),
+                "agent".to_owned(),
+            ),
+            (
+                "invalid-paid",
+                "personality_agent",
+                "transcript",
+                Some("conversation-1"),
+                "agent".to_owned(),
+            ),
+            (
+                "missing-paid",
+                "personality_agent",
+                "transcript",
+                None,
+                "agent".to_owned(),
+            ),
+            (
+                "shared-wrong-retention",
+                "personality_agent",
+                "transcript",
+                Some(paid.as_str()),
+                format!("artifact:{}", "0".repeat(64)),
+            ),
+            (
+                "provider-wrong-retention",
+                "personality_agent",
+                "provider_context",
+                Some(paid.as_str()),
+                "agent".to_owned(),
+            ),
         ];
-        for purpose in [
-            "transcript",
-            "event",
-            "memory_summary",
-            "provider_context",
-            "command",
-            "mutation",
-            "artifact",
-        ] {
-            invalid.push(("agent", purpose, None));
-        }
-        for (scope, purpose, conversation_id) in invalid {
+        for (key_ref, key_scope, purpose, personality_agent_id, retention_unit) in invalid {
             let result = sqlx::query(
                 "INSERT INTO data_keys(
-                    key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, ?, ?, ?, ?, 'wrap', X'00', X'00', 'active', 'now', NULL)",
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, 'wrap', X'00', X'00', 'active', 'now', NULL)",
             )
-            .bind(format!("{scope}-{purpose}-{conversation_id:?}"))
-            .bind(scope)
+            .bind(key_ref)
+            .bind(key_scope)
             .bind(purpose)
-            .bind(conversation_id)
+            .bind(personality_agent_id)
+            .bind(retention_unit)
             .bind(WRAP_ALGORITHM)
             .execute(store.pool())
             .await;
-            assert!(result.is_err(), "fixture must violate CHECK constraints");
+            assert!(
+                result.is_err(),
+                "single-field invalid fixture {key_ref} must violate its constraint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_lookalike_retention_unit_prefixes() {
+        let store = store().await;
+        for (index, (purpose, retention_unit)) in [
+            (
+                "provider_context",
+                format!("providerXcontext:{}", "0".repeat(64)),
+            ),
+            (
+                "memory_summary",
+                format!("memoryXsummary:{}", "0".repeat(64)),
+            ),
+            ("artifact", format!("artifactX{}", "0".repeat(64))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = sqlx::query(
+                "INSERT INTO data_keys(
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(
+                    ?, 'personality_agent', ?, ?, ?, ?, 'wrap', X'00', X'00',
+                    'active', 'now', NULL
+                 )",
+            )
+            .bind(format!("lookalike-retention-{index}"))
+            .bind(purpose)
+            .bind(scope().personality_agent_id.as_str())
+            .bind(retention_unit)
+            .bind(WRAP_ALGORITHM)
+            .execute(store.pool())
+            .await;
+            assert!(
+                result.is_err(),
+                "lookalike {purpose} retention prefix must be rejected"
+            );
         }
     }
 
@@ -2867,12 +3506,17 @@ mod tests {
         {
             let result = sqlx::query(
                 "INSERT INTO data_keys(
-                    key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, 'conversation', 'artifact', 'conversation-1', ?, 'wrap',
-                    ?, ?, ?, 'now', ?)",
+                    key_ref, scope, purpose, personality_agent_id, retention_unit,
+                    algorithm, wrap_key_id, wrap_nonce, wrapped_key, state,
+                    created_at, destroyed_at
+                 ) VALUES(
+                    ?, 'personality_agent', 'artifact', ?,
+                    'artifact:0000000000000000000000000000000000000000000000000000000000000000',
+                    ?, 'wrap', ?, ?, ?, 'now', ?
+                 )",
             )
             .bind(format!("invalid-state-{index}"))
+            .bind(scope().personality_agent_id.as_str())
             .bind(WRAP_ALGORITHM)
             .bind(wrap_nonce)
             .bind(wrapped_key)
@@ -2887,23 +3531,75 @@ mod tests {
         }
 
         let key = store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("mint command key");
         let duplicate = store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("reuse active command key");
         assert_eq!(key.key_ref, duplicate.key_ref);
 
+        let command_target = DerivedRetentionEraseTarget::new(
+            key.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ArtifactDeletion,
+        )
+        .unwrap();
         store
-            .destroy_conversation_key_ref(&key.key_ref)
+            .destroy_derived_retention_key(&command_target)
             .await
-            .expect("destroy command key");
+            .expect_err("canonical command key cannot be selectively erased");
+        sqlx::query(
+            "UPDATE data_keys
+             SET state='destroyed', wrap_nonce=NULL, wrapped_key=NULL, destroyed_at='agent-death'
+             WHERE key_ref=?",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("simulate supervisor-owned whole-agent key destruction");
+        assert!(
+            store
+                .private_key(DataKeyPurpose::Command)
+                .await
+                .expect_err("destroyed canonical command key cannot be replaced")
+                .to_string()
+                .contains("cannot be recreated")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM data_keys
+                 WHERE personality_agent_id=? AND purpose='command' AND retention_unit='agent'"
+            )
+            .bind(scope().personality_agent_id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            1
+        );
+        let artifact = store
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/attachments/state-transition",
+                    scope().personality_agent_id
+                ),
+            })
+            .await
+            .unwrap();
+        let artifact_target = DerivedRetentionEraseTarget::new(
+            artifact.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ArtifactDeletion,
+        )
+        .unwrap();
+        store
+            .destroy_derived_retention_key(&artifact_target)
+            .await
+            .expect("destroy derived artifact key");
         let destroyed = sqlx::query(
             "SELECT state, wrapped_key, wrap_nonce, destroyed_at FROM data_keys WHERE key_ref = ?",
         )
-        .bind(&key.key_ref)
+        .bind(&artifact.key_ref)
         .fetch_one(store.pool())
         .await
         .expect("read destroyed key");
@@ -2914,34 +3610,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_ref_crypto_erase_is_scoped_transactional_and_idempotent() {
+    async fn derived_crypto_erase_is_typed_transactional_and_idempotent() {
         let store = store().await;
         let transcript = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint conversation transcript key");
         let provider_anchor = store
             .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
                 anchor_id: "message-1:7".to_owned(),
             })
             .await
             .expect("mint provider-context anchor key");
 
-        for key_ref in [&transcript.key_ref, &provider_anchor.key_ref] {
-            store
-                .destroy_conversation_key_ref(key_ref)
+        let transcript_target = DerivedRetentionEraseTarget::new(
+            transcript.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+        )
+        .unwrap();
+        store
+            .destroy_derived_retention_key(&transcript_target)
+            .await
+            .expect_err("canonical transcript key cannot be selectively erased");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref=?")
+                .bind(&transcript.key_ref)
+                .fetch_one(store.pool())
                 .await
-                .expect("destroy conversation key");
+                .unwrap(),
+            "active"
+        );
+
+        let provider_target = DerivedRetentionEraseTarget::new(
+            provider_anchor.key_ref.clone(),
+            DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+        )
+        .unwrap();
+        for target in [&provider_target, &provider_target] {
             store
-                .destroy_conversation_key_ref(key_ref)
+                .destroy_derived_retention_key(target)
                 .await
-                .expect("repeated destroy is an idempotent no-op");
+                .expect("derived-key destroy is idempotent");
             let row = sqlx::query(
                 "SELECT state, wrapped_key, wrap_nonce, destroyed_at
                  FROM data_keys WHERE key_ref = ?",
             )
-            .bind(key_ref)
+            .bind(&provider_anchor.key_ref)
             .fetch_one(store.pool())
             .await
             .expect("read destroyed key");
@@ -2951,33 +3666,31 @@ mod tests {
             assert!(row.get::<Option<String>, _>("destroyed_at").is_some());
         }
 
-        sqlx::query(
-            "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES('workspace-key', 'agent', 'workspace', NULL, ?, 'wrap',
-                X'00', X'00', 'active', 'now', NULL)",
-        )
-        .bind(WRAP_ALGORITHM)
-        .execute(store.pool())
-        .await
-        .expect("insert agent-scoped fixture");
-        let error = store
-            .destroy_conversation_key_ref("workspace-key")
+        let workspace = store
+            .private_key(DataKeyPurpose::Workspace)
             .await
-            .expect_err("conversation erase must reject an agent key");
+            .expect("mint PAID-owned workspace key");
+        let error = store
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    workspace.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::ArtifactDeletion,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect_err("private crypto erase must reject the workspace key");
         assert!(
             error
                 .to_string()
-                .contains("outside the active conversation")
+                .contains("not an authorized derived retention-unit target")
         );
         assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM data_keys WHERE key_ref='workspace-key'",
-            )
-            .fetch_one(store.pool())
-            .await
-            .expect("workspace key remains active"),
+            sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref=?",)
+                .bind(&workspace.key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("workspace key remains active"),
             "active"
         );
     }
@@ -2986,11 +3699,11 @@ mod tests {
     async fn provider_context_keys_are_stable_per_anchor_and_independently_erasable() {
         let store = store().await;
         let first_anchor = ProviderContextKeyAnchor {
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             anchor_id: "message-1:7".to_owned(),
         };
         let second_anchor = ProviderContextKeyAnchor {
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
             anchor_id: "message-2:8".to_owned(),
         };
         let first = store
@@ -3007,6 +3720,18 @@ mod tests {
             .expect("mint second anchor key");
         assert_eq!(first.key_ref, first_retry.key_ref);
         assert_ne!(first.key_ref, second.key_ref);
+        let retention_units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='provider_context' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load provider-context retention units");
+        assert_eq!(retention_units.len(), 2);
+        assert!(retention_units.iter().all(|unit| {
+            unit.starts_with("provider_context:") && unit.len() == "provider_context:".len() + 64
+        }));
+        assert_ne!(retention_units[0], retention_units[1]);
 
         let second_aad = store.scope().row_aad(
             "provider_context",
@@ -3016,7 +3741,13 @@ mod tests {
         let second_ciphertext =
             encrypt_content(&second, b"second-anchor", &second_aad).expect("encrypt second anchor");
         store
-            .destroy_conversation_key_ref(&first.key_ref)
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    first.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::ProviderContextInvalidation,
+                )
+                .unwrap(),
+            )
             .await
             .expect("erase first anchor only");
         assert!(
@@ -3039,50 +3770,229 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_context_key_api_rejects_shared_empty_and_cross_conversation_use() {
+    async fn artifact_keys_are_stable_per_handle_and_not_shared_at_paid_grain() {
         let store = store().await;
         assert!(
             store
-                .conversation_key(DataKeyPurpose::ProviderContext)
+                .private_key(DataKeyPurpose::Artifact)
+                .await
+                .expect_err("artifact keys require a handle retention anchor")
+                .to_string()
+                .contains("retention anchors")
+        );
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: scope().personality_agent_id,
+                    artifact_handle: "artifact://0198f0f4-9b72-7000-8000-000000000002/wrong"
+                        .to_owned(),
+                })
+                .await
+                .expect_err("handle PAID must match the authenticated Store")
+                .to_string()
+                .contains("authenticated PAID")
+        );
+        for invalid_suffix in [
+            "unknown/id",
+            "attachments",
+            "attachments/",
+            "attachments/.",
+            "attachments/..",
+            "attachments/id/extra",
+            "attachments/non_ascii_é",
+        ] {
+            assert!(
+                store
+                    .artifact_key(&ArtifactKeyAnchor {
+                        personality_agent_id: scope().personality_agent_id,
+                        artifact_handle: format!(
+                            "artifact://{}/{invalid_suffix}",
+                            scope().personality_agent_id
+                        ),
+                    })
+                    .await
+                    .is_err(),
+                "unrouteable artifact handle suffix {invalid_suffix:?} must be rejected"
+            );
+        }
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: scope().personality_agent_id,
+                    artifact_handle: format!(
+                        "artifact://{}/tool-output/{}",
+                        scope().personality_agent_id,
+                        "a".repeat(201)
+                    ),
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .artifact_key(&ArtifactKeyAnchor {
+                    personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
+                    artifact_handle: format!(
+                        "artifact://{}/attachments/wrong-typed-anchor",
+                        scope().personality_agent_id
+                    ),
+                })
+                .await
+                .expect_err("typed anchor PAID must match the authenticated Store")
+                .to_string()
+                .contains("different personality agent")
+        );
+        let first_anchor = ArtifactKeyAnchor {
+            personality_agent_id: scope().personality_agent_id,
+            artifact_handle: format!("artifact://{}/attachments/a", scope().personality_agent_id),
+        };
+        let second_anchor = ArtifactKeyAnchor {
+            personality_agent_id: scope().personality_agent_id,
+            artifact_handle: format!("artifact://{}/tool-output/b", scope().personality_agent_id),
+        };
+        let first = store.artifact_key(&first_anchor).await.unwrap();
+        let first_replay = store.artifact_key(&first_anchor).await.unwrap();
+        let second = store.artifact_key(&second_anchor).await.unwrap();
+        assert_eq!(first.key_ref, first_replay.key_ref);
+        assert_ne!(first.key_ref, second.key_ref);
+        let units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='artifact' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(
+            units.iter().all(|unit| {
+                unit.starts_with("artifact:") && unit.len() == "artifact:".len() + 64
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_summary_keys_are_stable_per_batch_or_job_and_independently_erasable() {
+        let store = store().await;
+        let batch = store.memory_summary_key("batch", "batch-1").await.unwrap();
+        let batch_replay = store.memory_summary_key("batch", "batch-1").await.unwrap();
+        let other_batch = store.memory_summary_key("batch", "batch-2").await.unwrap();
+        let job = store.memory_summary_key("job", "batch-1").await.unwrap();
+        assert_eq!(batch.key_ref, batch_replay.key_ref);
+        assert_ne!(batch.key_ref, other_batch.key_ref);
+        assert_ne!(
+            batch.key_ref, job.key_ref,
+            "batch and job domains must remain distinct for the same caller ID"
+        );
+
+        let job_aad =
+            store
+                .scope()
+                .row_aad("memory_jobs", "batch-1", DataKeyPurpose::MemorySummary);
+        let job_ciphertext =
+            encrypt_content(&job, b"job-summary", &job_aad).expect("encrypt job summary");
+        store
+            .destroy_derived_retention_key(
+                &DerivedRetentionEraseTarget::new(
+                    batch.key_ref.clone(),
+                    DerivedRetentionEraseAuthority::MemorySummaryDeletion,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("erase only the batch summary key");
+        assert!(
+            store
+                .memory_summary_key("batch", "batch-1")
+                .await
+                .expect_err("erased batch key cannot be reminted")
+                .to_string()
+                .contains("crypto-erased")
+        );
+        let job_replay = store.memory_summary_key("job", "batch-1").await.unwrap();
+        assert_eq!(
+            decrypt_content(&job_replay, &job_ciphertext, &job_aad).unwrap(),
+            b"job-summary"
+        );
+
+        let units: Vec<String> = sqlx::query_scalar(
+            "SELECT retention_unit FROM data_keys
+             WHERE purpose='memory_summary' ORDER BY retention_unit",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|unit| {
+            unit.starts_with("memory_summary:") && unit.len() == "memory_summary:".len() + 64
+        }));
+    }
+
+    #[tokio::test]
+    async fn provider_context_key_api_rejects_shared_empty_and_cross_paid_use() {
+        let store = store().await;
+        assert!(
+            store
+                .private_key(DataKeyPurpose::ProviderContext)
                 .await
                 .expect_err("purpose-level shared lookup is forbidden")
                 .to_string()
-                .contains("caller-stable authenticated anchor")
+                .contains("caller-stable retention anchors")
         );
         assert!(
             store
                 .provider_context_key(&ProviderContextKeyAnchor {
-                    conversation_id: "conversation-1".to_owned(),
+                    personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
                     anchor_id: String::new(),
                 })
                 .await
                 .expect_err("empty anchor")
                 .to_string()
-                .contains("must not be empty")
+                .contains("1..=1024 bytes")
         );
         assert!(
             store
                 .provider_context_key(&ProviderContextKeyAnchor {
-                    conversation_id: "conversation-2".to_owned(),
+                    personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
                     anchor_id: "message-1:7".to_owned(),
                 })
                 .await
-                .expect_err("cross-conversation anchor")
+                .expect_err("cross-PAID anchor")
                 .to_string()
-                .contains("different authenticated conversation")
+                .contains("different personality agent")
         );
     }
 
     #[tokio::test]
-    async fn conversation_key_rejects_workspace_purpose() {
+    async fn private_workspace_key_is_stable_and_agent_scoped() {
         let store = store().await;
-        assert!(
-            store
-                .conversation_key(DataKeyPurpose::Workspace)
-                .await
-                .expect_err("workspace keys must be agent-scoped")
-                .to_string()
-                .contains("workspace keys are agent-scoped")
+        let first = store
+            .private_key(DataKeyPurpose::Workspace)
+            .await
+            .expect("mint agent-scoped workspace key");
+        let second = store
+            .private_key(DataKeyPurpose::Workspace)
+            .await
+            .expect("reuse agent-scoped workspace key");
+        assert_eq!(first.key_ref, second.key_ref);
+        assert_eq!(first.purpose, DataKeyPurpose::Workspace);
+
+        let row: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT scope, purpose, personality_agent_id, retention_unit, state
+             FROM data_keys WHERE key_ref = ?",
+        )
+        .bind(&first.key_ref)
+        .fetch_one(store.pool())
+        .await
+        .expect("load persisted workspace key");
+        assert_eq!(
+            row,
+            (
+                "personality_agent".to_owned(),
+                "workspace".to_owned(),
+                store.scope().personality_agent_id.to_string(),
+                "agent".to_owned(),
+                "active".to_owned(),
+            )
         );
     }
 
@@ -3218,57 +4128,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_accepts_every_valid_data_key_scope_and_purpose_pair() {
+    async fn data_key_apis_persist_only_paid_scoped_retention_units() {
         let store = store().await;
         for purpose in [
-            "transcript",
-            "event",
-            "memory_summary",
-            "provider_context",
-            "command",
-            "mutation",
-            "artifact",
+            DataKeyPurpose::Transcript,
+            DataKeyPurpose::Event,
+            DataKeyPurpose::Command,
+            DataKeyPurpose::Mutation,
+            DataKeyPurpose::Workspace,
         ] {
-            if purpose == "mutation" {
-                let active_mutation_keys: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM data_keys
-                     WHERE scope = 'conversation' AND purpose = 'mutation'
-                       AND conversation_id = 'conversation-1' AND state = 'active'",
-                )
-                .fetch_one(store.pool())
+            store
+                .private_key(purpose)
                 .await
-                .expect("count startup projection-authentication key");
-                assert_eq!(
-                    active_mutation_keys, 1,
-                    "startup projection authentication proves the valid conversation/mutation pair"
-                );
-                continue;
-            }
-            sqlx::query(
-                "INSERT INTO data_keys(
-                    key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                    wrap_nonce, wrapped_key, state, created_at, destroyed_at
-                 ) VALUES(?, 'conversation', ?, 'conversation-1', ?, 'wrap',
-                    X'00', X'00', 'active', 'now', NULL)",
-            )
-            .bind(format!("valid-conversation-{purpose}"))
-            .bind(purpose)
-            .bind(WRAP_ALGORITHM)
-            .execute(store.pool())
-            .await
-            .unwrap_or_else(|error| panic!("valid conversation purpose {purpose}: {error}"));
+                .unwrap_or_else(|error| panic!("mint shared {} key: {error}", purpose.as_str()));
         }
-        sqlx::query(
-            "INSERT INTO data_keys(
-                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
-                wrap_nonce, wrapped_key, state, created_at, destroyed_at
-             ) VALUES('valid-agent-workspace', 'agent', 'workspace', NULL, ?, 'wrap',
-                X'00', X'00', 'active', 'now', NULL)",
+        store
+            .memory_summary_key("batch", "retention-test-batch")
+            .await
+            .expect("mint batch summary key");
+        store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                anchor_id: "retention-test-context".to_owned(),
+            })
+            .await
+            .expect("mint provider-context key");
+        store
+            .artifact_key(&ArtifactKeyAnchor {
+                personality_agent_id: scope().personality_agent_id,
+                artifact_handle: format!(
+                    "artifact://{}/attachments/retention-test",
+                    scope().personality_agent_id
+                ),
+            })
+            .await
+            .expect("mint artifact key");
+
+        let rows = sqlx::query(
+            "SELECT purpose, personality_agent_id, retention_unit
+             FROM data_keys WHERE state='active'",
         )
-        .bind(WRAP_ALGORITHM)
-        .execute(store.pool())
+        .fetch_all(store.pool())
         .await
-        .expect("agent workspace is the valid agent-scoped purpose");
+        .expect("load persisted data-key identities");
+        assert!(!rows.is_empty());
+        for row in rows {
+            let purpose = DataKeyPurpose::parse(row.get("purpose")).expect("known purpose");
+            assert_eq!(
+                row.get::<String, _>("personality_agent_id"),
+                scope().personality_agent_id.as_str()
+            );
+            validate_retention_unit(purpose, row.get("retention_unit"))
+                .expect("purpose-specific retention unit");
+        }
     }
 
     #[tokio::test]
@@ -3277,7 +4189,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
         let wrong_scope = AgentScope {
-            conversation_id: "conversation-2".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
             ..scope()
         };
         let error = match Store::finish_open(pool, wrong_scope, provider()).await {
@@ -3285,6 +4197,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("database scope does not match"));
+    }
+
+    #[tokio::test]
+    async fn clean_store_initializes_provider_projection_schema_v2() {
+        let store = store().await;
+        let (schema_version, state, revision): (i64, String, i64) = sqlx::query_as(
+            "SELECT schema_version, state, revision
+             FROM provider_context_projection_head
+             WHERE singleton = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load provider-context projection genesis");
+        assert_eq!(schema_version, 2);
+        assert_eq!(state, "active");
+        assert_eq!(revision, 0);
     }
 
     #[tokio::test]
@@ -3303,7 +4231,7 @@ mod tests {
         drop(store);
 
         let wrong_scope = AgentScope {
-            conversation_id: "conversation-2".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
             ..scope()
         };
         let error = match Store::finish_open(pool.clone(), wrong_scope, provider()).await {
@@ -3323,7 +4251,8 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM data_keys
-                 WHERE purpose = 'mutation' AND conversation_id = 'conversation-2'",
+                 WHERE purpose = 'mutation'
+                   AND personality_agent_id = '0198f0f4-9b72-7000-8000-000000000002'",
             )
             .fetch_one(&pool)
             .await
@@ -3357,7 +4286,7 @@ mod tests {
     async fn startup_rejects_tampered_wrapped_key() {
         let store = store().await;
         store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
         sqlx::query("UPDATE data_keys SET wrapped_key = zeroblob(length(wrapped_key))")
@@ -3382,7 +4311,7 @@ mod tests {
     async fn startup_rejects_unknown_active_key_algorithm() {
         let store = store().await;
         store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
         sqlx::query("UPDATE data_keys SET algorithm = 'future/v9'")
@@ -3403,7 +4332,7 @@ mod tests {
     async fn startup_rejects_unsupported_message_redaction_version() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         sqlx::query(
@@ -3461,7 +4390,7 @@ mod tests {
     async fn hydration_key_lookup_rejects_wrong_purpose() {
         let store = store().await;
         let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
 
@@ -3487,7 +4416,7 @@ mod tests {
     async fn provider_context_fk_prevents_message_delete_cascade() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key for provider_context row");
 
@@ -3529,6 +4458,7 @@ mod tests {
 
     fn test_lease(raw: u64) -> ProcessGenerationLease {
         ProcessGenerationLease::new(
+            scope().personality_agent_id,
             ProcessGeneration::from_wire(raw).expect("valid generation"),
             "test-lease",
         )
@@ -3557,7 +4487,7 @@ mod tests {
 
     async fn seed_persisted_assistant(store: &Store, message_id: &str, seq: u64, spec: &ModelSpec) {
         let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let public = PublicMessage::Assistant(PublicAssistantMessage {
@@ -3625,12 +4555,8 @@ mod tests {
         };
         let footprint =
             eviction_footprint_for_payload(&spec, &item.payload).expect("canonical footprint");
-        let anchor_id = format!("{message_id}:{message_seq}");
         let key = store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: store.scope().conversation_id.clone(),
-                anchor_id,
-            })
+            .provider_context_item_key(&item, None)
             .await
             .expect("mint provider context key");
         let record = EncryptedProviderContextRecord::encrypt(
@@ -4164,7 +5090,7 @@ mod tests {
     async fn memory_batch_summary_hydrates_successfully() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-ok")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4188,7 +5114,7 @@ mod tests {
     async fn memory_batch_summary_rejects_tampered_ciphertext() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-tamper")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4218,13 +5144,13 @@ mod tests {
     async fn memory_batch_summary_rejects_wrong_key_ref() {
         let store = store().await;
         let memory_key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-wrong-key")
             .await
             .expect("mint memory summary key");
-        let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+        let other_memory_key = store
+            .memory_summary_key("batch", "different-batch")
             .await
-            .expect("mint transcript key");
+            .expect("mint a different batch summary key");
         let payload = test_memory_payload();
         let (ciphertext, projection, version) = encrypt_memory_projection(
             &store,
@@ -4235,7 +5161,7 @@ mod tests {
         );
         let error = authenticate_memory_summary(
             &store,
-            &transcript_key.key_ref,
+            &other_memory_key.key_ref,
             &ciphertext,
             &projection,
             i64::from(version),
@@ -4247,8 +5173,7 @@ mod tests {
         .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
-            message.contains("has purpose transcript")
-                && message.contains("expected memory_summary"),
+            message.contains("outside its exact retention unit"),
             "{message}"
         );
     }
@@ -4257,7 +5182,7 @@ mod tests {
     async fn memory_batch_summary_rejects_mismatched_projection() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-bad-projection")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4292,7 +5217,7 @@ mod tests {
     async fn memory_batch_summary_rejects_stale_redaction_version() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("batch", "batch-stale")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4321,7 +5246,7 @@ mod tests {
     async fn memory_job_result_hydrates_successfully() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-ok")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4345,7 +5270,7 @@ mod tests {
     async fn memory_job_result_rejects_tampered_ciphertext() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-tamper")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4375,13 +5300,13 @@ mod tests {
     async fn memory_job_result_rejects_wrong_key_ref() {
         let store = store().await;
         let memory_key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-wrong-key")
             .await
             .expect("mint memory summary key");
-        let transcript_key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+        let other_memory_key = store
+            .memory_summary_key("job", "different-job")
             .await
-            .expect("mint transcript key");
+            .expect("mint a different job summary key");
         let payload = test_memory_payload();
         let (ciphertext, projection, version) = encrypt_memory_projection(
             &store,
@@ -4392,7 +5317,7 @@ mod tests {
         );
         let error = authenticate_memory_summary(
             &store,
-            &transcript_key.key_ref,
+            &other_memory_key.key_ref,
             &ciphertext,
             &projection,
             i64::from(version),
@@ -4404,8 +5329,7 @@ mod tests {
         .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
-            message.contains("has purpose transcript")
-                && message.contains("expected memory_summary"),
+            message.contains("outside its exact retention unit"),
             "{message}"
         );
     }
@@ -4414,7 +5338,7 @@ mod tests {
     async fn memory_job_result_rejects_mismatched_projection() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-bad-projection")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -4444,7 +5368,7 @@ mod tests {
     async fn memory_job_result_rejects_stale_redaction_version() {
         let store = store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
+            .memory_summary_key("job", "job-stale")
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
@@ -5018,6 +5942,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: "pending logical suffix".to_owned(),
                     attachments: Vec::new(),
@@ -5135,6 +6061,8 @@ mod tests {
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
                 seq,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: text.to_owned(),
                     attachments: Vec::new(),
@@ -5168,7 +6096,7 @@ mod tests {
         let timestamp = DateTime::parse_from_rfc3339(&received_at)
             .expect("fixture receipt time is RFC3339")
             .with_timezone(&Utc);
-        let message_id = user_message_id(&command_id);
+        let message_id = user_message_id(store.scope().personality_agent_id(), &command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -5244,7 +6172,11 @@ mod tests {
                         ],
                     },
                 ],
-                injected_commands: vec![InjectedCommand::new(seq, command_id.clone())],
+                injected_commands: vec![InjectedCommand::new(
+                    seq,
+                    command_id.clone(),
+                    direct_chat_provenance(),
+                )],
             })
             .await
             .expect("commit canonical fixture MessageEnd");
@@ -5430,7 +6362,7 @@ mod tests {
         text: &str,
     ) -> TranscriptRecord {
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let message = PublicMessage::User(UserMessage {
@@ -5509,7 +6441,7 @@ mod tests {
             timestamp: Utc::now(),
         });
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("reuse transcript key");
         let raw = serde_json::to_vec(&replacement).expect("serialize replacement message");
@@ -5768,7 +6700,7 @@ mod tests {
             now + ChronoDuration::hours(1),
         );
         store
-            .install_approval_policy_bundle(&bundle, &approval_trust(), now)
+            .install_approval_policy_bundle(&bundle, &approval_trust(), "tenant-1", now)
             .await
             .expect("install signed policy");
         let pattern = serde_json::to_string(&rule).expect("serialize rule");
@@ -5790,7 +6722,7 @@ mod tests {
             .await
             .expect("reopen file-backed store");
         let loaded = store
-            .load_approval_policy("/workspace", &approval_trust(), 7, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 7, now)
             .await
             .expect("load persisted rules into policy");
         assert!(matches!(
@@ -5845,7 +6777,7 @@ mod tests {
             .await
             .expect("insert uncovered local proposal");
         let reloaded = store
-            .load_approval_policy("/workspace", &approval_trust(), 7, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 7, now)
             .await
             .expect("reload signed policy");
         assert!(!reloaded.policy.rules().contains(&proposal));
@@ -5901,7 +6833,7 @@ mod tests {
         };
 
         let missing = store
-            .load_approval_policy("/workspace", &approval_trust(), 1, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 1, now)
             .await
             .expect("missing cache loads Ask policy");
         assert_eq!(
@@ -5919,13 +6851,13 @@ mod tests {
         );
         assert!(
             store
-                .install_approval_policy_bundle(&expired, &approval_trust(), now)
+                .install_approval_policy_bundle(&expired, &approval_trust(), "tenant-1", now)
                 .await
                 .is_err()
         );
 
         let wrong_scope_payload = crate::approval::ApprovalPolicyBundle {
-            tenant_id: "other-tenant".to_owned(),
+            tenant_id: "tenant-2".to_owned(),
             ..signed_approval_bundle(
                 1,
                 vec![rule.clone()],
@@ -5944,7 +6876,7 @@ mod tests {
         };
         assert!(
             store
-                .install_approval_policy_bundle(&wrong_scope, &approval_trust(), now)
+                .install_approval_policy_bundle(&wrong_scope, &approval_trust(), "tenant-1", now)
                 .await
                 .is_err()
         );
@@ -5956,13 +6888,14 @@ mod tests {
             now + ChronoDuration::hours(1),
         );
         store
-            .install_approval_policy_bundle(&valid, &approval_trust(), now)
+            .install_approval_policy_bundle(&valid, &approval_trust(), "tenant-1", now)
             .await
             .expect("install valid bundle");
         let expired_after_install = store
             .load_approval_policy(
                 "/workspace",
                 &approval_trust(),
+                "tenant-1",
                 2,
                 now + ChronoDuration::hours(2),
             )
@@ -5977,7 +6910,7 @@ mod tests {
         assert_unavailable_asks(&expired_after_install.policy);
 
         let stale = store
-            .load_approval_policy("/workspace", &approval_trust(), 3, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 3, now)
             .await
             .expect("stale cache loads Ask policy");
         assert!(matches!(
@@ -5993,7 +6926,7 @@ mod tests {
             .await
             .expect("tamper cached signature");
         let tampered = store
-            .load_approval_policy("/workspace", &approval_trust(), 2, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 2, now)
             .await
             .expect("tampered cache loads Ask policy");
         assert!(matches!(
@@ -6022,26 +6955,26 @@ mod tests {
             now + ChronoDuration::hours(2),
         );
         store
-            .install_approval_policy_bundle(&v1, &approval_trust(), now)
+            .install_approval_policy_bundle(&v1, &approval_trust(), "tenant-1", now)
             .await
             .expect("install v1");
         store
-            .install_approval_policy_bundle(&v1, &approval_trust(), now)
+            .install_approval_policy_bundle(&v1, &approval_trust(), "tenant-1", now)
             .await
             .expect("exact v1 replay");
         store
-            .install_approval_policy_bundle(&v2, &approval_trust(), now)
+            .install_approval_policy_bundle(&v2, &approval_trust(), "tenant-1", now)
             .await
             .expect("replace with v2");
         assert!(
             store
-                .install_approval_policy_bundle(&v1, &approval_trust(), now)
+                .install_approval_policy_bundle(&v1, &approval_trust(), "tenant-1", now)
                 .await
                 .is_err(),
             "version rollback must fail"
         );
         let loaded = store
-            .load_approval_policy("/workspace", &approval_trust(), 2, now)
+            .load_approval_policy("/workspace", &approval_trust(), "tenant-1", 2, now)
             .await
             .expect("load v2");
         assert!(matches!(
@@ -6137,6 +7070,16 @@ mod tests {
         );
     }
 
+    async fn register_sqlite_migration_fixture_functions(pool: &SqlitePool) {
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire migration fixture connection");
+        sqlite_uuid::register(&mut connection)
+            .await
+            .expect("register canonical UUIDv7 migration fixture function");
+    }
+
     #[tokio::test]
     async fn migration_0006_upgrades_from_0001_and_0002_without_data_loss() {
         let pool = SqlitePoolOptions::new()
@@ -6144,6 +7087,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open upgrade test pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
 
         let one = MIGRATOR
             .migrations
@@ -6289,6 +7233,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open migration fixture pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
         for migration in MIGRATOR
             .migrations
             .iter()
@@ -6368,7 +7313,7 @@ mod tests {
     async fn migration_0009_memory_projection_event_foreign_keys_are_deferred() {
         let store = store().await;
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("mint event key");
 
@@ -6430,6 +7375,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("open migration 0008 test pool");
+        register_sqlite_migration_fixture_functions(&pool).await;
 
         for migration in MIGRATOR
             .migrations

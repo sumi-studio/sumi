@@ -7,21 +7,28 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
-use super::{DeliveryEpoch, EventSender, SupervisorHandle, SupervisorLifecycle};
+#[cfg(test)]
+use super::SupervisorLifecycle;
+use super::{DeliveryEpoch, EventSender, SupervisorHandle, SupervisorRuntime};
 use crate::agent::AgentEvent;
 use crate::gateway::{
     AgentHello, ApiHello, Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError,
     InboundCommand, OutboundFrame,
 };
+use crate::runtime::contracts::PersonalityAgentId;
 
 #[async_trait]
 pub(crate) trait SessionEventDelivery: Send + Sync + 'static {
     async fn on_durable_committed(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission>;
-    async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()>;
+    async fn on_volatile(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        event: AgentEvent,
+    ) -> Result<()>;
 }
 
 /// Result of passing one committed durable sequence through T17.
@@ -36,11 +43,13 @@ pub(crate) enum DurableEventAdmission {
     Deferred { after_epoch: Option<DeliveryEpoch> },
 }
 
-/// Opaque T17 capability transferred from a durable source to Session.
+/// Opaque T26/T17 delivery capability transferred from a durable source to
+/// Session.
 ///
-/// Session can only notify a committed sequence or offer a typed volatile
-/// event. It never receives a `DeliveryEpoch` and cannot send an event frame
-/// directly to T24.
+/// Durable sequences await the one post-commit dispatcher's cumulative
+/// admission proof; volatile events are offered directly to T17's online
+/// delivery gate. Session never receives a `DeliveryEpoch` and cannot send an
+/// event frame directly to T24.
 #[derive(Clone)]
 pub struct SessionEventSink {
     delivery: Arc<dyn SessionEventDelivery>,
@@ -55,16 +64,20 @@ impl SessionEventSink {
 
     async fn on_durable_committed(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         seq: u64,
     ) -> Result<DurableEventAdmission> {
         self.delivery
-            .on_durable_committed(conversation_id, seq)
+            .on_durable_committed(personality_agent_id, seq)
             .await
     }
 
-    async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()> {
-        self.delivery.on_volatile(conversation_id, event).await
+    async fn on_volatile(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        event: AgentEvent,
+    ) -> Result<()> {
+        self.delivery.on_volatile(personality_agent_id, event).await
     }
 }
 
@@ -74,20 +87,50 @@ impl SessionEventSink {
 /// The supervisor remains the sole owner of connection epochs, delivery epoch
 /// creation/invalidation, stale-frame rejection, and the authenticated T17
 /// delivery mode. Session events are exhaustively separated from ACKs: durable
-/// events notify T17 by sequence, volatile events enter T17's Online+Raw gate,
-/// and only ACKs may use T24's lossy direct path.
+/// events await T26's one ordered post-commit proof, volatile events enter
+/// T17's Online+Raw gate, and only ACKs may use T24's direct path.
 pub struct SessionGateway {
     commands: mpsc::Receiver<InboundCommand>,
     ack_events: EventSender,
     epochs: watch::Receiver<Option<DeliveryEpoch>>,
     online: watch::Receiver<bool>,
     session_events: Option<SessionEventSink>,
-    // Session transfers this owner to its dedicated writer task when it splits
-    // the gateway. Dropping that writer preserves the supervisor cancellation
-    // and delivery-epoch cleanup path.
+    // Production construction has no lifecycle field: bootstrap retains the
+    // SupervisorRuntime. Channel-only tests may keep an already-settled
+    // lifecycle here; live-task fixtures extract and join it explicitly.
+    #[cfg(test)]
     lifecycle: Option<SupervisorLifecycle>,
 }
 
+impl SessionGateway {
+    /// Transfer only stable gateway channels into Session. Bootstrap retains
+    /// the returned runtime owner so supervisor termination is monitored and
+    /// every teardown explicitly cancels and joins the task.
+    pub(crate) fn from_supervisor(handle: SupervisorHandle) -> (Self, SupervisorRuntime) {
+        let SupervisorHandle {
+            commands,
+            events,
+            epochs,
+            online,
+            session_events,
+            lifecycle,
+        } = handle;
+        (
+            Self {
+                commands,
+                ack_events: events,
+                epochs,
+                online,
+                session_events,
+                #[cfg(test)]
+                lifecycle: None,
+            },
+            SupervisorRuntime::new(lifecycle),
+        )
+    }
+}
+
+#[cfg(test)]
 impl From<SupervisorHandle> for SessionGateway {
     fn from(handle: SupervisorHandle) -> Self {
         let SupervisorHandle {
@@ -141,6 +184,7 @@ pub struct SessionGatewayWriter {
     online: watch::Receiver<bool>,
     session_events: Option<SessionEventSink>,
     ack_barrier: Option<DurableEventAdmission>,
+    #[cfg(test)]
     _lifecycle: Option<SupervisorLifecycle>,
 }
 
@@ -222,7 +266,7 @@ impl GatewayWriter for SessionGatewayWriter {
                     // later terminal ACK in the same committed batch cannot
                     // overtake this durable sequence.
                     let admission = session_events
-                        .on_durable_committed(&envelope.conversation_id, seq)
+                        .on_durable_committed(&envelope.personality_agent_id, seq)
                         .await
                         .map_err(|source| {
                             anyhow!(SessionGatewayError::DurableEvent { seq, source })
@@ -247,7 +291,7 @@ impl GatewayWriter for SessionGatewayWriter {
                     }));
                 }
                 session_events
-                    .on_volatile(&envelope.conversation_id, event)
+                    .on_volatile(&envelope.personality_agent_id, event)
                     .await
                     .map_err(|source| anyhow!(SessionGatewayError::VolatileEvent { source }))
             }
@@ -305,6 +349,7 @@ impl Gateway for SessionGateway {
                 online: self.online,
                 session_events: self.session_events,
                 ack_barrier: None,
+                #[cfg(test)]
                 _lifecycle: self.lifecycle,
             },
         )
@@ -336,31 +381,35 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingDelivery {
-        durable: Arc<Mutex<Vec<(String, u64)>>>,
-        volatile: Arc<Mutex<Vec<(String, AgentEvent)>>>,
+        durable: Arc<Mutex<Vec<(PersonalityAgentId, u64)>>>,
+        volatile: Arc<Mutex<Vec<(PersonalityAgentId, AgentEvent)>>>,
     }
 
     #[async_trait]
     impl SessionEventDelivery for RecordingDelivery {
         async fn on_durable_committed(
             &self,
-            conversation_id: &str,
+            personality_agent_id: &PersonalityAgentId,
             seq: u64,
         ) -> Result<DurableEventAdmission> {
             self.durable
                 .lock()
                 .unwrap()
-                .push((conversation_id.to_owned(), seq));
+                .push((personality_agent_id.clone(), seq));
             Ok(DurableEventAdmission::Enqueued {
                 epoch: DeliveryEpoch::for_test("session-gateway-flow"),
             })
         }
 
-        async fn on_volatile(&self, conversation_id: &str, event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            personality_agent_id: &PersonalityAgentId,
+            event: AgentEvent,
+        ) -> Result<()> {
             self.volatile
                 .lock()
                 .unwrap()
-                .push((conversation_id.to_owned(), event));
+                .push((personality_agent_id.clone(), event));
             Ok(())
         }
     }
@@ -372,13 +421,17 @@ mod tests {
     impl SessionEventDelivery for FailingDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             anyhow::bail!("store corruption")
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             anyhow::bail!("authorization corruption")
         }
     }
@@ -390,13 +443,17 @@ mod tests {
     impl SessionEventDelivery for DeferredDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             Ok(DurableEventAdmission::Deferred { after_epoch: None })
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -412,7 +469,7 @@ mod tests {
     impl SessionEventDelivery for BlockingDelivery {
         async fn on_durable_committed(
             &self,
-            _conversation_id: &str,
+            _personality_agent_id: &PersonalityAgentId,
             _seq: u64,
         ) -> Result<DurableEventAdmission> {
             self.entered.notify_one();
@@ -420,13 +477,19 @@ mod tests {
             Ok(DurableEventAdmission::Enqueued { epoch: self.epoch })
         }
 
-        async fn on_volatile(&self, _conversation_id: &str, _event: AgentEvent) -> Result<()> {
+        async fn on_volatile(
+            &self,
+            _personality_agent_id: &PersonalityAgentId,
+            _event: AgentEvent,
+        ) -> Result<()> {
             Ok(())
         }
     }
 
     fn command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical command id"),
             command: Command::Abort {},
@@ -438,6 +501,7 @@ mod tests {
             ack: CommandAck {
                 seq,
                 command_id: command_id.to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 status: CommandAckStatus::Received,
                 reject_reason: None,
             },
@@ -448,7 +512,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: Some(seq),
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "turn_start"}),
             },
         }
@@ -458,7 +522,7 @@ mod tests {
         OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "error", "message": message}),
             },
         }
@@ -549,12 +613,12 @@ mod tests {
         );
         assert_eq!(
             *delivery.durable.lock().unwrap(),
-            vec![("conversation".to_owned(), 19)]
+            vec![(crate::gateway::test_personality_agent_id(), 19)]
         );
         assert_eq!(
             *delivery.volatile.lock().unwrap(),
             vec![(
-                "conversation".to_owned(),
+                crate::gateway::test_personality_agent_id(),
                 AgentEvent::Error {
                     message: "sk-secret-delta".to_owned()
                 }
@@ -708,7 +772,7 @@ mod tests {
         let malformed = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "not_an_agent_event"}),
             },
         };
@@ -725,7 +789,7 @@ mod tests {
             .send(OutboundFrame::Event {
                 envelope: Envelope {
                     seq: None,
-                    conversation_id: "conversation".to_owned(),
+                    personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "turn_start"}),
                 },
             })
@@ -767,7 +831,7 @@ mod tests {
         assert_ne!(first_seen, second_seen);
         assert_eq!(
             *delivery.durable.lock().unwrap(),
-            vec![("conversation".to_owned(), 23)]
+            vec![(crate::gateway::test_personality_agent_id(), 23)]
         );
     }
 
@@ -911,7 +975,7 @@ mod tests {
         );
         let error = gateway
             .authenticate_hello(AgentHello {
-                agent_id: "agent".to_owned(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
                 generation: ProcessGeneration::MIN,
                 last_sent_event_seq: 0,
                 last_received_command_seq: 0,
@@ -938,7 +1002,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_writer_owns_supervisor_lifecycle_until_it_is_dropped() {
+    async fn production_split_keeps_supervisor_lifecycle_out_of_session() {
+        let (gateway, _command_tx, _event_rx, _epochs_tx, _online_tx, _delivery) =
+            make_gateway(1, 1, Some(DeliveryEpoch::for_test("bootstrap-lifecycle")));
+        let SessionGateway {
+            commands,
+            ack_events,
+            epochs,
+            online,
+            session_events,
+            lifecycle: _fixture_lifecycle,
+        } = gateway;
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            let _ = finished_tx.send(());
+            Ok(())
+        });
+        let handle = SupervisorHandle {
+            commands,
+            events: ack_events,
+            epochs,
+            online,
+            session_events,
+            lifecycle: SupervisorLifecycle {
+                cancel: cancel.clone(),
+                task: Some(task),
+            },
+        };
+        let (gateway, mut runtime) = SessionGateway::from_supervisor(handle);
+
+        let (reader, writer) = gateway.split();
+        drop(reader);
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_cancelled(),
+            "Session owns only channels and must not control supervisor lifetime"
+        );
+
+        runtime
+            .cancel_and_join()
+            .await
+            .expect("bootstrap-owned supervisor must cancel and join cleanly");
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("joined supervisor must run cancellation cleanup")
+            .expect("supervisor completion signal remains open");
+    }
+
+    #[tokio::test]
+    async fn split_writer_retains_supervisor_lifecycle_until_explicit_join() {
         let (mut gateway, _command_tx, _event_rx, _epochs_tx, _online_tx, _delivery) =
             make_gateway(1, 1, Some(DeliveryEpoch::for_test("session-lifecycle")));
         let cancel = CancellationToken::new();
@@ -954,7 +1071,7 @@ mod tests {
             task: Some(task),
         });
 
-        let (reader, writer) = gateway.split();
+        let (reader, mut writer) = gateway.split();
         drop(reader);
         tokio::task::yield_now().await;
         assert!(
@@ -962,10 +1079,19 @@ mod tests {
             "reader ownership must not tear down the writer's supervisor"
         );
 
+        let mut lifecycle = writer
+            ._lifecycle
+            .take()
+            .expect("writer retains the supervisor lifecycle");
         drop(writer);
+        lifecycle.cancel.cancel();
+        lifecycle
+            .join()
+            .await
+            .expect("retained lifecycle joins explicitly");
         tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
             .await
-            .expect("dropping the writer must cancel supervisor lifecycle");
+            .expect("explicit teardown cancels supervisor lifecycle");
         tokio::time::timeout(Duration::from_secs(1), finished_rx)
             .await
             .expect("cancelled supervisor task must finish")

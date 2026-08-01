@@ -30,7 +30,7 @@ export interface paths {
         };
         /**
          * Dependency readiness check
-         * @description Checks the Todo database when the Todo backend is enabled.
+         * @description Checks the control-plane database when it is configured.
          */
         get: operations["getReadiness"];
         put?: never;
@@ -41,7 +41,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/conversations/{conversation_id}/commands": {
+    "/direct-chat/commands": {
         parameters: {
             query?: never;
             header?: never;
@@ -51,23 +51,22 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Create a user command in a conversation
-         * @description Admits a user_message command from the web client. The caller is
-         *     authenticated by the signed HttpOnly `sumi_session` browser cookie; agent
-         *     bearer tokens are not accepted. The request is validated for UTF-8 JSON
-         *     shape, empty attachments, and a 1 MiB wire-size limit before any
-         *     command_id or seq is allocated. Rejections are returned as typed 4xx
-         *     responses with no command_id/seq, so they cannot create a sequence gap
-         *     in the durable command log.
+         * Create a direct-chat user command
+         * @description Admits content from the authenticated direct-chat browser session. The
+         *     signed HttpOnly `sumi_session` cookie supplies the target personality
+         *     agent and human provenance; neither is accepted from the browser body.
+         *     The request Origin must exactly match the configured browser origin
+         *     allowlist. Origin rejection occurs before session or body processing;
+         *     all rejections occur before command_id or seq allocation.
          */
-        post: operations["createUserCommand"];
+        post: operations["createDirectChatCommand"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/conversations/{conversation_id}/ws": {
+    "/direct-chat/ws": {
         parameters: {
             query?: never;
             header?: never;
@@ -121,18 +120,17 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List Todos owned by the authenticated user
-         * @description Every query is scoped by the authenticated user's ID.
+         * List Todos owned by the authenticated Human
+         * @description Every query is scoped by the authenticated HumanId.
          */
         get: operations["listTodos"];
         put?: never;
         /**
-         * Create a Todo owned by the authenticated user
-         * @description The owner is always derived from the authenticated development session.
-         *     `owner_user_id` is intentionally not accepted from the request body.
-         *     The server registers Todo routes only when both `SUMI_TODO_ENABLED=true`
-         *     and `SUMI_TODO_DEV_SESSION_AUTH=true`; production user-scoped auth is not
-         *     implemented yet.
+         * Create a Todo owned by the authenticated Human
+         * @description The owner is derived exclusively from the server-issued `sumi_session`.
+         *     Routes are registered only when `SUMI_TODO_ENABLED=true`; the shared
+         *     control-plane database and browser authentication must also be enabled.
+         *     Browser clients call this route through the same-origin frontend proxy.
          */
         post: operations["createTodo"];
         delete?: never;
@@ -150,7 +148,7 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Get one Todo owned by the authenticated user */
+        /** Get one Todo owned by the authenticated Human */
         get: operations["getTodo"];
         put?: never;
         post?: never;
@@ -164,7 +162,7 @@ export interface paths {
         /**
          * Update one Todo with optimistic locking
          * @description `due` is replaced as a whole when present and is cleared by `null`.
-         *     A Todo owned by another user is indistinguishable from a missing Todo.
+         *     A Todo owned by another Human is indistinguishable from a missing Todo.
          */
         patch: operations["updateTodo"];
         trace?: never;
@@ -286,17 +284,36 @@ export interface components {
              * @description canonical lower-case hyphenated UUID
              */
             command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            provenance: components["schemas"]["DirectChatProvenanceV1"];
             command: components["schemas"]["Command"];
         };
+        /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
+        PersonalityAgentId: string;
+        DirectChatProvenanceV1: {
+            /** @constant */
+            version: 1;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @constant */
+                kind: "human";
+                principal_id: components["schemas"]["PrincipalId"];
+            };
+            source: {
+                /** @constant */
+                surface: "direct_chat";
+            };
+        };
         AgentHello: {
-            /** @description agent identity from the short-lived credential claim */
-            agent_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             generation: components["schemas"]["ProcessGeneration"];
             last_sent_event_seq: components["schemas"]["CanonicalDecimalU64"];
             last_received_command_seq: components["schemas"]["CanonicalDecimalU64"];
             last_applied_command_seq: components["schemas"]["CanonicalDecimalU64"];
         };
         ApiHello: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             accepted_generation: components["schemas"]["ProcessGeneration"];
             last_received_event_seq: components["schemas"]["CanonicalDecimalU64"];
             next_command_seq: components["schemas"]["CanonicalDecimalU64"];
@@ -311,10 +328,41 @@ export interface components {
             ack: components["schemas"]["CommandAck"];
         };
         BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
-        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"];
+        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
+        DirectChatUserMessageCommand: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            attachments: components["schemas"]["Attachment"][];
+        };
+        DirectChatCommandReceipt: {
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        DirectChatCommandRejectedResponse: {
+            /** @constant */
+            error: "invalid_command";
+            idempotency_key?: string;
+            /** @enum {string} */
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        };
+        DirectChatCommandIdempotencyConflictResponse: {
+            /** @constant */
+            error: "idempotency_conflict";
+            idempotency_key: string;
+            /** @constant */
+            reject_reason: "idempotency_conflict";
+        };
         /** @description placeholder for v1; no attachments are accepted yet */
         Attachment: {
             [key: string]: unknown;
+        };
+        BrowserHello: {
+            /** @constant */
+            type: "hello";
+            last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
         /** @description any JSON value */
         AnyJSON: {
@@ -349,11 +397,6 @@ export interface components {
             type: "approval_decision";
             request_id: string;
             decision: components["schemas"]["ApprovalDecision"];
-        };
-        BrowserHello: {
-            /** @constant */
-            type: "hello";
-            last_event_seq: components["schemas"]["JsonSafeInteger"];
         };
         BrowserCommandFrame: {
             /** @constant */
@@ -589,12 +632,35 @@ export interface components {
             retry_at: string;
             error_message: string;
         };
-        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"];
-        DurableEnvelope: {
-            conversation_id: string;
-            event: components["schemas"]["DurableAgentEvent"];
-            seq: components["schemas"]["JsonSafeInteger"];
+        /** @enum {string} */
+        CommandRejectReason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        CommandDispositionEvent: {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "applied";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "superseded";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "rejected";
+            reject_reason: components["schemas"]["CommandRejectReason"];
         };
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {
@@ -683,35 +749,62 @@ export interface components {
             message: string;
         };
         VolatileAgentEvent: components["schemas"]["MessageUpdateEvent"] | components["schemas"]["ToolExecutionUpdateEvent"] | components["schemas"]["ErrorEvent"];
-        VolatileEnvelope: {
-            conversation_id: string;
+        BrowserEventEnvelope: {
+            seq: components["schemas"]["JsonSafeInteger"];
+            event: components["schemas"]["DurableAgentEvent"];
+        } | {
             event: components["schemas"]["VolatileAgentEvent"];
         };
-        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
         BrowserEventFrame: {
             /** @constant */
             type: "event";
-            envelope: components["schemas"]["Envelope"];
+            envelope: components["schemas"]["BrowserEventEnvelope"];
         };
         BrowserCommandAcceptedFrame: {
             /** @constant */
             type: "command_accepted";
-            envelope: components["schemas"]["CommandEnvelope"];
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
+            /** @description Exact durable terminal disposition for this command when already committed at idempotent acceptance time. Its command_id and command_seq must equal this receipt's command_id and seq. */
+            disposition?: components["schemas"]["CommandDispositionEvent"];
         };
         BrowserCommandRejectedFrame: {
             /** @constant */
             type: "command_rejected";
+            idempotency_key: string;
             /** @enum {string} */
-            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable";
         };
+        DirectChatStatusFrame: {
+            /** @constant */
+            type: "direct_chat_status";
+            /** @enum {string} */
+            status: "ready" | "unavailable";
+        };
+        /** @description opaque ASCII tenant identity */
+        TenantId: string;
+        /** @description opaque ASCII principal identity */
+        PrincipalId: string;
+        DurableEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["DurableAgentEvent"];
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        VolatileEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["VolatileAgentEvent"];
+        };
+        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
         CommandAck: {
             seq: components["schemas"]["JsonSafeInteger"];
             /** Format: uuid */
             command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
             /** @enum {string} */
             status: "received" | "applied" | "superseded" | "rejected";
-            /** @enum {string} */
-            reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+            reject_reason?: components["schemas"]["CommandRejectReason"];
         };
     };
     responses: {
@@ -732,7 +825,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Missing or invalid browser session */
+        /** @description Missing, invalid, expired, or revoked browser session */
         Unauthenticated: {
             headers: {
                 [name: string]: unknown;
@@ -783,7 +876,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Todo is absent or belongs to another user */
+        /** @description Todo is absent or belongs to another Human */
         TodoNotFound: {
             headers: {
                 [name: string]: unknown;
@@ -891,7 +984,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description An enabled dependency is unavailable */
+            /** @description A configured dependency is unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -905,33 +998,28 @@ export interface operations {
             };
         };
     };
-    createUserCommand: {
+    createDirectChatCommand: {
         parameters: {
             query?: never;
-            header?: never;
-            path: {
-                conversation_id: string;
+            header: {
+                "Idempotency-Key": string;
             };
+            path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": {
-                    /** @enum {string} */
-                    type: "user_message";
-                    text: string;
-                    attachments: unknown[];
-                };
+                "application/json": components["schemas"]["DirectChatUserMessageCommand"];
             };
         };
         responses: {
-            /** @description Command accepted and allocated a durable seq and command_id */
+            /** @description Target-free command receipt */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CommandEnvelope"];
+                    "application/json": components["schemas"]["DirectChatCommandReceipt"];
                 };
             };
             /** @description Command rejected before seq/command_id allocation */
@@ -940,12 +1028,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        error: "invalid_command";
-                        /** @enum {string} */
-                        reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
-                    };
+                    "application/json": components["schemas"]["DirectChatCommandRejectedResponse"];
                 };
             };
             /** @description Missing or invalid browser session cookie */
@@ -955,15 +1038,29 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Origin not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Idempotency key was already used for different content */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
+                };
+            };
         };
     };
     browserWebSocket: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                conversation_id: string;
-            };
+            path?: never;
             cookie?: never;
         };
         /** @description The first WebSocket frame (BrowserHello) */

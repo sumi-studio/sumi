@@ -2,11 +2,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,9 +19,15 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+#[cfg(test)]
 use crate::provider::types::ProviderContextItem;
 use crate::{
-    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode},
+    agent::{
+        AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode,
+        events::{CommandDisposition, CommandDispositionEvent, CommandDispositionRejectReason},
+    },
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
@@ -41,13 +48,17 @@ use crate::{
             StopReason, ToolResultMessage,
         },
     },
-    runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
+    runtime::contracts::{
+        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
+        ProcessGenerationLease,
+    },
 };
 
 use super::{
-    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
-    InjectionBatchSizeInput, InjectionCommandSizeInput, ProviderContextKeyAnchor,
-    PublicProjectionBuilder, Redactor, Store, command_payload_digest,
+    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer,
+    EventWriterQuiescence, InjectionApplication, InjectionBatchSizeInput,
+    InjectionCommandSizeInput, PostCommitDispatcherOwner, PublicProjectionBuilder, Redactor, Store,
+    command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
@@ -73,6 +84,35 @@ use super::{
 
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
+const INBOUND_ADMISSION_RECORD_VERSION: u8 = 2;
+const INBOUND_ADMISSION_RECORD_HMAC_DOMAIN: &[u8] = b"sumi-inbound-admission-record/v2";
+
+#[derive(Serialize)]
+struct InboundAdmissionRecordV2<'a> {
+    version: u8,
+    seq: u64,
+    command_id: &'a str,
+    personality_agent_id: &'a str,
+    provenance_json: &'a str,
+    command_kind: &'a str,
+    payload_key_ref: &'a str,
+    payload_hmac: &'a [u8],
+    reject_reason: Option<&'a str>,
+    reject_actual_bytes: Option<u64>,
+}
+
+fn admission_record_hmac(
+    key: &super::crypto::DataKeyMaterial,
+    record: &InboundAdmissionRecordV2<'_>,
+) -> Result<Vec<u8>> {
+    let canonical = serde_json::to_vec(record)
+        .context("failed to serialize canonical inbound admission record")?;
+    Ok(super::crypto::keyed_proof(
+        key,
+        INBOUND_ADMISSION_RECORD_HMAC_DOMAIN,
+        &canonical,
+    ))
+}
 
 #[derive(Serialize)]
 struct MemorySummaryPayload<'a> {
@@ -97,7 +137,22 @@ struct PhysicalRecoveryContext<'a> {
 /// transaction by `PhysicalRecoveryApplier::apply_in_transaction`.
 struct ApplyBatchOutcome {
     seqs: Vec<u64>,
+    events: Vec<AgentEvent>,
     receipt_outcome: Option<ApplyReceiptOutcome>,
+}
+
+pub(crate) struct AbortCutoffOutcome {
+    pub(crate) events: Vec<(u64, AgentEvent)>,
+    pub(crate) acks: Vec<CommandAck>,
+}
+
+impl ApplyBatchOutcome {
+    fn sequenced_events(self) -> Result<Vec<(u64, AgentEvent)>> {
+        if self.seqs.len() != self.events.len() {
+            bail!("EventWriter outcome event/sequence cardinality mismatch");
+        }
+        Ok(self.seqs.into_iter().zip(self.events).collect())
+    }
 }
 
 #[derive(Clone)]
@@ -110,6 +165,8 @@ pub(crate) struct DurableEvent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) direct_chat_provenance: Option<DirectChatProvenanceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,6 +272,27 @@ impl DurableEvent {
                 turn_id: Some(turn_id),
                 ..DurableEventMetadata::default()
             },
+        )
+    }
+
+    fn command_disposition(
+        command_id: impl Into<String>,
+        command_seq: u64,
+        disposition: CommandDisposition,
+    ) -> Result<Self> {
+        let command_id = command_id.into();
+        CommandId::parse(&command_id)
+            .map_err(|_| anyhow!("durable CommandDisposition command_id is not canonical"))?;
+        if command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+            bail!("durable CommandDisposition command_seq exceeds the JSON-safe integer range");
+        }
+        Self::from_parts(
+            AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }),
+            DurableEventMetadata::default(),
         )
     }
 
@@ -624,6 +702,10 @@ impl DurableEvent {
                 turn_id: self.metadata.turn_id.as_deref(),
                 ..empty("retry_scheduled")
             },
+            AgentEvent::CommandDisposition(event) => DurableEventIdentity {
+                command_id: Some(&event.command_id),
+                ..empty("command_disposition")
+            },
             AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
             AgentEvent::MessageUpdate { .. }
             | AgentEvent::ToolExecutionUpdate { .. }
@@ -670,12 +752,8 @@ pub(crate) struct InjectedCommand {
     seq: u64,
     command_id: CommandId,
     message_id: String,
+    provenance: DirectChatProvenanceV1,
 }
-
-/// T18 freezes this same value into the generated cross-language contracts.
-pub(crate) const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x78, 0xf6, 0x2d, 0x15, 0xb9, 0x45, 0x4a, 0x4f, 0x9d, 0x84, 0xd7, 0x3c, 0x7f, 0x93, 0x2b, 0x51,
-]);
 
 /// Temporary local namespace for Error-context disposition identities.
 ///
@@ -731,9 +809,12 @@ impl IntoCanonicalCommandId for String {
     }
 }
 
-pub(crate) fn user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+pub(crate) fn user_message_id(
+    _personality_agent_id: &PersonalityAgentId,
+    command_id: &(impl CanonicalCommandIdentity + ?Sized),
+) -> String {
     Uuid::new_v5(
-        &USER_MESSAGE_ID_NAMESPACE,
+        &crate::gateway::wire::USER_MESSAGE_ID_NAMESPACE,
         command_id.canonical_command_uuid().as_bytes(),
     )
     .to_string()
@@ -744,13 +825,18 @@ impl InjectedCommand {
         dead_code,
         reason = "the T15 run loop consumes the T12-frozen private injection builder"
     )]
-    pub(crate) fn new(seq: u64, command_id: impl IntoCanonicalCommandId) -> Self {
+    pub(crate) fn new(
+        seq: u64,
+        command_id: impl IntoCanonicalCommandId,
+        provenance: DirectChatProvenanceV1,
+    ) -> Self {
         let command_id = command_id.into_canonical_command_id();
-        let message_id = user_message_id(&command_id);
+        let message_id = user_message_id(provenance.personality_agent_id(), &command_id);
         Self {
             seq,
             command_id,
             message_id,
+            provenance,
         }
     }
 
@@ -769,16 +855,22 @@ impl InjectedCommand {
         &self.message_id
     }
 
+    pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
+        &self.provenance
+    }
+
     #[cfg(test)]
     fn with_caller_message_id(
         seq: u64,
         command_id: CommandId,
         message_id: impl Into<String>,
+        provenance: DirectChatProvenanceV1,
     ) -> Self {
         Self {
             seq,
             command_id,
             message_id: message_id.into(),
+            provenance,
         }
     }
 }
@@ -1033,6 +1125,8 @@ pub(crate) enum Projection {
     CommandRejected {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         raw_command: RejectedCommandPayload,
         payload_digest: Option<KeyedCommandDigest>,
@@ -1283,8 +1377,7 @@ enum PreparedProjection {
         interrupted: bool,
         l0_disposition: L0Disposition,
         provider_context: Vec<EncryptedProviderContextRecord>,
-        provider_context_key_ref: Option<String>,
-        provider_context_key_proof: Option<Vec<u8>>,
+        provider_context_key_proofs: Vec<(String, Vec<u8>)>,
         eviction_footprint_tokens: u64,
         /// Public transcript estimate for this message, used to durably update
         /// the open L0 batch's `est_tokens`.
@@ -1304,6 +1397,8 @@ enum PreparedProjection {
     CommandInsert {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance_json: String,
         command_kind: &'static str,
         payload_key_ref: String,
         payload_key_proof: Vec<u8>,
@@ -1312,6 +1407,7 @@ enum PreparedProjection {
         status: &'static str,
         reject_reason: Option<&'static str>,
         reject_actual_bytes: Option<u64>,
+        admission_record_hmac: Vec<u8>,
     },
     ProviderContextMutation {
         mutation_id: String,
@@ -1329,8 +1425,7 @@ enum PreparedProjection {
     MemoryJobUpdate {
         expected_source_versions: BTreeMap<String, i64>,
         job_mutations: Vec<PreparedMemoryJobMutation>,
-        memory_summary_key_ref: Option<String>,
-        memory_summary_key_proof: Option<Vec<u8>>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
     },
     MemoryTransition {
         expected_source_versions: BTreeMap<String, i64>,
@@ -1341,8 +1436,7 @@ enum PreparedProjection {
         job_inserts: Vec<MemoryJobRecord>,
         membership_inserts: Vec<MemoryBatchMessageRecord>,
         cursor_advance: Option<MemoryApplyCursorAdvance>,
-        memory_summary_key_ref: Option<String>,
-        memory_summary_key_proof: Option<Vec<u8>>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
     },
     MemoryCalibrationObservation {
         observed_prompt_tokens: u64,
@@ -1515,6 +1609,8 @@ struct CommandInsertInput<'a> {
     key: &'a super::crypto::DataKeyMaterial,
     seq: u64,
     command_id: String,
+    personality_agent_id: &'a PersonalityAgentId,
+    provenance: &'a DirectChatProvenanceV1,
     command_kind: &'static str,
     canonical_payload: &'a [u8],
     rejection: Option<CommandRejectReason>,
@@ -1606,9 +1702,128 @@ impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
     }
 }
 
-#[derive(Default)]
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
+    admission_open: bool,
+    #[cfg(test)]
+    post_commit_publish_hook: Option<PostCommitPublishHook>,
+}
+
+impl Default for WriterState {
+    fn default() -> Self {
+        Self {
+            checkpoint: None,
+            admission_open: true,
+            #[cfg(test)]
+            post_commit_publish_hook: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("EventWriter mutation admission is closed")]
+pub(crate) struct EventWriterAdmissionClosed;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct PostCommitPublishHook {
+    pub(crate) committed: Arc<tokio::sync::Notify>,
+    pub(crate) allow_publication: Arc<tokio::sync::Notify>,
+    pub(crate) return_error: Arc<AtomicBool>,
+    pub(crate) panic: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("EventWriter COMMIT finalizer {kind}: {message}")]
+pub(crate) struct EventWriterFinalizerFailure {
+    kind: &'static str,
+    message: String,
+}
+
+type CommitFinalizerOutcome = std::result::Result<(), Arc<EventWriterFinalizerFailure>>;
+type SharedCommitFinalizer = Shared<BoxFuture<'static, CommitFinalizerOutcome>>;
+
+#[derive(Default)]
+struct CommitFinalizerRegistryState {
+    next_id: u64,
+    pending: Option<(u64, SharedCommitFinalizer)>,
+}
+
+/// Store-shared ownership of the one COMMIT finalizer admitted under
+/// EventWriter's single-writer gate.
+///
+/// The shared future retains the task JoinHandle when the initiating caller is
+/// cancelled. A later writer or orderly close must observe its exact outcome
+/// before it can authenticate and reconcile the Store.
+#[derive(Clone, Default)]
+pub(super) struct CommitFinalizerRegistry {
+    inner: Arc<StdMutex<CommitFinalizerRegistryState>>,
+}
+
+impl CommitFinalizerRegistry {
+    fn register(&self, finalizer: SharedCommitFinalizer) -> Result<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_some() {
+            bail!("EventWriter attempted to replace an unsettled COMMIT finalizer");
+        }
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("EventWriter COMMIT finalizer identity exhausted"))?;
+        let id = state.next_id;
+        state.pending = Some((id, finalizer));
+        Ok(id)
+    }
+
+    fn pending(&self) -> Option<(u64, SharedCommitFinalizer)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clone()
+    }
+
+    fn clear(&self, id: u64) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.pending.as_ref() {
+            Some((pending_id, _)) if *pending_id == id => {
+                state.pending = None;
+                Ok(())
+            }
+            Some((pending_id, _)) => bail!(
+                "EventWriter COMMIT finalizer identity changed: expected {id}, found {pending_id}"
+            ),
+            None => bail!("EventWriter COMMIT finalizer {id} was already cleared"),
+        }
+    }
+}
+
+fn monitor_commit_finalizer(task: tokio::task::JoinHandle<Result<()>>) -> SharedCommitFinalizer {
+    async move {
+        match task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "returned an error",
+                message: format!("{error:#}"),
+            })),
+            Err(error) if error.is_panic() => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "panicked",
+                message: error.to_string(),
+            })),
+            Err(error) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "was cancelled",
+                message: error.to_string(),
+            })),
+        }
+    }
+    .boxed()
+    .shared()
 }
 
 #[derive(Clone)]
@@ -1617,6 +1832,12 @@ struct LifecycleCheckpoint {
     lifecycle: DurableLifecycleState,
     memory_projections: BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
     historical_rows_visited: u64,
+}
+
+impl LifecycleCheckpoint {
+    fn event_head_seq(&self) -> u64 {
+        self.event_head.as_ref().map_or(0, |head| head.last_seq)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1658,6 +1879,11 @@ pub(crate) struct InboundReceipt {
     pub(crate) ack: CommandAck,
     pub(crate) origin: InboundReceiptOrigin,
     pub(crate) received_at: DateTime<Utc>,
+    /// Exact writer-owned public events produced by a newly persisted
+    /// admission. Received commands have none; terminal rejection carries its
+    /// durable disposition. Replays rely on gateway catch-up and leave this
+    /// empty to avoid duplicate live publication.
+    pub(crate) events: Vec<(u64, AgentEvent)>,
 }
 
 impl InboundAdmission {
@@ -1681,6 +1907,7 @@ impl InboundAdmission {
         self.mode == InboundAdmissionMode::ReplayOnly
     }
 
+    #[cfg(test)]
     pub(crate) async fn receive(
         &mut self,
         writer: &EventWriter,
@@ -1712,6 +1939,119 @@ impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
         let gate = store.event_writer_state();
         Self { store, gate }
+    }
+
+    /// Permanently close mutation admission for this Store runtime and return
+    /// a typed proof only after every admitted COMMIT finalizer has published.
+    ///
+    /// Bootstrap teardown order is: stop and join command, Session,
+    /// maintenance, and recovery producers; call this method; pass the proof
+    /// to `OrderedPostCommitDispatcher::shutdown`; then invalidate and join
+    /// the T17 delivery/runtime epoch.
+    pub(crate) async fn close_post_commit_admission(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+    ) -> Result<EventWriterQuiescence> {
+        let mut state = self.gate.lock().await;
+        state.admission_open = false;
+        self.settle_pending_finalizer(&mut state).await?;
+        self.sync_authenticated_checkpoint_and_feed(&mut state)
+            .await?;
+        self.store.mint_post_commit_quiescence(
+            owner,
+            state
+                .checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.event_head_seq()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_post_commit_publish_hook(&self, hook: Option<PostCommitPublishHook>) {
+        self.gate.lock().await.post_commit_publish_hook = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_writer_gate_is_locked(&self) -> bool {
+        self.gate.try_lock().is_err()
+    }
+
+    async fn sync_authenticated_checkpoint_and_feed(&self, state: &mut WriterState) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for feed synchronization")?;
+        self.store
+            .sync_post_commit_authenticated_checkpoint(checkpoint.event_head_seq())
+            .context("failed to synchronize post-commit feed to authenticated event-log head")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn recover_authenticated_finalizer_checkpoint_and_feed(
+        &self,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for finalizer recovery")?;
+        self.store
+            .recover_post_commit_authenticated_finalizer(checkpoint.event_head_seq())
+            .context("failed to recover post-commit feed from authenticated finalizer outcome")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn settle_pending_finalizer(&self, state: &mut WriterState) -> Result<()> {
+        let registry = self.store.event_writer_finalizers();
+        let Some((id, finalizer)) = registry.pending() else {
+            return Ok(());
+        };
+        let outcome = finalizer.await;
+        if let Err(error) = self
+            .recover_authenticated_finalizer_checkpoint_and_feed(state)
+            .await
+        {
+            return Err(match outcome {
+                Ok(()) => error.context(format!(
+                    "COMMIT finalizer {id} completed but authenticated reconciliation failed"
+                )),
+                Err(failure) => error.context(format!(
+                    "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                )),
+            });
+        }
+        registry.clear(id)?;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(anyhow::Error::new((*failure).clone())),
+        }
+    }
+
+    async fn finish_registered_finalizer(
+        &self,
+        id: u64,
+        finalizer: SharedCommitFinalizer,
+        next_checkpoint: LifecycleCheckpoint,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let outcome = finalizer.await;
+        match outcome {
+            Ok(()) => {
+                state.checkpoint = Some(next_checkpoint);
+                self.store.event_writer_finalizers().clear(id)
+            }
+            Err(failure) => {
+                self.recover_authenticated_finalizer_checkpoint_and_feed(state)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                        )
+                    })?;
+                self.store.event_writer_finalizers().clear(id)?;
+                Err(anyhow::Error::new((*failure).clone()))
+            }
+        }
     }
 
     /// Build the fixed Invalidate target set for an authenticated Error
@@ -1796,7 +2136,7 @@ impl EventWriter {
 
         let local_agent_namespace = Uuid::new_v5(
             &ERROR_CONTEXT_DISPOSITION_NAMESPACE,
-            self.store.scope().conversation_id.as_bytes(),
+            self.store.scope().personality_agent_id.as_str().as_bytes(),
         );
         let mutation_id = Uuid::new_v5(
             &local_agent_namespace,
@@ -1805,7 +2145,7 @@ impl EventWriter {
         .to_string();
         let mutation_key = self
             .store
-            .conversation_key(DataKeyPurpose::Mutation)
+            .private_key(DataKeyPurpose::Mutation)
             .await
             .context("failed to load Error-context disposition mutation key")?;
         let prepared = ProviderContextMutationBuilder::new(
@@ -1855,7 +2195,11 @@ impl EventWriter {
         fence: &GenerationRecoveryFence,
     ) -> Result<BootstrapRecoveryGuard<'a>> {
         lease
-            .validate_exact(fence.generation(), fence.lease_id())
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
             .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
         fence
             .validate_exact(lease, fence.fence_id())
@@ -1932,8 +2276,7 @@ impl EventWriter {
 
     async fn ensure_checkpoint(&self, state: &mut WriterState) -> Result<()> {
         if state.checkpoint.is_none() {
-            state.checkpoint =
-                Some(reconstruct_authenticated_checkpoint(self.store.as_ref()).await?);
+            self.sync_authenticated_checkpoint_and_feed(state).await?;
         }
         Ok(())
     }
@@ -1952,6 +2295,13 @@ impl EventWriter {
         admission: InboundAdmissionMode,
     ) -> Result<InboundReceipt> {
         let mut guard = self.gate.lock().await;
+        if inbound.personality_agent_id() != self.store.scope().personality_agent_id() {
+            bail!("inbound command targets a different private personality-agent store");
+        }
+        inbound
+            .provenance()
+            .validate(self.store.scope().personality_agent_id())
+            .context("inbound command provenance does not match the private store")?;
         if let InboundCommand::Invalid {
             reason,
             raw_command,
@@ -2019,6 +2369,7 @@ impl EventWriter {
                 command_id,
                 command_kind,
                 rejection,
+                inbound.provenance(),
                 &canonical_payload,
                 payload_digest,
             )
@@ -2029,6 +2380,7 @@ impl EventWriter {
                 ack,
                 origin: InboundReceiptOrigin::Replay,
                 received_at,
+                events: Vec::new(),
             });
         }
         if admission == InboundAdmissionMode::ReplayOnly {
@@ -2047,29 +2399,37 @@ impl EventWriter {
             InboundCommand::Invalid {
                 seq,
                 command_id,
+                personality_agent_id,
+                provenance,
                 reason,
                 raw_command,
                 payload_digest,
             } => Projection::CommandRejected {
                 seq: *seq,
                 command_id: command_id.to_string(),
+                personality_agent_id: personality_agent_id.clone(),
+                provenance: provenance.clone(),
                 reason: reason.clone(),
                 raw_command: raw_command.clone(),
                 payload_digest: payload_digest.clone(),
             },
         };
-        self.apply_locked(
-            EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![projection],
-                }],
-                injected_commands: Vec::new(),
-            },
-            None,
-            &mut guard,
-        )
-        .await?;
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![projection],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
         let ack = self
             .ack_for_command(command_id)
             .await?
@@ -2079,6 +2439,7 @@ impl EventWriter {
             ack,
             origin: InboundReceiptOrigin::NewlyPersisted,
             received_at,
+            events,
         })
     }
 
@@ -2152,22 +2513,48 @@ impl EventWriter {
         self.apply_locked(batch, None, &mut guard).await
     }
 
+    /// Commit an EventBatch and return the exact typed public events materialized
+    /// by EventWriter with their durable sequences. This includes writer-owned
+    /// command dispositions inserted after their terminal projection owner.
+    pub(crate) async fn apply_with_events(
+        &self,
+        batch: EventBatch,
+    ) -> Result<Vec<(u64, AgentEvent)>> {
+        let mut guard = self.gate.lock().await;
+        self.apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?
+            .sequenced_events()
+    }
+
     /// Commit an EventBatch and, when it contains the one allowed calibration
     /// observation, return the exact persisted ratio while still holding the
     /// single-writer gate. This closes the commit-to-runtime race: a later
     /// MessageEnd cannot advance the singleton before the caller receives the
     /// value committed by this batch.
+    #[cfg(test)]
     pub(crate) async fn apply_with_calibration_receipt(
         &self,
         batch: EventBatch,
     ) -> Result<(Vec<u64>, Option<[u8; 8]>)> {
+        let (events, ratio_bits) = self
+            .apply_with_events_and_calibration_receipt(batch)
+            .await?;
+        Ok((events.into_iter().map(|(seq, _)| seq).collect(), ratio_bits))
+    }
+
+    pub(crate) async fn apply_with_events_and_calibration_receipt(
+        &self,
+        batch: EventBatch,
+    ) -> Result<(Vec<(u64, AgentEvent)>, Option<[u8; 8]>)> {
         let has_calibration_observation = batch.writes.iter().any(|write| {
             write.projections.iter().any(|projection| {
                 matches!(projection, Projection::MemoryCalibrationObservation { .. })
             })
         });
         let mut guard = self.gate.lock().await;
-        let seqs = self.apply_locked(batch, None, &mut guard).await?;
+        let outcome = self
+            .apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?;
         let ratio_bits = if has_calibration_observation {
             let bits: Vec<u8> =
                 sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
@@ -2183,7 +2570,7 @@ impl EventWriter {
         } else {
             None
         };
-        Ok((seqs, ratio_bits))
+        Ok((outcome.sequenced_events()?, ratio_bits))
     }
 
     /// Hydration entry point for a T27 physical recovery proof.  The receipt
@@ -2198,6 +2585,18 @@ impl EventWriter {
         receipt: PhysicalRecoveryReceipt,
         mut batch: EventBatch,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        lease
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| {
+                anyhow!("physical recovery lease is not bound to this Store: {error}")
+            })?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid physical recovery fence: {error}"))?;
         receipt.validate_for(lease, fence)?;
         let mut has_receipt_projection = false;
         for projection in batch.writes.iter().flat_map(|write| &write.projections) {
@@ -2225,7 +2624,7 @@ impl EventWriter {
             receipt: &receipt,
         };
         let outcome = self
-            .apply_locked_with_failpoint(batch, None, None, None, Some(context), &mut guard)
+            .apply_locked_with_failpoint(batch, None, None, Some(context), &mut guard)
             .await?;
         let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
             anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
@@ -2240,16 +2639,9 @@ impl EventWriter {
         fail_after_writes: usize,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(
-            batch,
-            Some(fail_after_writes),
-            None,
-            None,
-            None,
-            &mut guard,
-        )
-        .await
-        .map(|outcome| outcome.seqs)
+        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
+            .await
+            .map(|outcome| outcome.seqs)
     }
 
     #[cfg(all(test, unix))]
@@ -2266,24 +2658,11 @@ impl EventWriter {
             batch,
             None,
             Some((name, after_commit, readiness_path)),
-            None,
             physical_recovery,
             &mut guard,
         )
         .await
         .map(|outcome| outcome.seqs)
-    }
-
-    #[cfg(test)]
-    async fn apply_after_prepare_destroy_key(
-        &self,
-        batch: EventBatch,
-        key_ref: &str,
-    ) -> Result<Vec<u64>> {
-        let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), None, &mut guard)
-            .await
-            .map(|outcome| outcome.seqs)
     }
 
     pub(crate) async fn apply_idle_abort_cutoff(
@@ -2293,25 +2672,35 @@ impl EventWriter {
     ) -> Result<Vec<CommandAck>> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
             .await
+            .map(|outcome| outcome.acks)
     }
 
-    pub(crate) async fn apply_active_abort_cutoff(
+    pub(crate) async fn apply_idle_abort_cutoff_with_events(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+    ) -> Result<AbortCutoffOutcome> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff_with_events(
         &self,
         abort_command_id: &str,
         abort_seq: u64,
         run_id: &str,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), None)
             .await
     }
 
-    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition(
+    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition_and_events(
         &self,
         abort_command_id: &str,
         abort_seq: u64,
         run_id: &str,
         disposition: ErrorContextDisposition,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), Some(disposition))
             .await
     }
@@ -2322,7 +2711,7 @@ impl EventWriter {
         abort_seq: u64,
         run_id: Option<&str>,
         error_context_disposition: Option<ErrorContextDisposition>,
-    ) -> Result<Vec<CommandAck>> {
+    ) -> Result<AbortCutoffOutcome> {
         let mut guard = self.gate.lock().await;
         let mut authentication = self.store.pool().begin().await?;
         let command = load_authenticated_command(
@@ -2594,15 +2983,19 @@ impl EventWriter {
             projections,
         });
 
-        self.apply_locked(
-            EventBatch {
-                writes,
-                injected_commands: Vec::new(),
-            },
-            None,
-            &mut guard,
-        )
-        .await?;
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
 
         let expected_acks = terminal_ids.len();
         let mut acks = Vec::with_capacity(expected_acks);
@@ -2618,7 +3011,7 @@ impl EventWriter {
             expected_acks,
             "Abort cutoff ACK count must match terminal command count"
         );
-        Ok(acks)
+        Ok(AbortCutoffOutcome { events, acks })
     }
 
     async fn apply_locked(
@@ -2627,7 +3020,7 @@ impl EventWriter {
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None, physical_recovery, state)
+        self.apply_locked_with_failpoint(batch, None, None, physical_recovery, state)
             .await
             .map(|outcome| outcome.seqs)
     }
@@ -2637,11 +3030,31 @@ impl EventWriter {
         batch: EventBatch,
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
-        destroy_after_prepare: Option<&str>,
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<ApplyBatchOutcome> {
+        if !state.admission_open {
+            return Err(EventWriterAdmissionClosed.into());
+        }
+        let batch = materialize_command_dispositions(batch)?;
+        let events = batch
+            .writes
+            .iter()
+            .filter_map(|write| write.event.as_ref().map(|event| event.value.clone()))
+            .collect();
+        // A cancelled caller can leave one Store-owned COMMIT finalizer. Its
+        // shared outcome and the authenticated database/feed reconciliation
+        // must settle before this mutation can derive N+1.
+        self.settle_pending_finalizer(state).await?;
         self.ensure_checkpoint(state).await?;
+        for command in &batch.injected_commands {
+            command
+                .provenance
+                .validate(self.store.scope().personality_agent_id())
+                .map_err(|error| {
+                    anyhow!("injected command targets the wrong private store: {error}")
+                })?;
+        }
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let expected_injections = validate_batch_shape_with_recovery(
             self.store.redactor(),
@@ -2682,10 +3095,6 @@ impl EventWriter {
                         (name.as_str(), *after_commit, path.as_path())
                     })
             });
-
-        if let Some(key_ref) = destroy_after_prepare {
-            self.store.destroy_conversation_key_ref(key_ref).await?;
-        }
 
         let mut transaction = self.store.pool().begin().await?;
         revalidate_prepared_key_refs(self.store.as_ref(), &mut transaction, &prepared).await?;
@@ -2930,21 +3339,60 @@ impl EventWriter {
         if let Some((name, false, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "before_commit", readiness_path);
         }
-        transaction
-            .commit()
-            .await
-            .context("failed to commit EventBatch")?;
-        state.checkpoint = Some(LifecycleCheckpoint {
+        let next_checkpoint = LifecycleCheckpoint {
             event_head: updated_event_head,
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
             memory_projections: updated_memory_projections,
             historical_rows_visited: checkpoint.historical_rows_visited,
+        };
+        // From this point the database outcome is intentionally unknown to
+        // WriterState until the finalizer joins. If the caller is cancelled,
+        // the Store registry retains the exact finalizer outcome; the next
+        // writer authenticates and reconciles the database before proceeding.
+        state.checkpoint = None;
+        #[cfg(test)]
+        let publish_hook = state.post_commit_publish_hook.take();
+        #[cfg(all(test, unix))]
+        let after_commit_failpoint = effective_abrupt_failpoint
+            .filter(|(_, after_commit, _)| *after_commit)
+            .map(|(name, _, path)| (name.to_owned(), path.to_path_buf()));
+        let finalizer_store = self.store.clone();
+        let finalizer_event_seqs = event_seqs.clone();
+        let finalizer_task = tokio::spawn(async move {
+            transaction
+                .commit()
+                .await
+                .context("failed to commit EventBatch")?;
+            #[cfg(all(test, unix))]
+            if let Some((name, readiness_path)) = after_commit_failpoint {
+                abrupt_transaction_exit(&name, "after_commit", &readiness_path);
+            }
+            #[cfg(test)]
+            if let Some(hook) = publish_hook {
+                hook.committed.notify_one();
+                hook.allow_publication.notified().await;
+                if hook.panic.load(AtomicOrdering::SeqCst) {
+                    panic!("injected EventWriter post-COMMIT finalizer panic");
+                }
+                if hook.return_error.load(AtomicOrdering::SeqCst) {
+                    bail!("injected EventWriter post-COMMIT finalizer error");
+                }
+            }
+            // COMMIT is the durability boundary. Publication is an O(1) wake
+            // high-water over the canonical durable FIFO.
+            finalizer_store.publish_committed_event_seqs(&finalizer_event_seqs)
         });
-        if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
-            abrupt_transaction_exit(name, "after_commit", readiness_path);
-        }
+        let finalizer = monitor_commit_finalizer(finalizer_task);
+        let finalizer_id = self
+            .store
+            .event_writer_finalizers()
+            .register(finalizer.clone())
+            .expect("single-writer gate settled the previous COMMIT finalizer");
+        self.finish_registered_finalizer(finalizer_id, finalizer, next_checkpoint, state)
+            .await?;
         Ok(ApplyBatchOutcome {
             seqs: event_seqs,
+            events,
             receipt_outcome,
         })
     }
@@ -2960,8 +3408,13 @@ impl EventWriter {
             command_plaintext_bytes: 0,
         };
         EventBatchSizer::validate(bounds, 0)?;
+        let injected_provenance: HashMap<String, DirectChatProvenanceV1> = batch
+            .injected_commands
+            .iter()
+            .map(|command| (command.message_id.clone(), command.provenance.clone()))
+            .collect();
         let event_key = if batch.writes.iter().any(|write| write.event.is_some()) {
-            Some(self.store.conversation_key(DataKeyPurpose::Event).await?)
+            Some(self.store.private_key(DataKeyPurpose::Event).await?)
         } else {
             None
         };
@@ -2971,11 +3424,7 @@ impl EventWriter {
                 .iter()
                 .any(|projection| matches!(projection, Projection::MessageEnd { .. }))
         }) {
-            Some(
-                self.store
-                    .conversation_key(DataKeyPurpose::Transcript)
-                    .await?,
-            )
+            Some(self.store.private_key(DataKeyPurpose::Transcript).await?)
         } else {
             None
         };
@@ -2987,28 +3436,10 @@ impl EventWriter {
                 )
             })
         }) {
-            Some(self.store.conversation_key(DataKeyPurpose::Command).await?)
+            Some(self.store.private_key(DataKeyPurpose::Command).await?)
         } else {
             None
         };
-        let needs_memory_summary_key = batch.writes.iter().any(|write| {
-            write.projections.iter().any(|projection| {
-                matches!(
-                    projection,
-                    Projection::MemoryJobUpdate { .. } | Projection::MemoryTransition { .. }
-                )
-            })
-        });
-        let mut memory_summary_key = if needs_memory_summary_key {
-            Some(
-                self.store
-                    .conversation_key(DataKeyPurpose::MemorySummary)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
         let mut next_seq = first_seq;
         let mut pending_l0_batch: Option<PendingL0Batch> = None;
         let mut l0_allocator: Option<L0BatchAllocator> = None;
@@ -3044,7 +3475,29 @@ impl EventWriter {
                 None
             };
             let event = match (write.event, assigned_seq) {
-                (Some(event), Some(seq)) => {
+                (Some(mut event), Some(seq)) => {
+                    let user_message_id = match &event.value {
+                        AgentEvent::MessageStart {
+                            message_id,
+                            message,
+                        }
+                        | AgentEvent::MessageEnd {
+                            message_id,
+                            message,
+                        } if matches!(message.as_ref(), PublicMessage::User(_)) => Some(message_id),
+                        _ => None,
+                    };
+                    if event.metadata.direct_chat_provenance.is_some() {
+                        bail!("callers cannot supply direct-chat provenance event metadata");
+                    }
+                    if let Some(message_id) = user_message_id {
+                        event.metadata.direct_chat_provenance =
+                            Some(injected_provenance.get(message_id).cloned().ok_or_else(|| {
+                                anyhow!(
+                                    "user event {message_id} has no authenticated injected command provenance"
+                                )
+                            })?);
+                    }
                     let key = event_key.as_ref().expect("event key was loaded");
                     let aad = self.store.scope().row_aad(
                         "agent_events",
@@ -3263,10 +3716,7 @@ impl EventWriter {
                             interrupted,
                             l0_disposition,
                             provider_context: provider_context_records,
-                            provider_context_key_ref: provider_context_key
-                                .as_ref()
-                                .map(|(r, _)| r.clone()),
-                            provider_context_key_proof: provider_context_key.map(|(_, p)| p),
+                            provider_context_key_proofs: provider_context_key,
                             eviction_footprint_tokens,
                             public_est,
                             create_l0_batch,
@@ -3281,6 +3731,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq: envelope.seq,
                             command_id: envelope.command_id.to_string(),
+                            personality_agent_id: &envelope.personality_agent_id,
+                            provenance: &envelope.provenance,
                             command_kind: command_kind(&envelope.command),
                             canonical_payload: &payload,
                             rejection: None,
@@ -3295,6 +3747,8 @@ impl EventWriter {
                     Projection::CommandRejected {
                         seq,
                         command_id,
+                        personality_agent_id,
+                        provenance,
                         reason,
                         raw_command,
                         payload_digest,
@@ -3303,6 +3757,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq,
                             command_id,
+                            personality_agent_id: &personality_agent_id,
+                            provenance: &provenance,
                             command_kind: "invalid",
                             canonical_payload: raw_command.authenticated_bytes().unwrap_or(&[]),
                             rejection: Some(reason),
@@ -3342,9 +3798,7 @@ impl EventWriter {
                         });
                     }
                     Projection::MemoryJobUpdate(update) => {
-                        let prepared = self
-                            .prepare_memory_job_update(&mut memory_summary_key, update)
-                            .await?;
+                        let prepared = self.prepare_memory_job_update(update).await?;
                         let materialization =
                             prepared_memory_projection_materialization(&prepared)?;
                         charge_materialization_components(
@@ -3355,9 +3809,7 @@ impl EventWriter {
                         projections.push(prepared);
                     }
                     Projection::MemoryTransition(transition) => {
-                        let prepared = self
-                            .prepare_memory_transition(&mut memory_summary_key, transition)
-                            .await?;
+                        let prepared = self.prepare_memory_transition(transition).await?;
                         let materialization =
                             prepared_memory_projection_materialization(&prepared)?;
                         charge_materialization_components(
@@ -3418,11 +3870,21 @@ impl EventWriter {
             key,
             seq,
             command_id,
+            personality_agent_id,
+            provenance,
             command_kind,
             canonical_payload,
             rejection,
             provided_digest,
         } = input;
+        if personality_agent_id != self.store.scope().personality_agent_id() {
+            bail!("command insert targets a different private personality-agent store");
+        }
+        provenance
+            .validate(personality_agent_id)
+            .context("command insert provenance target mismatch")?;
+        let provenance_json =
+            serde_json::to_string(provenance).context("failed to serialize command provenance")?;
         let aad = self.store.scope().row_aad(
             "inbound_commands",
             seq.to_string(),
@@ -3460,9 +3922,26 @@ impl EventWriter {
             ),
             None => ("received", None, None),
         };
+        let admission_record_hmac = admission_record_hmac(
+            key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq,
+                command_id: &command_id,
+                personality_agent_id: personality_agent_id.as_str(),
+                provenance_json: &provenance_json,
+                command_kind,
+                payload_key_ref: &key.key_ref,
+                payload_hmac: &payload_hmac,
+                reject_reason,
+                reject_actual_bytes,
+            },
+        )?;
         Ok(PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id: personality_agent_id.clone(),
+            provenance_json,
             command_kind,
             payload_key_ref: key.key_ref.clone(),
             payload_key_proof: super::crypto::keyed_proof(
@@ -3475,6 +3954,7 @@ impl EventWriter {
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         })
     }
 
@@ -3544,10 +4024,10 @@ impl EventWriter {
     ) -> Result<(
         Vec<EncryptedProviderContextRecord>,
         u64,
-        Option<(String, Vec<u8>)>,
+        Vec<(String, Vec<u8>)>,
     )> {
         if fragments.is_empty() {
-            return Ok((Vec::new(), 0, None));
+            return Ok((Vec::new(), 0, Vec::new()));
         }
 
         let PublicMessage::Assistant(assistant) = message else {
@@ -3570,25 +4050,29 @@ impl EventWriter {
         )
         .map_err(anyhow::Error::msg)?;
 
-        let anchor_id = format!("{message_id}:{message_seq}");
-        let key = self
-            .store
-            .provider_context_key(&ProviderContextKeyAnchor {
-                conversation_id: self.store.scope().conversation_id.clone(),
-                anchor_id,
-            })
-            .await?;
-
-        let key_ref = key.key_ref.clone();
-        let key_proof = super::crypto::keyed_proof(
-            &key,
-            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-            PREPARED_KEY_MATERIAL_PROOF,
-        );
-
         let mut records = Vec::with_capacity(items.len());
+        let mut key_proofs = BTreeMap::new();
         let mut eviction_footprint_tokens = 0u64;
         for item in items {
+            let native_coordinates = match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => None,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => {
+                    Some((0, u64::from(item.ordinal)))
+                }
+            };
+            let key = self
+                .store
+                .provider_context_item_key(&item, native_coordinates)
+                .await?;
+            key_proofs.insert(
+                key.key_ref.clone(),
+                super::crypto::keyed_proof(
+                    &key,
+                    PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                    PREPARED_KEY_MATERIAL_PROOF,
+                ),
+            );
             let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
                 .context("failed to compute provider-context eviction footprint")?;
             let record = EncryptedProviderContextRecord::encrypt(
@@ -3609,7 +4093,7 @@ impl EventWriter {
         Ok((
             records,
             eviction_footprint_tokens,
-            Some((key_ref, key_proof)),
+            key_proofs.into_iter().collect(),
         ))
     }
 
@@ -4024,9 +4508,9 @@ impl EventWriter {
 
     async fn prepare_memory_job_update(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         update: MemoryJobUpdate,
     ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
         let expected_source_versions = convert_batch_versions(update.expected_source_versions)?;
         let source_versions_json = serde_json::to_string(&expected_source_versions)
             .context("failed to serialize memory job source versions")?;
@@ -4044,36 +4528,26 @@ impl EventWriter {
                 Some(source_versions_json.clone())
             };
             job_mutations.push(
-                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
-                    .await?,
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
             );
         }
-        let (key_ref, key_proof) = memory_summary_key
-            .as_ref()
-            .map(|key| {
-                (
-                    Some(key.key_ref.clone()),
-                    Some(super::crypto::keyed_proof(
-                        key,
-                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-                        PREPARED_KEY_MATERIAL_PROOF,
-                    )),
-                )
-            })
-            .unwrap_or((None, None));
         Ok(PreparedProjection::MemoryJobUpdate {
             expected_source_versions,
             job_mutations,
-            memory_summary_key_ref: key_ref,
-            memory_summary_key_proof: key_proof,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
         })
     }
 
     async fn prepare_memory_transition(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         transition: MemoryTransition,
     ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
         let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
@@ -4129,18 +4603,18 @@ impl EventWriter {
             };
 
             let summary = if let Some(result) = batch.summary {
-                if memory_summary_key.is_none() {
-                    *memory_summary_key = Some(
-                        self.store
-                            .conversation_key(DataKeyPurpose::MemorySummary)
-                            .await?,
-                    );
-                }
-                let key = memory_summary_key
-                    .as_ref()
-                    .expect("memory summary key loaded");
+                let batch_id = batch.batch_id.to_string();
+                let key = self.store.memory_summary_key("batch", &batch_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
                 Some(
-                    self.encrypt_memory_batch_summary(result, &batch.batch_id.to_string(), key)
+                    self.encrypt_memory_batch_summary(result, &batch_id, &key)
                         .await?,
                 )
             } else {
@@ -4175,24 +4649,14 @@ impl EventWriter {
                 Some(source_versions_json.clone())
             };
             job_mutations.push(
-                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
-                    .await?,
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
             );
         }
-
-        let (key_ref, key_proof) = memory_summary_key
-            .as_ref()
-            .map(|key| {
-                (
-                    Some(key.key_ref.clone()),
-                    Some(super::crypto::keyed_proof(
-                        key,
-                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
-                        PREPARED_KEY_MATERIAL_PROOF,
-                    )),
-                )
-            })
-            .unwrap_or((None, None));
 
         let expected_source_states: BTreeMap<String, MemoryBatchState> = transition
             .expected_source_states
@@ -4210,14 +4674,13 @@ impl EventWriter {
             job_inserts: transition.job_inserts,
             membership_inserts: transition.membership_inserts,
             cursor_advance: transition.cursor_advance,
-            memory_summary_key_ref: key_ref,
-            memory_summary_key_proof: key_proof,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
         })
     }
 
     async fn prepare_memory_job_mutation(
         &self,
-        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
+        memory_summary_key_proofs: &mut BTreeMap<String, Vec<u8>>,
         mutation: MemoryJobMutation,
         source_versions_json: Option<String>,
     ) -> Result<PreparedMemoryJobMutation> {
@@ -4265,17 +4728,18 @@ impl EventWriter {
                 lease_witness,
                 result,
             } => {
-                if memory_summary_key.is_none() {
-                    *memory_summary_key = Some(
-                        self.store
-                            .conversation_key(DataKeyPurpose::MemorySummary)
-                            .await?,
-                    );
-                }
-                let key = memory_summary_key
-                    .as_ref()
-                    .expect("memory summary key loaded");
-                let encrypted = self.encrypt_memory_job_result(result, &job_id, key).await?;
+                let key = self.store.memory_summary_key("job", &job_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
+                let encrypted = self
+                    .encrypt_memory_job_result(result, &job_id, &key)
+                    .await?;
                 (
                     job_id,
                     "running",
@@ -4460,7 +4924,9 @@ impl EventWriter {
         let mut group: Option<(InjectionApplication, String, String)> = None;
         for (command, expected) in commands.iter().zip(expected) {
             let row = sqlx::query(
-                "SELECT command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
+                "SELECT personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                        payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                        admission_record_version, admission_record_hmac,
                         status, run_phase, application_kind, run_id, turn_id, received_at
                  FROM inbound_commands
                  WHERE seq = ? AND command_id = ?",
@@ -4529,6 +4995,50 @@ impl EventWriter {
                 Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
             let digest: Vec<u8> = row.try_get("payload_hmac")?;
             verify_command_payload_digest(&key, &plaintext, &digest)?;
+            let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+            let provenance_json: String = row.try_get("provenance_json")?;
+            let persisted_provenance: DirectChatProvenanceV1 =
+                serde_json::from_str(&provenance_json)
+                    .context("durable injected command provenance is invalid")?;
+            if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+                || persisted_provenance != command.provenance
+                || serde_json::to_string(&persisted_provenance)? != provenance_json
+            {
+                bail!("injected command provenance does not exactly match its durable receipt");
+            }
+            let admission_record_version: i64 = row.try_get("admission_record_version")?;
+            if admission_record_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+                bail!("unsupported inbound admission record version");
+            }
+            let reject_reason: Option<String> = row.try_get("reject_reason")?;
+            let reject_actual_bytes = row
+                .try_get::<Option<i64>, _>("reject_actual_bytes")?
+                .map(|value| sqlite_u64(value, "rejected command byte count"))
+                .transpose()?;
+            let expected_admission_hmac = admission_record_hmac(
+                &key,
+                &InboundAdmissionRecordV2 {
+                    version: INBOUND_ADMISSION_RECORD_VERSION,
+                    seq: command.seq,
+                    command_id: command.command_id.as_str(),
+                    personality_agent_id: &stored_personality_agent_id,
+                    provenance_json: &provenance_json,
+                    command_kind: &command_kind,
+                    payload_key_ref: &key_ref,
+                    payload_hmac: &digest,
+                    reject_reason: reject_reason.as_deref(),
+                    reject_actual_bytes,
+                },
+            )?;
+            let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+            if expected_admission_hmac
+                .as_slice()
+                .ct_eq(&stored_admission_hmac)
+                .unwrap_u8()
+                != 1
+            {
+                bail!("inbound admission record HMAC mismatch");
+            }
 
             let mut parsed: Command = serde_json::from_slice(&plaintext)
                 .context("durable injected command payload is invalid")?;
@@ -4611,6 +5121,7 @@ impl EventWriter {
                 message_id: &command.message_id,
                 text: &expected.text,
                 timestamp: &expected.timestamp,
+                provenance: &command.provenance,
             })
             .collect();
         let size = EventBatchSizer::injection_batch(
@@ -4654,12 +5165,14 @@ impl EventWriter {
         command_id: &str,
         incoming_kind: &str,
         incoming_rejection: Option<&CommandRejectReason>,
+        incoming_provenance: &DirectChatProvenanceV1,
         canonical_payload: &[u8],
         incoming_digest: Option<&KeyedCommandDigest>,
     ) -> Result<Option<CommandAck>> {
         let by_id = sqlx::query(
-            "SELECT seq, command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
-                    reject_reason, reject_actual_bytes
+            "SELECT seq, personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                    payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac
              FROM inbound_commands WHERE command_id = ?",
         )
         .bind(command_id)
@@ -4711,6 +5224,53 @@ impl EventWriter {
             bail!("command replay references a non-command data key");
         }
         let digest: Vec<u8> = row.try_get("payload_hmac")?;
+        let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+        if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+            || stored_personality_agent_id != incoming_provenance.personality_agent_id().as_str()
+        {
+            bail!("command replay personality-agent identity mismatch");
+        }
+        let provenance_json: String = row.try_get("provenance_json")?;
+        let stored_provenance: DirectChatProvenanceV1 = serde_json::from_str(&provenance_json)
+            .context("persisted command provenance is invalid")?;
+        let canonical_stored_provenance = serde_json::to_string(&stored_provenance)
+            .context("failed to canonicalize persisted command provenance")?;
+        if provenance_json != canonical_stored_provenance
+            || &stored_provenance != incoming_provenance
+        {
+            bail!("command replay provenance mismatch");
+        }
+        let admission_version: i64 = row.try_get("admission_record_version")?;
+        if admission_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+            bail!("unsupported inbound admission record version");
+        }
+        let reject_actual_bytes = stored_actual
+            .map(|value| sqlite_u64(value, "rejected command byte count"))
+            .transpose()?;
+        let expected_admission_hmac = admission_record_hmac(
+            &key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq: stored_seq,
+                command_id,
+                personality_agent_id: &stored_personality_agent_id,
+                provenance_json: &provenance_json,
+                command_kind: &stored_kind,
+                payload_key_ref: &key_ref,
+                payload_hmac: &digest,
+                reject_reason: stored_reason.as_deref(),
+                reject_actual_bytes,
+            },
+        )?;
+        let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+        if expected_admission_hmac
+            .as_slice()
+            .ct_eq(&stored_admission_hmac)
+            .unwrap_u8()
+            != 1
+        {
+            bail!("inbound admission record HMAC mismatch");
+        }
         let ciphertext = row.try_get::<Option<Vec<u8>>, _>("payload_ciphertext")?;
         if let Some(incoming_digest) = incoming_digest {
             if incoming_digest.key_ref() != key_ref {
@@ -4758,6 +5318,7 @@ impl EventWriter {
         Ok(Some(CommandAck {
             seq: sqlite_u64(row.get::<i64, _>("seq"), "stored command sequence")?,
             command_id: command_id.to_owned(),
+            personality_agent_id: self.store.scope().personality_agent_id.clone(),
             status,
             reject_reason: row.try_get("reject_reason")?,
         }))
@@ -4869,9 +5430,9 @@ async fn load_verified_event_head_in_transaction(
 ) -> Result<Option<EventLogHead>> {
     let row = sqlx::query(
         "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE conversation_id = ?",
+         FROM event_log_heads WHERE personality_agent_id = ?",
     )
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .context("failed to load event-log head in EventBatch")?;
@@ -4953,7 +5514,7 @@ async fn persist_event_head(
         sqlx::query(
             "UPDATE event_log_heads
              SET last_seq=?, event_count=?, chain_digest=?, key_ref=?, head_hmac=?, updated_at=?
-             WHERE conversation_id=? AND last_seq=? AND event_count=?
+             WHERE personality_agent_id=? AND last_seq=? AND event_count=?
                AND chain_digest=? AND key_ref=? AND head_hmac=?",
         )
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
@@ -4962,7 +5523,7 @@ async fn persist_event_head(
         .bind(&next.key_ref)
         .bind(&next.head_hmac)
         .bind(Utc::now().to_rfc3339())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             previous.last_seq,
             "previous event-log head last sequence",
@@ -4979,10 +5540,10 @@ async fn persist_event_head(
     } else {
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
              ) VALUES(?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
         .bind(sqlite_i64(next.event_count, "event-log event count")?)
         .bind(next.chain_digest.as_slice())
@@ -5002,11 +5563,9 @@ async fn revalidate_prepared_key_refs(
 ) -> Result<()> {
     let scope_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_scope
-         WHERE singleton=1 AND tenant_id=? AND agent_id=? AND conversation_id=?",
+         WHERE singleton=1 AND personality_agent_id=?",
     )
-    .bind(&store.scope().tenant_id)
-    .bind(&store.scope().agent_id)
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_one(&mut **transaction)
     .await?;
     if scope_count != 1 {
@@ -5028,8 +5587,7 @@ async fn revalidate_prepared_key_refs(
                 PreparedProjection::MessageEnd {
                     raw_key_ref,
                     raw_key_proof,
-                    provider_context_key_ref,
-                    provider_context_key_proof,
+                    provider_context_key_proofs,
                     ..
                 } => {
                     insert_prepared_key_expectation(
@@ -5038,9 +5596,7 @@ async fn revalidate_prepared_key_refs(
                         DataKeyPurpose::Transcript,
                         raw_key_proof,
                     )?;
-                    if let (Some(key_ref), Some(proof)) =
-                        (provider_context_key_ref, provider_context_key_proof)
-                    {
+                    for (key_ref, proof) in provider_context_key_proofs {
                         insert_prepared_key_expectation(
                             &mut refs,
                             key_ref,
@@ -5092,20 +5648,22 @@ async fn revalidate_prepared_key_refs(
                     intent_key_proof,
                 )?,
                 PreparedProjection::MemoryJobUpdate {
-                    memory_summary_key_ref: Some(key_ref),
-                    memory_summary_key_proof: Some(proof),
+                    memory_summary_key_proofs,
                     ..
                 }
                 | PreparedProjection::MemoryTransition {
-                    memory_summary_key_ref: Some(key_ref),
-                    memory_summary_key_proof: Some(proof),
+                    memory_summary_key_proofs,
                     ..
-                } => insert_prepared_key_expectation(
-                    &mut refs,
-                    key_ref,
-                    DataKeyPurpose::MemorySummary,
-                    proof,
-                )?,
+                } => {
+                    for (key_ref, proof) in memory_summary_key_proofs {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::MemorySummary,
+                            proof,
+                        )?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -5114,14 +5672,14 @@ async fn revalidate_prepared_key_refs(
     for (key_ref, (purpose, expected_proof)) in refs {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM data_keys
-             WHERE key_ref=? AND scope='conversation' AND purpose=?
-               AND conversation_id=? AND state='active' AND algorithm=?
+             WHERE key_ref=? AND scope='personality_agent' AND purpose=?
+               AND personality_agent_id=? AND state='active' AND algorithm=?
                AND wrap_key_id <> '' AND wrap_nonce IS NOT NULL AND wrapped_key IS NOT NULL
                AND destroyed_at IS NULL",
         )
         .bind(key_ref)
         .bind(purpose.as_str())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(super::crypto::WRAP_ALGORITHM)
         .fetch_one(&mut **transaction)
         .await?;
@@ -5562,6 +6120,116 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn rejection_disposition(reason: &CommandRejectReason) -> CommandDisposition {
+    let reject_reason = match reason {
+        CommandRejectReason::UnknownCommand => CommandDispositionRejectReason::UnknownCommand,
+        CommandRejectReason::SchemaViolation => CommandDispositionRejectReason::SchemaViolation,
+        CommandRejectReason::AttachmentsNotEmpty => {
+            CommandDispositionRejectReason::AttachmentsNotEmpty
+        }
+        CommandRejectReason::Oversized { .. } => CommandDispositionRejectReason::Oversized,
+    };
+    CommandDisposition::Rejected { reject_reason }
+}
+
+fn projection_command_disposition(
+    projection: &Projection,
+) -> Option<(&str, u64, CommandDisposition)> {
+    match projection {
+        Projection::CommandRejected {
+            seq,
+            command_id,
+            reason,
+            ..
+        } => Some((command_id, *seq, rejection_disposition(reason))),
+        Projection::CommandApplied {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Applied {})),
+        Projection::CommandSuperseded {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Superseded {})),
+        _ => None,
+    }
+}
+
+fn validate_command_disposition_pairs(batch: &EventBatch) -> Result<()> {
+    let mut events = HashMap::new();
+    let mut terminals = HashMap::new();
+    for write in &batch.writes {
+        if let Some(event) = &write.event
+            && let AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }) = &event.value
+            && events
+                .insert((command_id.clone(), *command_seq), disposition.clone())
+                .is_some()
+        {
+            bail!(
+                "duplicate command_disposition event for command {command_id} at sequence {command_seq}"
+            );
+        }
+        for projection in &write.projections {
+            if let Some((command_id, command_seq, disposition)) =
+                projection_command_disposition(projection)
+                && terminals
+                    .insert((command_id.to_owned(), command_seq), disposition)
+                    .is_some()
+            {
+                bail!(
+                    "duplicate terminal command projection for command {command_id} at sequence {command_seq}"
+                );
+            }
+        }
+    }
+    if events != terminals {
+        bail!("command_disposition events must exactly match terminal command projections");
+    }
+    Ok(())
+}
+
+fn materialize_command_dispositions(mut batch: EventBatch) -> Result<EventBatch> {
+    if batch.writes.iter().any(|write| {
+        write
+            .event
+            .as_ref()
+            .is_some_and(|event| matches!(event.value, AgentEvent::CommandDisposition(_)))
+    }) {
+        bail!("callers cannot supply command_disposition events");
+    }
+
+    let terminal_count = batch
+        .writes
+        .iter()
+        .flat_map(|write| &write.projections)
+        .filter(|projection| projection_command_disposition(projection).is_some())
+        .count();
+    let mut writes = Vec::with_capacity(batch.writes.len().saturating_add(terminal_count));
+    for write in batch.writes.drain(..) {
+        let dispositions = write
+            .projections
+            .iter()
+            .filter_map(projection_command_disposition)
+            .map(|(command_id, command_seq, disposition)| {
+                DurableEvent::command_disposition(command_id, command_seq, disposition)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writes.push(write);
+        writes.extend(dispositions.into_iter().map(|event| EventWrite {
+            event: Some(event),
+            projections: Vec::new(),
+        }));
+    }
+    batch.writes = writes;
+    validate_command_disposition_pairs(&batch)?;
+    Ok(batch)
+}
+
 #[cfg(test)]
 fn validate_batch_shape(
     _redactor: &Redactor,
@@ -5605,7 +6273,14 @@ fn validate_batch_shape_with_recovery(
     let mut message_ids = HashSet::new();
     let mut previous_seq = None;
     for command in &batch.injected_commands {
-        let canonical_message_id = user_message_id(&command.command_id);
+        command
+            .provenance
+            .validate(command.provenance.personality_agent_id())
+            .map_err(|error| anyhow!("invalid injected command provenance: {error}"))?;
+        let canonical_message_id = user_message_id(
+            command.provenance.personality_agent_id(),
+            &command.command_id,
+        );
         if command.message_id != canonical_message_id {
             bail!(
                 "injected command {} message_id is not the canonical UUIDv5 derivation",
@@ -5890,6 +6565,20 @@ fn validate_batch_shape_with_recovery(
                         || error_message.is_empty()
                     {
                         bail!("durable RetryScheduled identity and fields must be non-empty");
+                    }
+                }
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    command_id,
+                    command_seq,
+                    ..
+                }) => {
+                    CommandId::parse(command_id).map_err(|_| {
+                        anyhow!("durable CommandDisposition command_id is not canonical")
+                    })?;
+                    if *command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+                        bail!(
+                            "durable CommandDisposition command_seq exceeds the JSON-safe integer range"
+                        );
                     }
                 }
                 AgentEvent::MemoryMaintenance { kind } => {
@@ -7929,23 +8618,28 @@ fn prepared_injection_bytes(
             _ => false,
         });
         let related_event = write.event.as_ref().is_some_and(|event| {
-            event
-                .message_id
-                .as_deref()
-                .is_some_and(|message_id| message_ids.contains(message_id))
-                || event
-                    .command_id
+            // Terminal dispositions are synthesized after the original T12
+            // injection write-set is sized. The complete transaction bound
+            // above still includes them; exclude them only from the exact
+            // injection-sizer drift comparison.
+            event.kind != "command_disposition"
+                && (event
+                    .message_id
                     .as_deref()
-                    .is_some_and(|command_id| command_ids.contains(command_id))
-                || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
-                    && match event.kind.as_str() {
-                        "agent_start" => sizing.application == InjectionApplication::IdleRun,
-                        "turn_start" => {
-                            sizing.application != InjectionApplication::RetrySteer
-                                && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
-                        }
-                        _ => false,
-                    })
+                    .is_some_and(|message_id| message_ids.contains(message_id))
+                    || event
+                        .command_id
+                        .as_deref()
+                        .is_some_and(|command_id| command_ids.contains(command_id))
+                    || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
+                        && match event.kind.as_str() {
+                            "agent_start" => sizing.application == InjectionApplication::IdleRun,
+                            "turn_start" => {
+                                sizing.application != InjectionApplication::RetrySteer
+                                    && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
+                            }
+                            _ => false,
+                        }))
         });
         if !related_projection && !related_event {
             continue;
@@ -10244,31 +10938,85 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         }
     }
 
-    let command_key = store.conversation_key(DataKeyPurpose::Command).await?;
-    let event_key = store.conversation_key(DataKeyPurpose::Event).await?;
-    let mut transaction = store.pool().begin().await?;
+    let writer = EventWriter::new(Arc::new(store.clone()));
+    let provenance = DirectChatProvenanceV1::new(
+        "tenant-test",
+        store.scope().personality_agent_id.clone(),
+        "human-test",
+    )?;
+    let command_key = store.private_key(DataKeyPurpose::Command).await?;
     let command_seq_base: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM inbound_commands")
-            .fetch_one(&mut *transaction)
+            .fetch_one(store.pool())
             .await?;
+    let event_key = store.private_key(DataKeyPurpose::Event).await?;
+    let mut transaction = store.pool().begin().await?;
     for (index, owner) in by_end_seq.values().enumerate() {
         let command_seq = command_seq_base
             .checked_add(i64::try_from(index + 1).context("fixture command sequence overflow")?)
             .ok_or_else(|| anyhow!("fixture command sequence overflow"))?;
+        let command_id = Uuid::now_v7().to_string();
+        let command_seq = sqlite_u64(command_seq, "provider-context fixture command sequence")?;
+        let payload = Zeroizing::new(serde_json::to_vec(&Command::UserMessage {
+            text: format!("provider-context owner evidence for {}", owner.message_id),
+            attachments: Vec::new(),
+        })?);
+        let PreparedProjection::CommandInsert {
+            seq,
+            command_id,
+            personality_agent_id,
+            provenance_json,
+            command_kind,
+            payload_key_ref,
+            payload_key_proof: _,
+            payload_ciphertext,
+            payload_hmac,
+            status,
+            reject_reason,
+            reject_actual_bytes,
+            admission_record_hmac,
+        } = writer.prepare_command_insert(CommandInsertInput {
+            key: &command_key,
+            seq: command_seq,
+            command_id,
+            personality_agent_id: store.scope().personality_agent_id(),
+            provenance: &provenance,
+            command_kind: "user_message",
+            canonical_payload: &payload,
+            rejection: None,
+            provided_digest: None,
+        })?
+        else {
+            unreachable!("command preparation returns a command insert");
+        };
+        if status != "received" || reject_reason.is_some() || reject_actual_bytes.is_some() {
+            bail!("provider-context fixture command unexpectedly prepared as rejected");
+        }
         sqlx::query(
             "INSERT INTO inbound_commands(
-                seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                seq, command_id, personality_agent_id, provenance_json,
+                command_kind, payload_ciphertext, payload_key_ref,
                 payload_hmac, status, reject_reason, reject_actual_bytes,
+                admission_record_version, admission_record_hmac,
                 application_kind, run_id, turn_id, run_phase, received_at, applied_at
-             ) VALUES(?, ?, 'user_message', X'00', ?, X'00', 'applying',
-                      NULL, NULL, 'idle_run', ?, ?, 'assistant_started', ?, NULL)",
+             ) VALUES(
+                ?, ?, ?, ?, ?, ?, ?, ?, 'applying', NULL, NULL, ?, ?,
+                'idle_run', ?, ?, 'assistant_started', ?, NULL
+             )",
         )
-        .bind(command_seq)
-        .bind(format!(
-            "provider-context-fixture-command-{}",
-            owner.message_id
-        ))
-        .bind(&command_key.key_ref)
+        .bind(sqlite_i64(
+            seq,
+            "provider-context fixture command sequence",
+        )?)
+        .bind(command_id)
+        .bind(personality_agent_id.as_str())
+        .bind(provenance_json)
+        .bind(command_kind)
+        .bind(payload_ciphertext)
+        .bind(payload_key_ref)
+        .bind(payload_hmac)
+        .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+        .bind(admission_record_hmac)
         .bind(&owner.run_id)
         .bind(&owner.turn_id)
         .bind(Utc::now().to_rfc3339())
@@ -10363,7 +11111,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
             "UPDATE event_log_heads
              SET last_seq = ?, event_count = ?, chain_digest = ?, key_ref = ?,
                  head_hmac = ?, updated_at = ?
-             WHERE conversation_id = ? AND last_seq = ? AND event_count = ?
+             WHERE personality_agent_id = ? AND last_seq = ? AND event_count = ?
                AND chain_digest = ?",
         )
         .bind(sqlite_i64(
@@ -10378,7 +11126,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         .bind(&event_key.key_ref)
         .bind(head_hmac)
         .bind(Utc::now().to_rfc3339())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             previous.last_seq,
             "provider-context fixture previous event-log sequence",
@@ -10397,10 +11145,10 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
     } else {
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
              ) VALUES(?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             last_seq,
             "provider-context fixture event-log last sequence",
@@ -11613,8 +12361,7 @@ async fn apply_projection(
             interrupted,
             l0_disposition,
             provider_context,
-            provider_context_key_ref: _,
-            provider_context_key_proof: _,
+            provider_context_key_proofs: _,
             eviction_footprint_tokens,
             public_est,
             create_l0_batch,
@@ -11777,6 +12524,8 @@ async fn apply_projection(
         PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id,
+            provenance_json,
             command_kind,
             payload_key_ref,
             payload_key_proof: _,
@@ -11785,16 +12534,21 @@ async fn apply_projection(
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         } => {
             sqlx::query(
                 "INSERT INTO inbound_commands(
-                    seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                    seq, command_id, personality_agent_id, provenance_json,
+                    command_kind, payload_ciphertext, payload_key_ref,
                     payload_hmac, status, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac,
                     application_kind, run_id, turn_id, run_phase, received_at, applied_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
             )
             .bind(sqlite_i64(seq, "command sequence")?)
             .bind(command_id)
+            .bind(personality_agent_id.as_str())
+            .bind(provenance_json)
             .bind(command_kind)
             .bind(payload_ciphertext)
             .bind(payload_key_ref)
@@ -11806,6 +12560,8 @@ async fn apply_projection(
                     .map(|value| sqlite_i64(value, "rejected command byte count"))
                     .transpose()?,
             )
+            .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+            .bind(admission_record_hmac)
             .bind(Utc::now().to_rfc3339())
             .bind(if status == "rejected" {
                 Some(Utc::now().to_rfc3339())
@@ -11837,7 +12593,8 @@ async fn apply_projection(
             job_mutations,
             ..
         } => {
-            apply_memory_job_update(transaction, expected_source_versions, job_mutations).await?;
+            apply_memory_job_update(store, transaction, expected_source_versions, job_mutations)
+                .await?;
         }
         PreparedProjection::MemoryTransition {
             expected_source_versions,
@@ -12192,13 +12949,14 @@ async fn verify_source_states(
 }
 
 async fn apply_memory_job_update(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
     job_mutations: Vec<PreparedMemoryJobMutation>,
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
     for job in job_mutations {
-        apply_memory_job_mutation(transaction, job).await?;
+        apply_memory_job_mutation(store, transaction, job).await?;
     }
     Ok(())
 }
@@ -12411,7 +13169,7 @@ async fn apply_memory_transition(
     }
 
     for job in job_mutations {
-        apply_memory_job_mutation(transaction, job).await?;
+        apply_memory_job_mutation(store, transaction, job).await?;
     }
     if let Some(cursor) = cursor_advance {
         let cursor_record = MemoryApplyCursorRecord {
@@ -12455,6 +13213,15 @@ async fn apply_memory_batch_mutation(
     batch: PreparedMemoryBatchMutation,
     store: &Store,
 ) -> Result<()> {
+    if let Some(summary) = &batch.summary {
+        let expected = super::memory_summary_key_ref(store.scope(), "batch", &batch.batch_id);
+        if summary.key_ref != expected {
+            bail!(
+                "memory batch {} summary key is outside its exact retention unit",
+                batch.batch_id
+            );
+        }
+    }
     if batch.delete_membership {
         let owner_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT m.id, m.seq
@@ -12568,9 +13335,19 @@ async fn apply_memory_batch_mutation(
 }
 
 async fn apply_memory_job_mutation(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     job: PreparedMemoryJobMutation,
 ) -> Result<()> {
+    if let Some(result) = &job.result {
+        let expected = super::memory_summary_key_ref(store.scope(), "job", &job.job_id);
+        if result.key_ref != expected {
+            bail!(
+                "memory job {} result key is outside its exact retention unit",
+                job.job_id
+            );
+        }
+    }
     let (result_key_ref, result_ciphertext, result_projection, result_redaction_version) =
         match job.result {
             Some(result) => (
@@ -12954,8 +13731,12 @@ mod tests {
     }
 
     fn test_lease(raw: u64) -> ProcessGenerationLease {
-        ProcessGenerationLease::new(test_process_generation(raw), "test-lease")
-            .expect("valid test lease")
+        ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
+            test_process_generation(raw),
+            "test-lease",
+        )
+        .expect("valid test lease")
     }
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
@@ -13124,10 +13905,21 @@ mod tests {
 
     fn scope() -> AgentScope {
         AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         }
+    }
+
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+            .expect("valid direct-chat provenance")
+    }
+
+    fn test_user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+        user_message_id(scope().personality_agent_id(), command_id)
+    }
+
+    fn test_injected_command(seq: u64, command_id: impl IntoCanonicalCommandId) -> InjectedCommand {
+        InjectedCommand::new(seq, command_id, test_provenance())
     }
 
     #[test]
@@ -13200,6 +13992,7 @@ mod tests {
         .expect("insert running job without lease");
 
         apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "null-lease-job".to_owned(),
@@ -13226,9 +14019,20 @@ mod tests {
     }
 
     fn user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
+        user_command_with_provenance(seq, command_id, text, test_provenance())
+    }
+
+    fn user_command_with_provenance(
+        seq: u64,
+        command_id: &str,
+        text: &str,
+        provenance: DirectChatProvenanceV1,
+    ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance,
             command: Command::UserMessage {
                 text: text.to_owned(),
                 attachments: Vec::new(),
@@ -13240,6 +14044,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::Abort {},
         })
     }
@@ -13257,6 +14063,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::ApprovalDecision {
                 request_id: request_id.to_owned(),
                 decision,
@@ -13554,7 +14362,7 @@ mod tests {
         text: &str,
         timestamp: DateTime<Utc>,
     ) -> Vec<EventWrite> {
-        let message_id = user_message_id(command_id);
+        let message_id = test_user_message_id(command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -13661,7 +14469,7 @@ mod tests {
             })
             .await
             .expect("classify injected command");
-        InjectedCommand::new(
+        test_injected_command(
             seq,
             CommandId::parse(command_id).expect("canonical test command UUID"),
         )
@@ -13783,7 +14591,7 @@ mod tests {
             })
             .await
             .expect("commit calibration assistant terminal");
-        assert_eq!(seqs.len(), 3);
+        assert_eq!(seqs.len(), 4);
         (
             seqs[0],
             ratio_bits.expect("calibration terminal must return exact committed bits"),
@@ -13986,7 +14794,7 @@ mod tests {
         })
         .expect("canonical payload");
         let timestamp = durable_test_timestamp();
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = format!("run-{}", command_id.as_str());
         let turn_id = format!("turn-{}", command_id.as_str());
         let commands = [InjectionCommandSizeInput {
@@ -13995,6 +14803,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: injected.provenance(),
         }];
         let predicted = EventBatchSizer::injection_batch(
             store.redactor(),
@@ -14030,11 +14839,12 @@ mod tests {
             CommandId::parse("00000000-0000-4000-8000-000000000033").expect("canonical UUID");
         let previous_owner =
             CommandId::parse("00000000-0000-4000-8000-000000000034").expect("canonical UUID");
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = "run-application-sizer";
         let turn_id = "turn-application-sizer";
         let text = "application-specific write-set";
         let timestamp = durable_test_timestamp();
+        let provenance = test_provenance();
         let message = canonical_user_message(text, timestamp);
         let payload = serde_json::to_vec(&Command::UserMessage {
             text: text.to_owned(),
@@ -14047,6 +14857,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: &provenance,
         }];
 
         for application in [
@@ -14132,7 +14943,7 @@ mod tests {
                     ],
                 },
             ]);
-            let injected = InjectedCommand::new(2, command_id.clone());
+            let injected = test_injected_command(2, command_id.clone());
             let batch = EventBatch {
                 writes,
                 injected_commands: vec![injected.clone()],
@@ -14340,7 +15151,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE id=?")
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("committed message count"),
@@ -14392,7 +15203,8 @@ mod tests {
             })
             .await
             .expect("classify");
-        let message_id_before_restart = user_message_id("00000000-0000-4000-8000-000000000001");
+        let message_id_before_restart =
+            test_user_message_id("00000000-0000-4000-8000-000000000001");
         drop(writer);
         store.pool().close().await;
         drop(store);
@@ -14404,7 +15216,7 @@ mod tests {
         let reopened_writer = EventWriter::new(reopened.clone());
         assert_eq!(
             message_id_before_restart,
-            user_message_id("00000000-0000-4000-8000-000000000001"),
+            test_user_message_id("00000000-0000-4000-8000-000000000001"),
             "restart must not change the UUIDv5 projection anchor"
         );
         let invented = durable_timestamp + chrono::TimeDelta::seconds(1);
@@ -14416,7 +15228,7 @@ mod tests {
                     "timestamped",
                     invented,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -14442,7 +15254,7 @@ mod tests {
                     "timestamped",
                     durable_timestamp,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -14450,7 +15262,7 @@ mod tests {
             .await
             .expect("inject using durable timestamp");
         let payload: String = sqlx::query_scalar("SELECT payload FROM messages WHERE id=?")
-            .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+            .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
             .fetch_one(reopened.pool())
             .await
             .expect("stored user message");
@@ -14812,6 +15624,8 @@ mod tests {
                 CommandEnvelope {
                     seq: 2,
                     command_id: CommandId::parse(steer_id).expect("canonical test UUID"),
+                    personality_agent_id: scope().personality_agent_id,
+                    provenance: test_provenance(),
                     command: Command::UserMessage {
                         text: "steer now".to_owned(),
                         attachments: Vec::new(),
@@ -14823,6 +15637,7 @@ mod tests {
             let previous_owner = DurableRunBinding {
                 command_id: owner_id.to_owned(),
                 command_seq: 1,
+                provenance: test_provenance(),
                 run_id: run_id.clone(),
                 turn_id: old_turn_id.clone(),
                 executor_generation: ProcessGeneration::MIN,
@@ -14914,9 +15729,9 @@ mod tests {
                 .expect("count committed messages after reapply");
             let (expected_events, expected_messages) =
                 if application_kind == ApplicationKind::SoftSteer {
-                    (11, 3)
+                    (12, 3)
                 } else {
-                    (10, 3)
+                    (11, 3)
                 };
             assert_eq!(
                 (events, messages),
@@ -16346,8 +17161,8 @@ mod tests {
                     },
                 ],
                 injected_commands: vec![
-                    InjectedCommand::new(1, command_a.clone()),
-                    InjectedCommand::new(2, command_b),
+                    test_injected_command(1, command_a.clone()),
+                    test_injected_command(2, command_b),
                 ],
             },
         )
@@ -16360,7 +17175,7 @@ mod tests {
         );
 
         let command_id = command_a.to_string();
-        let message_id = user_message_id(command_id.as_str());
+        let message_id = test_user_message_id(command_id.as_str());
         let user = user_message("injected");
         let assistant = assistant_message(StopReason::Stop);
         let early_assistant = validate_batch_shape(
@@ -16404,7 +17219,7 @@ mod tests {
                         ],
                     },
                 ],
-                injected_commands: vec![InjectedCommand::new(1, command_a)],
+                injected_commands: vec![test_injected_command(1, command_a)],
             },
         )
         .err()
@@ -17115,6 +17930,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_replay_authenticates_exact_persisted_provenance_and_admission_record() {
+        let command_id = "00000000-0000-4000-8000-000000000031";
+        for tampered_provenance in [
+            DirectChatProvenanceV1::new("tenant-tampered", scope().personality_agent_id, "human-1")
+                .unwrap(),
+            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-tampered")
+                .unwrap(),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered_provenance).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance");
+            let matching_tamper =
+                user_command_with_provenance(1, command_id, "original", tampered_provenance);
+            let error = writer
+                .persist_inbound(&matching_tamper)
+                .await
+                .expect_err("unauthenticated provenance replacement must fail");
+            assert!(
+                error.to_string().contains("admission record HMAC mismatch"),
+                "{error:#}"
+            );
+        }
+
+        for (field, value) in [
+            ("source", serde_json::json!({"surface": "group_chat"})),
+            (
+                "personality_agent_id",
+                serde_json::json!("0198f0f4-9b72-7000-8000-000000000002"),
+            ),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            let mut tampered = serde_json::to_value(test_provenance()).unwrap();
+            tampered[field] = value;
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance field");
+            assert!(
+                writer.persist_inbound(&original).await.is_err(),
+                "tampered provenance field {field} must fail replay"
+            );
+        }
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "original");
+        writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist authenticated command");
+        sqlx::query(
+            "UPDATE inbound_commands SET admission_record_hmac=zeroblob(32)
+             WHERE command_id=?",
+        )
+        .bind(command_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper admission HMAC");
+        let error = writer
+            .persist_inbound(&original)
+            .await
+            .expect_err("tampered admission record must fail replay");
+        assert!(
+            error.to_string().contains("admission record HMAC mismatch"),
+            "{error:#}"
+        );
+
+        let root = std::env::temp_dir().join(format!("sumi-command-provenance-{}", Uuid::now_v7()));
+        let path = root.join("state").join("agent.db");
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "restart");
+        let expected = writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist command before restart");
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let replayed = EventWriter::new(reopened.clone())
+            .persist_inbound(&original)
+            .await
+            .expect("authenticate exact command provenance after restart");
+        assert_eq!(replayed, expected);
+        reopened.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove provenance restart fixture");
+    }
+
+    #[tokio::test]
     async fn live_admission_accepts_user_then_reserved_abort_without_reentering_replay_mode() {
         let store = test_store().await;
         let writer = EventWriter::new(store);
@@ -17145,6 +18070,92 @@ mod tests {
         assert_eq!(
             terminal.iter().map(|ack| ack.status).collect::<Vec<_>>(),
             vec![CommandAckStatus::Superseded, CommandAckStatus::Applied]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_checkpoint_publishes_authenticated_history_to_an_existing_receiver() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (mut prepared, _, _, event_seqs) = writer
+            .prepare_batch(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("pre-writer-authenticated-history")
+                                .expect("fixture maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect("prepare authenticated history");
+        assert_eq!(event_seqs, vec![1]);
+        let event = prepared
+            .pop()
+            .and_then(|write| write.event)
+            .expect("prepared history contains one event");
+        let mut transaction = store.pool().begin().await.expect("begin history seed");
+        let mut head = None;
+        append_prepared_event(&store, &mut transaction, event, &mut head)
+            .await
+            .expect("append authenticated history");
+        persist_event_head(
+            &store,
+            &mut transaction,
+            None,
+            head.as_ref().expect("history seed advances the event head"),
+        )
+        .await
+        .expect("persist authenticated history head");
+        transaction.commit().await.expect("commit history seed");
+
+        let receiver = store
+            .claim_post_commit_receiver()
+            .expect("claim receiver before writer checkpoint");
+        assert_eq!(receiver.published_through().unwrap(), 0);
+        let waiting = tokio::spawn(async move {
+            receiver
+                .wait_for_advance(0, &tokio_util::sync::CancellationToken::new())
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("authenticate existing event history");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("authenticated checkpoint wakes the existing receiver")
+                .expect("receiver task joins")
+                .expect("receiver observes a feed advance"),
+            Some(1)
+        );
+        assert_eq!(
+            store.committed_event_sequences(0, 1, 64).await.unwrap(),
+            vec![1],
+            "the awakened receiver scans the authenticated durable prefix"
+        );
+        assert_eq!(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("first-live-writer-commit")
+                                .expect("live maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("publish the exact event after authenticated history"),
+            vec![2]
         );
     }
 
@@ -17448,7 +18459,7 @@ mod tests {
         let wrong_seq = scope().row_aad("inbound_commands", "2", DataKeyPurpose::Command);
         assert!(decrypt_content(&key, &ciphertext, &wrong_seq).is_err());
         let wrong_conversation = AgentScope {
-            conversation_id: "conversation-2".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
             ..scope()
         }
         .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
@@ -17461,13 +18472,15 @@ mod tests {
         let writer = EventWriter::new(store.clone());
         let bytes = vec![b'x'; 1024 * 1024 + 1];
         let key = store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("command key");
         let inbound = InboundCommand::Invalid {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: bytes.len() as u64,
             },
@@ -17513,6 +18526,8 @@ mod tests {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: changed_bytes.len() as u64,
             },
@@ -17535,6 +18550,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_command_dispositions_are_public_exact_and_replay_safe() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let rejected = InboundCommand::Invalid {
+            seq: 1,
+            command_id: CommandId::parse("00000000-0000-4000-8000-000000000101")
+                .expect("canonical rejected command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                br#"{"type":"abort",}"#.to_vec(),
+            )),
+            payload_digest: None,
+        };
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let rejected_receipt = admission
+            .receive_with_origin(&writer, &rejected)
+            .await
+            .expect("persist rejected command");
+        let rejected_ack = rejected_receipt.ack;
+        assert_eq!(rejected_ack.status, CommandAckStatus::Rejected);
+        assert_eq!(rejected_receipt.events.len(), 1);
+        assert!(matches!(
+            &rejected_receipt.events[0],
+            (
+                _,
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    disposition: CommandDisposition::Rejected { .. },
+                    ..
+                })
+            )
+        ));
+
+        let envelope: String = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events WHERE event_type='command_disposition'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load rejected disposition");
+        let envelope: Value = serde_json::from_str(&envelope).expect("public disposition JSON");
+        assert_eq!(
+            envelope,
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000101",
+                "command_seq": 1,
+                "status": "rejected",
+                "reject_reason": "schema_violation"
+            }),
+            "public disposition must not expose provenance, personality-agent identity, or command body"
+        );
+
+        let replay = admission
+            .receive_with_origin(&writer, &rejected)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.ack, rejected_ack);
+        assert!(
+            replay.events.is_empty(),
+            "gateway catch-up owns replayed dispositions"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count replay-safe dispositions"),
+            1,
+            "terminal ACK replay must not append another disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_abort_cutoff_materializes_superseded_and_applied_dispositions_once() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let first = user_command(
+            1,
+            "00000000-0000-4000-8000-000000000111",
+            "first pending user",
+        );
+        let second = user_command(
+            2,
+            "00000000-0000-4000-8000-000000000112",
+            "second pending user",
+        );
+        let abort = abort_command(3, "00000000-0000-4000-8000-000000000113");
+        for command in [&first, &second, &abort] {
+            writer
+                .persist_inbound(command)
+                .await
+                .expect("persist cutoff command");
+        }
+
+        let acks = writer
+            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000113", 3)
+            .await
+            .expect("apply idle Abort cutoff");
+        assert_eq!(
+            acks.iter().map(|ack| ack.status).collect::<Vec<_>>(),
+            vec![
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Applied,
+            ]
+        );
+
+        let envelopes: Vec<String> = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events
+             WHERE event_type='command_disposition' ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load cutoff dispositions");
+        let envelopes = envelopes
+            .iter()
+            .map(|envelope| serde_json::from_str::<Value>(envelope).expect("disposition JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            envelopes,
+            vec![
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000111",
+                    "command_seq": 1,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000112",
+                    "command_seq": 2,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000113",
+                    "command_seq": 3,
+                    "status": "applied"
+                }),
+            ]
+        );
+
+        for (command, status) in [
+            (&first, CommandAckStatus::Superseded),
+            (&second, CommandAckStatus::Superseded),
+            (&abort, CommandAckStatus::Applied),
+        ] {
+            assert_eq!(
+                writer
+                    .persist_inbound(command)
+                    .await
+                    .expect("replay terminal command")
+                    .status,
+                status
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count cutoff dispositions after replay"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_and_disposition_roll_back_together() {
+        let applied_store = test_store().await;
+        let applied_writer = EventWriter::new(applied_store.clone());
+        let abort_id = "00000000-0000-4000-8000-000000000121";
+        applied_writer
+            .persist_inbound(&abort_command(1, abort_id))
+            .await
+            .expect("persist Abort target");
+        let error = applied_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: abort_id.to_owned(),
+                            command_seq: 1,
+                            run_id: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between terminal projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(abort_id)
+            .fetch_one(applied_store.pool())
+            .await
+            .expect("load rolled-back Abort"),
+            "received"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(applied_store.pool())
+                .await
+                .expect("count rolled-back applied disposition"),
+            0
+        );
+
+        let rejected_store = test_store().await;
+        let rejected_writer = EventWriter::new(rejected_store.clone());
+        let rejected_id = "00000000-0000-4000-8000-000000000122";
+        let error = rejected_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandRejected {
+                            seq: 1,
+                            command_id: rejected_id.to_owned(),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
+                            reason: CommandRejectReason::SchemaViolation,
+                            raw_command: RejectedCommandPayload::Present(
+                                SensitiveCommandPayload::new(br#"{"type":"abort",}"#.to_vec()),
+                            ),
+                            payload_digest: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between rejected projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected command"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected disposition"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_null_and_missing_payloads_are_distinct_in_both_replay_directions() {
         for (first, replay) in [
             (
@@ -17553,6 +18826,8 @@ mod tests {
             let original = InboundCommand::Invalid {
                 seq: 1,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: first,
                 payload_digest: None,
@@ -17571,6 +18846,8 @@ mod tests {
             let changed = InboundCommand::Invalid {
                 seq: 1,
                 command_id,
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: replay,
                 payload_digest: None,
@@ -17758,8 +19035,8 @@ mod tests {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
                 .fetch_one(store.pool())
                 .await
-                .expect("no unstarted close events"),
-            0
+                .expect("terminal dispositions for unstarted startup and Abort"),
+            2
         );
         drop(writer);
         store.pool().close().await;
@@ -18689,7 +19966,7 @@ mod tests {
                     "message-1",
                     "hello",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -18947,7 +20224,7 @@ mod tests {
             .await
             .expect("seed next owner");
             let message = user_message("next");
-            let message_id = user_message_id(next_id.as_str());
+            let message_id = test_user_message_id(next_id.as_str());
             let handoff_error = writer
                 .apply(EventBatch {
                     writes: vec![
@@ -19017,7 +20294,7 @@ mod tests {
                             ],
                         },
                     ],
-                    injected_commands: vec![InjectedCommand::new(2, next_id)],
+                    injected_commands: vec![test_injected_command(2, next_id)],
                 })
                 .await
                 .expect_err("pre-assistant owner handoff must fail");
@@ -19357,7 +20634,7 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_start",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageStart"),
@@ -19380,14 +20657,16 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_end",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageEnd"),
                     ),
                     projections: vec![
                         Projection::MessageEnd {
-                            message_id: user_message_id("00000000-0000-4000-8000-000000000018"),
+                            message_id: test_user_message_id(
+                                "00000000-0000-4000-8000-000000000018",
+                            ),
                             role: "user",
                             message,
                             append_to_l0: true,
@@ -19403,7 +20682,7 @@ mod tests {
                     ],
                 },
             ],
-            injected_commands: vec![InjectedCommand::new(
+            injected_commands: vec![test_injected_command(
                 2,
                 "00000000-0000-4000-8000-000000000018",
             )],
@@ -19566,8 +20845,7 @@ mod tests {
             job_inserts: Vec::new(),
             membership_inserts: vec![membership.clone()],
             cursor_advance: None,
-            memory_summary_key_ref: None,
-            memory_summary_key_proof: None,
+            memory_summary_key_proofs: Vec::new(),
         };
         let prepared_size = prepared_memory_projection_materialization(&prepared)
             .expect("size exact-boundary prepared transition");
@@ -19831,47 +21109,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_destroyed_after_prepare_prevents_any_ciphertext_row_from_committing() {
-        let store = test_store().await;
-        let writer = EventWriter::new(store.clone());
-        let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
-            .await
-            .expect("event key");
-        let batch = EventBatch {
-            writes: vec![EventWrite {
-                event: Some(
-                    DurableEvent::new(&json!({"type":"agent_start","run_id":"run-key-race"}))
-                        .expect("durable event"),
-                ),
-                projections: Vec::new(),
-            }],
-            injected_commands: Vec::new(),
-        };
-        let error = writer
-            .apply_after_prepare_destroy_key(batch, &event_key.key_ref)
-            .await
-            .expect_err("destroy commit between prepare and begin must fail closed");
-        assert!(error.to_string().contains("is not active"));
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await
-            .expect("count event rows");
-        assert_eq!(events, 0);
-        let state: String = sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref=?")
-            .bind(&event_key.key_ref)
-            .fetch_one(store.pool())
-            .await
-            .expect("read destroyed key state");
-        assert_eq!(state, "destroyed");
-    }
-
-    #[tokio::test]
     async fn key_material_replaced_after_prepare_is_rejected_in_transaction() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("event key");
         let batch = EventBatch {
@@ -19898,9 +21140,10 @@ mod tests {
                 .expect("replacement data key");
         let aad = KeyWrapAad {
             key_ref: event_key.key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::Event,
-            conversation_id: Some(scope().conversation_id),
+            personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit: "agent".to_owned(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -19978,9 +21221,13 @@ mod tests {
 
         let provider_context_key_ref = match &prepared[0].projections[0] {
             PreparedProjection::MessageEnd {
-                provider_context_key_ref: Some(key_ref),
+                provider_context_key_proofs,
                 ..
-            } => key_ref.clone(),
+            } => provider_context_key_proofs
+                .first()
+                .expect("one provider-context key proof")
+                .0
+                .clone(),
             _ => panic!("prepared MessageEnd must carry a provider-context key proof"),
         };
 
@@ -19990,11 +21237,18 @@ mod tests {
             DataKeyPurpose::ProviderContext,
         )
         .expect("replacement provider-context data key");
+        let retention_unit: String =
+            sqlx::query_scalar("SELECT retention_unit FROM data_keys WHERE key_ref=?")
+                .bind(&provider_context_key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("load provider-context retention unit");
         let aad = KeyWrapAad {
             key_ref: provider_context_key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::ProviderContext,
-            conversation_id: Some(scope().conversation_id),
+            personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit,
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -20029,7 +21283,7 @@ mod tests {
                 }],
                 injected_commands: (0_u64..17)
                     .map(|index| {
-                        InjectedCommand::new(
+                        test_injected_command(
                             index + 1,
                             format!("00000000-0000-4000-8000-{index:012}"),
                         )
@@ -20154,8 +21408,14 @@ mod tests {
     #[tokio::test]
     async fn injected_user_message_uuid_v5_is_canonical_and_replay_stable() {
         let command_id = "018f0000-0000-7000-8000-000000000001";
-        let canonical = user_message_id(command_id);
-        assert_eq!(canonical, user_message_id(command_id));
+        let canonical = test_user_message_id(command_id);
+        assert_eq!(canonical, test_user_message_id(command_id));
+        assert_eq!(
+            canonical,
+            crate::gateway::wire::user_message_id_from_command_id(command_id)
+                .expect("public wire message id"),
+            "Store projection must use the public command-to-message namespace"
+        );
         assert_eq!(
             Uuid::parse_str(&canonical)
                 .expect("derived message UUID")
@@ -20164,7 +21424,7 @@ mod tests {
         );
         assert_ne!(
             canonical,
-            user_message_id("018f0000-0000-7000-8000-000000000002")
+            test_user_message_id("018f0000-0000-7000-8000-000000000002")
         );
         assert_ne!(
             canonical,
@@ -20184,6 +21444,7 @@ mod tests {
             1,
             CommandId::parse(command_id).expect("canonical test command UUID"),
             "caller-choice",
+            test_provenance(),
         );
         let rejected = writer
             .apply(EventBatch {
@@ -20204,7 +21465,7 @@ mod tests {
         writer
             .apply(EventBatch {
                 writes: injection_writes(command_id, "ignored", "stable"),
-                injected_commands: vec![InjectedCommand::new(1, command_id)],
+                injected_commands: vec![test_injected_command(1, command_id)],
             })
             .await
             .expect("canonical UUIDv5 injection");
@@ -20217,8 +21478,8 @@ mod tests {
             canonical
         );
         assert_eq!(
-            user_message_id(command_id),
-            InjectedCommand::new(1, command_id).message_id(),
+            test_user_message_id(command_id),
+            test_injected_command(1, command_id).message_id(),
             "reclassification/replay must derive the same ID"
         );
     }
@@ -20230,6 +21491,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test command UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::Abort {},
             },
         };
@@ -23532,6 +24795,8 @@ mod tests {
             CommandEnvelope {
                 seq: 2,
                 command_id: CommandId::parse(steer_1_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::UserMessage {
                     text: "a".to_owned(),
                     attachments: Vec::new(),
@@ -23543,6 +24808,8 @@ mod tests {
             CommandEnvelope {
                 seq: 3,
                 command_id: CommandId::parse(steer_2_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::UserMessage {
                     text: "b".to_owned(),
                     attachments: Vec::new(),
@@ -23554,6 +24821,7 @@ mod tests {
         let previous_owner = DurableRunBinding {
             command_id: command_id.to_owned(),
             command_seq: 1,
+            provenance: test_provenance(),
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
             executor_generation: ProcessGeneration::MIN,
@@ -23798,7 +25066,7 @@ mod tests {
     async fn migration_rejects_invalid_command_and_tool_state_fixtures() {
         let store = test_store().await;
         store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("create command key");
         let key_ref: String = sqlx::query_scalar(
@@ -24148,6 +25416,8 @@ mod tests {
                             seq: 1,
                             command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                                 .expect("canonical test command UUID"),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
                             command: Command::Abort {},
                         },
                     }],
@@ -24160,6 +25430,8 @@ mod tests {
                     projections: vec![Projection::CommandRejected {
                         seq: 1,
                         command_id: "00000000-0000-4000-8000-000000000021".to_owned(),
+                        personality_agent_id: scope().personality_agent_id,
+                        provenance: test_provenance(),
                         reason: CommandRejectReason::SchemaViolation,
                         raw_command: RejectedCommandPayload::Present(
                             crate::gateway::SensitiveCommandPayload::new(
@@ -24189,7 +25461,7 @@ mod tests {
                     "message-1",
                     "inject",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -24418,7 +25690,7 @@ mod tests {
                         (SELECT COUNT(*) FROM inbound_commands
                          WHERE command_id='00000000-0000-4000-8000-000000000001' AND run_phase='user_committed')",
                 )
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("injection state");
@@ -24446,7 +25718,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("startup Abort state");
-                state == (1, 1, 0)
+                state == (1, 1, 2)
             }
             "approval_pending" => {
                 let state: (i64, i64, i64) = sqlx::query_as(
@@ -24476,7 +25748,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("approval resolved state");
-                state == (1, 1, 1, 3)
+                state == (1, 1, 1, 4)
             }
             "tool_prepared" => {
                 sqlx::query_scalar::<_, i64>(
@@ -24827,6 +26099,130 @@ mod tests {
             }],
             injected_commands: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_memory_recovery_and_provider_mutation_share_one_post_commit_dispatcher() {
+        #[derive(Clone)]
+        struct RecordingTarget(Arc<std::sync::Mutex<Vec<u64>>>);
+
+        #[async_trait::async_trait]
+        impl crate::gateway::supervisor::post_commit::PostCommitAdmissionTarget for RecordingTarget {
+            fn bind_post_commit_epoch(
+                &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn admit_committed(
+                &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
+                _personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
+                seq: u64,
+            ) -> Result<crate::gateway::supervisor::session::DurableEventAdmission> {
+                self.0.lock().unwrap().push(seq);
+                Ok(
+                    crate::gateway::supervisor::session::DurableEventAdmission::Deferred {
+                        after_epoch: None,
+                    },
+                )
+            }
+        }
+
+        let store = test_store().await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut dispatcher =
+            crate::gateway::supervisor::post_commit::OrderedPostCommitDispatcher::start(
+                store.clone(),
+                RecordingTarget(calls.clone()),
+                0,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .expect("one dispatcher claims the Store");
+        let client = dispatcher.client();
+        let writer = EventWriter::new(store.clone());
+
+        // Provider-context mutation uses its real prepared/apply contract.
+        let provider_mutation =
+            error_context_kill_target(&writer, "error_context_disposition_apply").await;
+        let session_event_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM agent_events WHERE event_type='message_end'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            session_event_seq > 0,
+            "the real Session fixture must commit lifecycle output"
+        );
+        let mut committed = writer.apply(provider_mutation).await.unwrap();
+
+        // Idle/background memory maintenance uses the same EventWriter.
+        committed.extend(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("background-memory")
+                                .expect("memory maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+
+        // Cold-boot recovery retains the writer gate but still publishes from
+        // the common post-COMMIT boundary.
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(41),
+            "post-commit-recovery-lease",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "post-commit-recovery-fence").unwrap();
+        let mut recovery = writer
+            .begin_bootstrap_recovery(&lease, &fence)
+            .await
+            .unwrap();
+        committed.extend(
+            recovery
+                .apply_recovery_batch(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("bootstrap-recovery")
+                                .expect("recovery event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+        drop(recovery);
+
+        let final_seq = *committed
+            .last()
+            .expect("producer commits returned receipts");
+        client
+            .admission_for(&store.scope().personality_agent_id, final_seq)
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            (1..=final_seq).collect::<Vec<_>>(),
+            "every producer must enter the one exact durable FIFO"
+        );
+        let quiescence = EventWriter::new(store.clone())
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await
+            .unwrap();
+        dispatcher.shutdown(quiescence).await.unwrap();
     }
 
     #[cfg(unix)]
@@ -25189,8 +26585,10 @@ mod tests {
             })
             .await
             .expect("persist projected provider terminal");
-        let [terminal_message_end_seq, _, _] = terminal_sequences.as_slice() else {
-            panic!("terminal batch must persist MessageEnd, TurnEnd, and AgentEnd");
+        let [terminal_message_end_seq, _, _, _] = terminal_sequences.as_slice() else {
+            panic!(
+                "terminal batch must persist MessageEnd, TurnEnd, AgentEnd, and command disposition"
+            );
         };
         let terminal_message_end_seq = i64::try_from(*terminal_message_end_seq)
             .expect("terminal MessageEnd sequence fits SQLite INTEGER");
@@ -27542,7 +28940,7 @@ mod tests {
             .await
             .expect("commit user message");
 
-        let message_id = user_message_id(command_id);
+        let message_id = test_user_message_id(command_id);
         sqlx::query("UPDATE messages SET role = 'assistant' WHERE id = ?")
             .bind(&message_id)
             .execute(store.pool())
@@ -27579,7 +28977,7 @@ mod tests {
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Native compaction coverage must identify an actual persisted message.
-        let user_message_id = user_message_id(command_id);
+        let user_message_id = test_user_message_id(command_id);
         let user_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
             .bind(&user_message_id)
             .fetch_one(writer.store.pool())
@@ -27704,6 +29102,17 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let (_, _, message_id) = seed_assistant_with_reasoning(&store, &writer).await;
+        let key_refs: Vec<String> =
+            sqlx::query_scalar("SELECT key_ref FROM provider_context ORDER BY id")
+                .fetch_all(store.pool())
+                .await
+                .expect("load exact provider-context retention keys");
+        assert_eq!(key_refs.len(), 3);
+        assert_eq!(
+            key_refs.iter().collect::<BTreeSet<_>>().len(),
+            3,
+            "each reasoning item and native window must use an independent retention key"
+        );
 
         let lease = test_lease(1);
         let fence = test_fence(&lease);
@@ -27838,7 +29247,7 @@ mod tests {
                 }
                 "extra" => {
                     let key = store
-                        .conversation_key(DataKeyPurpose::Transcript)
+                        .private_key(DataKeyPurpose::Transcript)
                         .await
                         .expect("mint transcript key");
                     let message = user_message("uncommitted extra member");
@@ -27962,8 +29371,12 @@ mod tests {
         run_id: &str,
         tool_call_id: &str,
     ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
-        let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
-            .expect("test process generation lease");
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(1),
+            "test-lease",
+        )
+        .expect("test process generation lease");
         let fence = GenerationRecoveryFence::new(&lease, "test-fence")
             .expect("test generation recovery fence");
         let decision_id = "00000000-0000-4000-8000-000000000003";
@@ -28174,7 +29587,7 @@ mod tests {
                 .await
                 .expect("reopen after T17 hard kill")
                 .into();
-            const SETUP_EVENTS: i64 = 3;
+            const SETUP_EVENTS: i64 = 4;
             const RECOVERY_EVENTS: i64 = 3;
 
             let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
@@ -28239,8 +29652,12 @@ mod tests {
                 // The before-commit kill rolled back the logical suffix and the
                 // application ledger. Replaying the exact same recovery batch must
                 // converge to a committed state.
-                let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
-                    .expect("test lease");
+                let lease = ProcessGenerationLease::new(
+                    reopened.scope().personality_agent_id.clone(),
+                    test_process_generation(1),
+                    "test-lease",
+                )
+                .expect("test lease");
                 let fence = GenerationRecoveryFence::new(&lease, "test-fence").expect("test fence");
                 let writer = EventWriter::new(reopened.clone());
                 let (batch, receipt) =
@@ -28342,7 +29759,7 @@ mod tests {
     async fn message_end_eviction_footprint_overflow_fails_closed() {
         let store = test_store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
 
@@ -28381,8 +29798,7 @@ mod tests {
             interrupted: false,
             l0_disposition: L0Disposition::Append,
             provider_context: vec![],
-            provider_context_key_ref: None,
-            provider_context_key_proof: None,
+            provider_context_key_proofs: Vec::new(),
             eviction_footprint_tokens: 1,
             public_est: 0,
             create_l0_batch: None,
@@ -28423,6 +29839,7 @@ mod tests {
         .expect("insert running job with lease");
 
         apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "lease-job".to_owned(),
@@ -28453,6 +29870,7 @@ mod tests {
         );
 
         let error = apply_memory_job_mutation(
+            &store,
             &mut transaction,
             PreparedMemoryJobMutation {
                 job_id: "lease-job".to_owned(),
@@ -28473,6 +29891,77 @@ mod tests {
             "{error:#}"
         );
         transaction.rollback().await.expect("rollback test fixture");
+    }
+
+    #[tokio::test]
+    async fn memory_mutations_reject_cross_unit_summary_keys_before_writes() {
+        let store = test_store().await;
+        let wrong_batch_key = store
+            .memory_summary_key("batch", "different-batch")
+            .await
+            .unwrap();
+        let wrong_job_key = store
+            .memory_summary_key("job", "different-job")
+            .await
+            .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+
+        let batch_error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "target-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: Some(MemoryBatchSummary {
+                    key_ref: wrong_batch_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+                est_tokens: 0,
+                footprint_delta: 0,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect_err("batch summary key from another batch must fail before commit");
+        assert!(
+            batch_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        let job_error = apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "target-job".to_owned(),
+                expected_status: "running",
+                new_status: "ready",
+                attempts: 1,
+                attempts_delta: 0,
+                expected_lease_until: None,
+                new_lease_until: None,
+                source_versions: None,
+                result: Some(MemoryJobResult {
+                    key_ref: wrong_job_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+            },
+        )
+        .await
+        .expect_err("job result key from another job must fail before commit");
+        assert!(
+            job_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -28577,7 +30066,7 @@ mod tests {
     async fn message_end_creates_l0_membership_and_attributes_footprint() {
         let store = test_store().await;
         let key = store
-            .conversation_key(DataKeyPurpose::Transcript)
+            .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
 
@@ -28612,8 +30101,7 @@ mod tests {
             l0_batch_id: Some("l0-batch".to_owned()),
             l0_batch_message_ord: Some(1),
             provider_context: vec![],
-            provider_context_key_ref: None,
-            provider_context_key_proof: None,
+            provider_context_key_proofs: Vec::new(),
             eviction_footprint_tokens: 42,
             public_est: 0,
             seal_transition: None,
