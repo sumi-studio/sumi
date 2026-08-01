@@ -1,6 +1,11 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -8,16 +13,19 @@ use zeroize::Zeroizing;
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
 use crate::memory::{HydratedMemoryRuntime, estimate::ProviderContextItemWithFootprint};
-use crate::provider::types::ContextMessage;
+use crate::provider::types::{
+    ContextMessage, Message, PublicAssistantContent, PublicMessage, StopReason, ToolCall,
+    ToolResultMessage, UserContent,
+};
 use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
     ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
-    PhysicalRecoveryReceipt, Projection, RunPhase, Store,
+    PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter, RunPhase, Store,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
-    verify_command_payload_digest,
+    tool_result_message_id, verify_command_payload_digest,
 };
 
 const EVENT_EVIDENCE_PAGE_ROWS: i64 = 64;
@@ -25,6 +33,8 @@ const PENDING_COMMAND_MAX_COUNT: usize = 32;
 const PENDING_COMMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
 const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
+const PROCESS_RESTARTED_ERROR_CODE: &str = "process_restarted";
+const PROCESS_RESTARTED_TOOL_RESULT: &str = "process restarted before tool execution";
 
 /// Typed identity for one durably pending approval whose prepared tool must be
 /// closed during logical suffix recovery.
@@ -115,6 +125,430 @@ pub(crate) enum RecoveryStep {
         /// not claim that the T26 consumer exists.
         pending_approval: Option<PendingApprovalRecovery>,
     },
+}
+
+/// Store-owned consumer for the narrow, authenticated ToolUse restart seam.
+///
+/// This executor intentionally supports only a complete single-step
+/// `ResumeAssistantFromDurableEvents` plan. Every other logical-recovery shape
+/// remains NotReady until its own canonical consumer is implemented. The
+/// supported path never calls a provider or tool: calls with terminal durable
+/// rows reuse their exact result, and rowless calls receive a synthetic error
+/// result plus an eventless `ToolExecutionMutation::Skip`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LogicalRecoveryExecutor;
+
+#[derive(Clone)]
+struct MissingToolResult {
+    call: ToolCall,
+    message_id: String,
+    result: ToolResultMessage,
+}
+
+struct ToolUseRecoverySnapshot {
+    command_id: String,
+    command_seq: u64,
+    run_id: String,
+    turn_id: String,
+    assistant: PublicMessage,
+    tool_results: Vec<ToolResultMessage>,
+    missing_results: Vec<MissingToolResult>,
+}
+
+impl LogicalRecoveryExecutor {
+    pub(crate) async fn execute(
+        &self,
+        store: &Store,
+        steps: &[RecoveryStep],
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<()> {
+        let [
+            RecoveryStep::ResumeAssistantFromDurableEvents {
+                command_id,
+                run_id,
+                turn_id,
+                pending_error_context,
+            },
+        ] = steps
+        else {
+            bail!(
+                "Store LogicalRecoveryExecutor only supports one ResumeAssistantFromDurableEvents step; received {} ordered step(s)",
+                steps.len()
+            );
+        };
+        if pending_error_context.is_some() {
+            bail!(
+                "Store LogicalRecoveryExecutor does not support an undisposed Error provider context"
+            );
+        }
+
+        // The guard authenticates the current lifecycle checkpoint and keeps
+        // this recovery writer exclusive through the final atomic batch.
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .context("failed to begin logical-recovery snapshot")?;
+        super::event_writer::authenticate_event_log_snapshot(store, &mut transaction)
+            .await
+            .context("failed to authenticate logical-recovery event snapshot")?;
+        let messages = store
+            .hydrate_messages(&mut transaction)
+            .await
+            .context("failed to authenticate logical-recovery transcript")?;
+        let snapshot =
+            ToolUseRecoverySnapshot::load(&mut transaction, &messages, command_id, run_id, turn_id)
+                .await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit logical-recovery inspection")?;
+
+        recovery
+            .apply_recovery_batch(snapshot.into_batch(lease.generation())?)
+            .await
+            .context("failed to atomically close rowless ToolUse restart seam")?;
+        Ok(())
+    }
+}
+
+impl ToolUseRecoverySnapshot {
+    async fn load(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        messages: &[ContextMessage],
+        command_id: &str,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<Self> {
+        let command = sqlx::query(
+            "SELECT seq, command_kind, status, application_kind, run_id, turn_id, run_phase
+             FROM inbound_commands WHERE command_id = ? LIMIT 1",
+        )
+        .bind(command_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .context("failed to inspect logical-recovery command owner")?
+        .ok_or_else(|| anyhow::anyhow!("logical-recovery command {command_id} disappeared"))?;
+        let command_seq = u64::try_from(command.try_get::<i64, _>("seq")?)
+            .context("logical-recovery command sequence is negative")?;
+        let command_kind: String = command.try_get("command_kind")?;
+        let status: String = command.try_get("status")?;
+        let application_kind: Option<String> = command.try_get("application_kind")?;
+        let stored_run_id: Option<String> = command.try_get("run_id")?;
+        let stored_turn_id: Option<String> = command.try_get("turn_id")?;
+        let run_phase: String = command.try_get("run_phase")?;
+        if command_kind != "user_message"
+            || status != "applying"
+            || application_kind.as_deref() != Some("idle_run")
+            || stored_run_id.as_deref() != Some(run_id)
+            || stored_turn_id.as_deref() != Some(turn_id)
+            || run_phase != "assistant_started"
+        {
+            bail!(
+                "logical-recovery command {command_id} is not the exact live assistant_started idle-run owner"
+            );
+        }
+
+        // Multiple assistant attempts may exist after retries. The latest
+        // authenticated MessageEnd in this open turn is the suffix owner.
+        let assistant_row = sqlx::query(
+            "SELECT m.id, m.seq
+             FROM messages AS m
+             JOIN agent_events AS e ON e.seq = m.seq
+             WHERE m.role = 'assistant'
+               AND e.event_type = 'message_end'
+               AND json_extract(e.internal_metadata, '$.run_id') = ?
+               AND json_extract(e.internal_metadata, '$.turn_id') = ?
+             ORDER BY m.seq DESC LIMIT 1",
+        )
+        .bind(run_id)
+        .bind(turn_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .context("failed to locate assistant logical-recovery owner")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "logical-recovery turn {run_id}/{turn_id} has no authenticated assistant MessageEnd"
+            )
+        })?;
+        let assistant_message_id: String = assistant_row.try_get("id")?;
+        let assistant_seq = u64::try_from(assistant_row.try_get::<i64, _>("seq")?)
+            .context("assistant logical-recovery sequence is negative")?;
+        let assistant = messages
+            .iter()
+            .find_map(|message| match message {
+                ContextMessage::Persisted {
+                    id,
+                    seq,
+                    message: Message::Assistant(_),
+                } if id == &assistant_message_id && *seq == assistant_seq => {
+                    Some(crate::memory::overflow::context_message_to_public(message))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "assistant logical-recovery owner {assistant_message_id}/{assistant_seq} is absent from the authenticated transcript"
+                )
+            })?;
+        let PublicMessage::Assistant(assistant_message) = &assistant else {
+            unreachable!("assistant transcript variant was matched")
+        };
+        if assistant_message.stop_reason != StopReason::ToolUse || assistant_message.interrupted {
+            bail!(
+                "assistant logical-recovery owner {assistant_message_id} is not a completed ToolUse MessageEnd"
+            );
+        }
+
+        let mut tool_call_ids = HashSet::new();
+        let mut calls = Vec::new();
+        for item in &assistant_message.content {
+            match item {
+                PublicAssistantContent::ToolCall { tool_call, .. } => {
+                    if !tool_call_ids.insert(tool_call.id.as_str()) {
+                        bail!(
+                            "assistant logical-recovery owner contains duplicate ToolCall {}",
+                            tool_call.id
+                        );
+                    }
+                    calls.push(tool_call.clone());
+                }
+                PublicAssistantContent::RejectedToolCall { .. } => {
+                    bail!(
+                        "Store LogicalRecoveryExecutor does not support mixed rejected ToolCall recovery"
+                    );
+                }
+                PublicAssistantContent::Text { .. } | PublicAssistantContent::Thinking { .. } => {}
+            }
+        }
+        if calls.is_empty() {
+            bail!("ToolUse logical recovery requires at least one ToolCall");
+        }
+
+        let mut persisted_results = HashMap::<String, (String, u64, ToolResultMessage)>::new();
+        for message in messages {
+            let ContextMessage::Persisted {
+                id,
+                seq,
+                message: Message::ToolResult(result),
+            } = message
+            else {
+                continue;
+            };
+            if tool_call_ids.contains(result.tool_call_id.as_str())
+                && persisted_results
+                    .insert(
+                        result.tool_call_id.clone(),
+                        (id.clone(), *seq, result.clone()),
+                    )
+                    .is_some()
+            {
+                bail!(
+                    "logical-recovery ToolCall {} has multiple durable results",
+                    result.tool_call_id
+                );
+            }
+        }
+
+        let mut tool_results = Vec::with_capacity(calls.len());
+        let mut missing_results = Vec::new();
+        for call in calls {
+            let tool_row = sqlx::query(
+                "SELECT command_id, run_id, state, error_code
+                 FROM tool_executions WHERE tool_call_id = ? LIMIT 1",
+            )
+            .bind(&call.id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .with_context(|| format!("failed to inspect ToolCall {}", call.id))?;
+            let approval_row = sqlx::query(
+                "SELECT run_id, turn_id, state FROM approval_log
+                 WHERE tool_call_id = ? LIMIT 1",
+            )
+            .bind(&call.id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .with_context(|| format!("failed to inspect ToolCall {} approval", call.id))?;
+            if let Some(approval) = approval_row.as_ref() {
+                let approval_run: String = approval.try_get("run_id")?;
+                let approval_turn: String = approval.try_get("turn_id")?;
+                if approval_run != run_id || approval_turn != turn_id {
+                    bail!(
+                        "ToolCall {} approval belongs to another run or turn",
+                        call.id
+                    );
+                }
+                let approval_state: String = approval.try_get("state")?;
+                if approval_state == "pending" {
+                    bail!(
+                        "Store LogicalRecoveryExecutor does not support pending approval for ToolCall {}",
+                        call.id
+                    );
+                }
+            }
+
+            let expected_message_id =
+                tool_result_message_id(&assistant_message_id, call.id.as_str());
+            match tool_row {
+                Some(row) => {
+                    let owner_command: String = row.try_get("command_id")?;
+                    let owner_run: String = row.try_get("run_id")?;
+                    let state: String = row.try_get("state")?;
+                    if owner_command != command_id || owner_run != run_id {
+                        bail!("ToolCall {} belongs to another durable owner", call.id);
+                    }
+                    if matches!(state.as_str(), "prepared" | "running") {
+                        bail!(
+                            "Store LogicalRecoveryExecutor does not support active ToolCall {} in state {state}",
+                            call.id
+                        );
+                    }
+                    if !matches!(
+                        state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "indeterminate" | "not_started"
+                    ) {
+                        bail!("ToolCall {} has unsupported durable state {state}", call.id);
+                    }
+                    let Some((message_id, result_seq, result)) =
+                        persisted_results.remove(call.id.as_str())
+                    else {
+                        bail!(
+                            "terminal ToolCall {} has no exact durable ToolResult MessageEnd",
+                            call.id
+                        );
+                    };
+                    if message_id != expected_message_id
+                        || result_seq <= assistant_seq
+                        || result.tool_call_id != call.id
+                        || result.tool_name != call.name
+                        || result.is_error != (state != "succeeded")
+                    {
+                        bail!(
+                            "terminal ToolCall {} disagrees with its exact durable ToolResult",
+                            call.id
+                        );
+                    }
+                    tool_results.push(result);
+                }
+                None => {
+                    if approval_row.is_some() {
+                        bail!(
+                            "rowless ToolCall {} has approval evidence and cannot be classified as pre-policy",
+                            call.id
+                        );
+                    }
+                    if persisted_results.contains_key(call.id.as_str()) {
+                        bail!(
+                            "rowless ToolCall {} already has a durable result without a terminal execution row",
+                            call.id
+                        );
+                    }
+                    let result = ToolResultMessage {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        content: vec![UserContent::Text {
+                            text: PROCESS_RESTARTED_TOOL_RESULT.to_owned(),
+                        }],
+                        details: json!({ "error": PROCESS_RESTARTED_TOOL_RESULT }),
+                        is_error: true,
+                        timestamp: Utc::now(),
+                    };
+                    tool_results.push(result.clone());
+                    missing_results.push(MissingToolResult {
+                        call,
+                        message_id: expected_message_id,
+                        result,
+                    });
+                }
+            }
+        }
+        if !persisted_results.is_empty() {
+            bail!("authenticated transcript contains unowned results for current ToolCalls");
+        }
+
+        Ok(Self {
+            command_id: command_id.to_owned(),
+            command_seq,
+            run_id: run_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            assistant,
+            tool_results,
+            missing_results,
+        })
+    }
+
+    fn into_batch(
+        self,
+        executor_generation: crate::runtime::contracts::ProcessGeneration,
+    ) -> Result<EventBatch> {
+        let mut writes = Vec::with_capacity(
+            self.missing_results
+                .len()
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        for missing in self.missing_results {
+            let message = PublicMessage::ToolResult(missing.result);
+            writes.push(EventWrite {
+                event: Some(super::DurableEvent::message(
+                    "message_start",
+                    &missing.message_id,
+                    &message,
+                )?),
+                projections: Vec::new(),
+            });
+            writes.push(EventWrite {
+                event: Some(super::DurableEvent::message(
+                    "message_end",
+                    &missing.message_id,
+                    &message,
+                )?),
+                projections: vec![
+                    Projection::MessageEnd {
+                        message_id: missing.message_id,
+                        role: "tool_result",
+                        message,
+                        append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
+                    },
+                    Projection::ToolExecution(super::ToolExecutionMutation::Skip {
+                        tool_call_id: missing.call.id.clone(),
+                        command_id: self.command_id.clone(),
+                        run_id: self.run_id.clone(),
+                        turn_id: self.turn_id.clone(),
+                        executor_generation,
+                        idempotency_key: format!("{}/{}", self.command_id, missing.call.id),
+                        error_code: PROCESS_RESTARTED_ERROR_CODE,
+                    }),
+                ],
+            });
+        }
+        writes.push(EventWrite {
+            event: Some(super::DurableEvent::turn_end(
+                &self.run_id,
+                &self.turn_id,
+                self.assistant,
+                self.tool_results,
+            )?),
+            projections: Vec::new(),
+        });
+        writes.push(EventWrite {
+            event: Some(super::DurableEvent::agent_end(&self.run_id)?),
+            projections: vec![Projection::CommandApplied {
+                command_id: self.command_id,
+                command_seq: self.command_seq,
+                run_id: Some(self.run_id),
+            }],
+        });
+        Ok(EventBatch {
+            writes,
+            injected_commands: Vec::new(),
+        })
+    }
 }
 
 /// Authenticated cold-boot hydration boundary returned by T17.
@@ -1158,12 +1592,22 @@ mod tests {
         gateway::{
             ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
         },
-        runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId},
+        provider::types::{
+            ApiProtocol, ProviderOrigin, PublicAssistantMessage, Usage, UserMessage,
+        },
+        runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration},
         store::{
-            AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, Projection,
+            AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand,
+            Projection, ToolExecutionMutation,
             crypto::{DATA_KEY_BYTES, WrappingKey},
+            user_message_id,
         },
     };
+
+    const TOOL_USE_RECOVERY_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000091";
+    const TOOL_USE_RECOVERY_RUN_ID: &str = "run-tool-use-recovery";
+    const TOOL_USE_RECOVERY_TURN_ID: &str = "turn-tool-use-recovery";
+    const TOOL_USE_RECOVERY_ASSISTANT_ID: &str = "assistant-tool-use-recovery";
 
     fn test_personality_agent_id() -> PersonalityAgentId {
         "0198f0f4-9b72-7000-8000-000000000001"
@@ -1207,6 +1651,540 @@ mod tests {
         .into();
         let writer = EventWriter::new(store.clone());
         (store, writer)
+    }
+
+    fn test_generation() -> ProcessGeneration {
+        ProcessGeneration::from_wire(7).expect("test generation")
+    }
+
+    fn tool_use_recovery_assistant() -> PublicMessage {
+        let calls = [
+            ("tool-terminal-success", "read_file", 0_u32),
+            ("tool-terminal-failure", "write_file", 1_u32),
+            ("tool-rowless-messaging", "messaging", 2_u32),
+        ];
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: calls
+                .into_iter()
+                .map(
+                    |(id, name, wire_item_index)| PublicAssistantContent::ToolCall {
+                        tool_call: ToolCall {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            arguments: serde_json::from_value(json!({ "slot": wire_item_index }))
+                                .expect("object tool arguments"),
+                        },
+                        wire_item_index,
+                    },
+                )
+                .collect(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-provider-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        })
+    }
+
+    async fn persist_terminal_tool(
+        writer: &EventWriter,
+        tool_call_id: &str,
+        tool_name: &str,
+        slot: u32,
+        is_error: bool,
+    ) {
+        let generation = test_generation();
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: None,
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Prepare {
+                                tool_call_id: tool_call_id.to_owned(),
+                                command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                                executor_generation: generation,
+                                idempotency_key: format!(
+                                    "{TOOL_USE_RECOVERY_COMMAND_ID}/{tool_call_id}"
+                                ),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::tool_execution_start(
+                                tool_call_id.to_owned(),
+                                tool_name.to_owned(),
+                                json!({ "slot": slot }),
+                                TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                                TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                                generation,
+                            )
+                            .expect("ToolExecutionStart"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Start {
+                                tool_call_id: tool_call_id.to_owned(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            },
+                        )],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("prepare and start terminal ToolCall fixture");
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            content: vec![UserContent::Text {
+                text: if is_error {
+                    "fixture failure".to_owned()
+                } else {
+                    "fixture success".to_owned()
+                },
+            }],
+            details: json!({ "fixture": true, "is_error": is_error }),
+            is_error,
+            timestamp: Utc::now(),
+        };
+        let message = PublicMessage::ToolResult(result.clone());
+        let message_id = tool_result_message_id(TOOL_USE_RECOVERY_ASSISTANT_ID, tool_call_id);
+        let state = if is_error { "failed" } else { "succeeded" };
+        let error_code = is_error.then_some("executor_failed");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::tool_execution_end(
+                                tool_call_id.to_owned(),
+                                serde_json::to_value(&result).expect("tool result value"),
+                                is_error,
+                                state.to_owned(),
+                                error_code.map(str::to_owned),
+                            )
+                            .expect("ToolExecutionEnd"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: tool_call_id.to_owned(),
+                                expected: "running",
+                                state,
+                                error_code,
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &message_id, &message)
+                                .expect("tool result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &message_id, &message)
+                                .expect("tool result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id,
+                            role: "tool_result",
+                            message,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("finish terminal ToolCall fixture");
+    }
+
+    async fn seed_tool_use_restart_seam(writer: &EventWriter) {
+        persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                        turn_id: TOOL_USE_RECOVERY_TURN_ID.to_owned(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify ToolUse recovery command");
+
+        let command_id = crate::gateway::CommandId::parse(TOOL_USE_RECOVERY_COMMAND_ID)
+            .expect("ToolUse recovery command ID");
+        let message_id = user_message_id(&test_personality_agent_id(), &command_id);
+        let received_at: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id=?")
+                .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+                .fetch_one(writer.store().pool())
+                .await
+                .expect("ToolUse recovery command timestamp");
+        let user = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+            }],
+            timestamp: chrono::DateTime::parse_from_rfc3339(&received_at)
+                .expect("stored command timestamp")
+                .with_timezone(&Utc),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_start(TOOL_USE_RECOVERY_RUN_ID)
+                                .expect("AgentStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(
+                                TOOL_USE_RECOVERY_RUN_ID,
+                                TOOL_USE_RECOVERY_TURN_ID,
+                            )
+                            .expect("TurnStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &message_id, &user)
+                                .expect("user MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &message_id, &user)
+                                .expect("user MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "user",
+                                message: user,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::RunPhase {
+                                command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(1, command_id, test_provenance())],
+            })
+            .await
+            .expect("persist ToolUse recovery user turn");
+
+        let assistant = tool_use_recovery_assistant();
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                TOOL_USE_RECOVERY_ASSISTANT_ID,
+                                &assistant,
+                                Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                                Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                TOOL_USE_RECOVERY_ASSISTANT_ID,
+                                &assistant,
+                                Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                                Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned(),
+                            role: "assistant",
+                            message: assistant,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist ToolUse assistant restart seam");
+
+        persist_terminal_tool(writer, "tool-terminal-success", "read_file", 0, false).await;
+        persist_terminal_tool(writer, "tool-terminal-failure", "write_file", 1, true).await;
+    }
+
+    #[tokio::test]
+    async fn logical_tool_use_recovery_reuses_terminal_results_skips_rowless_call_and_restarts_at_fixed_point()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-logical-tool-use-recovery-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let path = root.join("agent.db");
+        let scope = AgentScope {
+            personality_agent_id: test_personality_agent_id(),
+        };
+        let provider: Arc<dyn super::super::KeyProvider> = Arc::new(TestKeyProvider(
+            WrappingKey::new("test", [0x61; DATA_KEY_BYTES]),
+        ));
+        let store: Arc<Store> = Store::open(&path, scope.clone(), provider.clone())
+            .await
+            .expect("open first restart fixture")
+            .into();
+        let writer = EventWriter::new(store.clone());
+        seed_tool_use_restart_seam(&writer).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("pre-restart ToolExecutionStart count"),
+            2
+        );
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+
+        let first_restart: Arc<Store> = Store::open(&path, scope.clone(), provider.clone())
+            .await
+            .expect("open first logical-recovery restart")
+            .into();
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "logical-recovery-fence")
+            .expect("logical-recovery fence");
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = first_restart
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate first restart")
+        else {
+            panic!("first restart must require the ToolUse logical suffix")
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                command_id,
+                run_id,
+                turn_id,
+                pending_error_context: None,
+            }] if command_id == TOOL_USE_RECOVERY_COMMAND_ID
+                && run_id == TOOL_USE_RECOVERY_RUN_ID
+                && turn_id == TOOL_USE_RECOVERY_TURN_ID
+        ));
+
+        let events_before_unsupported: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(first_restart.pool())
+                .await
+                .expect("event count before unsupported plan");
+        let mut unsupported = steps.clone();
+        unsupported.push(RecoveryStep::Reclassify {
+            command_id: "00000000-0000-4000-8000-000000000092".to_owned(),
+        });
+        let error = LogicalRecoveryExecutor
+            .execute(&first_restart, &unsupported, &lease, &fence)
+            .await
+            .expect_err("mixed recovery plan must fail before mutation");
+        assert!(error.to_string().contains("only supports one"), "{error:#}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(first_restart.pool())
+                .await
+                .expect("event count after unsupported plan"),
+            events_before_unsupported
+        );
+
+        LogicalRecoveryExecutor
+            .execute(&first_restart, &steps, &lease, &fence)
+            .await
+            .expect("close authenticated ToolUse restart seam");
+
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT state, error_code FROM tool_executions
+                 WHERE tool_call_id='tool-rowless-messaging'",
+            )
+            .fetch_one(first_restart.pool())
+            .await
+            .expect("synthetic rowless tool disposition"),
+            (
+                "not_started".to_owned(),
+                Some("process_restarted".to_owned())
+            )
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                   (SELECT state FROM tool_executions
+                    WHERE tool_call_id='tool-terminal-success'),
+                   (SELECT state FROM tool_executions
+                    WHERE tool_call_id='tool-terminal-failure')",
+            )
+            .fetch_one(first_restart.pool())
+            .await
+            .expect("terminal tool states after recovery"),
+            ("succeeded".to_owned(), "failed".to_owned())
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT
+                   (SELECT COUNT(*) FROM agent_events
+                    WHERE event_type='tool_execution_start'),
+                   (SELECT COUNT(*) FROM agent_events
+                    WHERE event_type='tool_execution_end'),
+                   (SELECT COUNT(*) FROM agent_events
+                    WHERE event_type='tool_execution_start'
+                      AND json_extract(envelope, '$.tool_call_id')='tool-rowless-messaging')",
+            )
+            .fetch_one(first_restart.pool())
+            .await
+            .expect("tool event counts after recovery"),
+            (2, 2, 0),
+            "recovery must neither re-execute terminal calls nor execute the rowless call"
+        );
+
+        let synthetic_message_id =
+            tool_result_message_id(TOOL_USE_RECOVERY_ASSISTANT_ID, "tool-rowless-messaging");
+        let mut authentication = first_restart
+            .pool()
+            .begin()
+            .await
+            .expect("begin recovered transcript authentication");
+        super::super::event_writer::authenticate_event_log_snapshot(
+            &first_restart,
+            &mut authentication,
+        )
+        .await
+        .expect("authenticate recovered event snapshot");
+        let messages = first_restart
+            .hydrate_messages(&mut authentication)
+            .await
+            .expect("hydrate recovered transcript");
+        authentication
+            .commit()
+            .await
+            .expect("commit recovered transcript authentication");
+        let synthetic_result = messages
+            .iter()
+            .find_map(|message| match message {
+                ContextMessage::Persisted {
+                    id,
+                    message: Message::ToolResult(result),
+                    ..
+                } if id == &synthetic_message_id => Some(result),
+                _ => None,
+            })
+            .expect("synthetic restart ToolResult");
+        assert_eq!(synthetic_result.tool_call_id, "tool-rowless-messaging");
+        assert_eq!(synthetic_result.tool_name, "messaging");
+        assert!(synthetic_result.is_error);
+        assert_eq!(
+            synthetic_result.content,
+            vec![UserContent::Text {
+                text: PROCESS_RESTARTED_TOOL_RESULT.to_owned(),
+            }]
+        );
+        assert_eq!(
+            synthetic_result.details,
+            json!({ "error": PROCESS_RESTARTED_TOOL_RESULT })
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+                "SELECT
+                   (SELECT status FROM inbound_commands
+                    WHERE command_id=?),
+                   (SELECT run_phase FROM inbound_commands
+                    WHERE command_id=?),
+                   (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
+                   (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
+                   (SELECT json_array_length(json_extract(envelope, '$.tool_results'))
+                    FROM agent_events WHERE event_type='turn_end' LIMIT 1)",
+            )
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .fetch_one(first_restart.pool())
+            .await
+            .expect("recovered lifecycle closure"),
+            ("applied".to_owned(), "finished".to_owned(), 1, 1, 3)
+        );
+        first_restart.pool().close().await;
+        drop(first_restart);
+
+        let second_restart = Store::open(&path, scope, provider)
+            .await
+            .expect("open second restart");
+        assert!(matches!(
+            second_restart
+                .hydrate(&lease, &fence)
+                .await
+                .expect("hydrate second restart"),
+            HydrationOutcome::Complete(_)
+        ));
+        second_restart.pool().close().await;
+        drop(second_restart);
+        std::fs::remove_dir_all(root).expect("remove logical ToolUse recovery fixture");
     }
 
     async fn seed_pending_approval_decision(

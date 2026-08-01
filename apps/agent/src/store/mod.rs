@@ -102,7 +102,7 @@ pub(crate) use event_writer::{
     EventWriterFinalizerFailure, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
     InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
     MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
-    ToolExecutionMutation, user_message_id,
+    ToolExecutionMutation, tool_result_message_id, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -118,8 +118,8 @@ pub(crate) use memory_state::{
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
 pub(crate) use recovery::{
-    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, PendingErrorContextRecovery,
-    RecoveryStep, ResumeDirective, SuffixRecovery,
+    HydratedRunState, HydrationOutcome, LogicalRecoveryExecutor, PendingApprovalRecovery,
+    PendingErrorContextRecovery, RecoveryStep, ResumeDirective, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -7162,7 +7162,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0009");
+            .expect("apply migrations 0003 through 0010");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -7170,7 +7170,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
@@ -7254,6 +7254,134 @@ mod tests {
             .await
             .expect("enable foreign keys for migration fixture");
         pool
+    }
+
+    #[tokio::test]
+    async fn migration_0010_preserves_tool_rows_and_attestations_and_scopes_restart_to_skip() {
+        let pool = migration_pool_through(9).await;
+        sqlx::raw_sql(
+            "INSERT INTO agent_scope(singleton, personality_agent_id, created_at)
+             VALUES(1, '01900000-0000-7000-8000-000000000001', '2026-08-01T00:00:00Z');
+             INSERT INTO data_keys(
+               key_ref, scope, purpose, personality_agent_id, retention_unit,
+               algorithm, wrap_key_id, wrap_nonce, wrapped_key, state, created_at
+             ) VALUES(
+               'event-key', 'personality_agent', 'event',
+               '01900000-0000-7000-8000-000000000001', 'agent',
+               'fixture', 'fixture-wrap', X'00', X'00', 'active',
+               '2026-08-01T00:00:00Z'
+             );
+             INSERT INTO agent_events(
+               seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+               envelope, redaction_version, created_at
+             ) VALUES(
+               1, 'tool_execution_end', '{}', 'event-key', X'00', '{}', 1,
+               '2026-08-01T00:00:01Z'
+             );
+             INSERT INTO tool_executions(
+               tool_call_id, command_id, run_id, executor_generation, state,
+               idempotency_key, started_at, finished_at, error_code
+             ) VALUES(
+               'tool-running', 'command-1', 'run-1', 7, 'running',
+               'idem-running', '2026-08-01T00:00:00Z', NULL, NULL
+             );
+             INSERT INTO tool_executions(
+               tool_call_id, command_id, run_id, executor_generation, state,
+               idempotency_key, started_at, finished_at, error_code
+             ) VALUES(
+               'tool-skipped', 'command-1', 'run-1', 7, 'not_started',
+               'idem-skipped', NULL, '2026-08-01T00:00:01Z', 'approval_denied'
+             );
+             INSERT INTO physical_recovery_receipt_applications(
+               receipt_id, receipt_digest, personality_agent_id, lease_id,
+               fence_id, generation, intent_count, logical_suffix_first_seq,
+               logical_suffix_last_seq, applied_at
+             ) VALUES(
+               'receipt-1', 'digest-1',
+               '01900000-0000-7000-8000-000000000001', 'lease-1', 'fence-1',
+               7, 1, 1, 1, '2026-08-01T00:00:02Z'
+             );
+             INSERT INTO physical_recovery_receipt_intents(
+               receipt_id, tool_call_id, command_id, run_id,
+               executor_generation, indeterminate_terminal_seq
+             ) VALUES('receipt-1', 'tool-running', 'command-1', 'run-1', 7, 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed migration 0010 fixture");
+
+        let ten = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 10)
+            .expect("migration 0010");
+        let mut transaction = pool.begin().await.expect("begin sqlx-style migration");
+        sqlx::raw_sql(ten.sql.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .expect("apply migration 0010 with foreign keys enabled");
+        transaction.commit().await.expect("commit migration 0010");
+
+        let preserved: (String, String, i64) = sqlx::query_as(
+            "SELECT command_id, run_id, executor_generation
+             FROM physical_recovery_receipt_intents
+             WHERE receipt_id = 'receipt-1' AND tool_call_id = 'tool-running'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read preserved physical recovery attestation");
+        assert_eq!(preserved, ("command-1".to_owned(), "run-1".to_owned(), 7));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")
+                .fetch_one(&pool)
+                .await
+                .expect("count preserved tool executions"),
+            2
+        );
+
+        sqlx::query(
+            "INSERT INTO tool_executions(
+               tool_call_id, command_id, run_id, executor_generation, state,
+               idempotency_key, started_at, finished_at, error_code
+             ) VALUES(
+               'tool-restarted', 'command-1', 'run-1', 8, 'not_started',
+               'idem-restarted', NULL, '2026-08-01T00:00:03Z', 'process_restarted'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("process_restarted must be accepted for a skipped execution");
+
+        let error = sqlx::query(
+            "INSERT INTO tool_executions(
+               tool_call_id, command_id, run_id, executor_generation, state,
+               idempotency_key, started_at, finished_at, error_code
+             ) VALUES(
+               'tool-restarted-failed', 'command-1', 'run-1', 8, 'failed',
+               'idem-restarted-failed', '2026-08-01T00:00:03Z',
+               '2026-08-01T00:00:04Z', 'process_restarted'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("process_restarted is a skip reason, not a failed execution reason");
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{error}"
+        );
+
+        let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await
+            .expect("quick_check");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_optional(&pool)
+                .await
+                .expect("foreign_key_check")
+                .is_none()
+        );
     }
 
     #[tokio::test]
