@@ -30,6 +30,28 @@ if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
 fi
 
 : "${SUMI_COMPOSE_TIMEOUT:=30}"
+[[ "${SUMI_COMPOSE_TIMEOUT}" =~ ^[1-9][0-9]{0,2}$ ]] || {
+  printf '[sumi-supervisor] ERROR: SUMI_COMPOSE_TIMEOUT must be an integer from 1 to 999 seconds\n' >&2
+  exit 1
+}
+
+SUPERVISOR_CONTROL_ENABLED=0
+if [[ -n "${SUMI_SUPERVISOR_CONTROL_FD:-}" ]]; then
+  [[ "${SUMI_SUPERVISOR_CONTROL_FD}" == 3 ]] || {
+    printf '[sumi-supervisor] ERROR: SUMI_SUPERVISOR_CONTROL_FD must be the internal descriptor 3\n' >&2
+    exit 1
+  }
+  SUPERVISOR_CONTROL_ENABLED=1
+else
+  # Reserve the internal descriptor so child-close redirections are valid for
+  # direct operator/test invocations that do not install the control channel.
+  exec 3>/dev/null
+fi
+
+publish_supervisor_control() {
+  (( SUPERVISOR_CONTROL_ENABLED )) || return 0
+  printf '%s\n' "$1" >&3 || true
+}
 
 log() {
   printf '[sumi-supervisor] %s\n' "$*" >&2
@@ -417,6 +439,14 @@ readonly CLEANUP_MAX_ATTEMPTS=3
 readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
 readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
 readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
+# One explicit bound covers termination of the active detached Compose session,
+# every cleanup retry at the configured Compose timeout, verification calls,
+# retry delays, and a small scheduling margin. The provisioner receives this
+# exact contract over its private control descriptor before lifecycle work.
+readonly SUPERVISOR_CLEANUP_BOUND_SECONDS=$((
+  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT + 10
+))
+publish_supervisor_control "cleanup-bound-ms $((SUPERVISOR_CLEANUP_BOUND_SECONDS * 1000))"
 
 launch_compose() {
   docker compose \
@@ -447,8 +477,9 @@ run_tracked_compose() {
   setsid docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
     --file "${compose_file}" \
-    "$@" &
+    "$@" 3>&- &
   ACTIVE_COMPOSE_PID=$!
+  publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
   if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
     # A no-op lifecycle `down` can legitimately finish before /proc is
     # inspected. A launch must instead remain live and prove the PID/group
@@ -460,6 +491,7 @@ run_tracked_compose() {
       else
         status=$?
       fi
+      publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
       ACTIVE_COMPOSE_PID=
       return "${status}"
     fi
@@ -474,6 +506,7 @@ run_tracked_compose() {
   else
     status=$?
   fi
+  publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
   ACTIVE_COMPOSE_PID=
   return "${status}"
 }
@@ -548,6 +581,7 @@ terminate_active_compose() {
     fi
   fi
   wait "${pid}" 2>/dev/null || true
+  publish_supervisor_control "nested-done ${pid}"
 }
 
 validate_compose_redacted() {

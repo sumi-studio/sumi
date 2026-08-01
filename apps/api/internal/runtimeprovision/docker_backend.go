@@ -1,6 +1,7 @@
 package runtimeprovision
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,13 +13,19 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-const defaultSupervisorTerminationGrace = 5 * time.Second
+const defaultSupervisorCleanupBound = 100 * time.Second
+const supervisorCleanupDeliveryOverhead = time.Second
 const defaultSupervisorPipeWait = time.Second
+const supervisorControlFD = 3
 
 // DockerBackend reaches Docker only through the root-owned supervisor. No
 // Docker client or socket is exposed through the protocol or linked into API,
@@ -39,6 +46,20 @@ type execCommandRunner struct {
 	pipeWait         time.Duration
 }
 
+type supervisorControlTracker struct {
+	mu           sync.Mutex
+	cleanupBound time.Duration
+	boundReady   chan struct{}
+	boundOnce    sync.Once
+	nestedPID    int
+	nestedPIDFD  int
+	closed       bool
+}
+
+func newSupervisorControlTracker() *supervisorControlTracker {
+	return &supervisorControlTracker{boundReady: make(chan struct{}), nestedPIDFD: -1}
+}
+
 type supervisorCommandError struct {
 	cause      error
 	diagnostic string
@@ -47,13 +68,147 @@ type supervisorCommandError struct {
 func (err *supervisorCommandError) Error() string { return err.cause.Error() }
 func (err *supervisorCommandError) Unwrap() error { return err.cause }
 
+func (tracker *supervisorControlTracker) consume(reader io.Reader) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || value <= 0 {
+			continue
+		}
+		switch fields[0] {
+		case "cleanup-bound-ms":
+			if value > int64((2*time.Hour)/time.Millisecond) {
+				continue
+			}
+			bound := time.Duration(value) * time.Millisecond
+			tracker.mu.Lock()
+			if tracker.closed {
+				tracker.mu.Unlock()
+				continue
+			}
+			tracker.cleanupBound = bound
+			tracker.mu.Unlock()
+			tracker.boundOnce.Do(func() { close(tracker.boundReady) })
+		case "nested-start":
+			if value > 1<<30 {
+				continue
+			}
+			pid := int(value)
+			pidfd, err := unix.PidfdOpen(pid, 0)
+			if err != nil {
+				continue
+			}
+			tracker.mu.Lock()
+			if tracker.closed {
+				tracker.mu.Unlock()
+				_ = unix.Close(pidfd)
+				continue
+			}
+			if tracker.nestedPIDFD >= 0 {
+				_ = unix.Close(tracker.nestedPIDFD)
+			}
+			tracker.nestedPID = pid
+			tracker.nestedPIDFD = pidfd
+			tracker.mu.Unlock()
+		case "nested-done":
+			tracker.mu.Lock()
+			if tracker.nestedPID == int(value) {
+				if tracker.nestedPIDFD >= 0 {
+					_ = unix.Close(tracker.nestedPIDFD)
+				}
+				tracker.nestedPID = 0
+				tracker.nestedPIDFD = -1
+			}
+			tracker.mu.Unlock()
+		}
+	}
+}
+
+func (tracker *supervisorControlTracker) grace(override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	select {
+	case <-tracker.boundReady:
+	case <-time.After(100 * time.Millisecond):
+	}
+	tracker.mu.Lock()
+	bound := tracker.cleanupBound
+	tracker.mu.Unlock()
+	if bound <= 0 {
+		bound = defaultSupervisorCleanupBound
+	}
+	return bound + supervisorCleanupDeliveryOverhead
+}
+
+func (tracker *supervisorControlTracker) signalNested(signal syscall.Signal) error {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.nestedPID <= 0 || tracker.nestedPIDFD < 0 {
+		return nil
+	}
+	if err := unix.PidfdSendSignal(tracker.nestedPIDFD, 0, nil, 0); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	pgid, err := syscall.Getpgid(tracker.nestedPID)
+	if err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	if pgid != tracker.nestedPID {
+		return unix.PidfdSendSignal(tracker.nestedPIDFD, signal, nil, 0)
+	}
+	err = syscall.Kill(-tracker.nestedPID, signal)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func (tracker *supervisorControlTracker) close() {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.closed = true
+	if tracker.nestedPIDFD >= 0 {
+		_ = unix.Close(tracker.nestedPIDFD)
+	}
+	tracker.nestedPID = 0
+	tracker.nestedPIDFD = -1
+}
+
+func supervisorEnvironment(environment []string) []string {
+	result := make([]string, 0, len(environment)+1)
+	for _, item := range environment {
+		if strings.HasPrefix(item, "SUMI_SUPERVISOR_CONTROL_FD=") {
+			continue
+		}
+		result = append(result, item)
+	}
+	return append(result, "SUMI_SUPERVISOR_CONTROL_FD="+strconv.Itoa(supervisorControlFD))
+}
+
 func (runner execCommandRunner) Run(ctx context.Context, path string, args, environment []string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &supervisorCommandError{cause: err, diagnostic: "supervisor operation canceled before launch"}
 	}
+	controlRead, controlWrite, err := os.Pipe()
+	if err != nil {
+		return nil, &supervisorCommandError{cause: err, diagnostic: "cannot establish supervisor cleanup control"}
+	}
+	tracker := newSupervisorControlTracker()
 	command := exec.Command(path, args...)
-	command.Env = environment
+	command.Env = supervisorEnvironment(environment)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.ExtraFiles = []*os.File{controlWrite}
 	pipeWait := runner.pipeWait
 	if pipeWait <= 0 {
 		pipeWait = defaultSupervisorPipeWait
@@ -64,11 +219,19 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
 		return nil, &supervisorCommandError{
 			cause:      err,
 			diagnostic: sanitizeSupervisorError(stderr.String(), environment),
 		}
 	}
+	_ = controlWrite.Close()
+	go tracker.consume(controlRead)
+	defer func() {
+		_ = controlRead.Close()
+		tracker.close()
+	}()
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
 	select {
@@ -82,18 +245,16 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 		return stdout.Bytes(), nil
 	case <-ctx.Done():
 		// Prefer a graceful supervisor trap so a partially prepared generation
-		// can be rolled back. The supervisor and its children are placed in one
-		// private process group; after the grace bound, no member may survive.
+		// can be rolled back. Same-group children follow the supervisor signal;
+		// its detached Compose session is tracked over the control descriptor.
 	}
 
 	termErr := signalSupervisorHierarchy(command.Process.Pid, syscall.SIGTERM)
-	grace := runner.terminationGrace
-	if grace <= 0 {
-		grace = defaultSupervisorTerminationGrace
-	}
+	grace := tracker.grace(runner.terminationGrace)
 	timer := time.NewTimer(grace)
 	var waitErr error
 	var killErr error
+	cleanupExpired := false
 	select {
 	case waitErr = <-waited:
 		if !timer.Stop() {
@@ -103,16 +264,28 @@ func (runner execCommandRunner) Run(ctx context.Context, path string, args, envi
 			}
 		}
 	case <-timer.C:
-		killErr = signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL)
+		cleanupExpired = true
+		killErr = errors.Join(
+			tracker.signalNested(syscall.SIGKILL),
+			signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL),
+		)
 		waitErr = <-waited
 	}
 	// A child may have kept inherited output descriptors open after the shell
 	// exited. WaitDelay closes those pipes; this final group kill removes any
 	// remaining same-hierarchy descendant before returning.
-	killErr = errors.Join(killErr, signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL))
+	killErr = errors.Join(
+		killErr,
+		tracker.signalNested(syscall.SIGKILL),
+		signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL),
+	)
+	diagnostic := sanitizeSupervisorError(stderr.String(), environment)
+	if cleanupExpired {
+		diagnostic = "supervisor cleanup exceeded its advertised bound; host lifecycle state is indeterminate and requires reconciliation; " + diagnostic
+	}
 	return nil, &supervisorCommandError{
 		cause:      errors.Join(ctx.Err(), termErr, killErr, waitErr),
-		diagnostic: sanitizeSupervisorError(stderr.String(), environment),
+		diagnostic: diagnostic,
 	}
 }
 

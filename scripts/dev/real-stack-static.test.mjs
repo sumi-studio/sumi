@@ -60,6 +60,31 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   assert.match(firebaseCheck, /up --detach --pull never/);
 });
 
+test("Jenkins rebuilds the provisioner for every source tree embedded in it", async () => {
+  const [jenkinsfile, provisionerDockerfile] = await Promise.all([
+    source("Jenkinsfile"),
+    source("deploy/provisioner/Dockerfile"),
+  ]);
+
+  assert.match(provisionerDockerfile, /COPY apps\/api\/ \.\//);
+  assert.match(
+    provisionerDockerfile,
+    /COPY --from=build \/usr\/local\/bin\/sumi-runtime-provisioner/,
+  );
+  assert.match(
+    provisionerDockerfile,
+    /\/opt\/sumi\/deploy\/agent\/supervisor/,
+  );
+  assert.match(
+    jenkinsfile,
+    /provisioner:\s*\['apps\/api', 'deploy\/agent'\]/,
+  );
+  assert.match(
+    jenkinsfile,
+    /watchedDirs\.addAll\(extraWatchedDirsByImage\[name\] \?: \[\]\)/,
+  );
+});
+
 test("Compose gives runtime only the logical executor workspace address", async () => {
   const [compose, entrypoint] = await Promise.all([
     source("deploy/agent/compose.yaml"),
