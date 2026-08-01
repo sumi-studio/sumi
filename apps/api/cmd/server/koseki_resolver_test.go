@@ -106,30 +106,28 @@ func TestKosekiDirectChatAuthorizerEnforcesEmployer(t *testing.T) {
 	}
 
 	// Each Human is the Employer of their own Secretary: direct chat allowed.
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID); err != nil {
+	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, func() error { return nil }); err != nil {
 		t.Fatalf("owner should be authorized for own secretary: %v", err)
 	}
 	// A Human is NOT the Employer of another Human's Secretary: rejected.
-	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID); err == nil {
+	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, func() error { return nil }); err == nil {
 		t.Fatal("non-employer human must not direct-chat with another's secretary")
 	}
 
 	// 異動: transfer the first agent's employment to the second Human. The first
 	// Human is no longer the Employer and loses direct-chat access.
-	if _, err := pool.Exec(ctx,
-		"UPDATE employments SET ended_at = now() WHERE agent_id = $1 AND ended_at IS NULL",
-		first.AgentID); err != nil {
-		t.Fatalf("close first employment: %v", err)
-	}
-	if _, err := pool.Exec(ctx,
-		"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, 'human', $2)",
-		first.AgentID, second.HumanID); err != nil {
+	if err := store.TransferEmployment(
+		ctx,
+		first.AgentID,
+		koseki.EmployerHuman,
+		second.HumanID,
+	); err != nil {
 		t.Fatalf("transfer employment: %v", err)
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID); err == nil {
+	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, func() error { return nil }); err == nil {
 		t.Fatal("former employer must lose direct-chat access after 異動")
 	}
-	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID); err != nil {
+	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, func() error { return nil }); err != nil {
 		t.Fatalf("new employer should be authorized after 異動: %v", err)
 	}
 }

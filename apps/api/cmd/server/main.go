@@ -225,14 +225,14 @@ func (a *application) Close() error {
 			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
 			cancel()
 		}
+		if a.spawnManager != nil {
+			a.closeErr = errors.Join(a.closeErr, a.spawnManager.StopAll())
+		}
 		if a.store != nil {
 			a.closeErr = errors.Join(a.closeErr, a.store.Close())
 		}
 		if a.database != nil {
 			a.database.Close()
-		}
-		if a.spawnManager != nil {
-			a.closeErr = errors.Join(a.closeErr, a.spawnManager.StopAll())
 		}
 	})
 	return a.closeErr
