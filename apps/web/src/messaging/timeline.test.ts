@@ -25,6 +25,7 @@ function message(overrides: Partial<Message> & { seq: number }): Message {
     content: `msg ${overrides.seq}`,
     mentions: [],
     urgency: "normal",
+    reactions: [],
     replyTo: null,
     createdAt: BASE_AT + overrides.seq * 1_000,
     editedAt: null,

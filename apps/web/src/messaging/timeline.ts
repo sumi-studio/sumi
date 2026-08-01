@@ -195,6 +195,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         content: entry.content,
         mentions: entry.mentions,
         urgency: entry.urgency,
+        reactions: [],
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

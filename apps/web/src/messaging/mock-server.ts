@@ -10,6 +10,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
   SendMessageInput,
@@ -121,6 +122,7 @@ interface SeedSpec {
   minutesAgo: number;
   mentions?: ParticipantRef[];
   urgency?: Message["urgency"];
+  reactions?: ReactionSummary[];
 }
 
 function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
@@ -133,6 +135,7 @@ function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
     content: spec.content,
     mentions: spec.mentions ?? [],
     urgency: spec.urgency ?? "normal",
+    reactions: spec.reactions ?? [],
     replyTo: null,
     createdAt: now - spec.minutesAgo * 60_000,
     editedAt: null,
@@ -235,7 +238,12 @@ function buildSeedHistory(): Map<string, Message[]> {
         minutesAgo: 58,
       },
       { author: HARU, content: "本番反映は夕方でいい？", minutesAgo: 45 },
-      { author: KURO, content: "はい、17時以降が安全です。", minutesAgo: 44 },
+      {
+        author: KURO,
+        content: "はい、17時以降が安全です。",
+        minutesAgo: 44,
+        reactions: [{ emoji: "👍", participants: [HARU, SELF] }],
+      },
     ]),
   );
   history.set(
@@ -344,6 +352,7 @@ export class MockMessagingServer implements MessagingBackend {
       statuses: [...this.statuses.values()],
       readMarkers,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
+      employedAgents: [SUMI],
     };
   }
 
@@ -458,6 +467,44 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "reply_later_resolved", markerId });
   }
 
+  async toggleReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    this.applyReaction(place, messageId, SELF, emoji);
+  }
+
+  /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
+  private applyReaction(
+    place: Place,
+    messageId: string,
+    participant: ParticipantRef,
+    emoji: string,
+  ): void {
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const message = messages.find((entry) => entry.messageId === messageId);
+    if (!message || message.deleted) return;
+    const summary = message.reactions.find((entry) => entry.emoji === emoji);
+    if (!summary) {
+      message.reactions.push({ emoji, participants: [participant] });
+    } else if (
+      summary.participants.some((ref) => sameParticipant(ref, participant))
+    ) {
+      summary.participants = summary.participants.filter(
+        (ref) => !sameParticipant(ref, participant),
+      );
+      if (summary.participants.length === 0) {
+        message.reactions = message.reactions.filter(
+          (entry) => entry.emoji !== emoji,
+        );
+      }
+    } else {
+      summary.participants.push(participant);
+    }
+    this.emit({ type: "reaction_updated", message: { ...message } });
+  }
+
   sendTyping(_place: Place): void {
     // 自分のtypingは他参加者向け。モックでは表示相手がいないため何もしない。
   }
@@ -503,6 +550,7 @@ export class MockMessagingServer implements MessagingBackend {
       content: input.content,
       mentions: input.mentions,
       urgency: input.urgency,
+      reactions: [],
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
@@ -522,6 +570,21 @@ export class MockMessagingServer implements MessagingBackend {
   private scheduleAgentResponses(trigger: Message): void {
     for (const persona of PERSONAS) {
       if (!this.isCalled(trigger, persona.ref)) continue;
+      // FYI（返信不要）は文章で返さず、読んだ合図の👀だけ置く。
+      if (trigger.urgency === "fyi") {
+        window.setTimeout(
+          () => {
+            this.applyReaction(
+              trigger.place,
+              trigger.messageId,
+              persona.ref,
+              "👀",
+            );
+          },
+          1_200 + Math.random() * 1_000,
+        );
+        continue;
+      }
       const key = participantKey(persona.ref);
       const status = this.statuses.get(key);
       if (status?.status === "busy") {

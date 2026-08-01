@@ -47,6 +47,9 @@ interface MessagingState {
   draftByPlace: Record<PlaceKey, string>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
+  employedAgents: ParticipantRef[];
+  hasMoreByPlace: Record<PlaceKey, boolean>;
+  loadingOlderByPlace: Record<PlaceKey, boolean>;
   activePlaceKey: PlaceKey | null;
   editingMessageId: string | null;
   replyTargetId: string | null;
@@ -64,7 +67,9 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string): void;
-  createReplyLater(message: Message): void;
+  createReplyLater(message: Message, delayMs?: number): void;
+  toggleReaction(message: Message, emoji: string): void;
+  loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
 }
@@ -95,7 +100,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
-    if (event.type === "message_created" || event.type === "message_edited") {
+    if (
+      event.type === "message_created" ||
+      event.type === "message_edited" ||
+      event.type === "reaction_updated"
+    ) {
       const key = placeKey(event.message.place);
       set((state) => {
         const messages = upsertMessage(
@@ -184,12 +193,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   };
 
+  const PAGE_SIZE = 50;
+
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place);
+    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
     set((state) => ({
       messagesByPlace: { ...state.messagesByPlace, [key]: messages },
+      hasMoreByPlace: {
+        ...state.hasMoreByPlace,
+        [key]: messages.length >= PAGE_SIZE,
+      },
     }));
   };
 
@@ -237,6 +252,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     draftByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
+    employedAgents: [],
+    hasMoreByPlace: {},
+    loadingOlderByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
     replyTargetId: null,
@@ -275,6 +293,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           statusByKey,
           lastReadByPlace,
           replyLaterById,
+          employedAgents: snapshot.employedAgents,
         });
         const first = snapshot.channels[0];
         if (first) {
@@ -399,12 +418,47 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.setStatus(status, note);
     },
 
-    createReplyLater(message) {
+    createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
       void backend.createReplyLater(
         message.place,
         message.messageId,
-        Date.now() + DEFAULT_REPLY_LATER_REMIND_MS,
+        Date.now() + delayMs,
       );
+    },
+
+    toggleReaction(message, emoji) {
+      void backend.toggleReaction(message.place, message.messageId, emoji);
+    },
+
+    async loadOlder(key) {
+      const state = get();
+      const place = parsePlaceKey(key);
+      const current = state.messagesByPlace[key];
+      if (!place || !current || current.length === 0) return;
+      if (state.loadingOlderByPlace[key] || !state.hasMoreByPlace[key]) return;
+      set((entry) => ({
+        loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
+      }));
+      const older = await backend.fetchMessages(place, {
+        beforeSeq: current[0].seq,
+        limit: PAGE_SIZE,
+      });
+      set((entry) => {
+        const existing = entry.messagesByPlace[key] ?? [];
+        const known = new Set(existing.map((m) => m.messageId));
+        const fresh = older.filter((m) => !known.has(m.messageId));
+        return {
+          messagesByPlace: {
+            ...entry.messagesByPlace,
+            [key]: [...fresh, ...existing],
+          },
+          hasMoreByPlace: {
+            ...entry.hasMoreByPlace,
+            [key]: older.length >= PAGE_SIZE,
+          },
+          loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: false },
+        };
+      });
     },
 
     resolveReplyLater(markerId) {

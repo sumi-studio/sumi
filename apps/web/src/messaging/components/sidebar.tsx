@@ -1,4 +1,5 @@
-import { Hash } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
+import { DoorOpen, Hash } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
@@ -73,6 +74,8 @@ export function Sidebar() {
   const selfKey = useMessaging((state) => state.selfKey);
   const self = useMessaging((state) => state.self);
   const setStatus = useMessaging((state) => state.setStatus);
+  const employedAgents = useMessaging((state) => state.employedAgents);
+  const navigate = useNavigate();
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
 
   const counts = useMemo(() => {
@@ -149,6 +152,33 @@ export function Sidebar() {
             />
           );
         })}
+        {employedAgents.length > 0 ? (
+          <>
+            <p className="flex items-center gap-1 px-2 pt-4 pb-1 font-medium text-[11px] text-muted-foreground/80">
+              直通
+              <span className="text-[10px] text-muted-foreground/50">
+                — 生の回線
+              </span>
+            </p>
+            {employedAgents.map((agent) => {
+              const key = participantKey(agent);
+              const member = membersByKey[key];
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => void navigate({ to: "/direct" })}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                >
+                  <DoorOpen className="size-3.5 shrink-0 opacity-60" />
+                  <span className="min-w-0 flex-1 truncate">
+                    {member?.displayName ?? "不明"}
+                  </span>
+                </button>
+              );
+            })}
+          </>
+        ) : null}
       </nav>
       <div className="relative shrink-0 border-border/70 border-t p-2">
         {statusMenuOpen ? (

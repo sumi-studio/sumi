@@ -1,5 +1,6 @@
 import { Clock, Hash, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppRail } from "../../shell/app-rail";
 import { type PlaceKey, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
@@ -157,6 +158,75 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   );
 }
 
+function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
+  const replyLaterById = useMessaging((state) => state.replyLaterById);
+  const selfKey = useMessaging((state) => state.selfKey);
+  const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
+  const [now, setNow] = useState(() => Date.now());
+  const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const due = Object.values(replyLaterById).filter(
+    (marker) =>
+      !marker.resolved &&
+      participantKey(marker.participant) === selfKey &&
+      marker.remindAt <= now &&
+      !dismissed[marker.markerId],
+  );
+  const marker = due[0];
+  if (!marker) return null;
+
+  return (
+    <div className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg">
+      <p className="flex items-center gap-1.5 font-medium text-[13px]">
+        <Clock className="size-3.5 text-rose-500" />
+        後で返信の時間です
+      </p>
+      <p className="mt-1 truncate text-[12.5px] text-muted-foreground">
+        {marker.note}
+      </p>
+      <div className="mt-2 flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() =>
+            onJump({
+              placeKey: `${marker.place.kind}:${
+                marker.place.kind === "channel"
+                  ? marker.place.channelId
+                  : marker.place.dmId
+              }`,
+              messageId: marker.messageId,
+            })
+          }
+          className="rounded-md bg-primary px-2.5 py-1 font-medium text-[12px] text-primary-foreground hover:opacity-90"
+        >
+          移動して返信
+        </button>
+        <button
+          type="button"
+          onClick={() => resolveReplyLater(marker.markerId)}
+          className="rounded-md px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent"
+        >
+          完了にする
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            setDismissed((entry) => ({ ...entry, [marker.markerId]: true }))
+          }
+          className="ml-auto rounded-md px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent"
+        >
+          閉じる
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function MessagingScreen() {
   const init = useMessaging((state) => state.init);
   const ready = useMessaging((state) => state.ready);
@@ -164,6 +234,8 @@ export function MessagingScreen() {
   const selectPlace = useMessaging((state) => state.selectPlace);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
   const display = usePlaceDisplay(activePlaceKey);
+  const lastReadByPlace = useMessaging((state) => state.lastReadByPlace);
+  const selfKey = useMessaging((state) => state.selfKey);
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
@@ -171,6 +243,29 @@ export function MessagingScreen() {
   useEffect(() => {
     init();
   }, [init]);
+
+  // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
+  useEffect(() => {
+    let unread = 0;
+    for (const [key, messages] of Object.entries(messagesByPlace)) {
+      const lastRead = lastReadByPlace[key] ?? 0;
+      for (const message of messages) {
+        if (message.seq <= lastRead || message.deleted) continue;
+        if (participantKey(message.author) === selfKey) continue;
+        const mentionsSelf = message.mentions.some(
+          (ref) => participantKey(ref) === selfKey,
+        );
+        if (
+          mentionsSelf ||
+          key.startsWith("dm:") ||
+          key.startsWith("group_dm:")
+        ) {
+          unread += 1;
+        }
+      }
+    }
+    document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
+  }, [messagesByPlace, lastReadByPlace, selfKey]);
 
   // permalink (?place=…&m=…) で開かれたら該当placeへ移動してジャンプする。
   useEffect(() => {
@@ -220,6 +315,7 @@ export function MessagingScreen() {
 
   return (
     <div className="flex h-dvh bg-background text-foreground">
+      <AppRail activeAppId="home" />
       <Sidebar />
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
@@ -256,6 +352,7 @@ export function MessagingScreen() {
         <Composer />
       </main>
       {membersOpen ? <MemberList /> : null}
+      <ReplyLaterKnock onJump={requestJump} />
     </div>
   );
 }

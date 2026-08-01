@@ -59,6 +59,12 @@ export type Urgency = "urgent" | "normal" | "fyi";
 /** seqはJSONで安全に運べる整数に収める（wire契約はJsonSafeInteger）。 */
 export const MAX_SEQ = Number.MAX_SAFE_INTEGER;
 
+/** 絵文字リアクションの集計。参加者は解決済みParticipantRef。 */
+export interface ReactionSummary {
+  emoji: string;
+  participants: ParticipantRef[];
+}
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -69,6 +75,7 @@ export interface Message {
   /** Admission時に解決済みのmention先。raw文字列一致は判定に使わない。 */
   mentions: ParticipantRef[];
   urgency: Urgency;
+  reactions: ReactionSummary[];
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -143,7 +150,8 @@ export type ServerEvent =
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
-  | { type: "reply_later_resolved"; markerId: string };
+  | { type: "reply_later_resolved"; markerId: string }
+  | { type: "reaction_updated"; message: Message };
 
 export interface SendMessageInput {
   place: Place;
@@ -179,6 +187,8 @@ export interface MessagingBackend {
     statuses: ParticipantStatus[];
     readMarkers: ReadMarker[];
     replyLaterMarkers: ReplyLaterMarker[];
+    /** 自分がEmployerである人格agent。直通（生の直接回線）の対象。 */
+    employedAgents: ParticipantRef[];
   }>;
   fetchMessages(
     place: Place,
@@ -195,6 +205,7 @@ export interface MessagingBackend {
     remindAt: number,
   ): Promise<void>;
   resolveReplyLater(markerId: string): Promise<void>;
+  toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

@@ -9,12 +9,12 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as TalkRouteImport } from './routes/talk'
+import { Route as DirectRouteImport } from './routes/direct'
 import { Route as IndexRouteImport } from './routes/index'
 
-const TalkRoute = TalkRouteImport.update({
-  id: '/talk',
-  path: '/talk',
+const DirectRoute = DirectRouteImport.update({
+  id: '/direct',
+  path: '/direct',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -25,37 +25,37 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/talk': typeof TalkRoute
+  '/direct': typeof DirectRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/talk': typeof TalkRoute
+  '/direct': typeof DirectRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/talk': typeof TalkRoute
+  '/direct': typeof DirectRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/talk'
+  fullPaths: '/' | '/direct'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/talk'
-  id: '__root__' | '/' | '/talk'
+  to: '/' | '/direct'
+  id: '__root__' | '/' | '/direct'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  TalkRoute: typeof TalkRoute
+  DirectRoute: typeof DirectRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/talk': {
-      id: '/talk'
-      path: '/talk'
-      fullPath: '/talk'
-      preLoaderRoute: typeof TalkRouteImport
+    '/direct': {
+      id: '/direct'
+      path: '/direct'
+      fullPath: '/direct'
+      preLoaderRoute: typeof DirectRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -70,7 +70,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  TalkRoute: TalkRoute,
+  DirectRoute: DirectRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -12,20 +12,29 @@ import {
   ConversationVirtualizer,
   type ConversationVirtualizerHandle,
 } from "../../components/conversation-virtualizer";
-import type { Message } from "../model";
+import { type Message, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { buildRows, type PendingMessage, type TimelineRow } from "../timeline";
 import { MessageItem } from "./message-item";
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
 const NO_PENDING: PendingMessage[] = [];
+const NO_NAMES: string[] = [];
+
+interface OlderRow {
+  id: "__older__";
+  kind: "older";
+}
+
+type ListRow = TimelineRow | OlderRow;
 
 export interface MessageListHandle {
   jumpToMessage(messageId: string): void;
   jumpToSeq(seq: number): void;
 }
 
-function estimateRowSize(row: TimelineRow): number {
+function estimateRowSize(row: ListRow): number {
+  if (row.kind === "older") return 44;
   if (row.kind === "date") return 36;
   if (row.kind === "unread") return 24;
   return row.grouped ? 30 : 62;
@@ -61,6 +70,15 @@ export function MessageList({
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
+  const toggleReaction = useMessaging((state) => state.toggleReaction);
+  const editingMessageId = useMessaging((state) => state.editingMessageId);
+  const replyLaterById = useMessaging((state) => state.replyLaterById);
+  const hasMore = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.hasMoreByPlace[state.activePlaceKey] ?? false)
+      : false,
+  );
+  const loadOlder = useMessaging((state) => state.loadOlder);
 
   const virtualizerRef = useRef<ConversationVirtualizerHandle>(null);
   const [atEnd, setAtEnd] = useState(true);
@@ -72,7 +90,7 @@ export function MessageList({
 
   const rows = useMemo(() => {
     if (!messages || !self) return [];
-    return buildRows({
+    const built = buildRows({
       messages,
       pending,
       selfKey,
@@ -80,7 +98,10 @@ export function MessageList({
       self,
       now: Date.now(),
     });
-  }, [messages, pending, selfKey, unreadLineSeq, self]);
+    return hasMore
+      ? ([{ id: "__older__", kind: "older" } as OlderRow, ...built] as const)
+      : built;
+  }, [messages, pending, selfKey, unreadLineSeq, self, hasMore]);
 
   const messagesById = useMemo(() => {
     const map = new Map<string, Message>();
@@ -94,6 +115,19 @@ export function MessageList({
       map.set(message.seq, message.messageId);
     return map;
   }, [messages]);
+
+  // 「後で返信します」を置いている相手の表示名をメッセージごとに引けるようにする。
+  const replyLaterByMessage = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const marker of Object.values(replyLaterById)) {
+      if (marker.resolved) continue;
+      const owner = participantKey(marker.participant);
+      if (owner === selfKey) continue;
+      const name = membersByKey[owner]?.displayName ?? "不明";
+      map.set(marker.messageId, [...(map.get(marker.messageId) ?? []), name]);
+    }
+    return map;
+  }, [replyLaterById, selfKey, membersByKey]);
 
   const flashMessage = useCallback((messageId: string) => {
     virtualizerRef.current?.scrollToMessage(messageId, {
@@ -172,23 +206,47 @@ export function MessageList({
   const copyLink = useCallback(
     (message: Message) => {
       if (!activePlaceKey) return;
-      const url = `${window.location.origin}/talk?place=${encodeURIComponent(activePlaceKey)}&m=${message.seq}`;
+      const url = `${window.location.origin}/?place=${encodeURIComponent(activePlaceKey)}&m=${message.seq}`;
       void navigator.clipboard.writeText(url);
     },
     [activePlaceKey],
   );
 
-  const confirmDelete = useCallback(
+  const deleteMessage2 = useCallback(
     (message: Message) => {
-      if (window.confirm("このメッセージを削除しますか？")) {
-        deleteMessage(message.messageId);
-      }
+      deleteMessage(message.messageId);
     },
     [deleteMessage],
   );
 
+  const loadOlderAnchored = useCallback(async () => {
+    if (!activePlaceKey || !messages || messages.length === 0) return;
+    const anchorId = messages[0].messageId;
+    await loadOlder(activePlaceKey);
+    // prependでスクロール位置が飛ばないよう、直前の先頭メッセージへ揃え直す。
+    window.requestAnimationFrame(() => {
+      virtualizerRef.current?.scrollToMessage(anchorId, {
+        align: "start",
+        behavior: "auto",
+      });
+    });
+  }, [activePlaceKey, messages, loadOlder]);
+
   const renderRow = useCallback(
-    (row: TimelineRow) => {
+    (row: ListRow) => {
+      if (row.kind === "older") {
+        return (
+          <div className="flex justify-center px-4 py-2">
+            <button
+              type="button"
+              onClick={() => void loadOlderAnchored()}
+              className="rounded-full border border-border bg-background px-3 py-1 text-[12px] text-muted-foreground transition-colors hover:text-foreground"
+            >
+              以前のメッセージを読み込む
+            </button>
+          </div>
+        );
+      }
       if (row.kind === "date") {
         return (
           <div className="flex items-center gap-3 px-4 pt-4 pb-1 sm:px-6">
@@ -213,7 +271,9 @@ export function MessageList({
           className={
             highlightedId === row.message.messageId
               ? "rounded-md bg-primary/8 ring-1 ring-primary/25 transition-colors"
-              : undefined
+              : editingMessageId === row.message.messageId
+                ? "rounded-md ring-1 ring-primary/40"
+                : undefined
           }
         >
           <MessageItem
@@ -221,6 +281,9 @@ export function MessageList({
             grouped={row.grouped}
             pending={row.pending}
             failed={row.failed}
+            replyLaterBy={
+              replyLaterByMessage.get(row.message.messageId) ?? NO_NAMES
+            }
             onRetry={(message) => {
               if (message.clientNonce) retrySend(message.clientNonce);
             }}
@@ -228,10 +291,13 @@ export function MessageList({
             membersByKey={membersByKey}
             findMessage={(id) => messagesById.get(id)}
             onReply={(message) => setReplyTarget(message.messageId)}
-            onReplyLater={createReplyLater}
+            onReplyLater={(message, delayMs) =>
+              createReplyLater(message, delayMs)
+            }
+            onToggleReaction={toggleReaction}
             onCopyLink={copyLink}
             onEdit={(message) => startEdit(message.messageId)}
-            onDelete={confirmDelete}
+            onDelete={deleteMessage2}
             onJumpTo={flashMessage}
           />
         </div>
@@ -239,16 +305,20 @@ export function MessageList({
     },
     [
       highlightedId,
+      editingMessageId,
       selfKey,
       membersByKey,
       messagesById,
+      replyLaterByMessage,
       setReplyTarget,
       createReplyLater,
+      toggleReaction,
       retrySend,
       copyLink,
       startEdit,
-      confirmDelete,
+      deleteMessage2,
       flashMessage,
+      loadOlderAnchored,
     ],
   );
 

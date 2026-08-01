@@ -1,8 +1,25 @@
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@sumi/ui/components/alert-dialog";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@sumi/ui/components/popover";
+import {
   Clock,
   CornerUpLeft,
   Link as LinkIcon,
   Pencil,
+  SmilePlus,
   Trash2,
 } from "lucide-react";
 import { Fragment, memo, type ReactNode } from "react";
@@ -22,6 +39,53 @@ const FULL_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   minute: "2-digit",
 });
 
+const REACTION_PALETTE = ["👍", "✅", "👀", "🙏", "🎉", "😄", "❤️", "🤔"];
+
+const REPLY_LATER_OPTIONS: { label: string; delayMs: number }[] = [
+  { label: "30分後", delayMs: 30 * 60_000 },
+  { label: "1時間後", delayMs: 60 * 60_000 },
+  { label: "3時間後", delayMs: 3 * 60 * 60_000 },
+];
+
+const URL_PATTERN = /https?:\/\/[^\s<>"）」』】]+/g;
+
+/** プレーン文中のURLをリンク化する。開発チームの会話はURLだらけになるので必須の道具。 */
+function linkifyText(text: string, keyBase: string): ReactNode[] {
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let index = 0;
+  for (const match of text.matchAll(URL_PATTERN)) {
+    const start = match.index ?? 0;
+    if (start > cursor) {
+      parts.push(
+        <Fragment key={`${keyBase}t${index}`}>
+          {text.slice(cursor, start)}
+        </Fragment>,
+      );
+      index += 1;
+    }
+    parts.push(
+      <a
+        key={`${keyBase}u${index}`}
+        href={match[0]}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
+      >
+        {match[0]}
+      </a>,
+    );
+    index += 1;
+    cursor = start + match[0].length;
+  }
+  if (cursor < text.length) {
+    parts.push(
+      <Fragment key={`${keyBase}t${index}`}>{text.slice(cursor)}</Fragment>,
+    );
+  }
+  return parts;
+}
+
 function renderContent(
   content: string,
   members: Record<ParticipantKey, MemberProfile>,
@@ -30,7 +94,7 @@ function renderContent(
   const names = Object.values(members)
     .map((member) => member.displayName)
     .sort((a, b) => b.length - a.length);
-  if (names.length === 0) return content;
+  if (names.length === 0) return linkifyText(content, "c");
   const escaped = names.map((name) =>
     name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
   );
@@ -42,9 +106,7 @@ function renderContent(
   while (match) {
     if (match.index > cursor) {
       parts.push(
-        <Fragment key={`t${index}`}>
-          {content.slice(cursor, match.index)}
-        </Fragment>,
+        ...linkifyText(content.slice(cursor, match.index), `s${index}`),
       );
       index += 1;
     }
@@ -71,7 +133,7 @@ function renderContent(
     match = pattern.exec(content);
   }
   if (cursor < content.length) {
-    parts.push(<Fragment key={`t${index}`}>{content.slice(cursor)}</Fragment>);
+    parts.push(...linkifyText(content.slice(cursor), `s${index}`));
   }
   return parts;
 }
@@ -101,7 +163,7 @@ function ToolbarButton({
   danger,
 }: {
   label: string;
-  onClick: () => void;
+  onClick?: () => void;
   children: ReactNode;
   danger?: boolean;
 }) {
@@ -122,6 +184,52 @@ function ToolbarButton({
   );
 }
 
+function ReactionChips({
+  message,
+  selfKey,
+  membersByKey,
+  onToggleReaction,
+}: {
+  message: Message;
+  selfKey: ParticipantKey;
+  membersByKey: Record<ParticipantKey, MemberProfile>;
+  onToggleReaction: (message: Message, emoji: string) => void;
+}) {
+  if (message.reactions.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1">
+      {message.reactions.map((reaction) => {
+        const mine = reaction.participants.some(
+          (ref) => participantKey(ref) === selfKey,
+        );
+        const names = reaction.participants
+          .map(
+            (ref) => membersByKey[participantKey(ref)]?.displayName ?? "不明",
+          )
+          .join("、");
+        return (
+          <button
+            key={reaction.emoji}
+            type="button"
+            title={names}
+            onClick={() => onToggleReaction(message, reaction.emoji)}
+            className={`flex items-center gap-1 rounded-full border px-1.5 py-px text-[12px] transition-colors ${
+              mine
+                ? "border-primary/40 bg-primary/10"
+                : "border-border bg-muted/40 hover:border-muted-foreground/40"
+            }`}
+          >
+            <span>{reaction.emoji}</span>
+            <span className="text-[11px] text-muted-foreground tabular-nums">
+              {reaction.participants.length}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export interface MessageItemProps {
   message: Message;
   grouped: boolean;
@@ -129,9 +237,12 @@ export interface MessageItemProps {
   failed: boolean;
   selfKey: ParticipantKey;
   membersByKey: Record<ParticipantKey, MemberProfile>;
+  /** このメッセージへ「後で返信します」を置いている相手の表示名。 */
+  replyLaterBy: string[];
   findMessage: (messageId: string) => Message | undefined;
   onReply: (message: Message) => void;
-  onReplyLater: (message: Message) => void;
+  onReplyLater: (message: Message, delayMs: number) => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
   onCopyLink: (message: Message) => void;
   onEdit: (message: Message) => void;
   onDelete: (message: Message) => void;
@@ -146,9 +257,11 @@ export const MessageItem = memo(function MessageItem({
   failed,
   selfKey,
   membersByKey,
+  replyLaterBy,
   findMessage,
   onReply,
   onReplyLater,
+  onToggleReaction,
   onCopyLink,
   onEdit,
   onDelete,
@@ -230,6 +343,18 @@ export const MessageItem = memo(function MessageItem({
               </span>
             ) : null}
           </div>
+          <ReactionChips
+            message={message}
+            selfKey={selfKey}
+            membersByKey={membersByKey}
+            onToggleReaction={onToggleReaction}
+          />
+          {replyLaterBy.length > 0 ? (
+            <p className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
+              <Clock className="size-3" />
+              {replyLaterBy.join("、")} が後で返信予定
+            </p>
+          ) : null}
           {failed ? (
             <div className="mt-0.5 flex items-center gap-2 text-[11px] text-rose-500">
               送信できませんでした
@@ -246,16 +371,65 @@ export const MessageItem = memo(function MessageItem({
       </div>
       {pending ? null : (
         <div className="absolute top-0 right-4 hidden -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 shadow-sm group-hover:flex">
+          <Popover>
+            <PopoverTrigger
+              render={
+                <button
+                  type="button"
+                  title="リアクション"
+                  aria-label="リアクション"
+                  className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                />
+              }
+            >
+              <SmilePlus className="size-3.5" />
+            </PopoverTrigger>
+            <PopoverContent side="top" className="flex gap-0.5 p-1">
+              {REACTION_PALETTE.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  onClick={() => onToggleReaction(message, emoji)}
+                  className="flex size-8 items-center justify-center rounded-md text-[16px] transition-colors hover:bg-accent"
+                >
+                  {emoji}
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
           {own ? null : (
-            <ToolbarButton
-              label="後で返信"
-              onClick={() => onReplyLater(message)}
-            >
-              <Clock className="size-3.5" />
-            </ToolbarButton>
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <button
+                    type="button"
+                    title="後で返信"
+                    aria-label="後で返信"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  />
+                }
+              >
+                <Clock className="size-3.5" />
+              </PopoverTrigger>
+              <PopoverContent side="top" className="w-40 p-1">
+                <p className="px-2 pt-1 pb-0.5 text-[11px] text-muted-foreground">
+                  後で返信 — いつ知らせる？
+                </p>
+                {REPLY_LATER_OPTIONS.map((option) => (
+                  <button
+                    key={option.label}
+                    type="button"
+                    onClick={() => onReplyLater(message, option.delayMs)}
+                    className="w-full rounded-md px-2 py-1 text-left text-[12.5px] transition-colors hover:bg-accent"
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </PopoverContent>
+            </Popover>
           )}
           <ToolbarButton
             label="リンクをコピー"
@@ -268,13 +442,34 @@ export const MessageItem = memo(function MessageItem({
               <ToolbarButton label="編集" onClick={() => onEdit(message)}>
                 <Pencil className="size-3.5" />
               </ToolbarButton>
-              <ToolbarButton
-                label="削除"
-                danger
-                onClick={() => onDelete(message)}
-              >
-                <Trash2 className="size-3.5" />
-              </ToolbarButton>
+              <AlertDialog>
+                <AlertDialogTrigger
+                  render={
+                    <button
+                      type="button"
+                      title="削除"
+                      aria-label="削除"
+                      className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-rose-500"
+                    />
+                  }
+                >
+                  <Trash2 className="size-3.5" />
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>メッセージを削除</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      削除すると元に戻せません。削除の事実は残ります。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>キャンセル</AlertDialogCancel>
+                    <AlertDialogAction onClick={() => onDelete(message)}>
+                      削除する
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             </>
           ) : null}
         </div>
