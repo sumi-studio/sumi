@@ -5,6 +5,7 @@ import { FaGithub } from "react-icons/fa";
 import { FcGoogle } from "react-icons/fc";
 import { type SignInProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
+import type { AuthIntent } from "./auth-flow-client";
 
 const providers: Array<{ id: SignInProvider; label: string }> = [
   { id: "google", label: "Googleで続ける" },
@@ -12,8 +13,17 @@ const providers: Array<{ id: SignInProvider; label: string }> = [
 ];
 
 export function LoginScreen() {
-  const { configured, signIn } = useAuth();
-  const [busy, setBusy] = useState<SignInProvider | null>(null);
+  const {
+    cancelIntentTransition,
+    confirmation,
+    configured,
+    confirmIntentTransition,
+    signIn,
+  } = useAuth();
+  const [intent, setIntent] = useState<AuthIntent>("sign_in");
+  const [busy, setBusy] = useState<
+    SignInProvider | "confirm" | "cancel" | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
 
   const handleSignIn = async (provider: SignInProvider) => {
@@ -23,7 +33,7 @@ export function LoginScreen() {
     setBusy(provider);
     setError(null);
     try {
-      await signIn(provider);
+      await signIn(provider, intent);
     } catch (nextError) {
       setError(getAuthErrorMessage(nextError));
     } finally {
@@ -50,31 +60,99 @@ export function LoginScreen() {
                 id="login-title"
                 className="font-semibold text-2xl tracking-[-0.025em]"
               >
-                アカウントにログイン
+                {confirmation
+                  ? "続行方法の確認"
+                  : intent === "sign_in"
+                    ? "アカウントにログイン"
+                    : "アカウントを新規登録"}
               </h1>
             </div>
 
-            <div className="space-y-3">
-              {providers.map((provider) => (
+            {confirmation ? (
+              <div className="space-y-4">
+                <p className="text-muted-foreground text-sm leading-6">
+                  {confirmation.action === "create_account"
+                    ? "ログインを選択しましたが、この認証情報に対応するSumiアカウントはまだありません。新規登録して続けますか？"
+                    : "新規登録を選択しましたが、この認証情報は既存のSumiアカウントに登録されています。ログインして続けますか？"}
+                </p>
                 <Button
-                  key={provider.id}
+                  type="button"
+                  onClick={() => {
+                    setBusy("confirm");
+                    setError(null);
+                    void confirmIntentTransition()
+                      .catch((nextError: unknown) => {
+                        setError(getAuthErrorMessage(nextError));
+                      })
+                      .finally(() => setBusy(null));
+                  }}
+                  disabled={busy !== null}
+                  className="h-11 w-full rounded-lg"
+                >
+                  {busy === "confirm" && (
+                    <LoaderCircle className="size-5 animate-spin" />
+                  )}
+                  {confirmation.action === "create_account"
+                    ? "新規登録して続ける"
+                    : "ログインして続ける"}
+                </Button>
+                <Button
                   type="button"
                   variant="outline"
-                  onClick={() => void handleSignIn(provider.id)}
-                  disabled={busy !== null || !configured}
-                  className="h-11 w-full justify-center gap-2.5 rounded-lg bg-background text-sm"
+                  onClick={() => {
+                    setBusy("cancel");
+                    void cancelIntentTransition().finally(() => setBusy(null));
+                  }}
+                  disabled={busy !== null}
+                  className="h-11 w-full rounded-lg"
                 >
-                  {busy === provider.id ? (
-                    <LoaderCircle className="size-5 animate-spin" />
-                  ) : provider.id === "github" ? (
-                    <FaGithub className="size-5" />
-                  ) : (
-                    <FcGoogle className="size-5" />
-                  )}
-                  {provider.label}
+                  キャンセル
                 </Button>
-              ))}
-            </div>
+              </div>
+            ) : (
+              <>
+                <div className="mb-4 grid grid-cols-2 rounded-lg bg-muted p-1">
+                  {(
+                    [
+                      ["sign_in", "ログイン"],
+                      ["sign_up", "新規登録"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      aria-pressed={intent === value}
+                      onClick={() => setIntent(value)}
+                      disabled={busy !== null}
+                      className="rounded-md px-3 py-2 font-medium text-sm aria-pressed:bg-background aria-pressed:shadow-sm"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="space-y-3">
+                  {providers.map((provider) => (
+                    <Button
+                      key={provider.id}
+                      type="button"
+                      variant="outline"
+                      onClick={() => void handleSignIn(provider.id)}
+                      disabled={busy !== null || !configured}
+                      className="h-11 w-full justify-center gap-2.5 rounded-lg bg-background text-sm"
+                    >
+                      {busy === provider.id ? (
+                        <LoaderCircle className="size-5 animate-spin" />
+                      ) : provider.id === "github" ? (
+                        <FaGithub className="size-5" />
+                      ) : (
+                        <FcGoogle className="size-5" />
+                      )}
+                      {provider.label}
+                    </Button>
+                  ))}
+                </div>
+              </>
+            )}
 
             {!configured && (
               <p

@@ -21,16 +21,30 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import {
+  clearPendingConfirmation,
+  loadPendingConfirmation,
+  type PendingAuthConfirmation,
+  savePendingConfirmation,
+} from "./auth-confirmation-state";
+import {
+  type AuthFlowProvider,
+  type AuthIntent,
+  confirmAuthFlow,
+  createAuthFlowNonce,
+  resolveAuthFlow,
+  startAuthFlow,
+} from "./auth-flow-client";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
   AuthAPIError,
-  establishSumiSession,
   getSumiSession,
   logoutSumiSession,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
   type SumiSessionStatus,
+  verifyCommittedSumiSession,
 } from "./session-client";
 
 export type SignInProvider = "google" | "github";
@@ -98,7 +112,10 @@ interface AuthContextValue {
   authenticated: boolean;
   canUseDirectChat: boolean;
   user: AuthUser | null;
-  signIn: (provider: SignInProvider) => Promise<void>;
+  confirmation: PendingAuthConfirmation | null;
+  signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
+  confirmIntentTransition: () => Promise<void>;
+  cancelIntentTransition: () => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -116,6 +133,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         ? "checking"
         : "unavailable",
   );
+  const [confirmation, setConfirmation] =
+    useState<PendingAuthConfirmation | null>(() => loadPendingConfirmation());
   // Every state-changing auth operation claims a generation. Late session
   // reads must never re-authorize the chat after logout has started.
   const authGeneration = useRef(0);
@@ -178,6 +197,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         : "unauthenticated";
       flushSync(() => {
         if (nextSession.authenticated) {
+          clearPendingConfirmation();
+          setConfirmation(null);
           bindDirectChatAuthority(nextSession.authorityBindingId);
         } else if (!clearDirectChatAuthority()) {
           nextState = "unavailable";
@@ -200,23 +221,52 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [refreshSession]);
 
   const signIn = useCallback(
-    async (providerName: SignInProvider) => {
+    async (providerName: SignInProvider, intent: AuthIntent) => {
       if (preissuedSessionMode || !authOriginAllowed) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
       }
       const generation = nextGeneration();
       const auth = getFirebaseAuth();
       const provider = createProvider(providerName);
+      const flowProvider = authFlowProvider(providerName);
+      const nonce = createAuthFlowNonce();
       let firebaseSignInCompleted = false;
+      let confirmationRequired = false;
       signInPending.current = true;
       try {
+        const started = await startAuthFlow({
+          intent,
+          provider: flowProvider,
+          continuation: "/",
+          nonce,
+        });
+        if (!isCurrentGeneration(generation)) return;
         const result = await signInWithPopup(auth, provider);
         firebaseSignInCompleted = true;
         await serializeSessionMutation(async () => {
           if (!isCurrentGeneration(generation)) return;
           const idToken = await getIdToken(result.user, true);
           if (!isCurrentGeneration(generation)) return;
-          const nextSession = await establishSumiSession(idToken);
+          const resolved = await resolveAuthFlow({
+            flowId: started.flowId,
+            nonce,
+            idToken,
+          });
+          if (resolved.outcome === "confirmation_required") {
+            const pending: PendingAuthConfirmation = {
+              flowId: resolved.flowId,
+              nonce,
+              intent,
+              provider: flowProvider,
+              expiresAt: resolved.expiresAt,
+              action: resolved.nextAction,
+            };
+            savePendingConfirmation(pending);
+            confirmationRequired = true;
+            if (isCurrentGeneration(generation)) setConfirmation(pending);
+            return;
+          }
+          const nextSession = await verifyCommittedSumiSession();
           // The HttpOnly authority changed even if logout claimed the UI
           // generation while this serialized exchange was in flight.
           flushSync(() => {
@@ -227,7 +277,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setSessionState("authenticated");
           });
         });
-        if (!isCurrentGeneration(generation)) {
+        if (!isCurrentGeneration(generation) && !confirmationRequired) {
           // A logout that began while the provider popup was open owns the
           // terminal Firebase state as well as the server cookie.
           await signOut(auth).catch(() => undefined);
@@ -252,7 +302,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         // A Firebase account is display state, not Sumi authorization. Do not
         // retain it when the server-owned identity binding/exchange failed.
-        if (firebaseSignInCompleted) {
+        if (firebaseSignInCompleted && !confirmationRequired) {
           await signOut(auth).catch(() => undefined);
         }
         throw error;
@@ -262,6 +312,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     },
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
   );
+
+  const confirmIntentTransition = useCallback(async () => {
+    const pending = confirmation;
+    if (!pending || preissuedSessionMode || !authOriginAllowed) {
+      throw new AuthAPIError("Authentication confirmation is unavailable.", 0);
+    }
+    const generation = nextGeneration();
+    await serializeSessionMutation(async () => {
+      await confirmAuthFlow({
+        flowId: pending.flowId,
+        nonce: pending.nonce,
+        action: pending.action,
+      });
+      const nextSession = await verifyCommittedSumiSession();
+      flushSync(() => {
+        bindDirectChatAuthority(nextSession.authorityBindingId);
+        serverSession.current = nextSession;
+        clearPendingConfirmation();
+        setConfirmation(null);
+        if (!isCurrentGeneration(generation)) return;
+        setSession(nextSession);
+        setSessionState("authenticated");
+      });
+    });
+  }, [
+    confirmation,
+    isCurrentGeneration,
+    nextGeneration,
+    serializeSessionMutation,
+  ]);
+
+  const cancelIntentTransition = useCallback(async () => {
+    nextGeneration();
+    clearPendingConfirmation();
+    setConfirmation(null);
+    await signOutFirebaseBestEffort();
+  }, [nextGeneration]);
 
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
@@ -323,11 +410,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       canUseDirectChat:
         sessionState === "authenticated" || sessionState === "preissued",
       user,
+      confirmation,
       signIn,
+      confirmIntentTransition,
+      cancelIntentTransition,
       logout,
       refreshSession,
     }),
-    [logout, refreshSession, session.authenticated, sessionState, signIn, user],
+    [
+      cancelIntentTransition,
+      confirmation,
+      confirmIntentTransition,
+      logout,
+      refreshSession,
+      session.authenticated,
+      sessionState,
+      signIn,
+      user,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -357,6 +457,10 @@ function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
   return provider;
+}
+
+function authFlowProvider(providerName: SignInProvider): AuthFlowProvider {
+  return providerName === "github" ? "github.com" : "google.com";
 }
 
 async function signOutFirebaseBestEffort(): Promise<void> {
