@@ -9,11 +9,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
+import { useNavigate } from "@tanstack/react-router";
 import {
   Check,
   ChevronRight,
   LogOut,
-  MessageCircle,
   Monitor,
   Moon,
   Palette,
@@ -25,6 +25,7 @@ import type { ComponentType, ReactElement } from "react";
 import { useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
+import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
 const THEME_OPTIONS: Array<{
@@ -38,24 +39,34 @@ const THEME_OPTIONS: Array<{
 ];
 
 /**
- * Only the working Talk surface is exposed. Future shared-workspace apps should
- * appear here when they have real product routes, not as local demo state.
+ * direct chat（直通）画面のレール。アプリ一覧はshell/app-descriptorsの
+ * local providerから描画し、ホーム（メッセージング）へ戻れる。
  */
 export function AppNavigation() {
+  const navigate = useNavigate();
   return (
     <aside className="app-sidebar flex h-dvh w-12 shrink-0 flex-col overflow-clip">
       <nav className="flex flex-col gap-1 px-1 py-2" aria-label="Sumi">
-        <NavigationTooltip label="トーク">
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="トーク"
-            aria-current="page"
-            className="size-10 bg-interactive-active"
-          >
-            <MessageCircle className="size-4" />
-          </Button>
-        </NavigationTooltip>
+        {LOCAL_APP_DESCRIPTORS.map((app) => {
+          const Icon = app.icon;
+          const active = app.id === "direct";
+          return (
+            <NavigationTooltip key={app.id} label={app.label}>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={app.label}
+                aria-current={active ? "page" : undefined}
+                onClick={
+                  active ? undefined : () => void navigate({ to: app.route })
+                }
+                className={`size-10 ${active ? "bg-interactive-active" : ""}`}
+              >
+                <Icon className="size-4" />
+              </Button>
+            </NavigationTooltip>
+          );
+        })}
       </nav>
       <div className="mt-auto px-2 pb-3">
         <SettingsPopover />

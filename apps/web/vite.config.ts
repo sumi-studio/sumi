@@ -42,6 +42,7 @@ export function createDevServerConfig(
     proxy: {
       "/auth": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
+      "/messaging": apiProxy(target.origin, true),
     },
   };
 }

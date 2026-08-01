@@ -1,5 +1,9 @@
 import { Button } from "@sumi/ui/components/button";
-import type { ReactNode } from "react";
+import { type ReactNode, useLayoutEffect, useReducer } from "react";
+import {
+  bindMessagingSessionIdentity,
+  getMessagingSessionIdentity,
+} from "../messaging/store";
 import { useAuth } from "./auth-context";
 import { AuthOutcomeNotice } from "./auth-outcome-notice";
 import { LoginScreen } from "./login-screen";
@@ -13,12 +17,25 @@ export function AuthGate({ children }: { children: ReactNode }) {
     outcomeNotice,
     sessionState,
     refreshSession,
+    user,
   } = useAuth();
+  const identity = canUseDirectChat ? (user?.id ?? "preissued") : null;
+  const identityMatches = getMessagingSessionIdentity() === identity;
+  const [, rerender] = useReducer((value: number) => value + 1, 0);
+
+  useLayoutEffect(() => {
+    if (identityMatches) return;
+    bindMessagingSessionIdentity(identity);
+    rerender();
+  }, [identity, identityMatches]);
 
   if (emailLinkCallbackPending) {
     return <LoginScreen />;
   }
   if (canUseDirectChat) {
+    if (!identityMatches) {
+      return <AuthStatus title="セッションを切り替えています…" />;
+    }
     return (
       <>
         {outcomeNotice && (

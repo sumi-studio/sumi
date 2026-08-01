@@ -25,6 +25,7 @@ pub use protocol::{
 };
 #[allow(unused_imports)]
 pub use remote::remote_executor_registry;
+pub(crate) use remote::remote_executor_registry_with_tools;
 pub use service::{
     run_artifact_broker_mode, run_tool_executor_mode, run_tool_executor_socket_mode,
 };

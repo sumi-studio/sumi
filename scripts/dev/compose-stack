@@ -405,7 +405,7 @@ else
 fi
 [[ "${ACTION}" == "down" || "${VITE_FIREBASE_PROJECT_ID:-sumi-studio}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
   fail "Firebase web and Admin project IDs must match"
-export SUMI_BROWSER_SESSION_AUDIENCE="${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web:direct-chat}"
+export SUMI_BROWSER_SESSION_AUDIENCE="${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}"
 export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${SUMI_DEV_WEB_ORIGIN}"
 export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
 

@@ -24,6 +24,15 @@ export interface ConversationVirtualizerHandle {
   isAtEnd: () => boolean;
   scrollToEnd: (options?: Pick<ConversationScrollOptions, "behavior">) => void;
   scrollToMessage: (id: string, options?: ConversationScrollOptions) => boolean;
+  /** スクロール位置の読み書き。routerのscroll restorationとの接続に使う。 */
+  getScrollOffset: () => number | null;
+  scrollToOffset: (offset: number) => void;
+  getScrollElement: () => HTMLElement | null;
+  /** 指定行の目標オフセット。直接scrollToと組み合わせた位置決めに使う。 */
+  getMessageOffset: (
+    id: string,
+    align?: "start" | "center" | "end",
+  ) => number | null;
 }
 
 export interface ConversationVirtualizerProps<
@@ -142,6 +151,18 @@ export function ConversationVirtualizer<
       isAtEnd: () => itemsRef.current.length === 0 || virtualizer.isAtEnd(),
       scrollToEnd,
       scrollToMessage,
+      getScrollOffset: () => viewportRef.current?.scrollTop ?? null,
+      scrollToOffset: (offset: number) => {
+        programmaticScrollRef.current.cancelled = false;
+        viewportRef.current?.scrollTo({ top: offset, behavior: "auto" });
+      },
+      getScrollElement: () => viewportRef.current,
+      getMessageOffset: (id, align = "center") => {
+        const index = itemsRef.current.findIndex((item) => item.id === id);
+        if (index < 0) return null;
+        const result = virtualizer.getOffsetForIndex(index, align);
+        return result ? result[0] : null;
+      },
     }),
     [scrollToEnd, scrollToMessage, virtualizer],
   );

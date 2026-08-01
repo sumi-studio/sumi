@@ -20,7 +20,7 @@ const agentDirectory = resolve(repositoryRoot, "apps/agent");
 const webDirectory = resolve(repositoryRoot, "apps/web");
 const maxChildLogCharacters = 64 * 1024;
 const processStopTimeoutMilliseconds = 8_000;
-const browserSessionAudience = "sumi:web:direct-chat";
+const browserSessionAudience = "sumi:web";
 
 export const firstUserMessage = "real browser turn one";
 export const secondUserMessage = "real browser turn two";
