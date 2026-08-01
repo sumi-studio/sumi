@@ -181,15 +181,33 @@ type fakeListenerController struct {
 }
 
 type fakeRuntimeReadiness struct {
-	mu    sync.Mutex
-	ready bool
-	err   error
+	mu                 sync.Mutex
+	ready              bool
+	terminal           bool
+	err                error
+	expectedGeneration *uint64
+	onObserve          func()
 }
 
-func (r *fakeRuntimeReadiness) IsPersonalityAgentReady(_ context.Context, _ string) (bool, error) {
+func (r *fakeRuntimeReadiness) Observe(
+	_ context.Context,
+	claims agentevents.TokenClaims,
+	generation uint64,
+) (agentevents.HydrationObservation, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ready, r.err
+	ready, terminal, err := r.ready, r.terminal, r.err
+	expectedGeneration, onObserve := r.expectedGeneration, r.onObserve
+	r.mu.Unlock()
+	if claims.Generation != generation {
+		return agentevents.HydrationObservation{}, errors.New("claims generation mismatch")
+	}
+	if expectedGeneration != nil && generation != *expectedGeneration {
+		return agentevents.HydrationObservation{}, errors.New("stale readiness generation")
+	}
+	if onObserve != nil {
+		onObserve()
+	}
+	return agentevents.HydrationObservation{Ready: ready, TerminalNotReady: terminal}, err
 }
 
 func (r *fakeRuntimeReadiness) setReady(ready bool) {
@@ -644,11 +662,50 @@ func TestProvisionedRuntimeSpawnerSurfacesPreReadyRuntimeExit(t *testing.T) {
 		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
 		GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
-	if err == nil || !strings.Contains(err.Error(), "left its active epoch before Ready") {
+	if err == nil || !strings.Contains(err.Error(), "left its exact active epoch before Ready") {
 		t.Fatalf("pre-Ready runtime exit was not surfaced: %v", err)
 	}
 	if authorizations.fences[paid] != 1 || listeners.active[paid] {
 		t.Fatalf("pre-Ready failure retained authority: fences=%d listener=%v", authorizations.fences[paid], listeners.active[paid])
+	}
+}
+
+func TestProvisionedRuntimeSpawnerRejectsReadyFromWrongGeneration(t *testing.T) {
+	spawner, _, authorizations, listeners, _ := newProvisioningTestSpawner(t)
+	wrongGeneration := uint64(99)
+	spawner.config.Readiness = &fakeRuntimeReadiness{ready: true, expectedGeneration: &wrongGeneration}
+	paid := provisionedTestPAIDs[0]
+	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+		GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "stale readiness generation") {
+		t.Fatalf("wrong-generation Ready satisfied activation: %v", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatal("wrong-generation Ready retained runtime authority")
+	}
+}
+
+func TestProvisionedRuntimeSpawnerRejectsReadyThenExit(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	readiness := &fakeRuntimeReadiness{ready: true}
+	readiness.onObserve = func() {
+		provisioner.mu.Lock()
+		delete(provisioner.epochs, paid)
+		provisioner.mu.Unlock()
+	}
+	spawner.config.Readiness = readiness
+	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+		GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "left its exact active epoch before Ready") {
+		t.Fatalf("Ready-then-exit runtime satisfied activation: %v", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatal("Ready-then-exit runtime retained authority")
 	}
 }
 

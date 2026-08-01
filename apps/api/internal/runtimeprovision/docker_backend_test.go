@@ -3,9 +3,14 @@ package runtimeprovision
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 type recordingRunner struct {
@@ -98,4 +103,89 @@ func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 	if err == nil {
 		t.Fatal("trailing supervisor output was accepted")
 	}
+}
+
+func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	termPath := filepath.Join(dir, "term")
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{terminationGrace: time.Second, pipeWait: 100 * time.Millisecond}).Run(
+			ctx,
+			"/bin/sh",
+			[]string{"-c", `trap 'printf term >"$TERM_PATH"; exit 143' TERM; printf ready >"$READY_PATH"; while :; do sleep 1; done`},
+			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "TERM_PATH=" + termPath},
+		)
+		result <- err
+	}()
+	waitForFile(t, readyPath)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runner error = %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not return after graceful cancellation")
+	}
+	if raw, err := os.ReadFile(termPath); err != nil || string(raw) != "term" {
+		t.Fatalf("supervisor TERM trap did not run: value=%q err=%v", raw, err)
+	}
+}
+
+func TestExecCommandRunnerBoundsInheritedPipeAndKillsProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	readyPath := filepath.Join(dir, "ready")
+	pidPath := filepath.Join(dir, "pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := (execCommandRunner{terminationGrace: 100 * time.Millisecond, pipeWait: 25 * time.Millisecond}).Run(
+			ctx,
+			"/bin/sh",
+			[]string{"-c", `trap 'exit 143' TERM; (trap '' TERM; while :; do printf held >&2; sleep 1; done) & printf '%s' "$$" >"$PID_PATH"; printf ready >"$READY_PATH"; while :; do sleep 1; done`},
+			[]string{"PATH=/usr/bin:/bin", "READY_PATH=" + readyPath, "PID_PATH=" + pidPath},
+		)
+		result <- err
+	}()
+	waitForFile(t, readyPath)
+	rawPID, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(rawPID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runner error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner hung on inherited stderr after cancellation")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("supervisor process group survived bounded cancellation")
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
 }

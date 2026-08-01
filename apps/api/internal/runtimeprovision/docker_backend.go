@@ -13,8 +13,12 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
+
+const defaultSupervisorTerminationGrace = 5 * time.Second
+const defaultSupervisorPipeWait = time.Second
 
 // DockerBackend reaches Docker only through the root-owned supervisor. No
 // Docker client or socket is exposed through the protocol or linked into API,
@@ -30,7 +34,10 @@ type commandRunner interface {
 	Run(context.Context, string, []string, []string) ([]byte, error)
 }
 
-type execCommandRunner struct{}
+type execCommandRunner struct {
+	terminationGrace time.Duration
+	pipeWait         time.Duration
+}
 
 type supervisorCommandError struct {
 	cause      error
@@ -40,20 +47,81 @@ type supervisorCommandError struct {
 func (err *supervisorCommandError) Error() string { return err.cause.Error() }
 func (err *supervisorCommandError) Unwrap() error { return err.cause }
 
-func (execCommandRunner) Run(ctx context.Context, path string, args, environment []string) ([]byte, error) {
-	command := exec.CommandContext(ctx, path, args...)
+func (runner execCommandRunner) Run(ctx context.Context, path string, args, environment []string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, &supervisorCommandError{cause: err, diagnostic: "supervisor operation canceled before launch"}
+	}
+	command := exec.Command(path, args...)
 	command.Env = environment
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	pipeWait := runner.pipeWait
+	if pipeWait <= 0 {
+		pipeWait = defaultSupervisorPipeWait
+	}
+	command.WaitDelay = pipeWait
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
 		return nil, &supervisorCommandError{
 			cause:      err,
 			diagnostic: sanitizeSupervisorError(stderr.String(), environment),
 		}
 	}
-	return stdout.Bytes(), nil
+	waited := make(chan error, 1)
+	go func() { waited <- command.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			return nil, &supervisorCommandError{
+				cause:      err,
+				diagnostic: sanitizeSupervisorError(stderr.String(), environment),
+			}
+		}
+		return stdout.Bytes(), nil
+	case <-ctx.Done():
+		// Prefer a graceful supervisor trap so a partially prepared generation
+		// can be rolled back. The supervisor and its children are placed in one
+		// private process group; after the grace bound, no member may survive.
+	}
+
+	termErr := signalSupervisorHierarchy(command.Process.Pid, syscall.SIGTERM)
+	grace := runner.terminationGrace
+	if grace <= 0 {
+		grace = defaultSupervisorTerminationGrace
+	}
+	timer := time.NewTimer(grace)
+	var waitErr error
+	var killErr error
+	select {
+	case waitErr = <-waited:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	case <-timer.C:
+		killErr = signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL)
+		waitErr = <-waited
+	}
+	// A child may have kept inherited output descriptors open after the shell
+	// exited. WaitDelay closes those pipes; this final group kill removes any
+	// remaining same-hierarchy descendant before returning.
+	killErr = errors.Join(killErr, signalSupervisorHierarchy(command.Process.Pid, syscall.SIGKILL))
+	return nil, &supervisorCommandError{
+		cause:      errors.Join(ctx.Err(), termErr, killErr, waitErr),
+		diagnostic: sanitizeSupervisorError(stderr.String(), environment),
+	}
+}
+
+func signalSupervisorHierarchy(pid int, signal syscall.Signal) error {
+	err := syscall.Kill(-pid, signal)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
 }
 
 func sanitizeSupervisorError(message string, environment []string) string {

@@ -37,7 +37,7 @@ type localRuntimeListenerController interface {
 }
 
 type runtimeReadinessController interface {
-	IsPersonalityAgentReady(context.Context, string) (bool, error)
+	Observe(context.Context, agentevents.TokenClaims, uint64) (agentevents.HydrationObservation, error)
 }
 
 type provisionedRuntimeSpawnerConfig struct {
@@ -215,23 +215,31 @@ func (s *provisionedRuntimeSpawner) awaitRuntimeReady(
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		ready, err := s.config.Readiness.IsPersonalityAgentReady(readyCtx, epoch.PersonalityAgentID)
-		if err != nil {
+		if err := s.requireExactActiveEpoch(readyCtx, epoch); err != nil {
 			return err
 		}
-		if ready {
-			return nil
-		}
-		inspection, err := s.config.Provisioner.Reconcile(readyCtx, runtimeprovision.ReconcileRequest{
-			Version:            runtimeprovision.ProtocolVersion,
-			PersonalityAgentID: epoch.PersonalityAgentID,
-		})
+		observation, err := s.config.Readiness.Observe(
+			readyCtx,
+			agentevents.TokenClaims{
+				PersonalityAgentID: epoch.PersonalityAgentID,
+				Generation:         epoch.Generation,
+			},
+			epoch.Generation,
+		)
 		if err != nil {
-			return fmt.Errorf("inspect active runtime before Ready: %w", err)
+			return fmt.Errorf("observe exact runtime readiness: %w", err)
 		}
-		if inspection.Phase != runtimeprovision.PhaseActive ||
-			inspection.Epoch == nil || *inspection.Epoch != epoch {
-			return errors.New("runtime left its active epoch before Ready")
+		if observation.TerminalNotReady {
+			return errors.New("runtime entered terminal NotReady before Ready")
+		}
+		// Ready and process liveness are separate authorities. Reconcile again
+		// after observing Ready so a runtime that exited concurrently cannot be
+		// returned as a healthy process.
+		if err := s.requireExactActiveEpoch(readyCtx, epoch); err != nil {
+			return err
+		}
+		if observation.Ready {
+			return nil
 		}
 		select {
 		case <-readyCtx.Done():
@@ -239,6 +247,24 @@ func (s *provisionedRuntimeSpawner) awaitRuntimeReady(
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *provisionedRuntimeSpawner) requireExactActiveEpoch(
+	ctx context.Context,
+	epoch runtimeprovision.PreparedEpoch,
+) error {
+	inspection, err := s.config.Provisioner.Reconcile(ctx, runtimeprovision.ReconcileRequest{
+		Version:            runtimeprovision.ProtocolVersion,
+		PersonalityAgentID: epoch.PersonalityAgentID,
+	})
+	if err != nil {
+		return fmt.Errorf("inspect active runtime before Ready: %w", err)
+	}
+	if inspection.Phase != runtimeprovision.PhaseActive ||
+		inspection.Epoch == nil || *inspection.Epoch != epoch {
+		return errors.New("runtime left its exact active epoch before Ready")
+	}
+	return nil
 }
 
 func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) error {

@@ -100,6 +100,7 @@ type Manager struct {
 	mu       sync.Mutex
 	running  map[string]*agentRuntime
 	starting map[string]*startAttempt
+	stopping map[string]*stopAttempt
 	closing  bool
 	now      func() time.Time
 	idleStop time.Duration
@@ -118,6 +119,11 @@ type startAttempt struct {
 	cancel     context.CancelFunc
 	err        error
 	cleanupErr error
+}
+
+type stopAttempt struct {
+	done chan struct{}
+	err  error
 }
 
 // New returns a Manager. A nil Spawner or Resolver is an error.
@@ -146,6 +152,7 @@ func New(cfg Config) (*Manager, error) {
 		cfg:      cfg,
 		running:  make(map[string]*agentRuntime),
 		starting: make(map[string]*startAttempt),
+		stopping: make(map[string]*stopAttempt),
 		now:      now,
 		idleStop: cfg.IdleTimeout,
 		stopWait: cfg.ShutdownTimeout,
@@ -157,65 +164,82 @@ func New(cfg Config) (*Manager, error) {
 // call as activity. It is called on 呼びかけ (direct-chat connection). Agents
 // in the SkipAgentIDs set are left to their external manager.
 func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
-	m.mu.Lock()
-	if m.closing {
-		m.mu.Unlock()
-		return ErrManagerClosed
-	}
-	if m.skip[agentID] {
-		m.mu.Unlock()
-		return nil
-	}
-	if rt, ok := m.running[agentID]; ok {
-		rt.lastActive = m.now()
-		m.mu.Unlock()
-		return nil
-	}
-	if attempt, ok := m.starting[agentID]; ok {
-		m.mu.Unlock()
-		select {
-		case <-attempt.done:
-			return attempt.err
-		case <-ctx.Done():
-			return ctx.Err()
+	for {
+		m.mu.Lock()
+		if m.closing {
+			m.mu.Unlock()
+			return ErrManagerClosed
 		}
-	}
-	startContext, cancelStart := context.WithCancel(ctx)
-	attempt := &startAttempt{
-		done:   make(chan struct{}),
-		cancel: cancelStart,
-	}
-	m.starting[agentID] = attempt
-	m.mu.Unlock()
+		if m.skip[agentID] {
+			m.mu.Unlock()
+			return nil
+		}
+		if attempt, ok := m.stopping[agentID]; ok {
+			m.mu.Unlock()
+			select {
+			case <-attempt.done:
+				if attempt.err != nil {
+					return attempt.err
+				}
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if rt, ok := m.running[agentID]; ok {
+			rt.lastActive = m.now()
+			m.mu.Unlock()
+			return nil
+		}
+		if attempt, ok := m.starting[agentID]; ok {
+			m.mu.Unlock()
+			select {
+			case <-attempt.done:
+				return attempt.err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		startContext, cancelStart := context.WithCancel(ctx)
+		attempt := &startAttempt{
+			done:   make(chan struct{}),
+			cancel: cancelStart,
+		}
+		m.starting[agentID] = attempt
+		m.mu.Unlock()
 
-	runtime, err := m.startRuntime(startContext, agentID)
-	cancelStart()
-	m.mu.Lock()
-	if !m.closing {
-		if err == nil {
-			m.running[agentID] = runtime
+		runtime, err := m.startRuntime(startContext, agentID)
+		cancelStart()
+		m.mu.Lock()
+		if !m.closing {
+			if err == nil {
+				m.running[agentID] = runtime
+			}
+			attempt.err = err
+			delete(m.starting, agentID)
+			close(attempt.done)
+			m.mu.Unlock()
+			if runtime != nil {
+				go m.watchRuntime(agentID, runtime)
+			}
+			return err
 		}
-		attempt.err = err
+		m.mu.Unlock()
+
+		// StopAll won the publication race. A spawner that returned success after
+		// manager cancellation must not escape shutdown or enter the running map.
+		if runtime != nil {
+			if stopErr := runtime.process.Stop(); stopErr != nil {
+				attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
+			}
+		}
+		m.mu.Lock()
+		attempt.err = errors.Join(ErrManagerClosed, attempt.cleanupErr)
 		delete(m.starting, agentID)
 		close(attempt.done)
 		m.mu.Unlock()
-		return err
+		return attempt.err
 	}
-	m.mu.Unlock()
-
-	// StopAll won the publication race. A spawner that returned success after
-	// manager cancellation must not escape shutdown or enter the running map.
-	if runtime != nil {
-		if stopErr := runtime.process.Stop(); stopErr != nil {
-			attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
-		}
-	}
-	m.mu.Lock()
-	attempt.err = errors.Join(ErrManagerClosed, attempt.cleanupErr)
-	delete(m.starting, agentID)
-	close(attempt.done)
-	m.mu.Unlock()
-	return attempt.err
 }
 
 func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRuntime, error) {
@@ -254,6 +278,17 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRunti
 	return &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}, nil
 }
 
+// watchRuntime evicts only the exact process instance whose Wait completed.
+// A prior epoch may finish after a replacement has already been published.
+func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
+	_ = runtime.process.Wait()
+	m.mu.Lock()
+	if m.running[agentID] == runtime {
+		delete(m.running, agentID)
+	}
+	m.mu.Unlock()
+}
+
 // Touch records activity for a running agent (an open direct-chat connection).
 func (m *Manager) Touch(agentID string) {
 	m.mu.Lock()
@@ -273,15 +308,38 @@ func (m *Manager) Running(agentID string) bool {
 
 // Stop terminates a running agent.
 func (m *Manager) Stop(agentID string) error {
-	m.mu.Lock()
-	rt, ok := m.running[agentID]
-	if !ok {
+	for {
+		m.mu.Lock()
+		if attempt, ok := m.stopping[agentID]; ok {
+			m.mu.Unlock()
+			<-attempt.done
+			return attempt.err
+		}
+		if attempt, ok := m.starting[agentID]; ok {
+			m.mu.Unlock()
+			<-attempt.done
+			continue
+		}
+		rt, ok := m.running[agentID]
+		if !ok {
+			m.mu.Unlock()
+			return nil
+		}
+		attempt := &stopAttempt{done: make(chan struct{})}
+		m.stopping[agentID] = attempt
 		m.mu.Unlock()
-		return nil
+
+		err := rt.process.Stop()
+		m.mu.Lock()
+		attempt.err = err
+		if m.running[agentID] == rt {
+			delete(m.running, agentID)
+		}
+		delete(m.stopping, agentID)
+		close(attempt.done)
+		m.mu.Unlock()
+		return err
 	}
-	delete(m.running, agentID)
-	m.mu.Unlock()
-	return rt.process.Stop()
 }
 
 // StopIdleCold stops any running cold-mode agent that has been idle longer than
@@ -326,10 +384,9 @@ func (m *Manager) Warmth(agentID string) string {
 func (m *Manager) StopAll() error {
 	m.mu.Lock()
 	m.closing = true
-	runtimes := make(map[string]*agentRuntime, len(m.running))
-	for id, runtime := range m.running {
-		runtimes[id] = runtime
-		delete(m.running, id)
+	ids := make([]string, 0, len(m.running))
+	for id := range m.running {
+		ids = append(ids, id)
 	}
 	type pendingStart struct {
 		agentID string
@@ -345,8 +402,8 @@ func (m *Manager) StopAll() error {
 		start.attempt.cancel()
 	}
 	var errs []error
-	for id, runtime := range runtimes {
-		if err := runtime.process.Stop(); err != nil {
+	for _, id := range ids {
+		if err := m.Stop(id); err != nil {
 			errs = append(errs, fmt.Errorf("stop agent %s: %w", id, err))
 		}
 	}

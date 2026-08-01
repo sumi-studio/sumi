@@ -73,6 +73,39 @@ type replacementRaceSpawner struct {
 	processes []Process
 }
 
+type delayedWaitProcess struct {
+	exited       chan struct{}
+	waitRelease  chan struct{}
+	waitReturned chan struct{}
+	once         sync.Once
+}
+
+func (p *delayedWaitProcess) Wait() error {
+	<-p.exited
+	<-p.waitRelease
+	close(p.waitReturned)
+	return nil
+}
+
+func (p *delayedWaitProcess) Stop() error {
+	p.once.Do(func() { close(p.exited) })
+	return nil
+}
+
+type sequenceSpawner struct {
+	mu        sync.Mutex
+	processes []Process
+	next      int
+}
+
+func (s *sequenceSpawner) Spawn(_ context.Context, _ AgentRuntimeConfig) (Process, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	process := s.processes[s.next]
+	s.next++
+	return process, nil
+}
+
 type parallelStopProcess struct {
 	id      string
 	entered chan<- string
@@ -314,6 +347,105 @@ func TestEnsureRunningCoalescesConcurrentStarts(t *testing.T) {
 	}
 	if got := spawner.spawnCount(); got != 1 {
 		t.Fatalf("running agent spawned again: got %d starts, want 1", got)
+	}
+}
+
+func TestExitedRuntimeIsEvictedAndCanRestart(t *testing.T) {
+	spawner := newFakeSpawner()
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "crashed-agent"
+	if err := mgr.EnsureRunning(context.Background(), agentID); err != nil {
+		t.Fatal(err)
+	}
+	spawner.mu.Lock()
+	first := spawner.processes[agentID]
+	spawner.mu.Unlock()
+	first.once.Do(func() { close(first.done) })
+
+	deadline := time.Now().Add(time.Second)
+	for mgr.Running(agentID) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if mgr.Running(agentID) {
+		t.Fatal("exited runtime remained cached as running")
+	}
+	if err := mgr.EnsureRunning(context.Background(), agentID); err != nil {
+		t.Fatal(err)
+	}
+	spawner.mu.Lock()
+	spawnCount := len(spawner.spawns)
+	spawner.mu.Unlock()
+	if spawnCount != 2 || !mgr.Running(agentID) {
+		t.Fatalf("crashed runtime was not replaced: spawns=%d running=%v", spawnCount, mgr.Running(agentID))
+	}
+}
+
+func TestPriorRuntimeWaitCannotEvictReplacement(t *testing.T) {
+	first := &delayedWaitProcess{exited: make(chan struct{}), waitRelease: make(chan struct{}), waitReturned: make(chan struct{})}
+	second := &fakeProcess{done: make(chan struct{})}
+	spawner := &sequenceSpawner{processes: []Process{first, second}}
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "replacement-agent"
+	if err := mgr.EnsureRunning(context.Background(), agentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Stop(agentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), agentID); err != nil {
+		t.Fatal(err)
+	}
+	close(first.waitRelease)
+	<-first.waitReturned
+	time.Sleep(10 * time.Millisecond)
+	if !mgr.Running(agentID) {
+		t.Fatal("prior runtime waiter deleted the replacement")
+	}
+}
+
+func TestEnsureRunningWaitsForPriorStopJoin(t *testing.T) {
+	first := &blockingStopProcess{
+		done:        make(chan struct{}),
+		stopEntered: make(chan struct{}),
+		releaseStop: make(chan struct{}),
+	}
+	spawner := &replacementRaceSpawner{first: first}
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "serialized-replacement"
+	if err := mgr.EnsureRunning(context.Background(), agentID); err != nil {
+		t.Fatal(err)
+	}
+	stopResult := make(chan error, 1)
+	go func() { stopResult <- mgr.Stop(agentID) }()
+	<-first.stopEntered
+	replacementResult := make(chan error, 1)
+	go func() { replacementResult <- mgr.EnsureRunning(context.Background(), agentID) }()
+	select {
+	case err := <-replacementResult:
+		t.Fatalf("replacement escaped before prior Stop joined: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if count := spawner.count(); count != 1 {
+		t.Fatalf("spawned replacement before Stop join: count=%d", count)
+	}
+	close(first.releaseStop)
+	if err := <-stopResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-replacementResult; err != nil {
+		t.Fatal(err)
+	}
+	if count := spawner.count(); count != 2 || !mgr.Running(agentID) {
+		t.Fatalf("replacement did not start after Stop join: count=%d running=%v", count, mgr.Running(agentID))
 	}
 }
 
