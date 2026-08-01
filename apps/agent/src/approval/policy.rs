@@ -2081,6 +2081,11 @@ fn default_non_bash_decision(action: &CanonicalAction) -> PolicyDecision {
         "read_file" | "list_dir" | "glob" | "grep" => PolicyDecision::Allow {
             matched_rules: Vec::new(),
         },
+        "messaging" if matches!(action.operation.as_str(), "overview" | "open") => {
+            PolicyDecision::Allow {
+                matched_rules: Vec::new(),
+            }
+        }
         "write_file" | "edit_file" => PolicyDecision::Allow {
             matched_rules: Vec::new(),
         },
