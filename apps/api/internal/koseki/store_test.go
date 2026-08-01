@@ -177,7 +177,7 @@ func TestEmployerAuthorityLeaseSerializesTransfer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := New(pool)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	first, err := store.AutoRegister(ctx, "firebase", "authority-lease-first")
 	if err != nil {
 		t.Fatalf("auto-register first Human: %v", err)

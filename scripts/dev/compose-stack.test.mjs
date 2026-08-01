@@ -67,6 +67,22 @@ test("emulator mode selects only the base Compose file", async () => {
   }
 });
 
+test("real Firebase down removes only the selected project's staged ADC volume", async () => {
+  const fixture = await createFixture(0o600);
+  try {
+    await runLauncher(fixture, "real", ["down"], {
+      SUMI_LOCAL_COMPOSE_PROJECT: "sumi-feature_153",
+    });
+    assert.deepEqual(await dockerArguments(fixture), [
+      "volume",
+      "rm",
+      "sumi-feature_153_firebase-adc-runtime",
+    ]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("real Firebase mode rejects a host ADC readable by other users", async () => {
   const fixture = await createFixture(0o644);
   try {
@@ -212,7 +228,7 @@ async function createFixture(adcMode, { fakeDocker = true } = {}) {
   return { root, bin, envFile, runtimeEnvFile, adcFile, dockerLog };
 }
 
-async function runLauncher(fixture, mode, action = ["config"]) {
+async function runLauncher(fixture, mode, action = ["config"], extraEnv = {}) {
   return execFileAsync(launcher, ["--firebase", mode, ...action], {
     cwd: repositoryRoot,
     env: {
@@ -223,6 +239,7 @@ async function runLauncher(fixture, mode, action = ["config"]) {
       SUMI_TEST_DOCKER_LOG: fixture.dockerLog,
       FIREBASE_AUTH_EMULATOR_HOST: "must-be-cleared",
       VITE_FIREBASE_AUTH_EMULATOR_URL: "must-be-cleared",
+      ...extraEnv,
     },
   });
 }

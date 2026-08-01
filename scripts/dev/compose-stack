@@ -7,7 +7,7 @@ readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
 readonly BASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
 readonly REAL_FIREBASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.real-firebase.yaml"
-readonly REAL_FIREBASE_ADC_VOLUME=sumi-dev_firebase-adc-runtime
+readonly REAL_FIREBASE_ADC_VOLUME_SUFFIX=firebase-adc-runtime
 readonly CONTROL_PLANE_NETWORK=sumi-control-plane
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
@@ -304,6 +304,10 @@ readonly ACTION FIREBASE_MODE
 
 [[ "${COMPOSE_PROJECT}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
   fail "SUMI_LOCAL_COMPOSE_PROJECT must be a canonical Compose project name"
+# Compose receives the project name explicitly through `-p`, so its named
+# volume is exactly this project-qualified name. Keep the cleanup scoped to the
+# selected stack rather than assuming the default `sumi-dev` project.
+readonly REAL_FIREBASE_ADC_VOLUME="${COMPOSE_PROJECT}_${REAL_FIREBASE_ADC_VOLUME_SUFFIX}"
 if [[ -n "${COMPOSE_OVERRIDE_FILE}" ]]; then
   [[ -f "${COMPOSE_OVERRIDE_FILE}" && ! -L "${COMPOSE_OVERRIDE_FILE}" ]] ||
     fail "SUMI_LOCAL_COMPOSE_OVERRIDE_FILE must be a regular non-symlink"
