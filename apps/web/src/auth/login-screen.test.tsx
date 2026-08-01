@@ -26,6 +26,30 @@ afterEach(() => {
 });
 
 describe("LoginScreen email-link callback", () => {
+  it("explains that a provider collision is waiting for email proof", () => {
+    loginMocks.useAuth.mockReturnValue({
+      authenticated: false,
+      cancelIntentTransition: vi.fn(),
+      completeEmailLink: vi.fn(),
+      confirmation: null,
+      configured: true,
+      confirmIntentTransition: vi.fn(),
+      credentialRecoveryEmailSent: true,
+      emailLinkCallbackPending: false,
+      logout: vi.fn(),
+      rejectEmailLink: vi.fn(),
+      sendEmailLink: vi.fn(),
+      sessionState: "unauthenticated",
+      signIn: vi.fn(),
+    });
+
+    render(<LoginScreen />);
+
+    expect(
+      screen.getByText(/既存アカウントを確認するメールリンク/),
+    ).toBeInTheDocument();
+  });
+
   it("requires an explicit choice before replacing an authenticated account", () => {
     const completeEmailLink = vi.fn();
     const rejectEmailLink = vi.fn();
@@ -36,6 +60,7 @@ describe("LoginScreen email-link callback", () => {
       confirmation: null,
       configured: true,
       confirmIntentTransition: vi.fn(),
+      credentialRecoveryEmailSent: false,
       emailLinkCallbackPending: true,
       logout: vi.fn(),
       rejectEmailLink,
@@ -74,6 +99,7 @@ describe("LoginScreen email-link callback", () => {
       confirmation: null,
       configured: true,
       confirmIntentTransition: vi.fn(),
+      credentialRecoveryEmailSent: false,
       emailLinkCallbackPending: true,
       logout,
       rejectEmailLink: vi.fn(),
@@ -110,6 +136,7 @@ describe("LoginScreen email-link callback", () => {
       },
       configured: true,
       confirmIntentTransition: vi.fn(),
+      credentialRecoveryEmailSent: false,
       emailLinkCallbackPending: false,
       logout: vi.fn(),
       rejectEmailLink: vi.fn(),
