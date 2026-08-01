@@ -1,7 +1,7 @@
 import { Button } from "@sumi/ui/components/button";
 import type { ReactNode } from "react";
-import { LoginScreen } from "./login-screen";
 import { useAuth } from "./auth-context";
+import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const { canUseDirectChat, loading, sessionState, refreshSession } = useAuth();

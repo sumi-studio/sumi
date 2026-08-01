@@ -1,11 +1,12 @@
 import { Button } from "@sumi/ui/components/button";
 import { LoaderCircle } from "lucide-react";
-import { useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { FaGithub } from "react-icons/fa";
 import { FcGoogle } from "react-icons/fc";
 import { type SignInProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
 import type { AuthIntent } from "./auth-flow-client";
+import { hasEmailLinkCallback } from "./email-link-auth";
 
 const providers: Array<{ id: SignInProvider; label: string }> = [
   { id: "google", label: "Googleで続ける" },
@@ -15,16 +16,39 @@ const providers: Array<{ id: SignInProvider; label: string }> = [
 export function LoginScreen() {
   const {
     cancelIntentTransition,
+    completeEmailLink,
     confirmation,
     configured,
     confirmIntentTransition,
+    sendEmailLink,
     signIn,
   } = useAuth();
   const [intent, setIntent] = useState<AuthIntent>("sign_in");
   const [busy, setBusy] = useState<
-    SignInProvider | "confirm" | "cancel" | null
+    SignInProvider | "email" | "confirm" | "cancel" | null
   >(null);
   const [error, setError] = useState<string | null>(null);
+  const [email, setEmail] = useState("");
+  const [emailSent, setEmailSent] = useState(false);
+  const emailCallbackStarted = useRef(false);
+
+  useEffect(() => {
+    if (
+      emailCallbackStarted.current ||
+      !configured ||
+      !hasEmailLinkCallback()
+    ) {
+      return;
+    }
+    emailCallbackStarted.current = true;
+    setBusy("email");
+    setError(null);
+    void completeEmailLink()
+      .catch((nextError: unknown) => {
+        setError(getAuthErrorMessage(nextError));
+      })
+      .finally(() => setBusy(null));
+  }, [completeEmailLink, configured]);
 
   const handleSignIn = async (provider: SignInProvider) => {
     if (busy || !configured) {
@@ -34,6 +58,22 @@ export function LoginScreen() {
     setError(null);
     try {
       await signIn(provider, intent);
+    } catch (nextError) {
+      setError(getAuthErrorMessage(nextError));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleEmailLink = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busy || !configured) return;
+    setBusy("email");
+    setError(null);
+    setEmailSent(false);
+    try {
+      await sendEmailLink(email, intent);
+      setEmailSent(true);
     } catch (nextError) {
       setError(getAuthErrorMessage(nextError));
     } finally {
@@ -129,6 +169,47 @@ export function LoginScreen() {
                       {label}
                     </button>
                   ))}
+                </div>
+                <form onSubmit={handleEmailLink} className="space-y-3">
+                  <label htmlFor="sumi-auth-email" className="sr-only">
+                    メールアドレス
+                  </label>
+                  <input
+                    id="sumi-auth-email"
+                    type="email"
+                    autoComplete="email"
+                    required
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    disabled={busy !== null || !configured}
+                    placeholder="メールアドレス"
+                    className="h-11 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50"
+                  />
+                  <Button
+                    type="submit"
+                    disabled={busy !== null || !configured}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    {busy === "email" && (
+                      <LoaderCircle className="size-5 animate-spin" />
+                    )}
+                    {intent === "sign_in"
+                      ? "メールでログイン"
+                      : "メールで新規登録"}
+                  </Button>
+                </form>
+                {emailSent && (
+                  <p
+                    role="status"
+                    className="mt-4 rounded-lg bg-emerald-50 px-3 py-2.5 text-emerald-800 text-sm dark:bg-emerald-950/30 dark:text-emerald-200"
+                  >
+                    ログインリンクを送信しました。このブラウザでメールを開いてください。
+                  </p>
+                )}
+                <div className="my-4 flex items-center gap-3 text-muted-foreground text-xs">
+                  <span className="h-px flex-1 bg-border" />
+                  または
+                  <span className="h-px flex-1 bg-border" />
                 </div>
                 <div className="space-y-3">
                   {providers.map((provider) => (

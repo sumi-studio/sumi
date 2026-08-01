@@ -32,6 +32,8 @@ const authMocks = vi.hoisted(() => ({
   }),
   confirmAuthFlow: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
+  beginEmailLinkAuth: vi.fn(),
+  completeEmailLinkAuth: vi.fn(),
   getFirebaseAuth: vi.fn(),
   signOut: vi.fn(),
   signInWithPopup: vi.fn(),
@@ -52,6 +54,11 @@ vi.mock("./auth-flow-client", () => ({
   createAuthFlowNonce: authMocks.createAuthFlowNonce,
   resolveAuthFlow: authMocks.resolveAuthFlow,
   startAuthFlow: authMocks.startAuthFlow,
+}));
+
+vi.mock("./email-link-auth", () => ({
+  beginEmailLinkAuth: authMocks.beginEmailLinkAuth,
+  completeEmailLinkAuth: authMocks.completeEmailLinkAuth,
 }));
 
 vi.mock("./firebase", () => ({

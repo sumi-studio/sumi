@@ -35,6 +35,7 @@ import {
   resolveAuthFlow,
   startAuthFlow,
 } from "./auth-flow-client";
+import { beginEmailLinkAuth, completeEmailLinkAuth } from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
@@ -114,6 +115,8 @@ interface AuthContextValue {
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
+  sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
+  completeEmailLink: () => Promise<void>;
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   logout: () => Promise<void>;
@@ -313,6 +316,62 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
   );
 
+  const sendEmailLink = useCallback(
+    async (email: string, intent: AuthIntent) => {
+      if (preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError("Authentication is unavailable.", 0);
+      }
+      nextGeneration();
+      signInPending.current = true;
+      try {
+        await beginEmailLinkAuth(email, intent);
+      } finally {
+        signInPending.current = false;
+      }
+    },
+    [nextGeneration],
+  );
+
+  const completeEmailLink = useCallback(async () => {
+    if (preissuedSessionMode || !authOriginAllowed) {
+      throw new AuthAPIError("Authentication is unavailable.", 0);
+    }
+    const generation = nextGeneration();
+    signInPending.current = true;
+    try {
+      const completed = await completeEmailLinkAuth();
+      await serializeSessionMutation(async () => {
+        if (!isCurrentGeneration(generation)) return;
+        if (completed.result.outcome === "confirmation_required") {
+          const pending: PendingAuthConfirmation = {
+            flowId: completed.result.flowId,
+            nonce: completed.flow.nonce,
+            intent: completed.flow.intent,
+            provider: "email_link",
+            expiresAt: completed.result.expiresAt,
+            action: completed.result.nextAction,
+          };
+          savePendingConfirmation(pending);
+          setConfirmation(pending);
+          return;
+        }
+        const nextSession = await verifyCommittedSumiSession();
+        flushSync(() => {
+          bindDirectChatAuthority(nextSession.authorityBindingId);
+          serverSession.current = nextSession;
+          if (!isCurrentGeneration(generation)) return;
+          setSession(nextSession);
+          setSessionState("authenticated");
+        });
+      });
+    } catch (error) {
+      await signOutFirebaseBestEffort();
+      throw error;
+    } finally {
+      signInPending.current = false;
+    }
+  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
+
   const confirmIntentTransition = useCallback(async () => {
     const pending = confirmation;
     if (!pending || preissuedSessionMode || !authOriginAllowed) {
@@ -412,6 +471,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       confirmation,
       signIn,
+      sendEmailLink,
+      completeEmailLink,
       confirmIntentTransition,
       cancelIntentTransition,
       logout,
@@ -420,11 +481,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       cancelIntentTransition,
       confirmation,
+      completeEmailLink,
       confirmIntentTransition,
       logout,
       refreshSession,
       session.authenticated,
       sessionState,
+      sendEmailLink,
       signIn,
       user,
     ],
