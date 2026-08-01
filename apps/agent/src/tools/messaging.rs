@@ -8,11 +8,8 @@
 use std::{fmt::Write as _, sync::Arc};
 
 use async_trait::async_trait;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -31,7 +28,7 @@ const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum MessagingAction {
     /// See the places available to this person and their unread state.
@@ -54,7 +51,7 @@ enum MessagingAction {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MessagingUrgency {
     Urgent,
@@ -105,6 +102,59 @@ impl MessagingTool {
     }
 }
 
+fn messaging_parameters_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description": concat!(
+            "Choose one messaging action and include only the fields used by that action. ",
+            "overview needs no other fields; open requires place_id and may include before_seq ",
+            "or limit; write requires content and may include urgency or reply_to. Write acts on ",
+            "the place most recently opened in this tool view."
+        ),
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["overview", "open", "write"],
+                "description": concat!(
+                    "Action to perform: overview lists available places and unread state; open ",
+                    "shows one place and focuses it for later writes; write sends a message to ",
+                    "the currently open place."
+                )
+            },
+            "place_id": {
+                "type": "string",
+                "description": "Required for open and omitted for other actions. The place to open."
+            },
+            "before_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional for open and omitted for other actions. Return messages before this sequence number."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Optional for open and omitted for other actions. Maximum number of messages to return."
+            },
+            "content": {
+                "type": "string",
+                "description": "Required for write and omitted for other actions. Message text to send to the currently open place."
+            },
+            "urgency": {
+                "type": "string",
+                "enum": ["urgent", "normal", "fyi"],
+                "description": "Optional for write and omitted for other actions. Message urgency; when omitted, normal is used."
+            },
+            "reply_to": {
+                "type": "string",
+                "description": "Optional for write and omitted for other actions. Message identifier to reply to."
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait]
 impl Tool for MessagingTool {
     fn def(&self) -> ToolDefinition {
@@ -116,8 +166,7 @@ impl Tool for MessagingTool {
                 "that currently open place. Opening never publishes presence."
             )
             .to_owned(),
-            parameters: serde_json::to_value(schemars::schema_for!(MessagingAction))
-                .unwrap_or_else(|_| Value::Object(Default::default())),
+            parameters: messaging_parameters_schema(),
         }
     }
 
@@ -290,6 +339,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
     use crate::{provider::types::ValidatedToolArguments, tools::WorkspacePaths};
 
     #[derive(Default)]
@@ -366,6 +416,110 @@ mod tests {
             workspace: &workspace,
         })
         .await
+    }
+
+    fn assert_flat_provider_schema(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    assert!(
+                        !matches!(
+                            key.as_str(),
+                            "oneOf"
+                                | "anyOf"
+                                | "allOf"
+                                | "$defs"
+                                | "$ref"
+                                | "const"
+                                | "default"
+                                | "format"
+                        ),
+                        "provider-incompatible schema keyword {key}: {value}"
+                    );
+                    if key == "type" {
+                        assert!(
+                            child.is_string(),
+                            "provider schema type must be a string, not an array: {child}"
+                        );
+                    }
+                    assert_flat_provider_schema(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    assert_flat_provider_schema(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn provider_schema_is_flat_and_openai_compatible() {
+        let tool = MessagingTool::new(Arc::new(FakeMessagingApi::default()));
+        let schema = tool.def().parameters;
+
+        assert_flat_provider_schema(&schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["overview", "open", "write"])
+        );
+        assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["properties"]["limit"]["maximum"], 50);
+        assert_eq!(
+            schema["properties"]["urgency"]["enum"],
+            json!(["urgent", "normal", "fyi"])
+        );
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .expect("properties must be an object")
+                .len(),
+            7
+        );
+    }
+
+    #[test]
+    fn all_messaging_actions_still_deserialize() {
+        let overview: MessagingAction =
+            serde_json::from_value(json!({"action": "overview"})).unwrap();
+        assert!(matches!(overview, MessagingAction::Overview {}));
+
+        let open: MessagingAction = serde_json::from_value(json!({
+            "action": "open",
+            "place_id": "general",
+            "before_seq": 0,
+            "limit": 50
+        }))
+        .unwrap();
+        assert!(matches!(
+            open,
+            MessagingAction::Open {
+                place_id,
+                before_seq: Some(0),
+                limit: Some(50)
+            } if place_id == "general"
+        ));
+
+        let write: MessagingAction = serde_json::from_value(json!({
+            "action": "write",
+            "content": "hello",
+            "urgency": "fyi",
+            "reply_to": "message-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            write,
+            MessagingAction::Write {
+                content,
+                urgency: MessagingUrgency::Fyi,
+                reply_to: Some(reply_to)
+            } if content == "hello" && reply_to == "message-1"
+        ));
     }
 
     #[tokio::test]
