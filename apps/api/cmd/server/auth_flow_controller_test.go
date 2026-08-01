@@ -257,6 +257,14 @@ func TestProviderLinkRejectsPreOperationTokenAndAcceptsForcedRefresh(t *testing.
 	if result.Outcome != "provider_linked" || !result.NoticeRequired {
 		t.Fatalf("forced-refresh completion: %+v", result)
 	}
+	replayed, err := controller.StartProviderOperation(ctx, claims, request, initial)
+	if err != nil {
+		t.Fatalf("terminal same-nonce start: %v", err)
+	}
+	if replayed.OperationID != started.OperationID || replayed.Outcome != "provider_linked" ||
+		replayed.ClientOperation != "" || !replayed.NoticeRequired {
+		t.Fatalf("terminal same-nonce start reissued browser mutation: %+v", replayed)
+	}
 }
 
 func TestCompletionTokenNotBeforeHandlesFirebaseSecondPrecision(t *testing.T) {

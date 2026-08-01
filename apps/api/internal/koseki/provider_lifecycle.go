@@ -49,14 +49,17 @@ func (s *Store) BeginProviderOperation(ctx context.Context, humanID, firebaseUID
 	operationID := newUUIDv7()
 	expiresAt := time.Now().UTC().Add(ProviderOperationTTL)
 	var result ProviderOperation
+	var unexpired bool
 	err = s.pool.QueryRow(ctx, `INSERT INTO provider_operations
 		(operation_id, nonce_hash, human_id, firebase_uid, provider, operation, decision_path, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT (nonce_hash) DO UPDATE SET nonce_hash=provider_operations.nonce_hash
-		RETURNING operation_id, human_id, firebase_uid, provider, operation, status, decision_path, created_at, expires_at`,
+		RETURNING operation_id, human_id, firebase_uid, provider, operation, status,
+			decision_path, created_at, expires_at, expires_at > now()`,
 		operationID, nonceHash, humanID, firebaseUID, provider, operation, decisionPath, expiresAt).Scan(
 		&result.OperationID, &result.HumanID, &result.FirebaseUID, &result.Provider,
-		&result.Operation, &result.Status, &result.DecisionPath, &result.CreatedAt, &result.ExpiresAt)
+		&result.Operation, &result.Status, &result.DecisionPath, &result.CreatedAt,
+		&result.ExpiresAt, &unexpired)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ProviderOperation{}, ErrProviderOperationPending
@@ -65,6 +68,17 @@ func (s *Store) BeginProviderOperation(ctx context.Context, humanID, firebaseUID
 	}
 	if result.HumanID != humanID || result.FirebaseUID != firebaseUID || result.Provider != provider ||
 		result.Operation != operation || result.DecisionPath != decisionPath {
+		return ProviderOperation{}, ErrInvalidAuthFlow
+	}
+	switch result.Status {
+	case "pending":
+		if result.Operation == "link" && !unexpired {
+			return ProviderOperation{}, ErrAuthFlowExpired
+		}
+	case "completed", "failed":
+		// The controller recovers the exact terminal state through the audited
+		// status path. It must never reissue a browser mutation for this nonce.
+	default:
 		return ProviderOperation{}, ErrInvalidAuthFlow
 	}
 	return result, nil

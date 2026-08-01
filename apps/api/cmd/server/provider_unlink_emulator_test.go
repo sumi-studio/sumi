@@ -217,6 +217,75 @@ func TestFirebaseEmulatorUnlinkReconcilesRemoteAppliedDatabaseLost(t *testing.T)
 	}
 }
 
+func TestFirebaseEmulatorLinkNonceReplayCannotEscapePendingUnlinkFence(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	client := firebaseProviderEmulatorClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := koseki.New(pool)
+	uid := firebaseEmulatorID(t, "link-replay-fence")
+	createFirebaseEmulatorUser(t, client, uid, map[string]string{
+		"google.com": "google-subject", "github.com": "github-subject",
+	})
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, subject := range map[string]string{"google.com": "google-subject", "github.com": "github-subject"} {
+		if err := store.BindCredential(ctx, provider, subject, registered.HumanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	terminalNonce := controllerNonce(t)
+	terminal, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "google.com", "link", "account_settings", terminalNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteProviderLink(ctx, terminal.OperationID, terminalNonce, uid, "google-subject"); err != nil {
+		t.Fatal(err)
+	}
+	expiredNonce := controllerNonce(t)
+	expired, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "google.com", "link", "notice_action", expiredNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-interval '1 second' WHERE operation_id=$1", expired.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	unlinkNonce := controllerNonce(t)
+	pendingUnlink, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", unlinkNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lifecycle := &firebaseAdminProviderLifecycle{client: client}
+	controller := newKosekiAuthFlowController(store, "local", lifecycle)
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	identity := agentevents.FirebaseIdentity{UID: uid}
+	recovered, err := controller.StartProviderOperation(ctx, claims, agentevents.StartProviderOperationRequest{
+		Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: terminalNonce,
+	}, identity)
+	if err != nil || recovered.OperationID != terminal.OperationID || recovered.Outcome != "provider_already_linked" || recovered.ClientOperation != "" {
+		t.Fatalf("terminal link replay: %+v %v", recovered, err)
+	}
+	if _, err := controller.StartProviderOperation(ctx, claims, agentevents.StartProviderOperationRequest{
+		Provider: "google.com", Operation: "link", DecisionPath: "notice_action", Nonce: expiredNonce,
+	}, identity); !errors.Is(err, agentevents.ErrBrowserAuthFlowExpired) {
+		t.Fatalf("expired link replay: %v", err)
+	}
+	pending, err := controller.StatusProviderOperation(ctx, claims, agentevents.ProviderOperationStatusRequest{
+		OperationID: pendingUnlink.OperationID, Nonce: unlinkNonce,
+	})
+	if err != nil || pending.Status != "pending" || pending.Outcome != "provider_operation_pending" || pending.ClientOperation != "" {
+		t.Fatalf("unlink fence after replays: %+v %v", pending, err)
+	}
+	account, err := lifecycle.ProviderAccount(ctx, uid)
+	if err != nil || account.ProviderSubjects["google.com"] != "google-subject" || account.ProviderSubjects["github.com"] != "github-subject" {
+		t.Fatalf("Firebase account changed during replay: %+v %v", account, err)
+	}
+}
+
 func TestFirebaseEmulatorConcurrentUnlinksNeverRemoveLastSupportedMethod(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	client := firebaseProviderEmulatorClient(t)

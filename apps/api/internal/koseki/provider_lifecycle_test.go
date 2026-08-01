@@ -154,6 +154,57 @@ func TestExpiredProviderUnlinkCanStillTerminalizeItsDurableFence(t *testing.T) {
 	}
 }
 
+func TestProviderLinkSameNonceReplayHonorsExpiryAndPendingUnlinkFence(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	owner, err := store.AutoRegister(ctx, "firebase", "link-replay-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expiredNonce := testNonce(t)
+	expired, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "google.com", "link", "account_settings", expiredNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-interval '1 second' WHERE operation_id=$1", expired.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	unlinkNonce := testNonce(t)
+	unlink, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "github.com", "unlink", "account_settings", unlinkNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "google.com", "link", "account_settings", expiredNonce); !errors.Is(err, ErrAuthFlowExpired) {
+		t.Fatalf("expired same-nonce link replay: %v", err)
+	}
+	if _, err := store.FailProviderOperation(ctx, unlink.OperationID, unlinkNonce, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+
+	linkNonce := testNonce(t)
+	link, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "google.com", "link", "account_settings", linkNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, "ALTER TABLE provider_operations DISABLE TRIGGER provider_operations_pending_unlink_uid_fence"); err != nil {
+		t.Fatal(err)
+	}
+	legacyUnlinkNonce := testNonce(t)
+	legacyUnlink, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "github.com", "unlink", "account_settings", legacyUnlinkNonce)
+	if _, enableErr := store.pool.Exec(ctx, "ALTER TABLE provider_operations ENABLE TRIGGER provider_operations_pending_unlink_uid_fence"); enableErr != nil {
+		t.Fatal(enableErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, "link-replay-owner", "google.com", "link", "account_settings", linkNonce); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("same-nonce link replay bypassed pending unlink fence: %v", err)
+	}
+	if link.OperationID == "" || legacyUnlink.OperationID == "" {
+		t.Fatal("legacy conflict fixture was not persisted")
+	}
+}
+
 func TestProviderOperationStatusRecoversPendingAndTerminalStates(t *testing.T) {
 	store, ctx := authFlowStore(t)
 	owner, err := store.AutoRegister(ctx, "firebase", "provider-status-owner")

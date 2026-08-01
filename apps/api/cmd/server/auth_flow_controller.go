@@ -134,6 +134,9 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
+	if operation.Status != "pending" {
+		return c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce)
+	}
 	if request.Operation == "unlink" {
 		return c.runProviderUnlink(ctx, claims, request, operation)
 	}
