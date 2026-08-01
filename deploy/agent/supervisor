@@ -809,13 +809,14 @@ case "${action}" in
     require_tracked_compose_support
     configure_apparmor_profile
     validate_prepare_compose_redacted
-    validate_local_control_socket
+    # The API installs exact-generation authorization and creates the PAID
+    # local-control listener only after this action returns PreparedEpoch.
+    # Socket trust is therefore activation-only and remains fail-closed there.
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
     run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null 2>&1
-    revalidate_local_control_socket
     remove_runtime_secret_tree
     prepare_status=0
     if run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --wait \
@@ -831,7 +832,6 @@ case "${action}" in
       exit "${prepare_status}"
     fi
     epoch_identity || fail "allocator completed without a coherent epoch"
-    revalidate_local_control_socket
     disarm_partial_generation_cleanup
     print_epoch_json prepared
     ;;
