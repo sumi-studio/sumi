@@ -149,3 +149,19 @@ CREATE TABLE read_markers (
     updated_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (place_id, member_kind, member_id)
 );
+
+-- MVP shared world. Membership is admitted lazily from the authenticated
+-- canonical Human identity, and admits that Human's PersonalityAgent(s) with
+-- the same participant shape. Stable IDs make bootstrap race-free across API
+-- replicas and restarts.
+INSERT INTO workspaces (workspace_id, name)
+VALUES ('01900000-0000-7000-8000-000000000001', 'Sumi');
+
+INSERT INTO places (place_id, kind, workspace_id, name, topic)
+VALUES (
+    '01900000-0000-7000-8000-000000000002',
+    'channel',
+    '01900000-0000-7000-8000-000000000001',
+    'general',
+    'みんなの場所'
+);

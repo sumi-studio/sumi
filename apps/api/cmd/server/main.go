@@ -288,6 +288,7 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("control-plane database: %w", err)
 	}
 	var databasePool *pgxpool.Pool
+	var messagingServer *messaging.Server
 	if database != nil {
 		databasePool = database.Pool
 	}
@@ -331,7 +332,7 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		messagingStore := messaging.New(database.Pool)
 		messagingHub := messaging.NewHub(messagingStore)
-		messagingServer := messaging.NewServer(messagingStore, messagingSessions)
+		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
@@ -344,6 +345,12 @@ func newApplicationFromEnv() (*application, error) {
 	if err != nil {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
+	}
+	if localControl != nil && messagingServer != nil {
+		if err := messagingServer.RegisterLocalControlRoutes(localControl); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("register messaging local control routes: %w", err)
+		}
 	}
 	localListener, err := localControlListenerFromEnv(enabled)
 	if err != nil {

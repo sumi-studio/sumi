@@ -18,6 +18,13 @@ const (
 	RoleOwner  = "owner"
 	RoleAdmin  = "admin"
 	RoleMember = "member"
+
+	// DefaultWorkspaceID and DefaultGeneralChannelID are stable product
+	// identities for the shared MVP Workspace. They are intentionally not
+	// tenant-derived: during the hackathon every authenticated Sumi Human and
+	// their PersonalityAgent Secretary inhabit the same shared world.
+	DefaultWorkspaceID      = "01900000-0000-7000-8000-000000000001"
+	DefaultGeneralChannelID = "01900000-0000-7000-8000-000000000002"
 )
 
 // Place kinds.
@@ -55,6 +62,81 @@ type Store struct {
 // a database with migrations applied (0002 for the 戸籍, 0008 for messaging).
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// EnsureDefaultWorkspaceMembership idempotently admits a participant to the
+// shared MVP Workspace. When a Human arrives, all of that Human's durable
+// PersonalityAgents are admitted through the identical membership shape. The
+// Human remains the caller; this does not act or speak on an agent's behalf.
+func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participant ParticipantRef) error {
+	if err := participant.Validate(); err != nil {
+		return err
+	}
+	if err := s.participantExists(ctx, participant); err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin default workspace admission: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO workspaces (workspace_id, name) VALUES ($1, 'Sumi')
+		 ON CONFLICT (workspace_id) DO NOTHING`, DefaultWorkspaceID); err != nil {
+		return fmt.Errorf("ensure default workspace: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO places (place_id, kind, workspace_id, name, topic)
+		 VALUES ($1, 'channel', $2, 'general', 'みんなの場所')
+		 ON CONFLICT (place_id) DO NOTHING`, DefaultGeneralChannelID, DefaultWorkspaceID); err != nil {
+		return fmt.Errorf("ensure default general channel: %w", err)
+	}
+	if err := addDefaultMember(ctx, tx, participant); err != nil {
+		return err
+	}
+	if participant.Kind == KindHuman {
+		rows, err := tx.Query(ctx,
+			`SELECT personality_agent_id FROM agents WHERE human_id = $1 ORDER BY personality_agent_id`,
+			participant.ID)
+		if err != nil {
+			return fmt.Errorf("list Human agents for default workspace: %w", err)
+		}
+		var agents []ParticipantRef
+		for rows.Next() {
+			var agentID string
+			if err := rows.Scan(&agentID); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan Human agent for default workspace: %w", err)
+			}
+			agents = append(agents, PersonalityAgent(agentID))
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate Human agents for default workspace: %w", err)
+		}
+		rows.Close()
+		for _, agent := range agents {
+			if err := addDefaultMember(ctx, tx, agent); err != nil {
+				return err
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit default workspace admission: %w", err)
+	}
+	return nil
+}
+
+func addDefaultMember(ctx context.Context, tx pgx.Tx, participant ParticipantRef) error {
+	_, err := tx.Exec(ctx,
+		`INSERT INTO workspace_members (workspace_id, member_kind, member_id, role)
+		 VALUES ($1, $2, $3, 'member')
+		 ON CONFLICT (workspace_id, member_kind, member_id) WHERE left_at IS NULL
+		 DO NOTHING`, DefaultWorkspaceID, participant.Kind, participant.ID)
+	if err != nil {
+		return fmt.Errorf("admit participant to default workspace: %w", err)
+	}
+	return nil
 }
 
 // Workspace is the Discord-shaped server: channels live directly under it.

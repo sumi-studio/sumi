@@ -171,6 +171,31 @@ type LocalControlServer struct {
 	authorizations          localRuntimeAuthorizationRegistry
 	tokenTTL                time.Duration
 	now                     func() time.Time
+	extensionMu             sync.RWMutex
+	extensions              map[string]LocalAuthorizedHandler
+}
+
+// LocalAuthorizedHandler is an extension mounted on the PAID-bound local
+// control transport. The authorization is derived from the bearer and bound
+// Unix socket, never from request JSON, and its epoch lease is held until the
+// handler returns.
+type LocalAuthorizedHandler func(http.ResponseWriter, *http.Request, LocalRuntimeAuthorization)
+
+// RegisterAuthorizedRoute adds one authenticated local-control extension.
+func (s *LocalControlServer) RegisterAuthorizedRoute(pattern string, handler LocalAuthorizedHandler) error {
+	if s == nil || handler == nil || pattern == "" {
+		return errors.New("local control authorized route is invalid")
+	}
+	s.extensionMu.Lock()
+	defer s.extensionMu.Unlock()
+	if s.extensions == nil {
+		s.extensions = make(map[string]LocalAuthorizedHandler)
+	}
+	if _, exists := s.extensions[pattern]; exists {
+		return errors.New("local control authorized route is already registered")
+	}
+	s.extensions[pattern] = handler
+	return nil
 }
 
 func NewLocalControlServer(
@@ -576,6 +601,19 @@ func (s *LocalControlServer) RegisterRoutes(mux *http.ServeMux) error {
 	}
 	mux.HandleFunc("POST "+LocalCredentialIssuePath, s.handleCredentialIssue)
 	mux.HandleFunc("POST "+LocalRuntimeStatePublishPath, s.handleRuntimeStatePublish)
+	s.extensionMu.RLock()
+	defer s.extensionMu.RUnlock()
+	for pattern, handler := range s.extensions {
+		handler := handler
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			authorization, release, ok := s.authorize(w, r)
+			if !ok {
+				return
+			}
+			defer release()
+			handler(w, r, authorization)
+		})
+	}
 	return nil
 }
 
