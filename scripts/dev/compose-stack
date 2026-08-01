@@ -229,6 +229,8 @@ Usage: scripts/dev/compose-stack [--firebase emulator|real] up|down|config [comp
 
 Starts or stops the full local Sumi stack in Docker Compose:
 Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+Sumi service images are pulled from ghcr.io/sumi-studio; authenticate the
+Compose host first when the packages are private.
 
 Firebase Auth defaults to the integrated emulator. --firebase real selects the
 real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
@@ -385,7 +387,7 @@ fi
 
 case "${ACTION}" in
   up)
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" up --build "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" up "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
     docker compose -p sumi-dev "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
