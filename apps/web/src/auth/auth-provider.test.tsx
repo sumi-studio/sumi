@@ -267,7 +267,7 @@ describe("canonical Human profile", () => {
     expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
   });
 
-  it("does not publish a reconciled profile through a different authority binding", async () => {
+  it("resets private state before publishing a reconciled authority binding", async () => {
     authMocks.getSumiSession
       .mockResolvedValueOnce({
         authenticated: true,
@@ -298,10 +298,110 @@ describe("canonical Human profile", () => {
     );
 
     await waitFor(() => {
-      expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId("display-name")).toHaveTextContent("After");
     });
+    expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
+      authorityBindingB,
+    );
+  });
+
+  it("publishes a replacement authority even when the rename did not commit", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingB,
+        user: { id: "user-a", displayName: "Before" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    authMocks.bindDirectChatAuthority.mockClear();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
+        authorityBindingB,
+      );
+    });
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "authenticated",
+    );
     expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+
+    authMocks.bindDirectChatAuthority.mockClear();
+    authMocks.getSumiSession.mockResolvedValueOnce({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-a", displayName: "Before" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+    await waitFor(() => {
+      expect(authMocks.getSumiSession).toHaveBeenCalledTimes(3);
+    });
     expect(authMocks.bindDirectChatAuthority).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a reconciled authority cannot clear private state", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingB,
+        user: { id: "user-a", displayName: "After" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+    authMocks.bindDirectChatAuthority.mockImplementation((bindingID) => {
+      if (bindingID === authorityBindingB) {
+        throw new Error("private reset failed");
+      }
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    authMocks.clearDirectChatAuthority.mockClear();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unavailable",
+      );
+    });
+    expect(screen.getByTestId("user-id")).toHaveTextContent("none");
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
   });
 
   it("does not let a queued profile update invalidate a later logout", async () => {

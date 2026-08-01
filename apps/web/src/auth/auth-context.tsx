@@ -765,11 +765,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (!isCurrentGeneration(generation)) return;
           if (
             !reconciled.authenticated ||
-            reconciled.user.id !== current.user.id ||
-            reconciled.authorityBindingId !== current.authorityBindingId
+            reconciled.user.id !== current.user.id
           ) {
+            const authorityCleared = clearDirectChatAuthority();
+            serverSession.current = { authenticated: false };
+            setSession({ authenticated: false });
+            setSessionState(
+              !reconciled.authenticated && authorityCleared
+                ? "unauthenticated"
+                : "unavailable",
+            );
             throw new SumiProfileUpdateIndeterminateError(error);
           }
+          if (reconciled.authorityBindingId !== current.authorityBindingId) {
+            try {
+              bindDirectChatAuthority(reconciled.authorityBindingId);
+            } catch (bindingError) {
+              clearDirectChatAuthority();
+              serverSession.current = { authenticated: false };
+              setSession({ authenticated: false });
+              setSessionState("unavailable");
+              throw new SumiProfileUpdateIndeterminateError(
+                new AggregateError(
+                  [error, bindingError],
+                  "Profile reconciliation could not replace browser authority.",
+                ),
+              );
+            }
+          }
+          serverSession.current = reconciled;
+          setSession(reconciled);
+          setSessionState("authenticated");
           if (
             reconciled.user.displayName === null ||
             canonicalizeSumiDisplayName(reconciled.user.displayName) !==
@@ -780,8 +806,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             }
             throw new SumiProfileUpdateIndeterminateError(error);
           }
-          serverSession.current = reconciled;
-          setSession(reconciled);
           return;
         }
         if (!isCurrentGeneration(generation)) return;
