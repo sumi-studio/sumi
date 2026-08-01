@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
+import { hasDisplayMention } from "./mention";
 import { MockMessagingServer } from "./mock-server";
 import type {
   ChannelSummary,
@@ -20,7 +21,7 @@ import type {
 } from "./model";
 import { parsePlaceKey, participantKey, placeKey } from "./model";
 import type { PendingMessage } from "./timeline";
-import { removeMessage, upsertMessage } from "./timeline";
+import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
@@ -42,6 +43,8 @@ interface MessagingState {
   messagesByPlace: Record<PlaceKey, Message[]>;
   pendingByPlace: Record<PlaceKey, PendingMessage[]>;
   lastReadByPlace: Record<PlaceKey, number>;
+  unreadCountByPlace: Record<PlaceKey, number>;
+  mentionCountByPlace: Record<PlaceKey, number>;
   /** placeへ入った時点のlastReadのスナップショット。離れるまで動かさない。 */
   unreadLineByPlace: Record<PlaceKey, number | null>;
   draftByPlace: Record<PlaceKey, string>;
@@ -57,6 +60,7 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
+  loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
   send(content: string, urgency: Urgency): void;
   retrySend(clientNonce: string): void;
@@ -83,11 +87,33 @@ function resolveMentions(
   for (const member of Object.values(members)) {
     const key = participantKey(member.participant);
     if (key === selfKey) continue;
-    if (content.includes(`@${member.displayName}`)) {
+    if (hasDisplayMention(content, member.displayName)) {
       mentions.push(member.participant);
     }
   }
   return mentions;
+}
+
+function unreadContribution(
+  message: Message,
+  lastReadSeq: number,
+  selfKey: ParticipantKey,
+): { unread: number; mentions: number } {
+  if (
+    message.deleted ||
+    message.seq <= lastReadSeq ||
+    participantKey(message.author) === selfKey
+  ) {
+    return { unread: 0, mentions: 0 };
+  }
+  return {
+    unread: 1,
+    mentions:
+      message.urgency !== "fyi" &&
+      message.mentions.some((ref) => participantKey(ref) === selfKey)
+        ? 1
+        : 0,
+  };
 }
 
 let initialized = false;
@@ -107,6 +133,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     ) {
       const key = placeKey(event.message.place);
       set((state) => {
+        const existing = (state.messagesByPlace[key] ?? []).find(
+          (message) => message.messageId === event.message.messageId,
+        );
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
           event.message,
@@ -124,26 +153,77 @@ export const useMessaging = create<MessagingState>((set, get) => {
           authorKey === state.selfKey
             ? Math.max(state.lastReadByPlace[key] ?? 0, event.message.seq)
             : (state.lastReadByPlace[key] ?? 0);
+        const previousContribution = existing
+          ? unreadContribution(existing, lastRead, state.selfKey)
+          : { unread: 0, mentions: 0 };
+        const nextContribution = unreadContribution(
+          event.message,
+          lastRead,
+          state.selfKey,
+        );
         return {
           messagesByPlace: { ...state.messagesByPlace, [key]: messages },
           pendingByPlace: { ...state.pendingByPlace, [key]: pending },
           typingByPlace: { ...state.typingByPlace, [key]: typing },
           lastReadByPlace: { ...state.lastReadByPlace, [key]: lastRead },
+          unreadCountByPlace: {
+            ...state.unreadCountByPlace,
+            [key]: Math.max(
+              0,
+              (state.unreadCountByPlace[key] ?? 0) -
+                previousContribution.unread +
+                nextContribution.unread,
+            ),
+          },
+          mentionCountByPlace: {
+            ...state.mentionCountByPlace,
+            [key]: Math.max(
+              0,
+              (state.mentionCountByPlace[key] ?? 0) -
+                previousContribution.mentions +
+                nextContribution.mentions,
+            ),
+          },
         };
       });
       return;
     }
     if (event.type === "message_deleted") {
-      const key = placeKey(event.place);
-      set((state) => ({
-        messagesByPlace: {
-          ...state.messagesByPlace,
-          [key]: removeMessage(
-            state.messagesByPlace[key] ?? [],
-            event.messageId,
-          ),
-        },
-      }));
+      const key = placeKey(event.message.place);
+      set((state) => {
+        const existing = (state.messagesByPlace[key] ?? []).find(
+          (message) => message.messageId === event.message.messageId,
+        );
+        const previous = existing ?? { ...event.message, deleted: false };
+        const contribution = unreadContribution(
+          previous,
+          state.lastReadByPlace[key] ?? 0,
+          state.selfKey,
+        );
+        return {
+          messagesByPlace: {
+            ...state.messagesByPlace,
+            [key]: upsertMessage(
+              state.messagesByPlace[key] ?? [],
+              event.message,
+            ),
+          },
+          unreadCountByPlace: {
+            ...state.unreadCountByPlace,
+            [key]: Math.max(
+              0,
+              (state.unreadCountByPlace[key] ?? 0) - contribution.unread,
+            ),
+          },
+          mentionCountByPlace: {
+            ...state.mentionCountByPlace,
+            [key]: Math.max(
+              0,
+              (state.mentionCountByPlace[key] ?? 0) - contribution.mentions,
+            ),
+          },
+        };
+      });
       return;
     }
     if (event.type === "typing") {
@@ -200,7 +280,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (get().messagesByPlace[key]) return;
     const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
     set((state) => ({
-      messagesByPlace: { ...state.messagesByPlace, [key]: messages },
+      messagesByPlace: {
+        ...state.messagesByPlace,
+        [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+      },
       hasMoreByPlace: {
         ...state.hasMoreByPlace,
         [key]: messages.length >= PAGE_SIZE,
@@ -217,10 +300,47 @@ export const useMessaging = create<MessagingState>((set, get) => {
       .sendMessage({
         place,
         content: pending.content,
-        mentions: pending.mentions,
         urgency: pending.urgency,
         replyTo: pending.replyTo,
         clientNonce: pending.clientNonce,
+      })
+      .then(async (receipt) => {
+        let confirmed = (get().messagesByPlace[key] ?? []).some(
+          (message) =>
+            message.messageId === receipt.messageId ||
+            message.clientNonce === pending.clientNonce,
+        );
+        if (!confirmed) {
+          // ACKだけ届き、live echoを取りこぼした再送もreceiptのseqから確定する。
+          const messages = await backend.fetchMessages(place, {
+            beforeSeq: receipt.seq + 1,
+            limit: 1,
+          });
+          const committed = messages.find(
+            (message) => message.messageId === receipt.messageId,
+          );
+          if (committed) {
+            set((state) => ({
+              messagesByPlace: {
+                ...state.messagesByPlace,
+                [key]: upsertMessage(
+                  state.messagesByPlace[key] ?? [],
+                  committed,
+                ),
+              },
+            }));
+            confirmed = true;
+          }
+        }
+        if (!confirmed) throw new Error("Committed message was not found");
+        set((state) => ({
+          pendingByPlace: {
+            ...state.pendingByPlace,
+            [key]: (state.pendingByPlace[key] ?? []).filter(
+              (entry) => entry.clientNonce !== pending.clientNonce,
+            ),
+          },
+        }));
       })
       .catch(() => {
         set((state) => ({
@@ -248,6 +368,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     messagesByPlace: {},
     pendingByPlace: {},
     lastReadByPlace: {},
+    unreadCountByPlace: {},
+    mentionCountByPlace: {},
     unreadLineByPlace: {},
     draftByPlace: {},
     typingByPlace: {},
@@ -263,8 +385,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      backend.subscribe(applyEvent);
-      backend.subscribeConnection((state) => set({ connection: state }));
       void backend.bootstrap().then((snapshot) => {
         const membersByKey: Record<ParticipantKey, MemberProfile> = {};
         for (const member of snapshot.members) {
@@ -282,6 +402,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
         for (const marker of snapshot.replyLaterMarkers) {
           replyLaterById[marker.markerId] = marker;
         }
+        const unreadCountByPlace: Record<PlaceKey, number> = {};
+        const mentionCountByPlace: Record<PlaceKey, number> = {};
+        const sinceByPlace: Record<PlaceKey, number> = {};
+        for (const summary of snapshot.unreadSummaries) {
+          const key = placeKey(summary.place);
+          unreadCountByPlace[key] = summary.unreadCount;
+          mentionCountByPlace[key] = summary.mentionCount;
+          sinceByPlace[key] = summary.latestSeq;
+        }
         set({
           ready: true,
           self: snapshot.self,
@@ -292,15 +421,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
           membersByKey,
           statusByKey,
           lastReadByPlace,
+          unreadCountByPlace,
+          mentionCountByPlace,
           replyLaterById,
           employedAgents: snapshot.employedAgents,
         });
+        backend.subscribe(applyEvent, { sinceByPlace });
+        backend.subscribeConnection((state) => set({ connection: state }));
       });
     },
 
     selectPlace(key) {
       const place = parsePlaceKey(key);
       if (!place) return;
+      const state = get();
+      const known =
+        place.kind === "channel"
+          ? state.channels.some(
+              (channel) => channel.channelId === place.channelId,
+            )
+          : state.dms.some(
+              (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
+            );
+      if (!known) return;
       set((state) => ({
         activePlaceKey: key,
         editingMessageId: null,
@@ -311,6 +454,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       void loadPlace(place);
+    },
+
+    async loadPlaceAround(key, seq) {
+      const place = parsePlaceKey(key);
+      if (!place || !Number.isSafeInteger(seq) || seq < 1) return false;
+      if (
+        (get().messagesByPlace[key] ?? []).some(
+          (message) => message.seq === seq,
+        )
+      ) {
+        return true;
+      }
+      const messages = await backend.fetchMessages(place, {
+        beforeSeq: seq + 1,
+        limit: 50,
+      });
+      set((state) => ({
+        messagesByPlace: {
+          ...state.messagesByPlace,
+          [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+        },
+      }));
+      return messages.some((message) => message.seq === seq);
     },
 
     setDraft(key, draft) {
@@ -404,6 +570,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (!place) return;
       set((entry) => ({
         lastReadByPlace: { ...entry.lastReadByPlace, [key]: seq },
+        unreadCountByPlace: {
+          ...entry.unreadCountByPlace,
+          [key]: (entry.messagesByPlace[key] ?? []).filter(
+            (message) =>
+              unreadContribution(message, seq, entry.selfKey).unread > 0,
+          ).length,
+        },
+        mentionCountByPlace: {
+          ...entry.mentionCountByPlace,
+          [key]: (entry.messagesByPlace[key] ?? []).filter(
+            (message) =>
+              unreadContribution(message, seq, entry.selfKey).mentions > 0,
+          ).length,
+        },
       }));
       void backend.markRead(place, seq);
     },

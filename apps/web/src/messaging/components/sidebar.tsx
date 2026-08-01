@@ -1,11 +1,10 @@
 import { useNavigate } from "@tanstack/react-router";
 import { DoorOpen, Hash } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
-import { mentionCount, unreadCount } from "../timeline";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const STATUS_LABEL: Record<StatusKind, string> = {
@@ -70,26 +69,16 @@ export function Sidebar() {
   const dms = useMessaging((state) => state.dms);
   const membersByKey = useMessaging((state) => state.membersByKey);
   const statusByKey = useMessaging((state) => state.statusByKey);
-  const messagesByPlace = useMessaging((state) => state.messagesByPlace);
-  const lastReadByPlace = useMessaging((state) => state.lastReadByPlace);
+  const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
+  const mentionCountByPlace = useMessaging(
+    (state) => state.mentionCountByPlace,
+  );
   const selfKey = useMessaging((state) => state.selfKey);
   const self = useMessaging((state) => state.self);
   const setStatus = useMessaging((state) => state.setStatus);
   const employedAgents = useMessaging((state) => state.employedAgents);
   const navigate = useNavigate();
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
-
-  const counts = useMemo(() => {
-    const byPlace = new Map<PlaceKey, { unread: number; mentions: number }>();
-    for (const [key, messages] of Object.entries(messagesByPlace)) {
-      const lastRead = lastReadByPlace[key] ?? 0;
-      byPlace.set(key, {
-        unread: unreadCount(messages, lastRead, selfKey),
-        mentions: mentionCount(messages, lastRead, selfKey),
-      });
-    }
-    return byPlace;
-  }, [messagesByPlace, lastReadByPlace, selfKey]);
 
   const selfProfile = self ? membersByKey[selfKey] : undefined;
   const selfStatus = statusByKey[selfKey];
@@ -107,15 +96,16 @@ export function Sidebar() {
         </p>
         {channels.map((channel) => {
           const key = `channel:${channel.channelId}`;
-          const count = counts.get(key) ?? { unread: 0, mentions: 0 };
+          const unread = unreadCountByPlace[key] ?? 0;
+          const mentions = mentionCountByPlace[key] ?? 0;
           return (
             <PlaceRow
               key={key}
               placeKey={key}
               label={channel.name}
               icon={<Hash className="size-3.5 shrink-0 opacity-60" />}
-              unread={count.unread}
-              mentions={count.mentions}
+              unread={unread}
+              mentions={mentions}
             />
           );
         })}
@@ -134,7 +124,7 @@ export function Sidebar() {
               (ref) => membersByKey[participantKey(ref)]?.displayName ?? "不明",
             )
             .join("、");
-          const count = counts.get(key) ?? { unread: 0, mentions: 0 };
+          const unread = unreadCountByPlace[key] ?? 0;
           return (
             <PlaceRow
               key={key}
@@ -148,8 +138,8 @@ export function Sidebar() {
                   status={statusByKey[firstKey]?.status}
                 />
               }
-              unread={count.unread}
-              mentions={count.unread}
+              unread={unread}
+              mentions={unread}
             />
           );
         })}

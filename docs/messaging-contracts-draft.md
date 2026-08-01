@@ -88,7 +88,7 @@
 
 - `urgency` は送信時に選ぶメッセージ単位の緊急度（既定 `normal`）。mention・DMの
   通知評価と覚醒トリガの優先度に使う。`fyi` は「返事不要、手すきで見て」の明示。
-- `author` の `kind` は現在 `human | agent` の2値だが、将来 `app`（道具としての
+- `author` の `kind` は現在 `human | personality_agent` の2値だが、将来 `app`（道具としての
   自動装置）を追加できるsum typeとして扱う。consumerは未知のkindをfail-closedで
   無視できること。
 - すべてのメッセージはplace + seqでpermalinkを持ち、引用共有とジャンプに使う。
@@ -124,6 +124,10 @@
 - 送信とlive配信は既存方針どおりWS経由（TTFT < 500ms、[screen-composition.md](screen-composition.md) の設計制約）。
   messagingは別endpoint（REST: `/messaging/…`、WS: `/messaging/ws` 1本で全Workspace/placeをmultiplex）。
   `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
+- bootstrap/place一覧は各placeの `latest_seq`、未読数、mention未読数を返す。履歴を
+  lazy loadしていても、未訪問placeのバッジを欠落させないための投影である。
+- 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして
+  受け取らない。サーバーがadmission時のmembershipからMessageのmentionsを構成する。
 - WS event（durable、place-seq付き）: `message_created`, `message_edited`,
   `message_deleted`, `read_marker_updated`, `membership_changed`,
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,

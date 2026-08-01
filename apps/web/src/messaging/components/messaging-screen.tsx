@@ -37,10 +37,10 @@ function TypingIndicator() {
   );
 
   useEffect(() => {
-    if (Object.keys(entries).length === 0) return;
+    if (active.length === 0) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [entries]);
+  }, [active.length]);
 
   const names = active
     .map(([key]) => membersByKey[key]?.displayName ?? "誰か")
@@ -62,7 +62,7 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const selfKey = useMessaging((state) => state.selfKey);
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [open, setOpen] = useState(false);
-  const now = Date.now();
+  const [now, setNow] = useState(() => Date.now());
 
   const markers = useMemo(
     () =>
@@ -75,6 +75,12 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
     [replyLaterById, selfKey],
   );
   const dueCount = markers.filter((marker) => marker.remindAt <= now).length;
+
+  useEffect(() => {
+    if (markers.length === 0) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [markers.length]);
 
   return (
     <div className="relative">
@@ -234,10 +240,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
   const placeNavigate = usePlaceNavigate();
+  const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
   const display = usePlaceDisplay(activePlaceKey);
-  const lastReadByPlace = useMessaging((state) => state.lastReadByPlace);
-  const selfKey = useMessaging((state) => state.selfKey);
+  const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
+  const mentionCountByPlace = useMessaging(
+    (state) => state.mentionCountByPlace,
+  );
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
@@ -255,36 +264,27 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   useEffect(() => {
     let unread = 0;
-    for (const [key, messages] of Object.entries(messagesByPlace)) {
-      const lastRead = lastReadByPlace[key] ?? 0;
-      for (const message of messages) {
-        if (message.seq <= lastRead || message.deleted) continue;
-        if (participantKey(message.author) === selfKey) continue;
-        const mentionsSelf = message.mentions.some(
-          (ref) => participantKey(ref) === selfKey,
-        );
-        if (
-          mentionsSelf ||
-          key.startsWith("dm:") ||
-          key.startsWith("group_dm:")
-        ) {
-          unread += 1;
-        }
-      }
+    for (const [key, count] of Object.entries(unreadCountByPlace)) {
+      unread +=
+        key.startsWith("dm:") || key.startsWith("group_dm:")
+          ? count
+          : (mentionCountByPlace[key] ?? 0);
     }
     document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
-  }, [messagesByPlace, lastReadByPlace, selfKey]);
+  }, [unreadCountByPlace, mentionCountByPlace]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {
     if (!ready || !placeKey) return;
     const params = new URLSearchParams(window.location.search);
-    const seq = params.get("m");
-    if (seq) {
-      setPendingJump({ placeKey, seq: Number(seq) });
+    const rawSeq = params.get("m");
+    const seq = rawSeq === null ? null : Number(rawSeq);
+    if (seq !== null && Number.isSafeInteger(seq) && seq > 0) {
+      setPendingJump({ placeKey, seq });
+      void loadPlaceAround(placeKey, seq);
       window.history.replaceState(null, "", window.location.pathname);
     }
-  }, [ready, placeKey]);
+  }, [ready, placeKey, loadPlaceAround]);
 
   const requestJump = useCallback(
     (jump: PendingJump) => {
@@ -300,6 +300,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     if (activePlaceKey !== pendingJump.placeKey) return;
     const messages = messagesByPlace[pendingJump.placeKey];
     if (!messages) return;
+    const targetAvailable = pendingJump.messageId
+      ? messages.some((message) => message.messageId === pendingJump.messageId)
+      : pendingJump.seq !== undefined
+        ? messages.some((message) => message.seq === pendingJump.seq)
+        : false;
+    if (!targetAvailable) return;
     const frame = window.requestAnimationFrame(() => {
       if (pendingJump.messageId) {
         listRef.current?.jumpToMessage(pendingJump.messageId);
