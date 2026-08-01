@@ -14,15 +14,23 @@ async function source(path) {
 }
 
 test("Compose pulls published Sumi images from GHCR", async () => {
-  const [local, realFirebase, agent, firebase, composeLauncher, supervisor] =
-    await Promise.all([
-      source("deploy/local/compose.dev.yaml"),
-      source("deploy/local/compose.real-firebase.yaml"),
-      source("deploy/agent/compose.yaml"),
-      source("deploy/firebase/compose.yaml"),
-      source("scripts/dev/compose-stack"),
-      source("deploy/agent/supervisor"),
-    ]);
+  const [
+    local,
+    realFirebase,
+    agent,
+    firebase,
+    composeLauncher,
+    supervisor,
+    firebaseCheck,
+  ] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("deploy/local/compose.real-firebase.yaml"),
+    source("deploy/agent/compose.yaml"),
+    source("deploy/firebase/compose.yaml"),
+    source("scripts/dev/compose-stack"),
+    source("deploy/agent/supervisor"),
+    source("scripts/dev/firebase-auth-emulator-check"),
+  ]);
 
   for (const compose of [local, realFirebase, agent, firebase]) {
     assert.doesNotMatch(compose, /^\s+build:/m);
@@ -42,6 +50,9 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   assert.match(firebase, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
   assert.doesNotMatch(composeLauncher, /--build/);
   assert.doesNotMatch(supervisor, /--build/);
+  assert.match(firebaseCheck, /docker build/);
+  assert.match(firebaseCheck, /local-check-/);
+  assert.match(firebaseCheck, /up --detach --pull never/);
 });
 
 test("Compose gives runtime only the logical executor workspace address", async () => {
