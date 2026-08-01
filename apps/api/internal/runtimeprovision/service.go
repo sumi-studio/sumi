@@ -1,0 +1,244 @@
+package runtimeprovision
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+)
+
+var ErrConflict = errors.New("runtime provision state conflict")
+
+// Service serializes every lifecycle transition for one PAID and makes
+// retries idempotent before delegating to the machine backend.
+type Service struct {
+	backend Backend
+	mu      sync.Mutex
+	entries map[string]*serviceEntry
+}
+
+type serviceEntry struct {
+	mu             sync.Mutex
+	known          bool
+	phase          Phase
+	epoch          PreparedEpoch
+	idempotencyKey string
+	stopped        bool
+}
+
+func NewService(backend Backend) (*Service, error) {
+	if backend == nil {
+		return nil, errors.New("runtime provision service requires a backend")
+	}
+	return &Service{backend: backend, entries: make(map[string]*serviceEntry)}, nil
+}
+
+func (service *Service) entry(personalityAgentID string) *serviceEntry {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	entry := service.entries[personalityAgentID]
+	if entry == nil {
+		entry = &serviceEntry{}
+		service.entries[personalityAgentID] = entry
+	}
+	return entry
+}
+
+func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (PreparedEpoch, error) {
+	if err := request.Validate(); err != nil {
+		return PreparedEpoch{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	if entry.known && (entry.phase == PhasePrepared || entry.phase == PhaseActive) {
+		if entry.idempotencyKey != "" && entry.idempotencyKey != request.IdempotencyKey {
+			return PreparedEpoch{}, fmt.Errorf("%w: personality agent already has a live prepared epoch", ErrConflict)
+		}
+		return entry.epoch, nil
+	}
+
+	// Recover a prepare that committed in the backend before a daemon response
+	// was delivered. This check is what prevents a daemon restart or cancelled
+	// client from allocating the next generation on retry.
+	inspection, err := service.backend.Inspect(ctx, request.PersonalityAgentID)
+	if err != nil {
+		return PreparedEpoch{}, fmt.Errorf("inspect before prepare: %w", err)
+	}
+	if err := inspection.Validate(); err != nil {
+		return PreparedEpoch{}, fmt.Errorf("backend returned invalid inspection: %w", err)
+	}
+	if inspection.Phase == PhasePrepared || inspection.Phase == PhaseActive {
+		entry.known = true
+		entry.phase = inspection.Phase
+		entry.epoch = *inspection.Epoch
+		entry.idempotencyKey = request.IdempotencyKey
+		entry.stopped = false
+		return entry.epoch, nil
+	}
+
+	epoch, err := service.backend.Prepare(ctx, request)
+	if err != nil {
+		return PreparedEpoch{}, err
+	}
+	if err := epoch.Validate(); err != nil {
+		return PreparedEpoch{}, fmt.Errorf("backend returned invalid prepared epoch: %w", err)
+	}
+	if epoch.PersonalityAgentID != request.PersonalityAgentID {
+		return PreparedEpoch{}, errors.New("backend prepared a different personality agent")
+	}
+	entry.known = true
+	entry.phase = PhasePrepared
+	entry.epoch = epoch
+	entry.idempotencyKey = request.IdempotencyKey
+	entry.stopped = false
+	return epoch, nil
+}
+
+func (service *Service) Activate(ctx context.Context, request ActivateRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
+		return Inspection{}, err
+	}
+	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
+		return Inspection{}, fmt.Errorf("%w: activate does not match the prepared epoch", ErrConflict)
+	}
+	if entry.phase == PhaseActive {
+		return inspectionOf(entry), nil
+	}
+	if err := service.backend.Activate(ctx, request); err != nil {
+		return Inspection{}, err
+	}
+	entry.phase = PhaseActive
+	entry.stopped = false
+	return inspectionOf(entry), nil
+}
+
+func (service *Service) Abort(ctx context.Context, request AbortRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.known && entry.phase == PhaseUnknown && entry.epoch == request.PreparedEpoch {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
+	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
+		return Inspection{}, err
+	}
+	if entry.known && entry.phase == PhaseUnknown {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
+	if !entry.known || entry.phase == PhaseUnknown || entry.epoch != request.PreparedEpoch {
+		return Inspection{}, fmt.Errorf("%w: abort does not match the prepared epoch", ErrConflict)
+	}
+	if err := service.backend.Abort(ctx, entry.epoch); err != nil {
+		return Inspection{}, err
+	}
+	entry.phase = PhaseUnknown
+	entry.stopped = false
+	return unknownInspection(request.PersonalityAgentID), nil
+}
+
+func (service *Service) Inspect(ctx context.Context, request InspectRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	inspection, err := service.backend.Inspect(ctx, request.PersonalityAgentID)
+	if err != nil {
+		return Inspection{}, err
+	}
+	if err := inspection.Validate(); err != nil {
+		return Inspection{}, fmt.Errorf("backend returned invalid inspection: %w", err)
+	}
+	entry.setInspection(inspection)
+	return inspection, nil
+}
+
+func (service *Service) Stop(ctx context.Context, request StopRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.known && entry.phase == PhaseUnknown && entry.epoch == request.PreparedEpoch {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
+	if err := service.hydrateEntry(ctx, request.PersonalityAgentID, entry); err != nil {
+		return Inspection{}, err
+	}
+	if entry.known && entry.phase == PhaseUnknown {
+		return unknownInspection(request.PersonalityAgentID), nil
+	}
+	if !entry.known || entry.phase != PhaseActive || entry.epoch != request.PreparedEpoch {
+		return Inspection{}, fmt.Errorf("%w: stop does not match the active epoch", ErrConflict)
+	}
+	if err := service.backend.Stop(ctx, entry.epoch); err != nil {
+		return Inspection{}, err
+	}
+	entry.phase = PhaseUnknown
+	entry.stopped = true
+	return unknownInspection(request.PersonalityAgentID), nil
+}
+
+func (service *Service) Reconcile(ctx context.Context, request ReconcileRequest) (Inspection, error) {
+	if err := request.Validate(); err != nil {
+		return Inspection{}, err
+	}
+	entry := service.entry(request.PersonalityAgentID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	inspection, err := service.backend.Reconcile(ctx, request.PersonalityAgentID)
+	if err != nil {
+		return Inspection{}, err
+	}
+	if err := inspection.Validate(); err != nil {
+		return Inspection{}, fmt.Errorf("backend returned invalid reconciliation: %w", err)
+	}
+	entry.setInspection(inspection)
+	return inspection, nil
+}
+
+func (service *Service) hydrateEntry(ctx context.Context, personalityAgentID string, entry *serviceEntry) error {
+	if entry.known {
+		return nil
+	}
+	inspection, err := service.backend.Inspect(ctx, personalityAgentID)
+	if err != nil {
+		return err
+	}
+	if err := inspection.Validate(); err != nil {
+		return fmt.Errorf("backend returned invalid inspection: %w", err)
+	}
+	entry.setInspection(inspection)
+	return nil
+}
+
+func (entry *serviceEntry) setInspection(inspection Inspection) {
+	entry.known = true
+	entry.phase = inspection.Phase
+	entry.stopped = inspection.Phase == PhaseUnknown
+	if inspection.Epoch != nil {
+		entry.epoch = *inspection.Epoch
+	}
+}
+
+func inspectionOf(entry *serviceEntry) Inspection {
+	epoch := entry.epoch
+	return Inspection{PersonalityAgentID: epoch.PersonalityAgentID, Phase: entry.phase, Epoch: &epoch}
+}
+
+func unknownInspection(personalityAgentID string) Inspection {
+	return Inspection{PersonalityAgentID: personalityAgentID, Phase: PhaseUnknown}
+}

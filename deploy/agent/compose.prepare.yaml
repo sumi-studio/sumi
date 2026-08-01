@@ -1,0 +1,66 @@
+# Prepare-only Compose graph. It has no runtime/executor/broker services and no
+# activation credentials, so allocating an epoch cannot accidentally start a
+# personality agent's private PC processes.
+services:
+  allocator:
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
+    user: "0:0"
+    command: [allocator]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
+    environment:
+      SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
+      SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
+      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator-root/state
+      SUMI_IDENTITY_OUTPUT_ROOT: /var/lib/sumi-allocator-root/identity-output
+      SUMI_RUNTIME_IDENTITY_GID: "10001"
+      SUMI_EXECUTOR_IDENTITY_GID: "10002"
+      SUMI_BROKER_IDENTITY_GID: "10003"
+    volumes:
+      - allocator-root:/var/lib/sumi-allocator-root
+      - allocator-state:/var/lib/sumi-allocator-root/state
+      - runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
+      - executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
+      - broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
+
+  prepare:
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
+    user: "0:0"
+    command: [prepare]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, FSETID]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
+    depends_on:
+      allocator:
+        condition: service_completed_successfully
+    volumes:
+      - state:/var/lib/sumi
+      - workspace:/workspace
+      - artifacts:/var/lib/sumi-artifacts
+      - executor-ipc:/run/sumi/executor
+      - broker-ipc:/run/sumi/broker
+
+volumes:
+  allocator-root: {}
+  allocator-state: {}
+  state: {}
+  workspace: {}
+  artifacts: {}
+  runtime-identity: {}
+  executor-identity: {}
+  broker-identity: {}
+  executor-ipc: {}
+  broker-ipc: {}

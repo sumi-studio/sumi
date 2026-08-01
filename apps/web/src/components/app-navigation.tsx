@@ -24,6 +24,7 @@ import {
 import type { ComponentType, ReactElement } from "react";
 import { useState } from "react";
 import { useAuth } from "../auth/auth-context";
+import { ProviderSettings } from "../auth/provider-settings";
 import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
@@ -117,6 +118,7 @@ function SettingsPopover() {
                 {user?.displayName ?? user?.email ?? user?.id ?? "アカウント"}
               </span>
             </div>
+            <ProviderSettings humanId={user?.id ?? ""} />
             <Button
               variant="ghost"
               onClick={() => void handleLogout()}

@@ -1041,6 +1041,10 @@ where
                 Err(SupervisorError::AuthRejected) => {
                     auth_attempt = auth_attempt.saturating_add(1);
                     reconnect_attempt = 0;
+                    tracing::warn!(
+                        attempt = auth_attempt,
+                        "gateway authentication was rejected; retrying with a fresh credential"
+                    );
                     let max = self
                         .config
                         .max_auth_attempts
@@ -1056,6 +1060,11 @@ where
                 }
                 Err(SupervisorError::Reconnect { reason }) => {
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tracing::warn!(
+                        attempt = reconnect_attempt,
+                        reason = %reason,
+                        "gateway connection attempt failed; reconnecting"
+                    );
                     if let Some(max) = self.config.max_reconnect_attempts
                         && reconnect_attempt >= max
                     {
@@ -1082,6 +1091,12 @@ where
                             return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
                         }
                     }
+                    tracing::warn!(
+                        attempt = reconnect_attempt,
+                        healthy,
+                        reason = %reason,
+                        "established gateway epoch ended; reconnecting"
+                    );
                     tokio::select! {
                         biased;
                         _ = self.cancel.cancelled() => return Ok(()),

@@ -4,8 +4,17 @@ import { useAuth } from "./auth-context";
 import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
-  const { canUseDirectChat, loading, sessionState, refreshSession } = useAuth();
+  const {
+    canUseDirectChat,
+    emailLinkCallbackPending,
+    loading,
+    sessionState,
+    refreshSession,
+  } = useAuth();
 
+  if (emailLinkCallbackPending) {
+    return <LoginScreen />;
+  }
   if (canUseDirectChat) {
     return children;
   }

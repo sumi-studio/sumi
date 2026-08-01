@@ -22,6 +22,7 @@ func NewProductionMux(
 	sv UserSessionAuthorizer,
 	agentOrigins,
 	browserOrigins []string,
+	authorizer DirectChatAuthorizer,
 ) (*http.ServeMux, *BrowserServer, *Server, error) {
 	mux := http.NewServeMux()
 
@@ -39,10 +40,13 @@ func NewProductionMux(
 		return nil, nil, nil, fmt.Errorf("user command ingress: %w", err)
 	}
 	ingress.AllowedOrigins = browserOrigins
+	ingress.Authorizer = authorizer
 	mux.Handle("POST /direct-chat/commands", ingress)
 
 	browser := NewBrowserServer(sv, runtime, runtime)
+	browser.commandIngress = ingress
 	browser.AllowedOrigins = browserOrigins
+	browser.Authorizer = authorizer
 	mux.Handle("GET /direct-chat/ws", browser)
 
 	return mux, browser, agent, nil

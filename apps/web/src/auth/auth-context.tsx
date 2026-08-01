@@ -3,6 +3,7 @@ import {
   GithubAuthProvider,
   GoogleAuthProvider,
   getIdToken,
+  onAuthStateChanged,
   signInWithPopup,
   signOut,
 } from "firebase/auth";
@@ -21,16 +22,36 @@ import {
   bindDirectChatAuthority,
   clearDirectChatAuthority,
 } from "../agent/auth-authority";
+import {
+  clearPendingConfirmation,
+  loadPendingConfirmation,
+  type PendingAuthConfirmation,
+  savePendingConfirmation,
+} from "./auth-confirmation-state";
+import {
+  type AuthFlowProvider,
+  type AuthIntent,
+  confirmAuthFlow,
+  createAuthFlowNonce,
+  resolveAuthFlow,
+  startAuthFlow,
+} from "./auth-flow-client";
+import {
+  beginEmailLinkAuth,
+  completeEmailLinkAuth,
+  hasEmailLinkCallback,
+  rejectEmailLinkAuth,
+} from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
   AuthAPIError,
-  establishSumiSession,
   getSumiSession,
   logoutSumiSession,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
   type SumiSessionStatus,
+  verifyCommittedSumiSession,
 } from "./session-client";
 
 export type SignInProvider = "google" | "github";
@@ -98,7 +119,14 @@ interface AuthContextValue {
   authenticated: boolean;
   canUseDirectChat: boolean;
   user: AuthUser | null;
-  signIn: (provider: SignInProvider) => Promise<void>;
+  confirmation: PendingAuthConfirmation | null;
+  emailLinkCallbackPending: boolean;
+  signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
+  sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
+  completeEmailLink: () => Promise<void>;
+  rejectEmailLink: () => void;
+  confirmIntentTransition: () => Promise<void>;
+  cancelIntentTransition: () => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -115,6 +143,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       : authOriginAllowed
         ? "checking"
         : "unavailable",
+  );
+  const [confirmation, setConfirmation] =
+    useState<PendingAuthConfirmation | null>(() => loadPendingConfirmation());
+  const [emailLinkCallbackPending, setEmailLinkCallbackPending] = useState(() =>
+    hasEmailLinkCallback(),
   );
   // Every state-changing auth operation claims a generation. Late session
   // reads must never re-authorize the chat after logout has started.
@@ -178,6 +211,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         : "unauthenticated";
       flushSync(() => {
         if (nextSession.authenticated) {
+          clearPendingConfirmation();
+          setConfirmation(null);
           bindDirectChatAuthority(nextSession.authorityBindingId);
         } else if (!clearDirectChatAuthority()) {
           nextState = "unavailable";
@@ -199,24 +234,82 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void refreshSession();
   }, [refreshSession]);
 
+  useEffect(() => {
+    if (!confirmation || preissuedSessionMode || !authOriginAllowed) return;
+    let unsubscribe: () => void = () => undefined;
+    try {
+      unsubscribe = onAuthStateChanged(getFirebaseAuth(), (firebaseUser) => {
+        if (firebaseUser?.uid === confirmation.firebaseUID) return;
+        nextGeneration();
+        clearPendingConfirmation();
+        setConfirmation(null);
+      });
+    } catch {
+      clearPendingConfirmation();
+      setConfirmation(null);
+    }
+    return unsubscribe;
+  }, [confirmation, nextGeneration]);
+
   const signIn = useCallback(
-    async (providerName: SignInProvider) => {
+    async (providerName: SignInProvider, intent: AuthIntent) => {
       if (preissuedSessionMode || !authOriginAllowed) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
       }
       const generation = nextGeneration();
       const auth = getFirebaseAuth();
       const provider = createProvider(providerName);
+      const flowProvider = authFlowProvider(providerName);
+      const nonce = createAuthFlowNonce();
       let firebaseSignInCompleted = false;
+      let confirmationRequired = false;
       signInPending.current = true;
+      let popup: ReturnType<typeof signInWithPopup> | null = null;
       try {
-        const result = await signInWithPopup(auth, provider);
+        // Firebase documents that popup auth may be blocked when invoked outside
+        // a click handler. Invoke it before the first await, while starting the
+        // persisted Sumi flow concurrently; proof resolution still waits for both.
+        popup = signInWithPopup(auth, provider);
+        const [started, result] = await Promise.all([
+          startAuthFlow({
+            intent,
+            provider: flowProvider,
+            continuation: "/",
+            nonce,
+          }),
+          popup,
+        ]);
         firebaseSignInCompleted = true;
+        if (!isCurrentGeneration(generation)) {
+          await signOut(auth).catch(() => undefined);
+          return;
+        }
         await serializeSessionMutation(async () => {
           if (!isCurrentGeneration(generation)) return;
           const idToken = await getIdToken(result.user, true);
           if (!isCurrentGeneration(generation)) return;
-          const nextSession = await establishSumiSession(idToken);
+          const resolved = await resolveAuthFlow({
+            flowId: started.flowId,
+            nonce,
+            idToken,
+          });
+          if (resolved.outcome === "confirmation_required") {
+            const pending: PendingAuthConfirmation = {
+              flowId: resolved.flowId,
+              nonce,
+              intent,
+              provider: flowProvider,
+              expiresAt: resolved.expiresAt,
+              action: resolved.nextAction,
+              firebaseUID: result.user.uid,
+              account: firebaseAccount(result.user),
+            };
+            savePendingConfirmation(pending);
+            confirmationRequired = true;
+            if (isCurrentGeneration(generation)) setConfirmation(pending);
+            return;
+          }
+          const nextSession = await verifyCommittedSumiSession();
           // The HttpOnly authority changed even if logout claimed the UI
           // generation while this serialized exchange was in flight.
           flushSync(() => {
@@ -227,12 +320,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setSessionState("authenticated");
           });
         });
-        if (!isCurrentGeneration(generation)) {
+        if (!isCurrentGeneration(generation) && !confirmationRequired) {
           // A logout that began while the provider popup was open owns the
           // terminal Firebase state as well as the server cookie.
           await signOut(auth).catch(() => undefined);
         }
       } catch (error) {
+        if (!firebaseSignInCompleted && popup) {
+          const popupResult = await popup.catch(() => null);
+          firebaseSignInCompleted = popupResult !== null;
+        }
         if (
           (error instanceof SumiSessionCompensatedError ||
             error instanceof SumiSessionCompensationFailedError) &&
@@ -252,7 +349,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         // A Firebase account is display state, not Sumi authorization. Do not
         // retain it when the server-owned identity binding/exchange failed.
-        if (firebaseSignInCompleted) {
+        if (firebaseSignInCompleted && !confirmationRequired) {
           await signOut(auth).catch(() => undefined);
         }
         throw error;
@@ -262,6 +359,174 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     },
     [isCurrentGeneration, nextGeneration, serializeSessionMutation],
   );
+
+  const sendEmailLink = useCallback(
+    async (email: string, intent: AuthIntent) => {
+      if (preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError("Authentication is unavailable.", 0);
+      }
+      nextGeneration();
+      signInPending.current = true;
+      try {
+        await beginEmailLinkAuth(email, intent);
+      } finally {
+        signInPending.current = false;
+      }
+    },
+    [nextGeneration],
+  );
+
+  const completeEmailLink = useCallback(async () => {
+    if (preissuedSessionMode || !authOriginAllowed) {
+      throw new AuthAPIError("Authentication is unavailable.", 0);
+    }
+    const generation = nextGeneration();
+    signInPending.current = true;
+    try {
+      const completed = await completeEmailLinkAuth();
+      await serializeSessionMutation(async () => {
+        if (!isCurrentGeneration(generation)) return;
+        if (completed.result.outcome === "confirmation_required") {
+          const pending: PendingAuthConfirmation = {
+            flowId: completed.result.flowId,
+            nonce: completed.flow.nonce,
+            intent: completed.flow.intent,
+            provider: "email_link",
+            expiresAt: completed.result.expiresAt,
+            action: completed.result.nextAction,
+            firebaseUID: completed.firebaseUser.uid,
+            account: {
+              displayName: completed.firebaseUser.displayName,
+              email: completed.firebaseUser.email,
+            },
+          };
+          savePendingConfirmation(pending);
+          setConfirmation(pending);
+          setEmailLinkCallbackPending(false);
+          return;
+        }
+        const nextSession = await verifyCommittedSumiSession();
+        flushSync(() => {
+          bindDirectChatAuthority(nextSession.authorityBindingId);
+          serverSession.current = nextSession;
+          if (!isCurrentGeneration(generation)) return;
+          setSession(nextSession);
+          setSessionState("authenticated");
+          setEmailLinkCallbackPending(false);
+        });
+      });
+    } catch (error) {
+      await signOutFirebaseBestEffort();
+      throw error;
+    } finally {
+      signInPending.current = false;
+    }
+  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
+
+  const rejectEmailLink = useCallback(() => {
+    rejectEmailLinkAuth();
+    setEmailLinkCallbackPending(false);
+  }, []);
+
+  const confirmIntentTransition = useCallback(async () => {
+    const pending = confirmation;
+    if (!pending || preissuedSessionMode || !authOriginAllowed) {
+      throw new AuthAPIError("Authentication confirmation is unavailable.", 0);
+    }
+    const generation = nextGeneration();
+    await serializeSessionMutation(async () => {
+      const auth = getFirebaseAuth();
+      await auth.authStateReady();
+      const firebaseUser = auth.currentUser;
+      if (!firebaseUser || firebaseUser.uid !== pending.firebaseUID) {
+        clearPendingConfirmation();
+        setConfirmation(null);
+        throw new AuthAPIError(
+          "Firebase account changed before confirmation.",
+          0,
+        );
+      }
+      const idToken = await getIdToken(firebaseUser, true);
+      const refreshed = await resolveAuthFlow({
+        flowId: pending.flowId,
+        nonce: pending.nonce,
+        idToken,
+      });
+      if (
+        refreshed.outcome !== "confirmation_required" ||
+        refreshed.nextAction !== pending.action ||
+        auth.currentUser?.uid !== pending.firebaseUID
+      ) {
+        clearPendingConfirmation();
+        setConfirmation(null);
+        throw new AuthAPIError(
+          "Authentication confirmation is no longer valid.",
+          0,
+        );
+      }
+      await confirmAuthFlow({
+        flowId: pending.flowId,
+        nonce: pending.nonce,
+        action: pending.action,
+      });
+      if (
+        !isCurrentGeneration(generation) ||
+        auth.currentUser?.uid !== pending.firebaseUID
+      ) {
+        const identityError = new AuthAPIError(
+          "Firebase account changed during confirmation.",
+          0,
+        );
+        try {
+          await logoutSumiSession();
+        } catch (logoutError) {
+          flushSync(() => {
+            clearDirectChatAuthority();
+            serverSession.current = { authenticated: false };
+            clearPendingConfirmation();
+            setConfirmation(null);
+            setSession({ authenticated: false });
+            setSessionState("unavailable");
+          });
+          throw new SumiSessionCompensationFailedError(
+            identityError,
+            logoutError,
+          );
+        }
+        flushSync(() => {
+          const authorityCleared = clearDirectChatAuthority();
+          serverSession.current = { authenticated: false };
+          clearPendingConfirmation();
+          setConfirmation(null);
+          setSession({ authenticated: false });
+          setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
+        });
+        throw new SumiSessionCompensatedError(identityError);
+      }
+      const nextSession = await verifyCommittedSumiSession();
+      flushSync(() => {
+        bindDirectChatAuthority(nextSession.authorityBindingId);
+        serverSession.current = nextSession;
+        clearPendingConfirmation();
+        setConfirmation(null);
+        if (!isCurrentGeneration(generation)) return;
+        setSession(nextSession);
+        setSessionState("authenticated");
+      });
+    });
+  }, [
+    confirmation,
+    isCurrentGeneration,
+    nextGeneration,
+    serializeSessionMutation,
+  ]);
+
+  const cancelIntentTransition = useCallback(async () => {
+    nextGeneration();
+    clearPendingConfirmation();
+    setConfirmation(null);
+    await signOutFirebaseBestEffort();
+  }, [nextGeneration]);
 
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
@@ -323,11 +588,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       canUseDirectChat:
         sessionState === "authenticated" || sessionState === "preissued",
       user,
+      confirmation,
+      emailLinkCallbackPending,
       signIn,
+      sendEmailLink,
+      completeEmailLink,
+      rejectEmailLink,
+      confirmIntentTransition,
+      cancelIntentTransition,
       logout,
       refreshSession,
     }),
-    [logout, refreshSession, session.authenticated, sessionState, signIn, user],
+    [
+      cancelIntentTransition,
+      confirmation,
+      completeEmailLink,
+      confirmIntentTransition,
+      logout,
+      emailLinkCallbackPending,
+      rejectEmailLink,
+      refreshSession,
+      session.authenticated,
+      sessionState,
+      sendEmailLink,
+      signIn,
+      user,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -357,6 +643,17 @@ function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
   return provider;
+}
+
+function authFlowProvider(providerName: SignInProvider): AuthFlowProvider {
+  return providerName === "github" ? "github.com" : "google.com";
+}
+
+function firebaseAccount(user: {
+  displayName: string | null;
+  email: string | null;
+}): PendingAuthConfirmation["account"] {
+  return { displayName: user.displayName, email: user.email };
 }
 
 async function signOutFirebaseBestEffort(): Promise<void> {

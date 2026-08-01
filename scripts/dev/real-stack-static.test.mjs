@@ -13,6 +13,103 @@ async function source(path) {
   return readFile(resolve(repositoryRoot, path), "utf8");
 }
 
+test("Compose pulls published Sumi images from GHCR", async () => {
+  const [
+    local,
+    realFirebase,
+    agent,
+    agentPrepare,
+    firebase,
+    composeLauncher,
+    supervisor,
+    firebaseCheck,
+  ] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("deploy/local/compose.real-firebase.yaml"),
+    source("deploy/agent/compose.yaml"),
+    source("deploy/agent/compose.prepare.yaml"),
+    source("deploy/firebase/compose.yaml"),
+    source("scripts/dev/compose-stack"),
+    source("deploy/agent/supervisor"),
+    source("scripts/dev/firebase-auth-emulator-check"),
+  ]);
+
+  for (const compose of [local, realFirebase, agent, agentPrepare, firebase]) {
+    assert.doesNotMatch(compose, /^\s+build:/m);
+    const ghcrImages =
+      compose.match(/^\s+image: ghcr\.io\/sumi-studio\//gm) ?? [];
+    const alwaysPulls = compose.match(/^\s+pull_policy: always$/gm) ?? [];
+    assert.ok(ghcrImages.length > 0);
+    assert.equal(alwaysPulls.length, ghcrImages.length);
+  }
+
+  assert.match(local, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
+  assert.match(
+    local,
+    /sumi-provisioner:\$\{SUMI_PROVISIONER_IMAGE_TAG:-latest\}/,
+  );
+  assert.match(local, /sumi-web:\$\{SUMI_WEB_IMAGE_TAG:-latest\}/);
+  assert.match(local, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
+  assert.match(realFirebase, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
+  assert.match(agent, /sumi-agent:\$\{SUMI_AGENT_IMAGE_TAG:-latest\}/);
+  assert.match(firebase, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
+  assert.doesNotMatch(composeLauncher, /--build/);
+  assert.doesNotMatch(supervisor, /--build/);
+  assert.match(firebaseCheck, /docker build/);
+  assert.match(firebaseCheck, /local-check-/);
+  assert.match(firebaseCheck, /up --detach --pull never/);
+});
+
+test("runtime provisioner receives a file-scoped Docker config", async () => {
+  const [local, provisionerDockerfile] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("deploy/provisioner/Dockerfile"),
+  ]);
+  const provisioner = local.slice(
+    local.indexOf("  runtime-provisioner:"),
+    local.indexOf("\n  web:"),
+  );
+
+  assert.match(provisioner, /DOCKER_CONFIG: \/run\/sumi\/docker-config/);
+  assert.match(
+    provisioner,
+    /source: \$\{SUMI_DOCKER_CONFIG_FILE:\?SUMI_DOCKER_CONFIG_FILE is required\}/,
+  );
+  assert.match(
+    provisioner,
+    /target: \/run\/sumi\/docker-config\/config\.json/,
+  );
+  assert.match(provisioner, /read_only: true/);
+  assert.match(provisioner, /create_host_path: false/);
+  assert.doesNotMatch(provisioner, /\/root\/\.docker/);
+  assert.match(provisionerDockerfile, /install -d -m 0700 \/run\/sumi\/docker-config/);
+});
+
+test("Jenkins rebuilds the provisioner for every source tree embedded in it", async () => {
+  const [jenkinsfile, provisionerDockerfile] = await Promise.all([
+    source("Jenkinsfile"),
+    source("deploy/provisioner/Dockerfile"),
+  ]);
+
+  assert.match(provisionerDockerfile, /COPY apps\/api\/ \.\//);
+  assert.match(
+    provisionerDockerfile,
+    /COPY --from=build \/usr\/local\/bin\/sumi-runtime-provisioner/,
+  );
+  assert.match(
+    provisionerDockerfile,
+    /\/opt\/sumi\/deploy\/agent\/supervisor/,
+  );
+  assert.match(
+    jenkinsfile,
+    /provisioner:\s*\['apps\/api', 'deploy\/agent'\]/,
+  );
+  assert.match(
+    jenkinsfile,
+    /watchedDirs\.addAll\(extraWatchedDirsByImage\[name\] \?: \[\]\)/,
+  );
+});
+
 test("Compose gives runtime only the logical executor workspace address", async () => {
   const [compose, entrypoint] = await Promise.all([
     source("deploy/agent/compose.yaml"),

@@ -1,4 +1,4 @@
--- 0005_messaging_schema: the messaging surface tables (ADR 0011,
+-- 0008_messaging_schema: the messaging surface tables (ADR 0011,
 -- docs/messaging-contracts-draft.md). Humans and PersonalityAgents are the
 -- same "participant" everywhere: author, membership, mention, and read marker
 -- rows all carry a (kind, id) pair instead of referencing one identity table.

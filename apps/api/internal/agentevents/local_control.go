@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -152,14 +153,24 @@ type localControlIntegrityKeyring struct {
 	Previous map[string]localControlIntegrityKey
 }
 
+// localRuntimeAuthorizationRegistry linearizes authorization changes by PAID.
+// A read lease is held for the full authenticated request so a completed
+// replacement/removal is a hard fence: no request using the retired epoch can
+// still mutate state or receive a credential after the writer returns.
+type localRuntimeAuthorizationRegistry struct {
+	mu     sync.RWMutex
+	byPAID map[string]LocalRuntimeAuthorization
+}
+
 // LocalControlServer owns the local/CI issuer and state-publication handlers.
 // The HMAC signing key remains only in this Go process.
 type LocalControlServer struct {
-	gateway        *DurableGateway
-	signingSecret  []byte
-	authorizations []LocalRuntimeAuthorization
-	tokenTTL       time.Duration
-	now            func() time.Time
+	gateway                 *DurableGateway
+	signingSecret           []byte
+	authorizationMutationMu sync.Mutex
+	authorizations          localRuntimeAuthorizationRegistry
+	tokenTTL                time.Duration
+	now                     func() time.Time
 }
 
 func NewLocalControlServer(
@@ -208,41 +219,31 @@ func newLocalControlServer(
 		}
 		previousIntegrityKeys[i] = deriveLocalControlIntegrityKey(previousSecret)
 	}
-	if len(authorizations) == 0 {
-		return nil, errors.New("at least one local runtime authorization is required")
-	}
 	if err := gateway.revalidateRuntimeDirectory(); err != nil {
 		return nil, err
 	}
 
 	normalized := make([]LocalRuntimeAuthorization, len(authorizations))
-	seenBearer := make(map[string]struct{}, len(authorizations))
-	seenEpoch := make(map[string]struct{}, len(authorizations))
+	seenPAID := make(map[string]struct{}, len(authorizations))
 	for i, authorization := range authorizations {
-		if err := validateLocalRuntimeAuthorization(authorization); err != nil {
+		var err error
+		authorization, err = normalizeLocalRuntimeAuthorization(authorization)
+		if err != nil {
 			return nil, fmt.Errorf("local runtime authorization %d: %w", i, err)
 		}
 		if len(signingSecret) == len(authorization.BearerToken) &&
 			subtle.ConstantTimeCompare(signingSecret, []byte(authorization.BearerToken)) == 1 {
 			return nil, errors.New("local control bearer and token signing secret must be distinct")
 		}
-		if authorization.Audience == "" {
-			authorization.Audience = defaultAgentAudience
+		if _, exists := seenPAID[authorization.PersonalityAgentID]; exists {
+			return nil, errors.New("each personality agent must have exactly one local runtime authorization")
 		}
-		if _, exists := seenBearer[authorization.BearerToken]; exists {
-			return nil, errors.New("local runtime bearer tokens must be unique")
+		for j := 0; j < i; j++ {
+			if bearerTokensEqual(authorization.BearerToken, normalized[j].BearerToken) {
+				return nil, errors.New("local runtime bearer tokens must be unique")
+			}
 		}
-		epoch := fmt.Sprintf(
-			"%s\x00%d\x00%s",
-			authorization.PersonalityAgentID,
-			authorization.Generation,
-			authorization.RPCBootNonce,
-		)
-		if _, exists := seenEpoch[epoch]; exists {
-			return nil, errors.New("each local runtime epoch must have exactly one authorization")
-		}
-		seenBearer[authorization.BearerToken] = struct{}{}
-		seenEpoch[epoch] = struct{}{}
+		seenPAID[authorization.PersonalityAgentID] = struct{}{}
 		normalized[i] = authorization
 	}
 
@@ -276,12 +277,292 @@ func newLocalControlServer(
 	}
 
 	return &LocalControlServer{
-		gateway:        gateway,
-		signingSecret:  append([]byte(nil), signingSecret...),
-		authorizations: normalized,
-		tokenTTL:       defaultLocalCredentialTTL,
-		now:            time.Now,
+		gateway:       gateway,
+		signingSecret: append([]byte(nil), signingSecret...),
+		authorizations: localRuntimeAuthorizationRegistry{
+			byPAID: authorizationsByPAID(normalized),
+		},
+		tokenTTL: defaultLocalCredentialTTL,
+		now:      time.Now,
 	}, nil
+}
+
+func authorizationsByPAID(authorizations []LocalRuntimeAuthorization) map[string]LocalRuntimeAuthorization {
+	byPAID := make(map[string]LocalRuntimeAuthorization, len(authorizations))
+	for _, authorization := range authorizations {
+		byPAID[authorization.PersonalityAgentID] = authorization
+	}
+	return byPAID
+}
+
+func normalizeLocalRuntimeAuthorization(
+	authorization LocalRuntimeAuthorization,
+) (LocalRuntimeAuthorization, error) {
+	if err := validateLocalRuntimeAuthorization(authorization); err != nil {
+		return LocalRuntimeAuthorization{}, err
+	}
+	if authorization.Audience == "" {
+		authorization.Audience = defaultAgentAudience
+	}
+	return authorization, nil
+}
+
+func bearerTokensEqual(left, right string) bool {
+	return len(left) == len(right) &&
+		subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+// InstallLocalRuntimeAuthorization atomically installs or replaces the one
+// current authorization epoch for authorization.PersonalityAgentID. Callers
+// prepare the allocator/runtime first, then publish that coherent result here.
+// The signing and durable-integrity keyring remain process-owned and are never
+// replaced by this operation.
+func (s *LocalControlServer) InstallLocalRuntimeAuthorization(
+	ctx context.Context,
+	authorization LocalRuntimeAuthorization,
+) error {
+	if s == nil || s.gateway == nil {
+		return errors.New("local control server is not initialized")
+	}
+	if ctx == nil {
+		return errors.New("local runtime authorization context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized, err := normalizeLocalRuntimeAuthorization(authorization)
+	if err != nil {
+		return err
+	}
+	if len(s.signingSecret) == len(normalized.BearerToken) &&
+		subtle.ConstantTimeCompare(s.signingSecret, []byte(normalized.BearerToken)) == 1 {
+		return errors.New("local control bearer and token signing secret must be distinct")
+	}
+	s.authorizationMutationMu.Lock()
+	defer s.authorizationMutationMu.Unlock()
+	if err := s.authorizations.checkInstall(normalized); err != nil {
+		return err
+	}
+	state, err := s.gateway.state(ctx, normalized.PersonalityAgentID)
+	if err != nil {
+		return fmt.Errorf("validate existing local control runtime state: %w", err)
+	}
+	if state.present && state.LocalControl == nil {
+		return errors.New("existing runtime state is not owned by local control")
+	}
+
+	// Ownership and any previous-key repair must be ready before the epoch is
+	// externally reachable. Removing an authorization intentionally does not
+	// remove this process-owned integrity fence from durable state.
+	ownerAdded, err := s.gateway.addLocalControlOwner(normalized.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	installed := false
+	defer func() {
+		if ownerAdded && !installed {
+			s.gateway.removeLocalControlOwner(normalized.PersonalityAgentID)
+		}
+	}()
+	if err := s.gateway.resignIntegrityStates(ctx, normalized.PersonalityAgentID); err != nil {
+		return fmt.Errorf("repair local control integrity state: %w", err)
+	}
+	state, err = s.gateway.state(ctx, normalized.PersonalityAgentID)
+	if err != nil {
+		return fmt.Errorf("validate existing local control runtime state: %w", err)
+	}
+	if state.present && state.LocalControl == nil {
+		return errors.New("existing runtime state is not owned by local control")
+	}
+	if state.present {
+		control := state.LocalControl
+		switch {
+		case normalized.Generation < state.Generation:
+			return errors.New("local runtime authorization generation is older than durable state")
+		case normalized.Generation == state.Generation && normalized.RPCBootNonce != control.RPCBootNonce:
+			return errors.New("local runtime authorization reuses a generation with a different RPC boot nonce")
+		case normalized.Generation == state.Generation && control.Reason == LocalRuntimeShutdown:
+			return errors.New("local runtime authorization cannot revive a terminal epoch")
+		case normalized.Generation > state.Generation && control.Reason != LocalRuntimeShutdown:
+			// Fence an orphaned Ready record before the replacement epoch is
+			// reachable. This covers an API restart after the root runtime died.
+			s.authorizations.removeEpoch(
+				normalized.PersonalityAgentID,
+				state.Generation,
+				control.RPCBootNonce,
+			)
+			if err := s.publishControlPlaneShutdown(ctx, normalized.PersonalityAgentID, state); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.authorizations.install(normalized); err != nil {
+		return err
+	}
+	installed = true
+	return nil
+}
+
+// RemoveLocalRuntimeAuthorization atomically fences the current epoch for one
+// PAID. It is idempotent and does not retire process signing/integrity keys.
+func (s *LocalControlServer) RemoveLocalRuntimeAuthorization(personalityAgentID string) error {
+	if s == nil || s.gateway == nil {
+		return errors.New("local control server is not initialized")
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
+	s.authorizationMutationMu.Lock()
+	defer s.authorizationMutationMu.Unlock()
+	s.authorizations.remove(personalityAgentID)
+	return nil
+}
+
+// FenceLocalRuntimeAuthorization retires exactly one PAID/process epoch and
+// atomically drives any Ready state owned by that epoch to terminal NotReady.
+// A delayed cleanup from an older process can therefore never revoke or
+// overwrite a replacement generation.
+func (s *LocalControlServer) FenceLocalRuntimeAuthorization(
+	ctx context.Context,
+	personalityAgentID string,
+	generation uint64,
+	rpcBootNonce string,
+) error {
+	if s == nil || s.gateway == nil {
+		return errors.New("local control server is not initialized")
+	}
+	if ctx == nil {
+		return errors.New("local runtime authorization context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
+	if generation > maxProcessGeneration {
+		return errors.New("local runtime generation is outside the process-generation domain")
+	}
+	if err := validateOpaqueRuntimeID(rpcBootNonce, "RPC boot nonce"); err != nil {
+		return err
+	}
+
+	s.authorizationMutationMu.Lock()
+	defer s.authorizationMutationMu.Unlock()
+	// An API restart may have lost the in-memory authorization while the root
+	// provisioner and durable Ready state survive. Remove the exact epoch when
+	// present, but always reconcile matching durable state below.
+	s.authorizations.removeEpoch(personalityAgentID, generation, rpcBootNonce)
+	state, err := s.gateway.state(ctx, personalityAgentID)
+	if err != nil {
+		return fmt.Errorf("read local runtime state while fencing epoch: %w", err)
+	}
+	if !state.present || state.LocalControl == nil ||
+		state.Generation != generation || state.LocalControl.RPCBootNonce != rpcBootNonce ||
+		state.LocalControl.Reason == LocalRuntimeShutdown {
+		return nil
+	}
+	return s.publishControlPlaneShutdown(ctx, personalityAgentID, state)
+}
+
+func (s *LocalControlServer) publishControlPlaneShutdown(
+	ctx context.Context,
+	personalityAgentID string,
+	state runtimeState,
+) error {
+	if !state.present || state.LocalControl == nil || state.LocalControl.Reason == LocalRuntimeShutdown {
+		return nil
+	}
+	revision := state.LocalControl.Revision
+	digest := sha256.Sum256([]byte(fmt.Sprintf(
+		"sumi-control-plane-fence-v1\x00%s\x00%d\x00%s",
+		personalityAgentID,
+		state.Generation,
+		state.LocalControl.RPCBootNonce,
+	)))
+	_, err := s.publishRuntimeState(ctx, LocalRuntimeStatePublication{
+		PublicationID:      "control-plane-fence-" + hex.EncodeToString(digest[:16]),
+		PersonalityAgentID: personalityAgentID,
+		Generation:         state.Generation,
+		RPCBootNonce:       state.LocalControl.RPCBootNonce,
+		ExpectedRevision:   &revision,
+		State:              LocalRuntimeNotReady,
+		Reason:             LocalRuntimeShutdown,
+	})
+	if err != nil {
+		return fmt.Errorf("publish terminal local runtime fence: %w", err)
+	}
+	return nil
+}
+
+func (r *localRuntimeAuthorizationRegistry) checkInstall(
+	authorization LocalRuntimeAuthorization,
+) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for personalityAgentID, current := range r.byPAID {
+		if personalityAgentID != authorization.PersonalityAgentID &&
+			bearerTokensEqual(current.BearerToken, authorization.BearerToken) {
+			return errors.New("local runtime bearer tokens must be unique")
+		}
+	}
+	return nil
+}
+
+func (r *localRuntimeAuthorizationRegistry) install(authorization LocalRuntimeAuthorization) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byPAID == nil {
+		r.byPAID = make(map[string]LocalRuntimeAuthorization)
+	}
+	for personalityAgentID, current := range r.byPAID {
+		if personalityAgentID != authorization.PersonalityAgentID &&
+			bearerTokensEqual(current.BearerToken, authorization.BearerToken) {
+			return errors.New("local runtime bearer tokens must be unique")
+		}
+	}
+	r.byPAID[authorization.PersonalityAgentID] = authorization
+	return nil
+}
+
+func (r *localRuntimeAuthorizationRegistry) removeEpoch(
+	personalityAgentID string,
+	generation uint64,
+	rpcBootNonce string,
+) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, exists := r.byPAID[personalityAgentID]
+	if !exists || current.Generation != generation || current.RPCBootNonce != rpcBootNonce {
+		return false
+	}
+	delete(r.byPAID, personalityAgentID)
+	return true
+}
+
+func (r *localRuntimeAuthorizationRegistry) remove(personalityAgentID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.byPAID, personalityAgentID)
+}
+
+func (r *localRuntimeAuthorizationRegistry) acquire(
+	bearerToken string,
+	boundPersonalityAgentID string,
+) (LocalRuntimeAuthorization, func(), bool) {
+	r.mu.RLock()
+	for _, authorization := range r.byPAID {
+		if bearerTokensEqual(bearerToken, authorization.BearerToken) {
+			if boundPersonalityAgentID != "" &&
+				authorization.PersonalityAgentID != boundPersonalityAgentID {
+				r.mu.RUnlock()
+				return LocalRuntimeAuthorization{}, nil, false
+			}
+			return authorization, r.mu.RUnlock, true
+		}
+	}
+	r.mu.RUnlock()
+	return LocalRuntimeAuthorization{}, nil, false
 }
 
 // RegisterRoutes attaches the local control endpoints to an explicitly chosen
@@ -298,11 +579,42 @@ func (s *LocalControlServer) RegisterRoutes(mux *http.ServeMux) error {
 	return nil
 }
 
+type localControlBoundPersonalityAgentIDKey struct{}
+
+// HandlerForLocalRuntime returns the same local-control routes bound to one
+// PAID execution boundary. It is intended for that PAID's trusted Unix socket:
+// a request arriving there cannot authenticate as or publish state for a
+// different PAID, even if it possesses that other runtime's bearer.
+func (s *LocalControlServer) HandlerForLocalRuntime(
+	personalityAgentID string,
+) (http.Handler, error) {
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	if err := s.RegisterRoutes(mux); err != nil {
+		return nil, err
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(
+			r.Context(),
+			localControlBoundPersonalityAgentIDKey{},
+			personalityAgentID,
+		)
+		localRequest := r.Clone(ctx)
+		// Unix-domain HTTP requests do not have an IP RemoteAddr. The socket
+		// listener is the trusted loopback transport for this handler.
+		localRequest.RemoteAddr = "127.0.0.1:0"
+		mux.ServeHTTP(w, localRequest)
+	}), nil
+}
+
 func (s *LocalControlServer) handleCredentialIssue(w http.ResponseWriter, r *http.Request) {
-	authorization, ok := s.authorize(w, r)
+	authorization, release, ok := s.authorize(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	var request LocalCredentialIssueRequest
 	if !decodeLocalControlRequest(w, r, &request) {
 		return
@@ -325,10 +637,11 @@ func (s *LocalControlServer) handleCredentialIssue(w http.ResponseWriter, r *htt
 }
 
 func (s *LocalControlServer) handleRuntimeStatePublish(w http.ResponseWriter, r *http.Request) {
-	authorization, ok := s.authorize(w, r)
+	authorization, release, ok := s.authorize(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	var publication LocalRuntimeStatePublication
 	if !decodeLocalControlRequest(w, r, &publication) {
 		return
@@ -350,29 +663,33 @@ func (s *LocalControlServer) handleRuntimeStatePublish(w http.ResponseWriter, r 
 	writeLocalControlJSON(w, http.StatusOK, ack)
 }
 
-func (s *LocalControlServer) authorize(w http.ResponseWriter, r *http.Request) (LocalRuntimeAuthorization, bool) {
+func (s *LocalControlServer) authorize(
+	w http.ResponseWriter,
+	r *http.Request,
+) (LocalRuntimeAuthorization, func(), bool) {
 	if !requestIsLoopback(r) {
 		writeLocalControlError(w, http.StatusForbidden, "loopback_required")
-		return LocalRuntimeAuthorization{}, false
+		return LocalRuntimeAuthorization{}, nil, false
 	}
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
 		writeLocalControlError(w, http.StatusUnauthorized, "invalid_authorization")
-		return LocalRuntimeAuthorization{}, false
+		return LocalRuntimeAuthorization{}, nil, false
 	}
 	token, ok := bearerToken(values[0])
 	if !ok {
 		writeLocalControlError(w, http.StatusUnauthorized, "invalid_authorization")
-		return LocalRuntimeAuthorization{}, false
+		return LocalRuntimeAuthorization{}, nil, false
 	}
-	for _, authorization := range s.authorizations {
-		if len(token) == len(authorization.BearerToken) &&
-			subtle.ConstantTimeCompare([]byte(token), []byte(authorization.BearerToken)) == 1 {
-			return authorization, true
-		}
+	boundPersonalityAgentID, _ := r.Context().Value(
+		localControlBoundPersonalityAgentIDKey{},
+	).(string)
+	authorization, release, ok := s.authorizations.acquire(token, boundPersonalityAgentID)
+	if ok {
+		return authorization, release, true
 	}
 	writeLocalControlError(w, http.StatusUnauthorized, "invalid_authorization")
-	return LocalRuntimeAuthorization{}, false
+	return LocalRuntimeAuthorization{}, nil, false
 }
 
 func requestIsLoopback(r *http.Request) bool {
@@ -1149,6 +1466,31 @@ func (g *DurableGateway) installLocalControlIntegrityKeyring(
 		g.localControlOwners[personalityAgentID] = struct{}{}
 	}
 	return nil
+}
+
+func (g *DurableGateway) addLocalControlOwner(personalityAgentID string) (bool, error) {
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return false, err
+	}
+	g.localControlIntegrityMu.Lock()
+	defer g.localControlIntegrityMu.Unlock()
+	if g.localControlIntegrityCurrent.ID == "" {
+		return false, errors.New("local control integrity keyring is not installed")
+	}
+	if g.localControlOwners == nil {
+		g.localControlOwners = make(map[string]struct{})
+	}
+	if _, exists := g.localControlOwners[personalityAgentID]; exists {
+		return false, nil
+	}
+	g.localControlOwners[personalityAgentID] = struct{}{}
+	return true, nil
+}
+
+func (g *DurableGateway) removeLocalControlOwner(personalityAgentID string) {
+	g.localControlIntegrityMu.Lock()
+	defer g.localControlIntegrityMu.Unlock()
+	delete(g.localControlOwners, personalityAgentID)
 }
 
 func (g *DurableGateway) localControlIntegrityKeyringSnapshot() (localControlIntegrityKeyring, bool) {

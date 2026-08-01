@@ -35,14 +35,15 @@ const (
 )
 
 var (
-	ErrInvalidAuthFlow    = errors.New("invalid authentication flow")
-	ErrAuthFlowExpired    = errors.New("authentication flow expired")
-	ErrAuthFlowConsumed   = errors.New("authentication flow already consumed")
-	ErrAuthProofMismatch  = errors.New("verified identity does not match authentication flow")
-	ErrConfirmation       = errors.New("invalid authentication confirmation")
-	ErrCredentialInactive = errors.New("credential login method is inactive")
-	ErrLastLoginMethod    = errors.New("last usable login method cannot be removed")
-	ErrRecentReauth       = errors.New("recent reauthentication through another method is required")
+	ErrInvalidAuthFlow          = errors.New("invalid authentication flow")
+	ErrAuthFlowExpired          = errors.New("authentication flow expired")
+	ErrAuthFlowConsumed         = errors.New("authentication flow already consumed")
+	ErrAuthProofMismatch        = errors.New("verified identity does not match authentication flow")
+	ErrConfirmation             = errors.New("invalid authentication confirmation")
+	ErrCredentialInactive       = errors.New("credential login method is inactive")
+	ErrLastLoginMethod          = errors.New("last usable login method cannot be removed")
+	ErrRecentReauth             = errors.New("recent reauthentication through another method is required")
+	ErrProviderOperationPending = errors.New("another provider operation is pending")
 )
 
 type StartAuthFlowRequest struct {
@@ -267,7 +268,7 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			}
 			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn)
 		case flow.Intent == IntentSignUp && !exists:
-			flow, err = provisionFromFlow(ctx, tx, flow, identity)
+			flow, err = s.provisionFromFlow(ctx, tx, flow, identity)
 		case flow.Intent == IntentSignIn && !exists:
 			flow.ConfirmationAction = ActionCreateAccount
 			flow.Status = "confirmation_required"
@@ -303,7 +304,7 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			if exists {
 				return AuthFlow{}, ErrCredentialAlreadyBound
 			}
-			flow, err = provisionFromFlow(ctx, tx, flow, VerifiedIdentity{FirebaseUID: firebaseUID, SignInProvider: flow.ExpectedProvider, ProviderSubject: flow.VerifiedProviderSubject})
+			flow, err = s.provisionFromFlow(ctx, tx, flow, VerifiedIdentity{FirebaseUID: firebaseUID, SignInProvider: flow.ExpectedProvider, ProviderSubject: flow.VerifiedProviderSubject})
 		} else {
 			if !exists {
 				return AuthFlow{}, ErrAuthProofMismatch
@@ -368,7 +369,11 @@ func completeExistingFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, uid, hu
 	return flow, nil
 }
 
-func provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, identity VerifiedIdentity) (AuthFlow, error) {
+func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, identity VerifiedIdentity) (AuthFlow, error) {
+	wrappingKeyID, err := validateWrappingKeyID(s.wrappingKeyID)
+	if err != nil {
+		return AuthFlow{}, fmt.Errorf("configured wrapping key ID: %w", err)
+	}
 	humanID, agentID := newUUIDv7(), newUUIDv7()
 	wrappingKey, err := generateWrappingKey()
 	if err != nil {
@@ -381,7 +386,7 @@ func provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, identity V
 		{"INSERT INTO humans (human_id) VALUES ($1)", []any{humanID}},
 		{"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", []any{agentID, humanID}},
 		{"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, $2, $3)", []any{agentID, EmployerHuman, humanID}},
-		{"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)", []any{agentID, wrappingKey}},
+		{"INSERT INTO agent_secrets (personality_agent_id, wrapping_key_id, wrapping_key) VALUES ($1, $2, $3)", []any{agentID, wrappingKeyID, wrappingKey}},
 		{"INSERT INTO credentials (provider, external_subject, human_id) VALUES ('firebase', $1, $2)", []any{identity.FirebaseUID, humanID}},
 	}
 	for _, statement := range statements {

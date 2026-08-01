@@ -8,6 +8,7 @@ export const SUMI_DEV_HOST = "127.0.0.1";
 export const SUMI_DEV_PORT = 5173;
 export const SUMI_DEV_ORIGIN = `http://${SUMI_DEV_HOST}:${SUMI_DEV_PORT}`;
 export const SUMI_DEV_API_ORIGIN = "http://127.0.0.1:8080";
+export const SUMI_COMPOSE_API_ORIGIN = "http://api:8080";
 
 function apiProxy(target: string, websocket = false): ProxyOptions {
   return {
@@ -25,13 +26,13 @@ export function createDevServerConfig(
   if (
     target.origin !== apiOrigin ||
     target.protocol !== "http:" ||
-    isIP(target.hostname) !== 4 ||
-    target.hostname === "0.0.0.0" ||
+    ((isIP(target.hostname) !== 4 || target.hostname === "0.0.0.0") &&
+      target.origin !== SUMI_COMPOSE_API_ORIGIN) ||
     isIP(host) !== 4 ||
     host === "0.0.0.0"
   ) {
     throw new Error(
-      "Sumi dev host and API origin must use explicit literal IPv4 addresses",
+      "Sumi dev host must be an explicit literal IPv4 address and API origin must be literal IPv4 or the exact Compose service",
     );
   }
   return {

@@ -15,13 +15,25 @@ const (
 )
 
 type kosekiAuthFlowController struct {
-	store    *koseki.Store
-	tenantID string
-	clock    func() time.Time
+	store     *koseki.Store
+	tenantID  string
+	providers firebaseProviderLifecycle
+	clock     func() time.Time
 }
 
-func newKosekiAuthFlowController(store *koseki.Store, tenantID string) *kosekiAuthFlowController {
-	return &kosekiAuthFlowController{store: store, tenantID: tenantID, clock: time.Now}
+type firebaseProviderAccount struct {
+	UID              string
+	ProviderSubjects map[string]string
+	EmailProvider    bool
+}
+
+type firebaseProviderLifecycle interface {
+	ProviderAccount(ctx context.Context, firebaseUID string) (firebaseProviderAccount, error)
+	DeleteProvider(ctx context.Context, firebaseUID, provider string) error
+}
+
+func newKosekiAuthFlowController(store *koseki.Store, tenantID string, providers firebaseProviderLifecycle) *kosekiAuthFlowController {
+	return &kosekiAuthFlowController{store: store, tenantID: tenantID, providers: providers, clock: time.Now}
 }
 
 func (c *kosekiAuthFlowController) Start(ctx context.Context, request agentevents.StartBrowserAuthFlowRequest) (agentevents.BrowserAuthFlowResult, error) {
@@ -110,15 +122,11 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
 	if request.Operation == "unlink" {
-		reauthAge := c.clock().UTC().Sub(identity.AuthTime)
-		if identity.AuthTime.IsZero() || reauthAge < -time.Minute || reauthAge > recentReauthAge || identity.SignInProvider == request.Provider {
+		if !validProviderUnlinkReauth(identity, request.Provider, c.clock().UTC()) {
 			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthRecentReauth
 		}
-		if len(identity.ProviderSubjects[request.Provider]) != 1 {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
-		}
-		if usableProviderCount(identity.ProviderSubjects) < 2 {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
+		if c.providers == nil {
+			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
 		}
 	}
 	operation, err := c.store.BeginProviderOperation(ctx, claims.HumanID, uid, request.Provider,
@@ -126,29 +134,142 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	clientOperation := "firebase_link_with_credential"
+	if operation.Status != "pending" {
+		return c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce)
+	}
 	if request.Operation == "unlink" {
-		clientOperation = "firebase_unlink_provider"
+		return c.runProviderUnlink(ctx, claims, request, operation)
 	}
 	return agentevents.ProviderOperationResult{
 		OperationID: operation.OperationID, Outcome: "client_operation_required",
-		ClientOperation: clientOperation, CreatedAt: operation.CreatedAt,
+		ClientOperation: "firebase_link_with_credential", CreatedAt: operation.CreatedAt,
 		CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
 		ExpiresAt:                operation.ExpiresAt,
 	}, nil
 }
 
-func usableProviderCount(subjects map[string][]string) int {
-	count := 0
-	if len(subjects["email"]) > 0 || len(subjects["password"]) > 0 {
-		count++
+func validProviderUnlinkReauth(identity agentevents.FirebaseIdentity, targetProvider string, now time.Time) bool {
+	reauthAge := now.Sub(identity.AuthTime)
+	if identity.AuthTime.IsZero() || reauthAge < -time.Minute || reauthAge > recentReauthAge ||
+		identity.SignInProvider == targetProvider {
+		return false
 	}
-	for _, provider := range []string{"google.com", "github.com", "phone"} {
-		if len(subjects[provider]) > 0 {
+	switch identity.SignInProvider {
+	case "google.com", "github.com":
+		return len(identity.ProviderSubjects[identity.SignInProvider]) == 1
+	case "password":
+		return identity.EmailVerified && identity.Email != "" && len(identity.ProviderSubjects["email"]) == 1
+	default:
+		return false
+	}
+}
+
+func (c *kosekiAuthFlowController) runProviderUnlink(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.StartProviderOperationRequest, operation koseki.ProviderOperation) (agentevents.ProviderOperationResult, error) {
+	if operation.Status != "pending" {
+		return c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce)
+	}
+	providerSubject, err := c.store.ActiveProviderSubject(ctx, claims.HumanID, operation.Provider)
+	if err != nil {
+		if recovered, recoveryErr := c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce); recoveryErr == nil {
+			return recovered, nil
+		}
+		_, _ = c.store.FailProviderOperation(ctx, operation.OperationID, request.Nonce, "firebase_operation_failed")
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
+	}
+
+	account, err := c.providers.ProviderAccount(ctx, operation.FirebaseUID)
+	if err != nil {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	if account.UID != operation.FirebaseUID {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	remoteSubject, providerPresent := account.ProviderSubjects[operation.Provider]
+	if !providerPresent {
+		return c.finishProviderUnlink(ctx, claims, request.Nonce, operation, providerSubject)
+	}
+	if remoteSubject != providerSubject {
+		_, _ = c.store.FailProviderOperation(ctx, operation.OperationID, request.Nonce, "firebase_operation_failed")
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
+	}
+	emailLinkProof, err := c.store.HasCompletedEmailLinkProof(ctx, claims.HumanID, operation.FirebaseUID)
+	if err != nil {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	usableMethods := supportedProviderMethodCount(account)
+	if account.EmailProvider && emailLinkProof {
+		usableMethods++
+	}
+	if usableMethods <= 1 {
+		if _, err := c.store.FailProviderOperation(ctx, operation.OperationID, request.Nonce, "last_login_method"); err != nil {
+			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+		}
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
+	}
+
+	deleteErr := c.providers.DeleteProvider(ctx, operation.FirebaseUID, operation.Provider)
+	postcheck, postcheckErr := c.providers.ProviderAccount(ctx, operation.FirebaseUID)
+	if postcheckErr != nil {
+		// The pending row deliberately retains the per-UID fence. A same-nonce
+		// retry will repeat the live read and reconcile either remote state.
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	if postcheck.UID != operation.FirebaseUID {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	if _, stillPresent := postcheck.ProviderSubjects[operation.Provider]; stillPresent {
+		if _, err := c.store.FailProviderOperation(ctx, operation.OperationID, request.Nonce, "firebase_operation_failed"); err != nil {
+			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+		}
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	// An Admin error with an absent provider is an ambiguous-success response,
+	// not a failure. The live postcheck is authoritative.
+	_ = deleteErr
+	return c.finishProviderUnlink(ctx, claims, request.Nonce, operation, providerSubject)
+}
+
+func supportedProviderMethodCount(account firebaseProviderAccount) int {
+	count := 0
+	for _, provider := range []string{"google.com", "github.com"} {
+		if account.ProviderSubjects[provider] != "" {
 			count++
 		}
 	}
 	return count
+}
+
+func (c *kosekiAuthFlowController) finishProviderUnlink(ctx context.Context, claims agentevents.UserSessionClaims, nonce string, operation koseki.ProviderOperation, providerSubject string) (agentevents.ProviderOperationResult, error) {
+	_, err := c.store.CompleteProviderUnlink(ctx, operation.OperationID, nonce, operation.FirebaseUID, providerSubject)
+	if errors.Is(err, koseki.ErrAuthFlowConsumed) {
+		return c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, nonce)
+	}
+	if err != nil {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	return agentevents.ProviderOperationResult{
+		OperationID: operation.OperationID, Outcome: "provider_unlinked",
+		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt: operation.ExpiresAt, NoticeRequired: true,
+	}, nil
+}
+
+func (c *kosekiAuthFlowController) recoverStartedProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, operationID, nonce string) (agentevents.ProviderOperationResult, error) {
+	status, err := c.StatusProviderOperation(ctx, claims, agentevents.ProviderOperationStatusRequest{OperationID: operationID, Nonce: nonce})
+	if err != nil {
+		return agentevents.ProviderOperationResult{}, err
+	}
+	if status.Status == "pending" {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+	}
+	if status.Status == "failed" && status.Outcome == "last_login_method" {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
+	}
+	return agentevents.ProviderOperationResult{
+		OperationID: status.OperationID, Outcome: status.Outcome,
+		CreatedAt: status.CreatedAt, CompletionTokenNotBefore: status.CompletionTokenNotBefore,
+		ExpiresAt: status.ExpiresAt, NoticeRequired: status.NoticeRequired,
+	}, nil
 }
 
 func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.CompleteProviderOperationRequest, identity agentevents.FirebaseIdentity) (agentevents.ProviderOperationResult, error) {
@@ -159,48 +280,33 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 	if operation.HumanID != claims.HumanID || operation.FirebaseUID != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
+	if operation.Operation != "link" {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowInvalid
+	}
 	if identity.IssuedAt.IsZero() || identity.IssuedAt.Before(completionTokenNotBefore(operation.CreatedAt)) {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
-	if operation.Operation == "link" {
-		subjects := identity.ProviderSubjects[operation.Provider]
-		if len(subjects) != 1 {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
-		}
-		var event koseki.SecurityEvent
-		event, err = c.store.CompleteProviderLink(ctx, request.OperationID, request.Nonce, identity.UID, subjects[0])
-		if errors.Is(err, koseki.ErrCredentialAlreadyBound) {
-			_, _ = c.store.FailProviderOperation(ctx, request.OperationID, request.Nonce, "credential_in_use")
-		}
-		if err == nil && event.TerminalOutcome == "already_linked" {
-			return agentevents.ProviderOperationResult{
-				OperationID: operation.OperationID, Outcome: "provider_already_linked",
-				CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
-				ExpiresAt: operation.ExpiresAt,
-			}, nil
-		}
-	} else {
-		if len(identity.ProviderSubjects[operation.Provider]) != 0 {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
-		}
-		if usableProviderCount(identity.ProviderSubjects) < 1 {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
-		}
-		subject, subjectErr := c.store.ActiveProviderSubject(ctx, claims.HumanID, operation.Provider)
-		if subjectErr != nil {
-			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
-		}
-		_, err = c.store.CompleteProviderUnlink(ctx, request.OperationID, request.Nonce, identity.UID, subject)
+	subjects := identity.ProviderSubjects[operation.Provider]
+	if len(subjects) != 1 {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
+	}
+	var event koseki.SecurityEvent
+	event, err = c.store.CompleteProviderLink(ctx, request.OperationID, request.Nonce, identity.UID, subjects[0])
+	if errors.Is(err, koseki.ErrCredentialAlreadyBound) {
+		_, _ = c.store.FailProviderOperation(ctx, request.OperationID, request.Nonce, "credential_in_use")
+	}
+	if err == nil && event.TerminalOutcome == "already_linked" {
+		return agentevents.ProviderOperationResult{
+			OperationID: operation.OperationID, Outcome: "provider_already_linked",
+			CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+			ExpiresAt: operation.ExpiresAt,
+		}, nil
 	}
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	outcome := "provider_linked"
-	if operation.Operation == "unlink" {
-		outcome = "provider_unlinked"
-	}
 	return agentevents.ProviderOperationResult{
-		OperationID: operation.OperationID, Outcome: outcome,
+		OperationID: operation.OperationID, Outcome: "provider_linked",
 		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
 		ExpiresAt: operation.ExpiresAt, NoticeRequired: true,
 	}, nil
@@ -227,7 +333,9 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 	if operation.HumanID != claims.HumanID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
-	if request.Outcome != "provider_already_linked" && request.Outcome != "credential_in_use" && request.Outcome != "firebase_operation_failed" && request.Outcome != "cancelled" {
+	// Unlink is a backend-owned saga. A browser must never release its durable
+	// fence or declare its Firebase Admin mutation failed.
+	if operation.Operation != "link" || !validClientProviderFailureOutcome(request.Outcome) {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowInvalid
 	}
 	_, err = c.store.FailProviderOperation(ctx, request.OperationID, request.Nonce, request.Outcome)
@@ -239,6 +347,57 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
 		ExpiresAt: operation.ExpiresAt,
 	}, nil
+}
+
+func validClientProviderFailureOutcome(outcome string) bool {
+	return outcome == "credential_in_use" || outcome == "firebase_operation_failed" || outcome == "cancelled"
+}
+
+func (c *kosekiAuthFlowController) StatusProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.ProviderOperationStatusRequest) (agentevents.ProviderOperationStatusResult, error) {
+	operation, err := c.store.ProviderOperationStatus(ctx, claims.HumanID, request.OperationID, request.Nonce)
+	if err != nil {
+		return agentevents.ProviderOperationStatusResult{}, mapFlowError(err)
+	}
+	result := agentevents.ProviderOperationStatusResult{
+		OperationID: operation.OperationID, Provider: operation.Provider,
+		Operation: operation.Operation, Status: operation.Status,
+		CreatedAt:                operation.CreatedAt,
+		CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt:                operation.ExpiresAt, CompletedAt: operation.CompletedAt,
+	}
+	switch operation.Status {
+	case "pending":
+		if operation.Operation == "unlink" {
+			result.Outcome = "provider_operation_pending"
+		} else {
+			result.Outcome = "client_operation_required"
+			result.ClientOperation = "firebase_link_with_credential"
+		}
+	case "completed":
+		switch {
+		case operation.Operation == "link" && operation.TerminalOutcome == "linked":
+			result.Outcome, result.NoticeRequired = "provider_linked", true
+		case operation.Operation == "link" && operation.TerminalOutcome == "already_linked":
+			result.Outcome = "provider_already_linked"
+		case operation.Operation == "unlink" && operation.TerminalOutcome == "unlinked":
+			result.Outcome, result.NoticeRequired = "provider_unlinked", true
+		default:
+			return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+		}
+	case "failed":
+		if !validProviderFailureOutcome(operation.TerminalOutcome) {
+			return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+		}
+		result.Outcome = operation.TerminalOutcome
+	default:
+		return agentevents.ProviderOperationStatusResult{}, agentevents.ErrBrowserAuthFlowInvalid
+	}
+	return result, nil
+}
+
+func validProviderFailureOutcome(outcome string) bool {
+	return outcome == "provider_already_linked" || outcome == "credential_in_use" ||
+		outcome == "firebase_operation_failed" || outcome == "cancelled" || outcome == "last_login_method"
 }
 
 func mapFlowError(err error) error {
@@ -253,6 +412,8 @@ func mapFlowError(err error) error {
 		return agentevents.ErrBrowserAuthRecentReauth
 	case errors.Is(err, koseki.ErrLastLoginMethod):
 		return agentevents.ErrBrowserAuthLastMethod
+	case errors.Is(err, koseki.ErrProviderOperationPending):
+		return agentevents.ErrBrowserAuthProviderPending
 	default:
 		return agentevents.ErrBrowserAuthFlowInvalid
 	}

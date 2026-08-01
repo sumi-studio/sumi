@@ -8,6 +8,8 @@ COPY apps/agent/prompts ./prompts
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
+# Docker cannot create bind/secret targets inside a read-only rootfs. The real
+# PAID socket and four activation secret files mount over inert placeholders.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates util-linux \
     && rm -rf /var/lib/apt/lists/* \
@@ -23,13 +25,22 @@ RUN apt-get update \
     && groupadd --gid 10021 sumi-broker-ipc \
     && groupadd --gid 10022 sumi-local-control-ipc \
     && install -d -m 0755 /var/lib/sumi /var/lib/sumi-artifacts /workspace \
-       /run/sumi /run/sumi/local-control \
+       /run/sumi /run/sumi/local-control /run/sumi/identity \
+       /run/sumi/executor /run/sumi/broker /run/secrets \
     && install -d -m 0700 /var/lib/sumi-allocator-root \
        /var/lib/sumi-allocator-root/state \
        /var/lib/sumi-allocator-root/identity-output \
        /var/lib/sumi-allocator-root/identity-output/runtime \
        /var/lib/sumi-allocator-root/identity-output/executor \
-       /var/lib/sumi-allocator-root/identity-output/broker
+       /var/lib/sumi-allocator-root/identity-output/broker \
+    && for path in \
+       /run/sumi/local-control/control.sock \
+       /run/secrets/sumi_local_control_bearer \
+       /run/secrets/sumi_agent_wrapping_key \
+       /run/secrets/sumi_approval_secret_digest_key \
+       /run/secrets/sumi_provider_api_key; do \
+         install -m 000 /dev/null "${path}"; \
+       done
 
 COPY --from=build /src/apps/agent/target/release/sumi-agent /usr/local/bin/sumi-agent
 COPY deploy/agent/container-entrypoint /usr/local/bin/sumi-entrypoint
