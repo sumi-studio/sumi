@@ -170,6 +170,21 @@ describe("buildRows", () => {
     ).toEqual([false, false]);
   });
 
+  it("削除済みtombstoneをまたいでグルーピングしない", () => {
+    const result = rows(
+      [
+        message({ seq: 1, createdAt: BASE_AT }),
+        message({ seq: 2, deleted: true, createdAt: BASE_AT + 1_000 }),
+        message({ seq: 3, createdAt: BASE_AT + 2_000 }),
+      ],
+      null,
+    );
+    const messages = result.filter((row) => row.kind === "message");
+    expect(
+      messages.map((row) => row.kind === "message" && row.grouped),
+    ).toEqual([false, false]);
+  });
+
   it("pendingは末尾に自分のメッセージとして並ぶ", () => {
     const result = buildRows({
       messages: [message({ seq: 1 })],

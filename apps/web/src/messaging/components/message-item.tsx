@@ -23,6 +23,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Fragment, memo, type ReactNode } from "react";
+import { displayMentionPattern } from "../mention";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -95,10 +96,7 @@ function renderContent(
     .map((member) => member.displayName)
     .sort((a, b) => b.length - a.length);
   if (names.length === 0) return linkifyText(content, "c");
-  const escaped = names.map((name) =>
-    name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-  );
-  const pattern = new RegExp(`@(${escaped.join("|")})`, "g");
+  const pattern = displayMentionPattern(names);
   const parts: ReactNode[] = [];
   let cursor = 0;
   let match = pattern.exec(content);
@@ -283,8 +281,8 @@ export const MessageItem = memo(function MessageItem({
 
   return (
     <div
-      className={`group relative px-4 sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
-        mentionsSelf ? "bg-amber-500/6" : "hover:bg-accent/40"
+      className={`group relative px-4 transition-colors hover:bg-accent/55 sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+        mentionsSelf ? "bg-amber-500/6" : ""
       } ${pending && !failed ? "opacity-55" : ""}`}
     >
       {replyTarget && replyAuthor ? (
@@ -304,7 +302,7 @@ export const MessageItem = memo(function MessageItem({
             {TIME_FORMAT.format(message.createdAt)}
           </span>
         ) : (
-          <span className="pt-0.5">
+          <span className="w-8 shrink-0 pt-0.5">
             <ParticipantAvatar
               participantKey={authorKey}
               name={author?.displayName ?? "?"}
@@ -328,7 +326,7 @@ export const MessageItem = memo(function MessageItem({
             </div>
           )}
           <div className="whitespace-pre-wrap break-words text-[13.5px] leading-6">
-            {grouped ? (
+            {grouped && message.urgency !== "normal" ? (
               <span className="mr-1.5 align-middle">
                 <UrgencyChip urgency={message.urgency} />
               </span>
@@ -370,7 +368,7 @@ export const MessageItem = memo(function MessageItem({
         </div>
       </div>
       {pending ? null : (
-        <div className="absolute top-0 right-4 hidden -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 shadow-sm group-hover:flex">
+        <div className="pointer-events-none absolute top-0 right-4 flex -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
           <Popover>
             <PopoverTrigger
               render={

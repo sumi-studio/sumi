@@ -143,10 +143,18 @@ export interface ReadMarker {
   lastReadSeq: number;
 }
 
+/** 履歴をまだ取得していないplaceにも表示できる、認証済みparticipant向け集計。 */
+export interface UnreadSummary {
+  place: Place;
+  latestSeq: number;
+  unreadCount: number;
+  mentionCount: number;
+}
+
 export type ServerEvent =
   | { type: "message_created"; message: Message }
   | { type: "message_edited"; message: Message }
-  | { type: "message_deleted"; place: Place; messageId: string; seq: number }
+  | { type: "message_deleted"; message: Message }
   | { type: "typing"; place: Place; participant: ParticipantRef }
   | { type: "status_updated"; status: ParticipantStatus }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
@@ -156,7 +164,6 @@ export type ServerEvent =
 export interface SendMessageInput {
   place: Place;
   content: string;
-  mentions: ParticipantRef[];
   urgency: Urgency;
   replyTo: string | null;
   /** 必須のidempotency key。再送しても二重投稿にならない。 */
@@ -186,6 +193,7 @@ export interface MessagingBackend {
     members: MemberProfile[];
     statuses: ParticipantStatus[];
     readMarkers: ReadMarker[];
+    unreadSummaries: UnreadSummary[];
     replyLaterMarkers: ReplyLaterMarker[];
     /** 自分がEmployerである人格agent。直通（生の直接回線）の対象。 */
     employedAgents: ParticipantRef[];

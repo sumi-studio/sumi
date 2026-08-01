@@ -63,6 +63,16 @@ export function removeMessage(
   return messages.filter((entry) => entry.messageId !== messageId);
 }
 
+/** 複数の履歴ページとlive eventを、messageId/seqを保って一つにまとめる。 */
+export function mergeMessages(
+  current: readonly Message[],
+  incoming: readonly Message[],
+): Message[] {
+  let merged = [...current];
+  for (const message of incoming) merged = upsertMessage(merged, message);
+  return merged;
+}
+
 /** 他者からの未読件数。自分の発言と削除済みは数えない。 */
 export function unreadCount(
   messages: readonly Message[],
@@ -137,7 +147,10 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
   let previousBroken = true;
 
   const pushMessage = (message: Message, pending: boolean, failed = false) => {
-    if (message.deleted) return;
+    if (message.deleted) {
+      previousBroken = true;
+      return;
+    }
     if (previous && !sameDay(previous.createdAt, message.createdAt)) {
       rows.push({
         id: `date:${message.createdAt}`,

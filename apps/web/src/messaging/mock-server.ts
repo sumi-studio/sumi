@@ -1,4 +1,5 @@
 import { secureRandomUUID } from "../lib/random-uuid";
+import { hasDisplayMention } from "./mention";
 import type {
   ChannelSummary,
   ConnectionState,
@@ -17,6 +18,7 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  UnreadSummary,
   WorkspaceSummary,
 } from "./model";
 import {
@@ -313,6 +315,12 @@ function initialReadMarkers(
   return markers;
 }
 
+function resolveMentionsAtAdmission(content: string): ParticipantRef[] {
+  return MEMBERS.filter((member) =>
+    hasDisplayMention(content, member.displayName),
+  ).map((member) => member.participant);
+}
+
 const SEND_LATENCY_MS = 160;
 const TYPING_DELAY_MS = 650;
 const TYPING_INTERVAL_MS = 3_000;
@@ -339,9 +347,29 @@ export class MockMessagingServer implements MessagingBackend {
 
   async bootstrap() {
     const readMarkers: ReadMarker[] = [];
+    const unreadSummaries: UnreadSummary[] = [];
     for (const [key, lastReadSeq] of this.readMarkers) {
       const place = parsePlaceKey(key);
-      if (place) readMarkers.push({ place, lastReadSeq });
+      if (!place) continue;
+      readMarkers.push({ place, lastReadSeq });
+      const messages = this.history.get(key) ?? [];
+      unreadSummaries.push({
+        place,
+        latestSeq: messages.at(-1)?.seq ?? 0,
+        unreadCount: messages.filter(
+          (message) =>
+            message.seq > lastReadSeq &&
+            !message.deleted &&
+            !sameParticipant(message.author, SELF),
+        ).length,
+        mentionCount: messages.filter(
+          (message) =>
+            message.seq > lastReadSeq &&
+            !message.deleted &&
+            message.urgency !== "fyi" &&
+            message.mentions.some((mention) => sameParticipant(mention, SELF)),
+        ).length,
+      });
     }
     return {
       self: SELF,
@@ -351,6 +379,7 @@ export class MockMessagingServer implements MessagingBackend {
       members: MEMBERS,
       statuses: [...this.statuses.values()],
       readMarkers,
+      unreadSummaries,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
       employedAgents: [SUMI],
     };
@@ -384,7 +413,8 @@ export class MockMessagingServer implements MessagingBackend {
           place: input.place,
           author: SELF,
           content: input.content,
-          mentions: input.mentions,
+          // mentionはclientから信用せず、現在のmembershipからadmission時に解決する。
+          mentions: resolveMentionsAtAdmission(input.content),
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
@@ -404,8 +434,11 @@ export class MockMessagingServer implements MessagingBackend {
   ): Promise<void> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted) return;
+    if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
+      return;
+    }
     message.content = content;
+    message.mentions = resolveMentionsAtAdmission(content);
     message.editedAt = Date.now();
     this.emit({ type: "message_edited", message: { ...message } });
   }
@@ -413,15 +446,15 @@ export class MockMessagingServer implements MessagingBackend {
   async deleteMessage(place: Place, messageId: string): Promise<void> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
-    if (!message || message.deleted) return;
+    if (!message || message.deleted || !sameParticipant(message.author, SELF)) {
+      return;
+    }
     // tombstone化: contentは残さず、消えた事実とseqだけが残る。
     message.deleted = true;
     message.content = "";
     this.emit({
       type: "message_deleted",
-      place,
-      messageId,
-      seq: message.seq,
+      message: { ...message },
     });
   }
 
@@ -447,6 +480,13 @@ export class MockMessagingServer implements MessagingBackend {
     messageId: string,
     remindAt: number,
   ): Promise<void> {
+    const existing = [...this.replyLaterMarkers.values()].find(
+      (marker) =>
+        !marker.resolved &&
+        marker.messageId === messageId &&
+        sameParticipant(marker.participant, SELF),
+    );
+    if (existing) return;
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
