@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestProviderUnlinkFenceSerializesFirebaseUIDAndReleasesOnTerminalState(t *testing.T) {
@@ -244,6 +246,117 @@ func TestProviderOperationExpiryUsesDatabaseClockForStatusAndCompletion(t *testi
 	}
 	if _, err := store.FailProviderOperation(ctx, operation.OperationID, nonce, "cancelled"); !errors.Is(err, ErrAuthFlowExpired) {
 		t.Fatalf("link failure followed API clock instead of DB expiry: %v", err)
+	}
+}
+
+func TestCompleteProviderLinkWaitsForUIDFenceAndRechecksDatabaseExpiry(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	const (
+		firebaseUID     = "link-completion-fence-owner"
+		provider        = "github.com"
+		providerSubject = "link-completion-fence-subject"
+	)
+	owner, err := store.AutoRegister(ctx, "firebase", firebaseUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCredential(ctx, provider, providerSubject, owner.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	nonce := testNonce(t)
+	operation, err := store.BeginProviderOperation(ctx, owner.HumanID, firebaseUID, provider, "link", "account_settings", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model the unlink boundary while its Firebase deletion and local commit are
+	// in flight. Completion must wait here before it locks or inspects the link
+	// operation, then evaluate expiry using the database's current wall clock.
+	unlinkTx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unlinkTx.Rollback(ctx) }()
+	var unlinkPID int
+	if err := unlinkTx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&unlinkPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unlinkTx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "provider-unlink:"+firebaseUID); err != nil {
+		t.Fatal(err)
+	}
+
+	completion := make(chan error, 1)
+	go func() {
+		_, err := store.CompleteProviderLink(ctx, operation.OperationID, nonce, firebaseUID, providerSubject)
+		completion <- err
+	}()
+
+	var completionStartedAt time.Time
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	waiting := false
+	for !waiting {
+		select {
+		case err := <-completion:
+			t.Fatalf("link completion escaped the unlink fence before expiry: %v", err)
+		case <-poll.C:
+			err := store.pool.QueryRow(ctx, `SELECT a.xact_start
+				FROM pg_stat_activity a
+				WHERE a.datname=current_database()
+				  AND $1::integer=ANY(pg_blocking_pids(a.pid))
+				ORDER BY a.xact_start LIMIT 1`, unlinkPID).Scan(&completionStartedAt)
+			switch {
+			case err == nil:
+				waiting = true
+			case errors.Is(err, pgx.ErrNoRows):
+			default:
+				t.Fatal(err)
+			}
+		case <-deadline.C:
+			t.Fatal("link completion never waited on the unlink boundary")
+		}
+	}
+	// Expire the operation just after the waiting transaction began. Its
+	// transaction-start now() remains before this instant; clock_timestamp()
+	// after the UID lock is released is after it.
+	var expiresAt time.Time
+	if err := unlinkTx.QueryRow(ctx, `UPDATE provider_operations
+		SET expires_at=$2::timestamptz+interval '1 millisecond'
+		WHERE operation_id=$1 RETURNING expires_at`, operation.OperationID, completionStartedAt).Scan(&expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	var expiredAtDatabase bool
+	if err := unlinkTx.QueryRow(ctx, "SELECT clock_timestamp() > $1", expiresAt).Scan(&expiredAtDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if !expiredAtDatabase {
+		t.Fatalf("database clock did not cross fixture expiry: started=%s expires=%s", completionStartedAt, expiresAt)
+	}
+	if _, err := unlinkTx.Exec(ctx, `UPDATE credentials SET active=false, unlinked_at=clock_timestamp()
+		WHERE provider=$1 AND external_subject=$2 AND human_id=$3`, provider, providerSubject, owner.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := unlinkTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-completion:
+		if !errors.Is(err, ErrAuthFlowExpired) {
+			t.Fatalf("completion did not recheck expiry after UID fence: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("link completion remained blocked after unlink commit")
+	}
+	var active bool
+	if err := store.pool.QueryRow(ctx, `SELECT active FROM credentials
+		WHERE provider=$1 AND external_subject=$2 AND human_id=$3`, provider, providerSubject, owner.HumanID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("expired link completion reactivated the credential after unlink")
 	}
 }
 

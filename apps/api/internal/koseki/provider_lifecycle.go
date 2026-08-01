@@ -108,7 +108,7 @@ func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, non
 	var operation ProviderOperation
 	var unexpired bool
 	err = tx.QueryRow(ctx, `SELECT operation_id, human_id, firebase_uid, provider,
-		operation, status, decision_path, created_at, expires_at, expires_at > now()
+		operation, status, decision_path, created_at, expires_at, expires_at > clock_timestamp()
 		FROM provider_operations
 		WHERE operation_id=$1 AND nonce_hash=$2 FOR UPDATE`, operationID, nonceHash).Scan(
 		&operation.OperationID, &operation.HumanID, &operation.FirebaseUID,
@@ -259,7 +259,7 @@ func (s *Store) ActiveProviderSubject(ctx context.Context, humanID, provider str
 // credentials remain exclusively in the Firebase browser SDK and are never
 // accepted or persisted here.
 func (s *Store) CompleteProviderLink(ctx context.Context, operationID, nonce, firebaseUID, providerSubject string) (SecurityEvent, error) {
-	if providerSubject == "" || len(providerSubject) > 512 {
+	if firebaseUID == "" || len(firebaseUID) > 128 || providerSubject == "" || len(providerSubject) > 512 {
 		return SecurityEvent{}, ErrAuthProofMismatch
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -267,6 +267,11 @@ func (s *Store) CompleteProviderLink(ctx context.Context, operationID, nonce, fi
 		return SecurityEvent{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Match the operation-admission trigger's UID lock before sampling expiry.
+	// The transaction lock then preserves that ordering through the audit commit.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "provider-unlink:"+firebaseUID); err != nil {
+		return SecurityEvent{}, err
+	}
 	operation, err := scanProviderOperation(ctx, tx, operationID, nonce)
 	if err != nil {
 		return SecurityEvent{}, err
