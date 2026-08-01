@@ -79,14 +79,17 @@ func newKosekiDirectChatAuthorizer(store *koseki.Store) *kosekiDirectChatAuthori
 
 func (a *kosekiDirectChatAuthorizer) AuthorizeDirectChat(
 	ctx context.Context,
-	humanID, personalityAgentID string,
+	humanID,
+	personalityAgentID string,
+	operation func() error,
 ) error {
-	employerType, employerID, err := a.store.CurrentEmployer(ctx, personalityAgentID)
-	if err != nil {
-		return fmt.Errorf("resolve current employer: %w", err)
-	}
-	if employerType != koseki.EmployerHuman || employerID != humanID {
-		return errors.New("human is not the current Employer of this agent")
+	if err := a.store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		humanID,
+		personalityAgentID,
+		operation,
+	); err != nil {
+		return fmt.Errorf("authorize current Employer operation: %w", err)
 	}
 	return nil
 }
