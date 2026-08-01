@@ -218,6 +218,16 @@ type application struct {
 	closeErr      error
 }
 
+type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
+
+func (closers browserSessionConnectionClosers) CloseBrowserSession(sessionID string) {
+	for _, closer := range closers {
+		if closer != nil {
+			closer.CloseBrowserSession(sessionID)
+		}
+	}
+}
+
 func (a *application) Close() error {
 	if a == nil {
 		return nil
@@ -318,13 +328,13 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 	if authEnabled {
-		authServer.Connections = browser
 		authServer.RegisterRoutes(mux)
 	}
 	// The /messaging surface requires the control-plane database. Without a
 	// session verifier the routes stay mounted but fail closed (401), matching
 	// the direct-chat browser routes. sv is a concrete pointer, so guard the
 	// nil before it becomes a non-nil interface.
+	var messagingWS *messaging.WSServer
 	if database != nil {
 		var messagingSessions agentevents.UserSessionAuthorizer
 		if sv != nil {
@@ -336,10 +346,17 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
-		messagingWS := messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
+		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins
 		mux.Handle("GET /messaging/ws", messagingWS)
 		log.Print("messaging routes ready (REST + WS)")
+	}
+	if authEnabled {
+		closers := browserSessionConnectionClosers{browser}
+		if messagingWS != nil {
+			closers = append(closers, messagingWS)
+		}
+		authServer.Connections = closers
 	}
 	localControl, enabled, err := localControlServerFromEnvWithDB(runtime, databasePool)
 	if err != nil {
