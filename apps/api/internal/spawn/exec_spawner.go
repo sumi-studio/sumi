@@ -35,17 +35,34 @@ func NewExecSpawner(binaryPath string, sharedEnv map[string]string) (*ExecSpawne
 }
 
 func (e *ExecSpawner) Spawn(ctx context.Context, config AgentRuntimeConfig) (Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for _, dir := range []string{config.StateDir, config.WorkspaceDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create dir %s: %w", dir, err)
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
-	cmd := exec.CommandContext(ctx, e.BinaryPath)
+	// The provisioner owns runtime lifetime explicitly through Process.Stop.
+	// CommandContext would incorrectly kill a successfully-started agent when
+	// the bounded startup context expires or its browser caller returns.
+	cmd := exec.Command(e.BinaryPath)
 	cmd.Dir = config.WorkspaceDir
 	cmd.Env = buildAgentEnv(config, e.SharedEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start agent %s: %w", config.AgentID, err)
+	}
+	if err := ctx.Err(); err != nil {
+		process := &execProcess{cmd: cmd}
+		_ = process.Stop()
+		return nil, err
 	}
 	log.Printf("spawn: started agent %s (pid %d, warmth %s)", config.AgentID, cmd.Process.Pid, config.Warmth)
 	return &execProcess{cmd: cmd}, nil

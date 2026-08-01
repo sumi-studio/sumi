@@ -2,6 +2,7 @@ package spawn
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -56,6 +57,41 @@ func (s *fakeSpawner) config(agentID string) AgentRuntimeConfig {
 		}
 	}
 	return AgentRuntimeConfig{}
+}
+
+type blockingSpawner struct {
+	mu      sync.Mutex
+	spawns  int
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingSpawner() *blockingSpawner {
+	return &blockingSpawner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (s *blockingSpawner) Spawn(ctx context.Context, _ AgentRuntimeConfig) (Process, error) {
+	s.mu.Lock()
+	s.spawns++
+	if s.spawns == 1 {
+		close(s.started)
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.release:
+		return &fakeProcess{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockingSpawner) spawnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spawns
 }
 
 type fakeResolver struct {
@@ -114,6 +150,45 @@ func TestEnsureRunningSpawnsPerAgent(t *testing.T) {
 	}
 	if c1.Bearer != "bearer/a1" {
 		t.Fatalf("a1 derived bearer: got %q want bearer/a1", c1.Bearer)
+	}
+}
+
+func TestEnsureRunningCoalescesConcurrentStarts(t *testing.T) {
+	spawner := newBlockingSpawner()
+	mgr, err := New(Config{
+		Spawner:      spawner,
+		Resolver:     fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer: "bearer",
+		SharedNonce:  "nonce",
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	leaderResult := make(chan error, 1)
+	go func() {
+		leaderResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+
+	waiterContext, cancelWaiter := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWaiter()
+	if err := mgr.EnsureRunning(waiterContext, "a1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("concurrent waiter error = %v, want context deadline exceeded", err)
+	}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("concurrent EnsureRunning calls spawned %d processes, want 1", got)
+	}
+
+	close(spawner.release)
+	if err := <-leaderResult; err != nil {
+		t.Fatalf("leader EnsureRunning: %v", err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "a1"); err != nil {
+		t.Fatalf("EnsureRunning after start: %v", err)
+	}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("running agent spawned again: got %d starts, want 1", got)
 	}
 }
 

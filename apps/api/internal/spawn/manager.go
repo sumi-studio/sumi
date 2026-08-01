@@ -44,8 +44,9 @@ type Process interface {
 	Stop() error
 }
 
-// ProcessSpawner starts an agent process for the given config. Implementations
-// are pluggable so the lifecycle logic is testable without a real binary.
+// ProcessSpawner starts an agent process for the given config. The context
+// bounds startup only; canceling it after Spawn returns must not stop the
+// returned process. Runtime lifetime is owned through Process.Stop.
 type ProcessSpawner interface {
 	Spawn(ctx context.Context, config AgentRuntimeConfig) (Process, error)
 }
@@ -82,6 +83,7 @@ type Manager struct {
 	cfg      Config
 	mu       sync.Mutex
 	running  map[string]*agentRuntime
+	starting map[string]*startAttempt
 	now      func() time.Time
 	idleStop time.Duration
 	skip     map[string]bool
@@ -91,6 +93,11 @@ type agentRuntime struct {
 	process    Process
 	lastActive time.Time
 	warmth     string
+}
+
+type startAttempt struct {
+	done chan struct{}
+	err  error
 }
 
 // New returns a Manager. A nil Spawner or Resolver is an error.
@@ -115,6 +122,7 @@ func New(cfg Config) (*Manager, error) {
 	return &Manager{
 		cfg:      cfg,
 		running:  make(map[string]*agentRuntime),
+		starting: make(map[string]*startAttempt),
 		now:      now,
 		idleStop: cfg.IdleTimeout,
 		skip:     skip,
@@ -134,18 +142,42 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 		m.mu.Unlock()
 		return nil
 	}
+	if attempt, ok := m.starting[agentID]; ok {
+		m.mu.Unlock()
+		select {
+		case <-attempt.done:
+			return attempt.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	attempt := &startAttempt{done: make(chan struct{})}
+	m.starting[agentID] = attempt
 	m.mu.Unlock()
 
+	runtime, err := m.startRuntime(ctx, agentID)
+	m.mu.Lock()
+	if err == nil {
+		m.running[agentID] = runtime
+	}
+	attempt.err = err
+	delete(m.starting, agentID)
+	close(attempt.done)
+	m.mu.Unlock()
+	return err
+}
+
+func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRuntime, error) {
 	warmth, err := m.cfg.Resolver.AgentWarmth(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("resolve warmth for %s: %w", agentID, err)
+		return nil, fmt.Errorf("resolve warmth for %s: %w", agentID, err)
 	}
 	if warmth == "" {
 		warmth = WarmthCold
 	}
 	wrappingKey, err := m.cfg.Resolver.AgentWrappingKey(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("resolve wrapping key for %s: %w", agentID, err)
+		return nil, fmt.Errorf("resolve wrapping key for %s: %w", agentID, err)
 	}
 	now := m.now()
 	config := AgentRuntimeConfig{
@@ -166,12 +198,9 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 	}
 	process, err := m.cfg.Spawner.Spawn(ctx, config)
 	if err != nil {
-		return fmt.Errorf("spawn agent %s: %w", agentID, err)
+		return nil, fmt.Errorf("spawn agent %s: %w", agentID, err)
 	}
-	m.mu.Lock()
-	m.running[agentID] = &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}
-	m.mu.Unlock()
-	return nil
+	return &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}, nil
 }
 
 // Touch records activity for a running agent (an open direct-chat connection).
