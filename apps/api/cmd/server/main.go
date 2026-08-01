@@ -251,7 +251,9 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	closeOnError := func() {
 		_ = store.Close()
-		database.Close()
+		if database != nil {
+			database.Close()
+		}
 	}
 
 	mux, browser, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserOrigins)

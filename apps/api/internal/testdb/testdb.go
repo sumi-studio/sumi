@@ -31,7 +31,6 @@ func Create(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("connect maintenance pool: %v", err)
 	}
-	defer maintenance.Close()
 
 	suffix := make([]byte, 4)
 	if _, err := rand.Read(suffix); err != nil {
@@ -58,6 +57,7 @@ func Create(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(func() {
 		pool.Close()
+		defer maintenance.Close()
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer dropCancel()
 		if _, err := maintenance.Exec(dropCtx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s" WITH (FORCE)`, testDBName)); err != nil {

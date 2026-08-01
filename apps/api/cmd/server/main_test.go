@@ -388,7 +388,15 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 	client := &fakeFirebaseIDTokenClient{token: &firebaseauth.Token{
 		UID:      "firebase-user",
-		Firebase: firebaseauth.FirebaseInfo{Tenant: "firebase-tenant"},
+		AuthTime: time.Now().Add(-time.Minute).Unix(),
+		Claims: map[string]interface{}{
+			"email":          "Human@Example.com",
+			"email_verified": true,
+		},
+		Firebase: firebaseauth.FirebaseInfo{
+			Tenant: "firebase-tenant", SignInProvider: "github.com",
+			Identities: map[string]interface{}{"github.com": []interface{}{"github-subject"}},
+		},
 	}}
 	verifier := &firebaseAdminIDTokenVerifier{client: client}
 	identity, err := verifier.VerifyIDToken(context.Background(), "id-token")
@@ -400,6 +408,12 @@ func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 	}
 	if identity.UID != "firebase-user" || identity.TenantID != "firebase-tenant" {
 		t.Fatalf("unexpected identity: %+v", identity)
+	}
+	if identity.Email != "Human@Example.com" || !identity.EmailVerified ||
+		identity.SignInProvider != "github.com" ||
+		len(identity.ProviderSubjects["github.com"]) != 1 ||
+		identity.ProviderSubjects["github.com"][0] != "github-subject" || identity.AuthTime.IsZero() {
+		t.Fatalf("verified proof claims were not preserved: %+v", identity)
 	}
 }
 
