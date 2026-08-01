@@ -25,7 +25,7 @@ func (stubSessions) VerifySession(_ context.Context, cookie string) (agentevents
 	if cookie == "" || strings.HasPrefix(cookie, "revoked:") {
 		return agentevents.UserSessionClaims{}, fmt.Errorf("invalid session")
 	}
-	return agentevents.UserSessionClaims{TenantID: "tenant-1", HumanID: cookie}, nil
+	return agentevents.UserSessionClaims{TenantID: "tenant-1", UserID: cookie}, nil
 }
 
 func (stubSessions) AuthorizeSession(ctx context.Context, claims agentevents.UserSessionClaims, op func() error) error {

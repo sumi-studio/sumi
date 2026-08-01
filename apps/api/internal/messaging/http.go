@@ -222,7 +222,7 @@ func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (ParticipantRef,
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return ParticipantRef{}, none, false
 	}
-	viewer := Human(claims.HumanID)
+	viewer := Human(claims.UserID)
 	if err := viewer.Validate(); err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return ParticipantRef{}, none, false

@@ -101,7 +101,7 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return
 	}
-	viewer := Human(claims.HumanID)
+	viewer := Human(claims.UserID)
 	if err := viewer.Validate(); err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid_session")
 		return

@@ -13,6 +13,7 @@ package messaging
 import (
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
@@ -50,7 +51,11 @@ func PersonalityAgent(agentID string) ParticipantRef {
 func (p ParticipantRef) Validate() error {
 	switch p.Kind {
 	case KindHuman:
-		return agentevents.ValidateHumanID(p.ID)
+		id, err := uuid.Parse(p.ID)
+		if err != nil || id.String() != p.ID || id.Version() != 7 || id.Variant() != uuid.RFC4122 {
+			return fmt.Errorf("human_id must be a canonical lowercase UUIDv7")
+		}
+		return nil
 	case KindPersonalityAgent:
 		return agentevents.ValidatePersonalityAgentID(p.ID)
 	default:

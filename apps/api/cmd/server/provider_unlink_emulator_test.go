@@ -124,7 +124,7 @@ func TestFirebaseEmulatorUnlinkGuardRequiresLiveEmailFamilyAndSumiProof(t *testi
 	controller := newKosekiAuthFlowController(store, "local", lifecycle)
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
-	claims := agentevents.UserSessionClaims{TenantID: "local", HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
 	identity := agentevents.FirebaseIdentity{
 		UID: uid, AuthTime: now, SignInProvider: "google.com",
 		ProviderSubjects: map[string][]string{"google.com": {"google-subject"}},
@@ -199,7 +199,7 @@ func TestFirebaseEmulatorUnlinkReconcilesRemoteAppliedDatabaseLost(t *testing.T)
 		UID: uid, AuthTime: time.Now().UTC(), SignInProvider: "google.com",
 		ProviderSubjects: map[string][]string{"google.com": {"google-subject"}},
 	}
-	claims := agentevents.UserSessionClaims{TenantID: "local", HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
 	pendingStatus, err := controller.StatusProviderOperation(ctx, claims, agentevents.ProviderOperationStatusRequest{OperationID: pending.OperationID, Nonce: nonce})
 	if err != nil || pendingStatus.Status != "pending" || pendingStatus.Outcome != "provider_operation_pending" {
 		t.Fatalf("expired durable saga status: %+v %v", pendingStatus, err)
@@ -261,7 +261,7 @@ func TestFirebaseEmulatorLinkNonceReplayCannotEscapePendingUnlinkFence(t *testin
 
 	lifecycle := &firebaseAdminProviderLifecycle{client: client}
 	controller := newKosekiAuthFlowController(store, "local", lifecycle)
-	claims := agentevents.UserSessionClaims{TenantID: "local", HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
 	identity := agentevents.FirebaseIdentity{UID: uid}
 	recovered, err := controller.StartProviderOperation(ctx, claims, agentevents.StartProviderOperationRequest{
 		Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: terminalNonce,
@@ -309,7 +309,7 @@ func TestFirebaseEmulatorConcurrentUnlinksNeverRemoveLastSupportedMethod(t *test
 	controller := newKosekiAuthFlowController(store, "local", lifecycle)
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
-	claims := agentevents.UserSessionClaims{TenantID: "local", HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
 	type unlinkAttempt struct {
 		provider string
 		identity agentevents.FirebaseIdentity
