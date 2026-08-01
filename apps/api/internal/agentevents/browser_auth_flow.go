@@ -57,6 +57,11 @@ type FailProviderOperationRequest struct {
 	Outcome     string `json:"outcome"`
 }
 
+type ProviderOperationStatusRequest struct {
+	OperationID string `json:"operation_id"`
+	Nonce       string `json:"nonce"`
+}
+
 type ProviderOperationResult struct {
 	OperationID              string    `json:"operation_id,omitempty"`
 	Outcome                  string    `json:"outcome"`
@@ -67,13 +72,29 @@ type ProviderOperationResult struct {
 	NoticeRequired           bool      `json:"notice_required,omitempty"`
 }
 
+type ProviderOperationStatusResult struct {
+	OperationID              string     `json:"operation_id"`
+	Provider                 string     `json:"provider"`
+	Operation                string     `json:"operation"`
+	Status                   string     `json:"status"`
+	Outcome                  string     `json:"outcome"`
+	ClientOperation          string     `json:"client_operation,omitempty"`
+	CreatedAt                time.Time  `json:"created_at"`
+	CompletionTokenNotBefore time.Time  `json:"completion_token_not_before"`
+	ExpiresAt                time.Time  `json:"expires_at"`
+	CompletedAt              *time.Time `json:"completed_at,omitempty"`
+	NoticeRequired           bool       `json:"notice_required"`
+}
+
 var (
-	ErrBrowserAuthFlowInvalid  = errors.New("invalid authentication flow")
-	ErrBrowserAuthFlowExpired  = errors.New("authentication flow expired")
-	ErrBrowserAuthFlowConsumed = errors.New("authentication flow consumed")
-	ErrBrowserAuthFlowProof    = errors.New("authentication proof mismatch")
-	ErrBrowserAuthRecentReauth = errors.New("recent reauthentication required")
-	ErrBrowserAuthLastMethod   = errors.New("last login method")
+	ErrBrowserAuthFlowInvalid         = errors.New("invalid authentication flow")
+	ErrBrowserAuthFlowExpired         = errors.New("authentication flow expired")
+	ErrBrowserAuthFlowConsumed        = errors.New("authentication flow consumed")
+	ErrBrowserAuthFlowProof           = errors.New("authentication proof mismatch")
+	ErrBrowserAuthRecentReauth        = errors.New("recent reauthentication required")
+	ErrBrowserAuthLastMethod          = errors.New("last login method")
+	ErrBrowserAuthProviderPending     = errors.New("provider operation pending")
+	ErrBrowserAuthProviderUnavailable = errors.New("provider operation unavailable")
 )
 
 // BrowserAuthFlowController owns persisted intent/proof transitions. It never
@@ -88,6 +109,7 @@ type BrowserAuthFlowController interface {
 	StartProviderOperation(ctx context.Context, claims UserSessionClaims, request StartProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	CompleteProviderOperation(ctx context.Context, claims UserSessionClaims, request CompleteProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	FailProviderOperation(ctx context.Context, claims UserSessionClaims, request FailProviderOperationRequest) (ProviderOperationResult, error)
+	StatusProviderOperation(ctx context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error)
 }
 
 func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Request) {
@@ -272,6 +294,30 @@ func (s *BrowserAuthServer) serveFailProviderOperation(w http.ResponseWriter, r 
 	writeBrowserAuthJSON(w, http.StatusOK, result)
 }
 
+func (s *BrowserAuthServer) serveProviderOperationStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
+		return
+	}
+	claims, ok := s.authenticatedClaims(w, r)
+	if !ok {
+		return
+	}
+	var request ProviderOperationStatusRequest
+	if !decodeAuthJSON(w, r, &request) {
+		return
+	}
+	if request.OperationID == "" || request.Nonce == "" {
+		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	result, err := s.Flows.StatusProviderOperation(r.Context(), claims, request)
+	if err != nil {
+		writeFlowError(w, err)
+		return
+	}
+	writeBrowserAuthJSON(w, http.StatusOK, result)
+}
+
 func decodeAuthJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	if !hasJSONContentType(r.Header.Get("Content-Type")) {
 		writeBrowserAuthError(w, http.StatusUnsupportedMediaType, "application/json required")
@@ -302,6 +348,10 @@ func writeFlowError(w http.ResponseWriter, err error) {
 		status, code = http.StatusForbidden, "recent_reauth_required"
 	case errors.Is(err, ErrBrowserAuthLastMethod):
 		status, code = http.StatusConflict, "last_login_method"
+	case errors.Is(err, ErrBrowserAuthProviderPending):
+		status, code = http.StatusConflict, "provider_operation_pending"
+	case errors.Is(err, ErrBrowserAuthProviderUnavailable):
+		status, code = http.StatusServiceUnavailable, "provider_unavailable"
 	}
 	writeBrowserAuthJSON(w, status, map[string]string{"error": code})
 }

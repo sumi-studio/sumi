@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -34,7 +35,11 @@ const (
 var (
 	ErrCredentialAlreadyBound = errors.New("credential is already bound to a Human")
 	ErrHumanNotFound          = errors.New("human not found")
+	ErrNotCurrentEmployer     = errors.New("human is not the current Employer of this agent")
+	ErrNoCurrentEmployment    = errors.New("agent has no current employment")
 )
+
+const employmentAuthorityLockDomain = "sumi:employment-authority:v1:"
 
 // Store is the trusted provisioning boundary for the 戸籍. All minting and
 // credential binding flows through it; no other component writes the registry.
@@ -160,6 +165,121 @@ func (s *Store) CurrentEmployer(ctx context.Context, agentID string) (string, st
 		return "", "", err
 	}
 	return employerType, employerID, nil
+}
+
+// AuthorizeCurrentHumanEmployer holds a shared, operation-scoped authority
+// lease for one private direct-chat action. TransferEmployment takes the
+// matching exclusive lease, so a transfer either completes before this check
+// or waits until operation returns; it cannot land between them.
+func (s *Store) AuthorizeCurrentHumanEmployer(
+	ctx context.Context,
+	humanID,
+	agentID string,
+	operation func() error,
+) error {
+	if operation == nil {
+		return errors.New("current Employer authorization operation is required")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin current Employer authorization: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockEmploymentAuthority(ctx, tx, agentID, true); err != nil {
+		return err
+	}
+	var employerType, employerID string
+	err = tx.QueryRow(
+		ctx,
+		"SELECT employer_type, employer_id FROM employments WHERE agent_id = $1 AND ended_at IS NULL",
+		agentID,
+	).Scan(&employerType, &employerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotCurrentEmployer
+	}
+	if err != nil {
+		return fmt.Errorf("resolve current Employer under authority lease: %w", err)
+	}
+	if employerType != EmployerHuman || employerID != humanID {
+		return ErrNotCurrentEmployer
+	}
+	if err := operation(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("release current Employer authority lease: %w", err)
+	}
+	return nil
+}
+
+// TransferEmployment closes the active employment and opens its successor
+// under the exclusive counterpart of the direct-chat authority lease.
+func (s *Store) TransferEmployment(
+	ctx context.Context,
+	agentID,
+	employerType,
+	employerID string,
+) error {
+	if employerType != EmployerHuman && employerType != EmployerWorkspace {
+		return errors.New("unsupported Employer type")
+	}
+	if employerType == EmployerHuman {
+		if err := s.humanExists(ctx, employerID); err != nil {
+			return err
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin employment transfer: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := lockEmploymentAuthority(ctx, tx, agentID, false); err != nil {
+		return err
+	}
+	result, err := tx.Exec(
+		ctx,
+		"UPDATE employments SET ended_at = now() WHERE agent_id = $1 AND ended_at IS NULL",
+		agentID,
+	)
+	if err != nil {
+		return fmt.Errorf("close current employment: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrNoCurrentEmployment
+	}
+	if _, err := tx.Exec(
+		ctx,
+		"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, $2, $3)",
+		agentID,
+		employerType,
+		employerID,
+	); err != nil {
+		return fmt.Errorf("open successor employment: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit employment transfer: %w", err)
+	}
+	return nil
+}
+
+func lockEmploymentAuthority(
+	ctx context.Context,
+	tx pgx.Tx,
+	agentID string,
+	shared bool,
+) error {
+	statement := "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+	if shared {
+		statement = "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+	}
+	if _, err := tx.Exec(
+		ctx,
+		statement,
+		employmentAuthorityLockDomain+agentID,
+	); err != nil {
+		return fmt.Errorf("lock employment authority: %w", err)
+	}
+	return nil
 }
 
 // ListAgents returns the PersonalityAgentIds of all agents registered in the

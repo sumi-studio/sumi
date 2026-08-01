@@ -96,6 +96,25 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 	return ingress, nil
 }
 
+func (h *UserCommandIngress) authorizeDirectChat(
+	ctx context.Context,
+	claims UserSessionClaims,
+	operation func() error,
+) error {
+	if operation == nil {
+		return errors.New("direct-chat authorization operation is required")
+	}
+	if h.Authorizer == nil {
+		return operation()
+	}
+	return h.Authorizer.AuthorizeDirectChat(
+		ctx,
+		claims.UserID,
+		claims.PersonalityAgentID,
+		operation,
+	)
+}
+
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -122,11 +141,9 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
-	if h.Authorizer != nil {
-		if err := h.Authorizer.AuthorizeDirectChat(r.Context(), claims.UserID, claims.PersonalityAgentID); err != nil {
-			http.Error(w, "not authorized for this agent", http.StatusForbidden)
-			return
-		}
+	if err := h.authorizeDirectChat(r.Context(), claims, func() error { return nil }); err != nil {
+		http.Error(w, "not authorized for this agent", http.StatusForbidden)
+		return
 	}
 
 	raw, err := readLimitedBody(r.Body, h.MaxBytes)
@@ -167,19 +184,27 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var env CommandEnvelope
-	operationCalled := false
+	sessionLeaseEntered := false
+	appendCalled := false
 	operationContext, cancelOperation := browserSessionOperationContext(r.Context(), claims)
 	defer cancelOperation()
 	err = h.Sessions.AuthorizeSession(r.Context(), claims, func() error {
-		operationCalled = true
-		var appendErr error
-		env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
-		return appendErr
+		sessionLeaseEntered = true
+		return h.authorizeDirectChat(r.Context(), claims, func() error {
+			appendCalled = true
+			var appendErr error
+			env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
+			return appendErr
+		})
 	})
 	if err != nil {
-		if !operationCalled ||
+		if !sessionLeaseEntered ||
 			(errors.Is(err, context.DeadlineExceeded) && !time.Now().Before(claims.expiresAt)) {
 			http.Error(w, "invalid session", http.StatusUnauthorized)
+			return
+		}
+		if !appendCalled {
+			http.Error(w, "not authorized for this agent", http.StatusForbidden)
 			return
 		}
 		if errors.Is(err, errBrowserRuntimeUnavailable) {

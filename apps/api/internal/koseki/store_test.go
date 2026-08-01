@@ -103,6 +103,87 @@ func TestMintSecretaryRecordsAgentAndInitialEmployment(t *testing.T) {
 	}
 }
 
+func TestEmployerAuthorityLeaseSerializesTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool := connectTestPool(t, ctx)
+	store := New(pool)
+	first, err := store.AutoRegister(ctx, "firebase", "authority-lease-first")
+	if err != nil {
+		t.Fatalf("auto-register first Human: %v", err)
+	}
+	second, err := store.AutoRegister(ctx, "firebase", "authority-lease-second")
+	if err != nil {
+		t.Fatalf("auto-register second Human: %v", err)
+	}
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	authorized := make(chan error, 1)
+	go func() {
+		authorized <- store.AuthorizeCurrentHumanEmployer(
+			ctx,
+			first.HumanID,
+			first.AgentID,
+			func() error {
+				close(operationStarted)
+				select {
+				case <-releaseOperation:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		)
+	}()
+	select {
+	case <-operationStarted:
+	case <-ctx.Done():
+		t.Fatalf("Employer-authorized operation did not start: %v", ctx.Err())
+	}
+
+	blockedCtx, blockedCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	err = store.TransferEmployment(
+		blockedCtx,
+		first.AgentID,
+		EmployerHuman,
+		second.HumanID,
+	)
+	blockedCancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		close(releaseOperation)
+		t.Fatalf("transfer crossed active Employer authority lease: %v", err)
+	}
+	close(releaseOperation)
+	if err := <-authorized; err != nil {
+		t.Fatalf("Employer-authorized operation: %v", err)
+	}
+	if err := store.TransferEmployment(
+		ctx,
+		first.AgentID,
+		EmployerHuman,
+		second.HumanID,
+	); err != nil {
+		t.Fatalf("transfer after authority release: %v", err)
+	}
+	if err := store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		first.HumanID,
+		first.AgentID,
+		func() error { return nil },
+	); !errors.Is(err, ErrNotCurrentEmployer) {
+		t.Fatalf("former Employer authority after transfer: %v", err)
+	}
+	if err := store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		second.HumanID,
+		first.AgentID,
+		func() error { return nil },
+	); err != nil {
+		t.Fatalf("successor Employer authority after transfer: %v", err)
+	}
+}
+
 func TestCredentialBindingRejectsRebindAndDoubleBind(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

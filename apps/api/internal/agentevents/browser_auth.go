@@ -48,15 +48,22 @@ type IdentityBindingResolver interface {
 	ResolveIdentity(ctx context.Context, identity FirebaseIdentity) (UserSessionClaims, error)
 }
 
-// DirectChatAuthorizer gates the 私信 Surface (raw direct chat) on the calling
-// Human being the current Employer of the target agent (ADR 0009 §5). A nil
-// authorizer permits all verified sessions, preserving the legacy single-user
-// contract for tests and the static binding fallback.
+// DirectChatAuthorizer holds Current-Employer authority across one private
+// direct-chat operation (ADR 0009 §5). Employment transfer must serialize with
+// the operation rather than racing a point-in-time check. A nil authorizer
+// permits all verified sessions, preserving the static binding fallback.
 type DirectChatAuthorizer interface {
-	AuthorizeDirectChat(ctx context.Context, humanID, personalityAgentID string) error
+	AuthorizeDirectChat(
+		ctx context.Context,
+		humanID,
+		personalityAgentID string,
+		operation func() error,
+	) error
 }
 
-// DirectChatSpawner lazily starts an agent runtime on 呼びかけ (ADR 0010). A nil
+// DirectChatSpawner lazily starts an agent runtime on 呼びかけ (ADR 0010). The
+// EnsureRunning context bounds provisioning only; successful runtime lifetime
+// belongs to the provisioner. Calls for one agent must be idempotent. A nil
 // spawner disables lazy spawn (the agent is assumed already running).
 type DirectChatSpawner interface {
 	EnsureRunning(ctx context.Context, agentID string) error
@@ -188,6 +195,7 @@ func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /auth/providers/operations", s.serveStartProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/complete", s.serveCompleteProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/fail", s.serveFailProviderOperation)
+		mux.HandleFunc("POST /auth/providers/operations/status", s.serveProviderOperationStatus)
 	}
 	mux.HandleFunc("GET /auth/session", s.serveSessionStatus)
 	mux.HandleFunc("POST /auth/logout", s.serveLogout)

@@ -2,6 +2,7 @@ package spawn
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -154,6 +155,65 @@ func (s *fakeSpawner) config(agentID string) AgentRuntimeConfig {
 	return AgentRuntimeConfig{}
 }
 
+type blockingSpawner struct {
+	mu      sync.Mutex
+	spawns  int
+	started chan struct{}
+	release chan struct{}
+}
+
+type lateSuccessSpawner struct {
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	process  *fakeProcess
+}
+
+func newLateSuccessSpawner() *lateSuccessSpawner {
+	return &lateSuccessSpawner{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		process:  &fakeProcess{},
+	}
+}
+
+func (s *lateSuccessSpawner) Spawn(ctx context.Context, _ AgentRuntimeConfig) (Process, error) {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	<-s.release
+	return s.process, nil
+}
+
+func newBlockingSpawner() *blockingSpawner {
+	return &blockingSpawner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (s *blockingSpawner) Spawn(ctx context.Context, _ AgentRuntimeConfig) (Process, error) {
+	s.mu.Lock()
+	s.spawns++
+	if s.spawns == 1 {
+		close(s.started)
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.release:
+		return &fakeProcess{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *blockingSpawner) spawnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spawns
+}
+
 type fakeResolver struct {
 	keys   map[string]string
 	warmth map[string]string
@@ -213,162 +273,121 @@ func TestEnsureRunningSpawnsPerAgent(t *testing.T) {
 	}
 }
 
-func TestEnsureRunningSingleflightsConcurrentCallsPerPAID(t *testing.T) {
-	spawner := newFakeSpawner()
+func TestEnsureRunningCoalescesConcurrentStarts(t *testing.T) {
+	spawner := newBlockingSpawner()
 	mgr, err := New(Config{
-		Spawner:       spawner,
-		Resolver:      fakeResolver{},
-		SharedBearer:  "bearer",
-		SharedNonce:   "nonce",
-		StateRoot:     t.TempDir(),
-		WorkspaceRoot: t.TempDir(),
+		Spawner:      spawner,
+		Resolver:     fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer: "bearer",
+		SharedNonce:  "nonce",
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("new manager: %v", err)
 	}
-	const callers = 32
-	const agentID = "singleflight-agent"
-	var wait sync.WaitGroup
-	errs := make(chan error, callers)
-	for range callers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			errs <- mgr.EnsureRunning(context.Background(), agentID)
-		}()
+
+	leaderResult := make(chan error, 1)
+	go func() {
+		leaderResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+
+	waiterContext, cancelWaiter := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWaiter()
+	if err := mgr.EnsureRunning(waiterContext, "a1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("concurrent waiter error = %v, want context deadline exceeded", err)
 	}
-	wait.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("concurrent EnsureRunning calls spawned %d processes, want 1", got)
 	}
-	spawner.mu.Lock()
-	defer spawner.mu.Unlock()
-	if got := len(spawner.spawns); got != 1 {
-		t.Fatalf("spawned %d processes for one PAID, want 1", got)
+
+	close(spawner.release)
+	if err := <-leaderResult; err != nil {
+		t.Fatalf("leader EnsureRunning: %v", err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "a1"); err != nil {
+		t.Fatalf("EnsureRunning after start: %v", err)
+	}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("running agent spawned again: got %d starts, want 1", got)
 	}
 }
 
-func TestEnsureRunningWaitsForExactPriorStopBeforeReplacement(t *testing.T) {
-	first := &blockingStopProcess{
-		done:        make(chan struct{}),
-		stopEntered: make(chan struct{}),
-		releaseStop: make(chan struct{}),
-	}
-	spawner := &replacementRaceSpawner{first: first}
+func TestStopAllCancelsBlockedStartAndClosesAdmission(t *testing.T) {
+	spawner := newBlockingSpawner()
 	mgr, err := New(Config{
-		Spawner:       spawner,
-		Resolver:      fakeResolver{},
-		StateRoot:     t.TempDir(),
-		WorkspaceRoot: t.TempDir(),
+		Spawner:      spawner,
+		Resolver:     fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer: "bearer",
+		SharedNonce:  "nonce",
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	const paid = "0198f0f4-9b72-7000-8000-000000000001"
-	if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
-		t.Fatal(err)
-	}
-	stopDone := make(chan error, 1)
-	go func() { stopDone <- mgr.Stop(paid) }()
-	<-first.stopEntered
-
-	replacementDone := make(chan error, 1)
-	go func() { replacementDone <- mgr.EnsureRunning(context.Background(), paid) }()
-	select {
-	case err := <-replacementDone:
-		t.Fatalf("replacement escaped the prior stop/join: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if got := spawner.count(); got != 1 {
-		t.Fatalf("spawned replacement before prior stop completed: %d", got)
+		t.Fatalf("new manager: %v", err)
 	}
 
-	close(first.releaseStop)
-	if err := <-stopDone; err != nil {
-		t.Fatal(err)
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+	if err := mgr.StopAll(); err != nil {
+		t.Fatalf("StopAll: %v", err)
 	}
-	if err := <-replacementDone; err != nil {
-		t.Fatal(err)
+	if err := <-startResult; !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("canceled start error = %v, want ErrManagerClosed", err)
 	}
-	if got := spawner.count(); got != 2 || !mgr.Running(paid) {
-		t.Fatalf("replacement did not become the sole running epoch: spawns=%d running=%v", got, mgr.Running(paid))
+	if err := mgr.EnsureRunning(context.Background(), "a1"); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("post-shutdown start error = %v, want ErrManagerClosed", err)
+	}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("shutdown admitted another start: got %d starts, want 1", got)
+	}
+	if mgr.Running("a1") {
+		t.Fatal("canceled start was published after StopAll")
 	}
 }
 
-func TestStopAllJoinsThreePAIDsConcurrentlyBeforeRestart(t *testing.T) {
-	spawner := &parallelStopSpawner{entered: make(chan string, 3), release: make(chan struct{})}
-	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
+func TestStopAllStopsLateSuccessfulProcessAfterWaitTimeout(t *testing.T) {
+	spawner := newLateSuccessSpawner()
+	mgr, err := New(Config{
+		Spawner:         spawner,
+		Resolver:        fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer:    "bearer",
+		SharedNonce:     "nonce",
+		ShutdownTimeout: 25 * time.Millisecond,
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("new manager: %v", err)
 	}
-	paids := []string{"agent-a", "agent-b", "agent-c"}
-	for _, paid := range paids {
-		if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
-			t.Fatal(err)
-		}
-	}
-	stopped := make(chan error, 1)
-	go func() { stopped <- mgr.StopAll() }()
-	seen := make(map[string]bool, 3)
-	for range paids {
-		select {
-		case paid := <-spawner.entered:
-			seen[paid] = true
-		case <-time.After(time.Second):
-			t.Fatalf("StopAll serialized or stalled before all PAIDs entered teardown: %v", seen)
-		}
-	}
-	close(spawner.release)
-	if err := <-stopped; err != nil {
-		t.Fatal(err)
-	}
-	for _, paid := range paids {
-		if mgr.Running(paid) {
-			t.Fatalf("%s remained running after StopAll", paid)
-		}
-		if err := mgr.EnsureRunning(context.Background(), paid); err != nil {
-			t.Fatal(err)
-		}
-		if !mgr.Running(paid) {
-			t.Fatalf("%s did not restart after the joined shutdown", paid)
-		}
-	}
-	spawner.mu.Lock()
-	defer spawner.mu.Unlock()
-	if spawner.spawns != 6 {
-		t.Fatalf("restart spawn count=%d, want 6", spawner.spawns)
-	}
-}
 
-func TestStopAllJoinsBlockedStartAndStopsCommittedProcess(t *testing.T) {
-	process := &fakeProcess{done: make(chan struct{})}
-	spawner := &blockingSpawnSpawner{entered: make(chan struct{}), release: make(chan struct{}), process: process}
-	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{}})
-	if err != nil {
-		t.Fatal(err)
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+	if err := mgr.StopAll(); !errors.Is(err, ErrStartShutdownTimeout) {
+		t.Fatalf("StopAll error = %v, want ErrStartShutdownTimeout", err)
 	}
-	ensureDone := make(chan error, 1)
-	go func() { ensureDone <- mgr.EnsureRunning(context.Background(), "starting-agent") }()
-	<-spawner.entered
-	stopDone := make(chan error, 1)
-	go func() { stopDone <- mgr.StopAll() }()
 	select {
-	case err := <-stopDone:
-		t.Fatalf("StopAll returned before in-flight Spawn committed: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-spawner.canceled:
+	default:
+		t.Fatal("StopAll did not cancel the manager-owned start context")
 	}
+	if err := mgr.EnsureRunning(context.Background(), "a1"); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("post-shutdown start error = %v, want ErrManagerClosed", err)
+	}
+
 	close(spawner.release)
-	if err := <-ensureDone; err != nil {
-		t.Fatal(err)
+	if err := <-startResult; !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("late successful start error = %v, want ErrManagerClosed", err)
 	}
-	if err := <-stopDone; err != nil {
-		t.Fatal(err)
+	if !spawner.process.isStopped() {
+		t.Fatal("late successful process survived StopAll")
 	}
-	if !process.isStopped() || mgr.Running("starting-agent") {
-		t.Fatalf("process committed after StopAll: stopped=%v running=%v", process.isStopped(), mgr.Running("starting-agent"))
+	if mgr.Running("a1") {
+		t.Fatal("late successful process was registered after StopAll")
+	}
+	if err := mgr.StopAll(); err != nil {
+		t.Fatalf("repeated StopAll after late cleanup: %v", err)
 	}
 }
 

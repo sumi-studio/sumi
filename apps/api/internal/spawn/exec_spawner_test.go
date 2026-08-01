@@ -2,6 +2,7 @@ package spawn
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -69,6 +70,50 @@ func TestExecSpawnerBuildsAgentEnv(t *testing.T) {
 	}
 	if info, err := os.Stat(workspaceDir); err != nil || !info.IsDir() {
 		t.Fatalf("workspace dir not created: %v", err)
+	}
+}
+
+func TestExecSpawnerStartupContextDoesNotOwnRuntimeLifetime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process-group fixture is Unix-only")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "runtime-alive")
+	bin := filepath.Join(dir, "sumi-agent")
+	script := fmt.Sprintf(
+		"#!/bin/sh\nsleep 0.05\nprintf alive > %q\nwhile :; do sleep 1; done\n",
+		marker,
+	)
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatalf("write long-running fake binary: %v", err)
+	}
+	spawner, err := NewExecSpawner(bin, nil)
+	if err != nil {
+		t.Fatalf("NewExecSpawner: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	proc, err := spawner.Spawn(ctx, AgentRuntimeConfig{
+		AgentID:      "agent-1",
+		StateDir:     filepath.Join(dir, "state"),
+		WorkspaceDir: filepath.Join(dir, "workspace"),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Stop() })
+	cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("inspect runtime marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("successfully-started runtime died with its startup context")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
