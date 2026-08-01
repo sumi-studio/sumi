@@ -2,9 +2,11 @@ const maxAuthResponseBytes = 4_096;
 const csrfTokenPattern = /^[A-Za-z0-9_-]{43}$/;
 const authorityBindingIDPattern = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 export const authRequestTimeoutMilliseconds = 15_000;
+const maxDisplayNameCodePoints = 80;
 
 export interface SumiSessionUser {
   id: string;
+  displayName: string | null;
 }
 
 export type SumiSessionStatus =
@@ -22,6 +24,18 @@ export class AuthAPIError extends Error {
     super(message);
     this.name = "AuthAPIError";
     this.status = status;
+  }
+}
+
+export class SumiProfileUpdateIndeterminateError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(
+      "The display-name update may have committed, but its result could not be confirmed.",
+    );
+    this.name = "SumiProfileUpdateIndeterminateError";
+    this.cause = cause;
   }
 }
 
@@ -138,15 +152,60 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
     !isObject(body.user) ||
     typeof body.user.id !== "string" ||
     body.user.id.length === 0 ||
-    body.user.id.length > 256
+    body.user.id.length > 256 ||
+    (body.user.display_name !== undefined &&
+      body.user.display_name !== null &&
+      (typeof body.user.display_name !== "string" ||
+        (body.user.display_name.length > 0 &&
+          Array.from(body.user.display_name).length >
+            maxDisplayNameCodePoints)))
   ) {
     throw new AuthAPIError("Invalid authentication response.", response.status);
   }
   return {
     authenticated: true,
     authorityBindingId: body.authority_binding_id,
-    user: { id: body.user.id },
+    user: {
+      id: body.user.id,
+      displayName:
+        typeof body.user.display_name === "string" &&
+        body.user.display_name.trim()
+          ? body.user.display_name
+          : null,
+    },
   };
+}
+
+export async function updateSumiProfile(
+  displayName: string,
+): Promise<{ id: string; displayName: string }> {
+  const trimmedDisplayName = canonicalizeSumiDisplayName(displayName);
+  if (
+    !trimmedDisplayName ||
+    Array.from(trimmedDisplayName).length > maxDisplayNameCodePoints
+  ) {
+    throw new AuthAPIError("Invalid display name.", 400);
+  }
+  const body = await postAuthJSON("/auth/profile", {
+    display_name: trimmedDisplayName,
+  });
+  if (
+    !isObject(body) ||
+    !isObject(body.user) ||
+    typeof body.user.id !== "string" ||
+    body.user.id.length === 0 ||
+    body.user.id.length > 256 ||
+    typeof body.user.display_name !== "string" ||
+    body.user.display_name.length === 0 ||
+    Array.from(body.user.display_name).length > maxDisplayNameCodePoints
+  ) {
+    throw new AuthAPIError("Invalid authentication response.", 200);
+  }
+  return { id: body.user.id, displayName: body.user.display_name };
+}
+
+export function canonicalizeSumiDisplayName(displayName: string): string {
+  return displayName.trim().replace(/\s+/gu, " ");
 }
 
 export async function logoutSumiSession(): Promise<void> {

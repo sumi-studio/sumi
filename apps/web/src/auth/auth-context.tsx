@@ -57,11 +57,14 @@ import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
   AuthAPIError,
+  canonicalizeSumiDisplayName,
   getSumiSession,
   logoutSumiSession,
+  SumiProfileUpdateIndeterminateError,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
   type SumiSessionStatus,
+  updateSumiProfile,
   verifyCommittedSumiSession,
 } from "./session-client";
 
@@ -141,6 +144,7 @@ interface AuthContextValue {
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
+  updateDisplayName: (displayName: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -724,6 +728,77 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setOutcomeNotice(null);
   }, []);
 
+  const updateDisplayName = useCallback(
+    async (displayName: string) => {
+      const generation = nextGeneration();
+      await serializeSessionMutation(async () => {
+        if (!isCurrentGeneration(generation)) return;
+        const current = serverSession.current;
+        if (!current.authenticated) {
+          throw new AuthAPIError("Authentication is unavailable.", 401);
+        }
+        const requestedDisplayName = canonicalizeSumiDisplayName(displayName);
+        let updatedUser: { id: string; displayName: string };
+        try {
+          updatedUser = await updateSumiProfile(requestedDisplayName);
+        } catch (error) {
+          if (!isCurrentGeneration(generation)) return;
+          if (
+            error instanceof AuthAPIError &&
+            (error.status < 200 || error.status >= 300)
+          ) {
+            throw error;
+          }
+
+          let reconciled: SumiSessionStatus;
+          try {
+            reconciled = await getSumiSession();
+          } catch (reconciliationError) {
+            if (!isCurrentGeneration(generation)) return;
+            throw new SumiProfileUpdateIndeterminateError(
+              new AggregateError(
+                [error, reconciliationError],
+                "Profile update and reconciliation both failed.",
+              ),
+            );
+          }
+          if (!isCurrentGeneration(generation)) return;
+          if (
+            !reconciled.authenticated ||
+            reconciled.user.id !== current.user.id ||
+            reconciled.authorityBindingId !== current.authorityBindingId
+          ) {
+            throw new SumiProfileUpdateIndeterminateError(error);
+          }
+          if (
+            reconciled.user.displayName === null ||
+            canonicalizeSumiDisplayName(reconciled.user.displayName) !==
+              requestedDisplayName
+          ) {
+            if (reconciled.user.displayName === current.user.displayName) {
+              throw error;
+            }
+            throw new SumiProfileUpdateIndeterminateError(error);
+          }
+          serverSession.current = reconciled;
+          setSession(reconciled);
+          return;
+        }
+        if (!isCurrentGeneration(generation)) return;
+        if (updatedUser.id !== current.user.id) {
+          throw new AuthAPIError("Profile identity changed.", 409);
+        }
+        const nextSession: SumiSessionStatus = {
+          ...current,
+          user: updatedUser,
+        };
+        serverSession.current = nextSession;
+        setSession(nextSession);
+      });
+    },
+    [isCurrentGeneration, nextGeneration, serializeSessionMutation],
+  );
+
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
@@ -771,7 +846,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     return {
       id: session.user.id,
-      displayName: null,
+      displayName: session.user.displayName,
       email: null,
       photoURL: null,
     };
@@ -797,6 +872,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       confirmIntentTransition,
       cancelIntentTransition,
       dismissOutcomeNotice,
+      updateDisplayName,
       logout,
       refreshSession,
     }),
@@ -817,6 +893,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       outcomeNotice,
       user,
+      updateDisplayName,
     ],
   );
 
