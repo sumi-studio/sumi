@@ -1,13 +1,16 @@
 import { Button } from "@sumi/ui/components/button";
 import type { ReactNode } from "react";
 import { useAuth } from "./auth-context";
+import { AuthOutcomeNotice } from "./auth-outcome-notice";
 import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const {
     canUseDirectChat,
     emailLinkCallbackPending,
+    dismissOutcomeNotice,
     loading,
+    outcomeNotice,
     sessionState,
     refreshSession,
   } = useAuth();
@@ -16,7 +19,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
     return <LoginScreen />;
   }
   if (canUseDirectChat) {
-    return children;
+    return (
+      <>
+        {outcomeNotice && (
+          <AuthOutcomeNotice
+            notice={outcomeNotice}
+            onDismiss={dismissOutcomeNotice}
+          />
+        )}
+        {children}
+      </>
+    );
   }
   if (loading || sessionState === "checking") {
     return <AuthStatus title="ログイン状態を確認しています…" />;
