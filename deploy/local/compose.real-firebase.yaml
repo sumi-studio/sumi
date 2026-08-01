@@ -2,25 +2,61 @@
 # project. Keep the emulator service available for explicit test work, but do
 # not connect the API or browser to it.
 #
-# SUMI_FIREBASE_ADC_FILE must name the existing host ADC file. It is mounted
-# directly and read-only; credentials are never copied into an image or volume.
+# SUMI_FIREBASE_ADC_FILE must name the existing host ADC file. A networkless
+# one-shot service copies it into a role-owned runtime secret volume without
+# changing the host file's restrictive ownership or mode. The API receives that
+# volume read-only; no credential reaches an image or launcher output.
 
 services:
+  firebase-adc-init:
+    build:
+      context: ../..
+      dockerfile: deploy/api/Dockerfile
+    user: "0:0"
+    entrypoint: ["/busybox/sh"]
+    command:
+      - "-ceu"
+      - |
+        source=/run/sumi/firebase-source/application_default_credentials.json
+        target=/run/sumi/firebase-runtime/application_default_credentials.json
+        temporary=$${target}.tmp
+        umask 077
+        test -f "$${source}"
+        rm -f "$${temporary}"
+        cp "$${source}" "$${temporary}"
+        chown 65532:65532 "$${temporary}"
+        chmod 0400 "$${temporary}"
+        mv -f "$${temporary}" "$${target}"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - type: bind
+        source: ${SUMI_FIREBASE_ADC_FILE:?SUMI_FIREBASE_ADC_FILE is required}
+        target: /run/sumi/firebase-source/application_default_credentials.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - firebase-adc-runtime:/run/sumi/firebase-runtime
+    restart: "no"
+
   api:
     environment:
       FIREBASE_AUTH_EMULATOR_HOST: !reset null
       GOOGLE_APPLICATION_CREDENTIALS: /run/sumi/firebase/application_default_credentials.json
       GOOGLE_CLOUD_PROJECT: ${SUMI_AUTH_FIREBASE_PROJECT_ID:?SUMI_AUTH_FIREBASE_PROJECT_ID is required}
     volumes:
-      - type: bind
-        source: ${SUMI_FIREBASE_ADC_FILE:?SUMI_FIREBASE_ADC_FILE is required}
-        target: /run/sumi/firebase/application_default_credentials.json
-        read_only: true
-        bind:
-          create_host_path: false
+      - firebase-adc-runtime:/run/sumi/firebase:ro
     depends_on:
       firebase-auth: !reset null
+      firebase-adc-init:
+        condition: service_completed_successfully
 
   web:
     environment:
       VITE_FIREBASE_AUTH_EMULATOR_URL: !reset null
+
+volumes:
+  firebase-adc-runtime: {}

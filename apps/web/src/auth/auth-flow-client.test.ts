@@ -5,6 +5,7 @@ import {
   resolveAuthFlow,
   startAuthFlow,
 } from "./auth-flow-client";
+import { AuthAPIError } from "./session-client";
 
 const csrf = "c".repeat(43);
 const nonce = "n".repeat(43);
@@ -137,6 +138,70 @@ describe("Koseki browser auth-flow client", () => {
         action: "create_account",
       }),
     ).resolves.toMatchObject({ outcome: "account_created" });
+  });
+
+  it("recovers when a successful resolve response body cannot be decoded", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(csrfResponse())
+      .mockResolvedValueOnce(new Response("not-json", { status: 200 }))
+      .mockResolvedValueOnce(csrfResponse())
+      .mockResolvedValueOnce(
+        flowResponse({
+          flow_id: "flow-1",
+          outcome: "confirmation_required",
+          next_action: "create_account",
+          continuation: "/",
+          expires_at: "2026-08-01T01:00:00Z",
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      resolveAuthFlow({ flowId: "flow-1", nonce, idToken: "id-token" }),
+    ).resolves.toMatchObject({ outcome: "confirmation_required" });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/auth/csrf",
+      "/auth/flows/resolve",
+      "/auth/csrf",
+      "/auth/flows/status",
+    ]);
+  });
+
+  it("logs out when a successful confirm body is malformed and status is inconclusive", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(csrfResponse())
+      .mockResolvedValueOnce(new Response("not-json", { status: 200 }))
+      .mockResolvedValueOnce(csrfResponse())
+      .mockResolvedValueOnce(
+        flowResponse({
+          flow_id: "flow-1",
+          outcome: "confirmation_required",
+          next_action: "create_account",
+          continuation: "/",
+          expires_at: "2026-08-01T01:00:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(csrfResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      confirmAuthFlow({
+        flowId: "flow-1",
+        nonce,
+        action: "create_account",
+      }),
+    ).rejects.toBeInstanceOf(AuthAPIError);
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/auth/csrf",
+      "/auth/flows/confirm",
+      "/auth/csrf",
+      "/auth/flows/status",
+      "/auth/csrf",
+      "/auth/logout",
+    ]);
   });
 
   it("assures Sumi logout when ambiguous status cannot prove the outcome", async () => {

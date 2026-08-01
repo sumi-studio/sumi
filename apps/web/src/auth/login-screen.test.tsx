@@ -1,7 +1,14 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LoginScreen } from "./login-screen";
 
@@ -49,6 +56,46 @@ describe("LoginScreen email-link callback", () => {
     );
     expect(rejectEmailLink).toHaveBeenCalledTimes(1);
     expect(completeEmailLink).not.toHaveBeenCalled();
+  });
+
+  it("keeps the switch handler as the sole callback owner across logout", async () => {
+    let finishLogout!: () => void;
+    const logout = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishLogout = resolve;
+        }),
+    );
+    const completeEmailLink = vi.fn().mockResolvedValue(undefined);
+    const authState = {
+      authenticated: true,
+      cancelIntentTransition: vi.fn(),
+      completeEmailLink,
+      confirmation: null,
+      configured: true,
+      confirmIntentTransition: vi.fn(),
+      emailLinkCallbackPending: true,
+      logout,
+      rejectEmailLink: vi.fn(),
+      sendEmailLink: vi.fn(),
+      sessionState: "authenticated",
+      signIn: vi.fn(),
+    };
+    loginMocks.useAuth.mockImplementation(() => authState);
+    const { rerender } = render(<LoginScreen />);
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "現在のセッションを終了して切り替える",
+      }),
+    );
+    authState.authenticated = false;
+    authState.sessionState = "unauthenticated";
+    rerender(<LoginScreen />);
+
+    expect(completeEmailLink).not.toHaveBeenCalled();
+    await act(async () => finishLogout());
+    await waitFor(() => expect(completeEmailLink).toHaveBeenCalledTimes(1));
   });
 
   it("shows the Firebase account attached to a pending confirmation", () => {

@@ -193,6 +193,7 @@ function isAmbiguousMutationError(error: unknown): boolean {
   if (!(error instanceof AuthAPIError)) return true;
   return (
     error.status === 0 ||
+    (error.status >= 200 && error.status < 300) ||
     error.status === 408 ||
     error.status === 429 ||
     error.status >= 500

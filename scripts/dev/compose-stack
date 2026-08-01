@@ -5,11 +5,17 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
-readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
+readonly BASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
+readonly REAL_FIREBASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.real-firebase.yaml"
+readonly REAL_FIREBASE_ADC_VOLUME=sumi-dev_firebase-adc-runtime
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
 RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
 RUNTIME_ENV_FD=
+ACTION=
+FIREBASE_MODE=emulator
+declare -a COMPOSE_ARGUMENTS=()
+declare -a COMPOSE_FILES=(-f "${BASE_COMPOSE_FILE}")
 
 log() {
   printf '[sumi-compose-stack] %s\n' "$*" >&2
@@ -69,6 +75,57 @@ validate_firebase_web_config() {
       require_value "${name}"
     done
   fi
+}
+
+validate_real_firebase() {
+  local adc_file links metadata mode name owner
+  for name in \
+    VITE_FIREBASE_API_KEY \
+    VITE_FIREBASE_AUTH_DOMAIN \
+    VITE_FIREBASE_PROJECT_ID \
+    VITE_FIREBASE_APP_ID \
+    SUMI_FIREBASE_ADC_FILE
+  do
+    require_value "${name}"
+  done
+  require_command node
+  adc_file="$(realpath -e -- "${SUMI_FIREBASE_ADC_FILE}")" ||
+    fail "cannot resolve SUMI_FIREBASE_ADC_FILE"
+  [[ -f "${adc_file}" && -r "${adc_file}" && ! -L "${SUMI_FIREBASE_ADC_FILE}" ]] ||
+    fail "SUMI_FIREBASE_ADC_FILE must be a readable regular non-symlink"
+  metadata="$(stat -Lc '%u:%a:%h' -- "${adc_file}")" ||
+    fail "cannot inspect SUMI_FIREBASE_ADC_FILE"
+  IFS=: read -r owner mode links <<< "${metadata}"
+  [[ "${owner}" == "$(id -u)" && "${mode}" =~ ^[46]00$ && "${links}" == "1" ]] ||
+    fail "SUMI_FIREBASE_ADC_FILE must be owned by the current user, mode 0400 or 0600, with one link"
+  node -e '
+    const fs = require("node:fs");
+    const [path, expectedProject] = process.argv.slice(1);
+    let value;
+    try {
+      value = JSON.parse(fs.readFileSync(path, "utf8"));
+    } catch {
+      process.exit(2);
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) process.exit(3);
+    if (value.type === "service_account") {
+      if (
+        value.project_id !== expectedProject ||
+        typeof value.client_email !== "string" ||
+        !value.client_email ||
+        typeof value.private_key !== "string" ||
+        !value.private_key
+      ) process.exit(4);
+    } else if (value.type === "authorized_user") {
+      for (const key of ["client_id", "client_secret", "refresh_token"]) {
+        if (typeof value[key] !== "string" || !value[key]) process.exit(5);
+      }
+    } else {
+      process.exit(6);
+    }
+  ' "${adc_file}" "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ||
+    fail "SUMI_FIREBASE_ADC_FILE is not a supported ADC credential"
+  export SUMI_FIREBASE_ADC_FILE="${adc_file}"
 }
 
 load_env_file() {
@@ -168,28 +225,51 @@ validate_local_development_host() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev/compose-stack up|down|config
+Usage: scripts/dev/compose-stack [--firebase emulator|real] up|down|config [compose arguments]
 
 Starts or stops the full local Sumi stack in Docker Compose:
 Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+
+Firebase Auth defaults to the integrated emulator. --firebase real selects the
+real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
+non-root API container. config validates quietly and never renders secrets.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 EOF
 }
 
-if (($# == 0)); then
-  usage
-  exit 1
-fi
-readonly ACTION="$1"
-case "${ACTION}" in
-  up|down|config) ;;
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  *) fail "unknown command: ${ACTION}" ;;
+while (($# > 0)); do
+  case "$1" in
+    --firebase)
+      (($# >= 2)) || fail "--firebase requires emulator or real"
+      FIREBASE_MODE="$2"
+      shift
+      ;;
+    --firebase=*)
+      FIREBASE_MODE="${1#*=}"
+      ;;
+    up|down|config)
+      [[ -z "${ACTION}" ]] || fail "only one action may be selected"
+      ACTION="$1"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      [[ -n "${ACTION}" ]] || fail "unknown argument before action: $1"
+      COMPOSE_ARGUMENTS+=("$1")
+      ;;
+  esac
+  shift
+done
+[[ -n "${ACTION}" ]] || fail "up, down, or config is required"
+case "${FIREBASE_MODE}" in
+  emulator) ;;
+  real) COMPOSE_FILES+=(-f "${REAL_FIREBASE_COMPOSE_FILE}") ;;
+  *) fail "--firebase must be emulator or real" ;;
 esac
+readonly ACTION FIREBASE_MODE
 
 # Optional Firebase values are inherited from the user env file. Generated
 # runtime secrets live in a separate ignored 0600 file so durable state remains
@@ -217,12 +297,6 @@ else
 fi
 export SUMI_DEV_WEB_ORIGIN="http://${SUMI_DEV_BROWSER_HOST}:5173"
 
-# Compose owns one durable emulator. API traffic uses service DNS while the
-# browser uses the same exact host address as the web and API ports.
-export FIREBASE_AUTH_EMULATOR_HOST="firebase-auth:9099"
-export VITE_FIREBASE_AUTH_EMULATOR_URL="http://${SUMI_DEV_BROWSER_HOST}:9099"
-validate_firebase_web_config
-
 # Use a stable dev PAID. The API and the agent container share it. The API
 # grants the legacy env-agent authorization so the container can connect.
 export SUMI_PERSONALITY_AGENT_ID="0198f0f4-9b72-7000-8000-00000000000d"
@@ -235,7 +309,24 @@ export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral
 export SUMI_AUTH_TENANT_ID="${SUMI_AUTH_TENANT_ID:-sumi-dev}"
 export SUMI_AUTH_FIREBASE_PROJECT_ID="${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}"
 export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-${SUMI_AUTH_FIREBASE_PROJECT_ID}}"
-[[ "${VITE_FIREBASE_PROJECT_ID:-sumi-studio}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
+if [[ "${FIREBASE_MODE}" == "emulator" ]]; then
+  # Compose owns one durable emulator. API traffic uses service DNS while the
+  # browser uses the same exact host address as the web and API ports.
+  export FIREBASE_AUTH_EMULATOR_HOST="firebase-auth:9099"
+  export VITE_FIREBASE_AUTH_EMULATOR_URL="http://${SUMI_DEV_BROWSER_HOST}:9099"
+  validate_firebase_web_config
+else
+  unset FIREBASE_AUTH_EMULATOR_HOST VITE_FIREBASE_AUTH_EMULATOR_URL
+  if [[ "${ACTION}" == "down" ]]; then
+    # Cleanup must remain available if credentials were rotated or removed.
+    # The source is never mounted by `down`; this value only satisfies Compose
+    # interpolation while selecting the same overlay/project definition.
+    export SUMI_FIREBASE_ADC_FILE="${SUMI_FIREBASE_ADC_FILE:-/dev/null}"
+  else
+    validate_real_firebase
+  fi
+fi
+[[ "${ACTION}" == "down" || "${VITE_FIREBASE_PROJECT_ID:-sumi-studio}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
   fail "Firebase web and Admin project IDs must match"
 export SUMI_BROWSER_SESSION_AUDIENCE="${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web:direct-chat}"
 export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${SUMI_DEV_WEB_ORIGIN}"
@@ -292,16 +383,23 @@ if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
   log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"
 fi
 
-case "$1" in
+case "${ACTION}" in
   up)
-    shift
-    docker compose -p sumi-dev -f "${COMPOSE_FILE}" up --build "$@"
+    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" up --build "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
-    shift
-    docker compose -p sumi-dev -f "${COMPOSE_FILE}" down "$@"
+    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
+    if [[ "${FIREBASE_MODE}" == "real" ]]; then
+      # Unlike durable database/runtime state, the staged ADC must not survive
+      # an ordinary stack shutdown. Ignore only the already-absent case.
+      if docker volume inspect "${REAL_FIREBASE_ADC_VOLUME}" >/dev/null 2>&1; then
+        docker volume rm "${REAL_FIREBASE_ADC_VOLUME}" >/dev/null ||
+          fail "cannot remove staged Firebase ADC volume"
+      fi
+    fi
     ;;
   config)
-    docker compose -p sumi-dev -f "${COMPOSE_FILE}" config
+    ((${#COMPOSE_ARGUMENTS[@]} == 0)) || fail "config accepts no additional Compose arguments"
+    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" config --quiet
     ;;
 esac

@@ -87,13 +87,20 @@ export function LoginScreen() {
   };
 
   const handleEmailLinkAccountSwitch = async () => {
-    if (busy) return;
+    if (busy || emailCallbackStarted.current) return;
+    // Claim the callback before logout changes sessionState. Otherwise the
+    // unauthenticated callback effect can race this handler and consume the
+    // same one-time email link a second time.
+    emailCallbackStarted.current = true;
     setBusy("email");
     setError(null);
+    let logoutCompleted = false;
     try {
       await logout();
+      logoutCompleted = true;
       await completeEmailLink();
     } catch (nextError) {
+      if (!logoutCompleted) emailCallbackStarted.current = false;
       setError(getAuthErrorMessage(nextError));
     } finally {
       setBusy(null);
