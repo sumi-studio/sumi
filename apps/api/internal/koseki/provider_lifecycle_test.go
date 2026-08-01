@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestProviderUnlinkFenceSerializesFirebaseUIDAndReleasesOnTerminalState(t *testing.T) {
@@ -268,10 +269,16 @@ func TestCompleteProviderLinkWaitsForUIDFenceAndRechecksDatabaseExpiry(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	var expiresAt time.Time
+	if err := store.pool.QueryRow(ctx, `UPDATE provider_operations
+		SET expires_at=clock_timestamp()+interval '2 seconds'
+		WHERE operation_id=$1 RETURNING expires_at`, operation.OperationID).Scan(&expiresAt); err != nil {
+		t.Fatal(err)
+	}
 
 	// Model the unlink boundary while its Firebase deletion and local commit are
-	// in flight. Completion must wait here before it locks or inspects the link
-	// operation, then evaluate expiry using the database's current wall clock.
+	// in flight. Completion locks the operation first, then waits here and must
+	// evaluate expiry using the database's current wall clock after that wait.
 	unlinkTx, err := store.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -318,13 +325,13 @@ func TestCompleteProviderLinkWaitsForUIDFenceAndRechecksDatabaseExpiry(t *testin
 			t.Fatal("link completion never waited on the unlink boundary")
 		}
 	}
-	// Expire the operation just after the waiting transaction began. Its
-	// transaction-start now() remains before this instant; clock_timestamp()
-	// after the UID lock is released is after it.
-	var expiresAt time.Time
-	if err := unlinkTx.QueryRow(ctx, `UPDATE provider_operations
-		SET expires_at=$2::timestamptz+interval '1 millisecond'
-		WHERE operation_id=$1 RETURNING expires_at`, operation.OperationID, completionStartedAt).Scan(&expiresAt); err != nil {
+	if !completionStartedAt.Before(expiresAt) {
+		t.Fatalf("completion did not start before expiry: started=%s expires=%s", completionStartedAt, expiresAt)
+	}
+	// PostgreSQL now() remains at completionStartedAt while this transaction is
+	// blocked. Wait on the database clock so only clock_timestamp() sees expiry.
+	if _, err := unlinkTx.Exec(ctx, `SELECT pg_sleep(
+		GREATEST(EXTRACT(EPOCH FROM ($1::timestamptz-clock_timestamp())), 0)+0.05)`, expiresAt); err != nil {
 		t.Fatal(err)
 	}
 	var expiredAtDatabase bool
@@ -358,6 +365,104 @@ func TestCompleteProviderLinkWaitsForUIDFenceAndRechecksDatabaseExpiry(t *testin
 	if active {
 		t.Fatal("expired link completion reactivated the credential after unlink")
 	}
+}
+
+func TestCompleteProviderLinkAndSameNonceReplayDoNotDeadlock(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	const (
+		firebaseUID     = "link-replay-deadlock-owner"
+		provider        = "github.com"
+		providerSubject = "link-replay-deadlock-subject"
+	)
+	owner, err := store.AutoRegister(ctx, "firebase", firebaseUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCredential(ctx, provider, providerSubject, owner.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	nonce := testNonce(t)
+	operation, err := store.BeginProviderOperation(ctx, owner.HumanID, firebaseUID, provider, "link", "account_settings", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gateTx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = gateTx.Rollback(ctx) }()
+	var gatePID int
+	if err := gateTx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&gatePID); err != nil {
+		t.Fatal(err)
+	}
+	var lockedOperationID string
+	if err := gateTx.QueryRow(ctx, `SELECT operation_id FROM provider_operations
+		WHERE operation_id=$1 FOR UPDATE`, operation.OperationID).Scan(&lockedOperationID); err != nil {
+		t.Fatal(err)
+	}
+
+	replayResult := make(chan error, 1)
+	completionResult := make(chan error, 1)
+	waitForBlockedRequests := func(want int) {
+		t.Helper()
+		deadline := time.NewTimer(3 * time.Second)
+		defer deadline.Stop()
+		poll := time.NewTicker(10 * time.Millisecond)
+		defer poll.Stop()
+		for {
+			select {
+			case err := <-replayResult:
+				t.Fatalf("same-nonce replay returned before row gate release: %v", err)
+			case err := <-completionResult:
+				t.Fatalf("link completion returned before row gate release: %v", err)
+			case <-poll.C:
+				var blocked int
+				if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity a
+					WHERE a.datname=current_database()
+					  AND a.pid<>$1 AND a.wait_event_type='Lock'`, gatePID).Scan(&blocked); err != nil {
+					t.Fatal(err)
+				}
+				if blocked >= want {
+					return
+				}
+			case <-deadline.C:
+				t.Fatalf("blocked requests=%d never became observable", want)
+			}
+		}
+	}
+
+	go func() {
+		_, err := store.BeginProviderOperation(ctx, owner.HumanID, firebaseUID, provider, "link", "account_settings", nonce)
+		replayResult <- err
+	}()
+	waitForBlockedRequests(1)
+	go func() {
+		_, err := store.CompleteProviderLink(ctx, operation.OperationID, nonce, firebaseUID, providerSubject)
+		completionResult <- err
+	}()
+	waitForBlockedRequests(2)
+	if err := gateTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	assertSucceededWithoutDeadlock := func(name string, result <-chan error) {
+		t.Helper()
+		select {
+		case err := <-result:
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+				t.Fatalf("%s hit deterministic SQL deadlock: %v", name, err)
+			}
+			if err != nil {
+				t.Fatalf("%s failed: %v", name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not finish after row gate release", name)
+		}
+	}
+	assertSucceededWithoutDeadlock("same-nonce replay", replayResult)
+	assertSucceededWithoutDeadlock("link completion", completionResult)
 }
 
 func TestProviderOperationStatusRecoversPendingAndTerminalStates(t *testing.T) {

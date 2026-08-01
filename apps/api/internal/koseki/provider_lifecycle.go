@@ -100,21 +100,19 @@ func scanProviderOperationForReconciliation(ctx context.Context, tx pgx.Tx, oper
 	return scanProviderOperationState(ctx, tx, operationID, nonce, true)
 }
 
-func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, nonce string, allowExpiredUnlink bool) (ProviderOperation, error) {
+func lockProviderOperation(ctx context.Context, tx pgx.Tx, operationID, nonce string) (ProviderOperation, error) {
 	nonceHash, err := validateNonce(nonce)
 	if err != nil {
 		return ProviderOperation{}, err
 	}
 	var operation ProviderOperation
-	var unexpired bool
 	err = tx.QueryRow(ctx, `SELECT operation_id, human_id, firebase_uid, provider,
-		operation, status, decision_path, created_at, expires_at, expires_at > clock_timestamp()
+		operation, status, decision_path, created_at, expires_at
 		FROM provider_operations
 		WHERE operation_id=$1 AND nonce_hash=$2 FOR UPDATE`, operationID, nonceHash).Scan(
 		&operation.OperationID, &operation.HumanID, &operation.FirebaseUID,
 		&operation.Provider, &operation.Operation, &operation.Status,
-		&operation.DecisionPath, &operation.CreatedAt, &operation.ExpiresAt,
-		&unexpired)
+		&operation.DecisionPath, &operation.CreatedAt, &operation.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ProviderOperation{}, ErrInvalidAuthFlow
 	}
@@ -123,6 +121,26 @@ func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, non
 	}
 	if operation.Status != "pending" {
 		return ProviderOperation{}, ErrAuthFlowConsumed
+	}
+	return operation, nil
+}
+
+func providerOperationUnexpired(ctx context.Context, tx pgx.Tx, expiresAt time.Time) (bool, error) {
+	var unexpired bool
+	if err := tx.QueryRow(ctx, "SELECT $1::timestamptz > clock_timestamp()", expiresAt).Scan(&unexpired); err != nil {
+		return false, fmt.Errorf("check provider operation expiry: %w", err)
+	}
+	return unexpired, nil
+}
+
+func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, nonce string, allowExpiredUnlink bool) (ProviderOperation, error) {
+	operation, err := lockProviderOperation(ctx, tx, operationID, nonce)
+	if err != nil {
+		return ProviderOperation{}, err
+	}
+	unexpired, err := providerOperationUnexpired(ctx, tx, operation.ExpiresAt)
+	if err != nil {
+		return ProviderOperation{}, err
 	}
 	if !unexpired && (!allowExpiredUnlink || operation.Operation != "unlink") {
 		return ProviderOperation{}, ErrAuthFlowExpired
@@ -267,17 +285,24 @@ func (s *Store) CompleteProviderLink(ctx context.Context, operationID, nonce, fi
 		return SecurityEvent{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Match the operation-admission trigger's UID lock before sampling expiry.
-	// The transaction lock then preserves that ordering through the audit commit.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "provider-unlink:"+firebaseUID); err != nil {
-		return SecurityEvent{}, err
-	}
-	operation, err := scanProviderOperation(ctx, tx, operationID, nonce)
+	operation, err := lockProviderOperation(ctx, tx, operationID, nonce)
 	if err != nil {
 		return SecurityEvent{}, err
 	}
 	if operation.Operation != "link" || operation.FirebaseUID != firebaseUID {
 		return SecurityEvent{}, ErrAuthProofMismatch
+	}
+	// ON CONFLICT locks the operation row before its trigger takes this UID
+	// fence. Match that order, then resample expiry after any UID-lock wait.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "provider-unlink:"+operation.FirebaseUID); err != nil {
+		return SecurityEvent{}, err
+	}
+	unexpired, err := providerOperationUnexpired(ctx, tx, operation.ExpiresAt)
+	if err != nil {
+		return SecurityEvent{}, err
+	}
+	if !unexpired {
+		return SecurityEvent{}, ErrAuthFlowExpired
 	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", fmt.Sprintf("%d:%s%s", len(operation.Provider), operation.Provider, providerSubject)); err != nil {
 		return SecurityEvent{}, err
