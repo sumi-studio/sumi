@@ -4,24 +4,15 @@ A shared workspace where people and their AI secretaries work together.
 
 ### Description
 
-Sumi brings conversations, tasks, calendars, notes, email, browsing, meetings,
-studying, and whatever else each person needs into one connected place.
+Sumi brings conversations, tasks, calendars, notes, email, browsing, meetings, studying, and whatever else each person needs into one connected place.
 
-The workspace takes shape around each person's routines and needs. As trust grows,
-their AI secretary can remain by their side and understand more of their everyday
-life and work as it unfolds.
+The workspace takes shape around each person's routines and needs. As trust grows, their AI secretary can remain by their side and understand more of their everyday life and work as it unfolds.
 
-The interface can adapt to what each moment calls
-for. AI secretaries can coordinate with people and one another, point things out
-on screen, and gradually take action with the permissions people give them.
-People and their AI secretaries use the same apps and inhabit the same workspace.
+The interface can adapt to what each moment calls for. AI secretaries can coordinate with people and one another, point things out on screen, and gradually take action with the permissions people give them. People and their AI secretaries use the same apps and inhabit the same workspace.
 
-Each AI secretary lives there as an individual, moving through time alongside the
-people around them. What they live through together becomes part of who each
-secretary is and who they are becoming.
+Each AI secretary lives there as an individual, moving through time alongside the people around them. What they live through together becomes part of who each secretary is and who they are becoming.
 
-Sumi aims to democratize access to
-personal secretaries and extend what a personal secretary can be.
+Sumi aims to democratize access to personal secretaries and extend what a personal secretary can be.
 
 ## 技術スタック
 
