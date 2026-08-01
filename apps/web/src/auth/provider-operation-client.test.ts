@@ -79,6 +79,35 @@ describe("provider operation client", () => {
     );
   });
 
+  it("marks collision recovery as a distinct audited decision path", async () => {
+    clientMocks.postAuthJSON.mockResolvedValue({
+      operation_id: "operation-recovery",
+      outcome: "client_operation_required",
+      client_operation: "firebase_link_with_credential",
+      completion_token_not_before: "2026-08-01T09:00:01Z",
+      expires_at: "2026-08-01T09:10:00Z",
+    });
+
+    await startProviderOperation({
+      provider: "github.com",
+      operation: "link",
+      decisionPath: "same_email_recovery",
+      nonce: "recovery-nonce",
+      idToken: "email-proof-token",
+    });
+
+    expect(clientMocks.postAuthJSON).toHaveBeenCalledWith(
+      "/auth/providers/operations",
+      {
+        provider: "github.com",
+        operation: "link",
+        decision_path: "same_email_recovery",
+        nonce: "recovery-nonce",
+        id_token: "email-proof-token",
+      },
+    );
+  });
+
   it("supports bounded failure and status recovery routes", async () => {
     clientMocks.postAuthJSON
       .mockResolvedValueOnce({

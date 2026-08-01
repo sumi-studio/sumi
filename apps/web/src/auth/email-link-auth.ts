@@ -3,6 +3,7 @@ import {
   isSignInWithEmailLink,
   sendSignInLinkToEmail,
   signInWithEmailLink,
+  type User,
 } from "firebase/auth";
 import {
   type AuthFlowResult,
@@ -18,7 +19,9 @@ import {
   emailFlowContinuation,
   emailFlowStateFromLocation,
   loadPendingEmailFlow,
+  type PendingCredentialRecovery,
   type PendingEmailAuthFlow,
+  type SerializedOAuthCredential,
   savePendingEmailFlow,
 } from "./auth-flow-state";
 import { getFirebaseAuth } from "./firebase";
@@ -27,11 +30,7 @@ import { AuthAPIError } from "./session-client";
 export interface EmailLinkFlowCompletion {
   flow: PendingEmailAuthFlow;
   result: Exclude<AuthFlowResult, { outcome: "proof_required" }>;
-  firebaseUser: {
-    uid: string;
-    displayName: string | null;
-    email: string | null;
-  };
+  firebaseUser: User;
 }
 
 export function hasEmailLinkCallback(): boolean {
@@ -47,6 +46,11 @@ export function rejectEmailLinkAuth(): void {
 export async function beginEmailLinkAuth(
   rawEmail: string,
   intent: AuthIntent,
+  recovery?: {
+    provider: "google.com" | "github.com";
+    requestedIntent: AuthIntent;
+    credential: SerializedOAuthCredential;
+  },
 ): Promise<void> {
   const email = rawEmail.trim();
   if (!email || email.length > 320) {
@@ -70,6 +74,11 @@ export async function beginEmailLinkAuth(
     email,
     expiresAt: started.expiresAt,
     stage: "link_sent",
+    ...(recovery
+      ? {
+          credentialRecovery: boundedRecovery(recovery, started.expiresAt),
+        }
+      : {}),
   };
   savePendingEmailFlow(state, pending);
   try {
@@ -81,6 +90,23 @@ export async function beginEmailLinkAuth(
     clearPendingEmailFlow(state);
     throw error;
   }
+}
+
+function boundedRecovery(
+  recovery: Omit<PendingCredentialRecovery, "version" | "expiresAt">,
+  flowExpiresAt: string,
+): PendingCredentialRecovery {
+  const flowExpiry = Date.parse(flowExpiresAt);
+  if (!Number.isFinite(flowExpiry)) {
+    throw new AuthAPIError("Invalid authentication flow expiry.", 0);
+  }
+  return {
+    version: 1,
+    ...recovery,
+    expiresAt: new Date(
+      Math.min(flowExpiry, Date.now() + 10 * 60_000),
+    ).toISOString(),
+  };
 }
 
 export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> {
@@ -124,10 +150,6 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
   return {
     flow: pending,
     result,
-    firebaseUser: {
-      uid: user.uid,
-      displayName: user.displayName,
-      email: user.email,
-    },
+    firebaseUser: user,
   };
 }

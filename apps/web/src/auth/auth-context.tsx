@@ -29,13 +29,17 @@ import {
   savePendingConfirmation,
 } from "./auth-confirmation-state";
 import {
-  type AuthFlowProvider,
   type AuthIntent,
   confirmAuthFlow,
   createAuthFlowNonce,
   resolveAuthFlow,
   startAuthFlow,
 } from "./auth-flow-client";
+import {
+  beginSameEmailCredentialRecovery,
+  completeSameEmailCredentialRecovery,
+  isSameEmailCredentialCollision,
+} from "./credential-recovery";
 import {
   beginEmailLinkAuth,
   completeEmailLinkAuth,
@@ -121,6 +125,7 @@ interface AuthContextValue {
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
   emailLinkCallbackPending: boolean;
+  credentialRecoveryEmailSent: boolean;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
   sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
   completeEmailLink: () => Promise<void>;
@@ -149,6 +154,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [emailLinkCallbackPending, setEmailLinkCallbackPending] = useState(() =>
     hasEmailLinkCallback(),
   );
+  const [credentialRecoveryEmailSent, setCredentialRecoveryEmailSent] =
+    useState(false);
   // Every state-changing auth operation claims a generation. Late session
   // reads must never re-authorize the chat after logout has started.
   const authGeneration = useRef(0);
@@ -264,6 +271,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       let firebaseSignInCompleted = false;
       let confirmationRequired = false;
       signInPending.current = true;
+      setCredentialRecoveryEmailSent(false);
       let popup: ReturnType<typeof signInWithPopup> | null = null;
       try {
         // Firebase documents that popup auth may be blocked when invoked outside
@@ -331,6 +339,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           firebaseSignInCompleted = popupResult !== null;
         }
         if (
+          !firebaseSignInCompleted &&
+          isSameEmailCredentialCollision(error) &&
+          isCurrentGeneration(generation)
+        ) {
+          await beginSameEmailCredentialRecovery(error, flowProvider, intent);
+          if (isCurrentGeneration(generation)) {
+            setCredentialRecoveryEmailSent(true);
+          }
+          return;
+        }
+        if (
           (error instanceof SumiSessionCompensatedError ||
             error instanceof SumiSessionCompensationFailedError) &&
           isCurrentGeneration(generation)
@@ -366,6 +385,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
       }
       nextGeneration();
+      setCredentialRecoveryEmailSent(false);
       signInPending.current = true;
       try {
         await beginEmailLinkAuth(email, intent);
@@ -386,6 +406,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const completed = await completeEmailLinkAuth();
       await serializeSessionMutation(async () => {
         if (!isCurrentGeneration(generation)) return;
+        if (completed.flow.credentialRecovery) {
+          if (completed.result.outcome !== "signed_in") {
+            throw new AuthAPIError(
+              "Provider recovery requires an existing Sumi account.",
+              0,
+            );
+          }
+          await completeSameEmailCredentialRecovery({
+            recovery: completed.flow.credentialRecovery,
+            user: completed.firebaseUser,
+          });
+        }
         if (completed.result.outcome === "confirmation_required") {
           const pending: PendingAuthConfirmation = {
             flowId: completed.result.flowId,
@@ -413,9 +445,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSession(nextSession);
           setSessionState("authenticated");
           setEmailLinkCallbackPending(false);
+          setCredentialRecoveryEmailSent(false);
         });
       });
     } catch (error) {
+      if (isCurrentGeneration(generation)) {
+        let logoutCompleted = true;
+        try {
+          await logoutSumiSession();
+        } catch {
+          logoutCompleted = false;
+        }
+        let authorityCleared = true;
+        flushSync(() => {
+          authorityCleared = clearDirectChatAuthority();
+          serverSession.current = { authenticated: false };
+          setSession({ authenticated: false });
+          setSessionState(
+            logoutCompleted && authorityCleared
+              ? "unauthenticated"
+              : "unavailable",
+          );
+        });
+      }
       await signOutFirebaseBestEffort();
       throw error;
     } finally {
@@ -426,6 +478,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const rejectEmailLink = useCallback(() => {
     rejectEmailLinkAuth();
     setEmailLinkCallbackPending(false);
+    setCredentialRecoveryEmailSent(false);
   }, []);
 
   const confirmIntentTransition = useCallback(async () => {
@@ -590,6 +643,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       confirmation,
       emailLinkCallbackPending,
+      credentialRecoveryEmailSent,
       signIn,
       sendEmailLink,
       completeEmailLink,
@@ -606,6 +660,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       confirmIntentTransition,
       logout,
       emailLinkCallbackPending,
+      credentialRecoveryEmailSent,
       rejectEmailLink,
       refreshSession,
       session.authenticated,
@@ -645,7 +700,9 @@ function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
   return provider;
 }
 
-function authFlowProvider(providerName: SignInProvider): AuthFlowProvider {
+function authFlowProvider(
+  providerName: SignInProvider,
+): "google.com" | "github.com" {
   return providerName === "github" ? "github.com" : "google.com";
 }
 

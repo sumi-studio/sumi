@@ -15,6 +15,27 @@ export interface PendingEmailAuthFlow extends PendingAuthFlow {
   provider: "email_link";
   email: string;
   stage: "link_sent" | "firebase_complete";
+  credentialRecovery?: PendingCredentialRecovery;
+}
+
+export type RecoverableProvider = "google.com" | "github.com";
+
+export interface SerializedOAuthCredential {
+  providerId: RecoverableProvider;
+  signInMethod: RecoverableProvider;
+  idToken?: string;
+  accessToken?: string;
+  secret?: string;
+  nonce?: string;
+  pendingToken?: string;
+}
+
+export interface PendingCredentialRecovery {
+  version: 1;
+  provider: RecoverableProvider;
+  requestedIntent: AuthIntent;
+  expiresAt: string;
+  credential: SerializedOAuthCredential;
 }
 
 export function createEmailFlowState(): string {
@@ -56,7 +77,15 @@ export function loadPendingEmailFlow(
     const parsed: unknown = JSON.parse(
       localStorage.getItem(`${emailFlowPrefix}${state}`) ?? "null",
     );
-    return isPendingEmailFlow(parsed) ? parsed : null;
+    if (!isPendingEmailFlow(parsed)) return null;
+    if (
+      parsed.credentialRecovery &&
+      Date.parse(parsed.credentialRecovery.expiresAt) <= Date.now()
+    ) {
+      clearPendingEmailFlow(state);
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -102,7 +131,81 @@ function isPendingEmailFlow(value: unknown): value is PendingEmailAuthFlow {
     value.email.length > 0 &&
     value.email.length <= 320 &&
     "stage" in value &&
-    (value.stage === "link_sent" || value.stage === "firebase_complete")
+    (value.stage === "link_sent" || value.stage === "firebase_complete") &&
+    (!("credentialRecovery" in value) ||
+      value.credentialRecovery === undefined ||
+      isPendingCredentialRecovery(value.credentialRecovery, value.expiresAt))
+  );
+}
+
+function isPendingCredentialRecovery(
+  value: unknown,
+  flowExpiresAt: string,
+): value is PendingCredentialRecovery {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("version" in value) ||
+    value.version !== 1 ||
+    !("provider" in value) ||
+    (value.provider !== "google.com" && value.provider !== "github.com") ||
+    !("requestedIntent" in value) ||
+    (value.requestedIntent !== "sign_in" &&
+      value.requestedIntent !== "sign_up") ||
+    !("expiresAt" in value) ||
+    typeof value.expiresAt !== "string" ||
+    value.expiresAt.length === 0 ||
+    value.expiresAt.length > 64 ||
+    !Number.isFinite(Date.parse(value.expiresAt)) ||
+    Date.parse(value.expiresAt) > Date.now() + 10 * 60_000 + 5_000 ||
+    !Number.isFinite(Date.parse(flowExpiresAt)) ||
+    Date.parse(value.expiresAt) > Date.parse(flowExpiresAt) ||
+    !("credential" in value)
+  ) {
+    return false;
+  }
+  return isSerializedOAuthCredential(value.credential, value.provider);
+}
+
+function isSerializedOAuthCredential(
+  value: unknown,
+  provider: RecoverableProvider,
+): value is SerializedOAuthCredential {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const allowed = new Set([
+    "providerId",
+    "signInMethod",
+    "idToken",
+    "accessToken",
+    "secret",
+    "nonce",
+    "pendingToken",
+  ]);
+  if (JSON.stringify(record).length > 24 * 1024) return false;
+  if (Object.keys(record).some((key) => !allowed.has(key))) return false;
+  if (record.providerId !== provider || record.signInMethod !== provider) {
+    return false;
+  }
+  for (const key of [
+    "idToken",
+    "accessToken",
+    "secret",
+    "nonce",
+    "pendingToken",
+  ] as const) {
+    const field = record[key];
+    if (
+      field !== undefined &&
+      (typeof field !== "string" || field.length > 12_288)
+    ) {
+      return false;
+    }
+  }
+  return [record.idToken, record.accessToken, record.pendingToken].some(
+    (field) => typeof field === "string" && field.length > 0,
   );
 }
 
