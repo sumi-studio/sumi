@@ -5355,6 +5355,36 @@ impl EventWriter {
 }
 
 impl BootstrapRecoveryGuard<'_> {
+    /// Returns the turn currently open in the authenticated lifecycle prefix.
+    ///
+    /// Recovery callers use this identity for lifecycle-bound suffixes.  The
+    /// inbound command's stored turn remains its original ownership evidence,
+    /// but a continued provider/tool loop may have advanced the same run to a
+    /// later turn before the process stopped.
+    pub(in crate::store) fn authenticated_open_turn(&self, run_id: &str) -> Result<&str> {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap recovery initializes the lifecycle checkpoint")
+            .lifecycle;
+        let turn_id = lifecycle
+            .open_turns
+            .get(run_id)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                anyhow!("logical recovery run {run_id} has no authenticated open turn")
+            })?;
+        if lifecycle.inferred_owner_turns.contains(run_id)
+            || !lifecycle
+                .seen_turn_starts
+                .contains(&(run_id.to_owned(), turn_id.to_owned()))
+        {
+            bail!("logical recovery run {run_id} has no authenticated open turn");
+        }
+        Ok(turn_id)
+    }
+
     pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT mutation_id FROM provider_context_mutations
