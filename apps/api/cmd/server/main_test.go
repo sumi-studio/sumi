@@ -409,6 +409,7 @@ func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 		Claims: map[string]interface{}{
 			"email":          "Human@Example.com",
 			"email_verified": true,
+			"name":           "Verified Human",
 		},
 		Firebase: firebaseauth.FirebaseInfo{
 			Tenant: "firebase-tenant", SignInProvider: "github.com",
@@ -426,7 +427,7 @@ func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 	if identity.UID != "firebase-user" || identity.TenantID != "firebase-tenant" {
 		t.Fatalf("unexpected identity: %+v", identity)
 	}
-	if identity.Email != "Human@Example.com" || !identity.EmailVerified ||
+	if identity.Email != "Human@Example.com" || identity.DisplayName != "Verified Human" || !identity.EmailVerified ||
 		identity.SignInProvider != "github.com" ||
 		len(identity.ProviderSubjects["github.com"]) != 1 ||
 		identity.ProviderSubjects["github.com"][0] != "github-subject" || identity.AuthTime.IsZero() || identity.IssuedAt.IsZero() ||

@@ -3,7 +3,6 @@ package agentevents
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,6 +27,7 @@ const (
 type FirebaseIdentity struct {
 	UID              string
 	TenantID         string
+	DisplayName      string
 	Email            string
 	EmailVerified    bool
 	SignInProvider   string
@@ -46,6 +46,13 @@ type FirebaseIDTokenVerifier interface {
 // server-owned authorization binding. Browsers never author these claims.
 type IdentityBindingResolver interface {
 	ResolveIdentity(ctx context.Context, identity FirebaseIdentity) (UserSessionClaims, error)
+}
+
+// HumanProfileReader exposes only the canonical Human-owned presentation name
+// needed by the authenticated session bootstrap. It does not expose external
+// identity metadata or agent ownership internals.
+type HumanProfileReader interface {
+	HumanDisplayName(ctx context.Context, humanID string) (string, error)
 }
 
 // DirectChatAuthorizer holds Current-Employer authority across one private
@@ -148,6 +155,7 @@ type BrowserAuthServer struct {
 	SessionTTL     time.Duration
 	Connections    BrowserSessionConnectionCloser
 	Flows          BrowserAuthFlowController
+	Profiles       HumanProfileReader
 	random         io.Reader
 	sessionMu      sync.Mutex
 }
@@ -323,18 +331,28 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
+	displayName := ""
+	if s.Profiles != nil {
+		displayName, err = s.Profiles.HumanDisplayName(r.Context(), claims.UserID)
+		if err != nil {
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			return
+		}
+	}
 	writeBrowserAuthJSON(w, http.StatusOK, struct {
 		Authenticated      bool   `json:"authenticated"`
 		AuthorityBindingID string `json:"authority_binding_id"`
 		User               struct {
-			ID string `json:"id"`
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
 		} `json:"user"`
 	}{
 		Authenticated:      true,
 		AuthorityBindingID: claims.authorityBindingID,
 		User: struct {
-			ID string `json:"id"`
-		}{ID: claims.UserID},
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+		}{ID: claims.UserID, DisplayName: displayName},
 	})
 }
 
@@ -386,20 +404,7 @@ func (s *BrowserAuthServer) allowSafeReadOrigin(w http.ResponseWriter, r *http.R
 }
 
 func (s *BrowserAuthServer) requireCSRF(w http.ResponseWriter, r *http.Request) bool {
-	headers := r.Header.Values("X-CSRF-Token")
-	if len(headers) != 1 {
-		writeBrowserAuthError(w, http.StatusForbidden, "invalid CSRF token")
-		return false
-	}
-	cookies := r.CookiesNamed(BrowserCSRFCookie)
-	if len(cookies) != 1 {
-		writeBrowserAuthError(w, http.StatusForbidden, "invalid CSRF token")
-		return false
-	}
-	headerToken := headers[0]
-	cookieToken := cookies[0].Value
-	if !validCSRFToken(headerToken) || !validCSRFToken(cookieToken) ||
-		subtle.ConstantTimeCompare([]byte(headerToken), []byte(cookieToken)) != 1 {
+	if !BrowserCSRFValid(r) {
 		writeBrowserAuthError(w, http.StatusForbidden, "invalid CSRF token")
 		return false
 	}

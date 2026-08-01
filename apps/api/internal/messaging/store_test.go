@@ -92,6 +92,38 @@ func (w world) send(t *testing.T, ctx context.Context, placeID string, author Pa
 	return msg
 }
 
+func TestMemberProfilesQualifyCanonicalSumiByStableHuman(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	if _, err := w.store.pool.Exec(ctx,
+		"UPDATE agents SET display_name='Sumi' WHERE personality_agent_id=$1", w.agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	secondAgentID, err := koseki.New(w.store.pool).MintSecretary(ctx, w.humanB.ID)
+	if err != nil {
+		t.Fatalf("mint second Secretary: %v", err)
+	}
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	second := PersonalityAgent(secondAgentID)
+	if err := w.store.AddWorkspaceMember(ctx, workspace.WorkspaceID, second, RoleMember); err != nil {
+		t.Fatalf("add second Secretary: %v", err)
+	}
+	profiles, err := w.store.WorkspaceMemberProfiles(ctx, workspace.WorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, profile := range profiles {
+		if profile.Participant.Kind == KindPersonalityAgent {
+			names[profile.Participant.ID] = profile.ProjectedDisplayName()
+		}
+	}
+	if names[w.agent.ID] != "Sumi（Yohaku）" || names[secondAgentID] != "Sumi（Haru）" {
+		t.Fatalf("Secretary labels = %#v", names)
+	}
+}
+
 func TestChannelPostingFollowsWorkspaceMembership(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -171,7 +203,7 @@ func TestMentionsBindAtAdmissionFromActiveMembership(t *testing.T) {
 	w := newWorld(t, ctx)
 	ws, ch := w.workspaceWithChannel(t, ctx)
 
-	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro デプロイの様子どう？ @部外者 は無視")
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro（Yohaku） デプロイの様子どう？ @部外者 は無視")
 	if len(msg.Mentions) != 1 || msg.Mentions[0] != w.agent {
 		t.Fatalf("mentions = %+v, want exactly the agent", msg.Mentions)
 	}
@@ -180,7 +212,7 @@ func TestMentionsBindAtAdmissionFromActiveMembership(t *testing.T) {
 	if err := w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.agent); err != nil {
 		t.Fatalf("remove agent: %v", err)
 	}
-	after := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro もういないはず")
+	after := w.send(t, ctx, ch.PlaceID, w.humanA, "@Kuro（Yohaku） もういないはず")
 	if len(after.Mentions) != 0 {
 		t.Fatalf("left member must not bind, got %+v", after.Mentions)
 	}
@@ -295,7 +327,7 @@ func TestEditAndDeleteAuthorization(t *testing.T) {
 	w := newWorld(t, ctx)
 	_, ch := w.workspaceWithChannel(t, ctx)
 
-	msg := w.send(t, ctx, ch.PlaceID, w.humanB, "@Kuro 最初の本文") // seq 1
+	msg := w.send(t, ctx, ch.PlaceID, w.humanB, "@Kuro（Yohaku） 最初の本文") // seq 1
 	if len(msg.Mentions) != 1 {
 		t.Fatalf("setup: mention missing: %+v", msg.Mentions)
 	}

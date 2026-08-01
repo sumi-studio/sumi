@@ -63,14 +63,22 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := store.pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", registered.HumanID); err != nil {
+			t.Fatal(err)
+		}
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignIn, "Person@Example.com", nonce)
-		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("known-sign-in", "person@example.com"))
+		proof := emailProof("known-sign-in", "person@example.com")
+		proof.DisplayName = "Known Human"
+		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, proof)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if result.TerminalOutcome != OutcomeSignedIn || result.HumanID != registered.HumanID || result.AgentID != registered.AgentID {
 			t.Fatalf("unexpected result: %+v", result)
+		}
+		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Known Human" {
+			t.Fatalf("returning sentinel upgrade = %q", got)
 		}
 	})
 
@@ -78,7 +86,9 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		store, ctx := authFlowStore(t)
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignUp, "new@example.com", nonce)
-		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("new-sign-up", "new@example.com"))
+		proof := emailProof("new-sign-up", "new@example.com")
+		proof.DisplayName = "New Human"
+		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, proof)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,13 +101,18 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if _, err := store.AgentWrappingKey(ctx, result.AgentID); err != nil {
 			t.Fatalf("wrapping key: %v", err)
 		}
+		if got, _ := store.HumanDisplayName(ctx, result.HumanID); got != "New Human" {
+			t.Fatalf("new account display name = %q", got)
+		}
 	})
 
 	t.Run("sign in unknown requires create confirmation", func(t *testing.T) {
 		store, ctx := authFlowStore(t)
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignIn, "unknown@example.com", nonce)
-		pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("unknown-sign-in", "unknown@example.com"))
+		proof := emailProof("unknown-sign-in", "unknown@example.com")
+		proof.DisplayName = "Confirmed New Human"
+		pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, proof)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,6 +127,9 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if result.TerminalOutcome != OutcomeAccountCreated {
 			t.Fatalf("unexpected result: %+v", result)
 		}
+		if got, _ := store.HumanDisplayName(ctx, result.HumanID); got != "Confirmed New Human" {
+			t.Fatalf("confirmation lost verified display name: %q", got)
+		}
 		assertRegistryCounts(t, ctx, store, 1, 1)
 	})
 
@@ -121,14 +139,22 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := store.pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", registered.HumanID); err != nil {
+			t.Fatal(err)
+		}
 		nonce := testNonce(t)
 		flow := startEmailFlow(t, ctx, store, IntentSignUp, "known@example.com", nonce)
-		pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("known-sign-up", "known@example.com"))
+		proof := emailProof("known-sign-up", "known@example.com")
+		proof.DisplayName = "Confirmed Existing Human"
+		pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, proof)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if pending.Status != "confirmation_required" || pending.ConfirmationAction != ActionSignIn {
 			t.Fatalf("unexpected pending: %+v", pending)
+		}
+		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Sumi" {
+			t.Fatalf("account mutated before sign-in confirmation: %q", got)
 		}
 		result, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionSignIn)
 		if err != nil {
@@ -136,6 +162,9 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		}
 		if result.TerminalOutcome != OutcomeSignedIn || result.HumanID != registered.HumanID {
 			t.Fatalf("unexpected result: %+v", result)
+		}
+		if got, _ := store.HumanDisplayName(ctx, registered.HumanID); got != "Confirmed Existing Human" {
+			t.Fatalf("confirmed existing seed = %q", got)
 		}
 		assertRegistryCounts(t, ctx, store, 1, 1)
 	})

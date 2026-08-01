@@ -21,16 +21,20 @@ const mentionBoundary = ".,!?、。！？:：;；()（）[]{}「」『』"
 // display name is bound, since a caller typing an ambiguous name addressed
 // all of them.
 func resolveMentions(content string, members []MemberProfile) []ParticipantRef {
-	named := make([]MemberProfile, 0, len(members))
+	type namedMember struct {
+		participant ParticipantRef
+		name        string
+	}
+	named := make([]namedMember, 0, len(members))
 	for _, m := range members {
-		if m.DisplayName != "" {
-			named = append(named, m)
+		if name := m.ProjectedDisplayName(); name != "" {
+			named = append(named, namedMember{participant: m.Participant, name: name})
 		}
 	}
 	// Longest first so "@Kuro Prod" is not consumed by a member named "Kuro".
 	// The sort is stable so members with equal-length names keep store order.
 	sort.SliceStable(named, func(i, j int) bool {
-		return utf8.RuneCountInString(named[i].DisplayName) > utf8.RuneCountInString(named[j].DisplayName)
+		return utf8.RuneCountInString(named[i].name) > utf8.RuneCountInString(named[j].name)
 	})
 
 	type claim struct {
@@ -47,7 +51,7 @@ func resolveMentions(content string, members []MemberProfile) []ParticipantRef {
 		already = map[string]bool{}
 	)
 	for _, m := range named {
-		needle := "@" + m.DisplayName
+		needle := "@" + m.name
 		for from := 0; ; {
 			i := strings.Index(content[from:], needle)
 			if i < 0 {
@@ -67,7 +71,7 @@ func resolveMentions(content string, members []MemberProfile) []ParticipantRef {
 				// Same range, same display name: another member shares the
 				// name and is also addressed. Anything else is an overlap
 				// with a longer (or earlier) name and loses.
-				if !(c.start == start && c.end == end && c.name == m.DisplayName) {
+				if !(c.start == start && c.end == end && c.name == m.name) {
 					ok = false
 				}
 				break
@@ -75,10 +79,10 @@ func resolveMentions(content string, members []MemberProfile) []ParticipantRef {
 			if !ok {
 				continue
 			}
-			claims = append(claims, claim{start: start, end: end, name: m.DisplayName})
-			if !already[m.Participant.Key()] {
-				already[m.Participant.Key()] = true
-				bound = append(bound, binding{ref: m.Participant, start: start})
+			claims = append(claims, claim{start: start, end: end, name: m.name})
+			if !already[m.participant.Key()] {
+				already[m.participant.Key()] = true
+				bound = append(bound, binding{ref: m.participant, start: start})
 			}
 			break
 		}

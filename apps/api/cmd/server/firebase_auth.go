@@ -127,6 +127,7 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 	}
 	email, _ := token.Claims["email"].(string)
 	emailVerified, _ := token.Claims["email_verified"].(bool)
+	displayName, _ := token.Claims["name"].(string)
 	providerSubjects := make(map[string][]string, len(token.Firebase.Identities))
 	for provider, raw := range token.Firebase.Identities {
 		switch values := raw.(type) {
@@ -145,7 +146,7 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 		}
 	}
 	return agentevents.FirebaseIdentity{
-		UID: token.UID, TenantID: token.Firebase.Tenant, Email: email,
+		UID: token.UID, TenantID: token.Firebase.Tenant, DisplayName: displayName, Email: email,
 		EmailVerified: emailVerified, SignInProvider: token.Firebase.SignInProvider,
 		ProviderSubjects: providerSubjects, AuthTime: time.Unix(token.AuthTime, 0).UTC(),
 		IssuedAt: time.Unix(token.IssuedAt, 0).UTC(),
@@ -281,6 +282,7 @@ func browserAuthServerFromEnvWithDB(
 	}
 	server.SessionTTL = ttl
 	if kosekiMode {
+		server.Profiles = registrationStore
 		server.Flows = newKosekiAuthFlowController(
 			registrationStore,
 			strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID")),

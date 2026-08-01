@@ -62,15 +62,33 @@ func TestResolveMentionsPrefersLongestName(t *testing.T) {
 }
 
 func TestResolveMentionsBindsEveryMemberSharingTheName(t *testing.T) {
-	// Two participants named "Sumi" (the 戸籍 default): an ambiguous call
-	// addresses all of them.
+	// Two Humans with the same visible name: an ambiguous call addresses both.
 	members := []MemberProfile{
-		member(Human(testHumanID), "Sumi"),
-		member(PersonalityAgent(testAgentID), "Sumi"),
+		member(Human(testHumanID), "Kai"),
+		member(Human(testHuman2ID), "Kai"),
 	}
-	got := resolveMentions("@Sumi 会議です", members)
+	got := resolveMentions("@Kai 会議です", members)
 	if len(got) != 2 {
-		t.Fatalf("expected both Sumi to bind, resolved %v", keys(got))
+		t.Fatalf("expected both visible Kai names to bind, resolved %v", keys(got))
+	}
+}
+
+func TestResolveMentionsUsesVisibleSecretaryQualifier(t *testing.T) {
+	members := []MemberProfile{
+		{Participant: PersonalityAgent(testAgentID), DisplayName: "Sumi", SecretaryForDisplayName: "Yohaku"},
+		{Participant: PersonalityAgent(testAgent2ID), DisplayName: "Sumi", SecretaryForDisplayName: "Haru"},
+	}
+	if got := resolveMentions("@Sumi 見て", members); len(got) != 0 {
+		t.Fatalf("hidden ambiguous alias notified agents: %v", keys(got))
+	}
+	got := resolveMentions("@Sumi（Haru） 見て", members)
+	if len(got) != 1 || got[0] != PersonalityAgent(testAgent2ID) {
+		t.Fatalf("qualified mention resolved %v", keys(got))
+	}
+	members[1].SecretaryForDisplayName = "Yohaku"
+	got = resolveMentions("@Sumi（Yohaku） 見て", members)
+	if len(got) != 2 {
+		t.Fatalf("identical visible names lost explicit ambiguity: %v", keys(got))
 	}
 }
 

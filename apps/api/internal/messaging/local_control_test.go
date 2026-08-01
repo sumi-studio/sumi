@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,15 @@ func TestLocalOpenAdmitsAgentWithoutOverviewFirst(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("direct first-use open status = %d, body = %s", response.Code, response.Body.String())
 	}
+	var opened struct {
+		Members []memberWire `json:"members"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &opened); err != nil {
+		t.Fatalf("decode local open: %v", err)
+	}
+	if !hasProjectedMember(opened.Members, world.agent, "Kuro（Yohaku）") {
+		t.Fatalf("local open members = %#v", opened.Members)
+	}
 	workspaces, err := world.store.WorkspacesFor(ctx, world.agent)
 	if err != nil {
 		t.Fatalf("list agent workspaces: %v", err)
@@ -38,4 +48,21 @@ func TestLocalOpenAdmitsAgentWithoutOverviewFirst(t *testing.T) {
 	if len(workspaces) != 1 || workspaces[0].WorkspaceID != DefaultWorkspaceID {
 		t.Fatalf("agent workspaces = %#v, want only default Workspace", workspaces)
 	}
+	overview, err := server.buildOverview(ctx, world.agent)
+	if err != nil {
+		t.Fatalf("build overview: %v", err)
+	}
+	if !hasProjectedMember(overview.Members, world.agent, "Kuro（Yohaku）") {
+		t.Fatalf("overview members = %#v", overview.Members)
+	}
+}
+
+func hasProjectedMember(members []memberWire, participant ParticipantRef, name string) bool {
+	for _, member := range members {
+		ref, err := member.Participant.ref()
+		if err == nil && ref == participant && member.DisplayName == name {
+			return true
+		}
+	}
+	return false
 }

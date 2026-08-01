@@ -101,7 +101,7 @@ func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.
 func verifiedKosekiIdentity(identity agentevents.FirebaseIdentity) (koseki.VerifiedIdentity, error) {
 	verified := koseki.VerifiedIdentity{
 		FirebaseUID: identity.UID, EmailVerified: identity.EmailVerified,
-		SignInProvider: identity.SignInProvider,
+		SignInProvider: identity.SignInProvider, DisplayName: identity.DisplayName,
 	}
 	if identity.Email != "" {
 		email, err := koseki.NormalizeEmail(identity.Email)
