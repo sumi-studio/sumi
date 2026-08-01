@@ -25,6 +25,7 @@ import type { ComponentType, ReactElement } from "react";
 import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
+import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
 import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
@@ -117,8 +118,12 @@ export function SettingsPopover() {
       } catch {
         setProfileNotice("保存済み。トークの表示は再読み込みで反映されます。");
       }
-    } catch {
-      setProfileError("表示名を更新できませんでした。");
+    } catch (error) {
+      setProfileError(
+        error instanceof SumiProfileUpdateIndeterminateError
+          ? "更新結果を確認できませんでした。再読み込みしてください。"
+          : "表示名を更新できませんでした。",
+      );
     } finally {
       setSavingProfile(false);
     }

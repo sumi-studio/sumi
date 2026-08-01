@@ -10,6 +10,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
 import { AppRail } from "./app-rail";
 
 const mocks = vi.hoisted(() => ({
@@ -125,5 +126,27 @@ describe("AppRail settings", () => {
     expect(
       screen.queryByText("表示名を更新できませんでした。"),
     ).not.toBeInTheDocument();
+  });
+
+  it("distinguishes an indeterminate profile result from a rejected update", async () => {
+    mocks.updateDisplayName.mockRejectedValue(
+      new SumiProfileUpdateIndeterminateError(new TypeError("disconnected")),
+    );
+    render(
+      <TooltipProvider>
+        <AppRail activeAppId="home" />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "設定" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "表示名" }), {
+      target: { value: "たっけ" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(
+      await screen.findByText(
+        "更新結果を確認できませんでした。再読み込みしてください。",
+      ),
+    ).toBeInTheDocument();
   });
 });

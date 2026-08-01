@@ -231,6 +231,91 @@ describe("canonical Human profile", () => {
     });
     expect(authMocks.updateSumiProfile).toHaveBeenCalledWith("After");
   });
+
+  it("reconciles a committed profile update whose response was lost", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "After" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("After");
+    });
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a queued profile update invalidate a later logout", async () => {
+    let resolveFirstUpdate!: (value: {
+      id: string;
+      displayName: string;
+    }) => void;
+    const firstUpdate = new Promise<{ id: string; displayName: string }>(
+      (resolve) => {
+        resolveFirstUpdate = resolve;
+      },
+    );
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    });
+    authMocks.updateSumiProfile.mockReturnValue(firstUpdate);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      );
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+    await waitFor(() => {
+      expect(authMocks.updateSumiProfile).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "logout" }));
+    resolveFirstUpdate({ id: "user-a", displayName: "After" });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    expect(authMocks.updateSumiProfile).toHaveBeenCalledTimes(1);
+    expect(authMocks.logoutSumiSession).toHaveBeenCalledTimes(1);
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("logout authority transition", () => {

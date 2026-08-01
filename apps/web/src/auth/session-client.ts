@@ -27,6 +27,18 @@ export class AuthAPIError extends Error {
   }
 }
 
+export class SumiProfileUpdateIndeterminateError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(
+      "The display-name update may have committed, but its result could not be confirmed.",
+    );
+    this.name = "SumiProfileUpdateIndeterminateError";
+    this.cause = cause;
+  }
+}
+
 export class SumiSessionCompensatedError extends Error {
   readonly cause: unknown;
 
@@ -167,7 +179,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
 export async function updateSumiProfile(
   displayName: string,
 ): Promise<{ id: string; displayName: string }> {
-  const trimmedDisplayName = displayName.trim();
+  const trimmedDisplayName = canonicalizeSumiDisplayName(displayName);
   if (
     !trimmedDisplayName ||
     Array.from(trimmedDisplayName).length > maxDisplayNameCodePoints
@@ -190,6 +202,10 @@ export async function updateSumiProfile(
     throw new AuthAPIError("Invalid authentication response.", 200);
   }
   return { id: body.user.id, displayName: body.user.display_name };
+}
+
+export function canonicalizeSumiDisplayName(displayName: string): string {
+  return displayName.trim().replace(/\s+/gu, " ");
 }
 
 export async function logoutSumiSession(): Promise<void> {
