@@ -307,7 +307,7 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 
 	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: artifactOwner,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,

@@ -489,7 +489,7 @@ mod tests {
     fn command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical command id"),
             command: Command::Abort {},

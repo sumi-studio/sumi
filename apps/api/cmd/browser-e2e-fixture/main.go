@@ -50,7 +50,7 @@ func main() {
 		context.Background(),
 		agentevents.UserSessionClaims{
 			TenantID:           "tenant",
-			HumanID:            "user",
+			UserID:             "user",
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		},
 		time.Hour,

@@ -634,7 +634,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	}
 	command, err := store.Append(
 		context.Background(),
-		testInboundProvenance(testPersonalityAgentID),
+		testDirectChatProvenance(testPersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"after-ready","attachments":[]}`),
 	)
@@ -654,7 +654,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	defer browserHTTP.Close()
 	browserClaims := userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: testPersonalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -1217,7 +1217,7 @@ func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *test
 	defer store.Close()
 	command, err := store.Append(
 		context.Background(),
-		testInboundProvenance(testPersonalityAgentID),
+		testDirectChatProvenance(testPersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"lease-race","attachments":[]}`),
 	)

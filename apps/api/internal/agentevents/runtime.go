@@ -488,7 +488,7 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, personalityAgentI
 // no target, generation, or lifecycle reason to the browser transport.
 func (g *DurableGateway) Append(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, error) {
@@ -506,7 +506,7 @@ func (g *DurableGateway) Append(
 // durable command for the same key and authenticated bytes.
 func (g *DurableGateway) AppendWithIdempotencyStatus(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, bool, error) {
@@ -515,7 +515,7 @@ func (g *DurableGateway) AppendWithIdempotencyStatus(
 
 func (g *DurableGateway) appendWithIdempotencyStatus(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, bool, error) {

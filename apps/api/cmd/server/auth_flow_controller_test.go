@@ -76,7 +76,7 @@ func TestProviderUnlinkIsBackendOwnedAndCountsOnlyProvedMethods(t *testing.T) {
 	controller := newKosekiAuthFlowController(store, "local", providers)
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
-	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{Provider: "github.com", Operation: "unlink", DecisionPath: "notice_action", Nonce: controllerNonce(t), IDToken: "verified"}
 
 	stale := agentevents.FirebaseIdentity{
@@ -156,7 +156,7 @@ func TestProviderUnlinkReconcilesAmbiguousAdminSuccessAndSameNonceRetry(t *testi
 	}
 	controller := newKosekiAuthFlowController(store, "local", providers)
 	controller.clock = func() time.Time { return time.Now().UTC() }
-	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{Provider: "github.com", Operation: "unlink", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
 	identity := agentevents.FirebaseIdentity{
 		UID: "ambiguous-unlink-uid", AuthTime: time.Now().UTC(), SignInProvider: "google.com",
@@ -199,7 +199,7 @@ func TestProviderUnlinkKeepsFenceUntilIndeterminatePostcheckReconciles(t *testin
 	controller := newKosekiAuthFlowController(store, "local", providers)
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
-	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{Provider: "github.com", Operation: "unlink", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
 	identity := agentevents.FirebaseIdentity{UID: "postcheck-unlink-uid", AuthTime: now, SignInProvider: "google.com", ProviderSubjects: map[string][]string{"google.com": {"google-subject"}}}
 	if _, err := controller.StartProviderOperation(ctx, claims, request, identity); !errors.Is(err, agentevents.ErrBrowserAuthProviderUnavailable) {
@@ -229,7 +229,7 @@ func TestProviderLinkRejectsPreOperationTokenAndAcceptsForcedRefresh(t *testing.
 		t.Fatal(err)
 	}
 	controller := newKosekiAuthFlowController(store, "local", nil)
-	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{
 		Provider: "github.com", Operation: "link", DecisionPath: "same_email_recovery",
 		Nonce: controllerNonce(t), IDToken: "before-link",
@@ -293,8 +293,8 @@ func TestProviderOperationStatusMapsDurableSemanticOutcomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	controller := newKosekiAuthFlowController(store, "local", nil)
-	claims := agentevents.UserSessionClaims{TenantID: "local", HumanID: owner.HumanID, PersonalityAgentID: owner.AgentID}
-	otherClaims := agentevents.UserSessionClaims{TenantID: "local", HumanID: other.HumanID, PersonalityAgentID: other.AgentID}
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: owner.HumanID, PersonalityAgentID: owner.AgentID}
+	otherClaims := agentevents.UserSessionClaims{TenantID: "local", UserID: other.HumanID, PersonalityAgentID: other.AgentID}
 
 	pendingNonce := controllerNonce(t)
 	pending, err := store.BeginProviderOperation(ctx, owner.HumanID, "status-controller-owner", "github.com", "link", "account_settings", pendingNonce)

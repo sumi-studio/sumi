@@ -784,7 +784,7 @@ mod tests {
             "seq": 1,
             "command_id": "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
             "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            "provenance": crate::gateway::test_inbound_provenance(),
+            "provenance": crate::gateway::test_direct_chat_provenance(),
             "command": {
                 "type": "user_message",
                 "text": text,

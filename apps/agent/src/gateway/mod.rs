@@ -15,11 +15,6 @@ pub mod ws;
 pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
-/// Canonical `HumanId` for tests (ADR 0009 §1: UUIDv7, never a credential).
-#[cfg(test)]
-pub(crate) const TEST_HUMAN_ID: &str = "018f3f8d-7b2c-7a10-8f9e-00000000ab01";
-#[cfg(test)]
-pub(crate) const TEST_OTHER_HUMAN_ID: &str = "018f3f8d-7b2c-7a10-8f9e-00000000ab02";
 
 use std::fmt;
 
@@ -30,7 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::runtime::contracts::{InboundProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
 
 #[cfg(test)]
 pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
@@ -38,13 +33,8 @@ pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
 }
 
 #[cfg(test)]
-pub(crate) fn test_human_id() -> crate::runtime::contracts::HumanId {
-    crate::runtime::contracts::HumanId::parse(TEST_HUMAN_ID).expect("canonical test UUIDv7")
-}
-
-#[cfg(test)]
-pub(crate) fn test_inbound_provenance() -> InboundProvenanceV1 {
-    InboundProvenanceV1::direct_chat("tenant-test", test_personality_agent_id(), test_human_id())
+pub(crate) fn test_direct_chat_provenance() -> DirectChatProvenanceV1 {
+    DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
         .expect("valid direct-chat provenance")
 }
 
@@ -128,7 +118,7 @@ pub struct CommandEnvelope {
     pub seq: u64,
     pub command_id: CommandId,
     pub personality_agent_id: PersonalityAgentId,
-    pub provenance: InboundProvenanceV1,
+    pub provenance: DirectChatProvenanceV1,
     pub command: Command,
 }
 
@@ -194,7 +184,7 @@ pub enum InboundCommand {
         seq: u64,
         command_id: CommandId,
         personality_agent_id: PersonalityAgentId,
-        provenance: InboundProvenanceV1,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         /// Transient bytes used only to authenticate the durable receipt. The
         /// EventWriter encrypts valid-size rejects and discards oversized bytes
@@ -224,7 +214,7 @@ impl InboundCommand {
         }
     }
 
-    pub fn provenance(&self) -> &InboundProvenanceV1 {
+    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
         match self {
             Self::Valid(envelope) => &envelope.provenance,
             Self::Invalid { provenance, .. } => provenance,
@@ -337,7 +327,6 @@ pub enum CommandRejectReason {
     SchemaViolation,
     AttachmentsNotEmpty,
     Oversized { actual_bytes: u64 },
-    NotAllowed,
 }
 
 impl CommandRejectReason {
@@ -347,7 +336,6 @@ impl CommandRejectReason {
             Self::SchemaViolation => "schema_violation",
             Self::AttachmentsNotEmpty => "attachments_not_empty",
             Self::Oversized { .. } => "oversized",
-            Self::NotAllowed => "not_allowed",
         }
     }
 }

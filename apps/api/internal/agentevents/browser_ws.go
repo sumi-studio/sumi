@@ -68,7 +68,7 @@ type browserConnection struct {
 type idempotencyAwareCommandAppender interface {
 	AppendWithIdempotencyStatus(
 		ctx context.Context,
-		provenance InboundProvenance,
+		provenance DirectChatProvenance,
 		idempotencyKey string,
 		command json.RawMessage,
 	) (CommandEnvelope, bool, error)
@@ -338,7 +338,7 @@ func (s *BrowserServer) authorizeDirectChat(
 	}
 	if err := s.Authorizer.AuthorizeDirectChat(
 		ctx,
-		claims.HumanID,
+		claims.UserID,
 		claims.PersonalityAgentID,
 		operation,
 	); err != nil {

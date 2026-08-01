@@ -2434,7 +2434,7 @@ mod tests {
         UserMessage, ValidatedToolArguments,
     };
     use crate::runtime::contracts::{
-        GenerationRecoveryFence, InboundProvenanceV1, ProcessGeneration, ProcessGenerationLease,
+        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
         ApplicationKind, DataKeyPurpose, EncryptedProviderContextRecord, HydrationOutcome,
@@ -2448,11 +2448,11 @@ mod tests {
 
     const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
 
-    fn provenance(store: &Store) -> InboundProvenanceV1 {
-        InboundProvenanceV1::direct_chat(
+    fn provenance(store: &Store) -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new(
             "tenant-1",
             store.scope().personality_agent_id.clone(),
-            crate::gateway::test_human_id(),
+            "human-1",
         )
         .expect("canonical direct-chat provenance")
     }

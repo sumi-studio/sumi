@@ -138,12 +138,12 @@ func (r *LogRecord) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("command log record json: %w", err)
 	}
 	type rawRecord struct {
-		Seq                *uint64            `json:"seq"`
-		CommandID          *string            `json:"command_id"`
-		PersonalityAgentID *string            `json:"personality_agent_id"`
-		Provenance         *InboundProvenance `json:"provenance"`
-		Command            json.RawMessage    `json:"command"`
-		IdempotencyKey     string             `json:"idempotency_key"`
+		Seq                *uint64               `json:"seq"`
+		CommandID          *string               `json:"command_id"`
+		PersonalityAgentID *string               `json:"personality_agent_id"`
+		Provenance         *DirectChatProvenance `json:"provenance"`
+		Command            json.RawMessage       `json:"command"`
+		IdempotencyKey     string                `json:"idempotency_key"`
 	}
 	var raw rawRecord
 	if err := unmarshalStrict(data, &raw); err != nil {
@@ -324,7 +324,7 @@ func (s *CommandStore) rollbackLocked(st *personalityAgentState, offset int64, o
 // the same key and identical authenticated envelope, the existing
 // CommandEnvelope is returned without allocating a second seq. A changed
 // target, tenant, actor, source, or command is a conflict.
-func (s *CommandStore) Append(ctx context.Context, provenance InboundProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
+func (s *CommandStore) Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
 	return s.append(ctx, provenance, idempotencyKey, command, nil)
 }
 
@@ -334,7 +334,7 @@ func (s *CommandStore) Append(ctx context.Context, provenance InboundProvenance,
 // for every first-time admission.
 func (s *CommandStore) appendWithIdempotencyStatus(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, bool, error) {
@@ -345,7 +345,7 @@ func (s *CommandStore) appendWithIdempotencyStatus(
 
 func (s *CommandStore) append(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 	existingResult *bool,

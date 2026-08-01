@@ -50,7 +50,7 @@ type CommandAppender interface {
 	// If idempotencyKey is non-empty, the appender returns the existing
 	// CommandEnvelope for that key when the same command bytes are resubmitted;
 	// a different body for the same key is a conflict and returns an error.
-	Append(ctx context.Context, provenance InboundProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error)
+	Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error)
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
@@ -110,7 +110,7 @@ func (h *UserCommandIngress) authorizeDirectChat(
 	}
 	return h.Authorizer.AuthorizeDirectChat(
 		ctx,
-		claims.HumanID,
+		claims.UserID,
 		claims.PersonalityAgentID,
 		operation,
 	)
@@ -284,17 +284,16 @@ func writeUnavailable(w http.ResponseWriter, idempotencyKey string) {
 	})
 }
 
-func directChatProvenance(claims UserSessionClaims) InboundProvenance {
-	return InboundProvenance{
+func directChatProvenance(claims UserSessionClaims) DirectChatProvenance {
+	return DirectChatProvenance{
 		Version:            1,
 		TenantID:           claims.TenantID,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Actor: ProvenanceActor{
-			Kind:    "human",
-			HumanID: claims.HumanID,
+			Kind:        "human",
+			PrincipalID: claims.UserID,
 		},
-		Source:    ProvenanceSource{Surface: "direct_chat"},
-		Authority: AdmissionAuthority{Basis: "employer"},
+		Source: ProvenanceSource{Surface: "direct_chat"},
 	}
 }
 

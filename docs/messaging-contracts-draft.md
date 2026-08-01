@@ -177,38 +177,10 @@
 agentにとってより適した方法があるときだけそちらで代替する。AXとUXが高い精度で
 一致していることが目的である。
 
-> **実装状態（2026-08-01 更新）**: ADR 0011 Decision 1・2 に加え、messaging
-> service側（`apps/api/internal/messaging`、migration 0005・0006）が実装済み:
-> workspace/place/message/read markerの永続化とplace単位seq、`/messaging` REST
-> （bootstrap・履歴・送信・既読・DM作成）、`/messaging/ws`（cursor catch-up・
-> hub配送）、AttentionCandidateのper-agent inbox（message commitと同一
-> トランザクションで発行、candidate_seq・ack cursor・read_throughによる
-> supersession）。v0のeligibilityは既定「mentionとDMは起こす、それ以外は
-> 溜める」で、通知設定storeが入ったら本人の設定を読む。**未実装**: agent側の
-> 道具（bearer認証lane含む）、candidateをruntimeへ運ぶtransport、通知設定
-> CRUD、編集で新たに増えたmentionの候補発行。
-> `InboundProvenanceV1` は surface一般（direct chat / messaging）になり、actorは
-> human | personality_agent、humanはcanonical `HumanId`（UUIDv7）である
-> （`apps/agent/src/runtime/contracts.rs`、`contracts/agent-events.yaml`、
-> `apps/api/internal/agentevents/wire.go`）。**注意の経路はまだ無い。** そのため
-> messaging surface由来のinboundは agent の受信口で `not_allowed` として
-> fail-closedに拒否する（`apps/agent/src/gateway/stdio.rs`）。黙ってdirect chatと
-> 同じ扱いにすると、届いた瞬間にprovider turnになる＝channel botになるため。
-> この門は AttentionCandidate と本人の判断（interrupt / inject / defer / observe）
-> が実装された時点で外す。
->
-> **門が拒否するのは「agent turnへの直接投入」だけである。** messageは場の
-> durable eventとしてWorkspace側に残る。agentの disposition が `not_allowed`
-> でも、それはmessageが未配送・失敗という意味ではなく、**AttentionCandidateが
-> 未実装なだけ**である。messaging serviceは以下をしてはいけない。
->
-> - 拒否をもってmessageを未配送扱いにする（place上のseqは確定済み）
-> - 拒否を再試行して同じcommandを送り直す（rejectは終端dispositionであり、
->   agentはseqをackするので再送されない）
-> - 拒否をpoisonとして扱い、以後の配送を止める
->
-> 門が外れた後の配送は、拒否されたcommandの再試行ではなく**新しいcommand**
-> として送る。
+> **実装状態（2026-08-01）**: Workspace messaging の schema・REST・WebSocket と
+> human向けUIは実装済み。surface一般の inbound provenance と AttentionCandidate
+> transportは、人格agentを単純なchannel botへ退行させないattention境界が揃うまで
+> deferredとし、#172・#173で追跡する。この文書とADR 0011はProposedのままである。
 
 1. **呼びかけは AttentionCandidate として届く**: 決定論的なdelivery eligibility
    （block/mute、本人の通知設定、quiet hours、明示signal、membership・authority、

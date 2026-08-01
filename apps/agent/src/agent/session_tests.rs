@@ -519,7 +519,7 @@ fn user(seq: u64) -> InboundCommand {
     let command_id = format!("00000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
         personality_agent_id: crate::gateway::test_personality_agent_id(),
-        provenance: crate::gateway::test_inbound_provenance(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::UserMessage {
@@ -533,7 +533,7 @@ fn abort(seq: u64) -> InboundCommand {
     let command_id = format!("10000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
         personality_agent_id: crate::gateway::test_personality_agent_id(),
-        provenance: crate::gateway::test_inbound_provenance(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical command id"),
         command: Command::Abort {},
@@ -656,7 +656,7 @@ async fn newly_rejected_admission_publishes_disposition_before_terminal_ack() {
             seq: 1,
             command_id: command_id.clone(),
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             reason: CommandRejectReason::SchemaViolation,
             raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                 br#"{"type":"abort",}"#.to_vec(),
@@ -7434,7 +7434,7 @@ fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
     let command_id = format!("25000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
         personality_agent_id: crate::gateway::test_personality_agent_id(),
-        provenance: crate::gateway::test_inbound_provenance(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&command_id).expect("canonical live Responses command id"),
         command: Command::UserMessage {
@@ -10946,7 +10946,7 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
 fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
     InboundCommand::Valid(CommandEnvelope {
         personality_agent_id: crate::gateway::test_personality_agent_id(),
-        provenance: crate::gateway::test_inbound_provenance(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),
@@ -10978,7 +10978,7 @@ fn approval_always_decision_with_rule(seq: u64, request_id: &str, rule: Value) -
         .expect("object deferred ApproveAlways rule");
     InboundCommand::Valid(CommandEnvelope {
         personality_agent_id: crate::gateway::test_personality_agent_id(),
-        provenance: crate::gateway::test_inbound_provenance(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
             .expect("canonical command id"),

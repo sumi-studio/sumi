@@ -135,7 +135,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{claims: UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
@@ -174,7 +174,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 		t.Fatalf("verify session cookie: %v", err)
 	}
 	if claims.TenantID != bindings.claims.TenantID ||
-		claims.HumanID != bindings.claims.HumanID ||
+		claims.UserID != bindings.claims.UserID ||
 		claims.PersonalityAgentID != bindings.claims.PersonalityAgentID {
 		t.Fatalf("got %+v, want %+v", claims, bindings.claims)
 	}
@@ -199,7 +199,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 		t.Fatalf("decode session status: %v", err)
 	}
 	if !status.Authenticated ||
-		status.User.ID != "018f47a2-9b3c-7def-8abc-00000000ab01" ||
+		status.User.ID != "user-1" ||
 		status.AuthorityBindingID != claims.authorityBindingID ||
 		!validBrowserAuthorityBindingID(status.AuthorityBindingID) {
 		t.Fatalf("unexpected session status: %+v", status)
@@ -238,7 +238,7 @@ func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
 	}
 	bindings := &fakeBindingResolver{claims: UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
@@ -248,7 +248,7 @@ func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
 		testSessionSecret,
 		testSessionClaims{
 			TenantID:           bindings.claims.TenantID,
-			HumanID:            bindings.claims.HumanID,
+			UserID:             bindings.claims.UserID,
 			PersonalityAgentID: bindings.claims.PersonalityAgentID,
 			Iat:                now.Add(-time.Minute).Unix(),
 			Exp:                now.Add(time.Minute).Unix(),
@@ -300,7 +300,7 @@ func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
 		t.Fatalf("Firebase exchange did not issue a valid v2 cookie: %v", err)
 	}
 	if replacement.TenantID != bindings.claims.TenantID ||
-		replacement.HumanID != bindings.claims.HumanID ||
+		replacement.UserID != bindings.claims.UserID ||
 		replacement.PersonalityAgentID != bindings.claims.PersonalityAgentID {
 		t.Fatalf("replacement claims = %+v, want %+v", replacement, bindings.claims)
 	}
@@ -383,7 +383,7 @@ func TestBrowserAuthRequiresUniqueMatchingCSRF(t *testing.T) {
 func TestBrowserAuthFailsClosedForInvalidTokenAndUnboundIdentity(t *testing.T) {
 	validClaims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	cases := []struct {
@@ -501,7 +501,7 @@ func TestBrowserAuthLogoutRevokesSessionAndClosesOnlyItsConnections(t *testing.T
 	server.Connections = closer
 	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}, time.Minute)
 	if err != nil {
@@ -565,7 +565,7 @@ func TestBrowserAuthLogoutRetainsValidCookieWhenDurableRevocationIsUnavailable(t
 		context.Background(),
 		UserSessionClaims{
 			TenantID:           "tenant-1",
-			HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+			UserID:             "user-1",
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		},
 		time.Minute,
@@ -629,7 +629,7 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{claims: UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
@@ -744,7 +744,7 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	}
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	oldSession, err := firstSessions.IssueSession(
@@ -851,7 +851,7 @@ func TestBrowserAuthReplacementFailsClosedWhenOldSessionCannotBeRetired(t *testi
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{claims: UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
@@ -886,7 +886,7 @@ func TestBrowserAuthDuplicateCookieLogoutRevokesEveryVerifiableSession(t *testin
 	server.Connections = closer
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	first, err := sessions.IssueSession(context.Background(), claims, time.Minute)
@@ -960,7 +960,7 @@ func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
 func TestStaticIdentityBindingResolverAllowsOnlyConfiguredUID(t *testing.T) {
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	resolver, err := NewStaticIdentityBindingResolver("allowed-uid", claims)

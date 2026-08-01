@@ -3038,7 +3038,7 @@ mod tests {
         StopReason, Usage, UserContent, UserMessage,
     };
     use crate::runtime::contracts::{
-        GenerationRecoveryFence, InboundProvenanceV1, ProcessGeneration, ProcessGenerationLease,
+        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
     use crate::store::transcript::TranscriptRecord;
@@ -3071,13 +3071,9 @@ mod tests {
         }
     }
 
-    fn inbound_provenance() -> InboundProvenanceV1 {
-        InboundProvenanceV1::direct_chat(
-            "tenant-1",
-            scope().personality_agent_id,
-            crate::gateway::test_human_id(),
-        )
-        .expect("valid direct-chat provenance")
+    fn direct_chat_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+            .expect("valid direct-chat provenance")
     }
 
     fn provider() -> Arc<dyn KeyProvider> {
@@ -5947,7 +5943,7 @@ mod tests {
                 seq: 1,
                 command_id: command_id.clone(),
                 personality_agent_id: scope().personality_agent_id,
-                provenance: inbound_provenance(),
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: "pending logical suffix".to_owned(),
                     attachments: Vec::new(),
@@ -6066,7 +6062,7 @@ mod tests {
                 seq,
                 command_id: command_id.clone(),
                 personality_agent_id: scope().personality_agent_id,
-                provenance: inbound_provenance(),
+                provenance: direct_chat_provenance(),
                 command: Command::UserMessage {
                     text: text.to_owned(),
                     attachments: Vec::new(),
@@ -6179,7 +6175,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     seq,
                     command_id.clone(),
-                    inbound_provenance(),
+                    direct_chat_provenance(),
                 )],
             })
             .await

@@ -94,7 +94,7 @@ func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.
 		return result
 	}
 	result.Outcome = flow.TerminalOutcome
-	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, HumanID: flow.HumanID, PersonalityAgentID: flow.AgentID}
+	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, UserID: flow.HumanID, PersonalityAgentID: flow.AgentID}
 	return result
 }
 
@@ -117,7 +117,7 @@ func verifiedKosekiIdentity(identity agentevents.FirebaseIdentity) (koseki.Verif
 }
 
 func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.StartProviderOperationRequest, identity agentevents.FirebaseIdentity) (agentevents.ProviderOperationResult, error) {
-	uid, err := c.store.FirebaseUIDForHuman(ctx, claims.HumanID)
+	uid, err := c.store.FirebaseUIDForHuman(ctx, claims.UserID)
 	if err != nil || uid != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
@@ -129,7 +129,7 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
 		}
 	}
-	operation, err := c.store.BeginProviderOperation(ctx, claims.HumanID, uid, request.Provider,
+	operation, err := c.store.BeginProviderOperation(ctx, claims.UserID, uid, request.Provider,
 		request.Operation, request.DecisionPath, request.Nonce)
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
@@ -168,7 +168,7 @@ func (c *kosekiAuthFlowController) runProviderUnlink(ctx context.Context, claims
 	if operation.Status != "pending" {
 		return c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce)
 	}
-	providerSubject, err := c.store.ActiveProviderSubject(ctx, claims.HumanID, operation.Provider)
+	providerSubject, err := c.store.ActiveProviderSubject(ctx, claims.UserID, operation.Provider)
 	if err != nil {
 		if recovered, recoveryErr := c.recoverStartedProviderOperation(ctx, claims, operation.OperationID, request.Nonce); recoveryErr == nil {
 			return recovered, nil
@@ -192,7 +192,7 @@ func (c *kosekiAuthFlowController) runProviderUnlink(ctx context.Context, claims
 		_, _ = c.store.FailProviderOperation(ctx, operation.OperationID, request.Nonce, "firebase_operation_failed")
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
-	emailLinkProof, err := c.store.HasCompletedEmailLinkProof(ctx, claims.HumanID, operation.FirebaseUID)
+	emailLinkProof, err := c.store.HasCompletedEmailLinkProof(ctx, claims.UserID, operation.FirebaseUID)
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
 	}
@@ -277,7 +277,7 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	if operation.HumanID != claims.HumanID || operation.FirebaseUID != identity.UID {
+	if operation.HumanID != claims.UserID || operation.FirebaseUID != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
 	if operation.Operation != "link" {
@@ -330,7 +330,7 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	if operation.HumanID != claims.HumanID {
+	if operation.HumanID != claims.UserID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
 	// Unlink is a backend-owned saga. A browser must never release its durable
@@ -354,7 +354,7 @@ func validClientProviderFailureOutcome(outcome string) bool {
 }
 
 func (c *kosekiAuthFlowController) StatusProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.ProviderOperationStatusRequest) (agentevents.ProviderOperationStatusResult, error) {
-	operation, err := c.store.ProviderOperationStatus(ctx, claims.HumanID, request.OperationID, request.Nonce)
+	operation, err := c.store.ProviderOperationStatus(ctx, claims.UserID, request.OperationID, request.Nonce)
 	if err != nil {
 		return agentevents.ProviderOperationStatusResult{}, mapFlowError(err)
 	}

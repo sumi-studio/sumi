@@ -206,12 +206,8 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": {
-          "kind": "human",
-          "human_id": "018f1e72-6e9a-7c20-8e90-00000000a11c"
-        },
-        "source": { "surface": "direct_chat" },
-        "authority": { "basis": "employer", "decision_id": null }
+        "actor": { "kind": "human", "principal_id": "alice@example.com" },
+        "source": { "surface": "direct_chat" }
       },
       "command": {
         "type": "user_message",
@@ -230,12 +226,8 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": {
-          "kind": "human",
-          "human_id": "018f1e72-6e9a-7c20-8e90-00000000b0b1"
-        },
-        "source": { "surface": "direct_chat" },
-        "authority": { "basis": "employer", "decision_id": null }
+        "actor": { "kind": "human", "principal_id": "bob@example.com" },
+        "source": { "surface": "direct_chat" }
       },
       "command": { "type": "abort" }
     }
@@ -250,12 +242,8 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": {
-          "kind": "human",
-          "human_id": "018f1e72-6e9a-7c20-8e90-00000000a11c"
-        },
-        "source": { "surface": "direct_chat" },
-        "authority": { "basis": "employer", "decision_id": null }
+        "actor": { "kind": "human", "principal_id": "alice@example.com" },
+        "source": { "surface": "direct_chat" }
       },
       "command": {
         "type": "approval_decision",
@@ -274,12 +262,8 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": {
-          "kind": "human",
-          "human_id": "018f1e72-6e9a-7c20-8e90-00000000b0b1"
-        },
-        "source": { "surface": "direct_chat" },
-        "authority": { "basis": "employer", "decision_id": null }
+        "actor": { "kind": "human", "principal_id": "bob@example.com" },
+        "source": { "surface": "direct_chat" }
       },
       "command": {
         "type": "approval_decision",
@@ -288,51 +272,6 @@
           "type": "approve_always",
           "rule": { "tool_name": "test", "literal_prefix": ["test"] }
         }
-      }
-    }
-  },
-  "messaging_mention_command": {
-    "kind": "command_envelope",
-    "wire": {
-      "seq": 5,
-      "command_id": "00000000-0000-4000-8000-000000000005",
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "provenance": {
-        "version": 1,
-        "tenant_id": "tenant-1",
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": {
-          "kind": "personality_agent",
-          "personality_agent_id": "018f1e72-6e9a-7c20-8e90-1234567890ab"
-        },
-        "source": {
-          "surface": "messaging",
-          "workspace_id": "ws-1",
-          "place": { "kind": "channel", "channel_id": "ch-general" },
-          "delivery": {
-            "message_id": "msg-1",
-            "seq": 42,
-            "addressees": [
-              {
-                "kind": "personality_agent",
-                "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc"
-              }
-            ],
-            "trigger_reason": "mention",
-            "urgency": "urgent",
-            "correlation_id": "corr-1",
-            "causation_id": null
-          }
-        },
-        "authority": {
-          "basis": "place_membership",
-          "decision_id": "decision-1"
-        }
-      },
-      "command": {
-        "type": "user_message",
-        "text": "@secretary 明日の枠、押さえておいてもらえますか",
-        "attachments": []
       }
     }
   },

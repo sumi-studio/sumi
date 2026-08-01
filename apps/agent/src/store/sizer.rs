@@ -13,7 +13,7 @@ const ENVELOPE_OVERHEAD: usize = 1 + 24 + 16;
 use crate::{
     gateway::CommandId,
     provider::types::{PublicMessage, UserContent, UserMessage},
-    runtime::contracts::InboundProvenanceV1,
+    runtime::contracts::DirectChatProvenanceV1,
 };
 
 use super::{Redactor, event_writer::DurableEventMetadata, redactor::search_text_from_projection};
@@ -60,7 +60,7 @@ pub(crate) struct InjectionCommandSizeInput<'a> {
     pub message_id: &'a str,
     pub text: &'a str,
     pub timestamp: &'a DateTime<Utc>,
-    pub provenance: &'a InboundProvenanceV1,
+    pub provenance: &'a DirectChatProvenanceV1,
 }
 
 #[allow(dead_code, reason = "T12 boundary is consumed by the T15 run loop")]
@@ -126,7 +126,7 @@ impl EventBatchSizer {
             .len();
         for command in input.commands {
             let authenticated_metadata_bytes = serde_json::to_vec(&DurableEventMetadata {
-                inbound_provenance: Some(command.provenance.clone()),
+                direct_chat_provenance: Some(command.provenance.clone()),
                 ..DurableEventMetadata::default()
             })
             .map_err(|error| {
@@ -530,7 +530,7 @@ mod tests {
             message_id,
             text,
             timestamp: &timestamp,
-            provenance: &crate::gateway::test_inbound_provenance(),
+            provenance: &crate::gateway::test_direct_chat_provenance(),
         }];
         let message_only = size_one(text);
         let idle = EventBatchSizer::injection_batch(

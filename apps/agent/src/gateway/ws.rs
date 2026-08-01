@@ -610,7 +610,7 @@ mod tests {
             "seq": 42,
             "command_id": "00000000-0000-4000-8000-000000000042",
             "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            "provenance": crate::gateway::test_inbound_provenance(),
+            "provenance": crate::gateway::test_direct_chat_provenance(),
             "command": {
                 "type": "abort"
             }
@@ -636,7 +636,7 @@ mod tests {
         );
         assert_eq!(
             command.provenance,
-            crate::gateway::test_inbound_provenance()
+            crate::gateway::test_direct_chat_provenance()
         );
         assert!(matches!(command.command, Command::Abort {}));
     }
@@ -646,7 +646,7 @@ mod tests {
         let mut bytes = format!(
             r#"{{"seq":42,"command_id":"00000000-0000-4000-8000-000000000042","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
             crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            serde_json::to_string(&crate::gateway::test_inbound_provenance()).unwrap(),
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance()).unwrap(),
         )
         .into_bytes();
         bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
@@ -670,7 +670,7 @@ mod tests {
         let mut bytes = format!(
             r#"{{"seq":43,"command_id":"00000000-0000-4000-8000-000000000043","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
             crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            serde_json::to_string(&crate::gateway::test_inbound_provenance()).unwrap(),
+            serde_json::to_string(&crate::gateway::test_direct_chat_provenance()).unwrap(),
         )
         .into_bytes();
         bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
@@ -727,7 +727,7 @@ mod tests {
                 "seq": 2,
                 "command_id": "00000000-0000-4000-8000-000000000002",
                 "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-                "provenance": crate::gateway::test_inbound_provenance(),
+                "provenance": crate::gateway::test_direct_chat_provenance(),
                 "command": {"type": "abort"},
             }))
             .expect("serialize authenticated command fixture"),
@@ -1171,7 +1171,7 @@ mod tests {
             let mut oversized = format!(
                 r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"type":"user_message","text":""#,
                 crate::gateway::TEST_PERSONALITY_AGENT_ID,
-                serde_json::to_string(&crate::gateway::test_inbound_provenance())
+                serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
                     .expect("serialize direct-chat provenance fixture"),
             )
             .into_bytes();

@@ -18,10 +18,7 @@ import (
 )
 
 const (
-	// Surface-neutral: one browser session serves every app surface. The
-	// previous "sumi:web:direct-chat" audience is not accepted; the claim key
-	// rename (user_id → human_id) and this cutover are one break, not two.
-	defaultBrowserAudience         = "sumi:web"
+	defaultBrowserAudience         = "sumi:web:direct-chat"
 	maxBrowserSessionTTL           = time.Hour
 	maxRevokedSessions             = 4096
 	browserSessionIDBytes          = 32
@@ -51,7 +48,7 @@ func DefaultBrowserAudience() string { return defaultBrowserAudience }
 // never comes from a public route or browser-authored command.
 type UserSessionClaims struct {
 	TenantID           string
-	HumanID            string
+	UserID             string
 	PersonalityAgentID string
 	sessionID          string
 	expiresAt          time.Time
@@ -152,7 +149,7 @@ type BrowserSessionLifecycle interface {
 
 type userSessionWireClaims struct {
 	TenantID           string `json:"tenant_id"`
-	HumanID            string `json:"human_id"`
+	UserID             string `json:"user_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
 	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
@@ -240,7 +237,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	default:
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
-		ValidateHumanID(claims.HumanID) != nil {
+		!provenanceIDRegexp.MatchString(claims.UserID) {
 		return preparedBrowserSession{}, errors.New("browser session has invalid tenant or user binding")
 	}
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
@@ -259,7 +256,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	headerPart := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	wireClaims := userSessionWireClaims{
 		TenantID:           claims.TenantID,
-		HumanID:            claims.HumanID,
+		UserID:             claims.UserID,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Iat:                now.Unix(),
 		Exp:                now.Add(ttl).Unix(),
@@ -281,7 +278,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	return preparedBrowserSession{
 		claims: UserSessionClaims{
 			TenantID:           wireClaims.TenantID,
-			HumanID:            wireClaims.HumanID,
+			UserID:             wireClaims.UserID,
 			PersonalityAgentID: wireClaims.PersonalityAgentID,
 			sessionID:          wireClaims.SID,
 			expiresAt:          time.Unix(wireClaims.Exp, 0),
@@ -374,7 +371,7 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 		return UserSessionClaims{}, fmt.Errorf("parse browser session claims: %w", err)
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
-		ValidateHumanID(claims.HumanID) != nil ||
+		!provenanceIDRegexp.MatchString(claims.UserID) ||
 		claims.PersonalityAgentID == "" ||
 		claims.Iat == 0 ||
 		claims.Exp == 0 ||
@@ -394,7 +391,7 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 	}
 	return UserSessionClaims{
 		TenantID:           claims.TenantID,
-		HumanID:            claims.HumanID,
+		UserID:             claims.UserID,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		sessionID:          claims.SID,
 		expiresAt:          time.Unix(claims.Exp, 0),
@@ -431,7 +428,7 @@ func deriveBrowserAuthorityBindingID(
 	var length [4]byte
 	for _, value := range []string{
 		claims.TenantID,
-		claims.HumanID,
+		claims.UserID,
 		claims.PersonalityAgentID,
 	} {
 		binary.BigEndian.PutUint32(length[:], uint32(len(value)))

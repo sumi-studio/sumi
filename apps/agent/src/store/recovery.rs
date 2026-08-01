@@ -1158,7 +1158,7 @@ mod tests {
         gateway::{
             ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
         },
-        runtime::contracts::{InboundProvenanceV1, PersonalityAgentId},
+        runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId},
         store::{
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, Projection,
             crypto::{DATA_KEY_BYTES, WrappingKey},
@@ -1171,13 +1171,9 @@ mod tests {
             .expect("canonical test PAID")
     }
 
-    fn test_provenance() -> InboundProvenanceV1 {
-        InboundProvenanceV1::direct_chat(
-            "tenant-test",
-            test_personality_agent_id(),
-            crate::gateway::test_human_id(),
-        )
-        .expect("valid direct-chat provenance")
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+            .expect("valid direct-chat provenance")
     }
 
     struct TestKeyProvider(WrappingKey);

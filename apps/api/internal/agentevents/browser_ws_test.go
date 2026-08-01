@@ -183,7 +183,7 @@ type blockingCommandAppender struct {
 
 func (a *blockingCommandAppender) Append(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, error) {
@@ -230,7 +230,7 @@ func (a *mutableDirectChatAuthorizer) setAllowed(allowed bool) {
 
 func (a dispositionBeforeAppendReturn) Append(
 	ctx context.Context,
-	provenance InboundProvenance,
+	provenance DirectChatProvenance,
 	idempotencyKey string,
 	command json.RawMessage,
 ) (CommandEnvelope, error) {
@@ -275,7 +275,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	claims := userSessionWireClaims{TenantID: "tenant-1", HumanID: "018f47a2-9b3c-7def-8abc-00000000ab01", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience}
+	claims := userSessionWireClaims{TenantID: "tenant-1", UserID: "user-1", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience}
 	conn := dialBrowserWS(t, httpServer, signBrowserSession(t, testSecret, claims), "018f47a2-9b3c-7def-8abc-0123456789ab")
 	defer conn.Close()
 	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
@@ -405,7 +405,7 @@ func TestBrowserWebSocketFirstAdmissionPrecedesItsRacingDisposition(t *testing.T
 
 	sessionClaims := userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -461,7 +461,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 				PersonalityAgentID: personalityAgentID,
 				Generation:         generation,
 			}
-			provenance := testInboundProvenance(personalityAgentID)
+			provenance := testDirectChatProvenance(personalityAgentID)
 			originalBody := json.RawMessage(`{"type":"user_message","text":"original","attachments":[]}`)
 			original, err := gateway.Append(context.Background(), provenance, "lost-receipt-key", originalBody)
 			if err != nil {
@@ -555,7 +555,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 
 			sessionClaims := userSessionWireClaims{
 				TenantID:           "tenant-1",
-				HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+				UserID:             "user-1",
 				PersonalityAgentID: personalityAgentID,
 				Exp:                time.Now().Add(time.Hour).Unix(),
 				Aud:                defaultBrowserAudience,
@@ -731,7 +731,7 @@ func TestBrowserWebSocketRejectsUnavailableWithoutDurableCommand(t *testing.T) {
 
 	claims := userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -800,8 +800,8 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 		cookie string
 	}{
 		{"missing", ""},
-		{"expired", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", HumanID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(-time.Hour).Unix(), Aud: defaultBrowserAudience})},
-		{"malformed-personality-agent", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", HumanID: "user", PersonalityAgentID: "other", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})},
+		{"expired", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(-time.Hour).Unix(), Aud: defaultBrowserAudience})},
+		{"malformed-personality-agent", signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "other", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			header := http.Header{"Origin": {"https://web.example"}}
@@ -855,7 +855,7 @@ func TestBrowserWebSocketRejectsOriginAndAuthorityBeforeRuntimeActivity(t *testi
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 	}
 	validSession, err := sessions.IssueSession(context.Background(), claims, time.Minute)
@@ -951,7 +951,7 @@ func TestBrowserWebSocketRevocationWinsAdmissionBeforeSpawn(t *testing.T) {
 	sessions := &blockingAdmissionSessionAuthorizer{
 		claims: UserSessionClaims{
 			TenantID:           "tenant-1",
-			HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+			UserID:             "user-1",
 			PersonalityAgentID: personalityAgentID,
 			sessionID:          base64.RawURLEncoding.EncodeToString(make([]byte, browserSessionIDBytes)),
 			expiresAt:          time.Now().Add(time.Hour),
@@ -1030,7 +1030,7 @@ func TestBrowserWebSocketLogoutCompletesWhileSpawnerIsBlocked(t *testing.T) {
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 	}, time.Minute)
 	if err != nil {
@@ -1382,7 +1382,7 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	mux.Handle("GET /direct-chat/ws", server)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
-	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", HumanID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})
+	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant", UserID: "user", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})
 	claims := TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}
 	if err := gateway.PublishRuntimeState(claims.PersonalityAgentID, claims.Generation, nil); err != nil {
 		t.Fatal(err)
@@ -1434,7 +1434,7 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 
 	sessionClaims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 	}
 	firstSession, err := sessions.IssueSession(context.Background(), sessionClaims, time.Minute)
@@ -1556,7 +1556,7 @@ func TestBrowserSessionLineageLogoutStopsSuccessorOutboundFramesAcrossGateways(
 	}
 	sessionClaims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 	}
 	currentSession, err := firstSessions.IssueSession(
@@ -1642,7 +1642,7 @@ func TestBrowserWebSocketClosesAtSessionExpiry(t *testing.T) {
 	expires := time.Now().Add(2 * time.Second).Unix()
 	session := signBrowserSession(t, testSecret, userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Iat:                expires - int64(time.Minute/time.Second),
 		Exp:                expires,
@@ -1702,7 +1702,7 @@ func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T
 	expires := time.Now().Add(2 * time.Second).Unix()
 	session := signBrowserSession(t, testSecret, userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Iat:                expires - int64(time.Minute/time.Second),
 		Exp:                expires,
@@ -1796,7 +1796,7 @@ func openLiveAuthorizedBrowserWithOptions(
 	t.Cleanup(httpServer.Close)
 	session := signBrowserSession(t, testSecret, userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -1942,7 +1942,7 @@ func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *te
 
 	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{
 		TenantID:           "tenant-1",
-		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
+		UserID:             "user-1",
 		PersonalityAgentID: personalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -2065,7 +2065,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
 
-	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", HumanID: "018f47a2-9b3c-7def-8abc-00000000ab01", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})
+	cookie := signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", UserID: "user-1", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})
 	conn := dialBrowserWS(t, httpServer, cookie, personalityAgentID)
 	defer conn.Close()
 	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 2}); err != nil {
@@ -2151,7 +2151,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	defer httpServer.Close()
 
 	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
-	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", HumanID: "018f47a2-9b3c-7def-8abc-00000000ab01", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})}}
+	header := http.Header{"Origin": {"https://web.example"}, "Cookie": {BrowserSessionCookie + "=" + signBrowserSession(t, testSecret, userSessionWireClaims{TenantID: "tenant-1", UserID: "user-1", PersonalityAgentID: personalityAgentID, Exp: time.Now().Add(time.Hour).Unix(), Aud: defaultBrowserAudience})}}
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial browser websocket: %v", err)

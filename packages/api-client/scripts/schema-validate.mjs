@@ -93,8 +93,7 @@ for (const legacyRoute of [
 
 const directChatPost = openApi.paths?.["/direct-chat/commands"]?.post;
 const idempotencyParameter = directChatPost?.parameters?.find(
-  (parameter) =>
-    parameter.in === "header" && parameter.name === "Idempotency-Key",
+  (parameter) => parameter.in === "header" && parameter.name === "Idempotency-Key",
 );
 if (
   !idempotencyParameter?.required ||
@@ -109,8 +108,7 @@ if (
   failed = true;
 }
 
-const directChatRequest =
-  openApi.components?.schemas?.DirectChatUserMessageCommand;
+const directChatRequest = openApi.components?.schemas?.DirectChatUserMessageCommand;
 if (
   directChatRequest?.type !== "object" ||
   directChatRequest?.additionalProperties !== false ||
@@ -118,9 +116,7 @@ if (
   directChatRequest?.properties?.text?.type !== "string" ||
   directChatRequest?.properties?.attachments?.maxItems !== 0
 ) {
-  console.error(
-    "Direct-chat HTTP admission must preserve the strict structured user-message command body.",
-  );
+  console.error("Direct-chat HTTP admission must preserve the strict structured user-message command body.");
   failed = true;
 }
 
@@ -209,22 +205,16 @@ const httpRejectionCases = [
 ];
 
 for (const { name, definition, valid, invalid } of httpRejectionCases) {
-  const validate = schemaOnlyAjv.compile(
-    openApi.components.schemas[definition],
-  );
+  const validate = schemaOnlyAjv.compile(openApi.components.schemas[definition]);
   for (const value of valid) {
     if (!validate(value)) {
-      console.error(
-        `${name} rejected valid response: ${describeErrors(validate.errors)}`,
-      );
+      console.error(`${name} rejected valid response: ${describeErrors(validate.errors)}`);
       failed = true;
     }
   }
   for (const value of invalid) {
     if (validate(value)) {
-      console.error(
-        `${name} accepted invalid response: ${JSON.stringify(value)}`,
-      );
+      console.error(`${name} accepted invalid response: ${JSON.stringify(value)}`);
       failed = true;
     }
   }
@@ -419,81 +409,24 @@ const counterexamples = [
   })),
   {
     name: "provenance rejects a missing actor",
-    def: "InboundProvenanceV1",
+    def: "DirectChatProvenanceV1",
     value: {
       version: 1,
       tenant_id: "tenant-1",
       personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       source: { surface: "direct_chat" },
-      authority: { basis: "employer", decision_id: null },
     },
   },
   {
     name: "provenance rejects an unknown field",
-    def: "InboundProvenanceV1",
+    def: "DirectChatProvenanceV1",
     value: {
       version: 1,
       tenant_id: "tenant-1",
       personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      actor: {
-        kind: "human",
-        human_id: "018f1e72-6e9a-7c20-8e90-00000000a11c",
-      },
+      actor: { kind: "human", principal_id: "alice" },
       source: { surface: "direct_chat" },
-      authority: { basis: "employer", decision_id: null },
       extra: true,
-    },
-  },
-  {
-    // Firebase principal は credential であって identity ではない（ADR 0009 §2）。
-    name: "provenance rejects a credential in place of a HumanId",
-    def: "InboundProvenanceV1",
-    value: {
-      version: 1,
-      tenant_id: "tenant-1",
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      actor: { kind: "human", human_id: "alice@example.com" },
-      source: { surface: "direct_chat" },
-      authority: { basis: "employer", decision_id: null },
-    },
-  },
-  {
-    // messaging は必ず配送されたメッセージを伴う（ADR 0011 §1）。
-    name: "messaging provenance rejects a missing delivery",
-    def: "InboundProvenanceV1",
-    value: {
-      version: 1,
-      tenant_id: "tenant-1",
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      actor: {
-        kind: "human",
-        human_id: "018f1e72-6e9a-7c20-8e90-00000000a11c",
-      },
-      source: {
-        surface: "messaging",
-        workspace_id: null,
-        place: { kind: "channel", channel_id: "ch-general" },
-      },
-      authority: { basis: "place_membership", decision_id: null },
-    },
-  },
-  {
-    // direct chat に place は無い（ADR 0009 §5）。
-    name: "direct chat provenance rejects a place",
-    def: "InboundProvenanceV1",
-    value: {
-      version: 1,
-      tenant_id: "tenant-1",
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      actor: {
-        kind: "human",
-        human_id: "018f1e72-6e9a-7c20-8e90-00000000a11c",
-      },
-      source: {
-        surface: "direct_chat",
-        place: { kind: "channel", channel_id: "ch-general" },
-      },
-      authority: { basis: "employer", decision_id: null },
     },
   },
   {

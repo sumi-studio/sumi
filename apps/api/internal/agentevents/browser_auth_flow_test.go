@@ -105,7 +105,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		startResult:   BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "proof_required", ExpiresAt: time.Now().Add(time.Minute)},
 		resolveResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "confirmation_required", NextAction: "create_account"},
 		confirmResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "account_created", Claims: UserSessionClaims{
-			TenantID: "local", HumanID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
+			TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 		}},
 	}
 	server.Flows = controller
@@ -137,7 +137,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		t.Fatal("terminal outcome did not issue session")
 	}
 	claims, err := sessions.VerifySession(context.Background(), sessionCookie.Value)
-	if err != nil || claims.HumanID != controller.confirmResult.Claims.HumanID {
+	if err != nil || claims.UserID != controller.confirmResult.Claims.UserID {
 		t.Fatalf("session claims: %+v %v", claims, err)
 	}
 
@@ -175,7 +175,7 @@ func TestProviderOperationStatusRecoversWithoutSessionOrFirebaseSideEffects(t *t
 	firebase := &fakeFirebaseVerifier{}
 	server, sessions := newTestBrowserAuthServer(t, firebase, &fakeBindingResolver{})
 	claims := UserSessionClaims{
-		TenantID: "local", HumanID: "0198f0f4-9b72-7000-8000-000000000010",
+		TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010",
 		PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 	}
 	session, err := sessions.IssueSession(context.Background(), claims, 5*time.Minute)
@@ -218,7 +218,7 @@ func TestProviderOperationStatusRecoversWithoutSessionOrFirebaseSideEffects(t *t
 	if firebase.calls != 0 {
 		t.Fatalf("status verified Firebase token %d times", firebase.calls)
 	}
-	if controller.providerStatusCalls != 2 || controller.providerStatusClaims.HumanID != claims.HumanID ||
+	if controller.providerStatusCalls != 2 || controller.providerStatusClaims.UserID != claims.UserID ||
 		controller.providerStatusRequest.Nonce != "nonce-value" {
 		t.Fatalf("controller invocation: calls=%d claims=%+v request=%+v", controller.providerStatusCalls, controller.providerStatusClaims, controller.providerStatusRequest)
 	}
@@ -226,7 +226,7 @@ func TestProviderOperationStatusRecoversWithoutSessionOrFirebaseSideEffects(t *t
 		t.Fatalf("status invalidated original session: %v", err)
 	}
 	body := first.Body.String()
-	for _, secret := range []string{claims.HumanID, claims.PersonalityAgentID, "firebase", "id_token"} {
+	for _, secret := range []string{claims.UserID, claims.PersonalityAgentID, "firebase", "id_token"} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("status leaked %q: %s", secret, body)
 		}
@@ -246,7 +246,7 @@ func TestProviderOperationStatusRequiresOriginCSRFAndSession(t *testing.T) {
 	controller := &fakeAuthFlowController{}
 	server.Flows = controller
 	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
-		TenantID: "local", HumanID: "0198f0f4-9b72-7000-8000-000000000010",
+		TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010",
 		PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 	}, 5*time.Minute)
 	if err != nil {
@@ -297,7 +297,7 @@ func TestProviderOperationStatusUsesStrictTwoFieldJSON(t *testing.T) {
 	controller := &fakeAuthFlowController{}
 	server.Flows = controller
 	session, err := sessions.IssueSession(context.Background(), UserSessionClaims{
-		TenantID: "local", HumanID: "0198f0f4-9b72-7000-8000-000000000010",
+		TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010",
 		PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 	}, 5*time.Minute)
 	if err != nil {

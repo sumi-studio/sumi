@@ -16,7 +16,7 @@ use crate::{
             ToolResultMessage,
         },
     },
-    runtime::contracts::{InboundProvenanceV1, ProcessGeneration},
+    runtime::contracts::{DirectChatProvenanceV1, ProcessGeneration},
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent,
         ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
@@ -46,7 +46,7 @@ use super::{AdmittedCommand, AgentEvent, ApprovalResolution, run::LENGTH_LOOP_CO
 pub(crate) struct DurableRunBinding {
     pub command_id: String,
     pub command_seq: u64,
-    pub provenance: InboundProvenanceV1,
+    pub provenance: DirectChatProvenanceV1,
     pub run_id: String,
     pub turn_id: String,
     pub executor_generation: ProcessGeneration,
@@ -1175,7 +1175,12 @@ impl DurableBridge {
                     let state = approval_state(&resolution);
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
-                    let actor = command.envelope().provenance.actor().key();
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
                     let mut resolution_projections = vec![
@@ -1576,7 +1581,12 @@ impl DurableBridge {
                 } else {
                     let command_id = command.envelope().command_id.to_string();
                     let command_seq = command.envelope().seq;
-                    let actor = command.envelope().provenance.actor().key();
+                    let actor = command
+                        .envelope()
+                        .provenance
+                        .actor()
+                        .principal_id()
+                        .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let projections = vec![
                         Projection::Approval(ApprovalMutation::Resolve {
@@ -2721,7 +2731,7 @@ mod tests {
     fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::UserMessage {
@@ -2735,7 +2745,7 @@ mod tests {
         AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::UserMessage {
@@ -2750,7 +2760,7 @@ mod tests {
     fn test_abort_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::Abort {},
@@ -2761,7 +2771,7 @@ mod tests {
         AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::Abort {},
@@ -2779,7 +2789,7 @@ mod tests {
         AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::ApprovalDecision {
@@ -2853,7 +2863,7 @@ mod tests {
         assistant_origin: ProviderOrigin,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -2948,7 +2958,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
-                    crate::gateway::test_inbound_provenance(),
+                    crate::gateway::test_direct_chat_provenance(),
                 )],
             })
             .await
@@ -3187,7 +3197,7 @@ mod tests {
 
     fn binding(command_id: &str) -> DurableRunBinding {
         DurableRunBinding {
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: "run-a".to_owned(),
@@ -3322,7 +3332,7 @@ mod tests {
         let command = AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test command id"),
@@ -3674,7 +3684,7 @@ mod tests {
             timestamp: test_timestamp(),
         });
         let tool_binding = DurableRunBinding {
-            provenance: crate::gateway::test_inbound_provenance(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             command_id: owner_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -5009,7 +5019,7 @@ mod tests {
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),
@@ -5060,7 +5070,7 @@ mod tests {
             AdmittedCommand::new(
                 CommandEnvelope {
                     personality_agent_id: crate::gateway::test_personality_agent_id(),
-                    provenance: crate::gateway::test_inbound_provenance(),
+                    provenance: crate::gateway::test_direct_chat_provenance(),
                     seq,
                     command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                         .expect("canonical test UUID"),
@@ -5131,7 +5141,7 @@ mod tests {
         let decision_command = AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 3,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000003")
                     .expect("canonical test UUID"),
@@ -5165,7 +5175,7 @@ mod tests {
         let steer_command = AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_inbound_provenance(),
+                provenance: crate::gateway::test_direct_chat_provenance(),
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),

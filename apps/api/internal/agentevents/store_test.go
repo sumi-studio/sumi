@@ -39,7 +39,7 @@ func TestCommandStore_AppendAllocatesSeqAndCommandID(t *testing.T) {
 	defer store.Close()
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)
-	env, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+	env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestCommandStore_AppendAllocatesSeqAndCommandID(t *testing.T) {
 		t.Fatalf("command_id %q is not a canonical UUID", env.CommandID)
 	}
 
-	env2, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+	env2, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestCommandStore_ConcurrentAppendsNoDuplicateOrGap(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			envelopes[idx], errs[idx] = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+			envelopes[idx], errs[idx] = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 		}(i)
 	}
 	wg.Wait()
@@ -122,13 +122,13 @@ func TestCommandStore_RestartPreservesLogAndNextSeq(t *testing.T) {
 	}
 
 	cmd1 := json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd1)
+	env1, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	cmd2 := json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`)
-	env2, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd2)
+	env2, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestCommandStore_RestartPreservesLogAndNextSeq(t *testing.T) {
 		t.Fatal("restart corrupted command bytes")
 	}
 
-	env3, err := store2.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	env3, err := store2.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,12 +183,12 @@ func TestCommandStore_IdempotencyKey(t *testing.T) {
 	defer store.Close()
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"idem","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
+	env1, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	env2, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
+	env2, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestCommandStore_IdempotencyKey(t *testing.T) {
 	}
 
 	cmd3 := json.RawMessage(`{"type":"user_message","text":"different","attachments":[]}`)
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd3)
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd3)
 	if err == nil {
 		t.Fatal("expected idempotency key conflict for different command body")
 	}
@@ -215,11 +215,11 @@ func TestCommandStore_PerPersonalityAgentSeq(t *testing.T) {
 	defer store.Close()
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`)
-	a, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-012345678990"), "", cmd)
+	a, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-012345678990"), "", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-012345678991"), "", cmd)
+	b, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-012345678991"), "", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestCommandStore_CatchUpFromSeq(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		cmd := json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`)
-		if _, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd); err != nil {
+		if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -271,7 +271,7 @@ func TestCommandStore_ContextCancellation(t *testing.T) {
 	cancel()
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`)
-	_, err = store.Append(ctx, testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+	_, err = store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
 	}
@@ -286,7 +286,7 @@ func TestCommandStoreBlockedPersonalityAgentDoesNotBlockOtherPersonalityAgent(t 
 	}
 	defer store.Close()
 	const blocked = "018f47a2-9b3c-7def-8abc-012345678992"
-	if _, err := store.Append(context.Background(), testInboundProvenance(blocked), "", json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)); err != nil {
+	if _, err := store.Append(context.Background(), testDirectChatProvenance(blocked), "", json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)); err != nil {
 		t.Fatal(err)
 	}
 	blocker, err := os.OpenFile(commandLogPath(dir, blocked), os.O_RDWR, 0o600)
@@ -314,7 +314,7 @@ func TestCommandStoreBlockedPersonalityAgentDoesNotBlockOtherPersonalityAgent(t 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, err := store.Append(ctx, testInboundProvenance("018f47a2-9b3c-7def-8abc-012345678993"), "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {
+	if _, err := store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-012345678993"), "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {
 		t.Fatalf("blocked personality agent serialized unrelated append: %v", err)
 	}
 	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
@@ -363,7 +363,7 @@ func TestCommandStore_DurableCommitBeforeSuccess(t *testing.T) {
 	}
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"durable","attachments":[]}`)
-	env, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+	env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestCommandStore_RaceNoDuplicateSeqUnderPressure(t *testing.T) {
 			defer wg.Done()
 			time.Sleep(time.Duration(i) * time.Microsecond) // jitter
 			cmd := json.RawMessage(`{"type":"user_message","text":"race","attachments":[]}`)
-			env, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
+			env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 			if err != nil {
 				t.Errorf("append failed: %v", err)
 				return
@@ -434,7 +434,7 @@ func TestCommandStore_IdempotencyKeyPersistsAcrossRestart(t *testing.T) {
 	}
 
 	cmd := json.RawMessage(`{"type":"user_message","text":"idem","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
+	env1, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestCommandStore_IdempotencyKeyPersistsAcrossRestart(t *testing.T) {
 	}
 	defer store2.Close()
 
-	env2, err := store2.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
+	env2, err := store2.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestCommandStore_IdempotencyKeyPersistsAcrossRestart(t *testing.T) {
 	}
 
 	cmd3 := json.RawMessage(`{"type":"user_message","text":"different","attachments":[]}`)
-	_, err = store2.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd3)
+	_, err = store2.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "key-1", cmd3)
 	if err == nil {
 		t.Fatal("expected idempotency conflict after restart for different command body")
 	}
@@ -478,7 +478,7 @@ func TestCommandStore_SameSizeReplacementIsRescanned(t *testing.T) {
 	// replacement with a 7-character text plus an idempotency_key field has
 	// exactly the same JSON size.
 	originalCmd := json.RawMessage(`{"type":"user_message","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","attachments":[]}`)
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", originalCmd)
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", originalCmd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +507,7 @@ func TestCommandStore_SameSizeReplacementIsRescanned(t *testing.T) {
 
 	// A same-size rewrite should be detected by refreshStateLocked and the
 	// idempotency key must be visible on the next Append.
-	env, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "replaced-key", replacementCmd)
+	env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "replaced-key", replacementCmd)
 	if err != nil {
 		t.Fatalf("append after replacement: %v", err)
 	}
@@ -563,7 +563,7 @@ func TestCommandStore_PartialTailRecovery(t *testing.T) {
 		t.Fatalf("expected next seq 3 after tail truncation, got %d", next)
 	}
 
-	env3, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	env3, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +623,7 @@ func TestCommandStore_FirstCommandSeqAndCatchUp(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		cmd := json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":"msg %d","attachments":[]}`, i))
-		if _, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd); err != nil {
+		if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -780,7 +780,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 	defer store.Close()
 
 	// Seed the file so the append path seeks to end and then fails.
-	if _, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
+	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -788,7 +788,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 	ff.failWriteOn = 1
 	ff.failTruncateOn = 1
 
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -796,7 +796,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 		t.Fatalf("expected compound rollback error, got %v", err)
 	}
 
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil || !strings.Contains(err.Error(), "poisoned") {
 		t.Fatalf("expected poisoned state error, got %v", err)
 	}
@@ -812,7 +812,7 @@ func TestCommandStoreAppendRejectsInvalidCommandBeforeWrite(t *testing.T) {
 
 	if _, err := store.Append(
 		context.Background(),
-		testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
 		"",
 		json.RawMessage(`{"type":"abort","extra":true}`),
 	); err == nil {
@@ -821,7 +821,7 @@ func TestCommandStoreAppendRejectsInvalidCommandBeforeWrite(t *testing.T) {
 
 	env, err := store.Append(
 		context.Background(),
-		testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
+		testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"),
 		"",
 		json.RawMessage(`{"type":"abort"}`),
 	)
@@ -848,7 +848,7 @@ func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
+	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -856,7 +856,7 @@ func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
 	ff.failSyncOn = 1
 	ff.failTruncateOn = 1
 
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -878,14 +878,14 @@ func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
+	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
 	ff := injectFailingFile(t, store, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	ff.failSyncOn = 1
 
-	_, err = store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
+	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -901,7 +901,7 @@ func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
 		t.Fatalf("expected next seq to remain 2 after rollback, got %d", next)
 	}
 
-	env, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
+	env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1029,7 +1029,7 @@ func TestCommandStore_RepairMissingTrailingNewlineEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	env3, err := store.Append(context.Background(), testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	env3, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1125,7 +1125,7 @@ func TestCommandStore_MultiProcessWorker(t *testing.T) {
 		for i := 0; i < count; i++ {
 			text := fmt.Sprintf("child-%s-%d", id, i)
 			cmd := json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":%q,"attachments":[]}`, text))
-			env, err := store.Append(context.Background(), testInboundProvenance(conv), "", cmd)
+			env, err := store.Append(context.Background(), testDirectChatProvenance(conv), "", cmd)
 			if err != nil {
 				t.Fatalf("append %d: %v", i, err)
 			}
@@ -1139,13 +1139,13 @@ func TestCommandStore_MultiProcessWorker(t *testing.T) {
 		ff := &failingFile{File: st.file.(*os.File), failSyncOn: 1}
 		st.file = ff
 		cmd := json.RawMessage(`{"type":"user_message","text":"rollback-child","attachments":[]}`)
-		_, err := store.Append(context.Background(), testInboundProvenance(conv), "", cmd)
+		_, err := store.Append(context.Background(), testDirectChatProvenance(conv), "", cmd)
 		if err == nil {
 			t.Fatal("expected append to fail with injected sync failure")
 		}
 	case "keyed":
 		cmd := json.RawMessage(`{"type":"user_message","text":"global-idempotency","attachments":[]}`)
-		_, err := store.Append(context.Background(), testInboundProvenance(conv), "global-key", cmd)
+		_, err := store.Append(context.Background(), testDirectChatProvenance(conv), "global-key", cmd)
 		switch {
 		case err == nil:
 			fmt.Println("KEYED_ACCEPTED")
@@ -1302,7 +1302,7 @@ func TestCommandStore_MultiProcessRollbackDoesNotDestroyPeerRecord(t *testing.T)
 		t.Fatal(err)
 	}
 	parentCmd := json.RawMessage(`{"type":"user_message","text":"parent","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testInboundProvenance(conv), "", parentCmd)
+	env1, err := store.Append(context.Background(), testDirectChatProvenance(conv), "", parentCmd)
 	if err != nil {
 		t.Fatal(err)
 	}
