@@ -27,6 +27,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/researchlog"
+	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	"golang.org/x/sys/unix"
 )
 
@@ -91,12 +92,35 @@ func run(ctx context.Context) (runErr error) {
 		IdleTimeout:       15 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
+	if app.spawnManager != nil {
+		reaperCtx, cancelReaper := context.WithCancel(ctx)
+		defer cancelReaper()
+		go runIdleReaper(reaperCtx, app.spawnManager)
+	}
 	log.Printf("sumi local control listening on %s", app.localListener.description())
 	return serveHTTPServers(
 		ctx,
 		serverAndListener{server: publicServer, listener: publicListener},
 		serverAndListener{server: localServer, listener: localListener},
 	)
+}
+
+// runIdleReaper periodically stops cold-mode agents that have been idle longer
+// than the configured timeout. Warm-mode agents are never stopped. It exits
+// when ctx is done.
+func runIdleReaper(ctx context.Context, mgr *spawn.Manager) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if stopped := mgr.StopIdleCold(); len(stopped) > 0 {
+				log.Printf("spawn: stopped idle cold agents: %v", stopped)
+			}
+		}
+	}
 }
 
 func publicListenAddressFromEnv(port string) (string, error) {
@@ -187,6 +211,7 @@ type application struct {
 	store         *agentevents.CommandStore
 	browser       *agentevents.BrowserServer
 	database      *db.Pool
+	spawnManager  *spawn.Manager
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -206,6 +231,9 @@ func (a *application) Close() error {
 		}
 		if a.database != nil {
 			a.database.Close()
+		}
+		if a.spawnManager != nil {
+			a.closeErr = errors.Join(a.closeErr, a.spawnManager.StopAll())
 		}
 	})
 	return a.closeErr
@@ -303,6 +331,18 @@ func newApplicationFromEnv() (*application, error) {
 			return nil, fmt.Errorf("register local control fixture: %w", err)
 		}
 	}
+	var resolver spawn.AgentResolver
+	if database != nil {
+		resolver = koseki.New(database.Pool)
+	}
+	spawnManager, err := spawnManagerFromEnv(resolver, localListener)
+	if err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("spawn manager: %w", err)
+	}
+	if spawnManager != nil {
+		browser.Spawner = spawnManager
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	return &application{
 		publicMux:     mux,
@@ -311,6 +351,7 @@ func newApplicationFromEnv() (*application, error) {
 		store:         store,
 		browser:       browser,
 		database:      database,
+		spawnManager:  spawnManager,
 	}, nil
 }
 
@@ -1834,6 +1875,143 @@ func buildLocalControlAuthorizations(
 // the LocalControlServer can distinguish them.
 func deriveAgentCredential(shared, agentID string) string {
 	return shared + "/" + agentID
+}
+
+// spawnManagerFromEnv builds the lazy agent spawner when SUMI_AGENT_BINARY is
+// set. It requires the 戸籍 database and a loopback local-control listener so
+// spawned agents can connect back to the API. A nil listener or unset binary
+// yields a nil manager, which keeps the legacy single-process dev mode working.
+func spawnManagerFromEnv(resolver spawn.AgentResolver, listener *localControlListenerConfig) (*spawn.Manager, error) {
+	binaryPath := strings.TrimSpace(os.Getenv("SUMI_AGENT_BINARY"))
+	if binaryPath == "" {
+		return nil, nil
+	}
+	if resolver == nil {
+		return nil, errors.New("SUMI_AGENT_BINARY requires a 戸籍 database (SUMI_DB_URL)")
+	}
+	if listener == nil || listener.loopbackListen == "" {
+		return nil, errors.New("SUMI_AGENT_BINARY requires SUMI_LOCAL_CONTROL_ENABLED=1 with SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN")
+	}
+
+	execSpawner, err := spawn.NewExecSpawner(binaryPath, spawn.SharedAgentEnvFromOS())
+	if err != nil {
+		return nil, fmt.Errorf("exec spawner: %w", err)
+	}
+	stateRoot, err := requireDirFromEnv("SUMI_SPAWN_STATE_ROOT")
+	if err != nil {
+		return nil, err
+	}
+	workspaceRoot, err := requireDirFromEnv("SUMI_SPAWN_WORKSPACE_ROOT")
+	if err != nil {
+		return nil, err
+	}
+	gatewayURL, err := spawnGatewayURLFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	generation, err := requiredUintFromEnv("SUMI_LOCAL_CONTROL_GENERATION")
+	if err != nil {
+		return nil, err
+	}
+	bearer := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_BEARER"))
+	if bearer == "" {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_BEARER not set")
+	}
+	nonce := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"))
+	if nonce == "" {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE not set")
+	}
+	idleTimeout := 5 * time.Minute
+	if v := os.Getenv("SUMI_SPAWN_IDLE_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse SUMI_SPAWN_IDLE_TIMEOUT: %w", err)
+		}
+		idleTimeout = d
+	}
+	var skip []string
+	if id := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")); id != "" {
+		skip = append(skip, id)
+	}
+
+	mgr, err := spawn.New(spawn.Config{
+		Spawner:         execSpawner,
+		Resolver:        resolver,
+		StateRoot:       stateRoot,
+		WorkspaceRoot:   workspaceRoot,
+		GatewayURL:      gatewayURL,
+		ExecutorSocket:  os.Getenv("SUMI_EXECUTOR_SOCKET"),
+		LocalControlURL: "http://" + listener.loopbackListen,
+		Generation:      generation,
+		SharedBearer:    bearer,
+		SharedNonce:     nonce,
+		IdleTimeout:     idleTimeout,
+		SkipAgentIDs:    skip,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mgr, nil
+}
+
+// spawnGatewayURLFromEnv resolves the gateway URL passed to spawned agents.
+// Explicit SUMI_AGENT_GATEWAY_URL wins, otherwise derive from the public
+// loopback listener. Insecure ws:// loopback is expected for the dev plane.
+func spawnGatewayURLFromEnv() (string, error) {
+	if v := os.Getenv("SUMI_AGENT_GATEWAY_URL"); v != "" {
+		return v, nil
+	}
+	loopback := os.Getenv("SUMI_PUBLIC_LOOPBACK_LISTEN")
+	if loopback != "" {
+		return "ws://" + loopback + "/agent/ws", nil
+	}
+	public := os.Getenv("SUMI_PUBLIC_LISTEN")
+	if public == "" {
+		public = ":" + os.Getenv("PORT")
+		if public == ":" {
+			public = ":8080"
+		}
+	}
+	host, port, err := net.SplitHostPort(public)
+	if err != nil {
+		return "", fmt.Errorf("SUMI_PUBLIC_LISTEN must be host:port to derive agent gateway URL: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", errors.New("SUMI_PUBLIC_LISTEN host is not an IP")
+	}
+	if !ip.IsUnspecified() && !ip.IsLoopback() {
+		return "", errors.New("SUMI_PUBLIC_LISTEN must be loopback or 0.0.0.0 to derive agent gateway URL; set SUMI_AGENT_GATEWAY_URL explicitly")
+	}
+	if ip.IsUnspecified() {
+		ip = net.IPv4(127, 0, 0, 1)
+	}
+	return "ws://" + net.JoinHostPort(ip.String(), port) + "/agent/ws", nil
+}
+
+// requireDirFromEnv returns the value of name, ensuring the directory exists.
+func requireDirFromEnv(name string) (string, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return "", fmt.Errorf("%s not set", name)
+	}
+	if err := os.MkdirAll(value, 0o700); err != nil {
+		return "", fmt.Errorf("create %s: %w", name, err)
+	}
+	return value, nil
+}
+
+// requiredUintFromEnv parses a required unsigned integer env variable.
+func requiredUintFromEnv(name string) (uint64, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return 0, fmt.Errorf("%s not set", name)
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", name, err)
+	}
+	return n, nil
 }
 
 // browserSessionVerifierFromEnv is deliberately separate from the agent token
