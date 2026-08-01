@@ -186,6 +186,19 @@ agentにとってより適した方法があるときだけそちらで代替す
 > 同じ扱いにすると、届いた瞬間にprovider turnになる＝channel botになるため。
 > この門は AttentionCandidate と本人の判断（interrupt / inject / defer / observe）
 > が実装された時点で外す。
+>
+> **門が拒否するのは「agent turnへの直接投入」だけである。** messageは場の
+> durable eventとしてWorkspace側に残る。agentの disposition が `not_allowed`
+> でも、それはmessageが未配送・失敗という意味ではなく、**AttentionCandidateが
+> 未実装なだけ**である。messaging serviceは以下をしてはいけない。
+>
+> - 拒否をもってmessageを未配送扱いにする（place上のseqは確定済み）
+> - 拒否を再試行して同じcommandを送り直す（rejectは終端dispositionであり、
+>   agentはseqをackするので再送されない）
+> - 拒否をpoisonとして扱い、以後の配送を止める
+>
+> 門が外れた後の配送は、拒否されたcommandの再試行ではなく**新しいcommand**
+> として送る。
 
 1. **呼びかけは AttentionCandidate として届く**: 決定論的なdelivery eligibility
    （block/mute、本人の通知設定、quiet hours、明示signal、membership・authority、
