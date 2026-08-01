@@ -75,6 +75,10 @@ export function MessageList({
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
   const toggleReaction = useMessaging((state) => state.toggleReaction);
+  const allowReactions = useMessaging((state) => state.capabilities.reactions);
+  const allowReplyLater = useMessaging(
+    (state) => state.capabilities.replyLater,
+  );
   const editingMessageId = useMessaging((state) => state.editingMessageId);
   const replyLaterById = useMessaging((state) => state.replyLaterById);
   const hasMore = useMessaging((state) =>
@@ -342,6 +346,8 @@ export function MessageList({
             replyLaterBy={
               replyLaterByMessage.get(row.message.messageId) ?? NO_NAMES
             }
+            allowReactions={allowReactions}
+            allowReplyLater={allowReplyLater}
             onRetry={(message) => {
               if (message.clientNonce) retrySend(message.clientNonce);
             }}
@@ -371,6 +377,8 @@ export function MessageList({
       setReplyTarget,
       createReplyLater,
       toggleReaction,
+      allowReactions,
+      allowReplyLater,
       retrySend,
       copyLink,
       startEdit,

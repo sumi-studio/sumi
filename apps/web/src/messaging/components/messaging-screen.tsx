@@ -237,6 +237,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const init = useMessaging((state) => state.init);
   const ready = useMessaging((state) => state.ready);
+  const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
   const placeNavigate = usePlaceNavigate();
@@ -346,7 +347,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
-            <ReplyLaterMenu onJump={requestJump} />
+            {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             <button
               type="button"
               title="メンバーリスト"
@@ -364,7 +365,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
         <Composer />
       </main>
       {membersOpen ? <MemberList /> : null}
-      <ReplyLaterKnock onJump={requestJump} />
+      {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
     </div>
   );
 }

@@ -237,6 +237,8 @@ export interface MessageItemProps {
   membersByKey: Record<ParticipantKey, MemberProfile>;
   /** このメッセージへ「後で返信します」を置いている相手の表示名。 */
   replyLaterBy: string[];
+  allowReactions: boolean;
+  allowReplyLater: boolean;
   findMessage: (messageId: string) => Message | undefined;
   onReply: (message: Message) => void;
   onReplyLater: (message: Message, delayMs: number) => void;
@@ -256,6 +258,8 @@ export const MessageItem = memo(function MessageItem({
   selfKey,
   membersByKey,
   replyLaterBy,
+  allowReactions,
+  allowReplyLater,
   findMessage,
   onReply,
   onReplyLater,
@@ -341,12 +345,14 @@ export const MessageItem = memo(function MessageItem({
               </span>
             ) : null}
           </div>
-          <ReactionChips
-            message={message}
-            selfKey={selfKey}
-            membersByKey={membersByKey}
-            onToggleReaction={onToggleReaction}
-          />
+          {allowReactions ? (
+            <ReactionChips
+              message={message}
+              selfKey={selfKey}
+              membersByKey={membersByKey}
+              onToggleReaction={onToggleReaction}
+            />
+          ) : null}
           {replyLaterBy.length > 0 ? (
             <p className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
               <Clock className="size-3" />
@@ -369,36 +375,38 @@ export const MessageItem = memo(function MessageItem({
       </div>
       {pending ? null : (
         <div className="pointer-events-none absolute top-0 right-4 flex -translate-y-1/2 items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
-          <Popover>
-            <PopoverTrigger
-              render={
-                <button
-                  type="button"
-                  title="リアクション"
-                  aria-label="リアクション"
-                  className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                />
-              }
-            >
-              <SmilePlus className="size-3.5" />
-            </PopoverTrigger>
-            <PopoverContent side="top" className="flex gap-0.5 p-1">
-              {REACTION_PALETTE.map((emoji) => (
-                <button
-                  key={emoji}
-                  type="button"
-                  onClick={() => onToggleReaction(message, emoji)}
-                  className="flex size-8 items-center justify-center rounded-md text-[16px] transition-colors hover:bg-accent"
-                >
-                  {emoji}
-                </button>
-              ))}
-            </PopoverContent>
-          </Popover>
+          {allowReactions ? (
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <button
+                    type="button"
+                    title="リアクション"
+                    aria-label="リアクション"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  />
+                }
+              >
+                <SmilePlus className="size-3.5" />
+              </PopoverTrigger>
+              <PopoverContent side="top" className="flex gap-0.5 p-1">
+                {REACTION_PALETTE.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    onClick={() => onToggleReaction(message, emoji)}
+                    className="flex size-8 items-center justify-center rounded-md text-[16px] transition-colors hover:bg-accent"
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </PopoverContent>
+            </Popover>
+          ) : null}
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
-          {own ? null : (
+          {own || !allowReplyLater ? null : (
             <Popover>
               <PopoverTrigger
                 render={

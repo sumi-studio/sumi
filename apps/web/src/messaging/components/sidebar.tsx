@@ -75,6 +75,7 @@ export function Sidebar() {
   const selfKey = useMessaging((state) => state.selfKey);
   const self = useMessaging((state) => state.self);
   const setStatus = useMessaging((state) => state.setStatus);
+  const canSetStatus = useMessaging((state) => state.capabilities.status);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
 
   const selfProfile = self ? membersByKey[selfKey] : undefined;
@@ -142,7 +143,7 @@ export function Sidebar() {
         })}
       </nav>
       <div className="relative shrink-0 border-border/70 border-t p-2">
-        {statusMenuOpen ? (
+        {statusMenuOpen && canSetStatus ? (
           <div className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md">
             {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
               <button
@@ -175,8 +176,11 @@ export function Sidebar() {
         ) : null}
         <button
           type="button"
-          onClick={() => setStatusMenuOpen((open) => !open)}
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent/60"
+          disabled={!canSetStatus}
+          onClick={() => {
+            if (canSetStatus) setStatusMenuOpen((open) => !open);
+          }}
+          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
         >
           <ParticipantAvatar
             participantKey={selfKey}

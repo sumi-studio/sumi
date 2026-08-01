@@ -9,7 +9,7 @@ import {
   SUMI_DEV_PORT,
 } from "../vite.config.ts";
 
-test("the supported dev origin is fixed and proxies auth plus direct-chat", () => {
+test("the supported dev origin proxies auth, direct chat, and messaging", () => {
   const server = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
   assert.equal(SUMI_DEV_ORIGIN, "http://127.0.0.1:5173");
   assert.equal(SUMI_DEV_HOST, "127.0.0.1");
@@ -18,14 +18,26 @@ test("the supported dev origin is fixed and proxies auth plus direct-chat", () =
 
   const auth = server.proxy?.["/auth"];
   const directChat = server.proxy?.["/direct-chat"];
+  const messaging = server.proxy?.["/messaging"];
   assert.equal(typeof auth, "object");
   assert.equal(typeof directChat, "object");
-  if (typeof auth !== "object" || typeof directChat !== "object") return;
+  assert.equal(typeof messaging, "object");
+  if (
+    typeof auth !== "object" ||
+    typeof directChat !== "object" ||
+    typeof messaging !== "object"
+  )
+    return;
   assert.deepEqual(auth, {
     target: SUMI_DEV_API_ORIGIN,
     changeOrigin: false,
   });
   assert.deepEqual(directChat, {
+    target: SUMI_DEV_API_ORIGIN,
+    changeOrigin: false,
+    ws: true,
+  });
+  assert.deepEqual(messaging, {
     target: SUMI_DEV_API_ORIGIN,
     changeOrigin: false,
     ws: true,
@@ -45,10 +57,7 @@ test("the proxy target accepts only literal IPv4 or the exact Compose service", 
     "http://127.0.0.1:8080/prefix",
     "http://0.0.0.0:8080",
   ]) {
-    assert.throws(
-      () => createDevServerConfig(value),
-      /exact Compose service/,
-    );
+    assert.throws(() => createDevServerConfig(value), /exact Compose service/);
   }
   assert.throws(
     () => createDevServerConfig(SUMI_DEV_API_ORIGIN, "0.0.0.0"),
@@ -65,10 +74,19 @@ test("an explicit Tailnet IPv4 binds Vite and its API proxy without widening", (
   assert.equal(server.port, 5173);
   const auth = server.proxy?.["/auth"];
   const directChat = server.proxy?.["/direct-chat"];
+  const messaging = server.proxy?.["/messaging"];
   assert.equal(typeof auth, "object");
   assert.equal(typeof directChat, "object");
-  if (typeof auth !== "object" || typeof directChat !== "object") return;
+  assert.equal(typeof messaging, "object");
+  if (
+    typeof auth !== "object" ||
+    typeof directChat !== "object" ||
+    typeof messaging !== "object"
+  )
+    return;
   assert.equal(auth.target, "http://100.64.0.42:8080");
   assert.equal(directChat.target, "http://100.64.0.42:8080");
   assert.equal(directChat.ws, true);
+  assert.equal(messaging.target, "http://100.64.0.42:8080");
+  assert.equal(messaging.ws, true);
 });

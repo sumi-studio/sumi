@@ -1,8 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { AuthGate } from "../auth/auth-gate";
 import { MessagingScreen } from "../messaging/components/messaging-screen";
 
 export const Route = createFileRoute("/c/$channelId")({
-  component: ChannelRoute,
+  component: () => (
+    <AuthGate>
+      <ChannelRoute />
+    </AuthGate>
+  ),
 });
 
 function ChannelRoute() {

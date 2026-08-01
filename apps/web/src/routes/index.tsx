@@ -1,5 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
+import { AuthGate } from "../auth/auth-gate";
 import { useMessaging } from "../messaging/store";
 
 /**
@@ -7,7 +8,11 @@ import { useMessaging } from "../messaging/store";
  * URL（/c/:id、/dm/:id）が正本になる。
  */
 export const Route = createFileRoute("/")({
-  component: HomeRedirect,
+  component: () => (
+    <AuthGate>
+      <HomeRedirect />
+    </AuthGate>
+  ),
 });
 
 function HomeRedirect() {

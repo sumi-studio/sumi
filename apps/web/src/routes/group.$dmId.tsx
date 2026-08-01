@@ -1,8 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { AuthGate } from "../auth/auth-gate";
 import { MessagingScreen } from "../messaging/components/messaging-screen";
 
 export const Route = createFileRoute("/group/$dmId")({
-  component: GroupDmRoute,
+  component: () => (
+    <AuthGate>
+      <GroupDmRoute />
+    </AuthGate>
+  ),
 });
 
 function GroupDmRoute() {

@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
+import { ApiMessagingBackend } from "./api-backend";
 import { hasDisplayMention } from "./mention";
-import { MockMessagingServer } from "./mock-server";
 import type {
   ChannelSummary,
   ConnectionState,
@@ -9,6 +9,7 @@ import type {
   MemberProfile,
   Message,
   MessagingBackend,
+  MessagingCapabilities,
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
@@ -26,12 +27,16 @@ import { mergeMessages, upsertMessage } from "./timeline";
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
 
-/**
- * 実装差し替え点。実API接続時はここをWS+RESTクライアントに置き換える。
- */
-const backend: MessagingBackend = new MockMessagingServer();
+let backend: MessagingBackend = new ApiMessagingBackend();
+
+/** Tests and explicit development harnesses may replace the transport before init. */
+export function installMessagingBackend(override: MessagingBackend): void {
+  if (initialized) throw new Error("Messaging backend is already initialized");
+  backend = override;
+}
 
 interface MessagingState {
+  capabilities: MessagingCapabilities;
   ready: boolean;
   self: ParticipantRef | null;
   selfKey: ParticipantKey;
@@ -357,6 +362,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   return {
+    capabilities: backend.capabilities,
     ready: false,
     self: null,
     selfKey: "",
@@ -385,50 +391,57 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      void backend.bootstrap().then((snapshot) => {
-        const membersByKey: Record<ParticipantKey, MemberProfile> = {};
-        for (const member of snapshot.members) {
-          membersByKey[participantKey(member.participant)] = member;
-        }
-        const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
-        for (const status of snapshot.statuses) {
-          statusByKey[participantKey(status.participant)] = status;
-        }
-        const lastReadByPlace: Record<PlaceKey, number> = {};
-        for (const marker of snapshot.readMarkers) {
-          lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
-        }
-        const replyLaterById: Record<string, ReplyLaterMarker> = {};
-        for (const marker of snapshot.replyLaterMarkers) {
-          replyLaterById[marker.markerId] = marker;
-        }
-        const unreadCountByPlace: Record<PlaceKey, number> = {};
-        const mentionCountByPlace: Record<PlaceKey, number> = {};
-        const sinceByPlace: Record<PlaceKey, number> = {};
-        for (const summary of snapshot.unreadSummaries) {
-          const key = placeKey(summary.place);
-          unreadCountByPlace[key] = summary.unreadCount;
-          mentionCountByPlace[key] = summary.mentionCount;
-          sinceByPlace[key] = summary.latestSeq;
-        }
-        set({
-          ready: true,
-          self: snapshot.self,
-          selfKey: participantKey(snapshot.self),
-          workspaces: snapshot.workspaces,
-          channels: snapshot.channels,
-          dms: snapshot.dms,
-          membersByKey,
-          statusByKey,
-          lastReadByPlace,
-          unreadCountByPlace,
-          mentionCountByPlace,
-          replyLaterById,
-          employedAgents: snapshot.employedAgents,
+      void backend
+        .bootstrap()
+        .then((snapshot) => {
+          const membersByKey: Record<ParticipantKey, MemberProfile> = {};
+          for (const member of snapshot.members) {
+            membersByKey[participantKey(member.participant)] = member;
+          }
+          const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+          for (const status of snapshot.statuses) {
+            statusByKey[participantKey(status.participant)] = status;
+          }
+          const lastReadByPlace: Record<PlaceKey, number> = {};
+          for (const marker of snapshot.readMarkers) {
+            lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
+          }
+          const replyLaterById: Record<string, ReplyLaterMarker> = {};
+          for (const marker of snapshot.replyLaterMarkers) {
+            replyLaterById[marker.markerId] = marker;
+          }
+          const unreadCountByPlace: Record<PlaceKey, number> = {};
+          const mentionCountByPlace: Record<PlaceKey, number> = {};
+          const sinceByPlace: Record<PlaceKey, number> = {};
+          for (const summary of snapshot.unreadSummaries) {
+            const key = placeKey(summary.place);
+            unreadCountByPlace[key] = summary.unreadCount;
+            mentionCountByPlace[key] = summary.mentionCount;
+            sinceByPlace[key] = summary.latestSeq;
+          }
+          set({
+            ready: true,
+            capabilities: backend.capabilities,
+            self: snapshot.self,
+            selfKey: participantKey(snapshot.self),
+            workspaces: snapshot.workspaces,
+            channels: snapshot.channels,
+            dms: snapshot.dms,
+            membersByKey,
+            statusByKey,
+            lastReadByPlace,
+            unreadCountByPlace,
+            mentionCountByPlace,
+            replyLaterById,
+            employedAgents: snapshot.employedAgents,
+          });
+          backend.subscribe(applyEvent, { sinceByPlace });
+          backend.subscribeConnection((state) => set({ connection: state }));
+        })
+        .catch(() => {
+          initialized = false;
+          set({ connection: "disconnected" });
         });
-        backend.subscribe(applyEvent, { sinceByPlace });
-        backend.subscribeConnection((state) => set({ connection: state }));
-      });
     },
 
     selectPlace(key) {
@@ -589,19 +602,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setStatus(status, note) {
-      void backend.setStatus(status, note);
+      void backend.setStatus(status, note).catch(() => undefined);
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
-      void backend.createReplyLater(
-        message.place,
-        message.messageId,
-        Date.now() + delayMs,
-      );
+      void backend
+        .createReplyLater(
+          message.place,
+          message.messageId,
+          Date.now() + delayMs,
+        )
+        .catch(() => undefined);
     },
 
     toggleReaction(message, emoji) {
-      void backend.toggleReaction(message.place, message.messageId, emoji);
+      void backend
+        .toggleReaction(message.place, message.messageId, emoji)
+        .catch(() => undefined);
     },
 
     async loadOlder(key) {
@@ -636,7 +653,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      void backend.resolveReplyLater(markerId);
+      void backend.resolveReplyLater(markerId).catch(() => undefined);
     },
 
     sendTyping() {
@@ -646,3 +663,44 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
   };
 });
+
+let messagingSessionIdentity: string | null = null;
+
+export function getMessagingSessionIdentity(): string | null {
+  return messagingSessionIdentity;
+}
+
+export function bindMessagingSessionIdentity(identity: string | null): void {
+  if (identity === messagingSessionIdentity) return;
+  messagingSessionIdentity = identity;
+  backend.dispose();
+  backend = new ApiMessagingBackend();
+  initialized = false;
+  useMessaging.setState({
+    capabilities: backend.capabilities,
+    ready: false,
+    self: null,
+    selfKey: "",
+    workspaces: [],
+    channels: [],
+    dms: [],
+    membersByKey: {},
+    statusByKey: {},
+    messagesByPlace: {},
+    pendingByPlace: {},
+    lastReadByPlace: {},
+    unreadCountByPlace: {},
+    mentionCountByPlace: {},
+    unreadLineByPlace: {},
+    draftByPlace: {},
+    typingByPlace: {},
+    replyLaterById: {},
+    employedAgents: [],
+    hasMoreByPlace: {},
+    loadingOlderByPlace: {},
+    activePlaceKey: null,
+    editingMessageId: null,
+    replyTargetId: null,
+    connection: "disconnected",
+  });
+}

@@ -178,6 +178,12 @@ export interface SendReceipt {
 
 export type ConnectionState = "connected" | "reconnecting" | "disconnected";
 
+export interface MessagingCapabilities {
+  status: boolean;
+  replyLater: boolean;
+  reactions: boolean;
+}
+
 /**
  * メッセージングbackendの境界。モックと実API（REST: /messaging/…、
  * WS: /messaging/ws 1本で全place multiplex）が同じ形を実装する。
@@ -185,6 +191,7 @@ export type ConnectionState = "connected" | "reconnecting" | "disconnected";
  * tool経由で使う（AX）。UIだけにある操作を作らない。
  */
 export interface MessagingBackend {
+  readonly capabilities: MessagingCapabilities;
   bootstrap(): Promise<{
     self: ParticipantRef;
     workspaces: WorkspaceSummary[];
@@ -225,4 +232,5 @@ export interface MessagingBackend {
     options?: { sinceByPlace?: Record<PlaceKey, number> },
   ): () => void;
   subscribeConnection(listener: (state: ConnectionState) => void): () => void;
+  dispose(): void;
 }

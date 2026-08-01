@@ -327,6 +327,11 @@ const TYPING_INTERVAL_MS = 3_000;
 const REPLY_LATER_REMIND_MS = 9_000;
 
 export class MockMessagingServer implements MessagingBackend {
+  readonly capabilities = {
+    status: true,
+    replyLater: true,
+    reactions: true,
+  } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
@@ -343,6 +348,10 @@ export class MockMessagingServer implements MessagingBackend {
       note: "デプロイ対応中",
       expiresAt: null,
     });
+  }
+
+  dispose(): void {
+    this.listeners.clear();
   }
 
   async bootstrap() {
