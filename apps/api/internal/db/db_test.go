@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -124,41 +125,147 @@ func TestKosekiSchemaConstraints(t *testing.T) {
 	}
 }
 
-func TestAgentWrappingKeyIdentityMigrationRequiresExplicitResolution(t *testing.T) {
+func TestAgentWrappingKeyIdentityMigrationCanonicalizesHistoricalMaterial(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 6)
+
+	const historicalHumanID = "0198f0f4-9b72-7000-8000-000000000011"
+	const historicalAgentID = "0198f0f4-9b72-7000-8000-000000000012"
+	// Raw URL-safe base64 encoding of bytes 0x00 through 0x1f, exactly as the
+	// pre-change Store generated it. It is deliberately not a hex fixture.
+	const historicalKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+	const canonicalKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	const alreadyHexHumanID = "0198f0f4-9b72-7000-8000-000000000013"
+	const alreadyHexAgentID = "0198f0f4-9b72-7000-8000-000000000014"
+	const alreadyHexKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, humanID := range []string{historicalHumanID, alreadyHexHumanID} {
+		if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pair := range [][2]string{
+		{historicalAgentID, historicalHumanID},
+		{alreadyHexAgentID, alreadyHexHumanID},
+	} {
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)",
+			pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pair := range [][2]string{
+		{historicalAgentID, historicalKey},
+		{alreadyHexAgentID, alreadyHexKey},
+	} {
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)",
+			pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
+		t.Fatalf("migrate historical wrapping key: %v", err)
 	}
-	const humanID = "0198f0f4-9b72-7000-8000-000000000011"
-	const agentID = "0198f0f4-9b72-7000-8000-000000000012"
-	const key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
-		t.Fatal(err)
+
+	for _, want := range []struct {
+		agentID string
+		key     string
+	}{
+		{historicalAgentID, canonicalKey},
+		{alreadyHexAgentID, alreadyHexKey},
+	} {
+		var key string
+		var keyID *string
+		if err := pool.QueryRow(ctx,
+			"SELECT wrapping_key, wrapping_key_id FROM agent_secrets WHERE personality_agent_id=$1",
+			want.agentID).Scan(&key, &keyID); err != nil {
+			t.Fatal(err)
+		}
+		if key != want.key || keyID != nil {
+			t.Fatalf("migrated material mismatch for %s: key=%q id=%v", want.agentID, key, keyID)
+		}
 	}
-	if _, err := pool.Exec(ctx, "INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", agentID, humanID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx,
-		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)",
-		agentID, key); err != nil {
-		t.Fatalf("unresolved pre-migration row was not representable: %v", err)
-	}
-	var unresolved bool
-	if err := pool.QueryRow(ctx,
-		"SELECT wrapping_key_id IS NULL FROM agent_secrets WHERE personality_agent_id=$1",
-		agentID).Scan(&unresolved); err != nil || !unresolved {
-		t.Fatalf("historical key identity was guessed: unresolved=%v err=%v", unresolved, err)
-	}
+
 	if _, err := pool.Exec(ctx,
 		"UPDATE agent_secrets SET wrapping_key_id=$2 WHERE personality_agent_id=$1",
-		agentID, " proven-id"); err == nil {
+		historicalAgentID, " proven-id"); err == nil {
 		t.Fatal("invalid wrapping key ID passed the schema constraint")
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE agent_secrets SET wrapping_key_id=$2 WHERE personality_agent_id=$1",
-		agentID, "test-wrapping/v1"); err != nil {
+		historicalAgentID, "issue75-agent-wrapping/v1"); err != nil {
 		t.Fatalf("explicit proven wrapping key ID was rejected: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE agent_secrets SET wrapping_key=$2 WHERE personality_agent_id=$1",
+		historicalAgentID, historicalKey); err == nil {
+		t.Fatal("noncanonical wrapping key passed the schema constraint")
+	}
+}
+
+func TestAgentWrappingKeyIdentityMigrationRejectsUnknownMaterialAtomically(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	applyMigrationsThrough(t, ctx, pool, 6)
+
+	const humanID = "0198f0f4-9b72-7000-8000-000000000021"
+	const agentID = "0198f0f4-9b72-7000-8000-000000000022"
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)",
+		agentID, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, 'not-a-wrapping-key')",
+		agentID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Migrate(ctx, pool); err == nil {
+		t.Fatal("migration accepted unknown historical wrapping-key material")
+	}
+	latest, err := LatestAppliedVersion(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != 6 {
+		t.Fatalf("failed migration was recorded: latest=%d", latest)
+	}
+	var wrappingKeyIDColumnCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='agent_secrets' AND column_name='wrapping_key_id'
+	`).Scan(&wrappingKeyIDColumnCount); err != nil {
+		t.Fatal(err)
+	}
+	if wrappingKeyIDColumnCount != 0 {
+		t.Fatal("failed migration did not roll back the wrapping_key_id schema change")
+	}
+}
+
+func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, migrationBookkeepingSchema); err != nil {
+		t.Fatalf("initialize migration bookkeeping: %v", err)
+	}
+	migrations, err := embeddedUpMigrations()
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	for _, migration := range migrations {
+		if migration.version > maxVersion {
+			break
+		}
+		if err := applyMigration(ctx, pool, migration); err != nil {
+			t.Fatalf("apply migration %d: %v", migration.version, err)
+		}
 	}
 }
