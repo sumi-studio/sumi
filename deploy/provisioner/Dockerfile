@@ -10,6 +10,7 @@ RUN apk add --no-cache bash coreutils util-linux
 WORKDIR /opt/sumi
 COPY . /opt/sumi
 COPY --from=build /usr/local/bin/sumi-runtime-provisioner /usr/local/bin/sumi-runtime-provisioner
-RUN chmod 0755 /usr/local/bin/sumi-runtime-provisioner /opt/sumi/deploy/agent/supervisor
+RUN install -d -m 0700 /run/sumi/docker-config && \
+    chmod 0755 /usr/local/bin/sumi-runtime-provisioner /opt/sumi/deploy/agent/supervisor
 ENTRYPOINT ["/usr/local/bin/sumi-runtime-provisioner"]
 CMD ["-socket", "/run/sumi/runtime-provisioner/control.sock", "-socket-gid", "20000", "-supervisor", "/opt/sumi/deploy/agent/supervisor"]

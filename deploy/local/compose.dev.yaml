@@ -182,6 +182,12 @@ services:
       - /opt/sumi/deploy/agent/supervisor
     environment:
       SUMI_CONTROL_PLANE_NETWORK: sumi-control-plane
+      # The launcher validates and file-mounts config.json here so the Docker
+      # CLI used by the supervisor can pull private agent images.
+      DOCKER_CONFIG: /run/sumi/docker-config
+      # Keep lazily provisioned agent containers on the same selected image
+      # tag as the local control plane. The default remains latest.
+      SUMI_AGENT_IMAGE_TAG: ${SUMI_AGENT_IMAGE_TAG:-latest}
       # Passed only to the supervisor's non-secret activation descriptor.
       # Empty keeps the agent default; local diagnostics may set a bounded
       # tracing filter without rebuilding the API.
@@ -191,6 +197,12 @@ services:
       SUMI_DEV_ALLOW_APPARMOR_UNCONFINED: ${SUMI_DEV_ALLOW_APPARMOR_UNCONFINED:-false}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}
+        target: /run/sumi/docker-config/config.json
+        read_only: true
+        bind:
+          create_host_path: false
       - provisioner-control:/run/sumi/runtime-provisioner
       - type: bind
         source: /run/sumi/local-control

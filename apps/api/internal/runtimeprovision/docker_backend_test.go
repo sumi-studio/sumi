@@ -84,6 +84,24 @@ func TestDockerBackendUsesExplicitPhasesAndCoherentHandle(t *testing.T) {
 	}
 }
 
+func TestDockerBackendPassesPinnedAgentImageTagToSupervisor(t *testing.T) {
+	const tag = "a1b2c3d4e5f6"
+	runner := &recordingRunner{outputs: map[string]string{
+		"prepare": `{"personality_agent_id":"` + testPAID + `","phase":"prepared","generation":7,"rpc_boot_nonce":"boot-7"}`,
+	}}
+	backend := &DockerBackend{
+		supervisor:      "/fake/supervisor",
+		baseEnvironment: []string{"SUMI_AGENT_IMAGE_TAG=" + tag},
+		runner:          runner,
+	}
+	if _, err := backend.Prepare(context.Background(), PrepareRequest{PersonalityAgentID: testPAID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(runner.envs[0], "\n"); !strings.Contains(got, "SUMI_AGENT_IMAGE_TAG="+tag) {
+		t.Fatalf("supervisor environment = %q, want pinned agent image tag", got)
+	}
+}
+
 func TestDockerBackendRejectsAuthorityEnvironmentOverridesAndRedactsFailure(t *testing.T) {
 	runner := &recordingRunner{outputs: map[string]string{}, failed: map[string]bool{"activate": true}}
 	backend := &DockerBackend{supervisor: "/fake/supervisor", runner: runner}

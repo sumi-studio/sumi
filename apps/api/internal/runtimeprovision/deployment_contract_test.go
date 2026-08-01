@@ -141,6 +141,38 @@ func TestFullStackProvisionedRolesRetainCanonicalSandboxHardening(t *testing.T) 
 	}
 }
 
+func TestLocalProvisionerForwardsPinnedAgentImageTag(t *testing.T) {
+	controlPlane := readRepositoryFile(t, "deploy", "local", "compose.dev.yaml")
+	provisionerStart := strings.Index(controlPlane, "  runtime-provisioner:")
+	webStart := strings.Index(controlPlane, "  web:")
+	if provisionerStart < 0 || webStart <= provisionerStart {
+		t.Fatal("local compose omits the runtime provisioner service boundary")
+	}
+	provisioner := controlPlane[provisionerStart:webStart]
+	if !strings.Contains(provisioner, "SUMI_AGENT_IMAGE_TAG: ${SUMI_AGENT_IMAGE_TAG:-latest}") {
+		t.Fatal("local runtime provisioner does not forward SUMI_AGENT_IMAGE_TAG")
+	}
+	for _, required := range []string{
+		"DOCKER_CONFIG: /run/sumi/docker-config",
+		"source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}",
+		"target: /run/sumi/docker-config/config.json",
+		"read_only: true",
+		"create_host_path: false",
+	} {
+		if !strings.Contains(provisioner, required) {
+			t.Fatalf("local runtime provisioner Docker config handoff omits %q", required)
+		}
+	}
+	if strings.Contains(provisioner, "/root/.docker") {
+		t.Fatal("local runtime provisioner mounts a Docker configuration directory")
+	}
+
+	agent := readDeploymentFile(t, "compose.yaml")
+	if !strings.Contains(agent, "image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}") {
+		t.Fatal("agent runtime compose does not interpolate SUMI_AGENT_IMAGE_TAG into the sumi-agent image")
+	}
+}
+
 func readDeploymentFile(t *testing.T, name string) string {
 	t.Helper()
 	return readRepositoryFile(t, "deploy", "agent", name)

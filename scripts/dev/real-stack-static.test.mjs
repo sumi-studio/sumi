@@ -60,6 +60,31 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   assert.match(firebaseCheck, /up --detach --pull never/);
 });
 
+test("runtime provisioner receives a file-scoped Docker config", async () => {
+  const [local, provisionerDockerfile] = await Promise.all([
+    source("deploy/local/compose.dev.yaml"),
+    source("deploy/provisioner/Dockerfile"),
+  ]);
+  const provisioner = local.slice(
+    local.indexOf("  runtime-provisioner:"),
+    local.indexOf("\n  web:"),
+  );
+
+  assert.match(provisioner, /DOCKER_CONFIG: \/run\/sumi\/docker-config/);
+  assert.match(
+    provisioner,
+    /source: \$\{SUMI_DOCKER_CONFIG_FILE:\?SUMI_DOCKER_CONFIG_FILE is required\}/,
+  );
+  assert.match(
+    provisioner,
+    /target: \/run\/sumi\/docker-config\/config\.json/,
+  );
+  assert.match(provisioner, /read_only: true/);
+  assert.match(provisioner, /create_host_path: false/);
+  assert.doesNotMatch(provisioner, /\/root\/\.docker/);
+  assert.match(provisionerDockerfile, /install -d -m 0700 \/run\/sumi\/docker-config/);
+});
+
 test("Jenkins rebuilds the provisioner for every source tree embedded in it", async () => {
   const [jenkinsfile, provisionerDockerfile] = await Promise.all([
     source("Jenkinsfile"),
