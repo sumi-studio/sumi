@@ -2,11 +2,86 @@ package runtimeprovision
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestSupervisorPrepareDoesNotRequireActivationEnvironment(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	testRoot := t.TempDir()
+	fakeDocker := filepath.Join(testRoot, "docker")
+	fakeStat := filepath.Join(testRoot, "stat")
+	dockerLog := filepath.Join(testRoot, "docker.log")
+	fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  *"compose.prepare.yaml run --rm --no-deps --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=prepare-phase-nonce\nSUMI_PROCESS_GENERATION_LEASE_ID=prepare-lease\nSUMI_GENERATION_RECOVERY_FENCE_ID=prepare-fence\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The host root uid is unmapped inside a rootless user namespace. Preserve
+	// the production assertion for every mutable trust path and report only the
+	// immutable namespace root as uid 0 to the supervisor.
+	fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" prepare`,
+		"--", supervisor,
+	)
+	command.Env = []string{
+		"PATH=" + testRoot + ":/usr/bin:/bin",
+		"SUMI_CONFIG_FILE=/dev/null",
+		"SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true",
+		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real supervisor prepare required activation-only environment: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"phase":"prepared"`) {
+		t.Fatalf("real supervisor prepare did not return a prepared epoch: %s", output)
+	}
+	calls, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"compose version", "compose.lifecycle.yaml down", "compose.prepare.yaml up", "compose.prepare.yaml run"} {
+		if !strings.Contains(string(calls), required) {
+			t.Fatalf("real supervisor prepare omitted %q:\n%s", required, calls)
+		}
+	}
+}
 
 func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	prepare := readDeploymentFile(t, "compose.prepare.yaml")
@@ -18,6 +93,23 @@ func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	}
 	if !regexp.MustCompile(`(?m)^  allocator:$`).MatchString(prepare) || !regexp.MustCompile(`(?m)^  prepare:$`).MatchString(prepare) {
 		t.Fatal("prepare graph omits allocator or filesystem prepare role")
+	}
+	supervisor := readDeploymentFile(t, "supervisor")
+	prepareStart := strings.Index(supervisor, "  prepare)")
+	activateStart := strings.Index(supervisor, "  activate)")
+	if prepareStart < 0 || activateStart <= prepareStart {
+		t.Fatal("supervisor has no explicit prepare-to-activate phase boundary")
+	}
+	prepareAction := supervisor[prepareStart:activateStart]
+	for _, activationOnly := range []string{
+		"validate_local_control_socket",
+		"revalidate_local_control_socket",
+		"SUMI_LOCAL_CONTROL_SERVER_UID",
+		"SUMI_LOCAL_CONTROL_SOCKET_GID",
+	} {
+		if strings.Contains(prepareAction, activationOnly) {
+			t.Fatalf("prepare phase depends on activation-only local-control state %q:\n%s", activationOnly, prepareAction)
+		}
 	}
 }
 
@@ -31,6 +123,19 @@ func TestDeploymentActivateCannotRerunAllocatorOrExposeDockerSocket(t *testing.T
 	activate := supervisor[activateStart:abortStart]
 	if !strings.Contains(activate, "--no-deps") || !strings.Contains(activate, "executor broker runtime") {
 		t.Fatalf("activate phase can reach a one-shot allocator dependency:\n%s", activate)
+	}
+	launchEnvironmentStart := strings.Index(supervisor, "require_launch_environment()")
+	launchEnvironmentEnd := strings.Index(supervisor, "\nrequire_paid\n")
+	if launchEnvironmentStart < 0 || launchEnvironmentEnd <= launchEnvironmentStart ||
+		!strings.Contains(supervisor[launchEnvironmentStart:launchEnvironmentEnd], "validate_local_control_socket") {
+		t.Fatal("activation environment validation does not establish the local-control trust snapshot")
+	}
+	validate := strings.Index(activate, "require_launch_environment")
+	launch := strings.Index(activate, `run_tracked_compose "${COMPOSE_FILE}"`)
+	firstRevalidation := strings.Index(activate, "revalidate_local_control_socket")
+	lastRevalidation := strings.LastIndex(activate, "revalidate_local_control_socket")
+	if validate < 0 || firstRevalidation <= validate || launch <= firstRevalidation || lastRevalidation <= launch {
+		t.Fatalf("activate does not revalidate local-control trust immediately before and after runtime launch:\n%s", activate)
 	}
 	for _, file := range []string{"compose.yaml", "compose.prepare.yaml", "compose.lifecycle.yaml"} {
 		if strings.Contains(readDeploymentFile(t, file), "docker.sock") {
@@ -180,11 +285,15 @@ func readDeploymentFile(t *testing.T, name string) string {
 
 func readRepositoryFile(t *testing.T, parts ...string) string {
 	t.Helper()
-	pathParts := append([]string{"..", "..", "..", ".."}, parts...)
-	path := filepath.Join(pathParts...)
+	path := repositoryFilePath(parts...)
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(contents)
+}
+
+func repositoryFilePath(parts ...string) string {
+	pathParts := append([]string{"..", "..", "..", ".."}, parts...)
+	return filepath.Join(pathParts...)
 }
