@@ -459,7 +459,7 @@ case "${action}" in
     run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
     revalidate_local_control_socket
-    run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --build --wait
+    run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --wait
     revalidate_local_control_socket
     disarm_partial_generation_cleanup
     log "project ${SUMI_COMPOSE_PROJECT} containers started; runtime owns authenticated dependency Health and Ready"

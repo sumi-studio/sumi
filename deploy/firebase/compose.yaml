@@ -2,13 +2,12 @@
 #
 # Choose one exact host address; do not use 0.0.0.0 for the published port.
 # Examples:
-#   FIREBASE_AUTH_EMULATOR_BIND_HOST=100.116.25.99 docker compose -f deploy/firebase/compose.yaml up -d --build
-#   FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 docker compose -f deploy/firebase/compose.yaml up -d --build
+#   FIREBASE_AUTH_EMULATOR_BIND_HOST=100.116.25.99 docker compose -f deploy/firebase/compose.yaml up -d
+#   FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 docker compose -f deploy/firebase/compose.yaml up -d
 services:
   firebase-auth:
-    build:
-      context: ../..
-      dockerfile: deploy/firebase/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-firebase:${SUMI_FIREBASE_IMAGE_TAG:-latest}
+    pull_policy: always
     environment:
       FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-sumi-studio}
       FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth

@@ -13,9 +13,8 @@ name: sumi-dev
 
 services:
   firebase-auth:
-    build:
-      context: ../..
-      dockerfile: deploy/firebase/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-firebase:${SUMI_FIREBASE_IMAGE_TAG:-latest}
+    pull_policy: always
     environment:
       FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}
       FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth
@@ -58,9 +57,8 @@ services:
     restart: "no"
 
   migrate:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     # The image's ENTRYPOINT is sumi-api; override it to run the migrate binary.
     entrypoint: ["/usr/local/bin/sumi-migrate"]
     command: []
@@ -74,9 +72,8 @@ services:
   # Prepare API state and local-control socket directories with the exact
   # ownership and modes the server expects.
   api-state-init:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     entrypoint: ["/busybox/sh"]
     command:
@@ -93,9 +90,8 @@ services:
     restart: "no"
 
   api:
-    build:
-      context: ../..
-      dockerfile: deploy/api/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "65532:10001"
     group_add:
       - "10001"
@@ -182,9 +178,8 @@ services:
     restart: "no"
 
   web:
-    build:
-      context: ../..
-      dockerfile: deploy/web/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-web:${SUMI_WEB_IMAGE_TAG:-latest}
+    pull_policy: always
     # Share the API's network namespace so the web dev server can use the
     # loopback public server (127.0.0.1:8080) without exposing the API off-host.
     network_mode: service:api
@@ -212,9 +207,8 @@ services:
   # The allocator is the only service that can mutate the generation ledger.
   # It distributes role-minimal identity.env files atomically and exits.
   agent-allocator:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     command: [allocator]
     network_mode: none
@@ -239,9 +233,8 @@ services:
       - agent-broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
 
   agent-prepare:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "0:0"
     command: [prepare]
     network_mode: none
@@ -260,9 +253,8 @@ services:
         condition: service_completed_successfully
 
   agent-runtime:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "10001:10001"
     group_add:
       - "10020"
@@ -319,9 +311,8 @@ services:
         condition: service_healthy
 
   agent-executor:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     # Run the executor under the runtime UID so the IPC parent is uid-owned
     # and group-traversable by the runtime; keep the executor identity group
     # for reading its identity file.
@@ -340,9 +331,8 @@ services:
         condition: service_completed_successfully
 
   agent-broker:
-    build:
-      context: ../..
-      dockerfile: deploy/agent/Dockerfile
+    image: ghcr.io/sumi-studio/sumi-agent:${SUMI_AGENT_IMAGE_TAG:-latest}
+    pull_policy: always
     user: "10003:10003"
     command: [broker]
     network_mode: none

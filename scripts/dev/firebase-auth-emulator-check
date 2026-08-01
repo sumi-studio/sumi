@@ -30,7 +30,7 @@ wait_for_auth() {
 }
 
 FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 FIREBASE_PROJECT_ID="${project_id}" \
-  "${compose[@]}" up --detach --build
+  "${compose[@]}" up --detach
 wait_for_auth
 
 curl --fail --silent --show-error --max-time 5 \
