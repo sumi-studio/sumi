@@ -47,16 +47,15 @@ func (s *Store) BeginProviderOperation(ctx context.Context, humanID, firebaseUID
 		return ProviderOperation{}, err
 	}
 	operationID := newUUIDv7()
-	expiresAt := time.Now().UTC().Add(ProviderOperationTTL)
 	var result ProviderOperation
 	var unexpired bool
 	err = s.pool.QueryRow(ctx, `INSERT INTO provider_operations
 		(operation_id, nonce_hash, human_id, firebase_uid, provider, operation, decision_path, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,now()+$8::bigint*interval '1 microsecond')
 		ON CONFLICT (nonce_hash) DO UPDATE SET nonce_hash=provider_operations.nonce_hash
 		RETURNING operation_id, human_id, firebase_uid, provider, operation, status,
 			decision_path, created_at, expires_at, expires_at > now()`,
-		operationID, nonceHash, humanID, firebaseUID, provider, operation, decisionPath, expiresAt).Scan(
+		operationID, nonceHash, humanID, firebaseUID, provider, operation, decisionPath, ProviderOperationTTL.Microseconds()).Scan(
 		&result.OperationID, &result.HumanID, &result.FirebaseUID, &result.Provider,
 		&result.Operation, &result.Status, &result.DecisionPath, &result.CreatedAt,
 		&result.ExpiresAt, &unexpired)
@@ -101,18 +100,21 @@ func scanProviderOperationForReconciliation(ctx context.Context, tx pgx.Tx, oper
 	return scanProviderOperationState(ctx, tx, operationID, nonce, true)
 }
 
-func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, nonce string, allowExpired bool) (ProviderOperation, error) {
+func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, nonce string, allowExpiredUnlink bool) (ProviderOperation, error) {
 	nonceHash, err := validateNonce(nonce)
 	if err != nil {
 		return ProviderOperation{}, err
 	}
 	var operation ProviderOperation
+	var unexpired bool
 	err = tx.QueryRow(ctx, `SELECT operation_id, human_id, firebase_uid, provider,
-		operation, status, decision_path, created_at, expires_at FROM provider_operations
+		operation, status, decision_path, created_at, expires_at, expires_at > now()
+		FROM provider_operations
 		WHERE operation_id=$1 AND nonce_hash=$2 FOR UPDATE`, operationID, nonceHash).Scan(
 		&operation.OperationID, &operation.HumanID, &operation.FirebaseUID,
 		&operation.Provider, &operation.Operation, &operation.Status,
-		&operation.DecisionPath, &operation.CreatedAt, &operation.ExpiresAt)
+		&operation.DecisionPath, &operation.CreatedAt, &operation.ExpiresAt,
+		&unexpired)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ProviderOperation{}, ErrInvalidAuthFlow
 	}
@@ -122,7 +124,7 @@ func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, non
 	if operation.Status != "pending" {
 		return ProviderOperation{}, ErrAuthFlowConsumed
 	}
-	if !allowExpired && !time.Now().UTC().Before(operation.ExpiresAt) {
+	if !unexpired && (!allowExpiredUnlink || operation.Operation != "unlink") {
 		return ProviderOperation{}, ErrAuthFlowExpired
 	}
 	return operation, nil
@@ -178,11 +180,13 @@ func (s *Store) ProviderOperationStatus(ctx context.Context, humanID, operationI
 
 	var operation ProviderOperation
 	var completedAt *time.Time
+	var unexpired bool
 	var eventCount int64
 	var eventHumanID, eventProvider, eventType, eventDecisionPath, eventOutcome string
 	err = s.pool.QueryRow(ctx, `SELECT p.operation_id, p.human_id,
 		p.provider, p.operation, p.status, p.decision_path,
 		COALESCE(p.terminal_outcome, ''), p.created_at, p.expires_at, p.completed_at,
+		p.expires_at > now(),
 		count(e.event_id) OVER (PARTITION BY p.operation_id),
 		COALESCE(e.human_id::text, ''), COALESCE(e.provider, ''),
 		COALESCE(e.event_type, ''), COALESCE(e.decision_path, ''),
@@ -194,6 +198,7 @@ func (s *Store) ProviderOperationStatus(ctx context.Context, humanID, operationI
 		&operation.Operation, &operation.Status,
 		&operation.DecisionPath, &operation.TerminalOutcome,
 		&operation.CreatedAt, &operation.ExpiresAt, &completedAt,
+		&unexpired,
 		&eventCount, &eventHumanID, &eventProvider, &eventType,
 		&eventDecisionPath, &eventOutcome)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -220,7 +225,7 @@ func (s *Store) ProviderOperationStatus(ctx context.Context, humanID, operationI
 		// Link operations are browser intents and expire. Backend-owned unlink
 		// operations are durable sagas: while remote state is indeterminate their
 		// pending row remains the per-UID fence and must stay recoverable by nonce.
-		if operation.Operation != "unlink" && !time.Now().UTC().Before(operation.ExpiresAt) {
+		if operation.Operation != "unlink" && !unexpired {
 			return ProviderOperation{}, ErrAuthFlowExpired
 		}
 	case "completed", "failed":
@@ -352,12 +357,6 @@ func (s *Store) FailProviderOperation(ctx context.Context, operationID, nonce, t
 	operation, err := scanProviderOperationForReconciliation(ctx, tx, operationID, nonce)
 	if err != nil {
 		return SecurityEvent{}, err
-	}
-	// Browser-owned link intents expire. Backend-owned unlinks remain durable
-	// until their remote state is known, so a same-nonce retry must also be able
-	// to terminalize an expired saga whose provider is still present.
-	if operation.Operation != "unlink" && !time.Now().UTC().Before(operation.ExpiresAt) {
-		return SecurityEvent{}, ErrAuthFlowExpired
 	}
 	eventType := "provider_" + operation.Operation + "_failed"
 	event, err := finishProviderOperation(ctx, tx, operation, eventType, terminalOutcome)

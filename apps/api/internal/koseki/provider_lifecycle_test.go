@@ -205,6 +205,48 @@ func TestProviderLinkSameNonceReplayHonorsExpiryAndPendingUnlinkFence(t *testing
 	}
 }
 
+func TestProviderOperationExpiryUsesDatabaseClockForStatusAndCompletion(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	owner, err := store.AutoRegister(ctx, "firebase", "database-clock-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := testNonce(t)
+	operation, err := store.BeginProviderOperation(ctx, owner.HumanID, "database-clock-owner", "github.com", "link", "account_settings", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := operation.ExpiresAt.Sub(operation.CreatedAt); got != ProviderOperationTTL {
+		t.Fatalf("provider TTL was not derived from one DB timestamp: got %s want %s", got, ProviderOperationTTL)
+	}
+
+	var expiresAt, databaseNow time.Time
+	if err := store.pool.QueryRow(ctx, `UPDATE provider_operations
+		SET expires_at=now()-interval '1 second' WHERE operation_id=$1
+		RETURNING expires_at, now()`, operation.OperationID).Scan(&expiresAt, &databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	// This models the reported skew: PostgreSQL has expired the operation while
+	// a lagging API wall clock would still consider it live.
+	laggingAPINow := databaseNow.Add(-time.Hour)
+	if !laggingAPINow.Before(expiresAt) || expiresAt.After(databaseNow) {
+		t.Fatalf("invalid skew fixture: API=%s expires=%s DB=%s", laggingAPINow, expiresAt, databaseNow)
+	}
+
+	if _, err := store.ProviderOperationStatus(ctx, owner.HumanID, operation.OperationID, nonce); !errors.Is(err, ErrAuthFlowExpired) {
+		t.Fatalf("status followed API clock instead of DB expiry: %v", err)
+	}
+	if _, err := store.PendingProviderOperation(ctx, operation.OperationID, nonce); !errors.Is(err, ErrAuthFlowExpired) {
+		t.Fatalf("pending completion followed API clock instead of DB expiry: %v", err)
+	}
+	if _, err := store.CompleteProviderLink(ctx, operation.OperationID, nonce, "database-clock-owner", "github-subject"); !errors.Is(err, ErrAuthFlowExpired) {
+		t.Fatalf("link completion followed API clock instead of DB expiry: %v", err)
+	}
+	if _, err := store.FailProviderOperation(ctx, operation.OperationID, nonce, "cancelled"); !errors.Is(err, ErrAuthFlowExpired) {
+		t.Fatalf("link failure followed API clock instead of DB expiry: %v", err)
+	}
+}
+
 func TestProviderOperationStatusRecoversPendingAndTerminalStates(t *testing.T) {
 	store, ctx := authFlowStore(t)
 	owner, err := store.AutoRegister(ctx, "firebase", "provider-status-owner")
