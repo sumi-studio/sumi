@@ -149,6 +149,11 @@ function AuthStateProbe() {
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
       </div>
+      <div data-testid="outcome">
+        {auth.outcomeNotice
+          ? `${auth.outcomeNotice.outcome}:${auth.outcomeNotice.intent}:${auth.outcomeNotice.intentTransition}`
+          : "none"}
+      </div>
       <button
         type="button"
         onClick={() => void auth.logout().catch(() => undefined)}
@@ -342,6 +347,10 @@ describe("logout authority transition", () => {
     expect(screen.getByTestId("session-state")).toHaveTextContent(
       "authenticated",
     );
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "signed_in:sign_in:none",
+    );
+    expect(sessionStorage.getItem("sumi.auth.outcome-notice.v1")).toBeNull();
   });
 
   it("opens the Firebase popup synchronously before the flow start settles", async () => {
@@ -441,7 +450,7 @@ describe("logout authority transition", () => {
     const recovery = {
       version: 1 as const,
       provider: "github.com" as const,
-      requestedIntent: "sign_in" as const,
+      requestedIntent: "sign_up" as const,
       expiresAt: "2099-08-01T01:00:00Z",
       credential: {
         providerId: "github.com" as const,
@@ -498,6 +507,9 @@ describe("logout authority transition", () => {
         "authenticated",
       );
     });
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "provider_linked:sign_up:recovery_proved",
+    );
   });
 
   it("does not mint a session for an intent mismatch until explicit confirmation", async () => {
@@ -573,6 +585,9 @@ describe("logout authority transition", () => {
       nonce: "n".repeat(43),
       idToken: "id-token-fresh",
     });
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "account_created:sign_in:confirmed",
+    );
   });
 
   it("invalidates pending confirmation when Firebase auth state changes", async () => {
