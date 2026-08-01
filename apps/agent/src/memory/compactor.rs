@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::prompts::{compact_format_instructions, compact_system_prompt};
 use crate::provider::{
     canonical_request::CanonicalRequestBody,
     model::{MaxTokensField, ModelSpec},
@@ -39,23 +40,6 @@ use crate::store::{
 };
 
 use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
-
-const COMPACT_SYSTEM_PROMPT: &str = "あなたは記憶の圧縮係。会話を続けるな。要約だけ出力せよ。";
-
-const COMPACT_FORMAT_INSTRUCTIONS: &str = r"指定フォーマット:
-## 出来事
-（何が起き、何を話したか。時刻付き）
-
-## ユーザーについて分かったこと
-（好み・事実・関係性）
-
-## 約束・宿題
-（やると言ったこと、期限）
-
-## 参照
-（ワークスペースに書いたメモのパス、調べれば分かること）
-
-目標圧縮率: 入力の 1/8〜1/15、上限 800 トークン程度";
 
 const MAX_COMPACT_OUTPUT_TOKENS: u64 = 800;
 
@@ -375,6 +359,7 @@ pub(crate) fn build_compact_request(
     }
 
     let user_content = build_user_content(input);
+    let system_prompt = compact_system_prompt();
     let mut request = Map::new();
     request.insert("model".to_owned(), json!(spec.model.id));
     request.insert("stream".to_owned(), json!(false));
@@ -392,7 +377,7 @@ pub(crate) fn build_compact_request(
             request.insert(
                 "messages".to_owned(),
                 json!([
-                    json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT}),
+                    json!({"role": "system", "content": system_prompt}),
                     json!({"role": "user", "content": user_content}),
                 ]),
             );
@@ -406,11 +391,11 @@ pub(crate) fn build_compact_request(
             let system = if compat.supports_prompt_cache {
                 json!([{
                     "type": "text",
-                    "text": COMPACT_SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }])
             } else {
-                json!(COMPACT_SYSTEM_PROMPT)
+                json!(system_prompt)
             };
             request.insert("system".to_owned(), system);
             request.insert(
@@ -424,7 +409,7 @@ pub(crate) fn build_compact_request(
                 .model
                 .responses_compat()
                 .ok_or(CompactError::UnsupportedProtocol)?;
-            request.insert("instructions".to_owned(), json!(COMPACT_SYSTEM_PROMPT));
+            request.insert("instructions".to_owned(), json!(system_prompt));
             request.insert(
                 "input".to_owned(),
                 json!([{"role": "user", "content": user_content}]),
@@ -744,7 +729,7 @@ fn build_user_content(input: &CompactionInput) -> String {
         ));
     }
 
-    content.push_str(COMPACT_FORMAT_INSTRUCTIONS);
+    content.push_str(compact_format_instructions());
     content
 }
 
@@ -2716,6 +2701,56 @@ mod tests {
             .or_else(|| request["max_tokens"].as_u64())
             .expect("max tokens");
         assert_eq!(max_tokens, 800);
+    }
+
+    #[test]
+    fn compact_request_shape_uses_file_prompts_for_all_protocols() {
+        let input = CompactionInput::from_public_batch(&[user("hello")], None);
+        let expected_user_content = format!(
+            "<conversation>\n[USER] [{}] hello\n</conversation>\n{}",
+            timestamp().to_rfc3339_opts(SecondsFormat::Secs, true),
+            compact_format_instructions(),
+        );
+
+        for preset in ["kimi-k3", "anthropic", "openai-responses"] {
+            let conversation = ModelSpec::preset(preset).expect("protocol preset");
+            let compact = select_compact_model(&conversation, None, &[]).expect("supported");
+            let body = build_compact_request(&compact, &input).expect("protocol request");
+            let request: Value = serde_json::from_str(&request_text(&body)).expect("json");
+
+            let expected = match conversation.protocol {
+                ApiProtocol::OpenAiChatCompletions => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "messages": [
+                        {"role": "system", "content": compact_system_prompt()},
+                        {"role": "user", "content": expected_user_content},
+                    ],
+                    "max_completion_tokens": 800,
+                }),
+                ApiProtocol::AnthropicMessages => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "system": [{
+                        "type": "text",
+                        "text": compact_system_prompt(),
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    "messages": [{"role": "user", "content": expected_user_content}],
+                    "max_tokens": 800,
+                }),
+                ApiProtocol::OpenAiResponses => json!({
+                    "model": conversation.id,
+                    "stream": false,
+                    "instructions": compact_system_prompt(),
+                    "input": [{"role": "user", "content": expected_user_content}],
+                    "max_output_tokens": 800,
+                    "store": false,
+                }),
+            };
+
+            assert_eq!(request, expected, "request shape changed for {preset}");
+        }
     }
 
     #[test]
