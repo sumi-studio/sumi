@@ -1,12 +1,22 @@
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 pub const SYSTEM_PROMPT_VERSION: &str = "1";
 
-pub(crate) fn compact_format_instructions() -> &'static str {
-    without_trailing_newline(include_str!("../prompts/compact-format-instructions.md"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactPrompt {
+    L0ToL1,
+    L1ToL2,
+    ConsolidateL2,
 }
 
-pub(crate) fn compact_system_prompt() -> &'static str {
-    without_trailing_newline(include_str!("../prompts/compact-system.md"))
+impl CompactPrompt {
+    pub(crate) fn as_str(self) -> &'static str {
+        let prompt = match self {
+            Self::L0ToL1 => include_str!("../prompts/compact-l0-to-l1.md"),
+            Self::L1ToL2 => include_str!("../prompts/compact-l1-to-l2.md"),
+            Self::ConsolidateL2 => include_str!("../prompts/compact-l2-consolidation.md"),
+        };
+        without_trailing_newline(prompt)
+    }
 }
 
 fn without_trailing_newline(prompt: &'static str) -> &'static str {
@@ -20,29 +30,21 @@ fn without_trailing_newline(prompt: &'static str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_format_instructions, compact_system_prompt};
-    use sha2::{Digest, Sha256};
+    use super::CompactPrompt;
 
     #[test]
-    fn compact_prompt_file_line_endings_are_not_sent() {
-        assert!(!compact_system_prompt().ends_with('\n'));
-        assert!(!compact_format_instructions().ends_with('\n'));
-    }
-
-    #[test]
-    fn compact_prompts_preserve_the_extracted_wire_text() {
-        // These hashes pin the former inline strings without duplicating the
-        // prompt bodies outside their Markdown source files.
-        assert_eq!(
-            format!("{:x}", Sha256::digest(compact_system_prompt().as_bytes())),
-            "25892439577d9bfc78e26d1f3b4547b77fe2e36f7566197aba2dbdf151dfa14d"
-        );
-        assert_eq!(
-            format!(
-                "{:x}",
-                Sha256::digest(compact_format_instructions().as_bytes())
-            ),
-            "4e2361a5c0e97c479dd3e7e50e4b84f3390a4d9799c3d1392f2ae2feb88ca195"
-        );
+    fn compact_prompts_are_stage_specific_and_self_contained() {
+        for (prompt, stage) in [
+            (CompactPrompt::L0ToL1, "L0の会話履歴をL1の要約へ"),
+            (CompactPrompt::L1ToL2, "複数のL1要約を1つのL2要約へ"),
+            (CompactPrompt::ConsolidateL2, "L2の要約群を1つのL2要約へ"),
+        ] {
+            let text = prompt.as_str();
+            assert!(text.contains(stage));
+            assert!(text.contains("指定フォーマット:"));
+            assert!(text.contains("## 出来事"));
+            assert!(text.contains("## 参照"));
+            assert!(!text.ends_with('\n'));
+        }
     }
 }
