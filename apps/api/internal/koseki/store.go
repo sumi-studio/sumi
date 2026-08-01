@@ -125,6 +125,16 @@ func (s *Store) ResolveCredential(ctx context.Context, provider, externalSubject
 	return humanID, nil
 }
 
+func (s *Store) FirebaseUIDForHuman(ctx context.Context, humanID string) (string, error) {
+	var uid string
+	err := s.pool.QueryRow(ctx, `SELECT external_subject FROM credentials
+		WHERE provider='firebase' AND human_id=$1 AND active`, humanID).Scan(&uid)
+	if err != nil {
+		return "", err
+	}
+	return uid, nil
+}
+
 // AgentForHuman returns the PersonalityAgentId of the Human's Secretary, or
 // pgx.ErrNoRows when none exists.
 func (s *Store) AgentForHuman(ctx context.Context, humanID string) (string, error) {
@@ -142,9 +152,9 @@ func (s *Store) AgentForHuman(ctx context.Context, humanID string) (string, erro
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
 // and the per-agent wrapping key generated at hire time.
 type Registration struct {
-	HumanID      string
-	AgentID      string
-	WrappingKey  string
+	HumanID     string
+	AgentID     string
+	WrappingKey string
 }
 
 // AutoRegister performs first-login self-serve signup for an unbound credential:

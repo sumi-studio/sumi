@@ -26,8 +26,13 @@ const (
 // FirebaseIdentity contains only the stable server-verified Firebase
 // principal needed for Sumi identity binding.
 type FirebaseIdentity struct {
-	UID      string
-	TenantID string
+	UID              string
+	TenantID         string
+	Email            string
+	EmailVerified    bool
+	SignInProvider   string
+	ProviderSubjects map[string][]string
+	AuthTime         time.Time
 }
 
 // FirebaseIDTokenVerifier verifies a Firebase client ID token server-side.
@@ -119,6 +124,7 @@ type BrowserAuthServer struct {
 	SecureCookies  bool
 	SessionTTL     time.Duration
 	Connections    BrowserSessionConnectionCloser
+	Flows          BrowserAuthFlowController
 	random         io.Reader
 	sessionMu      sync.Mutex
 }
@@ -156,7 +162,17 @@ func NewBrowserAuthServer(
 // omit registration entirely when authentication is not configured.
 func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/csrf", s.serveCSRF)
-	mux.HandleFunc("POST /auth/session", s.serveSessionExchange)
+	if s.Flows == nil {
+		mux.HandleFunc("POST /auth/session", s.serveSessionExchange)
+	} else {
+		mux.HandleFunc("POST /auth/flows", s.serveStartAuthFlow)
+		mux.HandleFunc("POST /auth/flows/resolve", s.serveResolveAuthFlow)
+		mux.HandleFunc("POST /auth/flows/confirm", s.serveConfirmAuthFlow)
+		mux.HandleFunc("POST /auth/flows/status", s.serveAuthFlowStatus)
+		mux.HandleFunc("POST /auth/providers/operations", s.serveStartProviderOperation)
+		mux.HandleFunc("POST /auth/providers/operations/complete", s.serveCompleteProviderOperation)
+		mux.HandleFunc("POST /auth/providers/operations/fail", s.serveFailProviderOperation)
+	}
 	mux.HandleFunc("GET /auth/session", s.serveSessionStatus)
 	mux.HandleFunc("POST /auth/logout", s.serveLogout)
 }
@@ -217,6 +233,15 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 		writeBrowserAuthError(w, http.StatusForbidden, "account is not authorized")
 		return
 	}
+	if err := s.establishSession(w, r, claims); err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *BrowserAuthServer) establishSession(w http.ResponseWriter, r *http.Request, claims UserSessionClaims) error {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	ttl := s.SessionTTL
@@ -232,8 +257,7 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 			ttl,
 		)
 		if rotateErr != nil {
-			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-			return
+			return rotateErr
 		}
 		if valid {
 			session = replacement
@@ -243,15 +267,14 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 		}
 	}
 	if session == "" {
+		var err error
 		session, err = s.Sessions.IssueSession(r.Context(), claims, ttl)
 		if err != nil {
-			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
-			return
+			return err
 		}
 	}
 	http.SetCookie(w, s.sessionCookie(session, int(ttl/time.Second)))
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Request) {

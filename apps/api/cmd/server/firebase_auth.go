@@ -64,7 +64,30 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 	if token == nil || token.UID == "" {
 		return agentevents.FirebaseIdentity{}, errors.New("verified Firebase token has no UID")
 	}
-	return agentevents.FirebaseIdentity{UID: token.UID, TenantID: token.Firebase.Tenant}, nil
+	email, _ := token.Claims["email"].(string)
+	emailVerified, _ := token.Claims["email_verified"].(bool)
+	providerSubjects := make(map[string][]string, len(token.Firebase.Identities))
+	for provider, raw := range token.Firebase.Identities {
+		switch values := raw.(type) {
+		case []interface{}:
+			for _, value := range values {
+				if subject, ok := value.(string); ok && subject != "" {
+					providerSubjects[provider] = append(providerSubjects[provider], subject)
+				}
+			}
+		case []string:
+			for _, subject := range values {
+				if subject != "" {
+					providerSubjects[provider] = append(providerSubjects[provider], subject)
+				}
+			}
+		}
+	}
+	return agentevents.FirebaseIdentity{
+		UID: token.UID, TenantID: token.Firebase.Tenant, Email: email,
+		EmailVerified: emailVerified, SignInProvider: token.Firebase.SignInProvider,
+		ProviderSubjects: providerSubjects, AuthTime: time.Unix(token.AuthTime, 0).UTC(),
+	}, nil
 }
 
 // browserAuthServerFromEnv creates the Firebase exchange boundary. When a
@@ -80,10 +103,11 @@ func browserAuthServerFromEnv(
 	return browserAuthServerFromEnvWithDB(ctx, sessions, allowedOrigins, nil)
 }
 
-// browserAuthServerFromEnvWithDB enables the 戸籍-backed identity resolver
-// (ADR 0009 §3) when pool is non-nil: any verified Firebase identity is
-// auto-registered on first login and resolved to its HumanId + Secretary on
-// subsequent logins. A nil pool preserves the legacy single-UID binding.
+// browserAuthServerFromEnvWithDB enables the explicit 戸籍 auth-flow boundary
+// when pool is non-nil. Production routes then require a persisted sign-in or
+// sign-up intent and never invoke the old resolver's silent auto-registration
+// exchange. A nil pool is retained only for the isolated static-binding test
+// fixture.
 func browserAuthServerFromEnvWithDB(
 	ctx context.Context,
 	sessions *agentevents.HMACUserSessionVerifier,
@@ -122,7 +146,8 @@ func browserAuthServerFromEnvWithDB(
 		if tenantID == "" {
 			return nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
 		}
-		bindings = newKosekiIdentityBindingResolver(koseki.New(pool), tenantID, "firebase")
+		store := koseki.New(pool)
+		bindings = newKosekiIdentityBindingResolver(store, tenantID, "firebase")
 	} else {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
 		userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
@@ -186,6 +211,9 @@ func browserAuthServerFromEnvWithDB(
 		return nil, false, err
 	}
 	server.SessionTTL = ttl
+	if kosekiMode {
+		server.Flows = newKosekiAuthFlowController(koseki.New(pool), strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID")))
+	}
 	return server, true, nil
 }
 
