@@ -17,9 +17,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::protocol::MAX_ATTACHMENT_CHUNK_BYTES;
 use super::protocol::{
     ArtifactKind, ArtifactOperation, RpcOperationValidation, parse_artifact_handle,
 };
+use crate::runtime::contracts::PersonalityAgentId;
 use crate::tools::{
     ResourceLimit, ToolError,
     fs::{MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES},
@@ -55,6 +58,9 @@ pub enum ArtifactResponse {
     Finished,
     Read { content: Vec<u8>, eof: bool },
     Grep { matches: Vec<ArtifactGrepMatch> },
+    Put { handle: String },
+    AttachmentBegun { offset: u64 },
+    AttachmentAppended { offset: u64 },
 }
 
 /// A broker instance pins its root inode for its lifetime. All descendants are
@@ -121,45 +127,238 @@ impl ArtifactBroker {
         })
     }
 
-    pub fn execute(&self, operation: ArtifactOperation) -> Result<ArtifactResponse, ToolError> {
+    pub fn execute(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        operation: ArtifactOperation,
+    ) -> Result<ArtifactResponse, ToolError> {
         operation.validate()?;
+        operation.validate_authenticated_owner(personality_agent_id)?;
         match operation {
             ArtifactOperation::BeginToolOutput {
-                conversation_id,
                 execution_id,
                 content,
-            } => self.begin_tool_output(&conversation_id, &execution_id, &content),
+            } => self.begin_tool_output(personality_agent_id, &execution_id, &content),
             ArtifactOperation::AppendToolOutput {
-                conversation_id,
                 handle,
                 offset,
                 content,
-            } => self.append_tool_output(&conversation_id, &handle, offset, &content),
-            ArtifactOperation::FinishToolOutput {
-                conversation_id,
-                handle,
-            } => self.finish_tool_output(&conversation_id, &handle),
+            } => self.append_tool_output(personality_agent_id, &handle, offset, &content),
+            ArtifactOperation::FinishToolOutput { handle } => {
+                self.finish_tool_output(personality_agent_id, &handle)
+            }
             ArtifactOperation::ReadArtifact {
-                conversation_id,
                 handle,
                 offset,
                 limit,
-            } => self.read_artifact(&conversation_id, &handle, offset, limit),
-            ArtifactOperation::GrepArtifact {
-                conversation_id,
-                handle,
-                pattern,
-            } => self.grep_artifact(&conversation_id, &handle, &pattern),
+            } => self.read_artifact(personality_agent_id, &handle, offset, limit),
+            ArtifactOperation::GrepArtifact { handle, pattern } => {
+                self.grep_artifact(personality_agent_id, &handle, &pattern)
+            }
+            ArtifactOperation::PutAttachment {
+                artifact_id,
+                content,
+            } => self.put_attachment(personality_agent_id, &artifact_id, &content),
+            ArtifactOperation::BeginAttachment {
+                artifact_id,
+                total_bytes,
+                content_digest,
+            } => self.begin_attachment(
+                personality_agent_id,
+                &artifact_id,
+                total_bytes,
+                &content_digest,
+            ),
+            ArtifactOperation::AppendAttachment {
+                artifact_id,
+                total_bytes,
+                content_digest,
+                offset,
+                content,
+            } => self.append_attachment(
+                personality_agent_id,
+                &artifact_id,
+                total_bytes,
+                &content_digest,
+                offset,
+                &content,
+            ),
+            ArtifactOperation::FinishAttachment {
+                artifact_id,
+                total_bytes,
+                content_digest,
+            } => self.finish_attachment(
+                personality_agent_id,
+                &artifact_id,
+                total_bytes,
+                &content_digest,
+            ),
         }
+    }
+
+    fn begin_attachment(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_personality_agent, attachments) =
+            self.ensure_artifact_dirs(personality_agent_id, ArtifactKind::Attachments)?;
+        let final_name = cstring(artifact_id)?;
+        match openat2_cstr(
+            attachments.as_raw_fd(),
+            &final_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                ensure_regular_file(&file, "artifact")?;
+                if file_matches_attachment(&mut file, total_bytes, content_digest)? {
+                    return Ok(ArtifactResponse::AttachmentBegun {
+                        offset: total_bytes,
+                    });
+                }
+                return Err(ToolError::Protocol(
+                    "duplicate attachment has conflicting content".to_owned(),
+                ));
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let staging = ensure_dir(&attachments, ".staging")?;
+        let name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let name = cstring(&name)?;
+        let fd = openat2_cstr(
+            staging.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT,
+            0o600,
+        )?;
+        let file = File::from(fd);
+        ensure_regular_file(&file, "attachment staging file")?;
+        fchmod(file.as_raw_fd(), 0o600)?;
+        lock_exclusive(&file)?;
+        let offset = file.metadata()?.len();
+        if offset > total_bytes {
+            return Err(ToolError::Protocol(
+                "attachment staging file exceeds declared length".to_owned(),
+            ));
+        }
+        Ok(ArtifactResponse::AttachmentBegun { offset })
+    }
+
+    fn append_attachment(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+        offset: u64,
+        content: &[u8],
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_personality_agent, attachments) =
+            self.open_artifact_dirs(personality_agent_id, ArtifactKind::Attachments)?;
+        let staging = open_dir(&attachments, ".staging")?;
+        let name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let fd = open_regular_file(&staging, &name, libc::O_RDWR)?;
+        let mut file = File::from(fd);
+        lock_exclusive(&file)?;
+        let next = offset
+            .checked_add(
+                u64::try_from(content.len()).map_err(|_| {
+                    ToolError::Protocol("attachment chunk length overflow".to_owned())
+                })?,
+            )
+            .ok_or_else(|| ToolError::Protocol("attachment chunk offset overflow".to_owned()))?;
+        if next > total_bytes {
+            return Err(ToolError::Protocol(
+                "attachment chunk exceeds declared length".to_owned(),
+            ));
+        }
+        let actual = file.metadata()?.len();
+        if actual == offset {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            fsync_fd(staging.as_raw_fd())?;
+            return Ok(ArtifactResponse::AttachmentAppended { offset: next });
+        }
+        if actual >= next && file_range_equals(&mut file, offset, content)? {
+            return Ok(ArtifactResponse::AttachmentAppended { offset: next });
+        }
+        Err(ToolError::Protocol(
+            "attachment append offset or replay content conflicts".to_owned(),
+        ))
+    }
+
+    fn finish_attachment(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        artifact_id: &str,
+        total_bytes: u64,
+        content_digest: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let _state = self.lock_state()?;
+        let (_personality_agent, attachments) =
+            self.open_artifact_dirs(personality_agent_id, ArtifactKind::Attachments)?;
+        let final_name = cstring(artifact_id)?;
+        match openat2_cstr(
+            attachments.as_raw_fd(),
+            &final_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                ensure_regular_file(&file, "artifact")?;
+                if file_matches_attachment(&mut file, total_bytes, content_digest)? {
+                    return Ok(ArtifactResponse::Put {
+                        handle: format!(
+                            "artifact://{personality_agent_id}/attachments/{artifact_id}"
+                        ),
+                    });
+                }
+                return Err(ToolError::Protocol(
+                    "duplicate attachment has conflicting content".to_owned(),
+                ));
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let staging = open_dir(&attachments, ".staging")?;
+        let staging_name = attachment_staging_name(artifact_id, total_bytes, content_digest);
+        let fd = open_regular_file(&staging, &staging_name, libc::O_RDWR)?;
+        let mut file = File::from(fd);
+        lock_exclusive(&file)?;
+        if !file_matches_attachment(&mut file, total_bytes, content_digest)? {
+            return Err(ToolError::Protocol(
+                "attachment finish does not match declared content".to_owned(),
+            ));
+        }
+        file.sync_all()?;
+        renameat(
+            staging.as_raw_fd(),
+            &cstring(&staging_name)?,
+            attachments.as_raw_fd(),
+            &final_name,
+        )?;
+        fsync_fd(attachments.as_raw_fd())?;
+        Ok(ArtifactResponse::Put {
+            handle: format!("artifact://{personality_agent_id}/attachments/{artifact_id}"),
+        })
     }
 
     fn begin_tool_output(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         execution_id: &str,
         content: &[u8],
     ) -> Result<ArtifactResponse, ToolError> {
-        let handle = format!("artifact://{conversation_id}/tool-output/{execution_id}");
+        let handle = format!("artifact://{personality_agent_id}/tool-output/{execution_id}");
         let initial_len = u64::try_from(content.len()).map_err(|_| {
             ToolError::Protocol("artifact initial content length overflow".to_owned())
         })?;
@@ -181,8 +380,8 @@ impl ArtifactBroker {
                 "artifact process state capacity of {MAX_TRACKED_ARTIFACTS} was reached"
             )));
         }
-        let (conversation, kind) =
-            self.ensure_artifact_dirs(conversation_id, ArtifactKind::ToolOutput)?;
+        let (personality_agent, kind) =
+            self.ensure_artifact_dirs(personality_agent_id, ArtifactKind::ToolOutput)?;
         let name = cstring(execution_id)?;
         let created = match openat2_cstr(
             kind.as_raw_fd(),
@@ -210,7 +409,7 @@ impl ArtifactBroker {
             file.write_all(content)?;
             file.sync_all()?;
             fsync_fd(kind.as_raw_fd())?;
-            fsync_fd(conversation.as_raw_fd())?;
+            fsync_fd(personality_agent.as_raw_fd())?;
             fsync_fd(self.root.as_raw_fd())?;
         } else if !file_equals(&mut file, content)? {
             return Err(ToolError::Protocol(
@@ -233,15 +432,92 @@ impl ArtifactBroker {
         })
     }
 
+    fn put_attachment(
+        &self,
+        personality_agent_id: &PersonalityAgentId,
+        artifact_id: &str,
+        content: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let handle = format!("artifact://{personality_agent_id}/attachments/{artifact_id}");
+        let content_bytes = content.as_bytes();
+        let content_len = u64::try_from(content_bytes.len()).map_err(|_| {
+            ToolError::Protocol("artifact attachment content length overflow".to_owned())
+        })?;
+        let content_digest: [u8; 32] = Sha256::digest(content_bytes).into();
+
+        let mut state = self.lock_state()?;
+        if let Some(record) = state.artifacts.get(&handle) {
+            if record.initial_len != content_len || record.initial_digest != content_digest {
+                return Err(ToolError::Protocol(
+                    "duplicate PutAttachment has conflicting content".to_owned(),
+                ));
+            }
+            return Ok(ArtifactResponse::Put { handle });
+        }
+        if state.artifacts.len() >= MAX_TRACKED_ARTIFACTS {
+            return Err(ToolError::Protocol(format!(
+                "artifact process state capacity of {MAX_TRACKED_ARTIFACTS} was reached"
+            )));
+        }
+
+        let (personality_agent, kind) =
+            self.ensure_artifact_dirs(personality_agent_id, ArtifactKind::Attachments)?;
+        let name = cstring(artifact_id)?;
+        let created = match openat2_cstr(
+            kind.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(fd) => (fd, true),
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => (
+                openat2_cstr(
+                    kind.as_raw_fd(),
+                    &name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )?,
+                false,
+            ),
+            Err(error) => return Err(error),
+        };
+        ensure_regular(&created.0, "artifact")?;
+        fchmod(created.0.as_raw_fd(), 0o600)?;
+        let mut file = File::from(created.0);
+        lock_exclusive(&file)?;
+        if created.1 {
+            file.write_all(content_bytes)?;
+            file.sync_all()?;
+            fsync_fd(kind.as_raw_fd())?;
+            fsync_fd(personality_agent.as_raw_fd())?;
+            fsync_fd(self.root.as_raw_fd())?;
+        } else if !file_equals(&mut file, content_bytes)? {
+            return Err(ToolError::Protocol(
+                "duplicate PutAttachment has conflicting content".to_owned(),
+            ));
+        }
+        state.artifacts.insert(
+            handle.clone(),
+            ArtifactRecord {
+                initial_len: content_len,
+                initial_digest: content_digest,
+                committed_offset: content_len,
+                last_append: None,
+                finished: true,
+            },
+        );
+        Ok(ArtifactResponse::Put { handle })
+    }
+
     fn append_tool_output(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         handle: &str,
         offset: u64,
         content: &[u8],
     ) -> Result<ArtifactResponse, ToolError> {
         let (kind, artifact_id) =
-            checked_handle(conversation_id, handle, Some(ArtifactKind::ToolOutput))?;
+            checked_handle(personality_agent_id, handle, Some(ArtifactKind::ToolOutput))?;
         let mut state = self.lock_state()?;
         let record = state.artifacts.get_mut(handle).ok_or_else(|| {
             ToolError::Protocol("artifact append has no process-local Begin state".to_owned())
@@ -273,7 +549,7 @@ impl ArtifactBroker {
                 record.committed_offset
             )));
         }
-        let (_conversation, kind_dir) = self.open_artifact_dirs(conversation_id, kind)?;
+        let (_personality_agent, kind_dir) = self.open_artifact_dirs(personality_agent_id, kind)?;
         let fd = open_regular_file(&kind_dir, artifact_id, libc::O_RDWR)?;
         let mut file = File::from(fd);
         lock_exclusive(&file)?;
@@ -303,11 +579,11 @@ impl ArtifactBroker {
 
     fn finish_tool_output(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         handle: &str,
     ) -> Result<ArtifactResponse, ToolError> {
         let (kind, artifact_id) =
-            checked_handle(conversation_id, handle, Some(ArtifactKind::ToolOutput))?;
+            checked_handle(personality_agent_id, handle, Some(ArtifactKind::ToolOutput))?;
         let mut state = self.lock_state()?;
         let record = state.artifacts.get_mut(handle).ok_or_else(|| {
             ToolError::Protocol("artifact finish has no process-local Begin state".to_owned())
@@ -315,7 +591,7 @@ impl ArtifactBroker {
         if record.finished {
             return Ok(ArtifactResponse::Finished);
         }
-        let (_conversation, kind_dir) = self.open_artifact_dirs(conversation_id, kind)?;
+        let (_personality_agent, kind_dir) = self.open_artifact_dirs(personality_agent_id, kind)?;
         let fd = open_regular_file(&kind_dir, artifact_id, libc::O_RDWR)?;
         let file = File::from(fd);
         lock_exclusive(&file)?;
@@ -327,18 +603,18 @@ impl ArtifactBroker {
 
     fn read_artifact(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         handle: &str,
         offset: u64,
         limit: usize,
     ) -> Result<ArtifactResponse, ToolError> {
-        let (kind, artifact_id) = checked_handle(conversation_id, handle, None)?;
+        let (kind, artifact_id) = checked_handle(personality_agent_id, handle, None)?;
         let limit_u64 = u64::try_from(limit)
             .map_err(|_| ToolError::Protocol("artifact read limit overflow".to_owned()))?;
         offset
             .checked_add(limit_u64)
             .ok_or_else(|| ToolError::Protocol("artifact read range overflow".to_owned()))?;
-        let (_conversation, kind_dir) = self.open_artifact_dirs(conversation_id, kind)?;
+        let (_personality_agent, kind_dir) = self.open_artifact_dirs(personality_agent_id, kind)?;
         let fd = open_regular_file(&kind_dir, artifact_id, libc::O_RDONLY | libc::O_NONBLOCK)?;
         let mut file = File::from(fd);
         lock_shared(&file)?;
@@ -360,14 +636,14 @@ impl ArtifactBroker {
 
     fn grep_artifact(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         handle: &str,
         pattern: &str,
     ) -> Result<ArtifactResponse, ToolError> {
-        let (kind, artifact_id) = checked_handle(conversation_id, handle, None)?;
+        let (kind, artifact_id) = checked_handle(personality_agent_id, handle, None)?;
         let pattern = Regex::new(pattern)
             .map_err(|error| ToolError::Protocol(format!("invalid grep pattern: {error}")))?;
-        let (_conversation, kind_dir) = self.open_artifact_dirs(conversation_id, kind)?;
+        let (_personality_agent, kind_dir) = self.open_artifact_dirs(personality_agent_id, kind)?;
         let fd = open_regular_file(&kind_dir, artifact_id, libc::O_RDONLY | libc::O_NONBLOCK)?;
         let file = File::from(fd);
         lock_shared(&file)?;
@@ -433,22 +709,22 @@ impl ArtifactBroker {
 
     fn ensure_artifact_dirs(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         kind: ArtifactKind,
     ) -> Result<(OwnedFd, OwnedFd), ToolError> {
-        let conversation = ensure_dir(&self.root, conversation_id)?;
-        let kind = ensure_dir(&conversation, kind_name(kind))?;
-        Ok((conversation, kind))
+        let personality_agent = ensure_dir(&self.root, personality_agent_id.as_str())?;
+        let kind = ensure_dir(&personality_agent, kind_name(kind))?;
+        Ok((personality_agent, kind))
     }
 
     fn open_artifact_dirs(
         &self,
-        conversation_id: &str,
+        personality_agent_id: &PersonalityAgentId,
         kind: ArtifactKind,
     ) -> Result<(OwnedFd, OwnedFd), ToolError> {
-        let conversation = open_dir(&self.root, conversation_id)?;
-        let kind = open_dir(&conversation, kind_name(kind))?;
-        Ok((conversation, kind))
+        let personality_agent = open_dir(&self.root, personality_agent_id.as_str())?;
+        let kind = open_dir(&personality_agent, kind_name(kind))?;
+        Ok((personality_agent, kind))
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, BrokerState>, ToolError> {
@@ -459,14 +735,14 @@ impl ArtifactBroker {
 }
 
 fn checked_handle<'a>(
-    conversation_id: &str,
+    personality_agent_id: &PersonalityAgentId,
     handle: &'a str,
     required_kind: Option<ArtifactKind>,
 ) -> Result<(ArtifactKind, &'a str), ToolError> {
     let parsed = parse_artifact_handle(handle)?;
-    if parsed.conversation_id != conversation_id {
+    if &parsed.personality_agent_id != personality_agent_id {
         return Err(ToolError::InvalidPath(
-            "artifact belongs to another conversation".to_owned(),
+            "artifact belongs to another personality agent".to_owned(),
         ));
     }
     if required_kind.is_some_and(|kind| parsed.kind != kind) {
@@ -538,6 +814,75 @@ fn ensure_regular(fd: &OwnedFd, operation: &str) -> Result<(), ToolError> {
         Err(ToolError::InvalidPath(format!(
             "{operation} is not a regular file"
         )))
+    }
+}
+
+fn ensure_regular_file(file: &File, operation: &str) -> Result<(), ToolError> {
+    if file.metadata()?.is_file() {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidPath(format!(
+            "{operation} is not a regular file"
+        )))
+    }
+}
+
+fn attachment_staging_name(artifact_id: &str, total_bytes: u64, content_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(artifact_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(total_bytes.to_be_bytes());
+    hasher.update(content_digest.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn file_matches_attachment(
+    file: &mut File,
+    total_bytes: u64,
+    content_digest: &str,
+) -> Result<bool, ToolError> {
+    if file.metadata()?.len() != total_bytes {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == content_digest)
+}
+
+fn file_range_equals(file: &mut File, offset: u64, expected: &[u8]) -> Result<bool, ToolError> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut compared = 0usize;
+    let mut buffer = [0u8; 8192];
+    while compared < expected.len() {
+        let read = file.read(&mut buffer)?;
+        if read == 0 || buffer[..read] != expected[compared..compared + read] {
+            return Ok(false);
+        }
+        compared = compared
+            .checked_add(read)
+            .ok_or_else(|| ToolError::Protocol("attachment comparison overflow".to_owned()))?;
+    }
+    Ok(true)
+}
+
+fn renameat(
+    old_dir: RawFd,
+    old_name: &CStr,
+    new_dir: RawFd,
+    new_name: &CStr,
+) -> Result<(), ToolError> {
+    if unsafe { libc::renameat(old_dir, old_name.as_ptr(), new_dir, new_name.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
     }
 }
 
@@ -652,6 +997,33 @@ mod tests {
 
     use super::*;
 
+    const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000002";
+
+    fn paid() -> PersonalityAgentId {
+        PersonalityAgentId::parse(PERSONALITY_AGENT_ID).expect("canonical personality-agent ID")
+    }
+
+    fn other_paid() -> PersonalityAgentId {
+        PersonalityAgentId::parse(OTHER_PERSONALITY_AGENT_ID)
+            .expect("canonical personality-agent ID")
+    }
+
+    fn execute(
+        broker: &ArtifactBroker,
+        operation: ArtifactOperation,
+    ) -> Result<ArtifactResponse, ToolError> {
+        broker.execute(&paid(), operation)
+    }
+
+    fn execute_as(
+        broker: &ArtifactBroker,
+        personality_agent_id: &PersonalityAgentId,
+        operation: ArtifactOperation,
+    ) -> Result<ArtifactResponse, ToolError> {
+        broker.execute(personality_agent_id, operation)
+    }
+
     static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     struct UmaskGuard(libc::mode_t);
@@ -687,19 +1059,17 @@ mod tests {
 
     fn begin(content: impl Into<Vec<u8>>) -> ArtifactOperation {
         ArtifactOperation::BeginToolOutput {
-            conversation_id: "conversation-1".to_owned(),
             execution_id: "execution-1".to_owned(),
             content: content.into(),
         }
     }
 
     fn handle() -> &'static str {
-        "artifact://conversation-1/tool-output/execution-1"
+        "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1"
     }
 
     fn append(offset: u64, content: impl Into<Vec<u8>>) -> ArtifactOperation {
         ArtifactOperation::AppendToolOutput {
-            conversation_id: "conversation-1".to_owned(),
             handle: handle().to_owned(),
             offset,
             content: content.into(),
@@ -708,7 +1078,6 @@ mod tests {
 
     fn read(offset: u64, limit: usize) -> ArtifactOperation {
         ArtifactOperation::ReadArtifact {
-            conversation_id: "conversation-1".to_owned(),
             handle: handle().to_owned(),
             offset,
             limit,
@@ -718,7 +1087,9 @@ mod tests {
     #[test]
     fn read_and_grep_reject_a_no_writer_fifo_without_blocking() {
         let root = TestRoot::new();
-        let kind_dir = root.0.join("conversation-1/tool-output");
+        let kind_dir = root
+            .0
+            .join("0198f0f4-9b72-7000-8000-000000000001/tool-output");
         fs::create_dir_all(&kind_dir).unwrap();
         let fifo = kind_dir.join("execution-1");
         let fifo = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
@@ -728,13 +1099,12 @@ mod tests {
         for operation in [
             read(0, 10),
             ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle().to_owned(),
                 pattern: "needle".to_owned(),
             },
         ] {
             assert!(matches!(
-                broker.execute(operation),
+                execute(&broker, operation),
                 Err(ToolError::InvalidPath(message))
                     if message == "artifact is not a regular file"
             ));
@@ -766,25 +1136,34 @@ mod tests {
             {
                 let _umask = UmaskGuard::set(mask);
                 let broker = ArtifactBroker::open(&root.0).unwrap();
-                broker.execute(begin(b"prefix".to_vec())).unwrap();
+                execute(&broker, begin(b"prefix".to_vec())).unwrap();
             }
 
             assert_eq!(fs::metadata(&root.0).unwrap().mode() & 0o777, 0o700);
             assert_eq!(
-                fs::metadata(root.0.join("conversation-1")).unwrap().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(root.0.join("conversation-1/tool-output"))
+                fs::metadata(root.0.join("0198f0f4-9b72-7000-8000-000000000001"))
                     .unwrap()
                     .mode()
                     & 0o777,
                 0o700
             );
             assert_eq!(
-                fs::metadata(root.0.join("conversation-1/tool-output/execution-1"))
-                    .unwrap()
-                    .mode()
+                fs::metadata(
+                    root.0
+                        .join("0198f0f4-9b72-7000-8000-000000000001/tool-output")
+                )
+                .unwrap()
+                .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(
+                    root.0
+                        .join("0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1")
+                )
+                .unwrap()
+                .mode()
                     & 0o777,
                 0o600
             );
@@ -799,60 +1178,170 @@ mod tests {
             handle: handle().to_owned(),
             offset: 6,
         };
-        assert_eq!(broker.execute(begin(b"prefix".to_vec())).unwrap(), begun);
-        assert_eq!(broker.execute(begin(b"prefix".to_vec())).unwrap(), begun);
+        assert_eq!(execute(&broker, begin(b"prefix".to_vec())).unwrap(), begun);
+        assert_eq!(execute(&broker, begin(b"prefix".to_vec())).unwrap(), begun);
         assert!(matches!(
-            broker.execute(begin(b"different".to_vec())),
+            execute(&broker, begin(b"different".to_vec())),
             Err(ToolError::Protocol(message))
                 if message == "duplicate BeginToolOutput has conflicting content"
         ));
 
         assert_eq!(
-            broker.execute(append(6, b"-suffix".to_vec())).unwrap(),
+            execute(&broker, append(6, b"-suffix".to_vec())).unwrap(),
             ArtifactResponse::Appended { offset: 13 }
         );
         assert_eq!(
-            broker.execute(append(6, b"-suffix".to_vec())).unwrap(),
+            execute(&broker, append(6, b"-suffix".to_vec())).unwrap(),
             ArtifactResponse::Appended { offset: 13 }
         );
         assert!(matches!(
-            broker.execute(append(6, b"-different".to_vec())),
+            execute(&broker, append(6, b"-different".to_vec())),
             Err(ToolError::Protocol(message))
                 if message == "artifact append replay has conflicting content"
         ));
-        assert_eq!(broker.execute(begin(b"prefix".to_vec())).unwrap(), begun);
+        assert_eq!(execute(&broker, begin(b"prefix".to_vec())).unwrap(), begun);
         assert!(matches!(
-            broker.execute(begin(b"different".to_vec())),
+            execute(&broker, begin(b"different".to_vec())),
             Err(ToolError::Protocol(message))
                 if message == "duplicate BeginToolOutput has conflicting content"
         ));
         assert_eq!(
-            broker.execute(append(13, b"-tail".to_vec())).unwrap(),
+            execute(&broker, append(13, b"-tail".to_vec())).unwrap(),
             ArtifactResponse::Appended { offset: 18 }
         );
         assert!(matches!(
-            broker.execute(append(6, b"-suffix".to_vec())),
+            execute(&broker, append(6, b"-suffix".to_vec())),
             Err(ToolError::Protocol(message)) if message.contains("offset mismatch")
         ));
         assert!(matches!(
-            broker.execute(append(12, b"x".to_vec())),
+            execute(&broker, append(12, b"x".to_vec())),
             Err(ToolError::Protocol(message)) if message.contains("offset mismatch")
         ));
 
         let finish = ArtifactOperation::FinishToolOutput {
-            conversation_id: "conversation-1".to_owned(),
             handle: handle().to_owned(),
         };
         assert_eq!(
-            broker.execute(finish.clone()).unwrap(),
+            execute(&broker, finish.clone()).unwrap(),
             ArtifactResponse::Finished
         );
-        assert_eq!(broker.execute(finish).unwrap(), ArtifactResponse::Finished);
-        assert_eq!(broker.execute(begin(b"prefix".to_vec())).unwrap(), begun);
+        assert_eq!(
+            execute(&broker, finish).unwrap(),
+            ArtifactResponse::Finished
+        );
+        assert_eq!(execute(&broker, begin(b"prefix".to_vec())).unwrap(), begun);
         assert!(matches!(
-            broker.execute(append(13, b"late".to_vec())),
+            execute(&broker, append(13, b"late".to_vec())),
             Err(ToolError::Protocol(message)) if message.contains("finished artifact")
         ));
+    }
+
+    #[test]
+    fn put_attachment_is_idempotent_and_rejects_conflicts() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let put = ArtifactOperation::PutAttachment {
+            artifact_id: "artifact-1".to_owned(),
+            content: "large user text".to_owned(),
+        };
+        let expected = ArtifactResponse::Put {
+            handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/artifact-1"
+                .to_owned(),
+        };
+        assert_eq!(execute(&broker, put.clone()).unwrap(), expected);
+        assert_eq!(execute(&broker, put.clone()).unwrap(), expected);
+
+        let conflict = ArtifactOperation::PutAttachment {
+            artifact_id: "artifact-1".to_owned(),
+            content: "different".to_owned(),
+        };
+        assert!(matches!(
+            execute(&broker, conflict),
+            Err(ToolError::Protocol(message))
+                if message == "duplicate PutAttachment has conflicting content"
+        ));
+    }
+
+    #[test]
+    fn chunked_attachment_restarts_from_a_durable_prefix_and_publishes_atomically() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let content = vec![b'x'; 1_200 * 1024];
+        let digest = format!("{:x}", Sha256::digest(&content));
+        let total = content.len() as u64;
+        let begin = || ArtifactOperation::BeginAttachment {
+            artifact_id: "large-input".to_owned(),
+            total_bytes: total,
+            content_digest: digest.clone(),
+        };
+        assert_eq!(
+            execute(&broker, begin()).unwrap(),
+            ArtifactResponse::AttachmentBegun { offset: 0 }
+        );
+        let first = MAX_ATTACHMENT_CHUNK_BYTES;
+        assert_eq!(
+            execute(
+                &broker,
+                ArtifactOperation::AppendAttachment {
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest.clone(),
+                    offset: 0,
+                    content: content[..first].to_vec(),
+                },
+            )
+            .unwrap(),
+            ArtifactResponse::AttachmentAppended {
+                offset: first as u64
+            }
+        );
+        // A restarted broker reconstructs the durable staging offset rather
+        // than requiring process-local state.
+        drop(broker);
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        assert_eq!(
+            execute(&broker, begin()).unwrap(),
+            ArtifactResponse::AttachmentBegun {
+                offset: first as u64
+            }
+        );
+        for offset in (first..content.len()).step_by(MAX_ATTACHMENT_CHUNK_BYTES) {
+            let end = (offset + MAX_ATTACHMENT_CHUNK_BYTES).min(content.len());
+            execute(
+                &broker,
+                ArtifactOperation::AppendAttachment {
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest.clone(),
+                    offset: offset as u64,
+                    content: content[offset..end].to_vec(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            execute(
+                &broker,
+                ArtifactOperation::FinishAttachment {
+                    artifact_id: "large-input".to_owned(),
+                    total_bytes: total,
+                    content_digest: digest,
+                },
+            )
+            .unwrap(),
+            ArtifactResponse::Put {
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/large-input"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            fs::read(
+                root.0
+                    .join("0198f0f4-9b72-7000-8000-000000000001/attachments/large-input")
+            )
+            .unwrap(),
+            content
+        );
     }
 
     #[test]
@@ -860,24 +1349,24 @@ mod tests {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
         let content = [b"a".as_slice(), "界".as_bytes(), &[0, 0xff], b"z"].concat();
-        broker.execute(begin(content.clone())).unwrap();
+        execute(&broker, begin(content.clone())).unwrap();
 
         assert_eq!(
-            broker.execute(read(1, 4)).unwrap(),
+            execute(&broker, read(1, 4)).unwrap(),
             ArtifactResponse::Read {
                 content: content[1..5].to_vec(),
                 eof: false,
             }
         );
         assert_eq!(
-            broker.execute(read(content.len() as u64, 50)).unwrap(),
+            execute(&broker, read(content.len() as u64, 50)).unwrap(),
             ArtifactResponse::Read {
                 content: vec![],
                 eof: true,
             }
         );
         assert!(matches!(
-            broker.execute(read(u64::MAX, 1)),
+            execute(&broker, read(u64::MAX, 1)),
             Err(ToolError::Protocol(message)) if message.contains("range overflow")
         ));
     }
@@ -887,14 +1376,15 @@ mod tests {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
         let long = format!("needle{}\nother\nneedle-short\n", "界".repeat(600));
-        broker.execute(begin(long.into_bytes())).unwrap();
-        let result = broker
-            .execute(ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
+        execute(&broker, begin(long.into_bytes())).unwrap();
+        let result = execute(
+            &broker,
+            ArtifactOperation::GrepArtifact {
                 handle: handle().to_owned(),
                 pattern: "needle".to_owned(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let ArtifactResponse::Grep { matches } = result else {
             panic!("unexpected grep response")
         };
@@ -907,10 +1397,9 @@ mod tests {
 
         let binary_root = TestRoot::new();
         let binary = ArtifactBroker::open(&binary_root.0).unwrap();
-        binary.execute(begin(vec![b'n', 0xff, b'\n'])).unwrap();
+        execute(&binary, begin(vec![b'n', 0xff, b'\n'])).unwrap();
         assert!(matches!(
-            binary.execute(ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
+            execute(&binary, ArtifactOperation::GrepArtifact {
                 handle: handle().to_owned(),
                 pattern: "n".to_owned(),
             }),
@@ -922,33 +1411,37 @@ mod tests {
     fn grep_has_finite_scan_and_rendered_output_limits() {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
-        broker
-            .execute(begin(vec![b'x'; (MAX_SCAN_BYTES + 1) as usize]))
-            .unwrap();
+        execute(&broker, begin(vec![b'x'; (MAX_SCAN_BYTES + 1) as usize])).unwrap();
         assert!(matches!(
-            broker.execute(ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
-                handle: handle().to_owned(),
-                pattern: "x".to_owned(),
-            }),
+            execute(
+                &broker,
+                ArtifactOperation::GrepArtifact {
+                    handle: handle().to_owned(),
+                    pattern: "x".to_owned(),
+                }
+            ),
             Err(ToolError::ResourceLimit(ResourceLimit::ScanBytes))
         ));
 
         let output_root = TestRoot::new();
         let output_broker = ArtifactBroker::open(&output_root.0).unwrap();
-        output_broker
-            .execute(begin(
+        execute(
+            &output_broker,
+            begin(
                 ("match ".to_owned() + &"x".repeat(490) + "\n")
                     .repeat(200)
                     .into_bytes(),
-            ))
-            .unwrap();
+            ),
+        )
+        .unwrap();
         assert!(matches!(
-            output_broker.execute(ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
-                handle: handle().to_owned(),
-                pattern: "match".to_owned(),
-            }),
+            execute(
+                &output_broker,
+                ArtifactOperation::GrepArtifact {
+                    handle: handle().to_owned(),
+                    pattern: "match".to_owned(),
+                }
+            ),
             Err(ToolError::ResourceLimit(ResourceLimit::ScanBytes))
         ));
     }
@@ -1010,13 +1503,12 @@ mod tests {
 
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
-        broker.execute(begin(content.clone())).unwrap();
+        execute(&broker, begin(content.clone())).unwrap();
         let operation = ArtifactOperation::GrepArtifact {
-            conversation_id: "conversation-1".to_owned(),
             handle: handle().to_owned(),
             pattern: "needle".to_owned(),
         };
-        let response = broker.execute(operation.clone()).unwrap();
+        let response = execute(&broker, operation.clone()).unwrap();
         assert_eq!(
             serde_json::to_vec(&response).unwrap().len(),
             MAX_GREP_SERIALIZED_BYTES
@@ -1026,77 +1518,92 @@ mod tests {
         over_limit.extend_from_slice(b"needle\n");
         let over_root = TestRoot::new();
         let over_broker = ArtifactBroker::open(&over_root.0).unwrap();
-        over_broker.execute(begin(over_limit)).unwrap();
+        execute(&over_broker, begin(over_limit)).unwrap();
         assert!(matches!(
-            over_broker.execute(operation),
+            execute(&over_broker, operation),
             Err(ToolError::ResourceLimit(ResourceLimit::ScanBytes))
         ));
     }
 
     #[test]
-    fn conversation_kind_and_file_symlinks_are_rejected() {
+    fn personality_agent_kind_and_file_symlinks_are_rejected() {
         let outside = TestRoot::new();
 
-        let conversation_root = TestRoot::new();
-        symlink(&outside.0, conversation_root.0.join("conversation-1")).unwrap();
-        let broker = ArtifactBroker::open(&conversation_root.0).unwrap();
-        assert!(broker.execute(begin(b"x".to_vec())).is_err());
+        let personality_agent_root = TestRoot::new();
+        symlink(
+            &outside.0,
+            personality_agent_root
+                .0
+                .join("0198f0f4-9b72-7000-8000-000000000001"),
+        )
+        .unwrap();
+        let broker = ArtifactBroker::open(&personality_agent_root.0).unwrap();
+        assert!(execute(&broker, begin(b"x".to_vec())).is_err());
         assert!(!outside.0.join("tool-output/execution-1").exists());
 
         let kind_root = TestRoot::new();
-        fs::create_dir(kind_root.0.join("conversation-1")).unwrap();
-        symlink(&outside.0, kind_root.0.join("conversation-1/tool-output")).unwrap();
+        fs::create_dir(kind_root.0.join("0198f0f4-9b72-7000-8000-000000000001")).unwrap();
+        symlink(
+            &outside.0,
+            kind_root
+                .0
+                .join("0198f0f4-9b72-7000-8000-000000000001/tool-output"),
+        )
+        .unwrap();
         let broker = ArtifactBroker::open(&kind_root.0).unwrap();
-        assert!(broker.execute(begin(b"x".to_vec())).is_err());
+        assert!(execute(&broker, begin(b"x".to_vec())).is_err());
         assert!(!outside.0.join("execution-1").exists());
 
         let file_root = TestRoot::new();
-        fs::create_dir_all(file_root.0.join("conversation-1/tool-output")).unwrap();
+        fs::create_dir_all(
+            file_root
+                .0
+                .join("0198f0f4-9b72-7000-8000-000000000001/tool-output"),
+        )
+        .unwrap();
         let outside_file = outside.0.join("outside-file");
         fs::write(&outside_file, b"unchanged").unwrap();
         symlink(
             &outside_file,
-            file_root.0.join("conversation-1/tool-output/execution-1"),
+            file_root
+                .0
+                .join("0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1"),
         )
         .unwrap();
         let broker = ArtifactBroker::open(&file_root.0).unwrap();
-        assert!(broker.execute(begin(b"replacement".to_vec())).is_err());
+        assert!(execute(&broker, begin(b"replacement".to_vec())).is_err());
         for operation in [
             read(0, 10),
             append(0, b"replacement".to_vec()),
             ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle().to_owned(),
             },
             ArtifactOperation::GrepArtifact {
-                conversation_id: "conversation-1".to_owned(),
                 handle: handle().to_owned(),
                 pattern: "unchanged".to_owned(),
             },
         ] {
-            assert!(broker.execute(operation).is_err());
+            assert!(execute(&broker, operation).is_err());
         }
         assert_eq!(fs::read(outside_file).unwrap(), b"unchanged");
     }
 
     #[test]
-    fn claims_reject_cross_conversation_and_wrong_kind_mutation() {
+    fn claims_reject_cross_personality_agent_and_wrong_kind_mutation() {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
-        broker.execute(begin(b"content".to_vec())).unwrap();
+        execute(&broker, begin(b"content".to_vec())).unwrap();
         assert!(matches!(
-            broker.execute(ArtifactOperation::ReadArtifact {
-                conversation_id: "conversation-2".to_owned(),
+            execute_as(&broker, &other_paid(), ArtifactOperation::ReadArtifact {
                 handle: handle().to_owned(),
                 offset: 0,
                 limit: 10,
             }),
-            Err(ToolError::InvalidPath(message)) if message.contains("another conversation")
+            Err(ToolError::InvalidPath(message)) if message.contains("another personality agent")
         ));
         assert!(matches!(
-            broker.execute(ArtifactOperation::AppendToolOutput {
-                conversation_id: "conversation-1".to_owned(),
-                handle: "artifact://conversation-1/attachments/input-1".to_owned(),
+            execute(&broker, ArtifactOperation::AppendToolOutput {
+                handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/input-1".to_owned(),
                 offset: 0,
                 content: vec![],
             }),
@@ -1108,17 +1615,20 @@ mod tests {
     fn durable_boundaries_are_visible_through_an_independent_open() {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
-        broker.execute(begin(b"first".to_vec())).unwrap();
-        let path = root.0.join("conversation-1/tool-output/execution-1");
+        execute(&broker, begin(b"first".to_vec())).unwrap();
+        let path = root
+            .0
+            .join("0198f0f4-9b72-7000-8000-000000000001/tool-output/execution-1");
         assert_eq!(fs::read(&path).unwrap(), b"first");
-        broker.execute(append(5, b" second".to_vec())).unwrap();
+        execute(&broker, append(5, b" second".to_vec())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"first second");
-        broker
-            .execute(ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
+        execute(
+            &broker,
+            ArtifactOperation::FinishToolOutput {
                 handle: handle().to_owned(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(fs::read(path).unwrap(), b"first second");
     }
 
@@ -1126,16 +1636,19 @@ mod tests {
     fn existing_permissions_are_repaired_when_descendants_are_opened() {
         let root = TestRoot::new();
         let broker = ArtifactBroker::open(&root.0).unwrap();
-        broker.execute(begin(b"x".to_vec())).unwrap();
-        let conversation = root.0.join("conversation-1");
-        let kind = conversation.join("tool-output");
+        execute(&broker, begin(b"x".to_vec())).unwrap();
+        let personality_agent = root.0.join("0198f0f4-9b72-7000-8000-000000000001");
+        let kind = personality_agent.join("tool-output");
         let file = kind.join("execution-1");
-        fs::set_permissions(&conversation, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&personality_agent, fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(&kind, fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
 
-        broker.execute(read(0, 1)).unwrap();
-        assert_eq!(fs::metadata(conversation).unwrap().mode() & 0o777, 0o700);
+        execute(&broker, read(0, 1)).unwrap();
+        assert_eq!(
+            fs::metadata(personality_agent).unwrap().mode() & 0o777,
+            0o700
+        );
         assert_eq!(fs::metadata(kind).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(file).unwrap().mode() & 0o777, 0o600);
     }

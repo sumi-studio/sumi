@@ -696,8 +696,12 @@ impl MessageAssembler {
         }
         for (content_index, scratch) in &self.scratch {
             let Some(block) = authoritative.get(content_index) else {
+                // Error terminals are authoritative about durability. Open
+                // thinking may be omitted when its producer did not verify or
+                // retain it; retained partial text must still be closed and
+                // reconciled explicitly.
                 if matches!(scratch, ScratchBlock::Tool(_))
-                    || (aborted && matches!(scratch, ScratchBlock::Thinking { .. }))
+                    || matches!(scratch, ScratchBlock::Thinking { .. })
                 {
                     continue;
                 }
@@ -1895,6 +1899,61 @@ mod tests {
             consumer.apply(&terminal).expect("authoritative terminal"),
             Some(message)
         );
+    }
+
+    #[test]
+    fn error_terminal_may_drop_unfinished_thinking_after_verified_content() {
+        let verified = AssistantContent::Text {
+            text: "verified".to_owned(),
+            wire_item_index: 0,
+        };
+        let terminal = ProviderEvent::Error {
+            reason: StopReason::Error,
+            output: ProviderOutput {
+                message: AssistantMessage {
+                    content: vec![verified.clone()],
+                    model: origin().model,
+                    provider: "moonshot".to_owned(),
+                    origin: origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Error,
+                    error_message: Some("provider failed".to_owned()),
+                    provider_code: Some("provider_error".to_owned()),
+                    interrupted: false,
+                    timestamp: timestamp(),
+                },
+                provider_context: Vec::new(),
+            },
+        };
+        let mut consumer = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "verified".to_owned(),
+            },
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "verified".to_owned(),
+            },
+            ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "signature".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "unsigned".to_owned(),
+            },
+        ] {
+            consumer.apply(&event).expect("trusted prefix");
+        }
+
+        let message = consumer
+            .apply(&terminal)
+            .expect("authoritative error may omit unfinished thinking")
+            .expect("terminal message");
+        assert_eq!(message.content, vec![verified]);
     }
 
     #[test]

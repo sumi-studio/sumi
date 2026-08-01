@@ -12,16 +12,24 @@ use tokio::io::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use super::supervisor::TerminalGatewayClosed;
+use super::wire::to_wire_frame;
 use super::{
-    CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason, Gateway, GatewayClosed,
-    GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
-    OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
+    AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
+    ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
+    GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
+    MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
+    SensitiveCommandPayload,
 };
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
 
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
 const MAX_ENVELOPE_KEY_BYTES: usize = 256;
+/// A readable envelope may be terminal-rejected after crossing the transport
+/// limit, but its line must still end within this bounded drain window.
+pub(crate) const MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES: usize =
+    MAX_FRAME_BYTES + MAX_ENVELOPE_METADATA_BYTES;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("command was {actual} bytes and exceeded the {limit} byte limit")]
@@ -90,6 +98,7 @@ impl<R, W> InjectedStdioGateway<R, W> {
     }
 }
 
+#[async_trait]
 impl<R, W> Gateway for InjectedStdioGateway<R, W>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -97,6 +106,13 @@ where
 {
     type Reader = InjectedStdioGatewayReader<R>;
     type Writer = InjectedStdioGatewayWriter<W>;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        stdio_hello(&hello)
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -141,9 +157,17 @@ impl StdioGateway {
     }
 }
 
+#[async_trait]
 impl Gateway for StdioGateway {
     type Reader = StdioGatewayReader;
     type Writer = StdioGatewayWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        stdio_hello(&hello)
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -173,7 +197,16 @@ impl GatewayWriter for StdioGatewayWriter {
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame) -> Result<()> {
-    let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
+    let wire_frame = to_wire_frame(frame).context("failed to convert gateway frame to wire DTO")?;
+    let mut line =
+        serde_json::to_vec(&wire_frame).context("failed to encode gateway frame JSON")?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(OversizedFrameError {
+            actual: line.len(),
+            max: MAX_FRAME_BYTES,
+        }
+        .into());
+    }
     line.push(b'\n');
     output
         .write_all(&line)
@@ -185,11 +218,34 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
         .context("failed to flush gateway frame")
 }
 
+/// Compute the `ApiHello` for a stdio (single-connection, no catch-up) peer.
+/// The peer is assumed to have received all events already sent, so catch-up
+/// begins at the durable cursor. The next command starts after the last applied
+/// durable command.
+pub(crate) fn stdio_hello(hello: &AgentHello) -> std::result::Result<ApiHello, HelloError> {
+    let next_command_seq = hello
+        .last_applied_command_seq
+        .checked_add(1)
+        .ok_or_else(|| {
+            HelloError::Fatal(anyhow!(
+                "last applied command sequence cannot advance beyond u64::MAX"
+            ))
+        })?;
+    Ok(ApiHello {
+        personality_agent_id: hello.personality_agent_id.clone(),
+        accepted_generation: hello.generation,
+        last_received_event_seq: hello.last_sent_event_seq,
+        next_command_seq,
+    })
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCommandIdentityEnvelope {
     seq: u64,
     command_id: CommandId,
+    personality_agent_id: PersonalityAgentId,
+    provenance: DirectChatProvenanceV1,
     #[serde(default)]
     command: CommandFieldPresence,
 }
@@ -211,20 +267,39 @@ impl<'de> Deserialize<'de> for CommandFieldPresence {
     }
 }
 
-async fn read_command<R>(
+pub(crate) async fn read_command<R>(
     input: &mut R,
     digest_factory: &dyn CommandDigestFactory,
 ) -> Result<InboundCommand>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut frame = read_frame(input, digest_factory.start()).await?;
-    let raw: RawCommandIdentityEnvelope =
-        serde_json::from_slice(&frame.identity).map_err(InvalidCommand)?;
+    let frame = read_frame(input, digest_factory.start(), true).await?;
+    decode_command_frame(frame)
+}
+
+pub(crate) async fn read_command_message<R>(
+    input: &mut R,
+    digest_factory: &dyn CommandDigestFactory,
+) -> Result<InboundCommand>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let frame = read_frame(input, digest_factory.start(), false).await?;
+    decode_command_frame(frame)
+}
+
+fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
+    let raw = parse_outer_identity(&frame.identity).map_err(InvalidCommand)?;
+    raw.provenance
+        .validate(&raw.personality_agent_id)
+        .context("invalid command provenance")?;
     if matches!(raw.command, CommandFieldPresence::Missing) || !frame.command_found {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::SchemaViolation,
             raw_command: RejectedCommandPayload::Missing,
             payload_digest: None,
@@ -235,6 +310,8 @@ where
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::Oversized {
                 actual_bytes: command_bytes as u64,
             },
@@ -254,6 +331,8 @@ where
             return Ok(InboundCommand::Invalid {
                 seq: raw.seq,
                 command_id: raw.command_id,
+                personality_agent_id: raw.personality_agent_id,
+                provenance: raw.provenance,
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(sensitive_payload),
                 payload_digest: None,
@@ -283,6 +362,8 @@ where
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason,
             raw_command: RejectedCommandPayload::Present(sensitive_payload),
             payload_digest: None,
@@ -293,16 +374,25 @@ where
         Ok(command) => Ok(InboundCommand::Valid(CommandEnvelope {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             command,
         })),
         Err(_) => Ok(InboundCommand::Invalid {
             seq: raw.seq,
             command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
             reason: CommandRejectReason::SchemaViolation,
             raw_command: RejectedCommandPayload::Present(sensitive_payload),
             payload_digest: None,
         }),
     }
+}
+
+fn parse_outer_identity(bytes: &[u8]) -> serde_json::Result<RawCommandIdentityEnvelope> {
+    let identity = parse_command_value(bytes)?;
+    serde_json::from_value(identity)
 }
 
 fn parse_command_value(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
@@ -731,9 +821,38 @@ impl EnvelopeScanner {
         Ok(())
     }
 
+    fn is_done(&self) -> bool {
+        matches!(self.state, EnvelopeState::Done)
+    }
+
+    /// Whether the prefix seen before the command body already contains a
+    /// complete, schema-valid outer identity. The synthetic closing brace is
+    /// safe because command values are represented by the placeholder `{}` in
+    /// `identity`; the full envelope is still validated before it is returned.
+    fn has_readable_outer_identity(&self) -> bool {
+        if !self.command_found {
+            return false;
+        }
+
+        if parse_outer_identity(&self.identity)
+            .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
+        {
+            return true;
+        }
+
+        let mut candidate = Zeroizing::new(self.identity.to_vec());
+        candidate.push(b'}');
+        parse_outer_identity(&candidate)
+            .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
+    }
+
     fn finish(mut self) -> Result<ReadCommandFrame> {
-        if !matches!(self.state, EnvelopeState::Done) {
-            self.invalidate()?;
+        if !self.is_done() && parse_outer_identity(&self.identity).is_err() {
+            if self.has_readable_outer_identity() {
+                self.push_identity(b'}')?;
+            } else {
+                self.invalidate()?;
+            }
         }
         Ok(ReadCommandFrame {
             identity: self.identity,
@@ -748,15 +867,17 @@ impl EnvelopeScanner {
 async fn read_frame<R>(
     input: &mut R,
     digest: Box<dyn IncrementalCommandDigest>,
+    stop_at_newline: bool,
 ) -> Result<ReadCommandFrame>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut scanner = EnvelopeScanner::new(digest);
-    let mut actual_bytes = 0usize;
-    let mut terminator_bytes = 0usize;
+    let mut line_bytes = 0usize;
     let mut previous_byte = None;
     let mut saw_input = false;
+    let mut readable_identity_at_transport_limit = None;
+    let mut ended_by_newline = false;
 
     loop {
         let available = input.fill_buf().await.context("failed to read command")?;
@@ -768,40 +889,81 @@ where
         }
         saw_input = true;
 
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(available.len(), |position| position + 1);
-        let segment = &available[..consumed];
-        actual_bytes = actual_bytes.saturating_add(segment.len());
-        scanner.feed(&segment[..newline.unwrap_or(segment.len())])?;
-
-        if let Some(position) = newline {
-            let before_newline = if position > 0 {
-                Some(available[position - 1])
-            } else {
-                previous_byte
-            };
-            terminator_bytes = 1 + usize::from(before_newline == Some(b'\r'));
+        let newline = if stop_at_newline {
+            available.iter().position(|byte| *byte == b'\n')
         } else {
-            previous_byte = segment.last().copied();
+            None
+        };
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let content = &available[..newline.unwrap_or(available.len())];
+
+        let mut remaining = content;
+        while !remaining.is_empty() {
+            // Stop exactly one byte past the transport limit so the identity
+            // decision cannot be influenced by later command bytes. A trailing
+            // CR gets this one-byte grace until its following byte disambiguates
+            // CRLF from command content.
+            let until_transport_probe =
+                MAX_FRAME_BYTES.saturating_add(1).saturating_sub(line_bytes);
+            let take = if readable_identity_at_transport_limit.is_none() {
+                remaining.len().min(until_transport_probe)
+            } else {
+                remaining.len()
+            };
+            let (segment, rest) = remaining.split_at(take);
+            // `take == 0` would spin forever. It cannot happen because the
+            // transport probe caps `line_bytes` at exactly MAX_FRAME_BYTES + 1,
+            // after which `readable_identity_at_transport_limit` is always `Some`.
+            debug_assert!(take > 0, "read_frame must always make progress");
+            scanner.feed(segment)?;
+            line_bytes = line_bytes.saturating_add(segment.len());
+            previous_byte = segment.last().copied().or(previous_byte);
+            remaining = rest;
+
+            if readable_identity_at_transport_limit.is_none()
+                && line_bytes == MAX_FRAME_BYTES.saturating_add(1)
+            {
+                readable_identity_at_transport_limit = Some(scanner.has_readable_outer_identity());
+            }
+
+            let minimum_content_bytes = if stop_at_newline {
+                line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')))
+            } else {
+                line_bytes
+            };
+            if minimum_content_bytes > MAX_FRAME_BYTES
+                && readable_identity_at_transport_limit != Some(true)
+            {
+                return Err(CommandTooLarge {
+                    limit: MAX_FRAME_BYTES,
+                    actual: minimum_content_bytes,
+                }
+                .into());
+            }
+            if minimum_content_bytes > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES {
+                return Err(CommandTooLarge {
+                    limit: MAX_FRAME_BYTES,
+                    actual: minimum_content_bytes,
+                }
+                .into());
+            }
         }
         input.consume(consumed);
 
-        if newline.is_some() {
+        if stop_at_newline && newline.is_some() {
+            ended_by_newline = true;
             break;
-        }
-        let minimum_content_bytes =
-            actual_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')));
-        if minimum_content_bytes > MAX_FRAME_BYTES {
-            return Err(CommandTooLarge {
-                limit: MAX_FRAME_BYTES,
-                actual: minimum_content_bytes,
-            }
-            .into());
         }
     }
 
-    let content_bytes = actual_bytes.saturating_sub(terminator_bytes);
-    if content_bytes > MAX_FRAME_BYTES {
+    let content_bytes = if ended_by_newline {
+        line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')))
+    } else {
+        line_bytes
+    };
+    if content_bytes > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES
+        || (content_bytes > MAX_FRAME_BYTES && readable_identity_at_transport_limit != Some(true))
+    {
         return Err(CommandTooLarge {
             limit: MAX_FRAME_BYTES,
             actual: content_bytes,
@@ -811,13 +973,118 @@ where
     scanner.finish()
 }
 
+/// A `GatewayConnector` that yields a single stdio connection and refuses
+/// reconnects. This aligns the local injection harness to the same supervisor
+/// interface without changing the `EOF == process exit` semantics of stdio.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct SingleConnectionConnector<G> {
+    gateway: Option<G>,
+}
+
+pub struct SingleConnectionGateway<G> {
+    gateway: G,
+}
+
+pub struct SingleConnectionReader<R> {
+    reader: R,
+}
+
+#[async_trait]
+impl<R> GatewayReader for SingleConnectionReader<R>
+where
+    R: GatewayReader,
+{
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        match self.reader.next_command().await {
+            Err(error) if error.is::<GatewayClosed>() => Err(TerminalGatewayClosed.into()),
+            other => other,
+        }
+    }
+}
+
+#[async_trait]
+impl<G> Gateway for SingleConnectionGateway<G>
+where
+    G: Gateway,
+{
+    type Reader = SingleConnectionReader<G::Reader>;
+    type Writer = G::Writer;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        self.gateway.authenticate_hello(hello).await
+    }
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.gateway.split();
+        (SingleConnectionReader { reader }, writer)
+    }
+}
+
+impl<G: Gateway> SingleConnectionConnector<G> {
+    pub fn new(gateway: G) -> Self {
+        Self {
+            gateway: Some(gateway),
+        }
+    }
+}
+
+#[async_trait]
+impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
+    type Connection = SingleConnectionGateway<G>;
+
+    async fn connect(
+        &mut self,
+        _credential: GatewayCredential,
+    ) -> Result<Self::Connection, ConnectorError> {
+        self.gateway
+            .take()
+            .map(|gateway| SingleConnectionGateway { gateway })
+            .ok_or_else(|| {
+                ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
+            })
+    }
+}
+
+/// Convenience constructor for the production stdin/stdout single-connection
+/// harness.
+#[allow(dead_code)]
+pub fn stdio_single_connector(
+    digest_factory: Arc<dyn CommandDigestFactory>,
+) -> SingleConnectionConnector<StdioGateway> {
+    SingleConnectionConnector::new(StdioGateway::new(digest_factory))
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader, sink};
 
     use super::*;
-    use crate::gateway::Command;
+    use crate::gateway::{
+        AgentHello, Command, ConnectorError, DeliveryAuthorization, GatewayCredential,
+    };
+    use crate::runtime::contracts::{
+        DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration,
+    };
+
+    const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
+
+    fn test_personality_agent_id() -> PersonalityAgentId {
+        PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical UUIDv7")
+    }
+
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+            .expect("valid direct-chat provenance")
+    }
+
+    fn test_provenance_value() -> serde_json::Value {
+        serde_json::to_value(test_provenance()).expect("serialize test provenance")
+    }
 
     struct TestDigestFactory;
 
@@ -846,13 +1113,97 @@ mod tests {
         read_command(input, &TestDigestFactory).await
     }
 
+    #[tokio::test]
+    async fn writer_converts_frames_through_the_wire_contract() {
+        let mut output = sink();
+        let invalid = OutboundFrame::Event {
+            envelope: super::super::Envelope {
+                seq: Some(1),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                event: serde_json::json!({"type": "error", "message": "volatile"}),
+            },
+        };
+
+        let error = write_frame(&mut output, invalid)
+            .await
+            .expect_err("wire conversion must reject a volatile event with seq");
+        assert!(format!("{error:#}").contains("volatile event"));
+    }
+
+    fn retry_frame_with_error_len(error_message_len: usize) -> OutboundFrame {
+        OutboundFrame::Event {
+            envelope: super::super::Envelope {
+                seq: Some(1),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                event: serde_json::json!({
+                    "type": "retry_scheduled",
+                    "attempt": 1,
+                    "delay_ms": 0,
+                    "retry_at": "1970-01-01T00:00:00+00:00",
+                    "error_message": "x".repeat(error_message_len),
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_oversized_frame_before_writing() {
+        let empty = retry_frame_with_error_len(0);
+        let wire = to_wire_frame(empty).expect("convert empty fixture");
+        let base_len = serde_json::to_vec(&wire)
+            .expect("serialize empty fixture")
+            .len();
+        let oversized = retry_frame_with_error_len(MAX_FRAME_BYTES - base_len + 1);
+        let mut output = Vec::new();
+
+        let error = write_frame(&mut output, oversized)
+            .await
+            .expect_err("oversized frame must be rejected locally");
+
+        assert!(
+            error.is::<OversizedFrameError>(),
+            "oversized rejection must be typed: {error:?}"
+        );
+        assert!(output.is_empty(), "rejected frame must not be written");
+    }
+
     fn frame_with_total_bytes(total_bytes: usize) -> Vec<u8> {
-        let prefix =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":""#;
+        let prefix = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{"type":"user_message","text":""#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
         let suffix = br#"","attachments":[]}}"#;
         assert!(total_bytes >= prefix.len() + suffix.len());
         let mut frame = Vec::with_capacity(total_bytes);
+        frame.extend_from_slice(prefix.as_bytes());
+        frame.resize(total_bytes - suffix.len(), b'x');
+        frame.extend_from_slice(suffix);
+        frame
+    }
+
+    fn frame_with_identity_after_command(total_bytes: usize) -> Vec<u8> {
+        let prefix = br#"{"command":{"type":"user_message","text":""#;
+        let suffix = format!(
+            r#"","attachments":[]}},"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
+        assert!(total_bytes >= prefix.len() + suffix.len());
+        let mut frame = Vec::with_capacity(total_bytes);
         frame.extend_from_slice(prefix);
+        frame.resize(total_bytes - suffix.len(), b'x');
+        frame.extend_from_slice(suffix.as_bytes());
+        frame
+    }
+
+    fn oversized_frame_with_duplicate_seq(total_bytes: usize) -> Vec<u8> {
+        let prefix = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{"type":"user_message","text":""#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+        );
+        let suffix = br#"","attachments":[]},"seq":2}"#;
+        assert!(total_bytes >= prefix.len() + suffix.len());
+        let mut frame = Vec::with_capacity(total_bytes);
+        frame.extend_from_slice(prefix.as_bytes());
         frame.resize(total_bytes - suffix.len(), b'x');
         frame.extend_from_slice(suffix);
         frame
@@ -862,14 +1213,24 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "seq": 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
+            "provenance": test_provenance_value(),
             "command": command,
         }))
         .expect("serialize fixture")
     }
 
     fn raw_envelope(command: &str) -> Vec<u8> {
+        raw_envelope_for(1, "00000000-0000-4000-8000-000000000001", Some(command))
+    }
+
+    fn raw_envelope_for(seq: u64, command_id: &str, command: Option<&str>) -> Vec<u8> {
+        let command = command
+            .map(|command| format!(r#","command":{command}"#))
+            .unwrap_or_default();
         format!(
-            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{command}}}"#
+            r#"{{"seq":{seq},"command_id":"{command_id}","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}{command}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
         )
         .into_bytes()
     }
@@ -884,9 +1245,81 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_outer_identity_keys() {
+        for raw in [
+            r#"{"seq":1,"seq":2,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#,
+            r#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#,
+            r#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"},"command":{"type":"abort"}}"#,
+        ] {
+            let mut input = BufReader::with_capacity(3, raw.as_bytes());
+            assert!(
+                read_test_command(&mut input).await.is_err(),
+                "duplicate outer key must close the epoch: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_provenance_and_legacy_identity_before_command_admission() {
+        let valid = serde_json::json!({
+            "seq": 1,
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
+            "provenance": test_provenance_value(),
+            "command": {"type": "abort"},
+        });
+
+        let mut cases = Vec::new();
+
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("provenance");
+        cases.push(serde_json::to_vec(&missing).unwrap());
+
+        let mut unknown = valid.clone();
+        unknown["provenance"]["unknown"] = serde_json::json!(true);
+        cases.push(serde_json::to_vec(&unknown).unwrap());
+
+        let mut wrong_version = valid.clone();
+        wrong_version["provenance"]["version"] = serde_json::json!(2);
+        cases.push(serde_json::to_vec(&wrong_version).unwrap());
+
+        let mut target_mismatch = valid.clone();
+        target_mismatch["provenance"]["personality_agent_id"] =
+            serde_json::json!("018f3f8d-7b2c-7a10-8f9e-123456789abd");
+        cases.push(serde_json::to_vec(&target_mismatch).unwrap());
+
+        for legacy_field in ["agent_id", "conversation_id"] {
+            let mut legacy = valid.clone();
+            legacy[legacy_field] = serde_json::json!(TEST_PERSONALITY_AGENT_ID);
+            cases.push(serde_json::to_vec(&legacy).unwrap());
+        }
+
+        cases.push(
+            format!(
+                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{{"version":1,"version":1,"tenant_id":"tenant-test","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","actor":{{"kind":"human","principal_id":"human-test"}},"source":{{"surface":"direct_chat"}}}},"command":{{"type":"abort"}}}}"#
+            )
+            .into_bytes(),
+        );
+
+        for bytes in cases {
+            let mut input = BufReader::new(bytes.as_slice());
+            let error = read_test_command(&mut input)
+                .await
+                .expect_err("invalid authenticated envelope must fail before Store admission");
+            assert!(
+                error.is::<InvalidCommand>()
+                    || error.to_string().contains("invalid command provenance"),
+                "unexpected envelope rejection: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -900,6 +1333,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
@@ -928,6 +1363,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::Oversized {
                     actual_bytes: command_bytes.len() as u64,
                 },
@@ -949,8 +1386,13 @@ mod tests {
         let mut frame = Vec::with_capacity(command.len() + 64);
         frame.extend_from_slice(br#"{"command":"#);
         frame.extend_from_slice(&command);
-        frame
-            .extend_from_slice(br#","command_id":"00000000-0000-4000-8000-000000000008","seq":7}"#);
+        frame.extend_from_slice(
+            format!(
+                r#","command_id":"00000000-0000-4000-8000-000000000008","seq":7,"personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{}}}"#,
+                serde_json::to_string(&test_provenance()).expect("serialize test provenance")
+            )
+            .as_bytes(),
+        );
         let mut input = BufReader::with_capacity(13, frame.as_slice());
 
         let inbound = read_test_command(&mut input)
@@ -962,12 +1404,16 @@ mod tests {
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command,
             payload_digest,
+            personality_agent_id,
+            provenance,
         } = inbound
         else {
             panic!("oversized command must be a typed rejection");
         };
         assert_eq!(seq, 7);
         assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000008");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
         assert_eq!(actual_bytes, command.len() as u64);
         assert!(matches!(
             raw_command,
@@ -997,6 +1443,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::AttachmentsNotEmpty,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     serde_json::to_vec(&serde_json::json!({
@@ -1027,6 +1475,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     serde_json::to_vec(&serde_json::json!({
@@ -1059,6 +1509,8 @@ mod tests {
                     seq: 1,
                     command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                         .expect("canonical test UUID"),
+                    personality_agent_id: test_personality_agent_id(),
+                    provenance: test_provenance(),
                     reason: CommandRejectReason::SchemaViolation,
                     raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                         command.as_bytes().to_vec(),
@@ -1098,7 +1550,11 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_command_value_with_readable_identity_is_a_schema_violation() {
-        let bytes = br#"{"seq":7,"command_id":"00000000-0000-4000-8000-000000000009","command":{"type":"abort",}}"#;
+        let bytes = raw_envelope_for(
+            7,
+            "00000000-0000-4000-8000-000000000009",
+            Some(r#"{"type":"abort",}"#),
+        );
         let mut input = BufReader::with_capacity(3, bytes.as_slice());
 
         assert_eq!(
@@ -1109,6 +1565,8 @@ mod tests {
                 seq: 7,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000009")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     br#"{"type":"abort",}"#.to_vec(),
@@ -1130,6 +1588,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::UnknownCommand,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     br#"{"type":"future_command"}"#.to_vec(),
@@ -1138,7 +1598,7 @@ mod tests {
             }
         );
 
-        let missing = br#"{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002"}"#;
+        let missing = raw_envelope_for(2, "00000000-0000-4000-8000-000000000002", None);
         let mut input = BufReader::new(missing.as_slice());
         assert_eq!(
             read_test_command(&mut input)
@@ -1148,6 +1608,8 @@ mod tests {
                 seq: 2,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Missing,
                 payload_digest: None,
@@ -1157,8 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn present_null_is_not_collapsed_into_a_missing_command_field() {
-        let bytes =
-            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":null}"#;
+        let bytes = raw_envelope("null");
         let mut input = BufReader::new(bytes.as_slice());
         assert_eq!(
             read_test_command(&mut input)
@@ -1168,6 +1629,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
                     b"null".to_vec(),
@@ -1197,7 +1660,8 @@ mod tests {
     async fn measures_the_raw_command_bytes_before_json_compaction() {
         let whitespace = " ".repeat(MAX_USER_COMMAND_BYTES);
         let input = format!(
-            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{{{whitespace}"type":"user_message","text":"small","attachments":[]}}}}"#
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{{{whitespace}"type":"user_message","text":"small","attachments":[]}}}}"#,
+            serde_json::to_string(&test_provenance()).expect("serialize test provenance")
         );
         assert!(input.len() < MAX_FRAME_BYTES);
         let mut input = BufReader::new(input.as_bytes());
@@ -1215,18 +1679,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_oversized_command_line() {
+    async fn rejects_a_readable_oversized_command_line_without_poisoning_the_next_command() {
         let mut bytes = frame_with_total_bytes(MAX_FRAME_BYTES + 1);
         bytes.push(b'\n');
-        let mut input = BufReader::new(bytes.as_slice());
-        let error = read_test_command(&mut input)
+        bytes.extend_from_slice(&envelope(serde_json::json!({"type": "abort"})));
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let inbound = read_test_command(&mut input)
             .await
-            .expect_err("oversized input must fail");
+            .expect("readable oversized outer envelope must be terminal-rejected");
+        let InboundCommand::Invalid {
+            seq,
+            command_id,
+            reason,
+            raw_command,
+            payload_digest,
+            personality_agent_id,
+            provenance,
+        } = inbound
+        else {
+            panic!("oversized command line must produce a typed rejection");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000001");
+        assert_eq!(personality_agent_id, test_personality_agent_id());
+        assert_eq!(provenance, test_provenance());
+        let CommandRejectReason::Oversized { actual_bytes } = reason else {
+            panic!("expected Oversized rejection, got {reason:?}");
+        };
+        assert!(actual_bytes > MAX_USER_COMMAND_BYTES as u64);
+        assert!(
+            actual_bytes < (MAX_FRAME_BYTES + 1) as u64,
+            "reported command bytes must be bounded by the frame size"
+        );
+        assert!(matches!(
+            raw_command,
+            RejectedCommandPayload::DiscardedOversized
+        ));
+        assert!(payload_digest.is_some());
+
         assert_eq!(
-            error.downcast_ref::<CommandTooLarge>(),
-            Some(&CommandTooLarge {
-                limit: MAX_FRAME_BYTES,
-                actual: MAX_FRAME_BYTES + 1,
+            read_test_command(&mut input)
+                .await
+                .expect("next command is not poisoned"),
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
+                    .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
+                command: Command::Abort {},
             })
         );
     }
@@ -1237,7 +1740,7 @@ mod tests {
         bytes.extend_from_slice(b"\r\n");
         let mut input = BufReader::with_capacity(MAX_FRAME_BYTES + 1, bytes.as_slice());
 
-        let frame = read_frame(&mut input, TestDigestFactory.start())
+        let frame = read_frame(&mut input, TestDigestFactory.start(), true)
             .await
             .expect("maximum frame with CRLF is valid");
         assert!(frame.command_bytes > MAX_USER_COMMAND_BYTES);
@@ -1246,9 +1749,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_unterminated_oversized_frame_while_the_writer_is_open() {
+    async fn rejects_an_unterminated_identified_frame_beyond_the_drain_ceiling() {
         let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        let oversized = frame_with_total_bytes(MAX_FRAME_BYTES + 1);
+        let oversized = frame_with_total_bytes(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1);
         let writer_task = tokio::spawn(async move {
             writer
                 .write_all(&oversized)
@@ -1263,15 +1766,81 @@ mod tests {
             read_test_command(&mut input),
         )
         .await
-        .expect("oversized frame must not wait for newline or EOF")
+        .expect("drain ceiling must not wait for newline or EOF")
         .expect_err("oversized input must fail");
         writer_task.abort();
         assert_eq!(
             error.downcast_ref::<CommandTooLarge>(),
             Some(&CommandTooLarge {
                 limit: MAX_FRAME_BYTES,
+                actual: MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_oversized_frame_is_fail_closed() {
+        let mut bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("unreadable oversized frame must close fail-closed");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
                 actual: MAX_FRAME_BYTES + 1,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_after_the_transport_threshold_is_fail_closed() {
+        let mut bytes = frame_with_identity_after_command(MAX_FRAME_BYTES + 1024);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("identity unavailable at the transport threshold must close");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
+                actual: MAX_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn identified_oversized_frame_cannot_drain_without_bound() {
+        let mut bytes = frame_with_total_bytes(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(4 * 1024, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("identified oversized frame must obey the drain ceiling");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
+                actual: MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_duplicate_identity_cannot_mix_an_early_identity_with_later_body() {
+        let mut bytes = oversized_frame_with_duplicate_seq(MAX_FRAME_BYTES + 1024);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        assert!(
+            read_test_command(&mut input).await.is_err(),
+            "a duplicate discovered while draining must not become a typed rejection"
         );
     }
 
@@ -1304,8 +1873,67 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
                 command: Command::Abort {},
             })
         );
+    }
+
+    #[test]
+    fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
+        let hello = AgentHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 42,
+            last_received_command_seq: 10,
+            last_applied_command_seq: 9,
+        };
+        let api = stdio_hello(&hello).expect("non-maximum cursor advances");
+        assert_eq!(
+            api.accepted_generation,
+            ProcessGeneration::from_wire(7).unwrap()
+        );
+        assert_eq!(api.last_received_event_seq, 42);
+        assert_eq!(api.next_command_seq, 10);
+    }
+
+    #[test]
+    fn stdio_hello_fails_closed_when_the_applied_cursor_cannot_advance() {
+        let hello = AgentHello {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 42,
+            last_received_command_seq: u64::MAX,
+            last_applied_command_seq: u64::MAX,
+        };
+
+        let error = stdio_hello(&hello).expect_err("u64::MAX must not replay an applied command");
+        assert!(
+            matches!(error, HelloError::Fatal(_)),
+            "cursor overflow must fail the hello exchange: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_connection_connector_returns_fatal_after_consumed() {
+        let gateway = InjectedStdioGateway::new(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::new(TestDigestFactory),
+        );
+        let mut connector = SingleConnectionConnector::new(gateway);
+
+        let credential = GatewayCredential::new(
+            "test-token",
+            test_personality_agent_id(),
+            ProcessGeneration::from_wire(7).unwrap(),
+            DeliveryAuthorization::Raw,
+        );
+        assert!(connector.connect(credential.clone()).await.is_ok());
+
+        let result = connector.connect(credential).await;
+        let err = result.err().expect("second connect must fail");
+        assert!(matches!(err, ConnectorError::Fatal(_)));
     }
 }

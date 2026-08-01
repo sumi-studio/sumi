@@ -1,0 +1,13 @@
+DROP TRIGGER IF EXISTS credential_security_events_append_only ON credential_security_events;
+DROP FUNCTION IF EXISTS prevent_security_event_mutation();
+DROP TABLE IF EXISTS credential_security_events;
+DROP TABLE IF EXISTS provider_operations;
+DROP INDEX IF EXISTS auth_flows_expiry;
+DROP TABLE IF EXISTS auth_flows;
+DROP TRIGGER IF EXISTS credential_no_delete ON credentials;
+DROP FUNCTION IF EXISTS prevent_credential_delete();
+DROP TRIGGER IF EXISTS credential_history_immutable ON credentials;
+DROP FUNCTION IF EXISTS protect_credential_history();
+ALTER TABLE credentials DROP CONSTRAINT IF EXISTS credentials_unlink_state;
+ALTER TABLE credentials DROP COLUMN IF EXISTS unlinked_at;
+ALTER TABLE credentials DROP COLUMN IF EXISTS active;

@@ -1,0 +1,951 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://sumi.dev/contracts/agent-events.yaml
+
+$comment: |
+  T18 wire preparation contract for Sumi agent events, inbound commands, command
+  acknowledgements, and outbound frames. This file is the public wire contract;
+  Rust internal serde types are not authoritative.
+
+  User message IDs are derived deterministically from the canonical lower-case
+  hyphenated command_id UUID by UUIDv5 over the command_id UUID bytes, using the
+  namespace 78f62d15-b945-4a4f-9d84-d73c7f932b51. API and web consumers can
+  compute the same message_id at command admission time.
+
+  The MemoryMaintenance.kind vocabulary and the full provider-context payload
+  vocabulary are unresolved T17 dependencies. This draft keeps those
+  representations narrow (plain string for kind, opaque values for provider
+  context) so they can be updated once T17 lands without a compatibility break.
+
+$defs:
+  DurableEnvelope:
+    type: object
+    required: [personality_agent_id, event, seq]
+    additionalProperties: false
+    properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      event: { $ref: '#/$defs/DurableAgentEvent' }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+
+  VolatileEnvelope:
+    type: object
+    required: [personality_agent_id, event]
+    additionalProperties: false
+    properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      event: { $ref: '#/$defs/VolatileAgentEvent' }
+
+  Envelope:
+    oneOf:
+      - { $ref: '#/$defs/DurableEnvelope' }
+      - { $ref: '#/$defs/VolatileEnvelope' }
+
+  AgentStartEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: agent_start }
+
+  AgentEndEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: agent_end }
+
+  TurnStartEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: turn_start }
+
+  TurnEndEvent:
+    type: object
+    required: [type, message, tool_results]
+    additionalProperties: false
+    properties:
+      type: { const: turn_end }
+      message:
+        oneOf:
+          - type: 'null'
+          - { $ref: '#/$defs/PublicMessage' }
+      tool_results:
+        type: array
+        items: { $ref: '#/$defs/ToolResultPayload' }
+
+  MessageStartEvent:
+    type: object
+    required: [type, message_id, message]
+    additionalProperties: false
+    properties:
+      type: { const: message_start }
+      message_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        description: durable messages.id; user messages are UUIDv5(command_id, namespace)
+      message: { $ref: '#/$defs/PublicMessage' }
+
+  MessageUpdateEvent:
+    type: object
+    required: [type, message_id, event]
+    additionalProperties: false
+    properties:
+      type: { const: message_update }
+      message_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      event: { $ref: '#/$defs/PublicStreamEvent' }
+
+  MessageEndEvent:
+    type: object
+    required: [type, message_id, message]
+    additionalProperties: false
+    properties:
+      type: { const: message_end }
+      message_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        description: durable messages.id; user messages are UUIDv5(command_id, namespace)
+      message: { $ref: '#/$defs/PublicMessage' }
+
+  ToolExecutionStartEvent:
+    type: object
+    required: [type, tool_call_id, tool_name, args]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_start }
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      args: { $ref: '#/$defs/AnyJSONObject' }
+
+  ToolExecutionUpdateEvent:
+    type: object
+    required: [type, tool_call_id, partial]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_update }
+      tool_call_id: { type: string }
+      partial: { $ref: '#/$defs/AnyJSON' }
+
+  ToolExecutionEndEvent:
+    type: object
+    required: [type, tool_call_id, result, is_error]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_end }
+      tool_call_id: { type: string }
+      result: { $ref: '#/$defs/AnyJSON' }
+      is_error: { type: boolean }
+
+  ApprovalRequestedEvent:
+    type: object
+    required: [type, request]
+    additionalProperties: false
+    properties:
+      type: { const: approval_requested }
+      request: { $ref: '#/$defs/ApprovalRequest' }
+
+  ApprovalResolvedEvent:
+    type: object
+    required: [type, request_id, resolution]
+    additionalProperties: false
+    properties:
+      type: { const: approval_resolved }
+      request_id: { type: string }
+      resolution: { $ref: '#/$defs/ApprovalResolution' }
+
+  SteeredEvent:
+    type: object
+    required: [type, mode]
+    additionalProperties: false
+    properties:
+      type: { const: steered }
+      mode: { $ref: '#/$defs/SteerMode' }
+
+  MemoryMaintenanceEvent:
+    type: object
+    required: [type, kind]
+    additionalProperties: false
+    properties:
+      type: { const: memory_maintenance }
+      kind:
+        type: string
+        description: unresolved T17 vocabulary; consumers must not assume a closed enum
+
+  RetryScheduledEvent:
+    type: object
+    required: [type, attempt, delay_ms, retry_at, error_message]
+    additionalProperties: false
+    properties:
+      type: { const: retry_scheduled }
+      attempt: { $ref: '#/$defs/JsonSafeInteger' }
+      delay_ms: { $ref: '#/$defs/JsonSafeInteger' }
+      retry_at: { type: string, format: date-time }
+      error_message: { type: string }
+
+  CommandDispositionEvent:
+    oneOf:
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: applied }
+      - type: object
+        required: [type, command_id, command_seq, status]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: superseded }
+      - type: object
+        required: [type, command_id, command_seq, status, reject_reason]
+        additionalProperties: false
+        properties:
+          type: { const: command_disposition }
+          command_id:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+          status: { const: rejected }
+          reject_reason: { $ref: '#/$defs/CommandRejectReason' }
+
+  ErrorEvent:
+    type: object
+    required: [type, message]
+    additionalProperties: false
+    properties:
+      type: { const: error }
+      message: { type: string }
+
+  AgentEvent:
+    oneOf:
+      - { $ref: '#/$defs/AgentStartEvent' }
+      - { $ref: '#/$defs/AgentEndEvent' }
+      - { $ref: '#/$defs/TurnStartEvent' }
+      - { $ref: '#/$defs/TurnEndEvent' }
+      - { $ref: '#/$defs/MessageStartEvent' }
+      - { $ref: '#/$defs/MessageUpdateEvent' }
+      - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ToolExecutionStartEvent' }
+      - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
+      - { $ref: '#/$defs/ToolExecutionEndEvent' }
+      - { $ref: '#/$defs/ApprovalRequestedEvent' }
+      - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/SteeredEvent' }
+      - { $ref: '#/$defs/MemoryMaintenanceEvent' }
+      - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
+      - { $ref: '#/$defs/ErrorEvent' }
+
+  DurableAgentEvent:
+    oneOf:
+      - { $ref: '#/$defs/AgentStartEvent' }
+      - { $ref: '#/$defs/AgentEndEvent' }
+      - { $ref: '#/$defs/TurnStartEvent' }
+      - { $ref: '#/$defs/TurnEndEvent' }
+      - { $ref: '#/$defs/MessageStartEvent' }
+      - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ToolExecutionStartEvent' }
+      - { $ref: '#/$defs/ToolExecutionEndEvent' }
+      - { $ref: '#/$defs/ApprovalRequestedEvent' }
+      - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/SteeredEvent' }
+      - { $ref: '#/$defs/MemoryMaintenanceEvent' }
+      - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/CommandDispositionEvent' }
+
+  VolatileAgentEvent:
+    oneOf:
+      - { $ref: '#/$defs/MessageUpdateEvent' }
+      - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
+      - { $ref: '#/$defs/ErrorEvent' }
+
+  PublicStreamEvent:
+    oneOf:
+      - type: object
+        required: [type, content_index]
+        additionalProperties: false
+        properties:
+          type: { const: text_start }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+      - type: object
+        required: [type, content_index, delta]
+        additionalProperties: false
+        properties:
+          type: { const: text_delta }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          delta: { type: string }
+      - type: object
+        required: [type, content_index, content]
+        additionalProperties: false
+        properties:
+          type: { const: text_end }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          content: { type: string }
+      - type: object
+        required: [type, content_index]
+        additionalProperties: false
+        properties:
+          type: { const: thinking_start }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+      - type: object
+        required: [type, content_index, delta]
+        additionalProperties: false
+        properties:
+          type: { const: thinking_delta }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          delta: { type: string }
+      - type: object
+        required: [type, content_index, content]
+        additionalProperties: false
+        properties:
+          type: { const: thinking_end }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          content: { type: string }
+      - type: object
+        required: [type, content_index]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call_start }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+      - type: object
+        required: [type, content_index, delta]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call_delta }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          delta: { type: string }
+      - type: object
+        required: [type, content_index, preview]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call_preview }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          preview: { $ref: '#/$defs/AnyJSON' }
+      - type: object
+        required: [type, content_index, tool_call]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call_end }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          tool_call: { $ref: '#/$defs/ToolCall' }
+      - type: object
+        required: [type, content_index, rejected]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call_rejected }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          rejected: { $ref: '#/$defs/RejectedToolCall' }
+      - type: object
+        required: [type, content_index]
+        additionalProperties: false
+        properties:
+          type: { const: reasoning_summary_start }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+      - type: object
+        required: [type, content_index, delta]
+        additionalProperties: false
+        properties:
+          type: { const: reasoning_summary_delta }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          delta: { type: string }
+      - type: object
+        required: [type, content_index, content]
+        additionalProperties: false
+        properties:
+          type: { const: reasoning_summary_end }
+          content_index: { $ref: '#/$defs/ContentIndex' }
+          content: { type: string }
+
+  PublicMessage:
+    oneOf:
+      - $ref: '#/$defs/UserMessage'
+      - $ref: '#/$defs/PublicAssistantMessage'
+      - $ref: '#/$defs/ToolResultMessage'
+
+  UserMessage:
+    type: object
+    required: [role, content, timestamp]
+    additionalProperties: false
+    properties:
+      role: { const: user }
+      content:
+        type: array
+        items: { $ref: '#/$defs/UserContent' }
+      timestamp: { type: string, format: date-time }
+
+  PublicAssistantMessage:
+    type: object
+    required: [role, content, model, provider, origin, usage, stop_reason, error_message, provider_code, interrupted, timestamp]
+    additionalProperties: false
+    properties:
+      role: { const: assistant }
+      content:
+        type: array
+        items: { $ref: '#/$defs/PublicAssistantContent' }
+      model: { type: string }
+      provider: { type: string }
+      origin: { $ref: '#/$defs/ProviderOrigin' }
+      usage: { $ref: '#/$defs/Usage' }
+      stop_reason: { $ref: '#/$defs/StopReason' }
+      error_message:
+        oneOf:
+          - type: string
+          - type: 'null'
+      provider_code:
+        oneOf:
+          - type: string
+          - type: 'null'
+      interrupted: { type: boolean }
+      timestamp: { type: string, format: date-time }
+
+  ToolResultMessage:
+    type: object
+    required: [role, tool_call_id, tool_name, content, details, is_error, timestamp]
+    additionalProperties: false
+    properties:
+      role: { const: tool_result }
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      content:
+        type: array
+        items: { $ref: '#/$defs/UserContent' }
+      details: { $ref: '#/$defs/AnyJSON' }
+      is_error: { type: boolean }
+      timestamp: { type: string, format: date-time }
+
+  ToolResultPayload:
+    type: object
+    description: tool result nested in TurnEnd; the enclosing event supplies its type
+    required: [tool_call_id, tool_name, content, details, is_error, timestamp]
+    additionalProperties: false
+    properties:
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      content:
+        type: array
+        items: { $ref: '#/$defs/UserContent' }
+      details: { $ref: '#/$defs/AnyJSON' }
+      is_error: { type: boolean }
+      timestamp: { type: string, format: date-time }
+
+  UserContent:
+    oneOf:
+      - type: object
+        required: [type, text]
+        additionalProperties: false
+        properties:
+          type: { const: text }
+          text: { type: string }
+      - type: object
+        required: [type, data, mime_type]
+        additionalProperties: false
+        properties:
+          type: { const: image }
+          data: { type: string }
+          mime_type: { type: string }
+
+  PublicAssistantContent:
+    oneOf:
+      - type: object
+        required: [type, text, wire_item_index]
+        additionalProperties: false
+        properties:
+          type: { const: text }
+          text: { type: string }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+      - type: object
+        required: [type, thinking, signature_field, wire_item_index]
+        additionalProperties: false
+        properties:
+          type: { const: thinking }
+          thinking: { type: string }
+          signature_field: { type: string }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+      - type: object
+        required: [type, tool_call, wire_item_index]
+        additionalProperties: false
+        properties:
+          type: { const: tool_call }
+          tool_call: { $ref: '#/$defs/ToolCall' }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+      - type: object
+        required: [type, rejected, wire_item_index]
+        additionalProperties: false
+        properties:
+          type: { const: rejected_tool_call }
+          rejected: { $ref: '#/$defs/RejectedToolCall' }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+
+  ToolCall:
+    type: object
+    required: [id, name, arguments]
+    additionalProperties: false
+    properties:
+      id: { type: string }
+      name: { type: string }
+      arguments:
+        type: object
+        description: JSON object validated against the tool schema at execution time
+        additionalProperties: { $ref: '#/$defs/AnyJSON' }
+
+  RejectedToolCall:
+    type: object
+    required: [id, name, error]
+    additionalProperties: false
+    properties:
+      id: { type: string }
+      name: { type: string }
+      error: { $ref: '#/$defs/ToolArgumentError' }
+
+  ToolArgumentError:
+    type: string
+    enum: [invalid_json, non_object, schema_violation, incomplete_response, too_large]
+
+  ContentIndex:
+    type: integer
+    minimum: 0
+    maximum: 9007199254740991
+    description: non-negative index representable exactly by JavaScript number clients
+
+  JsonSafeInteger:
+    type: integer
+    minimum: 0
+    maximum: 9007199254740991
+    description: non-negative integer representable exactly by JavaScript number clients
+
+  AnyJSON:
+    oneOf:
+      - type: object
+        additionalProperties: { $ref: '#/$defs/AnyJSON' }
+      - type: array
+        items: { $ref: '#/$defs/AnyJSON' }
+      - type: string
+      - type: integer
+        minimum: -9007199254740991
+        maximum: 9007199254740991
+      - type: number
+        not: { type: integer }
+        minimum: -9007199254740991
+        maximum: 9007199254740991
+      - type: boolean
+      - type: 'null'
+    description: any JSON value
+
+  AnyJSONObject:
+    type: object
+    additionalProperties: { $ref: '#/$defs/AnyJSON' }
+    description: any JSON object whose property values are JSON-safe AnyJSON values
+
+  ProviderOrigin:
+    type: object
+    required: [provider_instance_id, protocol, model]
+    additionalProperties: false
+    properties:
+      provider_instance_id: { type: string }
+      protocol: { $ref: '#/$defs/ApiProtocol' }
+      model: { type: string }
+
+  ApiProtocol:
+    type: string
+    enum: [open_ai_chat_completions, open_ai_responses, anthropic_messages]
+
+  Usage:
+    type: object
+    required: [input, output, cache_read, cache_write, reasoning, total_tokens]
+    additionalProperties: false
+    properties:
+      input: { $ref: '#/$defs/JsonSafeInteger' }
+      output: { $ref: '#/$defs/JsonSafeInteger' }
+      cache_read: { $ref: '#/$defs/JsonSafeInteger' }
+      cache_write: { $ref: '#/$defs/JsonSafeInteger' }
+      reasoning: { $ref: '#/$defs/JsonSafeInteger' }
+      total_tokens: { $ref: '#/$defs/JsonSafeInteger' }
+
+  StopReason:
+    type: string
+    enum: [stop, length, tool_use, error, aborted]
+
+  ApprovalRequest:
+    type: object
+    required: [id, tool_call_id, tool_name, action, args_summary]
+    additionalProperties: false
+    properties:
+      id: { type: string }
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      action: { $ref: '#/$defs/ReviewProjection' }
+      args_summary: { $ref: '#/$defs/AnyJSON' }
+      reason:
+        oneOf:
+          - type: string
+          - type: 'null'
+      audit:
+        oneOf:
+          - { $ref: '#/$defs/AuditDecision' }
+          - type: 'null'
+
+  ReviewProjection:
+    oneOf:
+      - type: object
+        required: [reviewable]
+        additionalProperties: false
+        properties:
+          reviewable: { $ref: '#/$defs/AnyJSON' }
+      - type: object
+        required: [insufficient_evidence]
+        additionalProperties: false
+        properties:
+          insufficient_evidence:
+            type: object
+            required: [reason]
+            additionalProperties: false
+            properties:
+              reason: { type: string }
+
+  AuditDecision:
+    type: object
+    required: [outcome, risk, authorization, rationale]
+    additionalProperties: false
+    properties:
+      outcome: { $ref: '#/$defs/AuditOutcome' }
+      risk: { $ref: '#/$defs/RiskLevel' }
+      authorization: { $ref: '#/$defs/UserAuthorization' }
+      rationale: { type: string }
+
+  AuditOutcome:
+    type: string
+    enum: [allow, deny]
+
+  RiskLevel:
+    type: string
+    enum: [low, medium, high, critical]
+
+  UserAuthorization:
+    type: string
+    enum: [unknown, low, medium, high]
+
+  ApprovalResolution:
+    oneOf:
+      - type: string
+        const: cancelled
+      - type: object
+        required: [decision]
+        additionalProperties: false
+        properties:
+          decision: { $ref: '#/$defs/ApprovalDecision' }
+
+  ApprovalDecision:
+    oneOf:
+      - type: object
+        required: [type]
+        additionalProperties: false
+        properties:
+          type: { const: approve_once }
+      - type: object
+        required: [type, rule]
+        additionalProperties: false
+        properties:
+          type: { const: approve_always }
+          rule: { $ref: '#/$defs/DeferredApprovalRule' }
+      - type: object
+        required: [type]
+        additionalProperties: false
+        properties:
+          type: { const: deny }
+
+  DeferredApprovalRule:
+    type: object
+    description: object boundary preserved for T22/T23; properties are intentionally open
+    additionalProperties: { $ref: '#/$defs/AnyJSON' }
+
+  SteerMode:
+    type: string
+    enum: [hard, soft]
+
+  Command:
+    oneOf:
+      - type: object
+        required: [type, text, attachments]
+        additionalProperties: false
+        properties:
+          type: { const: user_message }
+          text: { type: string }
+          attachments:
+            type: array
+            maxItems: 0
+            description: reserved for v1; must be an empty array
+            items: { $ref: '#/$defs/Attachment' }
+      - type: object
+        required: [type]
+        additionalProperties: false
+        properties:
+          type: { const: abort }
+      - type: object
+        required: [type, request_id, decision]
+        additionalProperties: false
+        properties:
+          type: { const: approval_decision }
+          request_id: { type: string }
+          decision: { $ref: '#/$defs/ApprovalDecision' }
+
+  PersonalityAgentId:
+    type: string
+    pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    description: exact lower-case hyphenated UUIDv7 personality-agent identity
+
+  TenantId:
+    type: string
+    minLength: 1
+    maxLength: 256
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
+    description: opaque ASCII tenant identity
+
+  PrincipalId:
+    type: string
+    minLength: 1
+    maxLength: 256
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
+    description: opaque ASCII principal identity
+
+  DirectChatProvenanceV1:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 1 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { const: human }
+          principal_id: { $ref: '#/$defs/PrincipalId' }
+      source:
+        type: object
+        required: [surface]
+        additionalProperties: false
+        properties:
+          surface: { const: direct_chat }
+
+  CommandEnvelope:
+    type: object
+    required: [seq, command_id, personality_agent_id, provenance, command]
+    additionalProperties: false
+    properties:
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      command_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        description: canonical lower-case hyphenated UUID
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
+      command: { $ref: '#/$defs/Command' }
+    $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
+
+  CommandRejectReason:
+    type: string
+    enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+
+  CommandAck:
+    type: object
+    required: [seq, command_id, personality_agent_id, status]
+    additionalProperties: false
+    properties:
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      command_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      status:
+        type: string
+        enum: [received, applied, superseded, rejected]
+      reject_reason:
+        $ref: '#/$defs/CommandRejectReason'
+    if:
+      properties:
+        status: { const: rejected }
+    then:
+      required: [reject_reason]
+    else:
+      properties:
+        reject_reason: false
+
+  OutboundFrame:
+    oneOf:
+      - type: object
+        required: [frame_type, envelope]
+        additionalProperties: false
+        properties:
+          frame_type: { const: event }
+          envelope: { $ref: '#/$defs/Envelope' }
+      - type: object
+        required: [frame_type, ack]
+        additionalProperties: false
+        properties:
+          frame_type: { const: command_ack }
+          ack: { $ref: '#/$defs/CommandAck' }
+
+  BrowserHello:
+    type: object
+    required: [type, last_event_seq]
+    additionalProperties: false
+    properties:
+      type: { const: hello }
+      last_event_seq: { $ref: '#/$defs/JsonSafeInteger' }
+
+  BrowserCommandFrame:
+    type: object
+    required: [type, idempotency_key, command]
+    additionalProperties: false
+    properties:
+      type: { const: command }
+      idempotency_key:
+        type: string
+        minLength: 1
+        maxLength: 1024
+      command: { $ref: '#/$defs/Command' }
+
+  BrowserClientFrame:
+    oneOf:
+      - { $ref: '#/$defs/BrowserHello' }
+      - { $ref: '#/$defs/BrowserCommandFrame' }
+
+  BrowserEventEnvelope:
+    oneOf:
+      - type: object
+        required: [seq, event]
+        additionalProperties: false
+        properties:
+          seq: { $ref: '#/$defs/JsonSafeInteger' }
+          event: { $ref: '#/$defs/DurableAgentEvent' }
+      - type: object
+        required: [event]
+        additionalProperties: false
+        properties:
+          event: { $ref: '#/$defs/VolatileAgentEvent' }
+
+  BrowserEventFrame:
+    type: object
+    required: [type, envelope]
+    additionalProperties: false
+    properties:
+      type: { const: event }
+      envelope: { $ref: '#/$defs/BrowserEventEnvelope' }
+
+  BrowserCommandAcceptedFrame:
+    type: object
+    required: [type, idempotency_key, command_id, seq]
+    additionalProperties: false
+    properties:
+      type: { const: command_accepted }
+      idempotency_key:
+        type: string
+        minLength: 1
+        maxLength: 1024
+      command_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      disposition:
+        description: >
+          Exact durable terminal disposition for this command when already
+          committed at idempotent acceptance time. Its command_id and
+          command_seq must equal this receipt's command_id and seq.
+        $ref: '#/$defs/CommandDispositionEvent'
+
+  BrowserCommandRejectedFrame:
+    type: object
+    required: [type, idempotency_key, reject_reason]
+    additionalProperties: false
+    properties:
+      type: { const: command_rejected }
+      idempotency_key:
+        type: string
+        minLength: 1
+        maxLength: 1024
+      reject_reason:
+        type: string
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable]
+
+  DirectChatStatusFrame:
+    type: object
+    required: [type, status]
+    additionalProperties: false
+    properties:
+      type: { const: direct_chat_status }
+      status:
+        type: string
+        enum: [ready, unavailable]
+
+  BrowserServerFrame:
+    oneOf:
+      - { $ref: '#/$defs/BrowserEventFrame' }
+      - { $ref: '#/$defs/BrowserCommandAcceptedFrame' }
+      - { $ref: '#/$defs/BrowserCommandRejectedFrame' }
+      - { $ref: '#/$defs/DirectChatStatusFrame' }
+
+  Attachment:
+    type: object
+    description: placeholder for v1; no attachments are accepted yet
+    additionalProperties: true
+
+  ProcessGeneration:
+    type: string
+    pattern: '^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7])$'
+    format: canonical-process-generation
+    description: canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
+
+  CanonicalDecimalU64:
+    type: string
+    pattern: '^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$'
+    format: canonical-decimal-u64
+    description: canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+
+  AgentHello:
+    type: object
+    required: [personality_agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
+    additionalProperties: false
+    properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      generation:
+        $ref: '#/$defs/ProcessGeneration'
+      last_sent_event_seq:
+        $ref: '#/$defs/CanonicalDecimalU64'
+      last_received_command_seq:
+        $ref: '#/$defs/CanonicalDecimalU64'
+      last_applied_command_seq:
+        $ref: '#/$defs/CanonicalDecimalU64'
+
+  ApiHello:
+    type: object
+    required: [personality_agent_id, accepted_generation, last_received_event_seq, next_command_seq]
+    additionalProperties: false
+    properties:
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      accepted_generation:
+        $ref: '#/$defs/ProcessGeneration'
+      last_received_event_seq:
+        $ref: '#/$defs/CanonicalDecimalU64'
+      next_command_seq:
+        $ref: '#/$defs/CanonicalDecimalU64'

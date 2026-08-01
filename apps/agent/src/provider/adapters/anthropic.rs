@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
@@ -14,11 +13,10 @@ use crate::provider::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent, UserMessage,
+        Usage, UserContent, UserMessage, VerifiedReplayProvenance,
     },
 };
 
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REDACTED_PLACEHOLDER: &str = "[Reasoning redacted]";
 
 #[derive(Debug, Error)]
@@ -121,13 +119,8 @@ pub fn build_request(
         ));
     }
     request.insert("messages".into(), Value::Array(messages));
-    let has_request_coverage = match request_coverage(spec, context, options.native_compaction) {
-        Ok(coverage) => coverage.is_some(),
-        Err(error) => {
-            tracing::warn!(reason = %error, "omitted unanchored Anthropic native compaction request");
-            false
-        }
-    };
+    let has_request_coverage =
+        request_coverage(spec, context, options.native_compaction)?.is_some();
     if has_request_coverage {
         request.insert(
             "context_management".into(),
@@ -170,25 +163,28 @@ pub(in crate::provider) fn build_replay_probe_request(
     build_replay_probe_request_with_usage(fragment, Usage::default())
 }
 
-fn build_replay_probe_request_with_usage(
+fn build_replay_probe_prompt(
+    spec: &ModelSpec,
     fragment: Option<&Value>,
     usage: Usage,
-) -> Result<Value, AnthropicAdapterError> {
-    let spec =
-        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+) -> Result<PromptContext, AnthropicAdapterError> {
+    ensure_anthropic_spec(spec)?;
     let anchor = ProviderContextAnchor {
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 2,
     };
+    let origin = spec.origin();
     let mut content = vec![AssistantContent::Thinking {
         thinking: "replay-probe-v1-sentinel".into(),
         signature_field: "thinking.signature".into(),
         wire_item_index: 0,
     }];
     let mut provider_context = vec![ProviderContextItem {
+        retention_owner: anchor.clone(),
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::AnthropicMessages,
             item: json!({
@@ -209,16 +205,18 @@ fn build_replay_probe_request_with_usage(
             wire_item_index: 1,
         });
         provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: fragment.clone(),
             },
         });
     }
-    let context = PromptContext {
+    Ok(PromptContext {
         system_prompt: "replay-probe-v1".into(),
         memory_blocks: Vec::new(),
         messages: vec![
@@ -239,7 +237,7 @@ fn build_replay_probe_request_with_usage(
                     content,
                     model: spec.id.clone(),
                     provider: spec.provider.clone(),
-                    origin: spec.origin(),
+                    origin: origin.clone(),
                     usage,
                     stop_reason: StopReason::Stop,
                     error_message: None,
@@ -261,7 +259,17 @@ fn build_replay_probe_request_with_usage(
         ],
         provider_context,
         tools: Vec::new(),
-    };
+        replay_provenance: None,
+    })
+}
+
+fn build_replay_probe_request_with_usage(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, AnthropicAdapterError> {
+    let spec =
+        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+    let context = build_replay_probe_prompt(&spec, fragment, usage)?;
     build_request(&spec, &context, &RequestOptions::default())
 }
 
@@ -372,6 +380,15 @@ fn convert_messages(
     native_compaction: bool,
 ) -> Result<Vec<Value>, AnthropicAdapterError> {
     let compat = ensure_anthropic_spec(spec)?;
+    crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
+        .map_err(AnthropicAdapterError::InvalidContext)?;
+    let replay_provenance = context
+        .verified_replay_provenance_for(&spec.origin())
+        .map_err(AnthropicAdapterError::InvalidContext)?;
+    if replay_provenance.is_none() {
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(AnthropicAdapterError::InvalidContext)?;
+    }
     let mut messages = Vec::<Value>::new();
     for memory in &context.memory_blocks {
         let layer = match memory.layer {
@@ -394,24 +411,45 @@ fn convert_messages(
             ProviderContextPayload::OpenAiCompactedWindow { .. }
         )
     });
-    let mut native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
-        context
-            .provider_context
-            .iter()
-            .filter_map(|item| match &item.payload {
-                ProviderContextPayload::AnthropicCompaction { block, coverage } => {
-                    Some((item, block, coverage))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
+    let native_enabled = native_compaction && compat.supports_native_compact && !has_foreign_native;
+    let native_candidates = context
+        .provider_context
+        .iter()
+        .filter_map(|item| match &item.payload {
+            ProviderContextPayload::AnthropicCompaction { block, coverage } => {
+                Some((item, block, coverage))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let native = match &replay_provenance {
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            provider_origin,
+            native_coverage_through_seq,
+            ..
+        }) => {
+            if !native_enabled {
+                return Err(AnthropicAdapterError::InvalidContext(
+                    "bound native Anthropic replay cannot be discarded".into(),
+                ));
+            }
+            validate_native_replay(
+                spec,
+                context,
+                &native_candidates,
+                provider_origin,
+                *native_coverage_through_seq,
+            )?;
+            native_candidates
+        }
+        Some(VerifiedReplayProvenance::SumiNormalized { .. }) => Vec::new(),
+        None if native_candidates.is_empty() && !has_foreign_native => Vec::new(),
+        None => {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "unbound prompt cannot replay or discard native provider context".into(),
+            ));
+        }
     };
-    if let Err(error) = validate_native_replay(spec, context, &native) {
-        tracing::warn!(reason = %error, "discarded stale Anthropic native context");
-        native.clear();
-    }
     let (coverage_seq, mut native_block) = if let Some((_, block, coverage)) = native.first() {
         if !context.memory_blocks.is_empty() {
             return Err(AnthropicAdapterError::InvalidContext(
@@ -428,6 +466,14 @@ fn convert_messages(
     } else {
         (None, None)
     };
+
+    if matches!(
+        replay_provenance,
+        Some(VerifiedReplayProvenance::ProviderNativeExact { .. })
+    ) && let Some(block) = native_block.take()
+    {
+        push_turn(&mut messages, "assistant", vec![block]);
+    }
 
     let mut opaque_by_anchor = BTreeMap::<(String, u64), Vec<&ProviderContextItem>>::new();
     for item in &context.provider_context {
@@ -475,15 +521,7 @@ fn convert_messages(
                     message,
                 )
             }
-            ContextMessage::Synthetic { message } => {
-                if coverage_seq.is_some() && persisted_started {
-                    return Err(AnthropicAdapterError::InvalidContext(
-                        "native compaction suffix requires persisted message sequence numbers"
-                            .into(),
-                    ));
-                }
-                (None, message)
-            }
+            ContextMessage::Synthetic { message } => (None, message),
         };
         match message {
             Message::User(user) => {
@@ -711,9 +749,13 @@ fn validate_native_replay(
     spec: &ModelSpec,
     context: &PromptContext,
     native: &[(&ProviderContextItem, &Value, &NativeCompactionCoverage)],
+    bound_origin: &crate::provider::types::ProviderOrigin,
+    bound_coverage: u64,
 ) -> Result<(), AnthropicAdapterError> {
     let Some((item, block, coverage)) = native.first().copied() else {
-        return Ok(());
+        return Err(AnthropicAdapterError::InvalidContext(
+            "bound native Anthropic replay is missing its compaction block".into(),
+        ));
     };
     if native.len() != 1 {
         return Err(AnthropicAdapterError::InvalidContext(
@@ -723,6 +765,14 @@ fn validate_native_replay(
     if item.origin_message.is_some() || item.wire_item_index.is_some() {
         return Err(AnthropicAdapterError::InvalidContext(
             "Anthropic native compaction has reasoning placement metadata".into(),
+        ));
+    }
+    if item.provider_origin != spec.origin()
+        || item.provider_origin != *bound_origin
+        || coverage.through_message_seq != bound_coverage
+    {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "Anthropic compaction block does not match its assembler replay binding".into(),
         ));
     }
     if coverage.through_message_seq == 0 {
@@ -739,61 +789,6 @@ fn validate_native_replay(
     if coverage.context_fingerprint != context_fingerprint(spec, context)? {
         return Err(AnthropicAdapterError::InvalidContext(
             "native compaction context fingerprint mismatch".into(),
-        ));
-    }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)
-}
-
-fn validate_native_suffix(
-    messages: &[ContextMessage],
-    coverage: u64,
-) -> Result<(), AnthropicAdapterError> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction suffix contains synthetic content after persisted history"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            ));
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq
-                    != coverage.checked_add(1).ok_or_else(|| {
-                        AnthropicAdapterError::InvalidContext("native coverage overflow".into())
-                    })?
-            {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native suffix must begin exactly at coverage + 1".into(),
-                ));
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "covered history appears after the native suffix".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous.ok_or_else(|| {
-        AnthropicAdapterError::InvalidContext(
-            "native compaction requires persisted replay history".into(),
-        )
-    })?;
-    if coverage > max_seq {
-        return Err(AnthropicAdapterError::InvalidContext(
-            "native compaction coverage exceeds the latest persisted message sequence".into(),
         ));
     }
     Ok(())
@@ -940,23 +935,23 @@ pub fn context_fingerprint(
     spec: &ModelSpec,
     context: &PromptContext,
 ) -> Result<String, AnthropicAdapterError> {
-    let compat = ensure_anthropic_spec(spec)?;
-    let tools = serde_json::to_vec(&context.tools)
-        .map_err(|error| AnthropicAdapterError::InvalidContext(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    for bytes in [
-        spec.provider_instance_id().as_bytes(),
-        b"anthropic_messages",
-        spec.id.as_bytes(),
-        context.system_prompt.as_bytes(),
-        tools.as_slice(),
-        compat.beta_headers.join("\0").as_bytes(),
-        ANTHROPIC_VERSION.as_bytes(),
-    ] {
-        hasher.update(bytes.len().to_be_bytes());
-        hasher.update(bytes);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    ensure_anthropic_spec(spec)?;
+    crate::provider::context_fingerprint::compute_context_fingerprint(
+        spec,
+        &context.system_prompt,
+        &context.tools,
+    )
+    .map_err(|error| match error {
+        crate::provider::context_fingerprint::ContextFingerprintError::UnsupportedProtocol(_) => {
+            AnthropicAdapterError::UnsupportedProtocol
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ToolsSerialize(error) => {
+            AnthropicAdapterError::InvalidContext(error.to_string())
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ProtocolCompatMismatch {
+            ..
+        } => AnthropicAdapterError::UnsupportedProtocol,
+    })
 }
 
 #[derive(Debug)]
@@ -1019,6 +1014,7 @@ pub struct AnthropicReceiveState {
     content_bytes: usize,
     event_count: usize,
     preview_work_bytes: usize,
+    tool_count: usize,
     saw_tool: bool,
     seen_tool_ids: HashSet<String>,
     coverage: Option<NativeCompactionCoverage>,
@@ -1048,6 +1044,7 @@ impl AnthropicReceiveState {
             content_bytes: 0,
             event_count: 0,
             preview_work_bytes: 0,
+            tool_count: 0,
             saw_tool: false,
             seen_tool_ids: HashSet::new(),
             coverage,
@@ -1158,9 +1155,11 @@ impl AnthropicReceiveState {
         let response_id = required_str(message, "id")?.to_owned();
         let model = required_str(message, "model")?;
         if model != self.expected_model {
-            return Err(AnthropicAdapterError::InvalidEvent(
-                "response model does not match requested model".into(),
-            ));
+            tracing::debug!(
+                observed_model = model,
+                canonical_model = self.expected_model,
+                "provider reported a different model string; using canonical spec model"
+            );
         }
         let response_model = model.to_owned();
         if required_str(message, "role")? != "assistant" {
@@ -1367,10 +1366,17 @@ impl AnthropicReceiveState {
                 )));
             }
         };
+        let tool_count = checked_counter(
+            self.tool_count,
+            usize::from(is_tool),
+            self.budget.max_tool_calls,
+            "tool_calls",
+        )?;
         self.charge(content_charge, events.len(), 0)?;
         if let OpenBlock::Tool { id, .. } = &open {
             self.seen_tool_ids.insert(id.clone());
         }
+        self.tool_count = tool_count;
         self.saw_tool |= is_tool;
         self.open = Some(open);
         Ok(AnthropicPush {
@@ -2021,40 +2027,30 @@ pub fn request_coverage(
     if !ensure_anthropic_spec(spec)?.supports_native_compact || !native_compaction {
         return Ok(None);
     }
-    let mut previous: Option<u64> = None;
-    let mut persisted_started = false;
-    for message in &context.messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction requires persisted messages to form a trailing suffix"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence must be greater than zero".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(*seq)
-        {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence is duplicated, nonmonotonic, or gapped".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    Ok(
-        previous.map(|through_message_seq| NativeCompactionCoverage {
-            through_message_seq,
-            context_fingerprint: context_fingerprint(spec, context)
-                .expect("spec was validated above"),
-        }),
-    )
+    let through_message_seq = match context
+        .verified_replay_provenance_for(&spec.origin())
+        .map_err(AnthropicAdapterError::InvalidContext)?
+    {
+        Some(VerifiedReplayProvenance::SumiNormalized {
+            canonical_through_seq,
+            ..
+        }) => canonical_through_seq,
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            native_coverage_through_seq,
+            canonical_suffix_through_seq,
+            ..
+        }) => Some(canonical_suffix_through_seq.unwrap_or(native_coverage_through_seq)),
+        None => crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(AnthropicAdapterError::InvalidContext)?,
+    };
+    let Some(through_message_seq) = through_message_seq else {
+        return Ok(None);
+    };
+    let context_fingerprint = context_fingerprint(spec, context).expect("spec was validated above");
+    Ok(Some(NativeCompactionCoverage {
+        through_message_seq,
+        context_fingerprint,
+    }))
 }
 
 #[cfg(test)]
@@ -2062,7 +2058,14 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::provider::types::{AssistantMessage, MemoryBlock, ToolResultMessage, UserMessage};
+    use crate::memory::context_assembler::{
+        bind_native_replay_for_test, bind_sumi_replay_for_origin_test,
+    };
+    use crate::provider::assembler::{MessageAssembler, TerminalMetadata};
+    use crate::provider::types::{
+        AssistantMessage, MemoryBlock, RejectedToolCall, ToolArgumentError, ToolResultMessage,
+        UserMessage,
+    };
 
     fn spec() -> ModelSpec {
         ModelSpec::preset("anthropic").expect("preset")
@@ -2084,6 +2087,7 @@ mod tests {
                     "additionalProperties":false,
                 }),
             }],
+            replay_provenance: None,
         }
     }
 
@@ -2108,6 +2112,59 @@ mod tests {
         Utc.timestamp_millis_opt(1_700_000_000_000)
             .single()
             .expect("timestamp")
+    }
+
+    #[test]
+    fn replay_probe_context_origin_matches_assistant_origin() {
+        let preset = spec();
+        let mut custom = preset.clone();
+        custom.set_model_id("claude-custom");
+        let fragments: [(&str, Option<Value>); 3] = [
+            ("none", None),
+            (
+                "thinking_signature",
+                Some(json!({
+                    "type": "thinking_signature",
+                    "signature": "probe-sig",
+                })),
+            ),
+            (
+                "redacted_thinking",
+                Some(json!({
+                    "type": "redacted_thinking",
+                    "data": "probe-data",
+                })),
+            ),
+        ];
+        for (spec_label, spec) in [("preset", &preset), ("custom", &custom)] {
+            for (fragment_label, fragment) in &fragments {
+                let context =
+                    super::build_replay_probe_prompt(spec, fragment.as_ref(), Usage::default())
+                        .unwrap_or_else(|error| {
+                            panic!("build prompt for {spec_label}/{fragment_label}: {error}")
+                        });
+                let assistant_origin = match &context.messages[1] {
+                    ContextMessage::Persisted {
+                        message: Message::Assistant(assistant),
+                        ..
+                    } => &assistant.origin,
+                    other => panic!(
+                        "expected assistant message for {spec_label}/{fragment_label}: {other:?}"
+                    ),
+                };
+                assert_eq!(
+                    context.provider_context.len(),
+                    if fragment.is_some() { 2 } else { 1 },
+                    "provider context count for {spec_label}/{fragment_label}"
+                );
+                for (i, item) in context.provider_context.iter().enumerate() {
+                    assert_eq!(
+                        &item.provider_origin, assistant_origin,
+                        "provider_context[{i}] origin must match assistant origin for {spec_label}/{fragment_label}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2201,25 +2258,33 @@ mod tests {
     #[test]
     fn native_compaction_is_opt_in_and_default_requests_omit_native_context() {
         let spec = spec();
-        let mut context = context(vec![persisted(1)]);
+        let mut context = context(vec![]);
         let coverage = NativeCompactionCoverage {
             through_message_seq: 1,
             context_fingerprint: context_fingerprint(&spec, &context).expect("fingerprint"),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"NATIVE_MARKER"}),
                 coverage,
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 1, None)
+            .expect("bind exact assembler replay");
 
-        let default_request = build_request(&spec, &context, &RequestOptions::default())
-            .expect("canonical three-layer request");
-        assert!(default_request.get("context_management").is_none());
-        assert!(!default_request.to_string().contains("NATIVE_MARKER"));
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
 
         let native_request = build_request(
             &spec,
@@ -2240,17 +2305,18 @@ mod tests {
         if let ProtocolCompat::Anthropic(compat) = &mut unsupported.compat {
             compat.supports_native_compact = false;
         }
-        let unsupported_request = build_request(
-            &unsupported,
-            &context,
-            &RequestOptions {
-                native_compaction: true,
-                ..RequestOptions::default()
-            },
-        )
-        .expect("capability loss falls back");
-        assert!(unsupported_request.get("context_management").is_none());
-        assert!(!unsupported_request.to_string().contains("NATIVE_MARKER"));
+        assert!(matches!(
+            build_request(
+                &unsupported,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
     }
 
     #[test]
@@ -2291,9 +2357,14 @@ mod tests {
         let spec = spec();
         let mut context = context(vec![persisted(1)]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id":"cmp",
@@ -2306,6 +2377,8 @@ mod tests {
                 },
             },
         });
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &context,
@@ -2317,6 +2390,58 @@ mod tests {
         .expect("foreign native state falls back");
         assert!(!request.to_string().contains("FOREIGN_NATIVE"));
         assert!(request.to_string().contains("message 1"));
+    }
+
+    #[test]
+    fn sumi_replay_destination_is_enforced_for_requests_and_coverage() {
+        let spec = spec();
+        let unbound = context(vec![persisted(1)]);
+        let mut context = unbound.clone();
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind Anthropic destination");
+
+        build_request(&spec, &context, &RequestOptions::default())
+            .expect("matching request destination");
+        assert_eq!(
+            request_coverage(&spec, &context, true)
+                .expect("matching coverage destination")
+                .expect("persisted coverage")
+                .through_message_seq,
+            1
+        );
+
+        let mut different_model = spec.clone();
+        different_model.set_model_id("different-model");
+        let mut different_instance = spec.clone();
+        different_instance.account_scope = "different-account".into();
+        for destination in [different_model, different_instance] {
+            assert!(matches!(
+                build_request(&destination, &context, &RequestOptions::default()),
+                Err(AnthropicAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+            assert!(matches!(
+                request_coverage(&destination, &context, true),
+                Err(AnthropicAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+        }
+
+        let mut foreign_origin = spec.origin();
+        foreign_origin.protocol = ApiProtocol::OpenAiChatCompletions;
+        let mut foreign_protocol = unbound;
+        bind_sumi_replay_for_origin_test(&mut foreign_protocol, foreign_origin, Some(1))
+            .expect("bind foreign protocol destination");
+        assert!(matches!(
+            build_request(&spec, &foreign_protocol, &RequestOptions::default()),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
+        assert!(matches!(
+            request_coverage(&spec, &foreign_protocol, true),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
     }
 
     #[test]
@@ -2730,9 +2855,11 @@ mod tests {
             },
         ]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"opaque-sig"}),
@@ -2811,9 +2938,11 @@ mod tests {
             },
         ]);
         context.provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"OPAQUE_MARKER"}),
@@ -2854,16 +2983,6 @@ mod tests {
                 timestamp: timestamp(),
             })),
             ContextMessage::Persisted {
-                id: "old".into(),
-                seq: 1,
-                message: Message::User(UserMessage {
-                    content: vec![UserContent::Text {
-                        text: "old-prefix-marker".into(),
-                    }],
-                    timestamp: timestamp(),
-                }),
-            },
-            ContextMessage::Persisted {
                 id: "compacted-response".into(),
                 seq: 2,
                 message: Message::Assistant(AssistantMessage {
@@ -2898,14 +3017,21 @@ mod tests {
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "old".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"opaque-compact"}),
                 coverage: coverage.clone(),
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 1, Some(3))
+            .expect("bind exact assembler replay");
         let request = build_request(
             &spec,
             &context,
@@ -2916,7 +3042,6 @@ mod tests {
         )
         .expect("native request");
         let serialized = serde_json::to_string(&request).unwrap();
-        assert!(!serialized.contains("old-prefix-marker"));
         assert!(serialized.contains("suffix-marker"));
         assert!(serialized.contains("assistant-suffix-marker"));
         assert!(serialized.contains("opaque-compact"));
@@ -2924,20 +3049,22 @@ mod tests {
             request["context_management"],
             json!({"edits":[{"type":"compact_20260112"}]})
         );
-        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(request["messages"][0]["role"], "assistant");
         assert_eq!(
             request["messages"][0]["content"],
-            json!([{"type":"text","text":"leading-synthetic"}])
+            json!([{"type":"compaction","content":"opaque-compact"}])
         );
-        assert_eq!(request["messages"][1]["role"], "assistant");
+        assert_eq!(request["messages"][1]["role"], "user");
         assert_eq!(
             request["messages"][1]["content"],
-            json!([
-                {"type":"compaction","content":"opaque-compact"},
-                {"type":"text","text":"assistant-suffix-marker"},
-            ])
+            json!([{"type":"text","text":"leading-synthetic"}])
         );
-        assert_eq!(request["messages"][2]["role"], "user");
+        assert_eq!(request["messages"][2]["role"], "assistant");
+        assert_eq!(
+            request["messages"][2]["content"],
+            json!([{"type":"text","text":"assistant-suffix-marker"}])
+        );
+        assert_eq!(request["messages"][3]["role"], "user");
 
         let schemas = FrozenToolSchemaRegistry::compile(&[]).unwrap();
         let mut receive = AnthropicReceiveState::with_budget(
@@ -2992,6 +3119,88 @@ mod tests {
             }
         );
         assert_eq!(terminal.provider_context[0].wire_item_index, None);
+    }
+
+    #[test]
+    fn native_compaction_replays_gapped_persisted_suffix() {
+        let spec = spec();
+        let mut context = context(vec![
+            ContextMessage::Persisted {
+                id: "compacted-response".into(),
+                seq: 3,
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::Text {
+                        text: "assistant-suffix-marker".into(),
+                        wire_item_index: 1,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: timestamp(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "new".into(),
+                seq: 5,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "suffix-marker".into(),
+                    }],
+                    timestamp: timestamp(),
+                }),
+            },
+        ]);
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+        };
+        context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "old".into(),
+                message_seq: 1,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"opaque-compact"}),
+                coverage: coverage.clone(),
+            },
+        });
+        bind_native_replay_for_test(&mut context, spec.origin(), 1, Some(5))
+            .expect("bind exact gapped assembler replay");
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("native request with gapped suffix");
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(serialized.contains("assistant-suffix-marker"));
+        assert!(serialized.contains("suffix-marker"));
+        assert!(serialized.contains("opaque-compact"));
+        assert_eq!(
+            request["context_management"],
+            json!({"edits":[{"type":"compact_20260112"}]})
+        );
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([
+                {"type":"compaction","content":"opaque-compact"},
+                {"type":"text","text":"assistant-suffix-marker"},
+            ])
+        );
+        assert_eq!(request["messages"][1]["role"], "user");
     }
 
     #[test]
@@ -3063,21 +3272,28 @@ mod tests {
     }
 
     #[test]
-    fn malformed_native_compaction_falls_back_and_valid_opaque_fields_are_preserved() {
+    fn malformed_bound_native_compaction_fails_closed_and_valid_opaque_fields_are_preserved() {
         let spec = spec();
-        let mut context = context(vec![persisted(1)]);
-        let coverage = NativeCompactionCoverage {
-            through_message_seq: 1,
-            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
-        };
-        let native = |block| ProviderContextItem {
-            origin_message: None,
-            wire_item_index: None,
-            ordinal: 0,
-            payload: ProviderContextPayload::AnthropicCompaction {
-                block,
-                coverage: coverage.clone(),
-            },
+        let bound_context = |block| {
+            let mut prompt = context(vec![]);
+            let coverage = NativeCompactionCoverage {
+                through_message_seq: 1,
+                context_fingerprint: context_fingerprint(&spec, &prompt).unwrap(),
+            };
+            prompt.provider_context.push(ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "message-1".into(),
+                    message_seq: 1,
+                },
+                origin_message: None,
+                wire_item_index: None,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: ProviderContextPayload::AnthropicCompaction { block, coverage },
+            });
+            bind_native_replay_for_test(&mut prompt, spec.origin(), 1, None)
+                .expect("bind exact assembler replay");
+            prompt
         };
 
         for malformed in [
@@ -3086,18 +3302,16 @@ mod tests {
             json!({"type":"compaction","content":7}),
             json!({"type":"compaction","content":{}}),
         ] {
-            context.provider_context = vec![native(malformed)];
-            let request = build_request(
+            let error = build_request(
                 &spec,
-                &context,
+                &bound_context(malformed),
                 &RequestOptions {
                     native_compaction: true,
                     ..RequestOptions::default()
                 },
             )
-            .expect("malformed persisted native state falls back");
-            assert!(request.get("context_management").is_some());
-            assert!(!request.to_string().contains("opaque"));
+            .expect_err("malformed bound native state fails closed");
+            assert!(error.to_string().contains("compaction"));
         }
 
         let opaque = json!({
@@ -3105,10 +3319,9 @@ mod tests {
             "content":"opaque",
             "future_provider_field":{"nested":[1,2,3]}
         });
-        context.provider_context = vec![native(opaque.clone())];
         let request = build_request(
             &spec,
-            &context,
+            &bound_context(opaque.clone()),
             &RequestOptions {
                 native_compaction: true,
                 ..RequestOptions::default()
@@ -3119,52 +3332,62 @@ mod tests {
     }
 
     #[test]
-    fn invalid_native_suffix_placement_falls_back_to_durable_messages() {
+    fn unbound_synthetic_after_persisted_history_fails_closed() {
         let spec = spec();
-        let mut context = context(vec![
-            persisted(1),
-            synthetic(Message::User(UserMessage {
-                content: vec![UserContent::Text {
-                    text: "late".into(),
+        let rejected = ContextMessage::Persisted {
+            id: "rejected-2".into(),
+            seq: 2,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::RejectedToolCall {
+                    rejected: RejectedToolCall {
+                        id: "rejected-call".into(),
+                        name: "fixture".into(),
+                        error: ToolArgumentError::SchemaViolation,
+                    },
+                    wire_item_index: 0,
                 }],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
                 timestamp: timestamp(),
-            })),
-        ]);
-        let coverage = NativeCompactionCoverage {
-            through_message_seq: 1,
-            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+            }),
         };
-        context.provider_context.push(ProviderContextItem {
-            origin_message: None,
-            wire_item_index: None,
-            ordinal: 0,
-            payload: ProviderContextPayload::AnthropicCompaction {
-                block: json!({"type":"compaction","content":"opaque"}),
-                coverage,
-            },
-        });
-        let request = build_request(
-            &spec,
-            &context,
-            &RequestOptions {
-                native_compaction: true,
-                ..RequestOptions::default()
-            },
-        )
-        .expect("invalid native placement falls back");
-        let serialized = request.to_string();
-        assert!(!serialized.contains("opaque"));
-        assert!(serialized.contains("late"));
+        let synthetic_rejection = crate::memory::transform::transform(&[rejected], &spec.origin())
+            .pop()
+            .expect("transform emits rejection diagnostic");
+        assert!(crate::memory::transform::is_generated_replay_artifact(
+            &synthetic_rejection
+        ));
+        let context = context(vec![persisted(1), synthetic_rejection]);
+        assert!(matches!(
+            build_request(
+                &spec,
+                &context,
+                &RequestOptions::default(),
+            ),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("synthetic content after persisted history")
+        ));
     }
 
     #[test]
-    fn native_fingerprint_and_suffix_gap_fall_back_without_sending_stale_block() {
+    fn native_fingerprint_falls_back_and_exact_suffix_replays_bound_block() {
         let spec = spec();
         let mut durable = context(vec![persisted(1), persisted(2)]);
         durable.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"STALE"}),
                 coverage: NativeCompactionCoverage {
@@ -3173,6 +3396,8 @@ mod tests {
                 },
             },
         });
+        bind_sumi_replay_for_origin_test(&mut durable, spec.origin(), Some(2))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &durable,
@@ -3186,9 +3411,14 @@ mod tests {
 
         let mut gap = context(vec![persisted(3)]);
         gap.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-3".into(),
+                message_seq: 3,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"GAP"}),
                 coverage: NativeCompactionCoverage {
@@ -3197,6 +3427,8 @@ mod tests {
                 },
             },
         });
+        bind_native_replay_for_test(&mut gap, spec.origin(), 1, Some(3))
+            .expect("bind exact assembler replay");
         let request = build_request(
             &spec,
             &gap,
@@ -3205,8 +3437,30 @@ mod tests {
                 ..RequestOptions::default()
             },
         )
-        .expect("suffix gap fallback");
-        assert!(!request.to_string().contains("GAP"));
+        .expect("exact suffix replay");
+        assert!(request.to_string().contains("GAP"));
+        assert!(matches!(
+            build_request(&spec, &gap, &RequestOptions::default()),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
+        if let ProviderContextPayload::AnthropicCompaction { coverage, .. } =
+            &mut gap.provider_context[0].payload
+        {
+            coverage.context_fingerprint = "wrong".into();
+        }
+        assert!(matches!(
+            build_request(
+                &spec,
+                &gap,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(AnthropicAdapterError::InvalidContext(message))
+                if message.contains("bound replay send view changed")
+        ));
     }
 
     #[test]
@@ -3546,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn native_coverage_requires_contiguous_trailing_persisted_suffix() {
+    fn native_coverage_accepts_gapped_trailing_persisted_suffix() {
         let spec = spec();
         let valid = context(vec![
             synthetic(Message::User(UserMessage {
@@ -3554,18 +3808,17 @@ mod tests {
                 timestamp: timestamp(),
             })),
             persisted(7),
-            persisted(8),
+            persisted(9),
         ]);
         assert_eq!(
             request_coverage(&spec, &valid, true)
                 .unwrap()
                 .expect("coverage")
                 .through_message_seq,
-            8
+            9
         );
 
         for messages in [
-            vec![persisted(7), persisted(9)],
             vec![persisted(7), persisted(7)],
             vec![persisted(0)],
             vec![persisted(8), persisted(7)],
@@ -3716,6 +3969,69 @@ mod tests {
             .push_named(Some("content_block_start"), block)
             .unwrap();
         state
+    }
+
+    #[test]
+    fn tool_call_budget_rejects_zero_and_excess_tool_blocks_before_normalization() {
+        let schemas = FrozenToolSchemaRegistry::compile(&context(Vec::new()).tools).unwrap();
+        let message_start = r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#;
+        let first_tool = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"read_file","input":{}}}"#;
+
+        let mut zero = AnthropicReceiveState::with_budget(
+            schemas.clone(),
+            ResponseBudget {
+                max_tool_calls: 0,
+                ..ResponseBudget::default()
+            },
+            None,
+            "claude",
+        );
+        zero.push_named(Some("message_start"), message_start)
+            .unwrap();
+        assert!(matches!(
+            zero.push_named(Some("content_block_start"), first_tool),
+            Err(AnthropicAdapterError::ResponseLimitExceeded {
+                resource: "tool_calls",
+                limit: 0
+            })
+        ));
+        assert!(zero.open.is_none());
+        assert_eq!(zero.next_index, 0);
+        assert_eq!(zero.tool_count, 0);
+        assert!(zero.seen_tool_ids.is_empty());
+
+        let mut one = AnthropicReceiveState::with_budget(
+            schemas,
+            ResponseBudget {
+                max_tool_calls: 1,
+                ..ResponseBudget::default()
+            },
+            None,
+            "claude",
+        );
+        one.push_named(Some("message_start"), message_start)
+            .unwrap();
+        one.push_named(Some("content_block_start"), first_tool)
+            .expect("exact tool-call boundary");
+        one.push_named(
+            Some("content_block_stop"),
+            r#"{"type":"content_block_stop","index":0}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            one.push_named(
+                Some("content_block_start"),
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"b","name":"read_file","input":{}}}"#,
+            ),
+            Err(AnthropicAdapterError::ResponseLimitExceeded {
+                resource: "tool_calls",
+                limit: 1
+            })
+        ));
+        assert!(one.open.is_none());
+        assert_eq!(one.next_index, 1);
+        assert_eq!(one.tool_count, 1);
+        assert_eq!(one.seen_tool_ids.len(), 1);
     }
 
     #[test]
@@ -4285,6 +4601,100 @@ mod tests {
             error
                 .to_string()
                 .contains("unsupported content block type fallback")
+        );
+    }
+
+    #[test]
+    fn observed_model_different_from_canonical_still_produces_normal_terminal() {
+        let mut spec = spec();
+        spec.id = "claude-3-opus-20240229".to_owned();
+        let schemas = FrozenToolSchemaRegistry::compile(&[]).unwrap();
+        let mut state = AnthropicReceiveState::with_budget(
+            schemas,
+            ResponseBudget::for_output_tokens(1024).unwrap(),
+            None,
+            spec.id.clone(),
+        );
+        // Provider may report a dated or resolved variant; the adapter must not
+        // reject an otherwise valid response because of this.
+        let observed_model = "claude-3-opus-20240229-0:0";
+        let mut events = Vec::new();
+        events.extend(
+            state
+                .push_named(
+                    Some("message_start"),
+                    &format!(
+                        r#"{{"type":"message_start","message":{{"id":"m","model":"{observed_model}","role":"assistant","content":[],"usage":{{"input_tokens":3,"output_tokens":0}}}}}}"#
+                    ),
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_start"),
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_delta"),
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_stop"),
+                    r#"{"type":"content_block_stop","index":0}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("message_delta"),
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        let terminal = state
+            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
+            .unwrap()
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.reason, StopReason::Stop);
+
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        for event in events {
+            assembler.apply(&event).unwrap();
+        }
+        let message = assembler
+            .finish(TerminalMetadata {
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: terminal.usage,
+                stop_reason: terminal.reason,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
+        assert_eq!(message.model, spec.id);
+        assert_eq!(message.origin, spec.origin());
+        assert_eq!(message.content.len(), 1);
+        assert!(
+            matches!(&message.content[0], AssistantContent::Text { text, .. } if text == "hello")
         );
     }
 

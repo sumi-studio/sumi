@@ -6,11 +6,14 @@
     "node": ">=20.19"
   },
   "scripts": {
-    "dev": "turbo run dev",
+    "dev": "bash scripts/dev/real-stack",
+    "dev:check": "bash scripts/dev/real-stack --check",
+    "dev:workspaces": "turbo run dev",
     "build": "turbo run build",
     "lint": "biome check . && turbo run lint",
     "check-types": "turbo run check-types",
-    "test": "turbo run test",
+    "test": "pnpm run test:operability && turbo run test",
+    "test:operability": "node --test scripts/dev/real-stack-static.test.mjs scripts/dev/compose-stack.test.mjs",
     "format": "biome format --write ."
   },
   "devDependencies": {

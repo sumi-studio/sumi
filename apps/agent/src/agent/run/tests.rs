@@ -2,27 +2,48 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use anyhow::{Result, anyhow};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::{
-    agent::DurableRunBinding,
-    gateway::{CommandEnvelope, CommandId},
-    provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
-        ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
-        RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
+    agent::{AttemptCancellation, DurableRunBinding, InjectedRunDriver, PublicStreamEvent},
+    approval::{
+        ApprovalBroker,
+        action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+        policy::Policy,
+        prompt::{ReviewerPrompt, ReviewerRole, TrustedEnvironment},
+        reviewer::{
+            Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
+            ReviewerTrustSet,
+        },
+    },
+    gateway::{ApprovalDecision, CommandEnvelope, CommandId},
+    memory::{
+        context_assembler::ProviderCallTrigger,
+        estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+    },
+    provider::{
+        ModelSpec, ProviderTimingObservation, ProviderTimingObserver, RequestOptions,
+        assembler::ResponseBudget,
+        types::{
+            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, PromptContext,
+            ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+            ProviderContextPayload, ProviderEventStream, ProviderOrigin, ProviderOutput,
+            PublicAssistantMessage, RejectedToolCall, SuccessTerminalCommit, ToolArgumentError,
+            Usage, ValidatedToolArguments,
+        },
     },
     runtime::contracts::ProcessGeneration,
-    tools::ToolError,
+    store::Redactor,
+    tools::{ToolError, ToolRegistryBuilder, WorkspacePaths},
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -43,6 +64,7 @@ fn output(message: AssistantMessage) -> Script {
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
     started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    started_triggers: Mutex<Vec<ProviderCallTrigger>>,
     started_command_times: Mutex<Vec<Option<std::time::Instant>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
@@ -57,6 +79,8 @@ struct FixtureDriver {
     overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
     overflow_core_epochs: Mutex<Vec<u64>>,
     overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
+    committed_calibration_failure: Option<&'static str>,
+    terminal_apply_failure: Option<&'static str>,
 }
 
 impl FixtureDriver {
@@ -64,6 +88,7 @@ impl FixtureDriver {
         Self {
             scripts: Mutex::new(scripts.into()),
             started_contexts: Mutex::new(Vec::new()),
+            started_triggers: Mutex::new(Vec::new()),
             started_command_times: Mutex::new(Vec::new()),
             tool_order: Mutex::new(Vec::new()),
             tool_failures: Mutex::new(VecDeque::new()),
@@ -78,6 +103,8 @@ impl FixtureDriver {
             overflow_recoveries: Mutex::new(Vec::new()),
             overflow_core_epochs: Mutex::new(Vec::new()),
             overflow_contexts: Mutex::new(VecDeque::new()),
+            committed_calibration_failure: None,
+            terminal_apply_failure: None,
         }
     }
 
@@ -103,6 +130,16 @@ impl FixtureDriver {
 
     fn with_overflow_contexts(self, contexts: Vec<Vec<PublicMessage>>) -> Self {
         *self.overflow_contexts.lock().expect("overflow contexts") = contexts.into();
+        self
+    }
+
+    fn failing_committed_calibration(mut self, failure: &'static str) -> Self {
+        self.committed_calibration_failure = Some(failure);
+        self
+    }
+
+    fn failing_terminal_apply(mut self, failure: &'static str) -> Self {
+        self.terminal_apply_failure = Some(failure);
         self
     }
 }
@@ -158,6 +195,23 @@ impl RunDriver for FixtureDriver {
             Script::Events(events) => Ok(provider_attempt_from_events(attempt, events)),
             Script::StartFailure(error) => Err(anyhow!(error)),
         }
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_triggers
+            .lock()
+            .expect("provider call triggers")
+            .push(trigger);
+        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+            .await
     }
 
     async fn execute_tool_observed(
@@ -231,6 +285,22 @@ impl RunDriver for FixtureDriver {
         ))
     }
 
+    fn install_committed_calibration(&self, _ratio_bits: [u8; 8]) -> Result<()> {
+        self.committed_calibration_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
+    }
+
+    async fn apply_terminal(
+        &self,
+        _message_id: &str,
+        _message_seq: u64,
+        _message: &AssistantMessage,
+        _provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        self.terminal_apply_failure
+            .map_or(Ok(()), |failure| Err(anyhow!(failure)))
+    }
+
     async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
         self.retry_waits.fetch_add(1, Ordering::SeqCst);
         self.retry_delays.lock().expect("retry delays").push(delay);
@@ -252,8 +322,8 @@ fn timestamp() -> chrono::DateTime<Utc> {
 fn origin() -> ProviderOrigin {
     ProviderOrigin {
         provider_instance_id: "fixture:https://example.invalid".to_owned(),
-        protocol: ApiProtocol::OpenAiChatCompletions,
-        model: "fixture-model".to_owned(),
+        protocol: ApiProtocol::OpenAiResponses,
+        model: "openai-responses".to_owned(),
     }
 }
 
@@ -487,6 +557,7 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
@@ -500,12 +571,15 @@ fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> P
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
 
 fn user(seq: u64) -> CommandEnvelope {
     CommandEnvelope {
+        personality_agent_id: crate::gateway::test_personality_agent_id(),
+        provenance: crate::gateway::test_direct_chat_provenance(),
         seq,
         command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
             .expect("command id"),
@@ -514,6 +588,10 @@ fn user(seq: u64) -> CommandEnvelope {
             attachments: Vec::new(),
         },
     }
+}
+
+fn user_message_id(command_id: &CommandId) -> String {
+    crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id)
 }
 
 fn admitted_user(seq: u64) -> AdmittedCommand {
@@ -527,10 +605,29 @@ fn live_admitted_user(seq: u64) -> AdmittedCommand {
 fn admitted_abort(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
             seq,
             command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
                 .expect("command id"),
             command: Command::Abort {},
+        },
+        timestamp(),
+    )
+}
+
+fn admitted_approval(seq: u64, request_id: &str) -> AdmittedCommand {
+    AdmittedCommand::new(
+        CommandEnvelope {
+            personality_agent_id: crate::gateway::test_personality_agent_id(),
+            provenance: crate::gateway::test_direct_chat_provenance(),
+            seq,
+            command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
+                .expect("command id"),
+            command: Command::ApprovalDecision {
+                request_id: request_id.to_owned(),
+                decision: ApprovalDecision::ApproveOnce,
+            },
         },
         timestamp(),
     )
@@ -563,6 +660,9 @@ fn recovered_context(label: &str) -> Vec<PublicMessage> {
 fn recovered_core(completion: RunCompletion) -> RunCore {
     match completion {
         RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("rehydration-required completion has no recoverable core: {failure}")
+        }
     }
 }
 
@@ -576,30 +676,222 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
 
 fn bound_core(seq: u64) -> RunCore {
     let command = admitted_user(seq);
+    let mut core = RunCore::fixture_with_unapproved_tools();
+    core.durable_binding = Some(DurableRunBinding::idle(
+        &command,
+        test_executor_generation(),
+    ));
+    core.attempt_cancellation = Some(Arc::new(AttemptCancellation::default()));
+    core
+}
+
+fn bound_core_with_runtime_shutdown(seq: u64, shutdown: &CancellationToken) -> RunCore {
+    let mut core = bound_core(seq);
+    core.runtime_shutdown = shutdown.child_token();
+    core
+}
+
+#[tokio::test]
+async fn tool_evaluation_without_broker_fails_closed() {
+    let command = admitted_user(1);
     let mut core = RunCore::new();
     core.durable_binding = Some(DurableRunBinding::idle(
         &command,
         test_executor_generation(),
     ));
-    core
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let call = ToolCall {
+        id: "call-no-broker".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let error = match runner.evaluate_call(&call, &[], "0").await {
+        Err(error) => error,
+        Ok(_) => panic!("missing broker must not allow tool execution"),
+    };
+    assert!(matches!(
+        error,
+        WorkerFailure::Error(message) if message.contains("configured ApprovalBroker")
+    ));
+}
+
+struct BlockingReviewer {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl ReviewerTransport for BlockingReviewer {
+    async fn complete(
+        &self,
+        _prompt: &ReviewerPrompt,
+        cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        Err(ReviewerTransportError::Fatal(
+            "cancelled by control".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
+    let started = Arc::new(Notify::new());
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let reviewer_model = ReviewerModelSpec::new(
+        "audit",
+        "fixture",
+        "https://reviewer.invalid",
+        "test",
+        "trusted",
+        "test-policy",
+    );
+    let reviewer = Arc::new(Reviewer::new(
+        reviewer_model.clone(),
+        ReviewerTrustSet::new(reviewer_model, vec![]),
+        Arc::new(BlockingReviewer {
+            started: started.clone(),
+        }),
+        Arc::new(SecretAwareActionProjector::new(
+            Redactor::v1(),
+            SecretDigestKey::fixture(),
+        )),
+    ));
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        projector,
+        Some(reviewer),
+        ReviewerMode::AutoReview,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let call = ToolCall {
+        id: "call-review-wait".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let task = tokio::spawn(async move { runner.evaluate_call(&call, &[], "0").await });
+    started.notified().await;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("send abort");
+    assert!(accepted_rx.await.expect("abort acceptance"));
+    committed_tx.send(()).expect("authorize durable abort");
+    let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("abort must not wait for reviewer")
+        .expect("runner task")
+        .expect("evaluate call");
+    assert!(matches!(outcome, CallDisposition::Denied { .. }));
+}
+
+#[tokio::test]
+async fn committed_context_mutation_advances_reviewer_cache_version_within_run() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let core = bound_core(1);
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    assert_eq!(runner.core.mutation_epoch(), 0);
+    let message = runtime_user(2);
+    runner
+        .retain_committed(
+            MessageCommitReceipt {
+                message_id: "persisted-user-2".to_owned(),
+                message_seq: 22,
+                calibration_ratio_bits: None,
+                new_turn_id: None,
+            },
+            &message,
+        )
+        .expect("retain committed steer");
+    assert_eq!(
+        runner.core.mutation_epoch(),
+        1,
+        "a same-run user/context mutation must invalidate cached reviewer allows"
+    );
+}
+
+#[tokio::test]
+async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue() {
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let broker = Arc::new(ApprovalBroker::headless(
+        Policy::new("/workspace"),
+        projector,
+    ));
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let (_waiter_tx, mut waiter_rx) = oneshot::channel();
+    let send_controls = async {
+        control_tx
+            .send(RunControl::Command(admitted_approval(2, "unrelated")))
+            .await
+            .expect("send unrelated decision");
+        control_tx
+            .send(RunControl::Command(admitted_approval(
+                3,
+                "already-terminal",
+            )))
+            .await
+            .expect("send matching terminal decision");
+    };
+    let (outcome, ()) = tokio::join!(
+        runner.wait_for_approval("already-terminal".to_owned(), &mut waiter_rx),
+        send_controls
+    );
+    assert!(matches!(
+        outcome.expect("wait outcome"),
+        ApprovalWaitOutcome::Cancelled
+    ));
+    assert!(
+        pending_sequences(&mut runner.core).is_empty(),
+        "unmatched approval decisions must not be queued as follow-up controls"
+    );
 }
 
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
-    run_fixture_with_initial(driver, admitted_user(1)).await
+    run_fixture_with(driver, bound_core(1), admitted_user(1)).await
 }
 
-async fn run_fixture_with_initial(
+async fn run_fixture_with(
     driver: Arc<FixtureDriver>,
+    core: RunCore,
     initial: AdmittedCommand,
 ) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = tokio::spawn(async move {
-        worker
-            .run(bound_core(1), initial, control_rx, events_tx)
-            .await
-    });
+    let completion =
+        tokio::spawn(async move { worker.run(core, initial, control_rx, events_tx).await });
     let mut events = Vec::new();
     let mut message_seq = 1;
     while let Some(mut output) = events_rx.recv().await {
@@ -620,6 +912,8 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: *next_seq,
+            calibration_ratio_bits: None,
+            new_turn_id: None,
         });
         *next_seq += 1;
     }
@@ -643,8 +937,89 @@ async fn complete_with_receipts(
     completion.await.expect("worker join")
 }
 
+async fn complete_with_calibrated_receipts(
+    future: WorkerFuture,
+    mut events_rx: mpsc::Receiver<RunOutput>,
+) -> RunCompletion {
+    let completion = tokio::spawn(future);
+    let mut message_seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                calibration_ratio_bits: Some([7; 8]),
+                new_turn_id: None,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    completion.await.expect("worker join")
+}
+
+#[tokio::test]
+async fn durable_terminal_followup_failures_require_rehydration_in_both_terminal_branches() {
+    let cases = [
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::Stop,
+                vec![AssistantContent::Text {
+                    text: "durable answer".to_owned(),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_committed_calibration("calibration after durable terminal failed"),
+            "calibration after durable terminal failed",
+        ),
+        (
+            FixtureDriver::new(vec![output(assistant(
+                StopReason::ToolUse,
+                vec![AssistantContent::ToolCall {
+                    tool_call: call("durable-tool"),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ))])
+            .failing_terminal_apply("apply after durable tool terminal failed"),
+            "apply after durable tool terminal failed",
+        ),
+    ];
+
+    for (driver, expected_failure) in cases {
+        let worker = SequentialRunWorker::new(Arc::new(driver));
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let completion = complete_with_calibrated_receipts(
+            worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+            events_rx,
+        )
+        .await;
+        assert!(matches!(
+            completion,
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::Error(ref failure),
+            } if failure == expected_failure
+        ));
+    }
+}
+
 fn assert_completed(completion: RunCompletion) {
-    assert!(matches!(completion, RunCompletion::Completed(_)));
+    match completion {
+        RunCompletion::Completed(_) => {}
+        RunCompletion::Failed { failure, .. } => panic!("run failed: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("run requires rehydration: {failure}")
+        }
+    }
 }
 
 #[tokio::test]
@@ -677,6 +1052,107 @@ async fn successful_run_has_canonical_outer_order() {
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn required_tool_choice_resets_after_retry_for_queued_user_turn() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = observed.clone();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let followup_tx = control_tx.clone();
+    let starter = Arc::new(
+        move |spec: ModelSpec,
+              _prompt: PromptContext,
+              options: RequestOptions,
+              cancel: CancellationToken,
+              observer: ProviderTimingObserver| {
+            let request_index = {
+                let mut observed = sink.lock().expect("observed options");
+                let request_index = observed.len();
+                observed.push(options.tool_choice);
+                request_index
+            };
+            if request_index == 1 {
+                followup_tx
+                    .try_send(RunControl::Command(admitted_user(2)))
+                    .expect("queue followup during retry");
+            }
+            observer.observe(ProviderTimingObservation::RequestSent(
+                std::time::Instant::now(),
+            ));
+            let retryable = request_index == 0;
+            let reason = if retryable {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            };
+            let output = ProviderOutput {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: reason,
+                    error_message: retryable.then(|| "network error".to_owned()),
+                    provider_code: retryable.then(|| "network_error".to_owned()),
+                    interrupted: false,
+                    timestamp: timestamp(),
+                },
+                provider_context: Vec::new(),
+            };
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send(ProviderEvent::Start).expect("start");
+            let terminal = if retryable {
+                ProviderEvent::Error { reason, output }
+            } else {
+                ProviderEvent::Done { reason, output }
+            };
+            tx.try_send(terminal).expect("terminal");
+            drop(tx);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        },
+    );
+    let registry = ToolRegistryBuilder::default().build();
+    let prompt = PromptContext {
+        system_prompt: "fixture".to_owned(),
+        memory_blocks: Vec::new(),
+        messages: Vec::new(),
+        provider_context: Vec::new(),
+        tools: registry.definitions(),
+        replay_provenance: None,
+    };
+    let driver = Arc::new(
+        InjectedRunDriver::with_stream_starter(
+            ModelSpec::preset("kimi-k3").expect("preset"),
+            RequestOptions {
+                tool_choice: Some(json!("required")),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("workspace")),
+            Some(test_executor_generation()),
+            starter,
+        )
+        .expect("driver"),
+    );
+    let worker = SequentialRunWorker::new(driver);
+    let (events_tx, events_rx) = mpsc::channel(64);
+
+    let completion = complete_with_receipts(
+        worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+        events_rx,
+    )
+    .await;
+    drop(control_tx);
+
+    assert_completed(completion);
+    assert_eq!(
+        *observed.lock().expect("observed options"),
+        vec![Some(json!("required")), None, Some(json!("required"))],
+        "required tool choice must be stripped on retry and restored for the queued user turn"
+    );
+}
+
 #[tokio::test]
 async fn retry_closes_error_before_schedule_and_does_not_append_error_context() {
     let driver = Arc::new(FixtureDriver::new(vec![
@@ -689,7 +1165,7 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
     let (completion, events) =
-        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
+        run_fixture_with(driver.clone(), bound_core(1), live_admitted_user(1)).await;
     assert_completed(completion);
     let retry = events
         .iter()
@@ -709,10 +1185,18 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         command_times[1], None,
         "retry backoff is not internal overhead"
     );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "a retry without a newly injected user is a continuation"
+    );
 }
 
 #[tokio::test]
-async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
+async fn nonempty_provider_context_flows_to_the_durable_message_barrier() {
     let message = assistant(StopReason::Stop, Vec::new(), None, None);
     let events = vec![
         ProviderEvent::Start,
@@ -724,7 +1208,12 @@ async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
                     wire_item_index: Some(0),
                     payload: ProviderContextPayload::EncryptedReasoning {
                         protocol: ApiProtocol::OpenAiResponses,
-                        item: json!({"encrypted_content":"opaque"}),
+                        item: json!({
+                            "id": "rs-test-opaque",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": "opaque",
+                        }),
                     },
                 }],
             },
@@ -746,17 +1235,636 @@ async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
     assert!(matches!(
         end,
         PublicMessage::Assistant(assistant)
-            if assistant.stop_reason == StopReason::Error
-                && assistant.error_message.as_deref().is_some_and(|message| {
-                    message.contains("T17 durable hand-off")
-                        && message.contains("refusing to persist opaque context")
-                })
+            if assistant.stop_reason == StopReason::Stop
     ));
     assert!(matches!(
         emitted[emitted.len() - 2],
         AgentEvent::TurnEnd { .. }
     ));
     assert!(matches!(emitted.last(), Some(AgentEvent::AgentEnd)));
+}
+
+fn cancellation_provider_context() -> Vec<ProviderContextFragment> {
+    vec![ProviderContextFragment {
+        wire_item_index: Some(0),
+        payload: ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "cancelled-reasoning",
+                "summary": [],
+                "encrypted_content": "cancelled-opaque"
+            }),
+        },
+    }]
+}
+
+fn cancellation_assistant(reason: StopReason) -> AssistantMessage {
+    let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
+    let mut message = assistant(reason, Vec::new(), None, None);
+    message.model = spec.id.clone();
+    message.provider = spec.provider.clone();
+    message.origin = spec.origin();
+    message
+}
+
+#[tokio::test]
+async fn aborted_message_end_keeps_verified_provider_context_on_barrier() {
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(
+        bound_core(1),
+        Arc::new(CancellingProbeDriver::new()),
+        control_rx,
+        events_tx,
+    );
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_aborted_attempt(
+        "assistant-aborted",
+        true,
+        partial,
+        cancellation_provider_context(),
+    );
+    let receive = async {
+        let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-aborted".to_owned(),
+            message_seq: 1,
+            calibration_ratio_bits: None,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
+    let AttemptOutcome::ClosedError {
+        message, receipt, ..
+    } = outcome.expect("close outcome")
+    else {
+        panic!("aborted close must return ClosedError");
+    };
+    let receipt = runner
+        .await_message_receipt(receipt)
+        .await
+        .expect("aborted receipt");
+    runner
+        .retain_committed(receipt, &message)
+        .expect("retain aborted context");
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
+}
+
+#[tokio::test]
+async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(
+        bound_core(1),
+        Arc::new(CancellingProbeDriver::new()),
+        control_rx,
+        events_tx,
+    );
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_hard_steer_attempt(
+        "assistant-steered",
+        true,
+        partial,
+        cancellation_provider_context(),
+        admitted_user(2),
+    );
+    let receive = async {
+        let mut output = events_rx
+            .recv()
+            .await
+            .expect("hard-steer MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-steered".to_owned(),
+            message_seq: 1,
+            calibration_ratio_bits: None,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
+    assert!(matches!(
+        outcome.expect("close outcome"),
+        AttemptOutcome::HardSteer
+    ));
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
+}
+
+struct HardSteerProviderContextDriver {
+    started_provider_contexts: Mutex<Vec<Vec<ProviderContextItem>>>,
+}
+
+impl HardSteerProviderContextDriver {
+    fn new() -> Self {
+        Self {
+            started_provider_contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn attempt(&self, attempt: usize, cancel: CancellationToken) -> Result<ProviderAttempt> {
+        if attempt > 0 {
+            return Ok(provider_attempt(
+                attempt,
+                assistant(StopReason::Stop, Vec::new(), None, None),
+            ));
+        }
+
+        let (normal_tx, normal_rx) = mpsc::channel(1);
+        let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+        let terminal_cancel = cancel.clone();
+        let producer = tokio::spawn(async move {
+            terminal_cancel.cancelled().await;
+            let _normal_tx = normal_tx;
+            priority_terminal_tx
+                .send(ProviderEvent::Error {
+                    reason: StopReason::Aborted,
+                    output: ProviderOutput {
+                        message: assistant(
+                            StopReason::Aborted,
+                            Vec::new(),
+                            Some("cancelled"),
+                            Some("cancelled"),
+                        ),
+                        provider_context: cancellation_provider_context(),
+                    },
+                })
+                .await
+                .expect("priority terminal receiver");
+        });
+
+        Ok(ProviderAttempt {
+            message_id: format!("assistant-{attempt}"),
+            initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            uncalibrated_prompt_estimate: 0,
+            events: ProviderEventStream::with_priority_terminal(
+                normal_rx,
+                priority_terminal_rx,
+                cancel,
+                "fixture",
+                origin(),
+                ResponseBudget::default(),
+                Arc::new(SuccessTerminalCommit::new()),
+            )
+            .own_producer(producer),
+        })
+    }
+}
+
+#[async_trait]
+impl RunDriver for HardSteerProviderContextDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.attempt(attempt, cancel)
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: ProviderCallTrigger,
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_provider_contexts
+            .lock()
+            .expect("provider contexts")
+            .push(
+                provider_context
+                    .iter()
+                    .map(|context| context.item.clone())
+                    .collect(),
+            );
+        self.attempt(attempt, cancel)
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "HardSteerProviderContextDriver has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!(
+            "HardSteerProviderContextDriver has no overflow recovery"
+        ))
+    }
+}
+
+#[tokio::test]
+async fn hard_steer_provider_context_reaches_the_next_live_provider_attempt() {
+    let driver = Arc::new(HardSteerProviderContextDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(core, admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let mut message_seq = 1;
+    let mut hard_steer_seq = None;
+    let mut steer_sent = false;
+    while let Some(mut output) = events_rx.recv().await {
+        if matches!(
+            &output.event,
+            AgentEvent::MessageStart { message_id, .. } if message_id == "assistant-0"
+        ) && !steer_sent
+        {
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            control_tx
+                .send(RunControl::HardSteer {
+                    command: admitted_user(2),
+                    accepted: accepted_tx,
+                })
+                .await
+                .expect("send hard steer");
+            assert!(accepted_rx.await.expect("worker accepts hard steer"));
+            cancellation
+                .reserve()
+                .expect("reserve provider cancellation")
+                .cancel_after_commit();
+            steer_sent = true;
+        }
+
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            let new_turn_id = if message_id == "assistant-0" {
+                hard_steer_seq = Some(message_seq);
+                Some("turn-after-hard-steer".to_owned())
+            } else {
+                None
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                calibration_ratio_bits: None,
+                new_turn_id,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+        if let Some(barrier) = output.retry_wait_commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+
+    assert_completed(completion.await.expect("worker join"));
+    let hard_steer_seq = hard_steer_seq.expect("hard-steer assistant receipt");
+    let fragment = cancellation_provider_context()
+        .into_iter()
+        .next()
+        .expect("provider context fragment");
+    let expected = ProviderContextItem {
+        retention_owner: ProviderContextAnchor {
+            message_id: "assistant-0".to_owned(),
+            message_seq: hard_steer_seq,
+        },
+        origin_message: Some(ProviderContextAnchor {
+            message_id: "assistant-0".to_owned(),
+            message_seq: hard_steer_seq,
+        }),
+        wire_item_index: fragment.wire_item_index,
+        ordinal: 0,
+        provider_origin: origin(),
+        payload: fragment.payload,
+    };
+    let snapshots = driver
+        .started_provider_contexts
+        .lock()
+        .expect("provider contexts");
+    assert_eq!(snapshots.len(), 2, "hard steer must start a new attempt");
+    assert!(snapshots[0].is_empty());
+    assert_eq!(
+        snapshots[1],
+        vec![expected],
+        "the next live provider attempt must receive the context committed with the hard-steer partial exactly once"
+    );
+}
+
+#[tokio::test]
+async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core() {
+    let driver = Arc::new(HardSteerProviderContextDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let worker = SequentialRunWorker::new(driver);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(core, admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let mut message_seq = 1;
+    let mut hard_steer_seq = None;
+    let mut steer_sent = false;
+    let mut abort_queued = false;
+    while let Some(mut output) = events_rx.recv().await {
+        if matches!(
+            &output.event,
+            AgentEvent::MessageStart { message_id, .. } if message_id == "assistant-0"
+        ) && !steer_sent
+        {
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            control_tx
+                .send(RunControl::HardSteer {
+                    command: admitted_user(2),
+                    accepted: accepted_tx,
+                })
+                .await
+                .expect("send hard steer");
+            assert!(accepted_rx.await.expect("worker accepts hard steer"));
+            cancellation
+                .reserve()
+                .expect("reserve provider cancellation")
+                .cancel_after_commit();
+            steer_sent = true;
+        }
+
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            let message_id = message_id.clone();
+            let new_turn_id = if message_id == "assistant-0" {
+                assert_eq!(
+                    barrier.provider_context_for_test(),
+                    cancellation_provider_context(),
+                    "hard-steer MessageEnd must carry the exact staged fragments"
+                );
+                hard_steer_seq = Some(message_seq);
+
+                let (accepted_tx, accepted_rx) = oneshot::channel();
+                let (committed_tx, committed_rx) = oneshot::channel();
+                control_tx
+                    .send(RunControl::Abort {
+                        command: admitted_abort(3),
+                        accepted: accepted_tx,
+                        committed: committed_rx,
+                    })
+                    .await
+                    .expect("queue post-MessageEnd abort");
+                committed_tx
+                    .send(())
+                    .expect("authorize queued abort durably");
+                barrier.resolve(MessageCommitReceipt {
+                    message_id,
+                    message_seq,
+                    calibration_ratio_bits: None,
+                    new_turn_id: Some("turn-after-hard-steer".to_owned()),
+                });
+                assert!(
+                    accepted_rx.await.expect("worker accepts queued abort"),
+                    "Abort must retain priority after the hard-steer receipt"
+                );
+                abort_queued = true;
+                message_seq += 1;
+                continue;
+            } else {
+                None
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id,
+                message_seq,
+                calibration_ratio_bits: None,
+                new_turn_id,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+        if let Some(barrier) = output.retry_wait_commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+
+    assert!(
+        abort_queued,
+        "test must exercise the post-receipt Abort race"
+    );
+    let core = match completion.await.expect("worker join") {
+        RunCompletion::Completed(core) => core,
+        RunCompletion::Failed { failure, .. } => {
+            panic!("post-receipt Abort run failed: {failure}")
+        }
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("post-receipt Abort unexpectedly requires rehydration: {failure}")
+        }
+    };
+    let hard_steer_seq = hard_steer_seq.expect("hard-steer assistant receipt");
+    let fragment = cancellation_provider_context()
+        .into_iter()
+        .next()
+        .expect("provider context fragment");
+    let provider_origin = origin();
+    let provider_spec =
+        ModelSpec::from_origin(&provider_origin).expect("known provider context origin");
+    let expected_footprint =
+        eviction_footprint_for_payload(&provider_spec, &fragment.payload).expect("footprint");
+    assert_eq!(
+        core.provider_context,
+        vec![ProviderContextItemWithFootprint::new(
+            ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: "assistant-0".to_owned(),
+                    message_seq: hard_steer_seq,
+                },
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: "assistant-0".to_owned(),
+                    message_seq: hard_steer_seq,
+                }),
+                wire_item_index: fragment.wire_item_index,
+                ordinal: 0,
+                provider_origin,
+                payload: fragment.payload,
+            },
+            expected_footprint,
+        )],
+        "the returned live core must match cold hydration exactly once after Abort wins"
+    );
+}
+
+#[tokio::test]
+async fn authoritative_error_terminal_preserves_metadata_context_and_retry_classification() {
+    let message = assistant_with_usage(
+        StopReason::Error,
+        vec![AssistantContent::Text {
+            text: "verified partial".to_owned(),
+            wire_item_index: 0,
+        }],
+        Some("provider display error"),
+        Some("network_error"),
+        17,
+        3,
+    );
+    let expected_public = public_message(&message);
+    let provider_context = cancellation_provider_context();
+    let driver = Arc::new(FixtureDriver::new(vec![Script::Events(vec![
+        ProviderEvent::Start,
+        ProviderEvent::TextStart { content_index: 0 },
+        ProviderEvent::TextDelta {
+            content_index: 0,
+            delta: "verified partial".to_owned(),
+        },
+        ProviderEvent::TextEnd {
+            content_index: 0,
+            content: "verified partial".to_owned(),
+        },
+        ProviderEvent::Error {
+            reason: StopReason::Error,
+            output: ProviderOutput {
+                message,
+                provider_context: provider_context.clone(),
+            },
+        },
+    ])]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+    let message_seq = 1;
+    let outcome = loop {
+        let mut output = events_rx.recv().await.expect("provider output");
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            assert_eq!(
+                barrier.provider_context_for_test(),
+                provider_context,
+                "the durable MessageEnd must retain the verified provider context"
+            );
+            let AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } = &output.event
+            else {
+                panic!("receipt barrier without MessageEnd");
+            };
+            assert_eq!(
+                message.as_ref(),
+                &expected_public,
+                "Agent must commit the provider's authoritative code, display error, usage, and partial content"
+            );
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                calibration_ratio_bits: None,
+                new_turn_id: None,
+            });
+            break task.await.expect("provider attempt task");
+        }
+    };
+    let AttemptOutcome::Retry { message, .. } = outcome.expect("provider attempt outcome") else {
+        panic!("provider machine code must retain its retry classification");
+    };
+    assert_eq!(message, expected_public);
+}
+
+#[tokio::test]
+async fn authoritative_error_context_survives_overflow_classification() {
+    let message = assistant(
+        StopReason::Error,
+        Vec::new(),
+        Some("maximum context length exceeded"),
+        Some("context_length_exceeded"),
+    );
+    let provider_context = cancellation_provider_context();
+    let driver = Arc::new(
+        FixtureDriver::new(vec![Script::Events(vec![
+            ProviderEvent::Start,
+            ProviderEvent::Error {
+                reason: StopReason::Error,
+                output: ProviderOutput {
+                    message,
+                    provider_context: provider_context.clone(),
+                },
+            },
+        ])])
+        .with_context_window(100),
+    );
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+
+    let outcome = loop {
+        let mut output = events_rx.recv().await.expect("provider output");
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            assert_eq!(
+                barrier.provider_context_for_test(),
+                provider_context,
+                "overflow recovery must not erase an authoritative Error terminal's context"
+            );
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq: 1,
+                calibration_ratio_bits: None,
+                new_turn_id: None,
+            });
+            break task.await.expect("provider attempt task");
+        }
+    };
+    assert!(matches!(
+        outcome.expect("provider attempt outcome"),
+        AttemptOutcome::ImmediateOverflow {
+            source: OverflowSource::ProviderCode,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -820,6 +1928,14 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
         contexts[1]
             .iter()
             .all(|message| matches!(context_message(message), Message::User(_)))
+    );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::FirstAfterUser,
+        ],
+        "retry-wait user injection must restore TTFT protection even at attempt ordinal one"
     );
 }
 
@@ -917,6 +2033,9 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
     assert!(driver.tool_order.lock().expect("tool order").is_empty());
@@ -1014,7 +2133,7 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
     let (completion, events) =
-        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
+        run_fixture_with(driver.clone(), bound_core(1), live_admitted_user(1)).await;
     assert_completed(completion);
     assert_eq!(
         *driver.tool_order.lock().expect("tool order"),
@@ -1022,6 +2141,14 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "tool-loop calls without a newly injected user are continuations"
+    );
     let command_times = driver.started_command_times.lock().expect("command times");
     assert_eq!(command_times.len(), 2);
     assert!(command_times[0].is_some());
@@ -1131,6 +2258,7 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
 #[test]
 fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_failure_role() {
     let binding = DurableRunBinding {
+        provenance: crate::gateway::test_direct_chat_provenance(),
         command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
         command_seq: 1,
         run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
@@ -1295,6 +2423,9 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert_eq!(core.runtime_context.len(), 2);
         assert!(matches!(
@@ -1399,6 +2530,9 @@ async fn non_authoritative_projection_failure_and_eof_discard_rejected_results()
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::RehydrationRequired { failure } => {
+                panic!("unexpected rehydration requirement: {failure}")
+            }
         };
         assert!(
             !core
@@ -1871,6 +3005,9 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     let recoveries = driver
         .overflow_recoveries
@@ -1895,8 +3032,8 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
             .overflow_core_epochs
             .lock()
             .expect("overflow core epochs"),
-        vec![0, 0],
-        "planning receives immutable core state and cannot advance it"
+        vec![1, 2],
+        "each committed context boundary advances the reviewer cache version"
     );
     assert_eq!(
         events
@@ -2152,6 +3289,9 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::RehydrationRequired { failure } => {
+            panic!("unexpected rehydration requirement: {failure}")
+        }
     };
     assert_eq!(
         core.pending_overflow_apply(),
@@ -2379,4 +3519,2278 @@ async fn retryable_error_breaks_the_consecutive_length_guard() {
                 if result.content.iter().any(|content| matches!(content,
                     UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE))))
     )));
+}
+
+#[tokio::test]
+async fn abort_requested_before_provider_start_skips_start_and_closes_normally() {
+    let driver = Arc::new(FixtureDriver::new(vec![output(assistant(
+        StopReason::Stop,
+        Vec::new(),
+        None,
+        None,
+    ))]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    runner
+        .claim_ordered_initial(admitted_user(1))
+        .expect("claim initial");
+    runner.abort_requested = true;
+
+    let outcome = runner.provider_attempt().await.expect("provider attempt");
+    assert!(
+        matches!(outcome, super::AttemptOutcome::ClosedError { .. }),
+        "abort before provider start must close with a synthetic error message"
+    );
+    assert_eq!(
+        driver.started_contexts.lock().expect("contexts").len(),
+        0,
+        "provider must not be started once abort was already requested"
+    );
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn accept_steer_control_releases_claim_when_durable_authorization_drops() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel::<()>();
+    drop(committed_tx);
+
+    let command = admitted_user(2);
+    let authorized = runner
+        .accept_steer_control(command, accepted_tx, committed_rx)
+        .await
+        .expect("dropped authorization is a no-op");
+    assert!(!authorized);
+    assert!(runner.in_flight_controls.is_empty());
+    assert!(accepted_rx.await.expect("accepted must still be sent"));
+}
+
+async fn approval_wait_preserves_pending_across_failed_control_authorization(abort: bool) {
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let call = ToolCall {
+        id: "approval-authorization-failure".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let outcome = broker
+        .start_request(
+            &call,
+            &[],
+            "approval-run",
+            "approval-turn",
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval");
+    let ApprovalOutcome::Pending { mut pending } = outcome else {
+        panic!("fixture must enter pending approval");
+    };
+    let request_id = pending.request().id.clone();
+    let waiter_request_id = request_id.clone();
+
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker.clone());
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let waiter = tokio::spawn(async move {
+        runner
+            .wait_for_approval(waiter_request_id, pending.receiver_mut())
+            .await
+    });
+
+    let send_control = |seq, accepted, committed| {
+        if abort {
+            RunControl::Abort {
+                command: admitted_abort(seq),
+                accepted,
+                committed,
+            }
+        } else {
+            RunControl::SoftSteer {
+                command: admitted_user(seq),
+                accepted,
+                committed,
+            }
+        }
+    };
+
+    // Dropping the authorization sender models the Session's EventWriter
+    // transaction failing before it can publish commit authorization.
+    let (first_accepted_tx, first_accepted_rx) = oneshot::channel();
+    let (first_committed_tx, first_committed_rx) = oneshot::channel::<()>();
+    control_tx
+        .send(send_control(2, first_accepted_tx, first_committed_rx))
+        .await
+        .expect("send first control");
+    assert!(
+        first_accepted_rx
+            .await
+            .expect("worker accepts first control")
+    );
+    drop(first_committed_tx);
+
+    // A second control being accepted proves the waiter processed the failed
+    // authorization and remained live rather than returning Cancelled.
+    let (second_accepted_tx, second_accepted_rx) = oneshot::channel();
+    let (second_committed_tx, second_committed_rx) = oneshot::channel();
+    control_tx
+        .send(send_control(3, second_accepted_tx, second_committed_rx))
+        .await
+        .expect("send retry control");
+    assert!(
+        second_accepted_rx
+            .await
+            .expect("approval wait must remain live after failed authorization")
+    );
+    assert!(
+        broker.has_pending(&request_id),
+        "failed durability authorization must preserve the exact broker Pending entry"
+    );
+
+    second_committed_tx
+        .send(())
+        .expect("authorize retry control");
+    let outcome = waiter
+        .await
+        .expect("approval waiter task")
+        .expect("approval wait");
+    assert!(matches!(outcome, ApprovalWaitOutcome::Cancelled));
+    assert!(
+        !broker.any_pending(),
+        "durably authorized control must cancel the pending approval"
+    );
+}
+
+#[tokio::test]
+async fn approval_wait_preserves_pending_when_soft_steer_event_writer_commit_fails() {
+    approval_wait_preserves_pending_across_failed_control_authorization(false).await;
+}
+
+#[tokio::test]
+async fn approval_wait_preserves_pending_when_abort_event_writer_commit_fails() {
+    approval_wait_preserves_pending_across_failed_control_authorization(true).await;
+}
+
+// The following drivers and tests cover the timeout/dropped-acceptance path
+// described in the RunControl handshake audit. They ensure HardSteer and Abort
+// are not applied when the Session `accepted` receiver has already been dropped.
+
+struct CancellingProbeDriver {
+    cancelled: Arc<AtomicBool>,
+    senders: Mutex<Vec<mpsc::Sender<ProviderEvent>>>,
+    started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    emit_partial: bool,
+}
+
+impl CancellingProbeDriver {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            senders: Mutex::new(Vec::new()),
+            started_contexts: Mutex::new(Vec::new()),
+            emit_partial: false,
+        }
+    }
+
+    fn with_partial(mut self) -> Self {
+        self.emit_partial = true;
+        self
+    }
+}
+
+#[async_trait]
+impl RunDriver for CancellingProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_contexts
+            .lock()
+            .expect("contexts")
+            .push(context.to_vec());
+        let cancelled = self.cancelled.clone();
+        let cancel_watch = cancel.clone();
+        tokio::spawn(async move {
+            cancel_watch.cancelled().await;
+            cancelled.store(true, Ordering::SeqCst);
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start).expect("start");
+        if self.emit_partial {
+            tx.try_send(ProviderEvent::TextStart { content_index: 0 })
+                .expect("text start");
+            tx.try_send(ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "authoritative text".to_owned(),
+            })
+            .expect("text delta");
+            tx.try_send(ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "reasoning_content".to_owned(),
+            })
+            .expect("thinking start");
+            tx.try_send(ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "authoritative thinking".to_owned(),
+            })
+            .expect("thinking delta");
+            tx.try_send(ProviderEvent::ThinkingEnd {
+                content_index: 1,
+                content: "authoritative thinking".to_owned(),
+            })
+            .expect("thinking end");
+        }
+        self.senders.lock().expect("senders").push(tx);
+
+        Ok(ProviderAttempt {
+            message_id: format!("assistant-{attempt}"),
+            initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            uncalibrated_prompt_estimate: 0,
+            events: crate::provider::types::ProviderEventStream::new(
+                rx,
+                cancel,
+                "fixture",
+                origin(),
+            ),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "CancellingProbeDriver has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, _message: &str) -> PublicMessage {
+        unreachable!("CancellingProbeDriver has no synthetic errors")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("CancellingProbeDriver has no overflow recovery")
+    }
+}
+
+/// Drain events from `events_rx` until the worker has emitted the assistant
+/// `MessageStart` for the first provider attempt. The worker is blocked on the
+/// bounded event channel at capacity 1 after that emit.
+async fn drain_to_first_assistant_start(events_rx: &mut mpsc::Receiver<RunOutput>) -> bool {
+    let mut found_assistant = false;
+    let mut seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut seq);
+        if let AgentEvent::MessageStart { message, .. } = output.event
+            && matches!(message.as_ref(), PublicMessage::Assistant(_))
+        {
+            found_assistant = true;
+            break;
+        }
+    }
+    found_assistant
+}
+
+async fn drain_to_partial_thinking_end(events_rx: &mut mpsc::Receiver<RunOutput>) {
+    while let Some(output) = events_rx.recv().await {
+        if matches!(
+            output.event,
+            AgentEvent::MessageUpdate {
+                event: PublicStreamEvent::ThinkingEnd { .. },
+                ..
+            }
+        ) {
+            return;
+        }
+    }
+    panic!("provider closed before the authoritative partial was projected");
+}
+
+async fn receive_partial_message_end(
+    events_rx: &mut mpsc::Receiver<RunOutput>,
+) -> PublicAssistantMessage {
+    let mut message_seq = 1;
+    loop {
+        let mut output = events_rx.recv().await.expect("partial MessageEnd");
+        resolve_message_output(&mut output, &mut message_seq);
+        if let AgentEvent::MessageEnd { message, .. } = output.event {
+            let PublicMessage::Assistant(message) = *message else {
+                panic!("partial terminal must be assistant");
+            };
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_streaming_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let found = drain_to_first_assistant_start(&mut events_rx).await;
+    if !found {
+        if handle.is_finished() {
+            let completion = handle.await.expect("worker join");
+            let completion = match completion {
+                RunCompletion::Completed(_) => "completed".to_owned(),
+                RunCompletion::Failed { failure, .. } => format!("{failure}"),
+                RunCompletion::RehydrationRequired { failure } => {
+                    format!("rehydration required: {failure}")
+                }
+            };
+            panic!("worker completed before assistant MessageStart: {completion}");
+        }
+        panic!("worker must emit assistant MessageStart");
+    }
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: oneshot::channel().1,
+        })
+        .await
+        .expect("abort control");
+
+    // The worker has already unblocked; there is no extra event to receive.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the provider"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn provider_abort_waits_for_durable_authorization_before_cancelling() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("abort control");
+    assert!(accepted_rx.await.expect("worker accepts abort"));
+    tokio::task::yield_now().await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "provider cancellation must remain behind the durable cutoff"
+    );
+
+    committed_tx.send(()).expect("authorize durable abort");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !driver.cancelled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider observes authorized cancellation");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn provider_abort_dropped_durable_authorization_is_a_no_op() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel::<()>();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("abort control");
+    assert!(accepted_rx.await.expect("worker accepts abort"));
+    drop(committed_tx);
+    tokio::task::yield_now().await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "failed durable Abort must not cancel the provider"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn hard_steer_persists_authoritative_accumulated_text_and_thinking_without_marker() {
+    let driver = Arc::new(CancellingProbeDriver::new().with_partial());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    drain_to_partial_thinking_end(&mut events_rx).await;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+    assert!(accepted_rx.await.expect("worker accepts hard steer"));
+    cancellation
+        .reserve()
+        .expect("reserve provider attempt")
+        .cancel_after_commit();
+
+    let partial = receive_partial_message_end(&mut events_rx).await;
+    assert_eq!(
+        partial.content,
+        vec![
+            PublicAssistantContent::Text {
+                text: "authoritative text".to_owned(),
+                wire_item_index: 0,
+            },
+            PublicAssistantContent::Thinking {
+                thinking: "authoritative thinking".to_owned(),
+                signature_field: "reasoning_content".to_owned(),
+                wire_item_index: 1,
+            },
+        ],
+        "durable hard-steer content must come from the stream assembler, not initial metadata"
+    );
+    assert!(partial.interrupted);
+    assert_eq!(partial.stop_reason, StopReason::Aborted);
+    let replay = crate::memory::transform::transform(
+        &[ContextMessage::Synthetic {
+            message: public_to_message(PublicMessage::Assistant(partial.clone())),
+        }],
+        &origin(),
+    );
+    let Message::Assistant(replayed) = context_message(&replay[0]) else {
+        panic!("hard-steer partial must replay as assistant");
+    };
+    assert_eq!(
+        replayed
+            .content
+            .iter()
+            .filter(|content| matches!(
+                content,
+                AssistantContent::Text { text, .. }
+                    if text == crate::memory::transform::INTERRUPTION_MARKER
+            ))
+            .count(),
+        1,
+        "persistence plus replay must append exactly one interruption marker"
+    );
+
+    assert!(matches!(
+        handle
+            .await
+            .expect("provider attempt join")
+            .expect("provider attempt"),
+        AttemptOutcome::HardSteer
+    ));
+}
+
+#[tokio::test]
+async fn abort_persists_authoritative_accumulated_content_without_steer_marker() {
+    let driver = Arc::new(CancellingProbeDriver::new().with_partial());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation);
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    drain_to_partial_thinking_end(&mut events_rx).await;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("abort control");
+    assert!(accepted_rx.await.expect("worker accepts abort"));
+    committed_tx.send(()).expect("authorize durable abort");
+
+    let partial = receive_partial_message_end(&mut events_rx).await;
+    assert_eq!(partial.content.len(), 2);
+    assert!(matches!(
+        &partial.content[0],
+        PublicAssistantContent::Text { text, .. } if text == "authoritative text"
+    ));
+    assert!(
+        partial.content.iter().all(|content| !matches!(
+            content,
+            PublicAssistantContent::Text { text, .. }
+                if text == crate::memory::transform::INTERRUPTION_MARKER
+        )),
+        "Abort must not persist the hard-steer replay marker"
+    );
+    assert!(partial.interrupted);
+
+    assert!(matches!(
+        handle
+            .await
+            .expect("provider attempt join")
+            .expect("provider attempt"),
+        AttemptOutcome::ClosedError { .. }
+    ));
+}
+
+#[tokio::test]
+async fn provider_streaming_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let found = drain_to_first_assistant_start(&mut events_rx).await;
+    assert!(found, "worker must emit assistant MessageStart");
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the provider"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+struct ControlProbeDriver {
+    released: Arc<Notify>,
+    update_dropped: Arc<Notify>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct RuntimeProviderProbeDriver {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for RuntimeProviderProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        self.cancelled.notify_one();
+        Err(anyhow!("runtime provider start cancelled"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        unreachable!("provider probe has no tools")
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("provider probe has no overflow recovery")
+    }
+}
+
+impl ControlProbeDriver {
+    fn new() -> Self {
+        Self {
+            released: Arc::new(Notify::new()),
+            update_dropped: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_shutdown_reaches_provider_start_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(RuntimeProviderProbeDriver {
+        started: Arc::new(Notify::new()),
+        cancelled: Arc::new(Notify::new()),
+    });
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    runner
+        .claim_ordered_initial(admitted_user(1))
+        .expect("claim initial command");
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+
+    driver.started.notified().await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), driver.cancelled.notified())
+        .await
+        .expect("provider receives runtime shutdown");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_retry_wait_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(FixtureDriver::new(Vec::new()).blocking_retry());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let task =
+        tokio::spawn(async move { runner.wait_retry_or_control(Duration::from_secs(30)).await });
+
+    driver.retry_waiting.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("retry wait observes shutdown")
+            .expect("retry task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_pending_approval_phase() {
+    let shutdown = CancellationToken::new();
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let call = ToolCall {
+        id: "runtime-shutdown-approval".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let ApprovalOutcome::Pending { mut pending } = broker
+        .start_request(
+            &call,
+            &[],
+            "runtime-run",
+            "runtime-turn",
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval")
+    else {
+        panic!("fixture must enter pending approval")
+    };
+    let request_id = pending.request().id.clone();
+    let mut core = bound_core_with_runtime_shutdown(1, &shutdown);
+    core.set_approval(broker);
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let task = tokio::spawn(async move {
+        runner
+            .wait_for_approval(request_id, pending.receiver_mut())
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("approval wait observes shutdown")
+            .expect("approval task join"),
+        Err(WorkerFailure::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_shutdown_interrupts_tool_and_reaper_phase() {
+    let shutdown = CancellationToken::new();
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = Runner::new(
+        bound_core_with_runtime_shutdown(1, &shutdown),
+        driver.clone(),
+        control_rx,
+        events_tx,
+    );
+    let call = call("runtime-shutdown-probe");
+    let task =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+    shutdown.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("tool phase observes shutdown")
+            .expect("tool task join"),
+        Err(ExecuteToolError::Cancelled)
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !driver.cancelled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool driver/reaper observes the propagated cancellation");
+}
+
+#[async_trait]
+impl RunDriver for ControlProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("ControlProbeDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.update_dropped.notify_one();
+        let cancelled = self.cancelled.clone();
+        tokio::select! {
+            _ = self.released.notified() => {}
+            _ = cancel.cancelled() => {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        drop(on_update);
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "released".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, _message: &str) -> PublicMessage {
+        unreachable!("ControlProbeDriver has no synthetic errors")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("ControlProbeDriver has no overflow recovery")
+    }
+}
+
+#[tokio::test]
+async fn tool_execution_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: oneshot::channel().1,
+        })
+        .await
+        .expect("abort control");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    driver.released.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("tool should complete")
+        .expect("runner task join");
+
+    assert!(
+        result.is_ok(),
+        "dropped accepted receiver must not cancel the tool: {result:?}"
+    );
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the tool"
+    );
+
+    // Drain any progress/terminal events to avoid a hung event collector.
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn tool_abort_waits_for_durable_authorization_before_cancelling() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("abort control");
+    assert!(accepted_rx.await.expect("worker accepts abort"));
+    tokio::task::yield_now().await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "tool cancellation must remain behind the durable cutoff"
+    );
+
+    committed_tx.send(()).expect("authorize durable abort");
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("authorized abort completes")
+        .expect("runner task join");
+    assert!(matches!(result, Err(ExecuteToolError::Cancelled)));
+    assert!(driver.cancelled.load(Ordering::SeqCst));
+
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn tool_abort_dropped_durable_authorization_is_a_no_op() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel::<()>();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("abort control");
+    assert!(accepted_rx.await.expect("worker accepts abort"));
+    drop(committed_tx);
+    tokio::task::yield_now().await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "failed durable Abort must not cancel the tool"
+    );
+
+    driver.released.notify_one();
+    assert!(
+        handle
+            .await
+            .expect("runner task join")
+            .expect("tool completes after failed Abort")
+            .content
+            .iter()
+            .any(|content| matches!(content, UserContent::Text { text } if text == "released"))
+    );
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn tool_execution_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    driver.released.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("tool should complete")
+        .expect("runner task join");
+
+    assert!(
+        result.is_ok(),
+        "dropped accepted receiver must not cancel the tool: {result:?}"
+    );
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    while events_rx.try_recv().is_ok() {}
+}
+
+struct HardSteerToolDriver {
+    started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    executed_tools: Mutex<Vec<String>>,
+    tool_started: Arc<Notify>,
+    tool_released: Arc<Notify>,
+    tool_cancelled: Arc<AtomicBool>,
+}
+
+impl HardSteerToolDriver {
+    fn new() -> Self {
+        Self {
+            started_contexts: Mutex::new(Vec::new()),
+            executed_tools: Mutex::new(Vec::new()),
+            tool_started: Arc::new(Notify::new()),
+            tool_released: Arc::new(Notify::new()),
+            tool_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for HardSteerToolDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let mut contexts = self.started_contexts.lock().expect("contexts");
+        let first = contexts.is_empty();
+        contexts.push(context.to_vec());
+        let message = if first {
+            assistant(
+                StopReason::ToolUse,
+                vec![
+                    AssistantContent::ToolCall {
+                        tool_call: call("probe"),
+                        wire_item_index: 0,
+                    },
+                    AssistantContent::ToolCall {
+                        tool_call: call("not-started"),
+                        wire_item_index: 1,
+                    },
+                ],
+                None,
+                None,
+            )
+        } else {
+            assistant(StopReason::Stop, Vec::new(), None, None)
+        };
+        Ok(provider_attempt(attempt, message))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.executed_tools
+            .lock()
+            .expect("executed tools")
+            .push(call.id.clone());
+        self.tool_started.notify_one();
+        tokio::select! {
+            _ = self.tool_released.notified() => {}
+            _ = cancel.cancelled() => {
+                self.tool_cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "cancelled".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("HardSteerToolDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn soft_steer_during_tool_execution_lets_active_tool_finish() {
+    let driver = Arc::new(HardSteerToolDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.tool_started.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::SoftSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("soft steer control");
+    assert!(accepted_rx.await.expect("worker accepts soft steer"));
+    committed_tx.send(()).expect("authorize durable soft steer");
+    driver.tool_released.notify_one();
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("collector should complete")
+        .expect("event collector join");
+
+    assert_completed(completion);
+    assert!(
+        !driver.tool_cancelled.load(Ordering::SeqCst),
+        "soft steer must not cancel the running tool"
+    );
+    assert_eq!(
+        *driver.executed_tools.lock().expect("executed tools"),
+        vec!["probe".to_owned()],
+        "soft steer must prevent the not-started call from reaching the executor"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
+            .count(),
+        1,
+        "not-started calls must not emit ToolExecutionStart: {events:#?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageEnd {
+            message,
+            ..
+        } if matches!(
+            message.as_ref(),
+            PublicMessage::ToolResult(result)
+                if result.tool_call_id == "not-started"
+                    && result.is_error
+                    && matches!(
+                        &result.content[0],
+                        UserContent::Text { text }
+                            if text == "ユーザーの新しい指示により実行前に取り消された"
+                    )
+        )
+    )));
+
+    let hard_steer_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message_id, .. } if message_id == &hard_steer_id
+                )
+            })
+            .count(),
+        1,
+        "hard-steer user message must be injected exactly once on the next turn: {events:#?}"
+    );
+
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(
+        contexts.len(),
+        2,
+        "there must be a second provider attempt after the hard steer"
+    );
+    assert!(
+        contexts[1].iter().any(|message| matches!(
+            context_message(message),
+            Message::User(user)
+                if matches!(&user.content[0], UserContent::Text { text } if text == "message 2")
+        )),
+        "second provider context must include the hard-steer user message: {contexts:?}"
+    );
+}
+
+#[tokio::test]
+async fn emit_tool_start_preempts_by_controls_queued_before_commit() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    // Queue a soft-steer control before the worker attempts to durably commit
+    // the ToolExecutionStart. The worker must observe it, classify the new
+    // instruction, and return Preempted without emitting ToolExecutionStart.
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let bind_commit = tokio::spawn(async move {
+        if accepted_rx.await.is_ok() {
+            let _ = committed_tx.send(());
+        }
+    });
+    control_tx
+        .send(RunControl::SoftSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("enqueue soft steer");
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("preempted"), None)
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    bind_commit.await.expect("steer bind commit task");
+
+    assert!(
+        runner.in_flight_controls.len() == 1,
+        "queued soft steer must be claimed for injection"
+    );
+    assert!(
+        events_rx.try_recv().is_err(),
+        "ToolExecutionStart must not be committed when preempted"
+    );
+}
+
+/// Simulates the race where the `ToolExecutionStart` output has been sent and
+/// its `ToolStartCommitBarrier` is deliberately held, then a soft-steer control
+/// arrives and is durably authorized before the barrier completes. The worker
+/// must return `Preempted` and the start output must never be committed.
+#[tokio::test]
+async fn tool_start_barrier_held_by_soft_steer_preempts() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    // Collector receives the ToolExecutionStart and holds the barrier so the
+    // start is not durably committed until the test decides.
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        assert!(matches!(
+            output.event,
+            AgentEvent::ToolExecutionStart { .. }
+        ));
+        let _ = start_held_tx.send(());
+        let _ = drop_rx.await;
+    });
+
+    // Send the soft-steer control only after the start output is held.
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        control_tx
+            .send(RunControl::SoftSteer {
+                command: admitted_user(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send soft steer");
+        assert!(accepted_rx.await.expect("accepted"));
+        committed_tx.send(()).expect("authorize soft steer");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("held"), None)
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    // Allow the collector to drop the held output without resolving the start
+    // barrier.
+    drop(drop_tx);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+
+    assert_eq!(
+        runner.in_flight_controls.len(),
+        1,
+        "soft steer must be claimed for injection"
+    );
+    assert!(!runner.abort_requested);
+    assert!(runner.core.next_followup().is_none());
+}
+
+/// Same race as `tool_start_barrier_held_by_soft_steer_preempts`, but with an
+/// abort control. The tool must not execute and the start output must not be
+/// durably committed.
+#[tokio::test]
+async fn tool_start_barrier_held_by_abort_preempts() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        assert!(matches!(
+            output.event,
+            AgentEvent::ToolExecutionStart { .. }
+        ));
+        let _ = start_held_tx.send(());
+        let _ = drop_rx.await;
+    });
+
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        control_tx
+            .send(RunControl::Abort {
+                command: admitted_abort(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send abort");
+        assert!(accepted_rx.await.expect("accepted"));
+        committed_tx.send(()).expect("authorize abort");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("held"), None)
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    drop(drop_tx);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+
+    assert!(runner.abort_requested, "abort must be requested");
+    assert!(runner.in_flight_controls.is_empty());
+    assert!(runner.core.next_followup().is_none());
+}
+
+#[tokio::test]
+async fn dropped_soft_steer_authorization_cannot_preempt_tool_start() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RunControl::SoftSteer {
+                command: admitted_user(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send soft steer");
+        assert!(accepted_rx.await.expect("accepted"));
+        drop(committed_tx);
+        commit_start_tx.send(()).expect("release held start");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("authorization-dropped"), None)
+        .await
+        .expect("dropped authorization must leave the committed start authoritative");
+    assert_eq!(outcome, ToolStartOutcome::Started);
+    assert!(runner.in_flight_controls.is_empty());
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+}
+
+#[tokio::test]
+async fn dropped_abort_authorization_cannot_cancel_committed_tool_start() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RunControl::Abort {
+                command: admitted_abort(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send abort");
+        assert!(accepted_rx.await.expect("accepted"));
+        drop(committed_tx);
+        commit_start_tx.send(()).expect("release held start");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("abort-authorization-dropped"), None)
+        .await
+        .expect("dropped authorization must leave the committed start authoritative");
+    assert_eq!(outcome, ToolStartOutcome::Started);
+    assert!(!runner.abort_requested);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+}
+
+#[tokio::test]
+async fn safe_point_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let cancel = CancellationToken::new();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_watch = cancel.clone();
+    let cancelled_flag = cancelled.clone();
+    tokio::spawn(async move {
+        cancel_watch.cancelled().await;
+        cancelled_flag.store(true, Ordering::SeqCst);
+    });
+    runner.provider_cancel = Some(cancel);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: oneshot::channel().1,
+        })
+        .await
+        .expect("abort control");
+
+    runner
+        .receive_control_safe_point()
+        .await
+        .expect("safe point");
+
+    assert!(!runner.abort_requested, "abort must not be applied");
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "provider must not be cancelled"
+    );
+}
+
+#[tokio::test]
+async fn safe_point_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let cancel = CancellationToken::new();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_watch = cancel.clone();
+    let cancelled_flag = cancelled.clone();
+    tokio::spawn(async move {
+        cancel_watch.cancelled().await;
+        cancelled_flag.store(true, Ordering::SeqCst);
+    });
+    runner.provider_cancel = Some(cancel);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    runner
+        .receive_control_safe_point()
+        .await
+        .expect("safe point");
+
+    assert!(
+        runner.core.pending_controls.is_empty(),
+        "hard steer must not be queued"
+    );
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "provider must not be cancelled"
+    );
+}
+
+#[tokio::test]
+async fn retry_wait_hard_steer_dropped_accept_continues_without_duplicate() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("stale hard steer");
+
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id)
+            })
+            .count(),
+        1,
+        "dropped hard steer must not be injected in addition to the durable deferral"
+    );
+}
+
+#[tokio::test]
+async fn retry_wait_abort_dropped_accept_continues_without_cancelling() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: oneshot::channel().1,
+        })
+        .await
+        .expect("stale abort");
+
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id)
+            })
+            .count(),
+        1,
+        "dropped abort must not cancel the worker before the durable deferral"
+    );
+}
+
+#[tokio::test]
+async fn provider_attempt_cancellation_deferred_until_hard_steer_commit() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver.clone(), control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (accepted_tx, _accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("send hard steer");
+
+    let reservation = cancellation.reserve().expect("reserve active attempt");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+    reservation.cancel_after_commit();
+    tokio::task::yield_now().await;
+    assert!(driver.cancelled.load(Ordering::SeqCst));
+
+    let mut seq = 1;
+    let mut output = events_rx
+        .recv()
+        .await
+        .expect("hard-steer partial MessageEnd");
+    resolve_message_output(&mut output, &mut seq);
+
+    let outcome = handle
+        .await
+        .expect("provider attempt join")
+        .expect("provider attempt");
+    assert!(matches!(outcome, super::AttemptOutcome::HardSteer));
+}
+
+#[tokio::test]
+async fn failed_hard_steer_reservation_restores_provider_for_abort() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver.clone(), control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (accepted_tx, _accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("send hard steer");
+
+    let reservation = cancellation.reserve().expect("reserve active attempt");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+    reservation.restore().expect("restore reservation");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (abort_accepted_tx, _abort_accepted_rx) = oneshot::channel();
+    let (abort_committed_tx, abort_committed_rx) = oneshot::channel();
+    abort_committed_tx
+        .send(())
+        .expect("authorize durable abort");
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(3),
+            accepted: abort_accepted_tx,
+            committed: abort_committed_rx,
+        })
+        .await
+        .expect("send abort");
+
+    let mut seq = 1;
+    let mut output = events_rx
+        .recv()
+        .await
+        .expect("aborted assistant MessageEnd");
+    resolve_message_output(&mut output, &mut seq);
+
+    let outcome = handle
+        .await
+        .expect("provider attempt join")
+        .expect("provider attempt");
+    assert!(matches!(outcome, super::AttemptOutcome::ClosedError { .. }));
+    tokio::task::yield_now().await;
+    assert!(driver.cancelled.load(Ordering::SeqCst));
+}
+
+async fn abort_during_tool_with_steer_event_sequence(
+    steer: Option<(RunControl, oneshot::Receiver<bool>, oneshot::Sender<()>)>,
+) -> (RunCompletion, Vec<AgentEvent>, Arc<HardSteerToolDriver>) {
+    let driver = Arc::new(HardSteerToolDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.tool_started.notified().await;
+
+    if let Some((steer, accepted_rx, committed_tx)) = steer {
+        control_tx.send(steer).await.expect("send steer control");
+        assert!(accepted_rx.await.expect("worker accepts steer"));
+        committed_tx.send(()).expect("authorize durable steer");
+    }
+
+    let (abort_accepted_tx, abort_accepted_rx) = oneshot::channel();
+    let (abort_committed_tx, abort_committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(3),
+            accepted: abort_accepted_tx,
+            committed: abort_committed_rx,
+        })
+        .await
+        .expect("send abort");
+    assert!(abort_accepted_rx.await.expect("worker accepts abort"));
+    abort_committed_tx
+        .send(())
+        .expect("authorize durable abort");
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("event collector should complete")
+        .expect("event collector join");
+
+    (completion, events, driver)
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_closes_normally_without_steer() {
+    let (completion, events, driver) = abort_during_tool_with_steer_event_sequence(None).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must not inject a steer user message: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_drops_claimed_soft_steer_and_closes_normally() {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let steer = RunControl::SoftSteer {
+        command: admitted_user(2),
+        accepted: accepted_tx,
+        committed: committed_rx,
+    };
+    let (completion, events, driver) =
+        abort_during_tool_with_steer_event_sequence(Some((steer, accepted_rx, committed_tx))).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must discard an already-claimed soft steer and not inject it: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool with soft steer must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool with soft steer must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_drops_claimed_retry_steer_and_closes_normally() {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let steer = RunControl::RetrySteer {
+        command: admitted_user(2),
+        accepted: accepted_tx,
+        committed: committed_rx,
+    };
+    let (completion, events, driver) =
+        abort_during_tool_with_steer_event_sequence(Some((steer, accepted_rx, committed_tx))).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must discard an already-claimed retry steer and not inject it: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool with retry steer must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool with retry steer must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_retry_wait_reaches_turn_end_and_agent_end() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.retry_waiting.notified().await;
+
+    let (abort_accepted_tx, abort_accepted_rx) = oneshot::channel();
+    let (abort_committed_tx, abort_committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: abort_accepted_tx,
+            committed: abort_committed_rx,
+        })
+        .await
+        .expect("send abort during retry wait");
+    assert!(abort_accepted_rx.await.expect("worker accepts abort"));
+    abort_committed_tx
+        .send(())
+        .expect("authorize durable abort during retry wait");
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("event collector should complete")
+        .expect("event collector join");
+
+    assert_completed(completion);
+    let turn_end_events: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        turn_end_events.len(),
+        1,
+        "abort during retry wait must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during retry wait must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[derive(Clone)]
+struct RecordingReviewer {
+    prompts: Arc<Mutex<Vec<ReviewerPrompt>>>,
+}
+
+impl RecordingReviewer {
+    fn new() -> Self {
+        Self {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn prompts(&self) -> Vec<ReviewerPrompt> {
+        self.prompts.lock().expect("prompts").clone()
+    }
+}
+
+#[async_trait]
+impl ReviewerTransport for RecordingReviewer {
+    async fn complete(
+        &self,
+        prompt: &ReviewerPrompt,
+        _cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        self.prompts.lock().expect("prompts").push(prompt.clone());
+        Ok(
+            r#"{"outcome":"allow","risk":"low","authorization":"high","rationale":"ok"}"#
+                .to_owned(),
+        )
+    }
+}
+
+fn bash_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value::<ValidatedToolArguments>(
+            json!({"command": "git status"}),
+        )
+        .expect("valid bash args"),
+    }
+}
+
+#[tokio::test]
+async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result() {
+    let transport = Arc::new(RecordingReviewer::new());
+    let reviewer_projector = Arc::new(SecretAwareActionProjector::new(
+        Redactor::v1(),
+        SecretDigestKey::fixture(),
+    ));
+    let model = ReviewerModelSpec::new(
+        "audit",
+        "fixture",
+        "https://reviewer.invalid",
+        "test",
+        "trusted",
+        "test-policy",
+    );
+    let reviewer = Arc::new(Reviewer::new(
+        model.clone(),
+        ReviewerTrustSet::new(model, vec![]),
+        transport.clone(),
+        reviewer_projector,
+    ));
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        projector,
+        Some(reviewer),
+        ReviewerMode::AutoReview,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::ToolUse,
+            vec![
+                AssistantContent::ToolCall {
+                    tool_call: bash_call("first"),
+                    wire_item_index: 0,
+                },
+                AssistantContent::ToolCall {
+                    tool_call: bash_call("second"),
+                    wire_item_index: 1,
+                },
+            ],
+            None,
+            None,
+        )),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (completion, _) = run_fixture_with(driver, core, admitted_user(1)).await;
+    assert_completed(completion);
+
+    let prompts = transport.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "same projection with advancing context/cache version must call reviewer twice"
+    );
+
+    fn tool_call_evidence_count(prompt: &ReviewerPrompt) -> usize {
+        prompt
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, ReviewerRole::ToolEvidence) && m.content.contains("tool_call")
+            })
+            .count()
+    }
+    fn tool_evidence_count(prompt: &ReviewerPrompt) -> usize {
+        prompt
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, ReviewerRole::ToolEvidence) && m.content.contains("tool_result")
+            })
+            .count()
+    }
+
+    assert_eq!(
+        tool_call_evidence_count(&prompts[0]),
+        2,
+        "first review must see both tool calls from the committed assistant message"
+    );
+    assert_eq!(
+        tool_evidence_count(&prompts[0]),
+        0,
+        "first review must not see uncommitted tool results"
+    );
+    assert_eq!(
+        tool_call_evidence_count(&prompts[1]),
+        2,
+        "second review must still see the current committed assistant tool-call message"
+    );
+    assert_eq!(
+        tool_evidence_count(&prompts[1]),
+        1,
+        "second review must see the first finalized tool result"
+    );
+    assert!(
+        prompts[1].messages.iter().any(|m| {
+            matches!(m.role, ReviewerRole::ToolEvidence)
+                && m.content.contains("bash")
+                && m.content.contains("outcome=ok")
+        }),
+        "second review transcript must include the first bash tool result"
+    );
 }

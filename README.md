@@ -1,10 +1,27 @@
 # sumi-studio
 
+Sumi は、1 人のユーザーと永続的な人格を持つエージェントが、同じチャットと
+作業空間で協働するためのアプリケーションです。React のブラウザ UI、Go の
+認証・リアルタイム API、Rust の PersonalityAgent runtime で構成されます。
+
 ## Sumi
+
 A shared workspace where people and their AI secretaries work together.
+
 ### Description
-Sumi brings conversations, tasks, calendars, notes, email, browsing, meetings, studying, and whatever else each person needs into one connected place. The workspace takes shape around each person's routines and needs. As trust grows, their AI secretary can remain by their side and understand more of their everyday life and work as it unfolds. The interface can adapt to what each moment calls for. AI secretaries can coordinate with people and one another, point things out on screen, and gradually take action with the permissions people give them.
-People and their AI secretaries use the same apps and inhabit the same workspace. Each AI secretary lives there as an individual, moving through time alongside the people around them. What they live through together becomes part of who each secretary is and who they are becoming. Sumi aims to democratize access to personal secretaries and extend what a personal secretary can be.
+
+Sumi brings conversations, tasks, calendars, notes, email, browsing, meetings,
+studying, and whatever else each person needs into one connected place. The
+workspace takes shape around each person's routines and needs. As trust grows,
+their AI secretary can remain by their side and understand more of their everyday
+life and work as it unfolds. The interface can adapt to what each moment calls
+for. AI secretaries can coordinate with people and one another, point things out
+on screen, and gradually take action with the permissions people give them.
+People and their AI secretaries use the same apps and inhabit the same workspace.
+Each AI secretary lives there as an individual, moving through time alongside the
+people around them. What they live through together becomes part of who each
+secretary is and who they are becoming. Sumi aims to democratize access to
+personal secretaries and extend what a personal secretary can be.
 
 ## 技術スタック
 
@@ -16,7 +33,7 @@ People and their AI secretaries use the same apps and inhabit the same workspace
 | 動的UI (SDUI) | zod スキーマ + component registry |
 | 状態管理 | Zustand + TanStack Query |
 | シェル (デスクトップ / モバイル) | Tauri 2 |
-| エージェント基盤 | Rust (導入予定、pi を設計参照) |
+| エージェント基盤 | Rust (durable runtime + 分離 tool executor) |
 | バックエンド | Go |
 | API 定義 | OpenAPI 3.1 (契約ファースト) |
 | モノレポ | pnpm workspaces + Turborepo |
@@ -73,7 +90,11 @@ sumi-studio/
 └── README.md
 ```
 
-`apps/agent` の Rust スキャフォールド(`Cargo.toml` と turbo 接続用 `package.json`)は関連 PR で導入し、agent loop・3層メモリ・ツール実行を配置する。設計と導入手順は [ADR 0002](docs/adr/0002-agent-stack.md) と [エージェント実装計画](docs/agent/implementation-plan.md) を参照。
+`apps/agent` には production bootstrap、durable agent loop、3 層メモリ、
+provider 接続、分離 tool executor を実装している。設計判断は
+[ADR 0002](docs/adr/0002-agent-stack.md)、
+[ADR 0007](docs/adr/0007-production-runtime-bootstrap-boundary.md)、
+[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md) を参照。
 
 ### アーキテクチャ上の原則
 
@@ -84,16 +105,27 @@ sumi-studio/
 
 ## 開発環境セットアップ
 
-必要なもの: Node.js >= 20.19、pnpm 11、Go 1.26+ (`~/.local/go` 等に配置して PATH を通す)。`apps/agent` 導入後のエージェント開発には Rust stable (`rustup` 推奨) も必要。
+必要なもの: Node.js >= 20.19、pnpm 11、Go、Rust stable、`curl`、
+`openssl`、`flock`。ブラウザから実際のエージェントを使う手順と Firebase /
+provider credential の設定は
+[Real local stack](docs/local-development.md) を参照。
 
 ```sh
-make setup   # pnpm install
-make dev     # 現在存在する全 dev サーバーを turbo 経由で起動
-make build   # 全ビルド
-make lint    # 現行ツリー: Biome + go vet
-make test    # 全テスト
-make api-dev # Go API サーバー単体起動 (PORT=8080)
+make setup     # pnpm install
+make dev-check # Firebase/provider/identity 設定を検証
+make dev       # 認証済み real stack を依存順・readiness gate 付きで起動
+make build     # 全ビルド
+make lint      # Biome + Go + Rust lint
+make test      # 全テスト
 ```
+
+既定の `make dev` URL は正確に `http://127.0.0.1:5173`。Vite が同一
+origin の `/auth` (HTTP) と `/direct-chat` (WebSocket) を Go API へ
+proxy する。別の Tailnet 端末から直接使う場合は、wildcard ではなく
+`SUMI_PUBLIC_LISTEN=<literal-tailscale-ipv4>:8080` を設定する。詳細は
+[Real local stack](docs/local-development.md#direct-tailnet-access) を参照。
+`make dev-workspaces` は raw Turbo task 用であり、利用可能な product stack を
+起動するコマンドではない。
 
 API の型を変更する場合は `contracts/openapi.yaml` を編集後、`pnpm --filter @sumi/api-client generate` で TS 型を再生成する。
 

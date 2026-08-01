@@ -15,7 +15,213 @@ paths:
               schema:
                 type: object
                 required: [status]
+                additionalProperties: false
                 properties:
                   status:
                     type: string
                     enum: [ok]
+  /direct-chat/commands:
+    post:
+      operationId: createDirectChatCommand
+      summary: Create a direct-chat user command
+      description: |
+        Admits content from the authenticated direct-chat browser session. The
+        signed HttpOnly `sumi_session` cookie supplies the target personality
+        agent and human provenance; neither is accepted from the browser body.
+        The request Origin must exactly match the configured browser origin
+        allowlist. Origin rejection occurs before session or body processing;
+        all rejections occur before command_id or seq allocation.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+      security:
+        - sumiSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DirectChatUserMessageCommand"
+      responses:
+        "201":
+          description: Target-free command receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectChatCommandReceipt"
+        "400":
+          description: Command rejected before seq/command_id allocation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectChatCommandRejectedResponse"
+        "409":
+          description: Idempotency key was already used for different content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectChatCommandIdempotencyConflictResponse"
+        "401":
+          description: Missing or invalid browser session cookie
+        "403":
+          description: Origin not allowed
+  /direct-chat/ws:
+    get:
+      operationId: browserWebSocket
+      summary: Browser-facing WebSocket
+      description: |
+        Upgrades to a WebSocket for browser clients. After the handshake the
+        client sends `BrowserClientFrame` messages and the server pushes
+        `BrowserServerFrame` messages. The caller is authenticated by the signed
+        HttpOnly `sumi_session` browser cookie.
+      security:
+        - sumiSession: []
+      requestBody:
+        description: The first WebSocket frame (BrowserHello)
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrowserClientFrame"
+      responses:
+        "101":
+          description: WebSocket upgrade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserServerFrame"
+        "401":
+          description: Missing or invalid browser session cookie
+        "403":
+          description: Origin not allowed
+  /agent/ws:
+    get:
+      operationId: agentWebSocket
+      summary: Agent-facing WebSocket
+      description: |
+        Upgrades to a WebSocket for agent workers. After the handshake the agent
+        sends `AgentHello` followed by `OutboundFrame` messages, and the server
+        replies with `ApiHello` followed by `CommandEnvelope` messages. The
+        caller is authenticated by a short-lived `Authorization: Bearer` token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        description: The first WebSocket frame (AgentHello)
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentHello"
+      responses:
+        "101":
+          description: WebSocket upgrade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiHello"
+        "401":
+          description: Missing or invalid agent token
+        "403":
+          description: Origin not allowed
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Short-lived HMAC-SHA256 agent token.
+    sumiSession:
+      type: apiKey
+      in: cookie
+      name: sumi_session
+      description: Signed HttpOnly browser session cookie.
+  schemas:
+    JsonSafeInteger:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: non-negative integer representable exactly by JavaScript number clients
+    ProcessGeneration:
+      type: string
+      pattern: '^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7])$'
+      format: canonical-process-generation
+      description: canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
+    CanonicalDecimalU64:
+      type: string
+      pattern: '^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$'
+      format: canonical-decimal-u64
+      description: canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+    CommandEnvelope:
+      $ref: "./agent-events.yaml#/$defs/CommandEnvelope"
+    PersonalityAgentId:
+      $ref: "./agent-events.yaml#/$defs/PersonalityAgentId"
+    DirectChatProvenanceV1:
+      $ref: "./agent-events.yaml#/$defs/DirectChatProvenanceV1"
+    AgentHello:
+      $ref: "./agent-events.yaml#/$defs/AgentHello"
+    ApiHello:
+      $ref: "./agent-events.yaml#/$defs/ApiHello"
+    OutboundFrame:
+      $ref: "./agent-events.yaml#/$defs/OutboundFrame"
+    BrowserClientFrame:
+      $ref: "./agent-events.yaml#/$defs/BrowserClientFrame"
+    BrowserServerFrame:
+      $ref: "./agent-events.yaml#/$defs/BrowserServerFrame"
+    DirectChatUserMessageCommand:
+      type: object
+      required: [type, text, attachments]
+      additionalProperties: false
+      properties:
+        type:
+          const: user_message
+        text:
+          type: string
+        attachments:
+          type: array
+          maxItems: 0
+          items:
+            $ref: "./agent-events.yaml#/$defs/Attachment"
+    DirectChatCommandReceipt:
+      type: object
+      required: [idempotency_key, command_id, seq]
+      additionalProperties: false
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        command_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        seq:
+          $ref: "#/components/schemas/JsonSafeInteger"
+    DirectChatCommandRejectedResponse:
+      type: object
+      required: [error, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: invalid_command
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        reject_reason:
+          type: string
+          enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+    DirectChatCommandIdempotencyConflictResponse:
+      type: object
+      required: [error, idempotency_key, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: idempotency_conflict
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        reject_reason:
+          const: idempotency_conflict

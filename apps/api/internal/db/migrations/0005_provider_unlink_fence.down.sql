@@ -1,0 +1,4 @@
+DROP INDEX IF EXISTS auth_flows_completed_email_link_proof;
+DROP TRIGGER IF EXISTS provider_operations_pending_unlink_uid_fence ON provider_operations;
+DROP FUNCTION IF EXISTS enforce_provider_unlink_uid_fence();
+DROP INDEX IF EXISTS provider_operations_one_pending_unlink_per_firebase_uid;

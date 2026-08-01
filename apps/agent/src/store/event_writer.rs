@@ -1,39 +1,82 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+#[cfg(test)]
+use crate::provider::types::ProviderContextItem;
 use crate::{
-    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, SteerMode},
+    agent::{
+        AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode,
+        events::{CommandDisposition, CommandDispositionEvent, CommandDispositionRejectReason},
+    },
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
-    provider::types::{PublicMessage, StopReason, ToolResultMessage},
-    runtime::contracts::ProcessGeneration,
+    memory::{
+        BatchId, BatchState, CompactResult, L0Batch,
+        batch::{BoundaryContext, SealReason, seal_before_next},
+        estimate::{
+            TOKEN_CALIBRATION_EMA_ALPHA, TokenCalibration, estimate_public_message,
+            eviction_footprint_for_payload, observed_prompt_tokens,
+        },
+    },
+    provider::{
+        model::ModelSpec,
+        types::{
+            ApiProtocol, ContextMessage, Message, ProviderContextAnchor, ProviderContextFragment,
+            ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+            StopReason, ToolResultMessage,
+        },
+    },
+    runtime::contracts::{
+        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
+        ProcessGenerationLease,
+    },
 };
 
 use super::{
-    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
-    InjectionBatchSizeInput, InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store,
+    BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer,
+    EventWriterQuiescence, InjectionApplication, InjectionBatchSizeInput,
+    InjectionCommandSizeInput, PostCommitDispatcherOwner, PublicProjectionBuilder, Redactor, Store,
     command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
+    },
+    memory_state::{
+        MEMORY_CALIBRATION_ID, MemoryApplyCursorRecord, MemoryBatchMessageRecord,
+        MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
+        MemoryJobResult, MemoryJobStatus, MemoryLayer, MemoryProjectionDeltaV1,
+        MemoryProjectionEntity, MemoryProjectionKey, MemoryProjectionRef,
+        capture_memory_projection_ref, commit_memory_projection, extend_memory_membership_digest,
+        load_verified_memory_projection_set, memory_membership_seed,
+    },
+    physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
+    provider_context::{
+        EncryptedProviderContextRecord, PreparedProviderContextMutation, ProviderContextMutation,
+        ProviderContextMutationApplier, ProviderContextMutationBuilder,
+        commit_provider_context_projection_set, provider_context_record_id,
+        verify_provider_context_projection_set,
     },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -41,6 +84,76 @@ use super::{
 
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
+const INBOUND_ADMISSION_RECORD_VERSION: u8 = 2;
+const INBOUND_ADMISSION_RECORD_HMAC_DOMAIN: &[u8] = b"sumi-inbound-admission-record/v2";
+
+#[derive(Serialize)]
+struct InboundAdmissionRecordV2<'a> {
+    version: u8,
+    seq: u64,
+    command_id: &'a str,
+    personality_agent_id: &'a str,
+    provenance_json: &'a str,
+    command_kind: &'a str,
+    payload_key_ref: &'a str,
+    payload_hmac: &'a [u8],
+    reject_reason: Option<&'a str>,
+    reject_actual_bytes: Option<u64>,
+}
+
+fn admission_record_hmac(
+    key: &super::crypto::DataKeyMaterial,
+    record: &InboundAdmissionRecordV2<'_>,
+) -> Result<Vec<u8>> {
+    let canonical = serde_json::to_vec(record)
+        .context("failed to serialize canonical inbound admission record")?;
+    Ok(super::crypto::keyed_proof(
+        key,
+        INBOUND_ADMISSION_RECORD_HMAC_DOMAIN,
+        &canonical,
+    ))
+}
+
+#[derive(Serialize)]
+struct MemorySummaryPayload<'a> {
+    summary: &'a str,
+    est_tokens: u64,
+    from: &'a DateTime<Utc>,
+    to: &'a DateTime<Utc>,
+}
+
+/// Recovery binding carried through an `EventWriter` transaction. Only
+/// `EventWriter::apply_physical_recovery` may supply this context; generic
+/// `apply` rejects `Projection::PhysicalRecovery` outright.
+struct PhysicalRecoveryContext<'a> {
+    lease: &'a ProcessGenerationLease,
+    fence: &'a GenerationRecoveryFence,
+    receipt: &'a PhysicalRecoveryReceipt,
+}
+
+/// Outcome of applying an `EventBatch`.  The `receipt_outcome` is only
+/// `Some` when the batch contains a `PhysicalRecovery` projection, whose
+/// `Applied`/`AlreadyApplied` result is determined inside the SQLite
+/// transaction by `PhysicalRecoveryApplier::apply_in_transaction`.
+struct ApplyBatchOutcome {
+    seqs: Vec<u64>,
+    events: Vec<AgentEvent>,
+    receipt_outcome: Option<ApplyReceiptOutcome>,
+}
+
+pub(crate) struct AbortCutoffOutcome {
+    pub(crate) events: Vec<(u64, AgentEvent)>,
+    pub(crate) acks: Vec<CommandAck>,
+}
+
+impl ApplyBatchOutcome {
+    fn sequenced_events(self) -> Result<Vec<(u64, AgentEvent)>> {
+        if self.seqs.len() != self.events.len() {
+            bail!("EventWriter outcome event/sequence cardinality mismatch");
+        }
+        Ok(self.seqs.into_iter().zip(self.events).collect())
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
@@ -53,6 +166,8 @@ pub(crate) struct DurableEvent {
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) direct_chat_provenance: Option<DirectChatProvenanceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) run_id: Option<String>,
@@ -63,9 +178,13 @@ pub(super) struct DurableEventMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tool_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) executor_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) approval_actor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) empty_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) memory_projection: Option<MemoryProjectionDeltaV1>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -84,13 +203,8 @@ impl DurableEvent {
     }
 
     fn from_parts(value: AgentEvent, metadata: DurableEventMetadata) -> Result<Self> {
-        let kind = value
-            .durable_kind()
-            .ok_or_else(|| anyhow!("durable event does not match the closed T12 schema"))?;
-        if kind == "memory_maintenance" {
-            bail!(
-                "durable event does not match the closed T12 schema: MemoryMaintenance is owned by T17"
-            );
+        if value.durable_kind().is_none() {
+            bail!("durable event does not match the closed T12 schema");
         }
         if matches!(&value, AgentEvent::ToolExecutionStart { args, .. } if !args.is_object()) {
             bail!(
@@ -161,6 +275,44 @@ impl DurableEvent {
         )
     }
 
+    fn command_disposition(
+        command_id: impl Into<String>,
+        command_seq: u64,
+        disposition: CommandDisposition,
+    ) -> Result<Self> {
+        let command_id = command_id.into();
+        CommandId::parse(&command_id)
+            .map_err(|_| anyhow!("durable CommandDisposition command_id is not canonical"))?;
+        if command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+            bail!("durable CommandDisposition command_seq exceeds the JSON-safe integer range");
+        }
+        Self::from_parts(
+            AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }),
+            DurableEventMetadata::default(),
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "T17 memory maintenance events are wired by the T20 maintainer"
+    )]
+    pub(crate) fn memory_maintenance(kind: impl Into<String>) -> Result<Self> {
+        let kind = kind.into();
+        if kind.is_empty() {
+            bail!("durable MemoryMaintenance kind must not be empty");
+        }
+        Self::from_parts(
+            AgentEvent::MemoryMaintenance {
+                kind: MemoryMaintKind::new(kind),
+            },
+            DurableEventMetadata::default(),
+        )
+    }
+
     #[allow(dead_code, reason = "T15 consumes the T12-frozen lifecycle builders")]
     pub(crate) fn turn_start(
         run_id: impl Into<String>,
@@ -196,7 +348,11 @@ impl DurableEvent {
         )
     }
 
-    fn empty_turn_end(run_id: impl Into<String>, turn_id: impl Into<String>) -> Result<Self> {
+    #[allow(dead_code, reason = "T15 consumes the T12-frozen lifecycle builders")]
+    pub(crate) fn empty_turn_end(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Result<Self> {
         Self::from_parts(
             AgentEvent::TurnEnd {
                 message: None,
@@ -260,6 +416,9 @@ impl DurableEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+        command_id: String,
+        run_id: String,
+        executor_generation: ProcessGeneration,
     ) -> Result<Self> {
         Self::from_parts(
             AgentEvent::ToolExecutionStart {
@@ -268,7 +427,10 @@ impl DurableEvent {
                 args,
             },
             DurableEventMetadata {
+                command_id: Some(command_id),
+                run_id: Some(run_id),
                 tool_state: Some("running".to_owned()),
+                executor_generation: Some(executor_generation.as_i64()),
                 ..DurableEventMetadata::default()
             },
         )
@@ -378,6 +540,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             None | Some(Value::Null) => Ok(None),
             Some(value) => serde_json::from_value::<String>(value).map(Some),
         };
+    let take_i64 =
+        |object: &mut serde_json::Map<String, Value>, field: &str| match object.remove(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value::<i64>(value).map(Some),
+        };
     let mut metadata = DurableEventMetadata::default();
     match event_type.as_str() {
         "agent_start" | "agent_end" => {
@@ -397,9 +564,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             metadata.turn_id = take_string(object, "turn_id")?;
         }
         "tool_execution_start" => {
+            metadata.command_id = take_string(object, "command_id")?;
             metadata.run_id = take_string(object, "run_id")?;
             metadata.turn_id = take_string(object, "turn_id")?;
             metadata.tool_state = take_string(object, "state")?;
+            metadata.executor_generation = take_i64(object, "executor_generation")?;
         }
         "tool_execution_end" => {
             metadata.run_id = take_string(object, "run_id")?;
@@ -533,8 +702,12 @@ impl DurableEvent {
                 turn_id: self.metadata.turn_id.as_deref(),
                 ..empty("retry_scheduled")
             },
-            AgentEvent::MemoryMaintenance { .. }
-            | AgentEvent::MessageUpdate { .. }
+            AgentEvent::CommandDisposition(event) => DurableEventIdentity {
+                command_id: Some(&event.command_id),
+                ..empty("command_disposition")
+            },
+            AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
+            AgentEvent::MessageUpdate { .. }
             | AgentEvent::ToolExecutionUpdate { .. }
             | AgentEvent::Error { .. } => unreachable!("non-T12 durable event was rejected"),
         }
@@ -559,16 +732,38 @@ pub(crate) struct EventBatch {
     pub injected_commands: Vec<InjectedCommand>,
 }
 
+/// Private-builder result for one Error attempt's provider-context retention
+/// boundary. The prepared intent is deliberately opaque outside EventWriter:
+/// lifecycle owners may attach it to the exact disposition transaction and
+/// invoke the common applier, but cannot change its target set or identity.
+#[derive(Clone, Debug)]
+pub(crate) struct ErrorContextDisposition {
+    prepared: PreparedProviderContextMutation,
+}
+
+impl ErrorContextDisposition {
+    pub(crate) fn mutation_id(&self) -> &str {
+        self.prepared.mutation_id()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InjectedCommand {
     seq: u64,
     command_id: CommandId,
     message_id: String,
+    provenance: DirectChatProvenanceV1,
 }
 
-/// T18 freezes this same value into the generated cross-language contracts.
-pub(crate) const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x78, 0xf6, 0x2d, 0x15, 0xb9, 0x45, 0x4a, 0x4f, 0x9d, 0x84, 0xd7, 0x3c, 0x7f, 0x93, 0x2b, 0x51,
+/// Temporary local namespace for Error-context disposition identities.
+///
+/// The outer UUIDv5 namespace is derived from the current agent DB's
+/// conversation identity and the inner name is the canonical disposition
+/// label plus message id. Issue #74 replaces only the outer namespace with the
+/// final `PersonalityAgentId`; callers never construct or persist a tenant /
+/// workspace owner.
+const ERROR_CONTEXT_DISPOSITION_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x4a, 0x8d, 0x64, 0x8e, 0x58, 0xa0, 0x45, 0xaf, 0x98, 0xe1, 0x2b, 0x95, 0x44, 0x97, 0xa2, 0x31,
 ]);
 
 pub(crate) trait CanonicalCommandIdentity {
@@ -614,9 +809,12 @@ impl IntoCanonicalCommandId for String {
     }
 }
 
-pub(crate) fn user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+pub(crate) fn user_message_id(
+    _personality_agent_id: &PersonalityAgentId,
+    command_id: &(impl CanonicalCommandIdentity + ?Sized),
+) -> String {
     Uuid::new_v5(
-        &USER_MESSAGE_ID_NAMESPACE,
+        &crate::gateway::wire::USER_MESSAGE_ID_NAMESPACE,
         command_id.canonical_command_uuid().as_bytes(),
     )
     .to_string()
@@ -627,13 +825,18 @@ impl InjectedCommand {
         dead_code,
         reason = "the T15 run loop consumes the T12-frozen private injection builder"
     )]
-    pub(crate) fn new(seq: u64, command_id: impl IntoCanonicalCommandId) -> Self {
+    pub(crate) fn new(
+        seq: u64,
+        command_id: impl IntoCanonicalCommandId,
+        provenance: DirectChatProvenanceV1,
+    ) -> Self {
         let command_id = command_id.into_canonical_command_id();
-        let message_id = user_message_id(&command_id);
+        let message_id = user_message_id(provenance.personality_agent_id(), &command_id);
         Self {
             seq,
             command_id,
             message_id,
+            provenance,
         }
     }
 
@@ -652,16 +855,22 @@ impl InjectedCommand {
         &self.message_id
     }
 
+    pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
+        &self.provenance
+    }
+
     #[cfg(test)]
     fn with_caller_message_id(
         seq: u64,
         command_id: CommandId,
         message_id: impl Into<String>,
+        provenance: DirectChatProvenanceV1,
     ) -> Self {
         Self {
             seq,
             command_id,
             message_id: message_id.into(),
+            provenance,
         }
     }
 }
@@ -702,7 +911,7 @@ impl ApplicationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunPhase {
     Received,
@@ -763,6 +972,141 @@ impl RunPhase {
 
 #[allow(
     dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryBatchMutation {
+    pub batch_id: BatchId,
+    pub expected_version: u64,
+    pub new_state: MemoryBatchState,
+    pub summary: Option<CompactResult>,
+    pub est_tokens: u64,
+    pub footprint_delta: i64,
+    /// When true, `apply_memory_batch_mutation` deletes all
+    /// `memory_batch_messages` rows for this batch and zeroes its
+    /// `eviction_footprint_tokens`. This is used when an L0 source batch is
+    /// dropped during promotion.
+    pub delete_membership: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) enum MemoryJobMutation {
+    /// Claim a `pending` job without consuming an attempt. The lease is
+    /// refreshed at the start of a provider attempt via [`Start`].
+    Claim { job_id: String, lease_until: String },
+    /// Refresh the lease and increment the durable attempt counter before a
+    /// provider call. This keeps crash-recovery from giving free retries.
+    /// `expected_attempt` and `lease_witness` are the values observed by the
+    /// caller; EventWriter CAS rejects a row that has been reclaimed by
+    /// another worker.
+    Start {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+        lease_until: String,
+    },
+    /// Commit a `running` job's compacted result. `expected_attempt` and
+    /// `lease_witness` must match the durable row at the time the job was
+    /// claimed and started.
+    Complete {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+        result: CompactResult,
+    },
+    /// Mark a `running` job as failed. `expected_attempt` and `lease_witness`
+    /// must match the durable row at the time the job was claimed and started.
+    Fail {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Synchronously reclaim a `failed` job at the hard-limit fallback point.
+    /// The durable attempt counter is reset by `attempts_delta` (typically
+    /// negative) and the lease is refreshed so the job can be retried inline.
+    Reclaim {
+        job_id: String,
+        expected_attempt: i64,
+        lease_until: String,
+        attempts_delta: i64,
+    },
+    Apply {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Discard a completed result whose source snapshot is stale. This is a
+    /// terminal transition that advances the apply cursor without modifying
+    /// the newer source shelves.
+    Discard {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Return a leased `running` job to the queue without consuming another
+    /// attempt (used for cancellation or stale-source reset).
+    /// `expected_attempt` and `lease_witness` must match the durable row.
+    Release {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryJobUpdate {
+    pub expected_source_versions: BTreeMap<BatchId, u64>,
+    pub job_mutations: Vec<MemoryJobMutation>,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryApplyCursorAdvance {
+    pub kind: String,
+    pub expected: u64,
+    pub next: u64,
+    pub initialize: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone, Default)]
+pub(crate) struct MemoryTransition {
+    pub expected_source_versions: BTreeMap<BatchId, u64>,
+    /// Optional source-state witness checked inside the EventWriter transaction.
+    /// Batches named here must already exist with the expected state; they are
+    /// not mutated by the transition itself.
+    pub expected_source_states: BTreeMap<BatchId, MemoryBatchState>,
+    pub batch_mutations: Vec<MemoryBatchMutation>,
+    pub job_mutations: Vec<MemoryJobMutation>,
+    /// New batches to insert atomically within the same EventWriter
+    /// transaction. `batch_seq` and `ord` are assigned inside the transaction
+    /// so recovery cannot race with L0 seal allocation.
+    pub batch_inserts: Vec<MemoryBatchRecord>,
+    /// New jobs to insert atomically within the same EventWriter transaction.
+    /// Their `batch_seq` is fixed to the matching inserted target batch.
+    pub job_inserts: Vec<MemoryJobRecord>,
+    /// Existing transcript messages to attach atomically to authenticated
+    /// batch membership chains.
+    pub membership_inserts: Vec<MemoryBatchMessageRecord>,
+    pub cursor_advance: Option<MemoryApplyCursorAdvance>,
+}
+
+#[allow(
+    dead_code,
     reason = "T12 freezes projections that the T15 run loop will construct"
 )]
 #[derive(Clone)]
@@ -772,6 +1116,8 @@ pub(crate) enum Projection {
         role: &'static str,
         message: PublicMessage,
         append_to_l0: bool,
+        provider_context: Vec<ProviderContextFragment>,
+        eviction_footprint_tokens: u64,
     },
     CommandReceived {
         envelope: CommandEnvelope,
@@ -779,6 +1125,8 @@ pub(crate) enum Projection {
     CommandRejected {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         raw_command: RejectedCommandPayload,
         payload_digest: Option<KeyedCommandDigest>,
@@ -807,8 +1155,39 @@ pub(crate) enum Projection {
     },
     ToolExecution(ToolExecutionMutation),
     Approval(ApprovalMutation),
+    /// T27 supplies the physical proof; T17 validates and applies this
+    /// projection only after the complete logical suffix is in the same
+    /// EventWriter transaction.
+    PhysicalRecovery(PhysicalRecoveryReceipt),
+    /// Prepared provider-context mutation terminal application. EventWriter
+    /// decrypts and revalidates the stored intent, HMAC, and Replace plaintext
+    /// HMAC inside its SQLite transaction.
+    ProviderContextMutation(ProviderContextMutation),
+    /// Durable prepare half of an Error attempt's provider-context
+    /// disposition. This projection must share the RetryScheduled, terminal
+    /// Error TurnEnd, or active Abort cutoff transaction that ends usability.
+    /// Deletion stays on `ProviderContextMutation` and the common recovery path.
+    ProviderContextMutationPrepare(ErrorContextDisposition),
+    /// Atomic durable memory job state update with source-version CAS.
+    MemoryJobUpdate(MemoryJobUpdate),
+    /// Atomic durable memory batch + job transition with source-version CAS.
+    MemoryTransition(MemoryTransition),
+    /// A successful provider terminal's raw prompt estimate. EventWriter binds
+    /// this to the assistant MessageEnd usage and updates the persisted EMA in
+    /// that same transaction.
+    MemoryCalibrationObservation {
+        uncalibrated_prompt_estimate: u64,
+    },
+    ApprovalRule(ApprovalRuleMutation),
     #[cfg(test)]
     SizePadding(usize),
+}
+
+#[derive(Clone)]
+pub(crate) struct ApprovalRuleMutation {
+    pub id: String,
+    pub tool: String,
+    pub pattern: String,
 }
 
 #[allow(
@@ -848,6 +1227,13 @@ pub(crate) enum ToolExecutionMutation {
     },
 }
 
+const SKIP_ERROR_CODES: &[&str] = &[
+    "length_guard",
+    "user_steer_cancelled",
+    "approval_denied",
+    "approval_cancelled",
+];
+
 #[allow(
     dead_code,
     reason = "T12 freezes approval durability transitions before T15 broker wiring"
@@ -870,6 +1256,7 @@ pub(crate) enum ApprovalMutation {
 struct PreparedEvent {
     seq: u64,
     kind: String,
+    metadata: DurableEventMetadata,
     internal_metadata: String,
     command_id: Option<String>,
     run_id: Option<String>,
@@ -896,6 +1283,86 @@ enum L0Disposition {
     ExcludeRetryError,
 }
 
+#[derive(Clone)]
+struct PreparedMemoryBatchMutation {
+    batch_id: String,
+    expected_version: i64,
+    old_state: MemoryBatchState,
+    new_state: MemoryBatchState,
+    summary: Option<MemoryBatchSummary>,
+    est_tokens: i64,
+    footprint_delta: i64,
+    delete_membership: bool,
+}
+
+#[derive(Clone)]
+struct PreparedMemoryJobMutation {
+    job_id: String,
+    expected_status: &'static str,
+    new_status: &'static str,
+    attempts: i64,
+    /// Attempts delta applied in the SET clause (`0` for claim/complete/fail/
+    /// apply/release, `1` for start).
+    attempts_delta: i64,
+    /// Lease value that the WHERE clause must match for non-pending CAS.
+    expected_lease_until: Option<String>,
+    /// Lease value written by the SET clause (`None` clears stale leases on
+    /// terminal transitions and release).
+    new_lease_until: Option<String>,
+    source_versions: Option<String>,
+    result: Option<MemoryJobResult>,
+}
+
+/// Carries an L0 reservation transition that is committed atomically with the
+/// MessageEnd projection that triggers it. The source batch is sealed, an L1
+/// target batch is allocated, and a pending compaction job is inserted.
+struct L0SealTransition {
+    source_id: String,
+    source_expected_version: i64,
+    source_next_version: i64,
+    target_record: MemoryBatchRecord,
+    job_record: MemoryJobRecord,
+}
+
+/// Intermediate value produced while preparing an L0 seal. It bundles the new
+/// open L0 batch for the current message with the seal transition itself.
+struct L0SealPrep {
+    new_l0_batch_record: MemoryBatchRecord,
+    seal_transition: Box<L0SealTransition>,
+}
+
+/// Boundary state carried for an L0 batch that has pending messages prepared
+/// inside the current EventBatch but not yet durably inserted. This lets later
+/// MessageEnd projections in the same batch re-run the forced-seal and
+/// safe-boundary checks instead of blindly appending to the pending batch.
+struct PendingL0Batch {
+    id: String,
+    version: i64,
+    ord: i64,
+    est_tokens: i64,
+    eviction_footprint_tokens: i64,
+    history: Vec<ContextMessage>,
+}
+
+/// Result of loading an existing open L0 batch's messages to decide whether it
+/// must be sealed before `next`. The loaded history is returned so it can be
+/// carried as pending in-batch state.
+struct LoadedL0Boundary {
+    seal_reason: Option<SealReason>,
+    history: Vec<ContextMessage>,
+}
+
+/// In-batch sequence/ordinal allocator for memory batches. `prepare` keeps one
+/// instance per EventBatch so that multiple L0 seals/new-batch allocations in
+/// the same batch do not reuse committed sequence numbers that have not yet
+/// been inserted.
+struct L0BatchAllocator {
+    next_l0_seq: i64,
+    next_l0_ord: i64,
+    next_l1_seq: i64,
+    next_l1_ord: i64,
+}
+
 enum PreparedProjection {
     MessageEnd {
         event_seq: u64,
@@ -909,10 +1376,29 @@ enum PreparedProjection {
         redaction_version: u32,
         interrupted: bool,
         l0_disposition: L0Disposition,
+        provider_context: Vec<EncryptedProviderContextRecord>,
+        provider_context_key_proofs: Vec<(String, Vec<u8>)>,
+        eviction_footprint_tokens: u64,
+        /// Public transcript estimate for this message, used to durably update
+        /// the open L0 batch's `est_tokens`.
+        public_est: i64,
+        /// Record to insert when this message creates a new open L0 batch
+        /// because no open batch exists.
+        create_l0_batch: Option<MemoryBatchRecord>,
+        /// The open L0 batch this message is appended to. `None` when the
+        /// message is excluded from L0 (e.g., retry errors).
+        l0_batch_id: Option<String>,
+        /// Ordinal within `l0_batch_id` for the membership row.
+        l0_batch_message_ord: Option<i64>,
+        /// If set, seal the previous open L0 batch and reserve a compaction
+        /// job before appending this message to a fresh batch.
+        seal_transition: Option<Box<L0SealTransition>>,
     },
     CommandInsert {
         seq: u64,
         command_id: String,
+        personality_agent_id: PersonalityAgentId,
+        provenance_json: String,
         command_kind: &'static str,
         payload_key_ref: String,
         payload_key_proof: Vec<u8>,
@@ -921,6 +1407,40 @@ enum PreparedProjection {
         status: &'static str,
         reject_reason: Option<&'static str>,
         reject_actual_bytes: Option<u64>,
+        admission_record_hmac: Vec<u8>,
+    },
+    ProviderContextMutation {
+        mutation_id: String,
+        intent_key_ref: String,
+        intent_key_proof: Vec<u8>,
+        insert_key_ref: Option<String>,
+        insert_key_proof: Option<Vec<u8>>,
+        affected_memory_batch_ids: Vec<String>,
+    },
+    ProviderContextMutationPrepare {
+        disposition: ErrorContextDisposition,
+        intent_key_ref: String,
+        intent_key_proof: Vec<u8>,
+    },
+    MemoryJobUpdate {
+        expected_source_versions: BTreeMap<String, i64>,
+        job_mutations: Vec<PreparedMemoryJobMutation>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
+    },
+    MemoryTransition {
+        expected_source_versions: BTreeMap<String, i64>,
+        expected_source_states: BTreeMap<String, MemoryBatchState>,
+        batch_mutations: Vec<PreparedMemoryBatchMutation>,
+        job_mutations: Vec<PreparedMemoryJobMutation>,
+        batch_inserts: Vec<MemoryBatchRecord>,
+        job_inserts: Vec<MemoryJobRecord>,
+        membership_inserts: Vec<MemoryBatchMessageRecord>,
+        cursor_advance: Option<MemoryApplyCursorAdvance>,
+        memory_summary_key_proofs: Vec<(String, Vec<u8>)>,
+    },
+    MemoryCalibrationObservation {
+        observed_prompt_tokens: u64,
+        uncalibrated_prompt_estimate: u64,
     },
     Plain(Projection),
 }
@@ -928,6 +1448,148 @@ enum PreparedProjection {
 struct PreparedWrite {
     event: Option<PreparedEvent>,
     projections: Vec<PreparedProjection>,
+}
+
+fn memory_projection_keys(write: &PreparedWrite) -> BTreeSet<MemoryProjectionKey> {
+    let mut keys = BTreeSet::new();
+    for projection in &write.projections {
+        match projection {
+            PreparedProjection::MessageEnd {
+                l0_disposition,
+                l0_batch_id,
+                seal_transition,
+                ..
+            } => {
+                if *l0_disposition != L0Disposition::Append {
+                    continue;
+                }
+                if let Some(batch_id) = l0_batch_id {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: batch_id.clone(),
+                    });
+                }
+                if let Some(seal) = seal_transition {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: seal.source_id.clone(),
+                    });
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: seal.target_record.id.clone(),
+                    });
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Job,
+                        id: seal.job_record.id.clone(),
+                    });
+                }
+            }
+            PreparedProjection::MemoryJobUpdate { job_mutations, .. } => {
+                keys.extend(job_mutations.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.job_id.clone(),
+                }));
+            }
+            PreparedProjection::MemoryTransition {
+                batch_mutations,
+                job_mutations,
+                batch_inserts,
+                job_inserts,
+                membership_inserts,
+                cursor_advance,
+                ..
+            } => {
+                keys.extend(batch_mutations.iter().map(|batch| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Batch,
+                    id: batch.batch_id.clone(),
+                }));
+                keys.extend(batch_inserts.iter().map(|batch| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Batch,
+                    id: batch.id.clone(),
+                }));
+                keys.extend(job_mutations.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.job_id.clone(),
+                }));
+                keys.extend(job_inserts.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.id.clone(),
+                }));
+                keys.extend(
+                    membership_inserts
+                        .iter()
+                        .map(|membership| MemoryProjectionKey {
+                            entity: MemoryProjectionEntity::Batch,
+                            id: membership.batch_id.clone(),
+                        }),
+                );
+                if let Some(cursor) = cursor_advance {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Cursor,
+                        id: cursor.kind.clone(),
+                    });
+                }
+            }
+            PreparedProjection::MemoryCalibrationObservation { .. } => {
+                keys.insert(MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Calibration,
+                    id: MEMORY_CALIBRATION_ID.to_owned(),
+                });
+            }
+            PreparedProjection::ProviderContextMutation {
+                affected_memory_batch_ids,
+                ..
+            } => {
+                keys.extend(affected_memory_batch_ids.iter().cloned().map(|id| {
+                    MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id,
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+fn memory_projection_metadata_upper_bound(write: &PreparedWrite) -> Result<usize> {
+    let keys = memory_projection_keys(write);
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let event = write
+        .event
+        .as_ref()
+        .ok_or_else(|| anyhow!("memory projection metadata reserve requires a durable event"))?;
+    let worst_case_previous = MemoryProjectionRef {
+        event_seq: u64::MAX,
+        digest: [u8::MAX; super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES],
+    };
+    let changes = keys
+        .into_iter()
+        .map(|key| super::memory_state::MemoryProjectionChange {
+            entity: key.entity,
+            id: key.id,
+            previous: Some(worst_case_previous.clone()),
+            current_digest: [u8::MAX; super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES],
+        })
+        .collect();
+    let mut metadata = event.metadata.clone();
+    metadata.memory_projection = Some(MemoryProjectionDeltaV1::new(changes)?);
+    let worst_case_len = serde_json::to_string(&metadata)
+        .context("failed to serialize memory projection metadata preflight")?
+        .len();
+    Ok(worst_case_len.saturating_sub(event.internal_metadata.len()))
+}
+
+fn prepared_write_has_physical_recovery(write: &PreparedWrite) -> bool {
+    write.projections.iter().any(|projection| {
+        matches!(
+            projection,
+            PreparedProjection::Plain(Projection::PhysicalRecovery(_))
+        )
+    })
 }
 
 struct ExpectedInjection {
@@ -947,6 +1609,8 @@ struct CommandInsertInput<'a> {
     key: &'a super::crypto::DataKeyMaterial,
     seq: u64,
     command_id: String,
+    personality_agent_id: &'a PersonalityAgentId,
+    provenance: &'a DirectChatProvenanceV1,
     command_kind: &'static str,
     canonical_payload: &'a [u8],
     rejection: Option<CommandRejectReason>,
@@ -1000,16 +1664,180 @@ pub(crate) struct EventWriter {
     gate: Arc<Mutex<WriterState>>,
 }
 
-#[derive(Default)]
+/// EventWriter-owned single-writer guard for cold-boot repair and hydration.
+///
+/// The guard is held from the first authenticated recovery inspection through
+/// the post-repair snapshot and logical-suffix decision. Recovery code applies
+/// batches through `apply_recovery_batch`, which reuses this guard instead of
+/// trying to acquire the public writer gate recursively.
+pub(crate) struct BootstrapRecoveryGuard<'a> {
+    writer: &'a EventWriter,
+    state: MutexGuard<'a, WriterState>,
+}
+
+#[allow(async_fn_in_trait)]
+pub(crate) trait RecoveryBatchWriter {
+    fn recovery_store(&self) -> &Store;
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>>;
+}
+
+impl RecoveryBatchWriter for EventWriter {
+    fn recovery_store(&self) -> &Store {
+        self.store.as_ref()
+    }
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>> {
+        self.apply(batch).await
+    }
+}
+
+impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
+    fn recovery_store(&self) -> &Store {
+        self.writer.store.as_ref()
+    }
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>> {
+        self.writer.apply_locked(batch, None, &mut self.state).await
+    }
+}
+
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
+    admission_open: bool,
+    #[cfg(test)]
+    post_commit_publish_hook: Option<PostCommitPublishHook>,
+}
+
+impl Default for WriterState {
+    fn default() -> Self {
+        Self {
+            checkpoint: None,
+            admission_open: true,
+            #[cfg(test)]
+            post_commit_publish_hook: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("EventWriter mutation admission is closed")]
+pub(crate) struct EventWriterAdmissionClosed;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct PostCommitPublishHook {
+    pub(crate) committed: Arc<tokio::sync::Notify>,
+    pub(crate) allow_publication: Arc<tokio::sync::Notify>,
+    pub(crate) return_error: Arc<AtomicBool>,
+    pub(crate) panic: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("EventWriter COMMIT finalizer {kind}: {message}")]
+pub(crate) struct EventWriterFinalizerFailure {
+    kind: &'static str,
+    message: String,
+}
+
+type CommitFinalizerOutcome = std::result::Result<(), Arc<EventWriterFinalizerFailure>>;
+type SharedCommitFinalizer = Shared<BoxFuture<'static, CommitFinalizerOutcome>>;
+
+#[derive(Default)]
+struct CommitFinalizerRegistryState {
+    next_id: u64,
+    pending: Option<(u64, SharedCommitFinalizer)>,
+}
+
+/// Store-shared ownership of the one COMMIT finalizer admitted under
+/// EventWriter's single-writer gate.
+///
+/// The shared future retains the task JoinHandle when the initiating caller is
+/// cancelled. A later writer or orderly close must observe its exact outcome
+/// before it can authenticate and reconcile the Store.
+#[derive(Clone, Default)]
+pub(super) struct CommitFinalizerRegistry {
+    inner: Arc<StdMutex<CommitFinalizerRegistryState>>,
+}
+
+impl CommitFinalizerRegistry {
+    fn register(&self, finalizer: SharedCommitFinalizer) -> Result<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.is_some() {
+            bail!("EventWriter attempted to replace an unsettled COMMIT finalizer");
+        }
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("EventWriter COMMIT finalizer identity exhausted"))?;
+        let id = state.next_id;
+        state.pending = Some((id, finalizer));
+        Ok(id)
+    }
+
+    fn pending(&self) -> Option<(u64, SharedCommitFinalizer)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clone()
+    }
+
+    fn clear(&self, id: u64) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.pending.as_ref() {
+            Some((pending_id, _)) if *pending_id == id => {
+                state.pending = None;
+                Ok(())
+            }
+            Some((pending_id, _)) => bail!(
+                "EventWriter COMMIT finalizer identity changed: expected {id}, found {pending_id}"
+            ),
+            None => bail!("EventWriter COMMIT finalizer {id} was already cleared"),
+        }
+    }
+}
+
+fn monitor_commit_finalizer(task: tokio::task::JoinHandle<Result<()>>) -> SharedCommitFinalizer {
+    async move {
+        match task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "returned an error",
+                message: format!("{error:#}"),
+            })),
+            Err(error) if error.is_panic() => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "panicked",
+                message: error.to_string(),
+            })),
+            Err(error) => Err(Arc::new(EventWriterFinalizerFailure {
+                kind: "was cancelled",
+                message: error.to_string(),
+            })),
+        }
+    }
+    .boxed()
+    .shared()
 }
 
 #[derive(Clone)]
 struct LifecycleCheckpoint {
     event_head: Option<EventLogHead>,
     lifecycle: DurableLifecycleState,
+    memory_projections: BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
     historical_rows_visited: u64,
+}
+
+impl LifecycleCheckpoint {
+    fn event_head_seq(&self) -> u64 {
+        self.event_head.as_ref().map_or(0, |head| head.last_seq)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1051,6 +1879,11 @@ pub(crate) struct InboundReceipt {
     pub(crate) ack: CommandAck,
     pub(crate) origin: InboundReceiptOrigin,
     pub(crate) received_at: DateTime<Utc>,
+    /// Exact writer-owned public events produced by a newly persisted
+    /// admission. Received commands have none; terminal rejection carries its
+    /// durable disposition. Replays rely on gateway catch-up and leave this
+    /// empty to avoid duplicate live publication.
+    pub(crate) events: Vec<(u64, AgentEvent)>,
 }
 
 impl InboundAdmission {
@@ -1074,6 +1907,7 @@ impl InboundAdmission {
         self.mode == InboundAdmissionMode::ReplayOnly
     }
 
+    #[cfg(test)]
     pub(crate) async fn receive(
         &mut self,
         writer: &EventWriter,
@@ -1105,6 +1939,281 @@ impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
         let gate = store.event_writer_state();
         Self { store, gate }
+    }
+
+    /// Permanently close mutation admission for this Store runtime and return
+    /// a typed proof only after every admitted COMMIT finalizer has published.
+    ///
+    /// Bootstrap teardown order is: stop and join command, Session,
+    /// maintenance, and recovery producers; call this method; pass the proof
+    /// to `OrderedPostCommitDispatcher::shutdown`; then invalidate and join
+    /// the T17 delivery/runtime epoch.
+    pub(crate) async fn close_post_commit_admission(
+        &self,
+        owner: &PostCommitDispatcherOwner,
+    ) -> Result<EventWriterQuiescence> {
+        let mut state = self.gate.lock().await;
+        state.admission_open = false;
+        self.settle_pending_finalizer(&mut state).await?;
+        self.sync_authenticated_checkpoint_and_feed(&mut state)
+            .await?;
+        self.store.mint_post_commit_quiescence(
+            owner,
+            state
+                .checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.event_head_seq()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_post_commit_publish_hook(&self, hook: Option<PostCommitPublishHook>) {
+        self.gate.lock().await.post_commit_publish_hook = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_writer_gate_is_locked(&self) -> bool {
+        self.gate.try_lock().is_err()
+    }
+
+    async fn sync_authenticated_checkpoint_and_feed(&self, state: &mut WriterState) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for feed synchronization")?;
+        self.store
+            .sync_post_commit_authenticated_checkpoint(checkpoint.event_head_seq())
+            .context("failed to synchronize post-commit feed to authenticated event-log head")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn recover_authenticated_finalizer_checkpoint_and_feed(
+        &self,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let checkpoint = reconstruct_authenticated_checkpoint(self.store.as_ref())
+            .await
+            .context("failed to authenticate EventWriter checkpoint for finalizer recovery")?;
+        self.store
+            .recover_post_commit_authenticated_finalizer(checkpoint.event_head_seq())
+            .context("failed to recover post-commit feed from authenticated finalizer outcome")?;
+        state.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn settle_pending_finalizer(&self, state: &mut WriterState) -> Result<()> {
+        let registry = self.store.event_writer_finalizers();
+        let Some((id, finalizer)) = registry.pending() else {
+            return Ok(());
+        };
+        let outcome = finalizer.await;
+        if let Err(error) = self
+            .recover_authenticated_finalizer_checkpoint_and_feed(state)
+            .await
+        {
+            return Err(match outcome {
+                Ok(()) => error.context(format!(
+                    "COMMIT finalizer {id} completed but authenticated reconciliation failed"
+                )),
+                Err(failure) => error.context(format!(
+                    "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                )),
+            });
+        }
+        registry.clear(id)?;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(anyhow::Error::new((*failure).clone())),
+        }
+    }
+
+    async fn finish_registered_finalizer(
+        &self,
+        id: u64,
+        finalizer: SharedCommitFinalizer,
+        next_checkpoint: LifecycleCheckpoint,
+        state: &mut WriterState,
+    ) -> Result<()> {
+        let outcome = finalizer.await;
+        match outcome {
+            Ok(()) => {
+                state.checkpoint = Some(next_checkpoint);
+                self.store.event_writer_finalizers().clear(id)
+            }
+            Err(failure) => {
+                self.recover_authenticated_finalizer_checkpoint_and_feed(state)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{failure}; authenticated reconciliation after COMMIT finalizer {id} failed"
+                        )
+                    })?;
+                self.store.event_writer_finalizers().clear(id)?;
+                Err(anyhow::Error::new((*failure).clone()))
+            }
+        }
+    }
+
+    /// Build the fixed Invalidate target set for an authenticated Error
+    /// MessageEnd. This does not persist the intent: the lifecycle owner must
+    /// attach the returned value to the exact disposition EventWrite.
+    pub(crate) async fn build_error_context_disposition(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+    ) -> Result<ErrorContextDisposition> {
+        if message_id.is_empty() {
+            bail!("Error-context disposition message_id must not be empty");
+        }
+        let message_seq_i64 = sqlite_i64(message_seq, "Error MessageEnd sequence")?;
+        let mut authentication = self.store.pool().begin().await?;
+        authenticate_event_log_snapshot(self.store.as_ref(), &mut authentication)
+            .await
+            .context("failed to authenticate event history for Error-context disposition")?;
+        let durable =
+            load_authenticated_event(self.store.as_ref(), &mut authentication, message_seq_i64)
+                .await
+                .context("failed to authenticate Error MessageEnd event")?;
+        let exact_error_event = durable.kind == "message_end"
+            && durable.envelope.get("message_id").and_then(Value::as_str) == Some(message_id)
+            && durable
+                .envelope
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+            && durable
+                .envelope
+                .get("message")
+                .and_then(|message| message.get("stop_reason"))
+                .and_then(Value::as_str)
+                == Some("error");
+        if !exact_error_event {
+            bail!(
+                "Error-context disposition target {message_id}/{message_seq} is not the exact authenticated Error MessageEnd event"
+            );
+        }
+        let messages = self
+            .store
+            .hydrate_messages(&mut authentication)
+            .await
+            .context("failed to authenticate transcript for Error-context disposition")?;
+        let provider_context = self
+            .store
+            .hydrate_provider_context(&messages, &mut authentication)
+            .await
+            .context("failed to authenticate provider context for Error-context disposition")?;
+        let exact_error = messages.iter().any(|message| {
+            matches!(
+                message,
+                ContextMessage::Persisted {
+                    id,
+                    seq,
+                    message: Message::Assistant(assistant),
+                } if id == message_id
+                    && *seq == message_seq
+                    && assistant.stop_reason == StopReason::Error
+            )
+        });
+        if !exact_error {
+            bail!(
+                "Error-context disposition target {message_id}/{message_seq} is not an authenticated Error assistant MessageEnd"
+            );
+        }
+        let mut invalidate_ids = provider_context
+            .iter()
+            .filter(|item| {
+                item.item.retention_owner.message_id == message_id
+                    && item.item.retention_owner.message_seq == message_seq
+            })
+            .map(|item| provider_context_record_id(&item.item))
+            .collect::<Vec<_>>();
+        invalidate_ids.sort();
+        if invalidate_ids.is_empty() {
+            bail!("Error-context disposition requires at least one active target row");
+        }
+        authentication.commit().await?;
+
+        let local_agent_namespace = Uuid::new_v5(
+            &ERROR_CONTEXT_DISPOSITION_NAMESPACE,
+            self.store.scope().personality_agent_id.as_str().as_bytes(),
+        );
+        let mutation_id = Uuid::new_v5(
+            &local_agent_namespace,
+            format!("error-context-disposition:{message_id}").as_bytes(),
+        )
+        .to_string();
+        let mutation_key = self
+            .store
+            .private_key(DataKeyPurpose::Mutation)
+            .await
+            .context("failed to load Error-context disposition mutation key")?;
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            self.store.scope().clone(),
+            mutation_id,
+        )
+        .build_invalidate(None, invalidate_ids)
+        .context("failed to build Error provider-context Invalidate intent")?;
+        Ok(ErrorContextDisposition { prepared })
+    }
+
+    /// Common destructive half of the Error-context disposition. The
+    /// disposition EventWrite prepares first; this audited MemoryMaintenance
+    /// application is also exactly what cold-boot mutation recovery executes.
+    pub(crate) async fn apply_error_context_disposition(
+        &self,
+        disposition: &ErrorContextDisposition,
+    ) -> Result<()> {
+        self.apply(EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance(format!(
+                    "provider_context_mutation:{}",
+                    disposition.mutation_id()
+                ))?),
+                projections: vec![Projection::ProviderContextMutation(
+                    ProviderContextMutation {
+                        mutation_id: disposition.mutation_id().to_owned(),
+                    },
+                )],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to apply Error provider-context disposition {}",
+                disposition.mutation_id()
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(in crate::store) async fn begin_bootstrap_recovery<'a>(
+        &'a self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<BootstrapRecoveryGuard<'a>> {
+        lease
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+        let mut state = self.gate.lock().await;
+        self.ensure_checkpoint(&mut state).await?;
+        Ok(BootstrapRecoveryGuard {
+            writer: self,
+            state,
+        })
+    }
+
+    pub(crate) fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
     /// Authenticates and reconstructs the durable lifecycle prefix exactly once
@@ -1167,8 +2276,7 @@ impl EventWriter {
 
     async fn ensure_checkpoint(&self, state: &mut WriterState) -> Result<()> {
         if state.checkpoint.is_none() {
-            state.checkpoint =
-                Some(reconstruct_authenticated_checkpoint(self.store.as_ref()).await?);
+            self.sync_authenticated_checkpoint_and_feed(state).await?;
         }
         Ok(())
     }
@@ -1187,6 +2295,13 @@ impl EventWriter {
         admission: InboundAdmissionMode,
     ) -> Result<InboundReceipt> {
         let mut guard = self.gate.lock().await;
+        if inbound.personality_agent_id() != self.store.scope().personality_agent_id() {
+            bail!("inbound command targets a different private personality-agent store");
+        }
+        inbound
+            .provenance()
+            .validate(self.store.scope().personality_agent_id())
+            .context("inbound command provenance does not match the private store")?;
         if let InboundCommand::Invalid {
             reason,
             raw_command,
@@ -1254,6 +2369,7 @@ impl EventWriter {
                 command_id,
                 command_kind,
                 rejection,
+                inbound.provenance(),
                 &canonical_payload,
                 payload_digest,
             )
@@ -1264,6 +2380,7 @@ impl EventWriter {
                 ack,
                 origin: InboundReceiptOrigin::Replay,
                 received_at,
+                events: Vec::new(),
             });
         }
         if admission == InboundAdmissionMode::ReplayOnly {
@@ -1282,28 +2399,37 @@ impl EventWriter {
             InboundCommand::Invalid {
                 seq,
                 command_id,
+                personality_agent_id,
+                provenance,
                 reason,
                 raw_command,
                 payload_digest,
             } => Projection::CommandRejected {
                 seq: *seq,
                 command_id: command_id.to_string(),
+                personality_agent_id: personality_agent_id.clone(),
+                provenance: provenance.clone(),
                 reason: reason.clone(),
                 raw_command: raw_command.clone(),
                 payload_digest: payload_digest.clone(),
             },
         };
-        self.apply_locked(
-            EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![projection],
-                }],
-                injected_commands: Vec::new(),
-            },
-            &mut guard,
-        )
-        .await?;
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![projection],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
         let ack = self
             .ack_for_command(command_id)
             .await?
@@ -1313,6 +2439,7 @@ impl EventWriter {
             ack,
             origin: InboundReceiptOrigin::NewlyPersisted,
             received_at,
+            events,
         })
     }
 
@@ -1383,7 +2510,126 @@ impl EventWriter {
     )]
     pub(crate) async fn apply(&self, batch: EventBatch) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked(batch, &mut guard).await
+        self.apply_locked(batch, None, &mut guard).await
+    }
+
+    /// Commit an EventBatch and return the exact typed public events materialized
+    /// by EventWriter with their durable sequences. This includes writer-owned
+    /// command dispositions inserted after their terminal projection owner.
+    pub(crate) async fn apply_with_events(
+        &self,
+        batch: EventBatch,
+    ) -> Result<Vec<(u64, AgentEvent)>> {
+        let mut guard = self.gate.lock().await;
+        self.apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?
+            .sequenced_events()
+    }
+
+    /// Commit an EventBatch and, when it contains the one allowed calibration
+    /// observation, return the exact persisted ratio while still holding the
+    /// single-writer gate. This closes the commit-to-runtime race: a later
+    /// MessageEnd cannot advance the singleton before the caller receives the
+    /// value committed by this batch.
+    #[cfg(test)]
+    pub(crate) async fn apply_with_calibration_receipt(
+        &self,
+        batch: EventBatch,
+    ) -> Result<(Vec<u64>, Option<[u8; 8]>)> {
+        let (events, ratio_bits) = self
+            .apply_with_events_and_calibration_receipt(batch)
+            .await?;
+        Ok((events.into_iter().map(|(seq, _)| seq).collect(), ratio_bits))
+    }
+
+    pub(crate) async fn apply_with_events_and_calibration_receipt(
+        &self,
+        batch: EventBatch,
+    ) -> Result<(Vec<(u64, AgentEvent)>, Option<[u8; 8]>)> {
+        let has_calibration_observation = batch.writes.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(projection, Projection::MemoryCalibrationObservation { .. })
+            })
+        });
+        let mut guard = self.gate.lock().await;
+        let outcome = self
+            .apply_locked_with_failpoint(batch, None, None, None, &mut guard)
+            .await?;
+        let ratio_bits = if has_calibration_observation {
+            let bits: Vec<u8> =
+                sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+                    .fetch_optional(self.store.pool())
+                    .await
+                    .context("failed to load committed calibration receipt")?
+                    .ok_or_else(|| anyhow!("committed calibration row is missing"))?;
+            Some(
+                bits.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("committed calibration ratio_bits has invalid length"))?,
+            )
+        } else {
+            None
+        };
+        Ok((outcome.sequenced_events()?, ratio_bits))
+    }
+
+    /// Hydration entry point for a T27 physical recovery proof.  The receipt
+    /// projection must be part of the supplied batch (normally as its final
+    /// eventless write); EventWriter then commits the logical suffix, terminal
+    /// tool events/results, and T17 application ledger in one SQLite transaction.
+    #[allow(dead_code, reason = "T17 hydration caller is composed by T26")]
+    pub(crate) async fn apply_physical_recovery(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        mut batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        lease
+            .validate_exact(
+                &self.store.scope().personality_agent_id,
+                fence.generation(),
+                fence.lease_id(),
+            )
+            .map_err(|error| {
+                anyhow!("physical recovery lease is not bound to this Store: {error}")
+            })?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid physical recovery fence: {error}"))?;
+        receipt.validate_for(lease, fence)?;
+        let mut has_receipt_projection = false;
+        for projection in batch.writes.iter().flat_map(|write| &write.projections) {
+            if let Projection::PhysicalRecovery(existing) = projection {
+                if existing != &receipt {
+                    bail!("EventBatch PhysicalRecovery projection disagrees with injected receipt");
+                }
+                has_receipt_projection = true;
+            }
+        }
+        if !has_receipt_projection {
+            batch.writes.push(EventWrite {
+                event: None,
+                projections: vec![Projection::PhysicalRecovery(receipt.clone())],
+            });
+        }
+        // Idempotency is decided inside the same SQLite transaction as the
+        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
+        // Reading `already_present` outside the transaction would create a TOCTOU
+        // window where two callers could both observe the receipt as new.
+        let mut guard = self.gate.lock().await;
+        let context = PhysicalRecoveryContext {
+            lease,
+            fence,
+            receipt: &receipt,
+        };
+        let outcome = self
+            .apply_locked_with_failpoint(batch, None, None, Some(context), &mut guard)
+            .await?;
+        let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
+            anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
+        })?;
+        Ok((receipt_outcome, outcome.seqs))
     }
 
     #[cfg(test)]
@@ -1395,36 +2641,28 @@ impl EventWriter {
         let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     #[cfg(all(test, unix))]
-    async fn apply_with_abrupt_transaction_failpoint(
+    async fn apply_with_abrupt_transaction_failpoint<'a>(
         &self,
         batch: EventBatch,
         name: &str,
         after_commit: bool,
         readiness_path: &std::path::Path,
+        physical_recovery: Option<PhysicalRecoveryContext<'a>>,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(
             batch,
             None,
             Some((name, after_commit, readiness_path)),
-            None,
+            physical_recovery,
             &mut guard,
         )
         .await
-    }
-
-    #[cfg(test)]
-    async fn apply_after_prepare_destroy_key(
-        &self,
-        batch: EventBatch,
-        key_ref: &str,
-    ) -> Result<Vec<u64>> {
-        let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), &mut guard)
-            .await
+        .map(|outcome| outcome.seqs)
     }
 
     pub(crate) async fn apply_idle_abort_cutoff(
@@ -1432,6 +2670,48 @@ impl EventWriter {
         abort_command_id: &str,
         abort_seq: u64,
     ) -> Result<Vec<CommandAck>> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
+            .await
+            .map(|outcome| outcome.acks)
+    }
+
+    pub(crate) async fn apply_idle_abort_cutoff_with_events(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+    ) -> Result<AbortCutoffOutcome> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None, None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff_with_events(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: &str,
+    ) -> Result<AbortCutoffOutcome> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff_with_error_context_disposition_and_events(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: &str,
+        disposition: ErrorContextDisposition,
+    ) -> Result<AbortCutoffOutcome> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id), Some(disposition))
+            .await
+    }
+
+    async fn apply_abort_cutoff(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: Option<&str>,
+        error_context_disposition: Option<ErrorContextDisposition>,
+    ) -> Result<AbortCutoffOutcome> {
         let mut guard = self.gate.lock().await;
         let mut authentication = self.store.pool().begin().await?;
         let command = load_authenticated_command(
@@ -1442,25 +2722,96 @@ impl EventWriter {
             "abort",
         )
         .await
-        .context("idle Abort failed authenticated command validation")?;
+        .context("Abort cutoff failed authenticated command validation")?;
         if !matches!(command, Command::Abort {}) {
             bail!("durable abort row contains a different command variant");
         }
         authentication.rollback().await?;
         let abort_seq = sqlite_i64(abort_seq, "Abort command sequence")?;
-        let owner_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM inbound_commands
+
+        let live_rows = sqlx::query(
+            "SELECT command_id, seq, run_phase FROM inbound_commands
              WHERE command_kind='user_message' AND status='applying'
                AND run_phase IN (
                  'user_started','user_committed','assistant_started',
                  'hard_steer_requested','cancel_requested'
-               )",
+               )
+             ORDER BY seq
+             LIMIT 2",
         )
-        .fetch_one(self.store.pool())
+        .fetch_all(self.store.pool())
         .await?;
-        if owner_count != 0 {
+        if live_rows.len() > 1 {
+            bail!("multiple applying live owners violate the owner invariant");
+        }
+        let live_owner: Option<(String, u64, RunPhase)> = live_rows
+            .into_iter()
+            .next()
+            .map(|row| {
+                let command_id: String = row.try_get("command_id")?;
+                let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "live owner sequence")?;
+                let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                Ok::<_, anyhow::Error>((command_id, seq, phase))
+            })
+            .transpose()?;
+
+        if run_id.is_none() && live_owner.is_some() {
             bail!("idle Abort path cannot run while a live owner exists");
         }
+
+        let owner_in_run: Option<(String, u64, RunPhase)> = if let Some(run_id) = run_id {
+            let owner_rows = sqlx::query(
+                "SELECT command_id, seq, run_phase FROM inbound_commands
+                 WHERE run_id = ? AND command_kind='user_message' AND status='applying'
+                   AND run_phase IN (
+                     'classified','run_started','turn_started',
+                     'user_started','user_committed','assistant_started',
+                     'hard_steer_requested','cancel_requested'
+                   )
+                 ORDER BY seq
+                 LIMIT 2",
+            )
+            .bind(run_id)
+            .fetch_all(self.store.pool())
+            .await?;
+            let parsed_rows = owner_rows
+                .into_iter()
+                .map(|row| {
+                    let command_id: String = row.try_get("command_id")?;
+                    let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "run owner sequence")?;
+                    let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                    Ok::<_, anyhow::Error>((command_id, seq, phase))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // A hard-steer step zero leaves the new command classified while
+            // the original owner remains in hard_steer_requested.  That
+            // classified handoff is pending work, not a second live owner;
+            // prefer the one post-user active owner for the Abort cutoff.
+            let active_rows = parsed_rows
+                .iter()
+                .filter(|(_, _, phase)| {
+                    !matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    )
+                })
+                .count();
+            if active_rows > 1 || (active_rows == 0 && parsed_rows.len() > 1) {
+                bail!("multiple applying owners in run {run_id} violate the owner invariant");
+            }
+            if active_rows == 1 {
+                parsed_rows.into_iter().find(|(_, _, phase)| {
+                    !matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    )
+                })
+            } else {
+                parsed_rows.into_iter().next()
+            }
+        } else {
+            None
+        };
 
         let pending = sqlx::query(
             "SELECT seq, command_id, command_kind, status, application_kind,
@@ -1474,11 +2825,12 @@ impl EventWriter {
         .fetch_all(self.store.pool())
         .await?;
         if pending.len() > 32 {
-            bail!("idle Abort cutoff exceeds the bounded 32-command window");
+            bail!("Abort cutoff exceeds the bounded 32-command window");
         }
         let mut pending_terminals = Vec::with_capacity(pending.len());
         let mut terminal_ids = Vec::with_capacity(pending.len() + 1);
         let mut startup: Option<(String, String, RunPhase)> = None;
+        let mut owner_seen = false;
         for row in pending {
             let seq = sqlite_u64(row.get::<i64, _>("seq"), "stored command sequence")?;
             let command_id: String = row.try_get("command_id")?;
@@ -1493,34 +2845,82 @@ impl EventWriter {
                 }
                 ("user_message", "applying") => {
                     let application_kind: String = row.try_get("application_kind")?;
-                    let run_id: String = row.try_get("run_id")?;
+                    let row_run_id: String = row.try_get("run_id")?;
                     let turn_id: String = row.try_get("turn_id")?;
                     let phase = RunPhase::parse(row.try_get("run_phase")?)?;
-                    if application_kind != "idle_run"
-                        || !matches!(
+                    let is_owner = owner_in_run
+                        .as_ref()
+                        .is_some_and(|(owner_id, _, _)| owner_id == &command_id);
+                    if is_owner
+                        && !matches!(
                             phase,
                             RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
                         )
-                        || startup.is_some()
                     {
+                        owner_seen = true;
+                        continue;
+                    }
+                    if application_kind == "idle_run"
+                        && matches!(
+                            phase,
+                            RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                        )
+                    {
+                        if startup.is_some() {
+                            bail!(
+                                "Abort cutoff requires at most one pre-user idle startup; found {command_id}"
+                            );
+                        }
+                        startup = Some((row_run_id.clone(), turn_id, phase));
+                        pending_terminals.push((command_id.clone(), seq, true, Some(row_run_id)));
+                    } else if matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    ) {
+                        pending_terminals.push((command_id.clone(), seq, true, Some(row_run_id)));
+                    } else {
                         bail!(
-                            "idle Abort cutoff requires at most one pre-user idle startup; found {command_id} in {application_kind}/{}",
+                            "Abort cutoff found unsupported pending user_message {command_id}: {application_kind}/{} {status}",
                             phase.as_str()
                         );
                     }
-                    pending_terminals.push((command_id.clone(), seq, true, Some(run_id.clone())));
-                    startup = Some((run_id, turn_id, phase));
                 }
                 _ => {
                     bail!(
-                        "idle Abort cutoff found unsupported pending command {command_id}: {kind}/{status}"
+                        "Abort cutoff found unsupported pending command {command_id}: {kind}/{status}"
                     );
                 }
             }
             terminal_ids.push(command_id);
         }
-        let abort_run_id = startup.as_ref().map(|(run_id, _, _)| run_id.clone());
-        let mut projections = Vec::with_capacity(pending_terminals.len() + 1);
+
+        let abort_run_id = run_id
+            .map(str::to_owned)
+            .or_else(|| startup.as_ref().map(|(r, _, _)| r.clone()));
+
+        if let Some(run_id) = run_id {
+            if owner_in_run.is_none() && startup.is_none() && live_owner.is_some() {
+                bail!(
+                    "active Abort cutoff run {run_id} has no durable owner or startup in that run"
+                );
+            }
+            if let Some((owner_id, _, owner_phase)) = &owner_in_run {
+                if matches!(
+                    owner_phase,
+                    RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                ) {
+                    // Pre-user idle startup is handled via supersede + empty close, not cancel_requested.
+                } else if !owner_seen {
+                    bail!(
+                        "active Abort cutoff run {run_id} owner {owner_id} was not found in pending scan"
+                    );
+                } else if live_owner.is_none() {
+                    bail!("active Abort cutoff run {run_id} has an owner in an unexpected phase");
+                }
+            }
+        }
+
+        let mut projections = Vec::with_capacity(pending_terminals.len() + 3);
         for (command_id, command_seq, is_user_message, stored_context) in pending_terminals {
             if is_user_message {
                 projections.push(Projection::CommandSuperseded {
@@ -1538,12 +2938,31 @@ impl EventWriter {
                 });
             }
         }
+
+        if let Some((owner_id, _, owner_phase)) = &owner_in_run
+            && !matches!(
+                owner_phase,
+                RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+            )
+        {
+            projections.push(Projection::RunPhase {
+                command_id: owner_id.clone(),
+                run_id: abort_run_id.clone().expect("live owner requires run_id"),
+                expected: *owner_phase,
+                next: RunPhase::CancelRequested,
+            });
+        }
+
         projections.push(Projection::CommandApplied {
             command_id: abort_command_id.to_owned(),
             command_seq: sqlite_u64(abort_seq, "Abort command sequence")?,
             run_id: abort_run_id,
         });
+        if let Some(disposition) = error_context_disposition {
+            projections.push(Projection::ProviderContextMutationPrepare(disposition));
+        }
         terminal_ids.push(abort_command_id.to_owned());
+
         let mut writes = Vec::new();
         if let Some((run_id, turn_id, phase)) = &startup {
             if *phase == RunPhase::TurnStarted {
@@ -1563,16 +2982,23 @@ impl EventWriter {
             event: None,
             projections,
         });
-        self.apply_locked(
-            EventBatch {
-                writes,
-                injected_commands: Vec::new(),
-            },
-            &mut guard,
-        )
-        .await?;
 
-        let mut acks = Vec::with_capacity(terminal_ids.len());
+        let events = self
+            .apply_locked_with_failpoint(
+                EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                },
+                None,
+                None,
+                None,
+                &mut guard,
+            )
+            .await?
+            .sequenced_events()?;
+
+        let expected_acks = terminal_ids.len();
+        let mut acks = Vec::with_capacity(expected_acks);
         for command_id in terminal_ids {
             acks.push(
                 self.ack_for_command(&command_id)
@@ -1580,12 +3006,23 @@ impl EventWriter {
                     .ok_or_else(|| anyhow!("terminal command {command_id} disappeared"))?,
             );
         }
-        Ok(acks)
+        assert_eq!(
+            acks.len(),
+            expected_acks,
+            "Abort cutoff ACK count must match terminal command count"
+        );
+        Ok(AbortCutoffOutcome { events, acks })
     }
 
-    async fn apply_locked(&self, batch: EventBatch, state: &mut WriterState) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None, state)
+    async fn apply_locked(
+        &self,
+        batch: EventBatch,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
+        state: &mut WriterState,
+    ) -> Result<Vec<u64>> {
+        self.apply_locked_with_failpoint(batch, None, None, physical_recovery, state)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     async fn apply_locked_with_failpoint(
@@ -1593,12 +3030,37 @@ impl EventWriter {
         batch: EventBatch,
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
-        destroy_after_prepare: Option<&str>,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<ApplyBatchOutcome> {
+        if !state.admission_open {
+            return Err(EventWriterAdmissionClosed.into());
+        }
+        let batch = materialize_command_dispositions(batch)?;
+        let events = batch
+            .writes
+            .iter()
+            .filter_map(|write| write.event.as_ref().map(|event| event.value.clone()))
+            .collect();
+        // A cancelled caller can leave one Store-owned COMMIT finalizer. Its
+        // shared outcome and the authenticated database/feed reconciliation
+        // must settle before this mutation can derive N+1.
+        self.settle_pending_finalizer(state).await?;
         self.ensure_checkpoint(state).await?;
+        for command in &batch.injected_commands {
+            command
+                .provenance
+                .validate(self.store.scope().personality_agent_id())
+                .map_err(|error| {
+                    anyhow!("injected command targets the wrong private store: {error}")
+                })?;
+        }
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
-        let expected_injections = validate_batch_shape(self.store.redactor(), &batch)?;
+        let expected_injections = validate_batch_shape_with_recovery(
+            self.store.redactor(),
+            &batch,
+            physical_recovery.as_ref(),
+        )?;
         let injected_commands = batch.injected_commands.clone();
         let checkpoint = state
             .checkpoint
@@ -1611,13 +3073,33 @@ impl EventWriter {
             .map_or(0, |head| head.last_seq)
             .checked_add(1)
             .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
-        let (prepared, transaction_bytes, event_seqs) = self.prepare_batch(batch, next_seq).await?;
-        if let Some(key_ref) = destroy_after_prepare {
-            self.store.destroy_conversation_key_ref(key_ref).await?;
-        }
+        let (prepared, transaction_bytes, memory_metadata_reserve, event_seqs) =
+            self.prepare_batch(batch, next_seq).await?;
+        let preflight_transaction_bytes = transaction_bytes
+            .checked_add(memory_metadata_reserve)
+            .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))?;
+
+        #[cfg(all(test, unix))]
+        let env_failpoint_storage = test_env_abrupt_failpoint_for_prepared(&prepared);
+        #[cfg(not(all(test, unix)))]
+        let env_failpoint_storage: Option<(String, bool, std::path::PathBuf)> = None;
+        #[cfg(all(test, unix))]
+        let env_write_failpoint_storage = test_env_abrupt_failpoint_for_writes(&prepared);
+        #[cfg(not(all(test, unix)))]
+        let env_write_failpoint_storage: Option<(String, usize, std::path::PathBuf)> = None;
+        let effective_abrupt_failpoint: Option<(&str, bool, &std::path::Path)> = abrupt_failpoint
+            .or_else(|| {
+                env_failpoint_storage
+                    .as_ref()
+                    .map(|(name, after_commit, path)| {
+                        (name.as_str(), *after_commit, path.as_path())
+                    })
+            });
 
         let mut transaction = self.store.pool().begin().await?;
         revalidate_prepared_key_refs(self.store.as_ref(), &mut transaction, &prepared).await?;
+        validate_prepared_error_context_fences(self.store.as_ref(), &mut transaction, &prepared)
+            .await?;
         let transaction_event_head =
             load_verified_event_head_in_transaction(self.store.as_ref(), &mut transaction).await?;
         if transaction_event_head != previous_event_head {
@@ -1648,7 +3130,7 @@ impl EventWriter {
                 );
             }
         }
-        EventBatchSizer::validate(command_bounds, transaction_bytes)?;
+        EventBatchSizer::validate(command_bounds, preflight_transaction_bytes)?;
         let mut owner_preconditions = HashSet::new();
         let mut owner_postconditions = HashSet::new();
         collect_owner_conditions(
@@ -1687,84 +3169,153 @@ impl EventWriter {
 
         let mut applied_writes = 0usize;
         let mut updated_event_head = previous_event_head.clone();
-        for write in prepared {
-            if let Some(event) = write.event {
-                let (previous_digest, previous_count, head_key_ref) =
-                    match updated_event_head.as_ref() {
-                        Some(head) => {
-                            if head.key_ref != event.raw_key_ref {
-                                bail!("event-log key changed without an explicit rotation");
-                            }
-                            (head.chain_digest, head.event_count, head.key_ref.clone())
-                        }
-                        None => ([0_u8; EVENT_DIGEST_BYTES], 0, event.raw_key_ref.clone()),
-                    };
-                let expected_seq = updated_event_head
-                    .as_ref()
-                    .map_or(1, |head| head.last_seq.saturating_add(1));
-                if event.seq != expected_seq {
+        let mut updated_memory_projections = checkpoint.memory_projections.clone();
+        let mut finalized_metadata_growth = 0usize;
+        let mut receipt_outcome = None;
+        for mut write in prepared {
+            let write_event_seq = write.event.as_ref().map(|event| event.seq);
+            let memory_keys = memory_projection_keys(&write);
+            let memory_bearing = !memory_keys.is_empty();
+            let provider_context_mutation = write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutation { .. }
+                )
+            });
+            if memory_bearing && prepared_write_has_physical_recovery(&write) {
+                bail!("memory projection writes cannot carry PhysicalRecovery");
+            }
+            if memory_bearing && write.event.is_none() {
+                bail!("memory projection write requires exactly one durable event");
+            }
+            if write
+                .event
+                .as_ref()
+                .is_some_and(|event| event.metadata.memory_projection.is_some())
+            {
+                bail!("callers cannot supply pre-finalized memory projection metadata");
+            }
+
+            let mut captured = Vec::with_capacity(memory_keys.len());
+            for key in memory_keys {
+                let captured_ref =
+                    capture_memory_projection_ref(self.store.scope(), &mut transaction, key)
+                        .await?;
+                let expected = updated_memory_projections.get(&captured_ref.0);
+                if expected != captured_ref.1.as_ref() {
                     bail!(
-                        "durable event sequence is not contiguous: expected {expected_seq}, prepared {}",
-                        event.seq
+                        "current {:?} {} projection does not match the authenticated event-chain checkpoint",
+                        captured_ref.0.entity,
+                        captured_ref.0.id
                     );
                 }
-                let chain_digest = extend_event_chain(
-                    &previous_digest,
-                    EventChainEntry {
-                        seq: event.seq,
-                        event_type: &event.kind,
-                        internal_metadata: &event.internal_metadata,
-                        key_ref: &event.raw_key_ref,
-                        ciphertext: &event.raw_ciphertext,
-                        envelope: &event.envelope,
-                        redaction_version: event.redaction_version,
-                    },
-                );
-                sqlx::query(
-                    "INSERT INTO agent_events(
-                        seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
-                        envelope, redaction_version, created_at
-                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(sqlite_i64(event.seq, "durable event sequence")?)
-                .bind(event.kind)
-                .bind(event.internal_metadata)
-                .bind(event.raw_key_ref)
-                .bind(event.raw_ciphertext)
-                .bind(event.envelope)
-                .bind(event.redaction_version as i64)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *transaction)
-                .await
-                .context("failed to append durable event")?;
-                let event_count = previous_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("durable event count overflow"))?;
-                let key = self
-                    .store
-                    .data_key_by_ref_in_transaction(&mut transaction, &head_key_ref)
-                    .await?;
-                let head_hmac = authenticate_event_head(
-                    self.store.scope(),
-                    &key,
-                    event.seq,
-                    event_count,
-                    &chain_digest,
-                )?;
-                updated_event_head = Some(EventLogHead {
-                    last_seq: event.seq,
-                    event_count,
-                    chain_digest,
-                    key_ref: head_key_ref,
-                    head_hmac,
-                });
+                captured.push(captured_ref);
             }
+
+            if !memory_bearing
+                && !provider_context_mutation
+                && let Some(event) = write.event.take()
+            {
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
+            }
+
             for projection in write.projections {
-                apply_projection(&mut transaction, projection).await?;
+                let outcome = apply_projection(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    projection,
+                    &event_seqs,
+                    physical_recovery.as_ref(),
+                    write_event_seq,
+                )
+                .await?;
+                if let Some(outcome) = outcome {
+                    if receipt_outcome.is_some() {
+                        bail!("multiple physical recovery outcomes in one EventBatch");
+                    }
+                    receipt_outcome = Some(outcome);
+                }
+            }
+
+            if memory_bearing {
+                let mut event = write
+                    .event
+                    .take()
+                    .expect("memory-bearing write event was validated");
+                let initial_metadata_len = event.internal_metadata.len();
+                let mut changes = Vec::with_capacity(captured.len());
+                for previous in captured {
+                    changes.push(
+                        commit_memory_projection(
+                            self.store.scope(),
+                            &mut transaction,
+                            event.seq,
+                            previous,
+                        )
+                        .await?,
+                    );
+                }
+                let delta = MemoryProjectionDeltaV1::new(changes)?;
+                apply_memory_projection_delta(
+                    &mut updated_memory_projections,
+                    event.seq,
+                    &event.kind,
+                    Some(&delta),
+                )?;
+                event.metadata.memory_projection = Some(delta);
+                event.internal_metadata = serde_json::to_string(&event.metadata)
+                    .context("failed to finalize memory projection event metadata")?;
+                finalized_metadata_growth = finalized_metadata_growth
+                    .checked_add(
+                        event
+                            .internal_metadata
+                            .len()
+                            .saturating_sub(initial_metadata_len),
+                    )
+                    .ok_or_else(|| anyhow!("finalized event metadata byte count overflow"))?;
+                if finalized_metadata_growth > memory_metadata_reserve {
+                    bail!(
+                        "finalized memory projection metadata exceeded its deterministic preflight reserve"
+                    );
+                }
+                let finalized_transaction_bytes = transaction_bytes
+                    .checked_add(finalized_metadata_growth)
+                    .ok_or_else(|| anyhow!("finalized EventBatch byte count overflow"))?;
+                EventBatchSizer::validate(command_bounds, finalized_transaction_bytes)?;
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
+            } else if provider_context_mutation {
+                let event = write
+                    .event
+                    .take()
+                    .expect("provider-context mutation event was validated");
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
             }
             applied_writes = applied_writes.saturating_add(1);
             if fail_after_writes == Some(applied_writes) {
                 bail!("EventWriter test failpoint after {applied_writes} writes");
+            }
+            if let Some((name, count, readiness_path)) = env_write_failpoint_storage.as_ref()
+                && applied_writes == *count
+            {
+                abrupt_transaction_exit(name, "after_writes", readiness_path.as_path());
             }
         }
 
@@ -1785,37 +3336,85 @@ impl EventWriter {
             )
             .await?;
         }
-        if let Some((name, false, readiness_path)) = abrupt_failpoint {
+        if let Some((name, false, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "before_commit", readiness_path);
         }
-        transaction
-            .commit()
-            .await
-            .context("failed to commit EventBatch")?;
-        state.checkpoint = Some(LifecycleCheckpoint {
+        let next_checkpoint = LifecycleCheckpoint {
             event_head: updated_event_head,
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
+            memory_projections: updated_memory_projections,
             historical_rows_visited: checkpoint.historical_rows_visited,
+        };
+        // From this point the database outcome is intentionally unknown to
+        // WriterState until the finalizer joins. If the caller is cancelled,
+        // the Store registry retains the exact finalizer outcome; the next
+        // writer authenticates and reconciles the database before proceeding.
+        state.checkpoint = None;
+        #[cfg(test)]
+        let publish_hook = state.post_commit_publish_hook.take();
+        #[cfg(all(test, unix))]
+        let after_commit_failpoint = effective_abrupt_failpoint
+            .filter(|(_, after_commit, _)| *after_commit)
+            .map(|(name, _, path)| (name.to_owned(), path.to_path_buf()));
+        let finalizer_store = self.store.clone();
+        let finalizer_event_seqs = event_seqs.clone();
+        let finalizer_task = tokio::spawn(async move {
+            transaction
+                .commit()
+                .await
+                .context("failed to commit EventBatch")?;
+            #[cfg(all(test, unix))]
+            if let Some((name, readiness_path)) = after_commit_failpoint {
+                abrupt_transaction_exit(&name, "after_commit", &readiness_path);
+            }
+            #[cfg(test)]
+            if let Some(hook) = publish_hook {
+                hook.committed.notify_one();
+                hook.allow_publication.notified().await;
+                if hook.panic.load(AtomicOrdering::SeqCst) {
+                    panic!("injected EventWriter post-COMMIT finalizer panic");
+                }
+                if hook.return_error.load(AtomicOrdering::SeqCst) {
+                    bail!("injected EventWriter post-COMMIT finalizer error");
+                }
+            }
+            // COMMIT is the durability boundary. Publication is an O(1) wake
+            // high-water over the canonical durable FIFO.
+            finalizer_store.publish_committed_event_seqs(&finalizer_event_seqs)
         });
-        if let Some((name, true, readiness_path)) = abrupt_failpoint {
-            abrupt_transaction_exit(name, "after_commit", readiness_path);
-        }
-        Ok(event_seqs)
+        let finalizer = monitor_commit_finalizer(finalizer_task);
+        let finalizer_id = self
+            .store
+            .event_writer_finalizers()
+            .register(finalizer.clone())
+            .expect("single-writer gate settled the previous COMMIT finalizer");
+        self.finish_registered_finalizer(finalizer_id, finalizer, next_checkpoint, state)
+            .await?;
+        Ok(ApplyBatchOutcome {
+            seqs: event_seqs,
+            events,
+            receipt_outcome,
+        })
     }
 
     async fn prepare_batch(
         &self,
         batch: EventBatch,
         first_seq: u64,
-    ) -> Result<(Vec<PreparedWrite>, usize, Vec<u64>)> {
+    ) -> Result<(Vec<PreparedWrite>, usize, usize, Vec<u64>)> {
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let bounds = BatchBounds {
             command_count: batch.injected_commands.len(),
             command_plaintext_bytes: 0,
         };
         EventBatchSizer::validate(bounds, 0)?;
+        let injected_provenance: HashMap<String, DirectChatProvenanceV1> = batch
+            .injected_commands
+            .iter()
+            .map(|command| (command.message_id.clone(), command.provenance.clone()))
+            .collect();
         let event_key = if batch.writes.iter().any(|write| write.event.is_some()) {
-            Some(self.store.conversation_key(DataKeyPurpose::Event).await?)
+            Some(self.store.private_key(DataKeyPurpose::Event).await?)
         } else {
             None
         };
@@ -1825,11 +3424,7 @@ impl EventWriter {
                 .iter()
                 .any(|projection| matches!(projection, Projection::MessageEnd { .. }))
         }) {
-            Some(
-                self.store
-                    .conversation_key(DataKeyPurpose::Transcript)
-                    .await?,
-            )
+            Some(self.store.private_key(DataKeyPurpose::Transcript).await?)
         } else {
             None
         };
@@ -1841,16 +3436,33 @@ impl EventWriter {
                 )
             })
         }) {
-            Some(self.store.conversation_key(DataKeyPurpose::Command).await?)
+            Some(self.store.private_key(DataKeyPurpose::Command).await?)
         } else {
             None
         };
-
         let mut next_seq = first_seq;
+        let mut pending_l0_batch: Option<PendingL0Batch> = None;
+        let mut l0_allocator: Option<L0BatchAllocator> = None;
         let mut prepared = Vec::with_capacity(batch.writes.len());
         let mut transaction_bytes = 0usize;
+        let mut prepared_components = 0usize;
+        charge_materialization_components(&mut prepared_components, batch.writes.len())?;
         let mut event_seqs = Vec::new();
         for write in batch.writes {
+            let calibration_observed_prompt_tokens = write
+                .projections
+                .iter()
+                .find_map(|projection| match projection {
+                    Projection::MessageEnd {
+                        role: "assistant",
+                        message: PublicMessage::Assistant(message),
+                        ..
+                    } => Some(&message.usage),
+                    _ => None,
+                })
+                .map(observed_prompt_tokens)
+                .transpose()
+                .context("failed to derive calibration prompt usage")?;
             let assigned_seq = if write.event.is_some() {
                 let seq = next_seq;
                 sqlite_i64(seq, "durable event sequence")?;
@@ -1863,7 +3475,29 @@ impl EventWriter {
                 None
             };
             let event = match (write.event, assigned_seq) {
-                (Some(event), Some(seq)) => {
+                (Some(mut event), Some(seq)) => {
+                    let user_message_id = match &event.value {
+                        AgentEvent::MessageStart {
+                            message_id,
+                            message,
+                        }
+                        | AgentEvent::MessageEnd {
+                            message_id,
+                            message,
+                        } if matches!(message.as_ref(), PublicMessage::User(_)) => Some(message_id),
+                        _ => None,
+                    };
+                    if event.metadata.direct_chat_provenance.is_some() {
+                        bail!("callers cannot supply direct-chat provenance event metadata");
+                    }
+                    if let Some(message_id) = user_message_id {
+                        event.metadata.direct_chat_provenance =
+                            Some(injected_provenance.get(message_id).cloned().ok_or_else(|| {
+                                anyhow!(
+                                    "user event {message_id} has no authenticated injected command provenance"
+                                )
+                            })?);
+                    }
                     let key = event_key.as_ref().expect("event key was loaded");
                     let aad = self.store.scope().row_aad(
                         "agent_events",
@@ -1906,6 +3540,7 @@ impl EventWriter {
                     Some(PreparedEvent {
                         seq,
                         kind,
+                        metadata: event.metadata.clone(),
                         internal_metadata,
                         command_id,
                         run_id,
@@ -1931,12 +3566,15 @@ impl EventWriter {
 
             let mut projections = Vec::with_capacity(write.projections.len());
             for projection in write.projections {
+                charge_materialization_components(&mut prepared_components, 1)?;
                 match projection {
                     Projection::MessageEnd {
                         message_id,
                         role,
                         message,
                         append_to_l0,
+                        provider_context,
+                        eviction_footprint_tokens: expected_eviction_footprint_tokens,
                     } => {
                         let l0_disposition = l0_disposition(&message, append_to_l0)?;
                         let event_seq = assigned_seq
@@ -1966,6 +3604,37 @@ impl EventWriter {
                             &message,
                             PublicMessage::Assistant(message) if message.interrupted
                         );
+                        let (
+                            provider_context_records,
+                            eviction_footprint_tokens,
+                            provider_context_key,
+                        ) = self
+                            .prepare_provider_context(
+                                &message_id,
+                                event_seq,
+                                &message,
+                                provider_context,
+                            )
+                            .await?;
+                        if eviction_footprint_tokens != expected_eviction_footprint_tokens {
+                            bail!(
+                                "MessageEnd eviction_footprint_tokens mismatch: expected {expected_eviction_footprint_tokens}, computed {eviction_footprint_tokens}"
+                            );
+                        }
+                        for record in &provider_context_records {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                record
+                                    .ciphertext()
+                                    .len()
+                                    .checked_add(record.key_ref().len())
+                                    .and_then(|bytes| bytes.checked_add(record.id().len()))
+                                    .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
+                                    .ok_or_else(|| {
+                                        anyhow!("provider-context record byte count overflow")
+                                    })?,
+                            )?;
+                        }
                         charge_transaction_bytes(
                             &mut transaction_bytes,
                             protected
@@ -1976,6 +3645,60 @@ impl EventWriter {
                                 .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                                 .ok_or_else(|| anyhow!("message projection byte count overflow"))?,
                         )?;
+                        let public_est_u64 = estimate_public_message(&message)
+                            .context("failed to estimate public message tokens")?;
+                        let public_est = i64::try_from(public_est_u64)
+                            .context("public est tokens overflow i64")?;
+                        let (create_l0_batch, l0_batch_id, l0_batch_message_ord, seal_transition) =
+                            self.prepare_l0_batch_membership(
+                                &mut pending_l0_batch,
+                                &mut l0_allocator,
+                                &message,
+                                public_est,
+                                eviction_footprint_tokens,
+                                l0_disposition,
+                            )
+                            .await?;
+                        if let Some(record) = &create_l0_batch {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| {
+                                        anyhow!("L0 batch record byte count overflow")
+                                    })?,
+                            )?;
+                        }
+                        if let Some(batch_id) = &l0_batch_id {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                batch_id
+                                    .len()
+                                    .checked_add(message_id.len())
+                                    .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
+                                    .ok_or_else(|| anyhow!("L0 membership byte count overflow"))?,
+                            )?;
+                        }
+                        if let Some(seal) = &seal_transition {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                seal.target_record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| anyhow!("L1 target byte count overflow"))?,
+                            )?;
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                seal.job_record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| anyhow!("L0 job byte count overflow"))?,
+                            )?;
+                        }
                         projections.push(PreparedProjection::MessageEnd {
                             event_seq,
                             message_id,
@@ -1992,6 +3715,14 @@ impl EventWriter {
                             redaction_version: protected.redaction_version,
                             interrupted,
                             l0_disposition,
+                            provider_context: provider_context_records,
+                            provider_context_key_proofs: provider_context_key,
+                            eviction_footprint_tokens,
+                            public_est,
+                            create_l0_batch,
+                            l0_batch_id,
+                            l0_batch_message_ord,
+                            seal_transition,
                         });
                     }
                     Projection::CommandReceived { envelope } => {
@@ -2000,6 +3731,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq: envelope.seq,
                             command_id: envelope.command_id.to_string(),
+                            personality_agent_id: &envelope.personality_agent_id,
+                            provenance: &envelope.provenance,
                             command_kind: command_kind(&envelope.command),
                             canonical_payload: &payload,
                             rejection: None,
@@ -2014,6 +3747,8 @@ impl EventWriter {
                     Projection::CommandRejected {
                         seq,
                         command_id,
+                        personality_agent_id,
+                        provenance,
                         reason,
                         raw_command,
                         payload_digest,
@@ -2022,6 +3757,8 @@ impl EventWriter {
                             key: command_key.as_ref().expect("command key was loaded"),
                             seq,
                             command_id,
+                            personality_agent_id: &personality_agent_id,
+                            provenance: &provenance,
                             command_kind: "invalid",
                             canonical_payload: raw_command.authenticated_bytes().unwrap_or(&[]),
                             rejection: Some(reason),
@@ -2032,6 +3769,73 @@ impl EventWriter {
                             prepared_projection_size(&prepared),
                         )?;
                         projections.push(prepared);
+                    }
+                    Projection::ProviderContextMutation(
+                        super::provider_context::ProviderContextMutation { mutation_id },
+                    ) => {
+                        let sized = ProviderContextMutationApplier::new(&self.store)
+                            .verify_and_size(&mutation_id)
+                            .await?;
+                        charge_transaction_bytes(&mut transaction_bytes, sized.size)?;
+                        projections.push(PreparedProjection::ProviderContextMutation {
+                            mutation_id,
+                            intent_key_ref: sized.intent_key_ref,
+                            intent_key_proof: sized.intent_key_proof,
+                            insert_key_ref: sized.insert_key_ref,
+                            insert_key_proof: sized.insert_key_proof,
+                            affected_memory_batch_ids: sized.affected_memory_batch_ids,
+                        });
+                    }
+                    Projection::ProviderContextMutationPrepare(disposition) => {
+                        let sized = ProviderContextMutationApplier::new(&self.store)
+                            .verify_prepared_invalidate_and_size(&disposition.prepared)
+                            .await?;
+                        charge_transaction_bytes(&mut transaction_bytes, sized.size)?;
+                        projections.push(PreparedProjection::ProviderContextMutationPrepare {
+                            disposition,
+                            intent_key_ref: sized.intent_key_ref,
+                            intent_key_proof: sized.intent_key_proof,
+                        });
+                    }
+                    Projection::MemoryJobUpdate(update) => {
+                        let prepared = self.prepare_memory_job_update(update).await?;
+                        let materialization =
+                            prepared_memory_projection_materialization(&prepared)?;
+                        charge_materialization_components(
+                            &mut prepared_components,
+                            materialization.components,
+                        )?;
+                        charge_transaction_bytes(&mut transaction_bytes, materialization.bytes)?;
+                        projections.push(prepared);
+                    }
+                    Projection::MemoryTransition(transition) => {
+                        let prepared = self.prepare_memory_transition(transition).await?;
+                        let materialization =
+                            prepared_memory_projection_materialization(&prepared)?;
+                        charge_materialization_components(
+                            &mut prepared_components,
+                            materialization.components,
+                        )?;
+                        charge_transaction_bytes(&mut transaction_bytes, materialization.bytes)?;
+                        projections.push(prepared);
+                    }
+                    Projection::MemoryCalibrationObservation {
+                        uncalibrated_prompt_estimate,
+                    } => {
+                        let observed_prompt_tokens = calibration_observed_prompt_tokens
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "memory calibration observation has no assistant prompt usage"
+                                )
+                            })?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            DURABLE_ROW_OVERHEAD_BYTES.saturating_add(16),
+                        )?;
+                        projections.push(PreparedProjection::MemoryCalibrationObservation {
+                            observed_prompt_tokens,
+                            uncalibrated_prompt_estimate,
+                        });
                     }
                     projection => {
                         charge_transaction_bytes(
@@ -2044,8 +3848,21 @@ impl EventWriter {
             }
             prepared.push(PreparedWrite { event, projections });
         }
-        EventBatchSizer::validate(bounds, transaction_bytes)?;
-        Ok((prepared, transaction_bytes, event_seqs))
+        let memory_metadata_reserve = prepared.iter().try_fold(0usize, |total, write| {
+            total
+                .checked_add(memory_projection_metadata_upper_bound(write)?)
+                .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))
+        })?;
+        let preflight_transaction_bytes = transaction_bytes
+            .checked_add(memory_metadata_reserve)
+            .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))?;
+        EventBatchSizer::validate(bounds, preflight_transaction_bytes)?;
+        Ok((
+            prepared,
+            transaction_bytes,
+            memory_metadata_reserve,
+            event_seqs,
+        ))
     }
 
     fn prepare_command_insert(&self, input: CommandInsertInput<'_>) -> Result<PreparedProjection> {
@@ -2053,11 +3870,21 @@ impl EventWriter {
             key,
             seq,
             command_id,
+            personality_agent_id,
+            provenance,
             command_kind,
             canonical_payload,
             rejection,
             provided_digest,
         } = input;
+        if personality_agent_id != self.store.scope().personality_agent_id() {
+            bail!("command insert targets a different private personality-agent store");
+        }
+        provenance
+            .validate(personality_agent_id)
+            .context("command insert provenance target mismatch")?;
+        let provenance_json =
+            serde_json::to_string(provenance).context("failed to serialize command provenance")?;
         let aad = self.store.scope().row_aad(
             "inbound_commands",
             seq.to_string(),
@@ -2095,9 +3922,26 @@ impl EventWriter {
             ),
             None => ("received", None, None),
         };
+        let admission_record_hmac = admission_record_hmac(
+            key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq,
+                command_id: &command_id,
+                personality_agent_id: personality_agent_id.as_str(),
+                provenance_json: &provenance_json,
+                command_kind,
+                payload_key_ref: &key.key_ref,
+                payload_hmac: &payload_hmac,
+                reject_reason,
+                reject_actual_bytes,
+            },
+        )?;
         Ok(PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id: personality_agent_id.clone(),
+            provenance_json,
             command_kind,
             payload_key_ref: key.key_ref.clone(),
             payload_key_proof: super::crypto::keyed_proof(
@@ -2110,7 +3954,964 @@ impl EventWriter {
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         })
+    }
+
+    fn validate_provider_context_fragment(
+        fragment: &ProviderContextFragment,
+        assistant: &PublicAssistantMessage,
+    ) -> Result<()> {
+        match &fragment.payload {
+            ProviderContextPayload::OpenAiCompactedWindow { .. } => {
+                if fragment.wire_item_index.is_some() {
+                    bail!(
+                        "native compaction provider context must be unanchored (wire_item_index=None)"
+                    );
+                }
+                if assistant.origin.protocol != ApiProtocol::OpenAiResponses {
+                    bail!("OpenAI native compaction requires an OpenAI Responses assistant origin");
+                }
+            }
+            ProviderContextPayload::AnthropicCompaction { .. } => {
+                if fragment.wire_item_index.is_some() {
+                    bail!(
+                        "native compaction provider context must be unanchored (wire_item_index=None)"
+                    );
+                }
+                if assistant.origin.protocol != ApiProtocol::AnthropicMessages {
+                    bail!("Anthropic native compaction requires an Anthropic assistant origin");
+                }
+            }
+            ProviderContextPayload::EncryptedReasoning { protocol, .. } => {
+                let Some(wire_item_index) = fragment.wire_item_index else {
+                    bail!(
+                        "encrypted reasoning provider context must be anchored to a wire_item_index"
+                    );
+                };
+                if *protocol != assistant.origin.protocol {
+                    bail!(
+                        "encrypted reasoning protocol {:?} does not match assistant origin protocol {:?}",
+                        protocol,
+                        assistant.origin.protocol
+                    );
+                }
+                if *protocol == ApiProtocol::AnthropicMessages
+                    && !assistant.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            PublicAssistantContent::Thinking { wire_item_index: index, .. }
+                                if *index == wire_item_index
+                        )
+                    })
+                {
+                    bail!(
+                        "Anthropic encrypted reasoning wire_item_index {wire_item_index} \
+                         does not match a public Thinking wire slot"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepare_provider_context(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+        message: &PublicMessage,
+        fragments: Vec<ProviderContextFragment>,
+    ) -> Result<(
+        Vec<EncryptedProviderContextRecord>,
+        u64,
+        Vec<(String, Vec<u8>)>,
+    )> {
+        if fragments.is_empty() {
+            return Ok((Vec::new(), 0, Vec::new()));
+        }
+
+        let PublicMessage::Assistant(assistant) = message else {
+            bail!("provider context may only accompany an assistant MessageEnd");
+        };
+
+        let spec = ModelSpec::from_origin(&assistant.origin)
+            .ok_or_else(|| anyhow!("no canonical ModelSpec for provider origin"))?;
+
+        for fragment in &fragments {
+            Self::validate_provider_context_fragment(fragment, assistant)?;
+        }
+        let items = crate::provider::types::bind_provider_context_fragments(
+            fragments,
+            ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            },
+            assistant.origin.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        let mut records = Vec::with_capacity(items.len());
+        let mut key_proofs = BTreeMap::new();
+        let mut eviction_footprint_tokens = 0u64;
+        for item in items {
+            let native_coordinates = match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => None,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => {
+                    Some((0, u64::from(item.ordinal)))
+                }
+            };
+            let key = self
+                .store
+                .provider_context_item_key(&item, native_coordinates)
+                .await?;
+            key_proofs.insert(
+                key.key_ref.clone(),
+                super::crypto::keyed_proof(
+                    &key,
+                    PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                    PREPARED_KEY_MATERIAL_PROOF,
+                ),
+            );
+            let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
+                .context("failed to compute provider-context eviction footprint")?;
+            let record = EncryptedProviderContextRecord::encrypt(
+                &item,
+                &assistant.origin.provider_instance_id,
+                assistant.origin.protocol,
+                &assistant.origin.model,
+                eviction_footprint,
+                &key,
+                self.store.scope(),
+            )
+            .context("failed to encrypt provider-context record")?;
+            eviction_footprint_tokens = eviction_footprint_tokens
+                .checked_add(record.eviction_tokens())
+                .ok_or_else(|| anyhow!("eviction footprint overflow"))?;
+            records.push(record);
+        }
+        Ok((
+            records,
+            eviction_footprint_tokens,
+            key_proofs.into_iter().collect(),
+        ))
+    }
+
+    /// Locate the current open L0 batch for a message that should be appended
+    /// to L0. If no open L0 batch exists, allocate a new one deterministically.
+    /// `pending_l0_batch` carries boundary state across multiple MessageEnd
+    /// projections prepared inside the same EventBatch so a newly allocated
+    /// batch is visible to later messages and forced-seal/safe-boundary checks
+    /// are re-run before every append. `l0_allocator` carries sequence/ordinal
+    /// values for any newly allocated memory batches in this EventBatch so
+    /// multiple allocations do not reuse numbers that have not yet durably
+    /// committed.
+    /// Returns `(record_to_create, batch_id, message_ord, seal_transition)`
+    /// where `record_to_create` is `Some` only when a new batch must be inserted
+    /// and `seal_transition` is `Some` when the previous open batch is sealed
+    /// and a compaction job is reserved.
+    async fn prepare_l0_batch_membership(
+        &self,
+        pending_l0_batch: &mut Option<PendingL0Batch>,
+        l0_allocator: &mut Option<L0BatchAllocator>,
+        message: &PublicMessage,
+        public_est: i64,
+        eviction_footprint_tokens: u64,
+        disposition: L0Disposition,
+    ) -> Result<(
+        Option<MemoryBatchRecord>,
+        Option<String>,
+        Option<i64>,
+        Option<Box<L0SealTransition>>,
+    )> {
+        if disposition != L0Disposition::Append {
+            return Ok((None, None, None, None));
+        }
+
+        let next = ContextMessage::Synthetic {
+            message: Message::from(message.clone()),
+        };
+
+        if let Some(pending) = pending_l0_batch {
+            let boundary = Self::build_boundary_context(&pending.history, &next);
+            let l0_batch = L0Batch {
+                id: BatchId::parse_str(&pending.id)
+                    .with_context(|| format!("pending L0 batch id {} is not a UUID", pending.id))?,
+                batch_seq: 0,
+                messages: Vec::new(),
+                est_tokens: u64::try_from(pending.est_tokens)
+                    .with_context(|| "pending L0 est_tokens out of range for u64")?,
+                eviction_footprint_tokens: u64::try_from(pending.eviction_footprint_tokens)
+                    .with_context(|| "pending L0 eviction footprint out of range for u64")?,
+                state: BatchState::Open,
+            };
+            if seal_before_next(&l0_batch, &boundary, TokenCalibration::default()).is_some() {
+                let seal = self
+                    .prepare_l0_seal_transition(
+                        &pending.id,
+                        pending.version,
+                        public_est,
+                        l0_allocator,
+                    )
+                    .await?;
+                let new_l0_id = seal.new_l0_batch_record.id.clone();
+                *pending = PendingL0Batch {
+                    id: new_l0_id.clone(),
+                    version: 0,
+                    ord: 1,
+                    est_tokens: public_est,
+                    eviction_footprint_tokens: sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?,
+                    history: vec![next],
+                };
+                return Ok((
+                    Some(seal.new_l0_batch_record),
+                    Some(new_l0_id),
+                    Some(1),
+                    Some(seal.seal_transition),
+                ));
+            }
+
+            let ord = pending
+                .ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
+            pending.ord = ord;
+            pending.est_tokens = pending
+                .est_tokens
+                .checked_add(public_est)
+                .ok_or_else(|| anyhow!("L0 batch est_tokens overflow"))?;
+            pending.eviction_footprint_tokens = pending
+                .eviction_footprint_tokens
+                .checked_add(sqlite_i64(
+                    eviction_footprint_tokens,
+                    "eviction footprint tokens",
+                )?)
+                .ok_or_else(|| anyhow!("L0 batch eviction footprint overflow"))?;
+            pending.history.push(next);
+            let batch_id = pending.id.clone();
+            return Ok((None, Some(batch_id), Some(ord), None));
+        }
+
+        let open_batch: Option<sqlx::sqlite::SqliteRow> = sqlx::query(
+            "SELECT id, batch_seq, version, est_tokens, eviction_footprint_tokens
+             FROM memory_batches
+             WHERE layer = ? AND state = 'open'
+             ORDER BY batch_seq DESC
+             LIMIT 1",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to locate open L0 batch")?;
+
+        if let Some(row) = open_batch {
+            let batch_id: String = row.try_get("id")?;
+            let batch_seq: i64 = row.try_get("batch_seq")?;
+            let version: i64 = row.try_get("version")?;
+            let est_tokens: i64 = row.try_get("est_tokens")?;
+            let footprint_tokens: i64 = row.try_get("eviction_footprint_tokens")?;
+
+            let loaded = self
+                .load_l0_batch_boundary(&batch_id, batch_seq, est_tokens, footprint_tokens, message)
+                .await?;
+
+            if loaded.seal_reason.is_some() {
+                let seal = self
+                    .prepare_l0_seal_transition(&batch_id, version, public_est, l0_allocator)
+                    .await?;
+                let new_l0_id = seal.new_l0_batch_record.id.clone();
+                *pending_l0_batch = Some(PendingL0Batch {
+                    id: new_l0_id.clone(),
+                    version: 0,
+                    ord: 1,
+                    est_tokens: public_est,
+                    eviction_footprint_tokens: sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?,
+                    history: vec![next],
+                });
+                return Ok((
+                    Some(seal.new_l0_batch_record),
+                    Some(new_l0_id),
+                    Some(1),
+                    Some(seal.seal_transition),
+                ));
+            }
+
+            let max_ord: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(ord) FROM memory_batch_messages WHERE batch_id = ?")
+                    .bind(&batch_id)
+                    .fetch_one(self.store.pool())
+                    .await
+                    .context("failed to compute L0 message ordinal")?;
+            let ord = max_ord
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
+            let mut history = loaded.history;
+            history.push(next);
+            *pending_l0_batch = Some(PendingL0Batch {
+                id: batch_id.clone(),
+                version,
+                ord,
+                est_tokens: est_tokens
+                    .checked_add(public_est)
+                    .ok_or_else(|| anyhow!("L0 batch est_tokens overflow"))?,
+                eviction_footprint_tokens: footprint_tokens
+                    .checked_add(sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?)
+                    .ok_or_else(|| anyhow!("L0 batch eviction footprint overflow"))?,
+                history,
+            });
+            return Ok((None, Some(batch_id), Some(ord), None));
+        }
+
+        self.ensure_l0_allocator(l0_allocator).await?;
+        let allocator = l0_allocator
+            .as_mut()
+            .ok_or_else(|| anyhow!("L0 allocator initialization failed"))?;
+        let batch_seq = allocator.next_l0_seq;
+        allocator.next_l0_seq = batch_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let batch_ord = allocator.next_l0_ord;
+        allocator.next_l0_ord = batch_ord
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+        let batch_id = Uuid::now_v7().to_string();
+        let record = MemoryBatchRecord::new(
+            &batch_id,
+            MemoryLayer::L0,
+            batch_ord,
+            batch_seq,
+            MemoryBatchState::Open,
+            public_est,
+            0,
+        );
+
+        // Membership for the first message in a freshly-created batch is ord 1.
+        *pending_l0_batch = Some(PendingL0Batch {
+            id: batch_id.clone(),
+            version: 0,
+            ord: 1,
+            est_tokens: public_est,
+            eviction_footprint_tokens: sqlite_i64(
+                eviction_footprint_tokens,
+                "eviction footprint tokens",
+            )?,
+            history: vec![next],
+        });
+        Ok((Some(record), Some(batch_id), Some(1), None))
+    }
+
+    /// Decide whether the current open L0 batch should be sealed before the
+    /// incoming message. This loads the batch's current messages from the
+    /// already-redacted `messages.payload` projection and uses the boundary
+    /// rules in `crate::memory::batch`. The loaded history is returned so it
+    /// can be carried as pending in-batch state.
+    async fn load_l0_batch_boundary(
+        &self,
+        batch_id: &str,
+        batch_seq: i64,
+        est_tokens: i64,
+        footprint_tokens: i64,
+        next_message: &PublicMessage,
+    ) -> Result<LoadedL0Boundary> {
+        let message_rows = sqlx::query(
+            "SELECT m.id, m.payload
+             FROM messages m
+             JOIN memory_batch_messages mbm ON m.id = mbm.message_id
+             WHERE mbm.batch_id = ?
+             ORDER BY mbm.ord ASC",
+        )
+        .bind(batch_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to load L0 batch messages for boundary decision")?;
+
+        let mut history = Vec::with_capacity(message_rows.len());
+        for row in message_rows {
+            let message_id: String = row.try_get("id")?;
+            let payload: String = row.try_get("payload")?;
+            let public: PublicMessage = serde_json::from_str(&payload).with_context(|| {
+                format!("failed to deserialize L0 batch message {message_id} from payload")
+            })?;
+            history.push(ContextMessage::Synthetic {
+                message: Message::from(public),
+            });
+        }
+
+        let next = ContextMessage::Synthetic {
+            message: Message::from(next_message.clone()),
+        };
+        let boundary = Self::build_boundary_context(&history, &next);
+
+        let l0_batch = L0Batch {
+            id: BatchId::parse_str(batch_id)
+                .with_context(|| format!("L0 batch id {batch_id} is not a UUID"))?,
+            batch_seq: u64::try_from(batch_seq)
+                .with_context(|| "L0 batch_seq out of range for u64")?,
+            messages: Vec::new(),
+            est_tokens: u64::try_from(est_tokens)
+                .with_context(|| "L0 est_tokens out of range for u64")?,
+            eviction_footprint_tokens: u64::try_from(footprint_tokens)
+                .with_context(|| "L0 eviction footprint out of range for u64")?,
+            state: BatchState::Open,
+        };
+
+        Ok(LoadedL0Boundary {
+            seal_reason: seal_before_next(&l0_batch, &boundary, TokenCalibration::default()),
+            history,
+        })
+    }
+
+    /// Build a `BoundaryContext` from the durable history and the next message.
+    /// The `next_user_is_steering` flag is derived from whether the previous
+    /// message was an interrupted assistant.
+    fn build_boundary_context(
+        history: &[ContextMessage],
+        next: &ContextMessage,
+    ) -> BoundaryContext {
+        let last_message = history.last().map(|context| match context {
+            ContextMessage::Synthetic { message } | ContextMessage::Persisted { message, .. } => {
+                message
+            }
+        });
+        let next_user_is_steering = matches!(
+            last_message,
+            Some(Message::Assistant(assistant)) if assistant.interrupted
+        );
+        BoundaryContext::from_history(history, next, next_user_is_steering)
+    }
+
+    async fn next_memory_batch_seq(&self, layer: MemoryLayer) -> Result<i64> {
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(batch_seq) FROM memory_batches WHERE layer = ?")
+                .bind(layer.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest batch sequence")?;
+        max.unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))
+    }
+
+    async fn next_memory_batch_ord(&self, layer: MemoryLayer) -> Result<i64> {
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(ord) FROM memory_batches WHERE layer = ?")
+                .bind(layer.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest batch ordinal")?;
+        max.unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))
+    }
+
+    /// Initialize the in-batch L0/L1 batch sequence allocator on first use.
+    async fn ensure_l0_allocator(&self, allocator: &mut Option<L0BatchAllocator>) -> Result<()> {
+        if allocator.is_some() {
+            return Ok(());
+        }
+        *allocator = Some(L0BatchAllocator {
+            next_l0_seq: self.next_memory_batch_seq(MemoryLayer::L0).await?,
+            next_l0_ord: self.next_memory_batch_ord(MemoryLayer::L0).await?,
+            next_l1_seq: self.next_memory_batch_seq(MemoryLayer::L1).await?,
+            next_l1_ord: self.next_memory_batch_ord(MemoryLayer::L1).await?,
+        });
+        Ok(())
+    }
+
+    async fn prepare_l0_seal_transition(
+        &self,
+        source_id: &str,
+        source_version: i64,
+        public_est: i64,
+        l0_allocator: &mut Option<L0BatchAllocator>,
+    ) -> Result<L0SealPrep> {
+        let source_next_version = source_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch version overflow"))?;
+
+        self.ensure_l0_allocator(l0_allocator).await?;
+        let allocator = l0_allocator
+            .as_mut()
+            .ok_or_else(|| anyhow!("L0 allocator initialization failed"))?;
+
+        let new_l0_seq = allocator.next_l0_seq;
+        allocator.next_l0_seq = new_l0_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let new_l0_ord = allocator.next_l0_ord;
+        allocator.next_l0_ord = new_l0_ord
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+        let new_l0_id = Uuid::now_v7().to_string();
+        let new_l0_batch_record = MemoryBatchRecord::new(
+            &new_l0_id,
+            MemoryLayer::L0,
+            new_l0_ord,
+            new_l0_seq,
+            MemoryBatchState::Open,
+            public_est,
+            0,
+        );
+
+        let target_seq = allocator.next_l1_seq;
+        allocator.next_l1_seq = target_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let target_ord = allocator.next_l1_ord;
+        allocator.next_l1_ord = target_ord
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+        let target_id = Uuid::now_v7().to_string();
+        let target_record = MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L1,
+            target_ord,
+            target_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+
+        let job_id = Uuid::now_v7().to_string();
+        let mut source_versions = BTreeMap::new();
+        source_versions.insert(source_id.to_owned(), source_next_version);
+        source_versions.insert(target_id.clone(), 0);
+        let job_record = MemoryJobRecord::new(
+            &job_id,
+            MemoryJobKind::CompactL0,
+            target_seq,
+            vec![source_id.to_owned()],
+            source_versions,
+        );
+
+        Ok(L0SealPrep {
+            new_l0_batch_record,
+            seal_transition: Box::new(L0SealTransition {
+                source_id: source_id.to_owned(),
+                source_expected_version: source_version,
+                source_next_version,
+                target_record,
+                job_record,
+            }),
+        })
+    }
+
+    async fn prepare_memory_job_update(
+        &self,
+        update: MemoryJobUpdate,
+    ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
+        let expected_source_versions = convert_batch_versions(update.expected_source_versions)?;
+        let source_versions_json = serde_json::to_string(&expected_source_versions)
+            .context("failed to serialize memory job source versions")?;
+        let mut job_mutations = Vec::with_capacity(update.job_mutations.len());
+        for mutation in update.job_mutations {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+                    | MemoryJobMutation::Discard { .. }
+            ) {
+                None
+            } else {
+                Some(source_versions_json.clone())
+            };
+            job_mutations.push(
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
+            );
+        }
+        Ok(PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
+        })
+    }
+
+    async fn prepare_memory_transition(
+        &self,
+        transition: MemoryTransition,
+    ) -> Result<PreparedProjection> {
+        let mut memory_summary_key_proofs = BTreeMap::new();
+        let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
+        let mut post_source_versions = pre_source_versions.clone();
+        let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
+        for batch in transition.batch_mutations {
+            let row = sqlx::query(
+                "SELECT version, state, est_tokens, eviction_footprint_tokens
+                 FROM memory_batches WHERE id = ?",
+            )
+            .bind(batch.batch_id.to_string())
+            .fetch_optional(self.store.pool())
+            .await
+            .context("failed to load memory batch for transition")?
+            .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
+            let old_version: i64 = row.try_get("version")?;
+            let old_state_str: String = row.try_get("state")?;
+            let old_state = parse_memory_batch_state(&old_state_str)?;
+            if old_version != sqlite_i64(batch.expected_version, "expected batch version")? {
+                bail!(
+                    "memory batch {} expected version {} but found {}",
+                    batch.batch_id,
+                    batch.expected_version,
+                    old_version
+                );
+            }
+
+            let old_est_tokens: i64 = row.try_get("est_tokens")?;
+            let old_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+
+            let version_increments = batch.summary.is_some() || batch.new_state != old_state;
+            let new_version = if version_increments {
+                old_version
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("memory batch version overflow"))?
+            } else {
+                old_version
+            };
+            post_source_versions.insert(batch.batch_id.to_string(), new_version);
+
+            // State-only transitions must preserve the existing token estimate,
+            // and dropping an L0 source batch must zero its eviction footprint.
+            let has_summary = batch.summary.is_some();
+            let est_tokens = if has_summary {
+                sqlite_i64(batch.est_tokens, "batch est_tokens")?
+            } else {
+                old_est_tokens
+            };
+            let footprint_delta = if batch.delete_membership {
+                old_footprint
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("memory batch footprint overflow"))?
+            } else {
+                batch.footprint_delta
+            };
+
+            let summary = if let Some(result) = batch.summary {
+                let batch_id = batch.batch_id.to_string();
+                let key = self.store.memory_summary_key("batch", &batch_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
+                Some(
+                    self.encrypt_memory_batch_summary(result, &batch_id, &key)
+                        .await?,
+                )
+            } else {
+                None
+            };
+
+            batch_mutations.push(PreparedMemoryBatchMutation {
+                batch_id: batch.batch_id.to_string(),
+                expected_version: sqlite_i64(batch.expected_version, "expected batch version")?,
+                old_state,
+                new_state: batch.new_state,
+                summary,
+                est_tokens,
+                footprint_delta,
+                delete_membership: batch.delete_membership,
+            });
+        }
+
+        let source_versions_json = serde_json::to_string(&post_source_versions)
+            .context("failed to serialize memory transition source versions")?;
+        let mut job_mutations = Vec::with_capacity(transition.job_mutations.len());
+        for mutation in transition.job_mutations {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+                    | MemoryJobMutation::Discard { .. }
+            ) {
+                None
+            } else {
+                Some(source_versions_json.clone())
+            };
+            job_mutations.push(
+                self.prepare_memory_job_mutation(
+                    &mut memory_summary_key_proofs,
+                    mutation,
+                    source_json,
+                )
+                .await?,
+            );
+        }
+
+        let expected_source_states: BTreeMap<String, MemoryBatchState> = transition
+            .expected_source_states
+            .iter()
+            .map(|(id, state)| Ok((id.to_string(), *state)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .context("invalid expected source state batch id")?;
+
+        Ok(PreparedProjection::MemoryTransition {
+            expected_source_versions: pre_source_versions,
+            expected_source_states,
+            batch_mutations,
+            job_mutations,
+            batch_inserts: transition.batch_inserts,
+            job_inserts: transition.job_inserts,
+            membership_inserts: transition.membership_inserts,
+            cursor_advance: transition.cursor_advance,
+            memory_summary_key_proofs: memory_summary_key_proofs.into_iter().collect(),
+        })
+    }
+
+    async fn prepare_memory_job_mutation(
+        &self,
+        memory_summary_key_proofs: &mut BTreeMap<String, Vec<u8>>,
+        mutation: MemoryJobMutation,
+        source_versions_json: Option<String>,
+    ) -> Result<PreparedMemoryJobMutation> {
+        let (
+            job_id,
+            expected_status,
+            new_status,
+            attempts_delta,
+            expected_attempt,
+            expected_lease_until,
+            new_lease_until,
+            result,
+        ) = match mutation {
+            MemoryJobMutation::Claim {
+                job_id,
+                lease_until,
+            } => (
+                job_id,
+                "pending",
+                "running",
+                0,
+                None,
+                None,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Start {
+                job_id,
+                expected_attempt,
+                lease_witness,
+                lease_until,
+            } => (
+                job_id,
+                "running",
+                "running",
+                1,
+                Some(expected_attempt),
+                lease_witness,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Complete {
+                job_id,
+                expected_attempt,
+                lease_witness,
+                result,
+            } => {
+                let key = self.store.memory_summary_key("job", &job_id).await?;
+                memory_summary_key_proofs.insert(
+                    key.key_ref.clone(),
+                    super::crypto::keyed_proof(
+                        &key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    ),
+                );
+                let encrypted = self
+                    .encrypt_memory_job_result(result, &job_id, &key)
+                    .await?;
+                (
+                    job_id,
+                    "running",
+                    "completed",
+                    0,
+                    Some(expected_attempt),
+                    lease_witness,
+                    None,
+                    Some(encrypted),
+                )
+            }
+            MemoryJobMutation::Fail {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Reclaim {
+                job_id,
+                expected_attempt,
+                lease_until,
+                attempts_delta,
+            } => (
+                job_id,
+                "failed",
+                "running",
+                attempts_delta,
+                Some(expected_attempt),
+                None,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Apply {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "applied",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Discard {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "discarded",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Release {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "pending",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+        };
+
+        // Terminal transitions, start and claim all use the witness values
+        // supplied by the caller. EventWriter's durable CAS rejects any row
+        // that has been reclaimed or advanced by another worker.
+        let attempts = expected_attempt.unwrap_or(0);
+        let new_lease_until = if new_status == "running" {
+            new_lease_until
+        } else {
+            None
+        };
+
+        Ok(PreparedMemoryJobMutation {
+            job_id,
+            expected_status,
+            new_status,
+            attempts,
+            attempts_delta,
+            expected_lease_until,
+            new_lease_until,
+            source_versions: source_versions_json,
+            result,
+        })
+    }
+
+    async fn encrypt_memory_batch_summary(
+        &self,
+        result: CompactResult,
+        batch_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<MemoryBatchSummary> {
+        let (ciphertext, projection, redaction_version) = self
+            .encrypt_memory_summary(result, "memory_batches", batch_id, key)
+            .await?;
+        Ok(MemoryBatchSummary {
+            key_ref: key.key_ref.clone(),
+            ciphertext,
+            projection,
+            redaction_version,
+        })
+    }
+
+    async fn encrypt_memory_job_result(
+        &self,
+        result: CompactResult,
+        job_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<MemoryJobResult> {
+        let (ciphertext, projection, redaction_version) = self
+            .encrypt_memory_summary(result, "memory_jobs", job_id, key)
+            .await?;
+        Ok(MemoryJobResult {
+            key_ref: key.key_ref.clone(),
+            ciphertext,
+            projection,
+            redaction_version,
+        })
+    }
+
+    async fn encrypt_memory_summary(
+        &self,
+        result: CompactResult,
+        table: &str,
+        row_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<(Vec<u8>, String, u32)> {
+        let mut raw = Zeroizing::new(
+            serde_json::to_vec(&MemorySummaryPayload {
+                summary: result.summary.expose(),
+                est_tokens: result.est_tokens,
+                from: &result.time_range.0,
+                to: &result.time_range.1,
+            })
+            .context("failed to serialize memory summary payload")?,
+        );
+        let aad = self
+            .store
+            .scope()
+            .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
+        let protected = PublicProjectionBuilder::new(self.store.redactor(), key)
+            .build_serialized(&raw, &aad)
+            .context("failed to build memory summary projection")?;
+        let ciphertext = super::crypto::encrypt_content(key, &raw, &aad)
+            .context("failed to encrypt memory summary ciphertext")?;
+        raw.zeroize();
+        Ok((
+            ciphertext,
+            protected.projection,
+            protected.redaction_version,
+        ))
     }
 
     async fn derive_injected_command_size(
@@ -2123,7 +4924,9 @@ impl EventWriter {
         let mut group: Option<(InjectionApplication, String, String)> = None;
         for (command, expected) in commands.iter().zip(expected) {
             let row = sqlx::query(
-                "SELECT command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
+                "SELECT personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                        payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                        admission_record_version, admission_record_hmac,
                         status, run_phase, application_kind, run_id, turn_id, received_at
                  FROM inbound_commands
                  WHERE seq = ? AND command_id = ?",
@@ -2192,6 +4995,50 @@ impl EventWriter {
                 Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
             let digest: Vec<u8> = row.try_get("payload_hmac")?;
             verify_command_payload_digest(&key, &plaintext, &digest)?;
+            let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+            let provenance_json: String = row.try_get("provenance_json")?;
+            let persisted_provenance: DirectChatProvenanceV1 =
+                serde_json::from_str(&provenance_json)
+                    .context("durable injected command provenance is invalid")?;
+            if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+                || persisted_provenance != command.provenance
+                || serde_json::to_string(&persisted_provenance)? != provenance_json
+            {
+                bail!("injected command provenance does not exactly match its durable receipt");
+            }
+            let admission_record_version: i64 = row.try_get("admission_record_version")?;
+            if admission_record_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+                bail!("unsupported inbound admission record version");
+            }
+            let reject_reason: Option<String> = row.try_get("reject_reason")?;
+            let reject_actual_bytes = row
+                .try_get::<Option<i64>, _>("reject_actual_bytes")?
+                .map(|value| sqlite_u64(value, "rejected command byte count"))
+                .transpose()?;
+            let expected_admission_hmac = admission_record_hmac(
+                &key,
+                &InboundAdmissionRecordV2 {
+                    version: INBOUND_ADMISSION_RECORD_VERSION,
+                    seq: command.seq,
+                    command_id: command.command_id.as_str(),
+                    personality_agent_id: &stored_personality_agent_id,
+                    provenance_json: &provenance_json,
+                    command_kind: &command_kind,
+                    payload_key_ref: &key_ref,
+                    payload_hmac: &digest,
+                    reject_reason: reject_reason.as_deref(),
+                    reject_actual_bytes,
+                },
+            )?;
+            let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+            if expected_admission_hmac
+                .as_slice()
+                .ct_eq(&stored_admission_hmac)
+                .unwrap_u8()
+                != 1
+            {
+                bail!("inbound admission record HMAC mismatch");
+            }
 
             let mut parsed: Command = serde_json::from_slice(&plaintext)
                 .context("durable injected command payload is invalid")?;
@@ -2274,6 +5121,7 @@ impl EventWriter {
                 message_id: &command.message_id,
                 text: &expected.text,
                 timestamp: &expected.timestamp,
+                provenance: &command.provenance,
             })
             .collect();
         let size = EventBatchSizer::injection_batch(
@@ -2317,12 +5165,14 @@ impl EventWriter {
         command_id: &str,
         incoming_kind: &str,
         incoming_rejection: Option<&CommandRejectReason>,
+        incoming_provenance: &DirectChatProvenanceV1,
         canonical_payload: &[u8],
         incoming_digest: Option<&KeyedCommandDigest>,
     ) -> Result<Option<CommandAck>> {
         let by_id = sqlx::query(
-            "SELECT seq, command_kind, payload_key_ref, payload_ciphertext, payload_hmac,
-                    reject_reason, reject_actual_bytes
+            "SELECT seq, personality_agent_id, provenance_json, command_kind, payload_key_ref,
+                    payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac
              FROM inbound_commands WHERE command_id = ?",
         )
         .bind(command_id)
@@ -2374,6 +5224,53 @@ impl EventWriter {
             bail!("command replay references a non-command data key");
         }
         let digest: Vec<u8> = row.try_get("payload_hmac")?;
+        let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
+        if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
+            || stored_personality_agent_id != incoming_provenance.personality_agent_id().as_str()
+        {
+            bail!("command replay personality-agent identity mismatch");
+        }
+        let provenance_json: String = row.try_get("provenance_json")?;
+        let stored_provenance: DirectChatProvenanceV1 = serde_json::from_str(&provenance_json)
+            .context("persisted command provenance is invalid")?;
+        let canonical_stored_provenance = serde_json::to_string(&stored_provenance)
+            .context("failed to canonicalize persisted command provenance")?;
+        if provenance_json != canonical_stored_provenance
+            || &stored_provenance != incoming_provenance
+        {
+            bail!("command replay provenance mismatch");
+        }
+        let admission_version: i64 = row.try_get("admission_record_version")?;
+        if admission_version != i64::from(INBOUND_ADMISSION_RECORD_VERSION) {
+            bail!("unsupported inbound admission record version");
+        }
+        let reject_actual_bytes = stored_actual
+            .map(|value| sqlite_u64(value, "rejected command byte count"))
+            .transpose()?;
+        let expected_admission_hmac = admission_record_hmac(
+            &key,
+            &InboundAdmissionRecordV2 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq: stored_seq,
+                command_id,
+                personality_agent_id: &stored_personality_agent_id,
+                provenance_json: &provenance_json,
+                command_kind: &stored_kind,
+                payload_key_ref: &key_ref,
+                payload_hmac: &digest,
+                reject_reason: stored_reason.as_deref(),
+                reject_actual_bytes,
+            },
+        )?;
+        let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
+        if expected_admission_hmac
+            .as_slice()
+            .ct_eq(&stored_admission_hmac)
+            .unwrap_u8()
+            != 1
+        {
+            bail!("inbound admission record HMAC mismatch");
+        }
         let ciphertext = row.try_get::<Option<Vec<u8>>, _>("payload_ciphertext")?;
         if let Some(incoming_digest) = incoming_digest {
             if incoming_digest.key_ref() != key_ref {
@@ -2421,6 +5318,7 @@ impl EventWriter {
         Ok(Some(CommandAck {
             seq: sqlite_u64(row.get::<i64, _>("seq"), "stored command sequence")?,
             command_id: command_id.to_owned(),
+            personality_agent_id: self.store.scope().personality_agent_id.clone(),
             status,
             reject_reason: row.try_get("reject_reason")?,
         }))
@@ -2436,6 +5334,40 @@ impl EventWriter {
         DateTime::parse_from_rfc3339(&value)
             .map(|timestamp| timestamp.with_timezone(&Utc))
             .map_err(|error| anyhow!("persisted command received_at is invalid: {error}"))
+    }
+}
+
+impl BootstrapRecoveryGuard<'_> {
+    pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT mutation_id FROM provider_context_mutations
+             WHERE state = 'prepared'
+             ORDER BY prepared_at, mutation_id",
+        )
+        .fetch_all(self.writer.store.pool())
+        .await
+        .context("failed to list prepared provider-context mutations")?;
+
+        for (mutation_id,) in rows {
+            self.apply_recovery_batch(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance(format!(
+                        "provider_context_mutation:{mutation_id}"
+                    ))?),
+                    projections: vec![Projection::ProviderContextMutation(
+                        super::provider_context::ProviderContextMutation {
+                            mutation_id: mutation_id.clone(),
+                        },
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .with_context(|| {
+                format!("failed to recover provider-context mutation {mutation_id}")
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -2498,9 +5430,9 @@ async fn load_verified_event_head_in_transaction(
 ) -> Result<Option<EventLogHead>> {
     let row = sqlx::query(
         "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE conversation_id = ?",
+         FROM event_log_heads WHERE personality_agent_id = ?",
     )
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .context("failed to load event-log head in EventBatch")?;
@@ -2582,7 +5514,7 @@ async fn persist_event_head(
         sqlx::query(
             "UPDATE event_log_heads
              SET last_seq=?, event_count=?, chain_digest=?, key_ref=?, head_hmac=?, updated_at=?
-             WHERE conversation_id=? AND last_seq=? AND event_count=?
+             WHERE personality_agent_id=? AND last_seq=? AND event_count=?
                AND chain_digest=? AND key_ref=? AND head_hmac=?",
         )
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
@@ -2591,7 +5523,7 @@ async fn persist_event_head(
         .bind(&next.key_ref)
         .bind(&next.head_hmac)
         .bind(Utc::now().to_rfc3339())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(
             previous.last_seq,
             "previous event-log head last sequence",
@@ -2608,10 +5540,10 @@ async fn persist_event_head(
     } else {
         sqlx::query(
             "INSERT INTO event_log_heads(
-                conversation_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
              ) VALUES(?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(sqlite_i64(next.last_seq, "event-log head last sequence")?)
         .bind(sqlite_i64(next.event_count, "event-log event count")?)
         .bind(next.chain_digest.as_slice())
@@ -2631,11 +5563,9 @@ async fn revalidate_prepared_key_refs(
 ) -> Result<()> {
     let scope_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_scope
-         WHERE singleton=1 AND tenant_id=? AND agent_id=? AND conversation_id=?",
+         WHERE singleton=1 AND personality_agent_id=?",
     )
-    .bind(&store.scope().tenant_id)
-    .bind(&store.scope().agent_id)
-    .bind(&store.scope().conversation_id)
+    .bind(store.scope().personality_agent_id.as_str())
     .fetch_one(&mut **transaction)
     .await?;
     if scope_count != 1 {
@@ -2657,6 +5587,7 @@ async fn revalidate_prepared_key_refs(
                 PreparedProjection::MessageEnd {
                     raw_key_ref,
                     raw_key_proof,
+                    provider_context_key_proofs,
                     ..
                 } => {
                     insert_prepared_key_expectation(
@@ -2665,6 +5596,14 @@ async fn revalidate_prepared_key_refs(
                         DataKeyPurpose::Transcript,
                         raw_key_proof,
                     )?;
+                    for (key_ref, proof) in provider_context_key_proofs {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::ProviderContext,
+                            proof,
+                        )?;
+                    }
                 }
                 PreparedProjection::CommandInsert {
                     payload_key_ref,
@@ -2676,7 +5615,56 @@ async fn revalidate_prepared_key_refs(
                     DataKeyPurpose::Command,
                     payload_key_proof,
                 )?,
-                PreparedProjection::Plain(_) => {}
+                PreparedProjection::ProviderContextMutation {
+                    intent_key_ref,
+                    intent_key_proof,
+                    insert_key_ref,
+                    insert_key_proof,
+                    ..
+                } => {
+                    insert_prepared_key_expectation(
+                        &mut refs,
+                        intent_key_ref,
+                        DataKeyPurpose::Mutation,
+                        intent_key_proof,
+                    )?;
+                    if let (Some(key_ref), Some(proof)) = (insert_key_ref, insert_key_proof) {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::ProviderContext,
+                            proof,
+                        )?;
+                    }
+                }
+                PreparedProjection::ProviderContextMutationPrepare {
+                    intent_key_ref,
+                    intent_key_proof,
+                    ..
+                } => insert_prepared_key_expectation(
+                    &mut refs,
+                    intent_key_ref,
+                    DataKeyPurpose::Mutation,
+                    intent_key_proof,
+                )?,
+                PreparedProjection::MemoryJobUpdate {
+                    memory_summary_key_proofs,
+                    ..
+                }
+                | PreparedProjection::MemoryTransition {
+                    memory_summary_key_proofs,
+                    ..
+                } => {
+                    for (key_ref, proof) in memory_summary_key_proofs {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::MemorySummary,
+                            proof,
+                        )?;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2684,14 +5672,14 @@ async fn revalidate_prepared_key_refs(
     for (key_ref, (purpose, expected_proof)) in refs {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM data_keys
-             WHERE key_ref=? AND scope='conversation' AND purpose=?
-               AND conversation_id=? AND state='active' AND algorithm=?
+             WHERE key_ref=? AND scope='personality_agent' AND purpose=?
+               AND personality_agent_id=? AND state='active' AND algorithm=?
                AND wrap_key_id <> '' AND wrap_nonce IS NOT NULL AND wrapped_key IS NOT NULL
                AND destroyed_at IS NULL",
         )
         .bind(key_ref)
         .bind(purpose.as_str())
-        .bind(&store.scope().conversation_id)
+        .bind(store.scope().personality_agent_id.as_str())
         .bind(super::crypto::WRAP_ALGORITHM)
         .fetch_one(&mut **transaction)
         .await?;
@@ -2722,6 +5710,135 @@ async fn revalidate_prepared_key_refs(
                 purpose.as_str()
             )
         })?;
+    }
+    Ok(())
+}
+
+/// Enforce the Error-context usability fence against the transaction's current
+/// durable rows and the ordered prepared write set. A prepare ends semantic
+/// usability but does not make the rows disappear; therefore a later
+/// MessageStart/AgentEnd in the same batch is still forbidden. Only the common
+/// mutation application can make the next transaction eligible. Its
+/// MemoryMaintenance event carries audit and memory-projection commitments,
+/// but no lifecycle transition.
+async fn validate_prepared_error_context_fences(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &[PreparedWrite],
+) -> Result<()> {
+    let common_mutation_apply_only = !prepared.is_empty()
+        && prepared.iter().all(|write| {
+            write
+                .event
+                .as_ref()
+                .is_some_and(|event| event.kind == "memory_maintenance")
+                && !write.projections.is_empty()
+                && write.projections.iter().all(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::ProviderContextMutation { .. }
+                    )
+                })
+        });
+    if common_mutation_apply_only {
+        // The common applier re-authenticates the already-prepared intent,
+        // fixed target ids, key proofs, and every target row before
+        // deleting rows or erasing unreferenced keys. Every fixed target must
+        // still exist: SQLite commits each application atomically, so a
+        // prepared mutation cannot legitimately represent a partially applied
+        // deletion, and there is no durable erasure tombstone to prove one.
+        return Ok(());
+    }
+
+    let provider_context_rows =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to inspect provider-context rows for the Error attempt fence")?;
+    let mut pending_units = 0usize;
+    if provider_context_rows != 0 {
+        if provider_context_rows < 0 {
+            bail!("provider-context row count is negative");
+        }
+        authenticate_event_log_snapshot(store, transaction)
+            .await
+            .context("failed to authenticate event history for the Error attempt fence")?;
+        let messages = store
+            .hydrate_messages(transaction)
+            .await
+            .context("failed to authenticate transcript for the Error attempt fence")?;
+        let provider_context = store
+            .hydrate_provider_context(&messages, transaction)
+            .await
+            .context("failed to authenticate provider context for the Error attempt fence")?;
+        pending_units = usize::from(
+            super::pending_error_context_recovery(&messages, &provider_context)?.is_some(),
+        );
+    }
+
+    for write in prepared {
+        let new_error_units = write
+            .projections
+            .iter()
+            .filter(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        l0_disposition: L0Disposition::ExcludeRetryError,
+                        provider_context,
+                        ..
+                    } if !provider_context.is_empty()
+                )
+            })
+            .count();
+        pending_units = pending_units
+            .checked_add(new_error_units)
+            .ok_or_else(|| anyhow!("pending Error provider-context count overflow"))?;
+        if pending_units > 1 {
+            bail!(
+                "EventBatch would create multiple pending Error provider-context retention units"
+            );
+        }
+
+        let has_prepare = write.projections.iter().any(|projection| {
+            matches!(
+                projection,
+                PreparedProjection::ProviderContextMutationPrepare { .. }
+            )
+        });
+        let is_abort_disposition = write.event.is_none()
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        next: RunPhase::CancelRequested,
+                        ..
+                    })
+                )
+            });
+        let is_event_disposition = write
+            .event
+            .as_ref()
+            .is_some_and(|event| matches!(event.kind.as_str(), "retry_scheduled" | "turn_end"));
+        if pending_units != 0 && (is_event_disposition || is_abort_disposition) && !has_prepare {
+            bail!(
+                "Error-context attempt disposition must prepare Invalidate in the same EventWrite"
+            );
+        }
+        if has_prepare && pending_units != 1 {
+            bail!("Error-context Invalidate prepare has no unique pending retention unit");
+        }
+
+        let is_fenced_progress = write.event.as_ref().is_some_and(|event| {
+            event.kind == "agent_end"
+                || (event.kind == "message_start"
+                    && event.message_role.as_deref() == Some("assistant"))
+        });
+        if pending_units != 0 && is_fenced_progress {
+            bail!(
+                "assistant MessageStart/AgentEnd is fenced until Error-context Invalidate is applied"
+            );
+        }
     }
     Ok(())
 }
@@ -2763,6 +5880,239 @@ fn abrupt_transaction_exit(name: &str, boundary: &str, readiness_path: &std::pat
     )
 }
 
+#[cfg(all(test, unix))]
+fn test_env_abrupt_failpoint_for_prepared(
+    prepared: &[PreparedWrite],
+) -> Option<(String, bool, std::path::PathBuf)> {
+    use std::env;
+
+    let name = env::var("SUMI_EVENT_WRITER_FAILPOINT_NAME").ok()?;
+    let boundary = env::var("SUMI_EVENT_WRITER_FAILPOINT_BOUNDARY").ok()?;
+    let readiness = env::var("SUMI_EVENT_WRITER_FAILPOINT_READY").ok()?;
+    let after_commit = match boundary.as_str() {
+        "before_commit" => false,
+        "after_commit" => true,
+        _ => return None,
+    };
+    if !batch_matches_failpoint(prepared, &name) {
+        return None;
+    }
+    Some((name, after_commit, readiness.into()))
+}
+
+#[cfg(all(test, unix))]
+fn test_env_abrupt_failpoint_for_writes(
+    prepared: &[PreparedWrite],
+) -> Option<(String, usize, std::path::PathBuf)> {
+    use std::env;
+
+    let name = env::var("SUMI_EVENT_WRITER_FAILPOINT_NAME").ok()?;
+    let after_writes = env::var("SUMI_EVENT_WRITER_FAILPOINT_AFTER_WRITES").ok()?;
+    let readiness = env::var("SUMI_EVENT_WRITER_FAILPOINT_READY").ok()?;
+    let after_writes: usize = after_writes.parse().ok()?;
+    if !batch_matches_failpoint(prepared, &name) {
+        return None;
+    }
+    Some((name, after_writes, readiness.into()))
+}
+
+#[cfg(all(test, unix))]
+fn batch_matches_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
+    match name {
+        "hard_steer_step_zero" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        next: RunPhase::HardSteerRequested,
+                        ..
+                    })
+                )
+            }) && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::CommandClassified {
+                        application_kind: ApplicationKind::HardSteer,
+                        ..
+                    })
+                )
+            })
+        }),
+        "hard_steer_partial_message_end" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        role: "assistant",
+                        interrupted: true,
+                        ..
+                    }
+                )
+            })
+        }),
+        "hard_steer_user_injection" => {
+            let projections: Vec<_> = prepared
+                .iter()
+                .flat_map(|write| write.projections.iter())
+                .collect();
+            projections.iter().copied().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::CommandApplied {
+                        run_id: Some(_),
+                        ..
+                    })
+                )
+            }) && projections.iter().copied().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd { role: "user", .. }
+                )
+            })
+        }
+        "turn_end" => {
+            let has_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            let has_message_end = prepared.iter().any(|write| {
+                write
+                    .projections
+                    .iter()
+                    .any(|projection| matches!(projection, PreparedProjection::MessageEnd { .. }))
+            });
+            has_turn_end && !has_message_end
+        }
+        "soft_steer_injection" => {
+            prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            }) && prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            })
+        }
+        "retry_steer_injection" => {
+            let has_soft_steer = prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            });
+            let has_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            has_soft_steer && !has_turn_end
+        }
+        "group_tail_owner_transfer" => {
+            prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            }) && prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandApplied { .. })
+                    )
+                })
+            })
+        }
+        "active_abort_cutoff" => {
+            prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandApplied {
+                            run_id: Some(_),
+                            ..
+                        })
+                    )
+                })
+            }) && prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::RunPhase {
+                            next: RunPhase::CancelRequested,
+                            ..
+                        })
+                    )
+                })
+            })
+        }
+        "error_context_message_end" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        l0_disposition: L0Disposition::ExcludeRetryError,
+                        provider_context,
+                        ..
+                    } if !provider_context.is_empty()
+                )
+            })
+        }),
+        "error_context_disposition_prepare" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutationPrepare { .. }
+                )
+            })
+        }),
+        "error_context_disposition_apply" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::ProviderContextMutation { .. }
+                )
+            })
+        }),
+        "supersede_cutoff" => {
+            let has_empty_or_normal_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            let has_agent_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "agent_end")
+            });
+            let has_superseded = prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandSuperseded { .. })
+                    )
+                })
+            });
+            has_empty_or_normal_turn_end && has_agent_end && has_superseded
+        }
+        "before_t17_logical_suffix_transaction" | "after_t17_logical_suffix_transaction" => {
+            prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::PhysicalRecovery(_))
+                    )
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
 fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     if incoming.len() != stored.len() || incoming.ct_eq(stored).unwrap_u8() == 0 {
         bail!("command payload digest mismatch");
@@ -2770,12 +6120,147 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn rejection_disposition(reason: &CommandRejectReason) -> CommandDisposition {
+    let reject_reason = match reason {
+        CommandRejectReason::UnknownCommand => CommandDispositionRejectReason::UnknownCommand,
+        CommandRejectReason::SchemaViolation => CommandDispositionRejectReason::SchemaViolation,
+        CommandRejectReason::AttachmentsNotEmpty => {
+            CommandDispositionRejectReason::AttachmentsNotEmpty
+        }
+        CommandRejectReason::Oversized { .. } => CommandDispositionRejectReason::Oversized,
+    };
+    CommandDisposition::Rejected { reject_reason }
+}
+
+fn projection_command_disposition(
+    projection: &Projection,
+) -> Option<(&str, u64, CommandDisposition)> {
+    match projection {
+        Projection::CommandRejected {
+            seq,
+            command_id,
+            reason,
+            ..
+        } => Some((command_id, *seq, rejection_disposition(reason))),
+        Projection::CommandApplied {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Applied {})),
+        Projection::CommandSuperseded {
+            command_id,
+            command_seq,
+            ..
+        } => Some((command_id, *command_seq, CommandDisposition::Superseded {})),
+        _ => None,
+    }
+}
+
+fn validate_command_disposition_pairs(batch: &EventBatch) -> Result<()> {
+    let mut events = HashMap::new();
+    let mut terminals = HashMap::new();
+    for write in &batch.writes {
+        if let Some(event) = &write.event
+            && let AgentEvent::CommandDisposition(CommandDispositionEvent {
+                command_id,
+                command_seq,
+                disposition,
+            }) = &event.value
+            && events
+                .insert((command_id.clone(), *command_seq), disposition.clone())
+                .is_some()
+        {
+            bail!(
+                "duplicate command_disposition event for command {command_id} at sequence {command_seq}"
+            );
+        }
+        for projection in &write.projections {
+            if let Some((command_id, command_seq, disposition)) =
+                projection_command_disposition(projection)
+                && terminals
+                    .insert((command_id.to_owned(), command_seq), disposition)
+                    .is_some()
+            {
+                bail!(
+                    "duplicate terminal command projection for command {command_id} at sequence {command_seq}"
+                );
+            }
+        }
+    }
+    if events != terminals {
+        bail!("command_disposition events must exactly match terminal command projections");
+    }
+    Ok(())
+}
+
+fn materialize_command_dispositions(mut batch: EventBatch) -> Result<EventBatch> {
+    if batch.writes.iter().any(|write| {
+        write
+            .event
+            .as_ref()
+            .is_some_and(|event| matches!(event.value, AgentEvent::CommandDisposition(_)))
+    }) {
+        bail!("callers cannot supply command_disposition events");
+    }
+
+    let terminal_count = batch
+        .writes
+        .iter()
+        .flat_map(|write| &write.projections)
+        .filter(|projection| projection_command_disposition(projection).is_some())
+        .count();
+    let mut writes = Vec::with_capacity(batch.writes.len().saturating_add(terminal_count));
+    for write in batch.writes.drain(..) {
+        let dispositions = write
+            .projections
+            .iter()
+            .filter_map(projection_command_disposition)
+            .map(|(command_id, command_seq, disposition)| {
+                DurableEvent::command_disposition(command_id, command_seq, disposition)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writes.push(write);
+        writes.extend(dispositions.into_iter().map(|event| EventWrite {
+            event: Some(event),
+            projections: Vec::new(),
+        }));
+    }
+    batch.writes = writes;
+    validate_command_disposition_pairs(&batch)?;
+    Ok(batch)
+}
+
+#[cfg(test)]
 fn validate_batch_shape(
     _redactor: &Redactor,
     batch: &EventBatch,
 ) -> Result<Vec<ExpectedInjection>> {
+    validate_batch_shape_with_recovery(_redactor, batch, None)
+}
+
+fn validate_batch_shape_with_recovery(
+    _redactor: &Redactor,
+    batch: &EventBatch,
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+) -> Result<Vec<ExpectedInjection>> {
     if batch.writes.is_empty() {
         bail!("EventBatch must contain at least one write");
+    }
+    let has_provider_context_mutation = batch.writes.iter().any(|write| {
+        write
+            .projections
+            .iter()
+            .any(|projection| matches!(projection, Projection::ProviderContextMutation(_)))
+    });
+    if has_provider_context_mutation
+        && (batch.writes.len() != 1
+            || batch.writes[0].projections.len() != 1
+            || !matches!(
+                batch.writes[0].projections[0],
+                Projection::ProviderContextMutation(_)
+            ))
+    {
+        bail!("ProviderContextMutation must be the only projection in the only EventBatch write");
     }
     EventBatchSizer::validate(
         BatchBounds {
@@ -2788,7 +6273,14 @@ fn validate_batch_shape(
     let mut message_ids = HashSet::new();
     let mut previous_seq = None;
     for command in &batch.injected_commands {
-        let canonical_message_id = user_message_id(&command.command_id);
+        command
+            .provenance
+            .validate(command.provenance.personality_agent_id())
+            .map_err(|error| anyhow!("invalid injected command provenance: {error}"))?;
+        let canonical_message_id = user_message_id(
+            command.provenance.personality_agent_id(),
+            &command.command_id,
+        );
         if command.message_id != canonical_message_id {
             bail!(
                 "injected command {} message_id is not the canonical UUIDv5 derivation",
@@ -2832,6 +6324,7 @@ fn validate_batch_shape(
     let mut tool_result_ids = HashSet::new();
     let mut tool_result_message_ids = HashMap::new();
     let mut tool_mutation_ids = HashSet::new();
+    let mut tool_prepare_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
@@ -2860,6 +6353,7 @@ fn validate_batch_shape(
     let mut turn_start_positions = HashMap::new();
     let mut turn_end_positions = HashMap::new();
     let mut agent_end_positions = HashMap::new();
+    let mut physical_recovery_positions = Vec::new();
     let mut assistant_start_positions = Vec::new();
     let mut injected_user_end_positions = Vec::new();
     for (write_position, write) in batch.writes.iter().enumerate() {
@@ -3073,8 +6567,26 @@ fn validate_batch_shape(
                         bail!("durable RetryScheduled identity and fields must be non-empty");
                     }
                 }
-                AgentEvent::MemoryMaintenance { .. }
-                | AgentEvent::MessageUpdate { .. }
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    command_id,
+                    command_seq,
+                    ..
+                }) => {
+                    CommandId::parse(command_id).map_err(|_| {
+                        anyhow!("durable CommandDisposition command_id is not canonical")
+                    })?;
+                    if *command_seq > crate::gateway::wire::MAX_JSON_SAFE_INTEGER {
+                        bail!(
+                            "durable CommandDisposition command_seq exceeds the JSON-safe integer range"
+                        );
+                    }
+                }
+                AgentEvent::MemoryMaintenance { kind } => {
+                    if kind.as_str().is_empty() {
+                        bail!("durable MemoryMaintenance kind must not be empty");
+                    }
+                }
+                AgentEvent::MessageUpdate { .. }
                 | AgentEvent::ToolExecutionUpdate { .. }
                 | AgentEvent::Error { .. } => {
                     bail!("volatile or future AgentEvent cannot be persisted by T12");
@@ -3082,6 +6594,20 @@ fn validate_batch_shape(
             }
         }
         for projection in &write.projections {
+            if let Projection::PhysicalRecovery(receipt) = projection {
+                if write.event.is_some() {
+                    bail!("PhysicalRecovery projection must be eventless");
+                }
+                let Some(ctx) = physical_recovery else {
+                    bail!(
+                        "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                    );
+                };
+                if ctx.receipt != receipt {
+                    bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
+                }
+                physical_recovery_positions.push(write_position);
+            }
             if let Projection::CommandReceived { envelope } = projection
                 && (!command_insert_ids.insert(envelope.command_id.as_str())
                     || !command_insert_seqs.insert(envelope.seq))
@@ -3235,7 +6761,14 @@ fn validate_batch_shape(
                     | ToolExecutionMutation::Finish { tool_call_id, .. }
                     | ToolExecutionMutation::Skip { tool_call_id, .. } => tool_call_id,
                 };
-                if !tool_mutation_ids.insert(tool_call_id.as_str()) {
+                // `tool_prepare_mutation_ids` must contain a Prepare before a
+                // matching Start is processed; this traversal order is validated
+                // by the duplicate-mutation check below. An atomic Start that
+                // immediately follows its Prepare is allowed.
+                let is_atomic_start = matches!(mutation, ToolExecutionMutation::Start { .. })
+                    && tool_prepare_mutation_ids.contains(tool_call_id)
+                    && !tool_start_mutation_ids.contains(tool_call_id);
+                if !tool_mutation_ids.insert(tool_call_id.as_str()) && !is_atomic_start {
                     bail!("duplicate tool mutation for tool {tool_call_id}");
                 }
                 match mutation {
@@ -3268,10 +6801,12 @@ fn validate_batch_shape(
                             },
                         );
                     }
-                    ToolExecutionMutation::Prepare { .. } => {}
+                    ToolExecutionMutation::Prepare { .. } => {
+                        tool_prepare_mutation_ids.insert(tool_call_id.clone());
+                    }
                     ToolExecutionMutation::Skip { error_code, .. } => {
-                        if *error_code != "length_guard" {
-                            bail!("ToolExecution Skip only supports length_guard");
+                        if !SKIP_ERROR_CODES.contains(error_code) {
+                            bail!("ToolExecution Skip only supports {SKIP_ERROR_CODES:?}");
                         }
                         tool_skip_mutation_ids.insert(tool_call_id.clone());
                     }
@@ -3334,6 +6869,14 @@ fn validate_batch_shape(
                 }
             }
         }
+    }
+    if physical_recovery_positions.len() > 1 {
+        bail!("EventBatch may contain at most one PhysicalRecovery projection");
+    }
+    if let Some(position) = physical_recovery_positions.first()
+        && *position != batch.writes.len().saturating_sub(1)
+    {
+        bail!("PhysicalRecovery projection must be the final EventBatch write");
     }
     for (message_id, start_position) in &message_start_positions {
         if let Some(end_position) = message_end_positions.get(message_id)
@@ -3671,7 +7214,266 @@ fn validate_batch_shape(
             bail!("approval resolution event and mutation disagree for {request_id}");
         }
     }
+    let mut calibration_observation_count = 0usize;
+    for write in &batch.writes {
+        let error_context_disposition_event =
+            write
+                .event
+                .as_ref()
+                .is_some_and(|event| match &event.value {
+                    AgentEvent::RetryScheduled { .. } => true,
+                    AgentEvent::TurnEnd {
+                        message: Some(message),
+                        ..
+                    } => matches!(
+                        message.as_ref(),
+                        PublicMessage::Assistant(assistant)
+                            if assistant.stop_reason == StopReason::Error
+                    ),
+                    _ => false,
+                });
+        let active_abort_disposition = write.event.is_none()
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::RunPhase {
+                        next: RunPhase::CancelRequested,
+                        ..
+                    }
+                )
+            })
+            && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::CommandApplied {
+                        run_id: Some(_),
+                        ..
+                    }
+                )
+            });
+        let mut has_memory_maintenance = false;
+        if let Some(event) = &write.event
+            && matches!(event.value, AgentEvent::MemoryMaintenance { .. })
+        {
+            has_memory_maintenance = true;
+        }
+        let mut memory_transition_seen = false;
+        let mut memory_job_update_seen = false;
+        let mut provider_context_seen = false;
+        let mut batch_ids: HashSet<String> = HashSet::new();
+        let mut job_ids: HashSet<String> = HashSet::new();
+        let calibration_observations: Vec<u64> = write
+            .projections
+            .iter()
+            .filter_map(|projection| match projection {
+                Projection::MemoryCalibrationObservation {
+                    uncalibrated_prompt_estimate,
+                } => Some(*uncalibrated_prompt_estimate),
+                _ => None,
+            })
+            .collect();
+        if calibration_observations.len() > 1 {
+            bail!("only one memory calibration observation is allowed per EventWrite");
+        }
+        if let Some(uncalibrated_prompt_estimate) = calibration_observations.first().copied() {
+            calibration_observation_count = calibration_observation_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory calibration observation count overflow"))?;
+            if calibration_observation_count > 1 {
+                bail!("only one memory calibration observation is allowed per EventBatch");
+            }
+            if uncalibrated_prompt_estimate == 0 {
+                bail!("memory calibration estimate must be positive");
+            }
+            let mut assistant_messages = write.projections.iter().filter_map(|projection| {
+                let Projection::MessageEnd { role, message, .. } = projection else {
+                    return None;
+                };
+                match (role, message) {
+                    (&"assistant", PublicMessage::Assistant(message)) => Some(message),
+                    _ => None,
+                }
+            });
+            let assistant = assistant_messages.next().ok_or_else(|| {
+                anyhow!("memory calibration observation requires a same-write assistant MessageEnd")
+            })?;
+            if assistant_messages.next().is_some() {
+                bail!("memory calibration observation must bind exactly one assistant MessageEnd");
+            }
+            if matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) || assistant.interrupted
+            {
+                bail!("memory calibration observation requires a successful provider terminal");
+            }
+            if observed_prompt_tokens(&assistant.usage)
+                .context("failed to derive calibration prompt usage")?
+                == 0
+            {
+                bail!("memory calibration observation requires reported prompt usage");
+            }
+        }
+        for projection in &write.projections {
+            match projection {
+                Projection::ProviderContextMutation(_) => {
+                    if !has_memory_maintenance {
+                        bail!(
+                            "ProviderContextMutation projection requires a same-write MemoryMaintenance event"
+                        );
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    provider_context_seen = true;
+                }
+                Projection::ProviderContextMutationPrepare(_) => {
+                    if !error_context_disposition_event && !active_abort_disposition {
+                        bail!(
+                            "ProviderContextMutationPrepare requires RetryScheduled, terminal Error TurnEnd, or active Abort disposition"
+                        );
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    provider_context_seen = true;
+                }
+                Projection::MemoryJobUpdate(update) => {
+                    if !has_memory_maintenance {
+                        bail!(
+                            "MemoryJobUpdate projection requires a same-write MemoryMaintenance event"
+                        );
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    memory_job_update_seen = true;
+                    for mutation in &update.job_mutations {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
+                            bail!("duplicate job_id in MemoryJobUpdate");
+                        }
+                        validate_memory_job_mutation_shape(mutation)?;
+                    }
+                }
+                Projection::MemoryTransition(transition) => {
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    memory_transition_seen = true;
+                    let completes_job = transition
+                        .job_mutations
+                        .iter()
+                        .any(|mutation| matches!(mutation, MemoryJobMutation::Complete { .. }));
+                    let has_compacted_summary = transition.batch_mutations.iter().any(|batch| {
+                        batch.new_state == MemoryBatchState::Compacted && batch.summary.is_some()
+                    });
+                    for batch in &transition.batch_mutations {
+                        if !batch_ids.insert(batch.batch_id.to_string()) {
+                            bail!("duplicate batch_id in MemoryTransition");
+                        }
+                        if batch.new_state == MemoryBatchState::Compacted
+                            && batch.summary.is_none()
+                            && !(completes_job && has_compacted_summary)
+                        {
+                            bail!("Compacted MemoryBatchMutation requires a summary");
+                        }
+                        if batch.summary.is_some()
+                            && !matches!(
+                                batch.new_state,
+                                MemoryBatchState::Compacted | MemoryBatchState::Promoted
+                            )
+                        {
+                            bail!(
+                                "MemoryBatchMutation summary is only valid for Compacted or Promoted states"
+                            );
+                        }
+                    }
+                    for insert in &transition.batch_inserts {
+                        if !batch_ids.insert(insert.id.clone()) {
+                            bail!("duplicate batch_id in MemoryTransition batch_inserts");
+                        }
+                        let insert_id = BatchId::parse_str(&insert.id)
+                            .with_context(|| format!("invalid inserted batch id {}", insert.id))?;
+                        if transition.expected_source_versions.contains_key(&insert_id)
+                            || transition.expected_source_states.contains_key(&insert_id)
+                        {
+                            bail!(
+                                "inserted batch_id {} is also listed as a source witness",
+                                insert.id
+                            );
+                        }
+                        if insert.version != 0 {
+                            bail!("MemoryTransition batch_inserts must have version 0");
+                        }
+                        if insert.summary.is_some() {
+                            bail!(
+                                "MemoryTransition batch_inserts must not carry caller-supplied summaries; summaries are encrypted by EventWriter from MemoryBatchMutation"
+                            );
+                        }
+                    }
+                    for mutation in &transition.job_mutations {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
+                            bail!("duplicate job_id in MemoryTransition");
+                        }
+                        validate_memory_job_mutation_shape(mutation)?;
+                    }
+                    for insert in &transition.job_inserts {
+                        if !job_ids.insert(insert.id.clone()) {
+                            bail!("duplicate job_id in MemoryTransition job_inserts");
+                        }
+                        if insert.status != MemoryJobStatus::Pending {
+                            bail!("MemoryTransition job_inserts must be in Pending state");
+                        }
+                        if insert.attempts != 0 {
+                            bail!("MemoryTransition job_inserts must have attempts 0");
+                        }
+                        if insert.lease_until.is_some() {
+                            bail!("MemoryTransition job_inserts must not have a lease");
+                        }
+                        if insert.result.is_some() {
+                            bail!("MemoryTransition job_inserts must not carry a result");
+                        }
+                        if insert.source_ids.is_empty() {
+                            bail!("MemoryTransition job_inserts must have at least one source");
+                        }
+                    }
+                    if !has_memory_maintenance {
+                        bail!(
+                            "MemoryTransition projection requires a same-write MemoryMaintenance event"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(expected_injections)
+}
+
+fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
+    match mutation {
+        MemoryJobMutation::Claim { job_id, .. }
+        | MemoryJobMutation::Start { job_id, .. }
+        | MemoryJobMutation::Complete { job_id, .. }
+        | MemoryJobMutation::Fail { job_id, .. }
+        | MemoryJobMutation::Reclaim { job_id, .. }
+        | MemoryJobMutation::Apply { job_id, .. }
+        | MemoryJobMutation::Discard { job_id, .. }
+        | MemoryJobMutation::Release { job_id, .. } => job_id.as_str(),
+    }
+}
+
+fn validate_memory_job_mutation_shape(mutation: &MemoryJobMutation) -> Result<()> {
+    match mutation {
+        MemoryJobMutation::Complete { result, .. } => {
+            if result.est_tokens == 0 && result.summary.expose().is_empty() {
+                bail!("MemoryJobMutation::Complete result must not be empty");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_approval_resolution(resolution: &str) -> Result<()> {
@@ -3718,7 +7520,15 @@ fn validate_terminal_tool_semantics(
     }
     if !matches!(
         error_code,
-        Some("executor_failed" | "cancelled" | "indeterminate" | "invalid_result" | "internal")
+        Some(
+            "executor_failed"
+                | "cancelled"
+                | "indeterminate"
+                | "invalid_result"
+                | "internal"
+                | "approval_denied"
+                | "approval_cancelled"
+        )
     ) {
         bail!("unknown terminal tool error_code");
     }
@@ -3826,23 +7636,74 @@ fn message_end_identity(event: &AgentEvent) -> Result<Option<MessageEndIdentity>
     }))
 }
 
-fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> Result<()> {
-    let max_components = super::sizer::EVENT_BATCH_MAX_BYTES / DURABLE_ROW_OVERHEAD_BYTES;
-    if batch.writes.len() > max_components {
+const MEMORY_SUMMARY_CIPHERTEXT_OVERHEAD_BYTES: usize = 1 + 24 + 16;
+const MEMORY_SUMMARY_KEY_REF_BYTES: usize = "memory_summary".len() + 1 + 36;
+const MEMORY_MUTATION_TIMESTAMP_MAX_BYTES: usize = 40;
+const MAX_MEMORY_BATCH_STATE_BYTES: usize = "compact_failed".len();
+const MAX_MATERIALIZATION_COMPONENTS: usize =
+    super::sizer::EVENT_BATCH_MAX_BYTES / DURABLE_ROW_OVERHEAD_BYTES;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryMaterialization {
+    components: usize,
+    bytes: usize,
+}
+
+impl MemoryMaterialization {
+    fn add_logical_component(&mut self, content_bytes: usize, label: &str) -> Result<()> {
+        let next_components = self
+            .components
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("{label} component count overflow"))?;
+        if next_components > MAX_MATERIALIZATION_COMPONENTS {
+            bail!(
+                "EventBatch has more than {MAX_MATERIALIZATION_COMPONENTS} materialization components while sizing {label}"
+            );
+        }
+        self.components = next_components;
+        self.bytes = self
+            .bytes
+            .checked_add(content_bytes)
+            .ok_or_else(|| anyhow!("{label} byte count overflow"))?;
+        Ok(())
+    }
+
+    fn add_durable_row(&mut self, content_bytes: usize, label: &str) -> Result<()> {
+        let row_bytes = content_bytes
+            .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+            .ok_or_else(|| anyhow!("{label} row byte count overflow"))?;
+        self.add_logical_component(row_bytes, label)
+    }
+}
+
+fn checked_byte_sum(label: &str, parts: impl IntoIterator<Item = usize>) -> Result<usize> {
+    parts.into_iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part)
+            .ok_or_else(|| anyhow!("{label} byte count overflow"))
+    })
+}
+
+fn charge_materialization_components(total: &mut usize, additional: usize) -> Result<()> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| anyhow!("EventBatch materialization component count overflow"))?;
+    if *total > MAX_MATERIALIZATION_COMPONENTS {
         bail!(
-            "EventBatch has {} writes, exceeding bounded materialization count {max_components}",
-            batch.writes.len()
+            "EventBatch has {} materialization components, limit is {}",
+            *total,
+            MAX_MATERIALIZATION_COMPONENTS
         );
     }
-    let mut components = batch.writes.len();
+    Ok(())
+}
+
+fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> Result<()> {
+    let mut components = 0usize;
+    charge_materialization_components(&mut components, batch.writes.len())?;
     let mut preflight_bytes = 0usize;
     for write in &batch.writes {
-        components = components
-            .checked_add(write.projections.len())
-            .ok_or_else(|| anyhow!("EventBatch component count overflow"))?;
-        if components > max_components {
-            bail!("EventBatch has more than {max_components} event/projection components");
-        }
+        charge_materialization_components(&mut components, write.projections.len())?;
         if let Some(event) = &write.event {
             let metadata_bytes = event
                 .metadata
@@ -3918,6 +7779,18 @@ fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> 
                         .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                         .ok_or_else(|| anyhow!("MessageEnd preflight byte count overflow"))?
                 }
+                Projection::MemoryJobUpdate(update) => {
+                    let materialization =
+                        memory_job_update_preflight_materialization(redactor, update)?;
+                    charge_materialization_components(&mut components, materialization.components)?;
+                    materialization.bytes
+                }
+                Projection::MemoryTransition(transition) => {
+                    let materialization =
+                        memory_transition_preflight_materialization(redactor, transition)?;
+                    charge_materialization_components(&mut components, materialization.components)?;
+                    materialization.bytes
+                }
                 projection => projection_size_upper_bound(projection)?,
             };
             if projection_bytes > super::sizer::EVENT_BATCH_MAX_BYTES {
@@ -3935,6 +7808,474 @@ fn charge_transaction_bytes(total: &mut usize, bytes: usize) -> Result<()> {
         .ok_or_else(|| anyhow!("EventBatch durable byte count overflow"))?;
     EventBatchSizer::validate(BatchBounds::default(), *total)?;
     Ok(())
+}
+
+fn compact_result_preflight_bytes(redactor: &Redactor, result: &CompactResult) -> Result<usize> {
+    let raw = serde_json::to_vec(&MemorySummaryPayload {
+        summary: result.summary.expose(),
+        est_tokens: result.est_tokens,
+        from: &result.time_range.0,
+        to: &result.time_range.1,
+    })
+    .context("failed to serialize memory summary sizing payload")?;
+    let projection = redactor
+        .redact_serialized(&raw)
+        .context("failed to redact memory summary sizing payload")?;
+    checked_byte_sum(
+        "memory summary",
+        [
+            MEMORY_SUMMARY_KEY_REF_BYTES,
+            raw.len()
+                .checked_add(MEMORY_SUMMARY_CIPHERTEXT_OVERHEAD_BYTES)
+                .ok_or_else(|| anyhow!("memory summary ciphertext byte count overflow"))?,
+            projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn encrypted_batch_summary_bytes(summary: &MemoryBatchSummary) -> Result<usize> {
+    checked_byte_sum(
+        "encrypted memory batch summary",
+        [
+            summary.key_ref.len(),
+            summary.ciphertext.len(),
+            summary.projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn encrypted_job_result_bytes(result: &MemoryJobResult) -> Result<usize> {
+    checked_byte_sum(
+        "encrypted memory job result",
+        [
+            result.key_ref.len(),
+            result.ciphertext.len(),
+            result.projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn memory_batch_record_bytes(record: &MemoryBatchRecord) -> Result<usize> {
+    let summary_bytes = record
+        .summary
+        .as_ref()
+        .map(encrypted_batch_summary_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    checked_byte_sum(
+        "memory batch insert",
+        [
+            record.id.len(),
+            record.state.as_str().len(),
+            record.updated_at.len(),
+            summary_bytes,
+            8 * std::mem::size_of::<i64>(),
+            2 * super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn memory_job_record_bytes(record: &MemoryJobRecord) -> Result<usize> {
+    let source_ids = serde_json::to_vec(&record.source_ids)
+        .context("failed to serialize memory job source ids for sizing")?;
+    let source_versions = serde_json::to_vec(&record.source_versions)
+        .context("failed to serialize memory job source versions for sizing")?;
+    let result_bytes = record
+        .result
+        .as_ref()
+        .map(encrypted_job_result_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    checked_byte_sum(
+        "memory job insert",
+        [
+            record.id.len(),
+            record.kind.as_str().len(),
+            record.status.as_str().len(),
+            record.lease_until.as_ref().map_or(0, String::len),
+            record.created_at.len(),
+            record.updated_at.len(),
+            source_ids.len(),
+            source_versions.len(),
+            result_bytes,
+            3 * std::mem::size_of::<i64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn charge_and_validate_memory_job_sources(
+    materialization: &mut MemoryMaterialization,
+    record: &MemoryJobRecord,
+) -> Result<()> {
+    let mut unique_sources = BTreeSet::new();
+    for source_id in &record.source_ids {
+        materialization.add_logical_component(
+            source_id
+                .len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("memory job source identity byte count overflow"))?,
+            "memory job source identity",
+        )?;
+        BatchId::parse_str(source_id).with_context(|| {
+            format!("memory job {} has invalid source id {source_id}", record.id)
+        })?;
+        if !unique_sources.insert(source_id.as_str()) {
+            bail!("memory job {} repeats source id {source_id}", record.id);
+        }
+        if !record.source_versions.contains_key(source_id) {
+            bail!(
+                "memory job {} source {source_id} is missing its version witness",
+                record.id
+            );
+        }
+    }
+
+    let mut target_count = 0usize;
+    for (batch_id, version) in &record.source_versions {
+        materialization.add_logical_component(
+            batch_id
+                .len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("memory job source-version byte count overflow"))?,
+            "memory job source-version identity",
+        )?;
+        BatchId::parse_str(batch_id).with_context(|| {
+            format!(
+                "memory job {} has invalid source-version batch id {batch_id}",
+                record.id
+            )
+        })?;
+        if *version < 0 {
+            bail!(
+                "memory job {} batch {batch_id} has a negative version witness",
+                record.id
+            );
+        }
+        if !unique_sources.contains(batch_id.as_str()) {
+            target_count = target_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory job target count overflow"))?;
+        }
+    }
+    if target_count != 1 {
+        bail!(
+            "memory job {} must have exactly one target batch witness, found {target_count}",
+            record.id
+        );
+    }
+    Ok(())
+}
+
+fn memory_job_mutation_preflight_bytes(
+    redactor: &Redactor,
+    mutation: &MemoryJobMutation,
+    source_versions_json_bytes: usize,
+) -> Result<usize> {
+    let (job_id, expected_status, new_status, expected_lease_bytes, new_lease_bytes, result_bytes) =
+        match mutation {
+            MemoryJobMutation::Claim {
+                job_id,
+                lease_until,
+            } => (job_id, "pending", "running", 0, lease_until.len(), 0),
+            MemoryJobMutation::Start {
+                job_id,
+                lease_witness,
+                lease_until,
+                ..
+            } => (
+                job_id,
+                "running",
+                "running",
+                lease_witness.as_ref().map_or(0, String::len),
+                lease_until.len(),
+                0,
+            ),
+            MemoryJobMutation::Complete {
+                job_id,
+                lease_witness,
+                result,
+                ..
+            } => (
+                job_id,
+                "running",
+                "completed",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                compact_result_preflight_bytes(redactor, result)?,
+            ),
+            MemoryJobMutation::Fail {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "running",
+                "failed",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Apply {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "completed",
+                "applied",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Reclaim {
+                job_id,
+                lease_until,
+                ..
+            } => (job_id, "failed", "running", 0, lease_until.len(), 0),
+            MemoryJobMutation::Discard {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "completed",
+                "discarded",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Release {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "running",
+                "pending",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+        };
+    memory_job_mutation_materialization_bytes(
+        job_id.len(),
+        expected_status.len(),
+        new_status.len(),
+        expected_lease_bytes,
+        new_lease_bytes,
+        source_versions_json_bytes,
+        result_bytes,
+    )
+}
+
+fn memory_job_mutation_materialization_bytes(
+    job_id_bytes: usize,
+    expected_status_bytes: usize,
+    new_status_bytes: usize,
+    expected_lease_bytes: usize,
+    new_lease_bytes: usize,
+    source_versions_bytes: usize,
+    result_bytes: usize,
+) -> Result<usize> {
+    checked_byte_sum(
+        "memory job mutation",
+        [
+            job_id_bytes,
+            expected_status_bytes,
+            new_status_bytes,
+            expected_lease_bytes,
+            new_lease_bytes,
+            source_versions_bytes,
+            result_bytes,
+            3 * std::mem::size_of::<i64>(),
+            MEMORY_MUTATION_TIMESTAMP_MAX_BYTES,
+            std::mem::size_of::<u64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn memory_batch_mutation_materialization_bytes(
+    batch_id_bytes: usize,
+    old_state_bytes: usize,
+    new_state_bytes: usize,
+    summary_bytes: usize,
+) -> Result<usize> {
+    checked_byte_sum(
+        "memory batch mutation",
+        [
+            batch_id_bytes,
+            old_state_bytes,
+            new_state_bytes,
+            summary_bytes,
+            4 * std::mem::size_of::<i64>(),
+            std::mem::size_of::<bool>(),
+            MEMORY_MUTATION_TIMESTAMP_MAX_BYTES,
+            std::mem::size_of::<u64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn mutation_writes_source_versions(mutation: &MemoryJobMutation) -> bool {
+    !matches!(
+        mutation,
+        MemoryJobMutation::Claim { .. }
+            | MemoryJobMutation::Start { .. }
+            | MemoryJobMutation::Release { .. }
+            | MemoryJobMutation::Discard { .. }
+    )
+}
+
+fn memory_job_update_preflight_materialization(
+    redactor: &Redactor,
+    update: &MemoryJobUpdate,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    let source_versions: BTreeMap<String, u64> = update
+        .expected_source_versions
+        .iter()
+        .map(|(id, version)| (id.to_string(), *version))
+        .collect();
+    for id in update.expected_source_versions.keys() {
+        materialization.add_logical_component(
+            id.to_string()
+                .len()
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or_else(|| anyhow!("memory source-version witness byte count overflow"))?,
+            "memory source-version witness",
+        )?;
+    }
+    let source_versions_json = serde_json::to_vec(&source_versions)
+        .context("failed to serialize memory job update source versions for sizing")?;
+    for mutation in &update.job_mutations {
+        materialization.add_durable_row(
+            memory_job_mutation_preflight_bytes(
+                redactor,
+                mutation,
+                if mutation_writes_source_versions(mutation) {
+                    source_versions_json.len()
+                } else {
+                    0
+                },
+            )?,
+            "memory job mutation",
+        )?;
+    }
+    Ok(materialization)
+}
+
+fn memory_transition_preflight_materialization(
+    redactor: &Redactor,
+    transition: &MemoryTransition,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    let mut post_source_versions: BTreeMap<String, u64> = transition
+        .expected_source_versions
+        .iter()
+        .map(|(id, version)| (id.to_string(), *version))
+        .collect();
+    for mutation in &transition.batch_mutations {
+        post_source_versions.insert(
+            mutation.batch_id.to_string(),
+            mutation
+                .expected_version
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch version sizing overflow"))?,
+        );
+    }
+    for id in transition.expected_source_versions.keys() {
+        materialization.add_logical_component(
+            id.to_string()
+                .len()
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or_else(|| anyhow!("memory source-version witness byte count overflow"))?,
+            "memory source-version witness",
+        )?;
+    }
+    let source_versions_json = serde_json::to_vec(&post_source_versions)
+        .context("failed to serialize memory transition source versions for sizing")?;
+    for (id, state) in &transition.expected_source_states {
+        materialization.add_logical_component(
+            checked_byte_sum(
+                "memory source-state witness",
+                [id.to_string().len(), state.as_str().len()],
+            )?,
+            "memory source-state witness",
+        )?;
+    }
+    for mutation in &transition.batch_mutations {
+        let summary_bytes = mutation
+            .summary
+            .as_ref()
+            .map(|summary| compact_result_preflight_bytes(redactor, summary))
+            .transpose()?
+            .unwrap_or(0);
+        materialization.add_durable_row(
+            memory_batch_mutation_materialization_bytes(
+                mutation.batch_id.to_string().len(),
+                MAX_MEMORY_BATCH_STATE_BYTES,
+                mutation.new_state.as_str().len(),
+                summary_bytes,
+            )?,
+            "memory batch mutation",
+        )?;
+    }
+    for mutation in &transition.job_mutations {
+        materialization.add_durable_row(
+            memory_job_mutation_preflight_bytes(
+                redactor,
+                mutation,
+                if mutation_writes_source_versions(mutation) {
+                    source_versions_json.len()
+                } else {
+                    0
+                },
+            )?,
+            "memory job mutation",
+        )?;
+    }
+    for record in &transition.batch_inserts {
+        materialization
+            .add_durable_row(memory_batch_record_bytes(record)?, "memory batch insert")?;
+    }
+    for record in &transition.job_inserts {
+        charge_and_validate_memory_job_sources(&mut materialization, record)?;
+        materialization.add_durable_row(memory_job_record_bytes(record)?, "memory job insert")?;
+    }
+    for membership in &transition.membership_inserts {
+        materialization.add_durable_row(
+            checked_byte_sum(
+                "memory membership insert",
+                [
+                    membership.batch_id.len(),
+                    membership.message_id.len(),
+                    std::mem::size_of::<i64>(),
+                ],
+            )?,
+            "memory membership insert",
+        )?;
+    }
+    if let Some(cursor) = &transition.cursor_advance {
+        materialization.add_durable_row(
+            checked_byte_sum(
+                "memory cursor mutation",
+                [
+                    cursor.kind.len(),
+                    2 * std::mem::size_of::<u64>(),
+                    std::mem::size_of::<bool>(),
+                    std::mem::size_of::<u64>(),
+                    super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+                ],
+            )?,
+            "memory cursor mutation",
+        )?;
+    }
+    Ok(materialization)
 }
 
 fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
@@ -4008,6 +8349,38 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 .saturating_add(turn_id.len()),
             ApprovalMutation::Resolve { request_id, .. } => request_id.len(),
         },
+        Projection::PhysicalRecovery(receipt) => receipt
+            .receipt_id
+            .len()
+            .saturating_add(receipt.digest.len())
+            .saturating_add(receipt.lease.lease_id().len())
+            .saturating_add(receipt.fence.fence_id().len())
+            .saturating_add(
+                receipt
+                    .intents
+                    .iter()
+                    .map(|intent| {
+                        intent
+                            .tool_call_id
+                            .len()
+                            .saturating_add(intent.command_id.len())
+                            .saturating_add(intent.run_id.len())
+                    })
+                    .sum::<usize>(),
+            ),
+        Projection::ProviderContextMutation(inner) => inner.mutation_id.len().saturating_add(4096),
+        Projection::ProviderContextMutationPrepare(disposition) => {
+            disposition.mutation_id().len().saturating_add(4096)
+        }
+        Projection::MemoryJobUpdate(_) | Projection::MemoryTransition(_) => {
+            unreachable!("memory projections use checked dedicated sizing")
+        }
+        Projection::MemoryCalibrationObservation { .. } => 16,
+        Projection::ApprovalRule(rule) => rule
+            .id
+            .len()
+            .saturating_add(rule.tool.len())
+            .saturating_add(rule.pattern.len()),
         Projection::MessageEnd { .. } => 0,
         #[cfg(test)]
         Projection::SizePadding(bytes) => return Ok(*bytes),
@@ -4031,6 +8404,174 @@ fn prepared_projection_size(projection: &PreparedProjection) -> usize {
             .saturating_add(512),
         _ => 0,
     }
+}
+
+fn convert_batch_versions(versions: BTreeMap<BatchId, u64>) -> Result<BTreeMap<String, i64>> {
+    versions
+        .into_iter()
+        .map(|(id, version)| Ok((id.to_string(), sqlite_i64(version, "source version")?)))
+        .collect()
+}
+
+fn parse_memory_batch_state(value: &str) -> Result<MemoryBatchState> {
+    match value {
+        "open" => Ok(MemoryBatchState::Open),
+        "sealed" => Ok(MemoryBatchState::Sealed),
+        "compacting" => Ok(MemoryBatchState::Compacting),
+        "compact_failed" => Ok(MemoryBatchState::CompactFailed),
+        "compacted" => Ok(MemoryBatchState::Compacted),
+        "promoted" => Ok(MemoryBatchState::Promoted),
+        "dropped" => Ok(MemoryBatchState::Dropped),
+        _ => bail!("unknown memory batch state {value}"),
+    }
+}
+
+fn prepared_memory_job_mutation_bytes(job: &PreparedMemoryJobMutation) -> Result<usize> {
+    let result_bytes = job
+        .result
+        .as_ref()
+        .map(encrypted_job_result_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    memory_job_mutation_materialization_bytes(
+        job.job_id.len(),
+        job.expected_status.len(),
+        job.new_status.len(),
+        job.expected_lease_until.as_ref().map_or(0, String::len),
+        job.new_lease_until.as_ref().map_or(0, String::len),
+        job.source_versions.as_ref().map_or(0, String::len),
+        result_bytes,
+    )
+}
+
+fn prepared_memory_batch_mutation_bytes(batch: &PreparedMemoryBatchMutation) -> Result<usize> {
+    let summary_bytes = batch
+        .summary
+        .as_ref()
+        .map(encrypted_batch_summary_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    memory_batch_mutation_materialization_bytes(
+        batch.batch_id.len(),
+        batch.old_state.as_str().len(),
+        batch.new_state.as_str().len(),
+        summary_bytes,
+    )
+}
+
+fn add_prepared_source_version_witnesses(
+    materialization: &mut MemoryMaterialization,
+    versions: &BTreeMap<String, i64>,
+) -> Result<()> {
+    for id in versions.keys() {
+        materialization.add_logical_component(
+            id.len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("prepared source-version witness byte count overflow"))?,
+            "prepared source-version witness",
+        )?;
+    }
+    Ok(())
+}
+
+fn prepared_memory_projection_materialization(
+    projection: &PreparedProjection,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    match projection {
+        PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            ..
+        } => {
+            add_prepared_source_version_witnesses(&mut materialization, expected_source_versions)?;
+            for job in job_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_job_mutation_bytes(job)?,
+                    "prepared memory job mutation",
+                )?;
+            }
+        }
+        PreparedProjection::MemoryTransition {
+            expected_source_versions,
+            expected_source_states,
+            batch_mutations,
+            job_mutations,
+            batch_inserts,
+            job_inserts,
+            membership_inserts,
+            cursor_advance,
+            ..
+        } => {
+            add_prepared_source_version_witnesses(&mut materialization, expected_source_versions)?;
+            for (id, state) in expected_source_states {
+                materialization.add_logical_component(
+                    checked_byte_sum(
+                        "prepared source-state witness",
+                        [id.len(), state.as_str().len()],
+                    )?,
+                    "prepared source-state witness",
+                )?;
+            }
+            for batch in batch_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_batch_mutation_bytes(batch)?,
+                    "prepared memory batch mutation",
+                )?;
+            }
+            for job in job_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_job_mutation_bytes(job)?,
+                    "prepared memory job mutation",
+                )?;
+            }
+            for batch in batch_inserts {
+                if batch.summary.is_some() {
+                    bail!(
+                        "prepared MemoryTransition batch insert carries a caller-supplied summary"
+                    );
+                }
+                materialization.add_durable_row(
+                    memory_batch_record_bytes(batch)?,
+                    "prepared memory batch insert",
+                )?;
+            }
+            for job in job_inserts {
+                materialization
+                    .add_durable_row(memory_job_record_bytes(job)?, "prepared memory job insert")?;
+            }
+            for membership in membership_inserts {
+                materialization.add_durable_row(
+                    checked_byte_sum(
+                        "prepared memory membership insert",
+                        [
+                            membership.batch_id.len(),
+                            membership.message_id.len(),
+                            std::mem::size_of::<i64>(),
+                        ],
+                    )?,
+                    "prepared memory membership insert",
+                )?;
+            }
+            if let Some(cursor) = cursor_advance {
+                materialization.add_durable_row(
+                    checked_byte_sum(
+                        "prepared memory cursor mutation",
+                        [
+                            cursor.kind.len(),
+                            2 * std::mem::size_of::<u64>(),
+                            std::mem::size_of::<bool>(),
+                            std::mem::size_of::<u64>(),
+                            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+                        ],
+                    )?,
+                    "prepared memory cursor mutation",
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(materialization)
 }
 
 fn prepared_injection_bytes(
@@ -4077,23 +8618,28 @@ fn prepared_injection_bytes(
             _ => false,
         });
         let related_event = write.event.as_ref().is_some_and(|event| {
-            event
-                .message_id
-                .as_deref()
-                .is_some_and(|message_id| message_ids.contains(message_id))
-                || event
-                    .command_id
+            // Terminal dispositions are synthesized after the original T12
+            // injection write-set is sized. The complete transaction bound
+            // above still includes them; exclude them only from the exact
+            // injection-sizer drift comparison.
+            event.kind != "command_disposition"
+                && (event
+                    .message_id
                     .as_deref()
-                    .is_some_and(|command_id| command_ids.contains(command_id))
-                || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
-                    && match event.kind.as_str() {
-                        "agent_start" => sizing.application == InjectionApplication::IdleRun,
-                        "turn_start" => {
-                            sizing.application != InjectionApplication::RetrySteer
-                                && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
-                        }
-                        _ => false,
-                    })
+                    .is_some_and(|message_id| message_ids.contains(message_id))
+                    || event
+                        .command_id
+                        .as_deref()
+                        .is_some_and(|command_id| command_ids.contains(command_id))
+                    || (event.run_id.as_deref() == Some(sizing.run_id.as_str())
+                        && match event.kind.as_str() {
+                            "agent_start" => sizing.application == InjectionApplication::IdleRun,
+                            "turn_start" => {
+                                sizing.application != InjectionApplication::RetrySteer
+                                    && event.turn_id.as_deref() == Some(sizing.turn_id.as_str())
+                            }
+                            _ => false,
+                        }))
         });
         if !related_projection && !related_event {
             continue;
@@ -4138,6 +8684,7 @@ fn prepared_injection_bytes(
                 PreparedProjection::Plain(projection) => {
                     bytes = bytes.saturating_add(projection_size_upper_bound(projection)?);
                 }
+                _ => {}
             }
         }
     }
@@ -4635,18 +9182,26 @@ async fn validate_tool_finish_owner(
             final_phase.as_str()
         ),
         "prepared" => {
-            let approval_cleanup = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM approval_log
-                 WHERE tool_call_id = ? AND state = 'pending'",
+            let maybe_approval = sqlx::query(
+                "SELECT id, state FROM approval_log
+                 WHERE tool_call_id = ?",
             )
             .bind(tool_call_id)
             .fetch_optional(&mut **transaction)
-            .await?
-            .is_some_and(|request_id| {
-                approval_resolutions
-                    .get(request_id.as_str())
-                    .is_some_and(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
-            });
+            .await?;
+            let approval_cleanup = if let Some(row) = maybe_approval {
+                let request_id: String = row.try_get("id")?;
+                let state: String = row.try_get("state")?;
+                match state.as_str() {
+                    "denied" | "cancelled" => true,
+                    "pending" => approval_resolutions.get(request_id.as_str()).is_some_and(
+                        |(resolution, _)| matches!(*resolution, "denied" | "cancelled"),
+                    ),
+                    _ => false,
+                }
+            } else {
+                false
+            };
             if finish.state != "cancelled"
                 || !(closes_owner
                     || approval_cleanup
@@ -4762,9 +9317,11 @@ async fn validate_required_projection_sets(
     let mut approval_resolution_positions = HashMap::new();
     let mut approval_pendings = Vec::new();
     let mut tool_prepares = HashMap::new();
+    let mut tool_prepare_positions = HashMap::new();
     let mut tool_starts = HashMap::new();
     let mut tool_start_positions = HashMap::new();
     let mut tool_finishes = HashMap::new();
+    let mut approval_rule_inserts = HashMap::new();
     let mut applied_controls = Vec::new();
     let mut supersedes = Vec::new();
     let mut projection_position = 0usize;
@@ -4788,6 +9345,16 @@ async fn validate_required_projection_sets(
                 })) => {
                     approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
                     approval_resolution_positions.insert(request_id.as_str(), projection_position);
+                }
+                PreparedProjection::Plain(Projection::ApprovalRule(rule))
+                    if approval_rule_inserts
+                        .insert(
+                            rule.id.as_str(),
+                            (rule.tool.as_str(), rule.pattern.as_str()),
+                        )
+                        .is_some() =>
+                {
+                    bail!("duplicate approval rule insert for {}", rule.id);
                 }
                 PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
                     request_id,
@@ -4813,6 +9380,7 @@ async fn validate_required_projection_sets(
                         tool_call_id.as_str(),
                         (command_id.as_str(), run_id.as_str()),
                     );
+                    tool_prepare_positions.insert(tool_call_id.as_str(), projection_position);
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Start {
@@ -4951,9 +9519,29 @@ async fn validate_required_projection_sets(
     }
 
     for (tool_call_id, contextual_run_id) in &tool_starts {
-        let binding = load_prepared_tool_binding(transaction, tool_call_id)
-            .await?
-            .ok_or_else(|| anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}"))?;
+        let binding = if let Some((command_id, prepared_run_id)) = tool_prepares.get(tool_call_id) {
+            let prepare_position = tool_prepare_positions
+                .get(tool_call_id)
+                .expect("tool prepare position was collected");
+            let start_position = tool_start_positions
+                .get(tool_call_id)
+                .expect("tool start position was collected");
+            if prepare_position >= start_position {
+                bail!(
+                    "ToolExecutionStart for {tool_call_id} requires its same-batch ToolExecutionPrepare to precede it"
+                );
+            }
+            PreparedToolBinding {
+                command_id: (*command_id).to_owned(),
+                run_id: (*prepared_run_id).to_owned(),
+            }
+        } else {
+            load_prepared_tool_binding(transaction, tool_call_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}")
+                })?
+        };
         if binding.run_id != *contextual_run_id {
             bail!(
                 "ToolExecutionStart for {tool_call_id} run {contextual_run_id} does not match prepared run {}",
@@ -5043,14 +9631,17 @@ async fn validate_required_projection_sets(
         let request_id: String = approval.try_get("id")?;
         let state: String = approval.try_get("state")?;
         let approval_run_id: String = approval.try_get("run_id")?;
-        let approved_in_batch = approval_resolutions
-            .get(request_id.as_str())
-            .is_some_and(|(resolution, _)| *resolution == "approved_once")
-            && approval_resolution_bindings.get(&request_id).is_some_and(
-                |(run_id, approved_tool)| {
-                    run_id == *contextual_run_id && approved_tool == *tool_call_id
-                },
-            );
+        let approved_in_batch =
+            approval_resolutions
+                .get(request_id.as_str())
+                .is_some_and(|(resolution, _)| {
+                    matches!(*resolution, "approved_once" | "approved_always")
+                })
+                && approval_resolution_bindings.get(&request_id).is_some_and(
+                    |(run_id, approved_tool)| {
+                        run_id == *contextual_run_id && approved_tool == *tool_call_id
+                    },
+                );
         let approved_event_before_start = durable_event_envelope_identity_position(
             prepared,
             "approval_resolved",
@@ -5072,7 +9663,7 @@ async fn validate_required_projection_sets(
                     approval_position < start_position
                 })
             && approved_event_before_start;
-        let already_approved = state == "approved_once"
+        let already_approved = matches!(state.as_str(), "approved_once" | "approved_always")
             && approval_run_id == *contextual_run_id
             && lifecycle
                 .approved_once
@@ -5325,13 +9916,14 @@ async fn validate_required_projection_sets(
     }
 
     let mut consumed_approval_resolutions = HashSet::new();
+    let mut consumed_approval_rule_ids = HashSet::new();
     let mut active_abort_runs = HashSet::new();
     let mut user_owner_close_runs = HashSet::new();
     let mut user_owner_closes = Vec::new();
     let mut abort_applications = Vec::new();
     for (command_id, command_seq, contextual_run_id, position) in &applied_controls {
         let row = sqlx::query(
-            "SELECT command_kind, status, run_id, run_phase,
+            "SELECT command_kind, application_kind, status, run_id, run_phase,
                     payload_key_ref, payload_ciphertext, payload_hmac
              FROM inbound_commands WHERE command_id = ? AND seq = ?",
         )
@@ -5435,15 +10027,6 @@ async fn validate_required_projection_sets(
                 };
                 match *contextual_run_id {
                     Some(run_id) => {
-                        let expected_resolution = match decision {
-                            ApprovalDecision::ApproveOnce => "approved_once",
-                            ApprovalDecision::Deny => "denied",
-                            ApprovalDecision::ApproveAlways { .. } => {
-                                bail!(
-                                    "active ApproveAlways requires the T22/T23 durable policy mutation path"
-                                )
-                            }
-                        };
                         let Some((resolution, actor)) =
                             approval_resolutions.get(request_id.as_str())
                         else {
@@ -5451,11 +10034,87 @@ async fn validate_required_projection_sets(
                                 "active ApprovalDecision CommandApplied requires ApprovalResolved for {request_id}"
                             );
                         };
-                        if *resolution != expected_resolution {
-                            bail!(
-                                "ApprovalDecision {request_id} maps to {expected_resolution}, not {resolution}"
-                            );
-                        }
+                        let require_atomic_pending_tool_start = match decision {
+                            ApprovalDecision::ApproveOnce => {
+                                if *resolution != "approved_once" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to approved_once, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::Deny => {
+                                if *resolution != "denied" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to denied, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::ApproveAlways { rule } => match *resolution {
+                                "approved_always" => {
+                                    let mut value = serde_json::to_value(&rule)?;
+                                    let (rule_id, tool) = {
+                                        let object = value.as_object_mut().ok_or_else(|| {
+                                            anyhow!("ApproveAlways rule must be an object")
+                                        })?;
+                                        let rule_id =
+                                            object.get("id").and_then(Value::as_str).ok_or_else(
+                                                || anyhow!("ApproveAlways rule has no id"),
+                                            )?;
+                                        if rule_id.is_empty() {
+                                            object.insert(
+                                                "id".to_owned(),
+                                                Value::String(request_id.clone()),
+                                            );
+                                        }
+                                        (
+                                            object
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .expect("normalized ApproveAlways id")
+                                                .to_owned(),
+                                            object
+                                                .get("tool")
+                                                .and_then(Value::as_str)
+                                                .ok_or_else(|| {
+                                                    anyhow!("ApproveAlways rule has no tool")
+                                                })?
+                                                .to_owned(),
+                                        )
+                                    };
+                                    let Some((inserted_tool, inserted_pattern)) =
+                                        approval_rule_inserts.get(rule_id.as_str())
+                                    else {
+                                        bail!(
+                                            "active ApproveAlways requires its durable approval rule insert"
+                                        );
+                                    };
+                                    let inserted_value: Value = serde_json::from_str(
+                                        inserted_pattern,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "parse durable ApproveAlways rule {rule_id} pattern"
+                                        )
+                                    })?;
+                                    if *inserted_tool != tool || inserted_value != value {
+                                        bail!(
+                                            "durable ApproveAlways rule does not match the command"
+                                        );
+                                    }
+                                    consumed_approval_rule_ids.insert(rule_id);
+                                    false
+                                }
+                                "approved_once" => true,
+                                "denied" => false,
+                                _ => {
+                                    bail!(
+                                        "ApproveAlways ApprovalDecision {request_id} cannot map to {resolution}"
+                                    )
+                                }
+                            },
+                        };
                         if *actor == "runtime" {
                             bail!("user ApprovalDecision cannot use the runtime resolution actor");
                         }
@@ -5471,8 +10130,16 @@ async fn validate_required_projection_sets(
                                 "ApprovalDecision {request_id} does not resolve a pending approval in run {run_id}"
                             );
                         }
-                        if expected_resolution == "denied" && !tool_starts.is_empty() {
+                        if *resolution == "denied" && !tool_starts.is_empty() {
                             bail!("denied ApprovalDecision cannot co-commit ToolExecutionStart");
+                        }
+                        if require_atomic_pending_tool_start
+                            && (tool_starts.len() != 1
+                                || !tool_starts.contains_key(tool_call_id.as_str()))
+                        {
+                            bail!(
+                                "ApproveAlways normalized to approved_once must atomically start its pending tool {tool_call_id}"
+                            );
                         }
                         if !tool_starts.is_empty()
                             && (!tool_starts.contains_key(tool_call_id.as_str())
@@ -5484,18 +10151,26 @@ async fn validate_required_projection_sets(
                         }
                         consumed_approval_resolutions.insert(request_id);
                     }
-                    None if approval_resolutions.contains_key(request_id.as_str()) => {
-                        bail!(
-                            "no-op ApprovalDecision cannot carry ApprovalResolved for {request_id}"
-                        );
-                    }
                     None => {
+                        if let Some((resolution, actor)) =
+                            approval_resolutions.get(request_id.as_str())
+                            && (*resolution != "cancelled" || *actor != "runtime")
+                        {
+                            bail!(
+                                "no-op ApprovalDecision can co-commit only its runtime cancellation for {request_id}"
+                            );
+                        }
                         let approval_state: Option<String> =
                             sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
                                 .bind(&request_id)
                                 .fetch_optional(&mut **transaction)
                                 .await?;
                         if approval_state.as_deref() == Some("pending")
+                            && !approval_resolutions.get(request_id.as_str()).is_some_and(
+                                |(resolution, actor)| {
+                                    *resolution == "cancelled" && *actor == "runtime"
+                                },
+                            )
                             && !has_later_abort_cutoff(
                                 transaction,
                                 &applied_controls,
@@ -5553,9 +10228,13 @@ async fn validate_required_projection_sets(
                                 && *expected == RunPhase::TurnStarted
                                 && *next == RunPhase::UserStarted
                         });
+                let application_kind: String = row.try_get("application_kind")?;
+                let steer_handoff =
+                    matches!(application_kind.as_str(), "soft_steer" | "retry_steer");
                 match (normal_close, handoff, final_phase) {
                     (true, false, RunPhase::AssistantStarted | RunPhase::CancelRequested) => {}
                     (false, true, RunPhase::AssistantStarted | RunPhase::HardSteerRequested) => {}
+                    (false, true, RunPhase::UserCommitted) if steer_handoff => {}
                     (true, true, _) => {
                         bail!("AgentEnd cannot co-commit a same-run owner handoff")
                     }
@@ -5576,6 +10255,9 @@ async fn validate_required_projection_sets(
             }
             value => bail!("CommandApplied cannot target command kind {value}"),
         }
+    }
+    if consumed_approval_rule_ids.len() != approval_rule_inserts.len() {
+        bail!("approval rule insert requires its active ApproveAlways CommandApplied");
     }
     for (command_id, run_id) in &user_owner_closes {
         validate_owner_active_work_terminalized(
@@ -5602,7 +10284,7 @@ async fn validate_required_projection_sets(
             bail!(
                 "ApprovalResolved for {request_id} requires its active ApprovalDecision CommandApplied"
             );
-        } else if *resolution == "approved_once" {
+        } else if matches!(*resolution, "approved_once" | "approved_always") {
             let (_, tool_call_id) = approval_resolution_bindings
                 .get(*request_id)
                 .expect("validated approval resolution binding");
@@ -5883,6 +10565,7 @@ async fn validate_non_empty_turn_end_bindings(
 }
 
 struct AuthenticatedDurableEvent {
+    event: AgentEvent,
     kind: String,
     internal_metadata: String,
     metadata: DurableEventMetadata,
@@ -5942,6 +10625,7 @@ async fn load_authenticated_event(
     }
     let internal_metadata: String = row.try_get("internal_metadata")?;
     Ok(AuthenticatedDurableEvent {
+        event,
         kind,
         internal_metadata: internal_metadata.clone(),
         metadata: serde_json::from_str(&internal_metadata)
@@ -5955,16 +10639,553 @@ async fn load_authenticated_event(
     })
 }
 
+async fn verify_authenticated_message_projection(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    seq: u64,
+    message_id: &str,
+    message: &PublicMessage,
+) -> Result<()> {
+    let seq_i64 = i64::try_from(seq).context("authenticated MessageEnd sequence is outside i64")?;
+    let rows = sqlx::query(
+        "SELECT id, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted
+         FROM messages WHERE seq = ?",
+    )
+    .bind(seq_i64)
+    .fetch_all(&mut **transaction)
+    .await
+    .with_context(|| format!("failed to load transcript projection for MessageEnd {seq}"))?;
+    let [row] = rows.as_slice() else {
+        bail!(
+            "authenticated MessageEnd {message_id} at sequence {seq} requires exactly one transcript row, found {}",
+            rows.len()
+        );
+    };
+
+    let stored_id: String = row.try_get("id")?;
+    if stored_id != message_id {
+        bail!(
+            "transcript message {stored_id} at sequence {seq} disagrees with authenticated MessageEnd id {message_id}"
+        );
+    }
+    let expected_role = super::public_message_role(message);
+    let stored_role: String = row.try_get("role")?;
+    if stored_role != expected_role {
+        bail!("transcript message {message_id} role disagrees with authenticated MessageEnd");
+    }
+    let redaction_version: i64 = row.try_get("redaction_version")?;
+    if redaction_version != i64::from(store.redactor().version()) {
+        bail!("message {message_id} uses an unsupported redaction version");
+    }
+
+    let key_ref: String = row.try_get("raw_key_ref")?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await
+        .with_context(|| format!("failed to load transcript data key {key_ref}"))?;
+    if key.purpose != DataKeyPurpose::Transcript {
+        bail!("transcript message {message_id} references a non-transcript data key");
+    }
+    let aad = store
+        .scope()
+        .row_aad("messages", message_id, DataKeyPurpose::Transcript);
+    let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+    let plaintext = Zeroizing::new(
+        super::crypto::decrypt_content(&key, &ciphertext, &aad)
+            .with_context(|| format!("failed to decrypt transcript message {message_id}"))?,
+    );
+    let projected: PublicMessage = serde_json::from_slice(&plaintext)
+        .with_context(|| format!("transcript message {message_id} is not a valid PublicMessage"))?;
+    if projected != *message {
+        bail!("transcript message {message_id} content disagrees with authenticated MessageEnd");
+    }
+
+    let interrupted: i64 = row.try_get("interrupted")?;
+    if (interrupted != 0) != super::message_interrupted(&projected) {
+        bail!("message {message_id} interrupted flag does not match authenticated raw message");
+    }
+    let stored_payload: String = row.try_get("payload")?;
+    let derived_payload = store
+        .redactor()
+        .redact_serialized(&plaintext)
+        .with_context(|| format!("failed to re-derive payload for message {message_id}"))?;
+    if stored_payload != derived_payload {
+        bail!("message {message_id} stored payload does not match re-derived redacted projection");
+    }
+    let stored_search_text: String = row.try_get("search_text")?;
+    let derived_search_text = search_text_from_projection(&derived_payload)
+        .with_context(|| format!("failed to re-derive search text for message {message_id}"))?;
+    if stored_search_text != derived_search_text {
+        bail!("message {message_id} stored search_text does not match re-derived search text");
+    }
+    Ok(())
+}
+
+pub(super) async fn authenticate_running_tool_intent(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    command_id: &str,
+    run_id: &str,
+    executor_generation: ProcessGeneration,
+) -> Result<()> {
+    let sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM agent_events
+         WHERE event_type = 'tool_execution_start'
+           AND json_extract(envelope, '$.tool_call_id') = ?
+         ORDER BY seq",
+    )
+    .bind(tool_call_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to locate durable ToolExecutionStart evidence")?;
+    if sequences.len() != 1 {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one durable ToolExecutionStart"
+        );
+    }
+    let event = load_authenticated_event(store, transaction, sequences[0]).await?;
+    if event.kind != "tool_execution_start"
+        || event.envelope.get("tool_call_id").and_then(Value::as_str) != Some(tool_call_id)
+        || event.metadata.command_id.as_deref() != Some(command_id)
+        || event.metadata.run_id.as_deref() != Some(run_id)
+        || event.metadata.tool_state.as_deref() != Some("running")
+        || event.metadata.executor_generation != Some(executor_generation.as_i64())
+    {
+        bail!(
+            "running tool execution {tool_call_id} disagrees with authenticated ToolExecutionStart evidence"
+        );
+    }
+
+    Ok(())
+}
+
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
-    let event_head = load_verified_event_head_in_transaction(store, &mut transaction).await?;
+    let checkpoint =
+        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction, true).await?;
+    transaction.commit().await?;
+    Ok(checkpoint)
+}
+
+pub(super) async fn authenticate_event_log_snapshot(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<()> {
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, true)
+        .await
+        .map(|_| ())
+}
+
+pub(super) struct ProviderContextOwnerEventEvidence {
+    pub(super) anchor: ProviderContextAnchor,
+    pub(super) message: Message,
+}
+
+pub(super) async fn authenticate_provider_context_owner_events(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    evidence: &[ProviderContextOwnerEventEvidence],
+) -> Result<()> {
+    let mut expected = BTreeMap::<u64, (&str, &Message)>::new();
+    for owner in evidence {
+        match expected.entry(owner.anchor.message_seq) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((&owner.anchor.message_id, &owner.message));
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if *entry.get() == (owner.anchor.message_id.as_str(), &owner.message) => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                bail!(
+                    "provider-context targets claim conflicting MessageEnd evidence at sequence {}",
+                    owner.anchor.message_seq
+                );
+            }
+        }
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    // Provider mutations may call this after staging an authenticated memory
+    // footprint delta but before the enclosing EventWriter commits its new
+    // memory-projection event metadata. Authenticate the complete event chain
+    // and exact MessageEnd rows without requiring the transient projection
+    // rows to equal the previous event-backed checkpoint.
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, false)
+        .await
+        .context("failed to authenticate event history for provider-context invalidation")?;
+    for (seq, (expected_message_id, expected_message)) in expected {
+        let physical_seq = sqlite_i64(seq, "provider-context retention owner event sequence")?;
+        let event = load_authenticated_event(store, transaction, physical_seq).await?;
+        let AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } = &event.event
+        else {
+            bail!(
+                "provider-context retention owner {expected_message_id}:{seq} does not resolve to an authenticated MessageEnd event"
+            );
+        };
+        if message_id != expected_message_id
+            || Message::from((**message).clone()) != *expected_message
+        {
+            bail!(
+                "provider-context retention owner {expected_message_id}:{seq} disagrees with authenticated MessageEnd evidence"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn seed_provider_context_owner_event_evidence(
+    store: &Store,
+    owners: &[(&str, u64)],
+) -> Result<()> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let mut head_transaction = store.pool().begin().await?;
+    let previous_head =
+        load_verified_event_head_in_transaction(store, &mut head_transaction).await?;
+    head_transaction.rollback().await?;
+    let previous_last_seq = previous_head.as_ref().map_or(0, |head| head.last_seq);
+    let previous_event_count = previous_head.as_ref().map_or(0, |head| head.event_count);
+    let existing_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        .fetch_one(store.pool())
+        .await?;
+    if sqlite_u64(existing_events, "provider-context fixture event count")? != previous_event_count
+    {
+        bail!("provider-context event-evidence fixture found an inconsistent event count");
+    }
+
+    struct OwnerFixture {
+        message_id: String,
+        message: PublicMessage,
+        run_id: String,
+        turn_id: String,
+    }
+
+    let mut by_end_seq = BTreeMap::new();
+    for (message_id, seq) in owners {
+        let row = sqlx::query(
+            "SELECT raw_key_ref, raw_ciphertext
+             FROM messages WHERE id = ? AND seq = ?",
+        )
+        .bind(message_id)
+        .bind(sqlite_i64(
+            *seq,
+            "provider-context fixture message sequence",
+        )?)
+        .fetch_optional(store.pool())
+        .await?
+        .ok_or_else(|| {
+            anyhow!("provider-context event fixture message {message_id}:{seq} does not exist")
+        })?;
+        let key_ref: String = row.try_get("raw_key_ref")?;
+        let key = store.data_key_by_ref(&key_ref).await?;
+        if key.purpose != DataKeyPurpose::Transcript {
+            bail!("provider-context event fixture message uses a non-transcript key");
+        }
+        let aad = store
+            .scope()
+            .row_aad("messages", *message_id, DataKeyPurpose::Transcript);
+        let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+        let plaintext = Zeroizing::new(
+            super::crypto::decrypt_content(&key, &ciphertext, &aad)
+                .context("failed to authenticate provider-context fixture transcript message")?,
+        );
+        let message: PublicMessage = serde_json::from_slice(&plaintext)
+            .context("provider-context fixture transcript is not a PublicMessage")?;
+        if !matches!(message, PublicMessage::Assistant(_)) {
+            bail!("provider-context event fixture owner must be an assistant message");
+        }
+        let fixture = OwnerFixture {
+            message_id: (*message_id).to_owned(),
+            message,
+            run_id: format!("provider-context-fixture-run-{message_id}-{seq}"),
+            turn_id: format!("provider-context-fixture-turn-{message_id}-{seq}"),
+        };
+        if by_end_seq.insert(*seq, fixture).is_some() {
+            bail!("provider-context event fixture owner sequences must be unique");
+        }
+    }
+
+    let end_seqs: BTreeSet<_> = by_end_seq.keys().copied().collect();
+    if end_seqs
+        .first()
+        .is_some_and(|first| *first <= previous_last_seq)
+    {
+        bail!("provider-context event-evidence fixture owner sequence is not after the event head");
+    }
+    let mut used_seqs = end_seqs.clone();
+    let mut starts = BTreeMap::new();
+    for (&end_seq, owner) in &by_end_seq {
+        let start_seq = (previous_last_seq.saturating_add(1)..end_seq)
+            .rev()
+            .find(|candidate| !used_seqs.contains(candidate))
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider-context event fixture MessageEnd {end_seq} has no earlier sequence for MessageStart"
+                )
+            })?;
+        used_seqs.insert(start_seq);
+        starts.insert(start_seq, end_seq);
+        if owner.message_id.is_empty() {
+            bail!("provider-context event fixture message id must not be empty");
+        }
+    }
+
+    let writer = EventWriter::new(Arc::new(store.clone()));
+    let provenance = DirectChatProvenanceV1::new(
+        "tenant-test",
+        store.scope().personality_agent_id.clone(),
+        "human-test",
+    )?;
+    let command_key = store.private_key(DataKeyPurpose::Command).await?;
+    let command_seq_base: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM inbound_commands")
+            .fetch_one(store.pool())
+            .await?;
+    let event_key = store.private_key(DataKeyPurpose::Event).await?;
+    let mut transaction = store.pool().begin().await?;
+    for (index, owner) in by_end_seq.values().enumerate() {
+        let command_seq = command_seq_base
+            .checked_add(i64::try_from(index + 1).context("fixture command sequence overflow")?)
+            .ok_or_else(|| anyhow!("fixture command sequence overflow"))?;
+        let command_id = Uuid::now_v7().to_string();
+        let command_seq = sqlite_u64(command_seq, "provider-context fixture command sequence")?;
+        let payload = Zeroizing::new(serde_json::to_vec(&Command::UserMessage {
+            text: format!("provider-context owner evidence for {}", owner.message_id),
+            attachments: Vec::new(),
+        })?);
+        let PreparedProjection::CommandInsert {
+            seq,
+            command_id,
+            personality_agent_id,
+            provenance_json,
+            command_kind,
+            payload_key_ref,
+            payload_key_proof: _,
+            payload_ciphertext,
+            payload_hmac,
+            status,
+            reject_reason,
+            reject_actual_bytes,
+            admission_record_hmac,
+        } = writer.prepare_command_insert(CommandInsertInput {
+            key: &command_key,
+            seq: command_seq,
+            command_id,
+            personality_agent_id: store.scope().personality_agent_id(),
+            provenance: &provenance,
+            command_kind: "user_message",
+            canonical_payload: &payload,
+            rejection: None,
+            provided_digest: None,
+        })?
+        else {
+            unreachable!("command preparation returns a command insert");
+        };
+        if status != "received" || reject_reason.is_some() || reject_actual_bytes.is_some() {
+            bail!("provider-context fixture command unexpectedly prepared as rejected");
+        }
+        sqlx::query(
+            "INSERT INTO inbound_commands(
+                seq, command_id, personality_agent_id, provenance_json,
+                command_kind, payload_ciphertext, payload_key_ref,
+                payload_hmac, status, reject_reason, reject_actual_bytes,
+                admission_record_version, admission_record_hmac,
+                application_kind, run_id, turn_id, run_phase, received_at, applied_at
+             ) VALUES(
+                ?, ?, ?, ?, ?, ?, ?, ?, 'applying', NULL, NULL, ?, ?,
+                'idle_run', ?, ?, 'assistant_started', ?, NULL
+             )",
+        )
+        .bind(sqlite_i64(
+            seq,
+            "provider-context fixture command sequence",
+        )?)
+        .bind(command_id)
+        .bind(personality_agent_id.as_str())
+        .bind(provenance_json)
+        .bind(command_kind)
+        .bind(payload_ciphertext)
+        .bind(payload_key_ref)
+        .bind(payload_hmac)
+        .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+        .bind(admission_record_hmac)
+        .bind(&owner.run_id)
+        .bind(&owner.turn_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    let last_seq = *by_end_seq
+        .last_key_value()
+        .expect("non-empty owner fixture")
+        .0;
+    let mut chain_digest = previous_head
+        .as_ref()
+        .map_or([0_u8; EVENT_DIGEST_BYTES], |head| head.chain_digest);
+    for seq in previous_last_seq.saturating_add(1)..=last_seq {
+        let event = if let Some(end_seq) = starts.get(&seq) {
+            let owner = by_end_seq
+                .get(end_seq)
+                .expect("start schedule references a known owner");
+            DurableEvent::message_in_turn(
+                "message_start",
+                &owner.message_id,
+                &owner.message,
+                Some(owner.run_id.clone()),
+                Some(owner.turn_id.clone()),
+            )?
+        } else if let Some(owner) = by_end_seq.get(&seq) {
+            DurableEvent::message_in_turn(
+                "message_end",
+                &owner.message_id,
+                &owner.message,
+                Some(owner.run_id.clone()),
+                Some(owner.turn_id.clone()),
+            )?
+        } else {
+            DurableEvent::memory_maintenance("provider-context-fixture-gap")?
+        };
+        let aad = store
+            .scope()
+            .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
+        let protected = PublicProjectionBuilder::new(store.redactor(), &event_key)
+            .build_serialized(&event.raw_json, &aad)?;
+        let kind = event
+            .value
+            .durable_kind()
+            .expect("fixture events are durable");
+        let internal_metadata = serde_json::to_string(&event.metadata)?;
+        chain_digest = extend_event_chain(
+            &chain_digest,
+            EventChainEntry {
+                seq,
+                event_type: kind,
+                internal_metadata: &internal_metadata,
+                key_ref: &event_key.key_ref,
+                ciphertext: &protected.ciphertext,
+                envelope: &protected.projection,
+                redaction_version: protected.redaction_version,
+            },
+        );
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(sqlite_i64(seq, "provider-context fixture event sequence")?)
+        .bind(kind)
+        .bind(internal_metadata)
+        .bind(&event_key.key_ref)
+        .bind(protected.ciphertext)
+        .bind(protected.projection)
+        .bind(i64::from(protected.redaction_version))
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let added_event_count = last_seq
+        .checked_sub(previous_last_seq)
+        .ok_or_else(|| anyhow!("provider-context fixture event count underflow"))?;
+    let event_count = previous_event_count
+        .checked_add(added_event_count)
+        .ok_or_else(|| anyhow!("provider-context fixture event count overflow"))?;
+    let head_hmac = authenticate_event_head(
+        store.scope(),
+        &event_key,
+        last_seq,
+        event_count,
+        &chain_digest,
+    )?;
+    if let Some(previous) = previous_head {
+        let result = sqlx::query(
+            "UPDATE event_log_heads
+             SET last_seq = ?, event_count = ?, chain_digest = ?, key_ref = ?,
+                 head_hmac = ?, updated_at = ?
+             WHERE personality_agent_id = ? AND last_seq = ? AND event_count = ?
+               AND chain_digest = ?",
+        )
+        .bind(sqlite_i64(
+            last_seq,
+            "provider-context fixture event-log last sequence",
+        )?)
+        .bind(sqlite_i64(
+            event_count,
+            "provider-context fixture event count",
+        )?)
+        .bind(chain_digest.as_slice())
+        .bind(&event_key.key_ref)
+        .bind(head_hmac)
+        .bind(Utc::now().to_rfc3339())
+        .bind(store.scope().personality_agent_id.as_str())
+        .bind(sqlite_i64(
+            previous.last_seq,
+            "provider-context fixture previous event-log sequence",
+        )?)
+        .bind(sqlite_i64(
+            previous.event_count,
+            "provider-context fixture previous event count",
+        )?)
+        .bind(previous.chain_digest.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        require_single_cas(
+            result.rows_affected(),
+            "provider-context fixture event-log head",
+        )?;
+    } else {
+        sqlx::query(
+            "INSERT INTO event_log_heads(
+                personality_agent_id, last_seq, event_count, chain_digest, key_ref, head_hmac, updated_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(store.scope().personality_agent_id.as_str())
+        .bind(sqlite_i64(
+            last_seq,
+            "provider-context fixture event-log last sequence",
+        )?)
+        .bind(sqlite_i64(
+            event_count,
+            "provider-context fixture event count",
+        )?)
+        .bind(chain_digest.as_slice())
+        .bind(&event_key.key_ref)
+        .bind(head_hmac)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    EventWriter::new(Arc::new(store.clone()))
+        .reset_checkpoint_after_direct_fixture_mutation()
+        .await;
+    Ok(())
+}
+
+async fn reconstruct_authenticated_checkpoint_in_transaction(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    verify_current_memory_projection_rows: bool,
+) -> Result<LifecycleCheckpoint> {
+    let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
+    let mut memory_projections = BTreeMap::new();
+    let mut authenticated_message_count = 0_u64;
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
              WHERE run_id IS NOT NULL AND status = 'applying' AND run_phase <> 'finished'",
         )
-        .fetch_all(&mut *transaction)
+        .fetch_all(&mut **transaction)
         .await?,
     );
     for row in sqlx::query(
@@ -5973,7 +11194,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
            AND run_phase IN ('user_started','user_committed','assistant_started',
                              'hard_steer_requested','cancel_requested')",
     )
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut **transaction)
     .await?
     {
         let run_id: String = row.try_get("run_id")?;
@@ -5992,7 +11213,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
             sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq > ? ORDER BY seq LIMIT ?")
                 .bind(after_seq)
                 .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .context("failed to page durable event history during startup recovery")?;
         if page.is_empty() {
@@ -6006,7 +11227,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                     "durable event chain is not contiguous: expected {expected_seq}, found {seq}"
                 );
             }
-            let event = load_authenticated_event(store, &mut transaction, physical_seq).await?;
+            let event = load_authenticated_event(store, transaction, physical_seq).await?;
             chain_digest = extend_event_chain(
                 &chain_digest,
                 EventChainEntry {
@@ -6026,6 +11247,29 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                 &event.envelope,
                 false,
             )?;
+            apply_memory_projection_delta(
+                &mut memory_projections,
+                seq,
+                &event.kind,
+                event.metadata.memory_projection.as_ref(),
+            )?;
+            if let AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } = &event.event
+            {
+                verify_authenticated_message_projection(
+                    store,
+                    transaction,
+                    seq,
+                    message_id,
+                    message,
+                )
+                .await?;
+                authenticated_message_count = authenticated_message_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("authenticated MessageEnd count overflow"))?;
+            }
             observed_count = observed_count
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("durable event count overflow"))?;
@@ -6044,12 +11288,78 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                 && head.chain_digest == chain_digest => {}
         Some(_) => bail!("durable event history does not match authenticated head"),
     }
-    transaction.commit().await?;
+    if verify_current_memory_projection_rows {
+        let stored_memory_projections =
+            load_verified_memory_projection_set(store.scope(), transaction).await?;
+        if stored_memory_projections != memory_projections {
+            bail!("memory projection rows do not exactly match authenticated event commitments");
+        }
+    }
+    let stored_message_count = u64::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(&mut **transaction)
+            .await?,
+    )
+    .context("stored transcript row count is outside u64")?;
+    if stored_message_count != authenticated_message_count {
+        bail!(
+            "transcript row count {stored_message_count} does not match authenticated MessageEnd count {authenticated_message_count}"
+        );
+    }
     Ok(LifecycleCheckpoint {
         event_head,
         lifecycle,
+        memory_projections,
         historical_rows_visited: observed_count,
     })
+}
+
+fn apply_memory_projection_delta(
+    checkpoint: &mut BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
+    event_seq: u64,
+    event_kind: &str,
+    delta: Option<&MemoryProjectionDeltaV1>,
+) -> Result<()> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    if !matches!(event_kind, "memory_maintenance" | "message_end") {
+        bail!(
+            "durable event {event_seq} of kind {event_kind} cannot carry memory projection commitments"
+        );
+    }
+    if delta.changes.is_empty() {
+        bail!("durable event {event_seq} has an empty memory projection delta");
+    }
+    let mut previous_key: Option<MemoryProjectionKey> = None;
+    for change in &delta.changes {
+        let key = change.key();
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            bail!(
+                "durable event {event_seq} memory projection changes are not strictly sorted and unique"
+            );
+        }
+        let expected_previous = checkpoint.get(&key);
+        if expected_previous != change.previous.as_ref() {
+            bail!(
+                "durable event {event_seq} memory projection previous reference does not match {:?} {}",
+                key.entity,
+                key.id
+            );
+        }
+        checkpoint.insert(
+            key.clone(),
+            MemoryProjectionRef {
+                event_seq,
+                digest: change.current_digest,
+            },
+        );
+        previous_key = Some(key);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -6083,6 +11393,7 @@ enum OwnerHandoffAccounting {
     Account,
 }
 
+#[cfg(test)]
 fn projection_closes_owner(
     projection: &PreparedProjection,
     command_id: &str,
@@ -6229,9 +11540,11 @@ async fn validate_durable_lifecycle_suffix(
                     || run_id.is_empty()
                     || turn_id.is_empty()
                     || idempotency_key.is_empty()
-                    || *error_code != "length_guard" =>
+                    || !SKIP_ERROR_CODES.contains(error_code) =>
                 {
-                    bail!("ToolExecutionSkip identity must be non-empty and use length_guard")
+                    bail!(
+                        "ToolExecutionSkip identity must be non-empty and use a supported error code"
+                    )
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Skip {
@@ -6378,21 +11691,63 @@ async fn require_exact_live_owner_turn(
     .bind(run_id)
     .fetch_all(&mut **transaction)
     .await?;
-    let matches =
-        rows.iter()
-            .filter(|row| {
-                let Ok(command_id) = row.try_get::<String, _>("command_id") else {
-                    return false;
-                };
-                let Ok(phase) = row.try_get::<String, _>("run_phase") else {
-                    return false;
-                };
-                let closes_owner = prepared
+    let mut matches = 0usize;
+    for row in &rows {
+        let command_id: String = row.try_get("command_id")?;
+        let phase: String = row.try_get("run_phase")?;
+        let mut phase = RunPhase::parse(&phase)?;
+        let mut status = "applying";
+
+        if matches!(handoff_accounting, OwnerHandoffAccounting::Account) {
+            for projection in prepared.iter().flat_map(|write| &write.projections) {
+                match projection {
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        command_id: target,
+                        run_id: target_run,
+                        expected,
+                        next,
+                    }) if target == &command_id
+                        && target_run == run_id
+                        && status == "applying"
+                        && phase == *expected =>
+                    {
+                        phase = *next;
+                    }
+                    PreparedProjection::Plain(Projection::CommandApplied {
+                        command_id: target,
+                        run_id: target_run,
+                        ..
+                    }) if target == &command_id
+                        && target_run.as_deref() == Some(run_id)
+                        && status == "applying"
+                        && phase.is_owner() =>
+                    {
+                        status = "applied";
+                        phase = RunPhase::Finished;
+                    }
+                    PreparedProjection::Plain(Projection::CommandSuperseded {
+                        command_id: target,
+                        run_id: target_run,
+                        ..
+                    }) if target == &command_id
+                        && target_run.as_deref() == Some(run_id)
+                        && status == "applying" =>
+                    {
+                        status = "superseded";
+                        phase = RunPhase::Finished;
+                    }
+                    _ => {}
+                }
+            }
+            if status == "applying" && phase.is_owner() {
+                matches += 1;
+            }
+        } else {
+            let opens_owner =
+                prepared
                     .iter()
                     .flat_map(|write| &write.projections)
-                    .any(|projection| projection_closes_owner(projection, &command_id, run_id));
-                let opens_owner = prepared.iter().flat_map(|write| &write.projections).any(
-                    |projection| {
+                    .any(|projection| {
                         matches!(
                             projection,
                             PreparedProjection::Plain(Projection::RunPhase {
@@ -6402,14 +11757,12 @@ async fn require_exact_live_owner_turn(
                                 ..
                             }) if target == &command_id && target_run == run_id && next.is_owner()
                         )
-                    },
-                );
-                (RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
-                    && (!matches!(handoff_accounting, OwnerHandoffAccounting::Account)
-                        || !closes_owner))
-                    || opens_owner
-            })
-            .count();
+                    });
+            if phase.is_owner() || opens_owner {
+                matches += 1;
+            }
+        }
+    }
     if matches != 1 {
         bail!("{kind} for {run_id}/{turn_id} requires exactly one live owner; found {matches}");
     }
@@ -6756,7 +12109,7 @@ fn apply_lifecycle_event(
                 .and_then(|resolution| resolution.get("decision"))
                 .and_then(|decision| decision.get("type"))
                 .and_then(Value::as_str);
-            if decision == Some("approve_once") {
+            if matches!(decision, Some("approve_once" | "approve_always")) {
                 state
                     .approved_once
                     .insert(request_id.to_owned(), tool_call_id);
@@ -6844,10 +12197,156 @@ async fn require_owner_count(
     Ok(())
 }
 
+async fn initialize_memory_batch_membership(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+) -> Result<()> {
+    let seed = memory_membership_seed(store.scope(), batch_id);
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET membership_count = 0, membership_digest = ?
+         WHERE id = ? AND membership_count = 0",
+    )
+    .bind(seed.as_slice())
+    .bind(batch_id)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to initialize memory batch membership commitment")?;
+    require_single_cas(
+        result.rows_affected(),
+        "memory batch membership initialization",
+    )
+}
+
+async fn append_memory_batch_membership(
+    _store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+    ord: i64,
+    message_id: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT membership_count, membership_digest
+         FROM memory_batches WHERE id = ?",
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to load memory batch membership commitment")?;
+    let previous_count: i64 = row.try_get("membership_count")?;
+    let expected_ord = previous_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("memory batch membership count overflow"))?;
+    if ord != expected_ord {
+        bail!(
+            "memory batch {batch_id} append ordinal {ord} does not follow committed count {previous_count}"
+        );
+    }
+    let previous_digest: [u8; 32] = row
+        .try_get::<Vec<u8>, _>("membership_digest")?
+        .try_into()
+        .map_err(|_| anyhow!("memory batch {batch_id} membership digest has invalid length"))?;
+    let next_digest = extend_memory_membership_digest(
+        &previous_digest,
+        u64::try_from(ord).context("memory batch membership ordinal out of range")?,
+        message_id,
+    );
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET membership_count = ?, membership_digest = ?
+         WHERE id = ? AND membership_count = ? AND membership_digest = ?",
+    )
+    .bind(expected_ord)
+    .bind(next_digest.as_slice())
+    .bind(batch_id)
+    .bind(previous_count)
+    .bind(previous_digest.as_slice())
+    .execute(&mut **transaction)
+    .await
+    .context("failed to append memory batch membership commitment")?;
+    require_single_cas(result.rows_affected(), "memory batch membership append")
+}
+
+async fn append_prepared_event(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: PreparedEvent,
+    updated_event_head: &mut Option<EventLogHead>,
+) -> Result<()> {
+    let (previous_digest, previous_count, head_key_ref) = match updated_event_head.as_ref() {
+        Some(head) => {
+            if head.key_ref != event.raw_key_ref {
+                bail!("event-log key changed without an explicit rotation");
+            }
+            (head.chain_digest, head.event_count, head.key_ref.clone())
+        }
+        None => ([0_u8; EVENT_DIGEST_BYTES], 0, event.raw_key_ref.clone()),
+    };
+    let expected_seq = updated_event_head
+        .as_ref()
+        .map_or(1, |head| head.last_seq.saturating_add(1));
+    if event.seq != expected_seq {
+        bail!(
+            "durable event sequence is not contiguous: expected {expected_seq}, prepared {}",
+            event.seq
+        );
+    }
+    let chain_digest = extend_event_chain(
+        &previous_digest,
+        EventChainEntry {
+            seq: event.seq,
+            event_type: &event.kind,
+            internal_metadata: &event.internal_metadata,
+            key_ref: &event.raw_key_ref,
+            ciphertext: &event.raw_ciphertext,
+            envelope: &event.envelope,
+            redaction_version: event.redaction_version,
+        },
+    );
+    sqlx::query(
+        "INSERT INTO agent_events(
+            seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+            envelope, redaction_version, created_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(sqlite_i64(event.seq, "durable event sequence")?)
+    .bind(event.kind)
+    .bind(event.internal_metadata)
+    .bind(event.raw_key_ref)
+    .bind(event.raw_ciphertext)
+    .bind(event.envelope)
+    .bind(event.redaction_version as i64)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **transaction)
+    .await
+    .context("failed to append durable event")?;
+    let event_count = previous_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("durable event count overflow"))?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &head_key_ref)
+        .await?;
+    let head_hmac =
+        authenticate_event_head(store.scope(), &key, event.seq, event_count, &chain_digest)?;
+    *updated_event_head = Some(EventLogHead {
+        last_seq: event.seq,
+        event_count,
+        chain_digest,
+        key_ref: head_key_ref,
+        head_hmac,
+    });
+    Ok(())
+}
+
 async fn apply_projection(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     projection: PreparedProjection,
-) -> Result<()> {
+    batch_event_seqs: &[u64],
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+    memory_event_seq: Option<u64>,
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         PreparedProjection::MessageEnd {
             event_seq,
@@ -6861,23 +12360,63 @@ async fn apply_projection(
             redaction_version,
             interrupted,
             l0_disposition,
+            provider_context,
+            provider_context_key_proofs: _,
+            eviction_footprint_tokens,
+            public_est,
+            create_l0_batch,
+            l0_batch_id,
+            l0_batch_message_ord,
+            seal_transition,
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
                 bail!("invalid message role {role}");
             }
-            // T12 freezes the exact L0 membership decision at the MessageEnd
-            // boundary. A later membership projection must consume this typed
-            // value rather than reinterpret role or stop_reason from payload.
             match l0_disposition {
                 L0Disposition::Append | L0Disposition::ExcludeRetryError => {}
             }
+
+            // Commit an L0 seal reservation atomically with the message that
+            // triggers it. The source batch is sealed, an L1 target is
+            // allocated, and a pending compaction job is inserted before the
+            // current message is appended to a fresh open L0 batch.
+            if let Some(seal) = seal_transition {
+                let seal = *seal;
+                let result = sqlx::query(
+                    "UPDATE memory_batches
+                     SET state = ?, version = ?, updated_at = ?
+                     WHERE id = ? AND version = ? AND state = ?",
+                )
+                .bind(MemoryBatchState::Compacting.as_str())
+                .bind(seal.source_next_version)
+                .bind(Utc::now().to_rfc3339())
+                .bind(&seal.source_id)
+                .bind(seal.source_expected_version)
+                .bind(MemoryBatchState::Open.as_str())
+                .execute(&mut **transaction)
+                .await
+                .context("failed to seal L0 source batch")?;
+                require_single_cas(result.rows_affected(), "L0 source seal")?;
+
+                seal.target_record
+                    .insert_staged(transaction, event_seq)
+                    .await
+                    .context("failed to insert L1 target batch for L0 seal")?;
+                initialize_memory_batch_membership(store, transaction, &seal.target_record.id)
+                    .await?;
+                seal.job_record
+                    .insert_staged(transaction, event_seq)
+                    .await
+                    .context("failed to insert L0 compaction job for L0 seal")?;
+            }
+
             sqlx::query(
                 "INSERT INTO messages(
                     id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
                     redaction_version, interrupted, created_at
                  ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(message_id)
+            .bind(&message_id)
             .bind(sqlite_i64(event_seq, "message event sequence")?)
             .bind(role)
             .bind(raw_key_ref)
@@ -6890,10 +12429,103 @@ async fn apply_projection(
             .execute(&mut **transaction)
             .await
             .context("failed to apply MessageEnd projection")?;
+
+            if l0_disposition == L0Disposition::Append {
+                let batch_id = l0_batch_id.as_ref().ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 batch id")
+                })?;
+                let ord = l0_batch_message_ord.ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 message ord")
+                })?;
+
+                // Insert a lazily-allocated open L0 batch first, then append
+                // explicit membership in the same transaction.
+                if let Some(record) = &create_l0_batch {
+                    record
+                        .insert_staged(transaction, event_seq)
+                        .await
+                        .context("failed to insert open L0 batch for MessageEnd")?;
+                    initialize_memory_batch_membership(store, transaction, &record.id).await?;
+                }
+
+                MemoryBatchMessageRecord {
+                    batch_id: batch_id.clone(),
+                    message_id: message_id.clone(),
+                    ord,
+                }
+                .insert(&mut **transaction)
+                .await
+                .context("failed to insert L0 batch membership")?;
+                append_memory_batch_membership(store, transaction, batch_id, ord, &message_id)
+                    .await?;
+
+                // Add this message's public transcript estimate to the batch.
+                // Newly-created batches already carry the first message's
+                // estimate in their record, so only update existing rows.
+                if create_l0_batch.is_none() {
+                    let result = sqlx::query(
+                        "UPDATE memory_batches
+                         SET est_tokens = est_tokens + ?
+                         WHERE id = ?",
+                    )
+                    .bind(public_est)
+                    .bind(batch_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .context("failed to update L0 batch est_tokens")?;
+                    require_single_cas(result.rows_affected(), "L0 est update")?;
+                }
+            }
+
+            let provider_projection_checkpoint = if provider_context.is_empty() {
+                None
+            } else {
+                Some(verify_provider_context_projection_set(store, transaction).await?)
+            };
+            for record in provider_context {
+                record
+                    .insert(&mut **transaction)
+                    .await
+                    .context("failed to apply provider-context record")?;
+            }
+            if let Some(checkpoint) = provider_projection_checkpoint.as_ref() {
+                commit_provider_context_projection_set(store, transaction, checkpoint).await?;
+            }
+
+            if l0_disposition == L0Disposition::Append && eviction_footprint_tokens > 0 {
+                let batch_id = l0_batch_id.as_ref().expect("L0 batch id checked above");
+                let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
+
+                let current: i64 = sqlx::query_scalar(
+                    "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
+                )
+                .bind(batch_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .context("failed to read memory batch eviction footprint")?;
+                let new = current.checked_add(delta).ok_or_else(|| {
+                    anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
+                })?;
+                if new < 0 {
+                    bail!("memory batch eviction_footprint_tokens underflow");
+                }
+                sqlx::query(
+                    "UPDATE memory_batches
+                     SET eviction_footprint_tokens = ?
+                     WHERE id = ?",
+                )
+                .bind(new)
+                .bind(batch_id)
+                .execute(&mut **transaction)
+                .await
+                .context("failed to update memory batch eviction footprint")?;
+            }
         }
         PreparedProjection::CommandInsert {
             seq,
             command_id,
+            personality_agent_id,
+            provenance_json,
             command_kind,
             payload_key_ref,
             payload_key_proof: _,
@@ -6902,16 +12534,21 @@ async fn apply_projection(
             status,
             reject_reason,
             reject_actual_bytes,
+            admission_record_hmac,
         } => {
             sqlx::query(
                 "INSERT INTO inbound_commands(
-                    seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                    seq, command_id, personality_agent_id, provenance_json,
+                    command_kind, payload_ciphertext, payload_key_ref,
                     payload_hmac, status, reject_reason, reject_actual_bytes,
+                    admission_record_version, admission_record_hmac,
                     application_kind, run_id, turn_id, run_phase, received_at, applied_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
             )
             .bind(sqlite_i64(seq, "command sequence")?)
             .bind(command_id)
+            .bind(personality_agent_id.as_str())
+            .bind(provenance_json)
             .bind(command_kind)
             .bind(payload_ciphertext)
             .bind(payload_key_ref)
@@ -6923,6 +12560,8 @@ async fn apply_projection(
                     .map(|value| sqlite_i64(value, "rejected command byte count"))
                     .transpose()?,
             )
+            .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
+            .bind(admission_record_hmac)
             .bind(Utc::now().to_rfc3339())
             .bind(if status == "rejected" {
                 Some(Utc::now().to_rfc3339())
@@ -6933,19 +12572,99 @@ async fn apply_projection(
             .await
             .context("failed to persist inbound command")?;
         }
+        PreparedProjection::ProviderContextMutation {
+            mutation_id,
+            affected_memory_batch_ids,
+            ..
+        } => {
+            ProviderContextMutationApplier::new(store)
+                .apply_in_transaction(transaction, &mutation_id, &affected_memory_batch_ids)
+                .await
+                .context("failed to apply provider-context mutation projection")?;
+        }
+        PreparedProjection::ProviderContextMutationPrepare { disposition, .. } => {
+            ProviderContextMutationApplier::new(store)
+                .prepare_in_transaction(transaction, &disposition.prepared)
+                .await
+                .context("failed to prepare provider-context mutation projection")?;
+        }
+        PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            ..
+        } => {
+            apply_memory_job_update(store, transaction, expected_source_versions, job_mutations)
+                .await?;
+        }
+        PreparedProjection::MemoryTransition {
+            expected_source_versions,
+            expected_source_states,
+            batch_mutations,
+            job_mutations,
+            batch_inserts,
+            job_inserts,
+            membership_inserts,
+            cursor_advance,
+            ..
+        } => {
+            apply_memory_transition(
+                store,
+                transaction,
+                expected_source_versions,
+                expected_source_states,
+                batch_mutations,
+                job_mutations,
+                batch_inserts,
+                job_inserts,
+                membership_inserts,
+                cursor_advance,
+                memory_event_seq.ok_or_else(|| {
+                    anyhow!("MemoryTransition is missing its durable event sequence")
+                })?,
+            )
+            .await?;
+        }
+        PreparedProjection::MemoryCalibrationObservation {
+            observed_prompt_tokens,
+            uncalibrated_prompt_estimate,
+        } => {
+            let event_seq = memory_event_seq.ok_or_else(|| {
+                anyhow!("memory calibration observation is missing its durable event sequence")
+            })?;
+            apply_memory_calibration_observation(
+                transaction,
+                event_seq,
+                observed_prompt_tokens,
+                uncalibrated_prompt_estimate,
+            )
+            .await?;
+        }
         PreparedProjection::Plain(projection) => {
-            apply_plain_projection(transaction, projection).await?;
+            return apply_plain_projection(
+                store,
+                transaction,
+                projection,
+                batch_event_seqs,
+                physical_recovery,
+            )
+            .await;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn apply_plain_projection(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     projection: Projection,
-) -> Result<()> {
+    batch_event_seqs: &[u64],
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
+        Projection::MemoryCalibrationObservation { .. } => {
+            unreachable!("memory calibration observation is prepared separately")
+        }
         Projection::CommandReceived { .. } | Projection::CommandRejected { .. } => {
             unreachable!("command insert is prepared separately")
         }
@@ -7108,9 +12827,585 @@ async fn apply_plain_projection(
         Projection::Approval(mutation) => {
             apply_approval_mutation(transaction, mutation).await?;
         }
+        Projection::PhysicalRecovery(receipt) => {
+            // Generic apply paths reject PhysicalRecovery before reaching here;
+            // only apply_physical_recovery supplies a bound recovery context.
+            let Some(ctx) = physical_recovery else {
+                bail!(
+                    "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                );
+            };
+            if &receipt != ctx.receipt {
+                bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
+            }
+            receipt.validate_for(ctx.lease, ctx.fence)?;
+            let outcome = PhysicalRecoveryApplier::new(store)
+                .apply_in_transaction(
+                    transaction,
+                    &receipt,
+                    batch_event_seqs,
+                    ctx.lease,
+                    ctx.fence,
+                )
+                .await?;
+            return Ok(Some(outcome));
+        }
+        Projection::ProviderContextMutation(_)
+        | Projection::ProviderContextMutationPrepare(_)
+        | Projection::MemoryJobUpdate(_)
+        | Projection::MemoryTransition(_) => {
+            bail!("memory and provider-context mutations must be prepared before apply");
+        }
+        Projection::ApprovalRule(rule) => {
+            if let Some(existing) =
+                sqlx::query("SELECT tool, pattern FROM approval_rules WHERE id = ?")
+                    .bind(&rule.id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            {
+                let stored_tool: String = existing.try_get("tool")?;
+                let stored_pattern: String = existing.try_get("pattern")?;
+                if stored_tool == rule.tool && stored_pattern == rule.pattern {
+                    return Ok(None);
+                }
+                bail!(
+                    "ApprovalRule identity mismatch for {}: existing ({stored_tool}, {stored_pattern}) does not match requested ({}, {})",
+                    rule.id,
+                    rule.tool,
+                    rule.pattern
+                );
+            }
+            let result = sqlx::query(
+                "INSERT INTO approval_rules(id, tool, pattern, created_at)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(rule.id)
+            .bind(rule.tool)
+            .bind(rule.pattern)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "ApprovalRuleInsert")?;
+        }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
     }
+    Ok(None)
+}
+
+async fn verify_source_versions(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected: &BTreeMap<String, i64>,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let mut actual: BTreeMap<String, i64> = BTreeMap::new();
+    for batch_id in expected.keys() {
+        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to read source version for memory CAS")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "memory source batch {batch_id} referenced by {job:?} does not exist",
+                    job = job_id.unwrap_or("transition")
+                )
+            })?;
+        let version: i64 = row.try_get("version")?;
+        actual.insert(batch_id.clone(), version);
+    }
+    if actual != *expected {
+        bail!(
+            "memory source version mismatch for {job}: expected {expected:?}, actual {actual:?}",
+            job = job_id.unwrap_or("transition")
+        );
+    }
+    Ok(())
+}
+
+async fn verify_source_states(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected: &BTreeMap<String, MemoryBatchState>,
+) -> Result<()> {
+    for (batch_id, expected_state) in expected {
+        let row = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to read source state for memory CAS")?
+            .ok_or_else(|| anyhow!("memory source batch {batch_id} does not exist"))?;
+        let state: String = row.try_get("state")?;
+        let actual = parse_memory_batch_state(&state)
+            .with_context(|| format!("memory source batch {batch_id} has unknown state {state}"))?;
+        if actual != *expected_state {
+            bail!(
+                "memory source batch {batch_id} state mismatch: expected {}, actual {}",
+                expected_state.as_str(),
+                state
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn apply_memory_job_update(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected_source_versions: BTreeMap<String, i64>,
+    job_mutations: Vec<PreparedMemoryJobMutation>,
+) -> Result<()> {
+    verify_source_versions(transaction, &expected_source_versions, None).await?;
+    for job in job_mutations {
+        apply_memory_job_mutation(store, transaction, job).await?;
+    }
+    Ok(())
+}
+
+async fn apply_memory_calibration_observation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_seq: u64,
+    observed_prompt_tokens: u64,
+    uncalibrated_prompt_estimate: u64,
+) -> Result<()> {
+    let saved_bits: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to load current memory calibration")?;
+    let mut calibration = match saved_bits.as_deref() {
+        Some(bits) => {
+            let bits: [u8; 8] = bits
+                .try_into()
+                .map_err(|_| anyhow!("memory calibration ratio_bits has invalid length"))?;
+            TokenCalibration::new(f64::from_bits(u64::from_be_bytes(bits)))
+                .context("stored memory calibration ratio is invalid")?
+        }
+        None => TokenCalibration::default(),
+    };
+    calibration
+        .update_ema(
+            observed_prompt_tokens,
+            uncalibrated_prompt_estimate,
+            TOKEN_CALIBRATION_EMA_ALPHA,
+        )
+        .context("failed to update memory calibration EMA")?;
+    let ratio_bits = calibration.ratio().to_bits().to_be_bytes();
+    if saved_bits.is_some() {
+        let result =
+            sqlx::query("UPDATE memory_calibration SET ratio_bits = ? WHERE singleton = 1")
+                .bind(ratio_bits.as_slice())
+                .execute(&mut **transaction)
+                .await
+                .context("failed to update memory calibration")?;
+        require_single_cas(result.rows_affected(), "memory calibration update")?;
+    } else {
+        sqlx::query(
+            "INSERT INTO memory_calibration(
+                singleton, ratio_bits, projection_event_seq, projection_digest
+             ) VALUES(1, ?, ?, zeroblob(32))",
+        )
+        .bind(ratio_bits.as_slice())
+        .bind(i64::try_from(event_seq).context("memory calibration event sequence out of range")?)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to insert memory calibration")?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "prepared projection decomposition"
+)]
+async fn apply_memory_transition(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected_source_versions: BTreeMap<String, i64>,
+    expected_source_states: BTreeMap<String, MemoryBatchState>,
+    batch_mutations: Vec<PreparedMemoryBatchMutation>,
+    job_mutations: Vec<PreparedMemoryJobMutation>,
+    batch_inserts: Vec<MemoryBatchRecord>,
+    job_inserts: Vec<MemoryJobRecord>,
+    mut membership_inserts: Vec<MemoryBatchMessageRecord>,
+    cursor_advance: Option<MemoryApplyCursorAdvance>,
+    event_seq: u64,
+) -> Result<()> {
+    verify_source_versions(transaction, &expected_source_versions, None).await?;
+    verify_source_states(transaction, &expected_source_states).await?;
+
+    // Allocate and insert new target batches inside the EventWriter transaction
+    // so concurrent L0 seal/recovery cannot reuse the same (layer, batch_seq).
+    let mut next_seq_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut next_ord_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut assigned_batch_seqs: BTreeMap<String, i64> = BTreeMap::new();
+    for mut batch in batch_inserts {
+        let layer = batch.layer.as_i64();
+
+        let next_seq = if let Some(seq) = next_seq_by_layer.get(&layer).copied() {
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(batch_seq), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max batch_seq for batch insert")?;
+            let seq = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        };
+
+        let next_ord = if let Some(ord) = next_ord_by_layer.get(&layer).copied() {
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(ord), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max ord for batch insert")?;
+            let ord = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        };
+
+        batch.batch_seq = next_seq;
+        batch.ord = next_ord;
+        assigned_batch_seqs.insert(batch.id.clone(), next_seq);
+        batch
+            .insert_staged(transaction, event_seq)
+            .await
+            .context("failed to insert memory batch in transition")?;
+        initialize_memory_batch_membership(store, transaction, &batch.id).await?;
+    }
+
+    for batch in batch_mutations {
+        apply_memory_batch_mutation(transaction, batch, store).await?;
+    }
+
+    for mut job in job_inserts {
+        let target_ids = job
+            .source_versions
+            .keys()
+            .filter(|id| !job.source_ids.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let [target_id] = target_ids.as_slice() else {
+            bail!(
+                "inserted job {} must have exactly one target batch witness",
+                job.id
+            );
+        };
+        if let Some(batch_seq) = assigned_batch_seqs.get(target_id).copied() {
+            job.batch_seq = batch_seq;
+        } else {
+            let stored_batch_seq: i64 =
+                sqlx::query_scalar("SELECT batch_seq FROM memory_batches WHERE id = ?")
+                    .bind(target_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "inserted job {} references missing target batch {}",
+                            job.id,
+                            target_id
+                        )
+                    })?;
+            if stored_batch_seq != job.batch_seq {
+                bail!(
+                    "inserted job {} target batch {} has sequence {}, expected {}",
+                    job.id,
+                    target_id,
+                    stored_batch_seq,
+                    job.batch_seq
+                );
+            }
+        }
+        job.insert_staged(transaction, event_seq)
+            .await
+            .context("failed to insert memory job in transition")?;
+    }
+
+    membership_inserts.sort_by(|left, right| {
+        left.batch_id
+            .as_bytes()
+            .cmp(right.batch_id.as_bytes())
+            .then_with(|| left.ord.cmp(&right.ord))
+            .then_with(|| left.message_id.as_bytes().cmp(right.message_id.as_bytes()))
+    });
+    for membership in membership_inserts {
+        membership
+            .insert(&mut **transaction)
+            .await
+            .context("failed to insert memory batch membership in transition")?;
+        append_memory_batch_membership(
+            store,
+            transaction,
+            &membership.batch_id,
+            membership.ord,
+            &membership.message_id,
+        )
+        .await?;
+    }
+
+    for job in job_mutations {
+        apply_memory_job_mutation(store, transaction, job).await?;
+    }
+    if let Some(cursor) = cursor_advance {
+        let cursor_record = MemoryApplyCursorRecord {
+            kind: cursor.kind,
+            next_batch_seq: sqlite_i64(cursor.next, "memory apply cursor next")?,
+        };
+        let advanced = if cursor.initialize {
+            let result = sqlx::query(
+                "INSERT INTO memory_apply_cursors(
+                    kind, next_batch_seq, projection_event_seq, projection_digest
+                 ) VALUES(?, ?, ?, zeroblob(32))
+                 ON CONFLICT(kind) DO NOTHING",
+            )
+            .bind(&cursor_record.kind)
+            .bind(cursor_record.next_batch_seq)
+            .bind(
+                i64::try_from(event_seq)
+                    .context("memory projection event sequence out of range")?,
+            )
+            .execute(&mut **transaction)
+            .await
+            .context("failed to initialize memory apply cursor")?;
+            result.rows_affected() == 1
+        } else {
+            cursor_record
+                .advance(
+                    &mut **transaction,
+                    sqlite_i64(cursor.expected, "memory apply cursor expected")?,
+                )
+                .await?
+        };
+        if !advanced {
+            bail!("memory apply cursor CAS failed");
+        }
+    }
+    Ok(())
+}
+
+async fn apply_memory_batch_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch: PreparedMemoryBatchMutation,
+    store: &Store,
+) -> Result<()> {
+    if let Some(summary) = &batch.summary {
+        let expected = super::memory_summary_key_ref(store.scope(), "batch", &batch.batch_id);
+        if summary.key_ref != expected {
+            bail!(
+                "memory batch {} summary key is outside its exact retention unit",
+                batch.batch_id
+            );
+        }
+    }
+    if batch.delete_membership {
+        let owner_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT m.id, m.seq
+             FROM memory_batch_messages mbm
+             JOIN messages m ON m.id = mbm.message_id
+             WHERE mbm.batch_id = ?
+             ORDER BY mbm.ord, m.id",
+        )
+        .bind(&batch.batch_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to load exact retention owners for dropped memory batch")?;
+        let mut dropped_owners = BTreeSet::new();
+        for (message_id, message_seq) in owner_rows {
+            let message_seq = u64::try_from(message_seq)
+                .context("dropped memory retention-owner sequence out of range")?;
+            if !dropped_owners.insert((message_id, message_seq)) {
+                bail!("dropped memory batch contains duplicate retention-owner membership");
+            }
+        }
+        Box::pin(
+            ProviderContextMutationApplier::new(store)
+                .erase_for_retention_owners(transaction, &dropped_owners),
+        )
+        .await?;
+
+        sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
+            .bind(&batch.batch_id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to delete memory batch membership")?;
+        let empty_membership = memory_membership_seed(store.scope(), &batch.batch_id);
+        sqlx::query(
+            "UPDATE memory_batches
+             SET membership_count = 0, membership_digest = ?
+             WHERE id = ?",
+        )
+        .bind(empty_membership.as_slice())
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to reset memory batch membership commitment")?;
+    }
+
+    let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
+    let new_version = if version_increments {
+        batch
+            .expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch version overflow"))?
+    } else {
+        batch.expected_version
+    };
+
+    let (key_ref, ciphertext, projection, redaction_version) = match batch.summary {
+        Some(summary) => (
+            Some(summary.key_ref),
+            Some(summary.ciphertext),
+            Some(summary.projection),
+            Some(i64::from(summary.redaction_version)),
+        ),
+        None => (None, None, None, None),
+    };
+
+    let row = sqlx::query(
+        "SELECT eviction_footprint_tokens
+         FROM memory_batches
+         WHERE id = ? AND version = ? AND state = ?",
+    )
+    .bind(&batch.batch_id)
+    .bind(batch.expected_version)
+    .bind(batch.old_state.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("failed to read memory batch for mutation")?
+    .ok_or_else(|| anyhow!("memory batch CAS failed or batch missing"))?;
+    let current_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+    let new_footprint = current_footprint
+        .checked_add(batch.footprint_delta)
+        .ok_or_else(|| anyhow!("memory batch eviction_footprint_tokens overflow"))?;
+    if new_footprint < 0 {
+        bail!("memory batch eviction_footprint_tokens underflow");
+    }
+
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET state = ?, version = ?, est_tokens = ?, eviction_footprint_tokens = ?,
+             summary_key_ref = COALESCE(?, summary_key_ref),
+             summary_ciphertext = COALESCE(?, summary_ciphertext),
+             summary_projection = COALESCE(?, summary_projection),
+             summary_redaction_version = COALESCE(?, summary_redaction_version),
+             updated_at = ?
+         WHERE id = ? AND version = ? AND state = ?",
+    )
+    .bind(batch.new_state.as_str())
+    .bind(new_version)
+    .bind(batch.est_tokens)
+    .bind(new_footprint)
+    .bind(key_ref.as_ref())
+    .bind(ciphertext.as_ref())
+    .bind(projection.as_ref())
+    .bind(redaction_version)
+    .bind(Utc::now().to_rfc3339())
+    .bind(&batch.batch_id)
+    .bind(batch.expected_version)
+    .bind(batch.old_state.as_str())
+    .execute(&mut **transaction)
+    .await?;
+    require_single_cas(result.rows_affected(), "MemoryBatchMutation")?;
+    Ok(())
+}
+
+async fn apply_memory_job_mutation(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    job: PreparedMemoryJobMutation,
+) -> Result<()> {
+    if let Some(result) = &job.result {
+        let expected = super::memory_summary_key_ref(store.scope(), "job", &job.job_id);
+        if result.key_ref != expected {
+            bail!(
+                "memory job {} result key is outside its exact retention unit",
+                job.job_id
+            );
+        }
+    }
+    let (result_key_ref, result_ciphertext, result_projection, result_redaction_version) =
+        match job.result {
+            Some(result) => (
+                Some(result.key_ref),
+                Some(result.ciphertext),
+                Some(result.projection),
+                Some(i64::from(result.redaction_version)),
+            ),
+            None => (None, None, None, None),
+        };
+
+    let result = if job.expected_status == "pending" {
+        // Claim: do not consume an attempt; source versions are fixed by the
+        // job creation path, so leave them untouched when not supplied.
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
+                 source_versions = COALESCE(?, source_versions), updated_at = ?
+             WHERE id = ? AND status = ?",
+        )
+        .bind(job.new_status)
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
+        .bind(job.source_versions.as_ref())
+        .bind(Utc::now().to_rfc3339())
+        .bind(&job.job_id)
+        .bind(job.expected_status)
+        .execute(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
+                 source_versions = COALESCE(?, source_versions),
+                 result_key_ref = COALESCE(?, result_key_ref),
+                 result_ciphertext = COALESCE(?, result_ciphertext),
+                 result_projection = COALESCE(?, result_projection),
+                 result_redaction_version = COALESCE(?, result_redaction_version),
+                 updated_at = ?
+             WHERE id = ? AND status = ? AND attempts = ? AND lease_until IS ?",
+        )
+        .bind(job.new_status)
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
+        .bind(job.source_versions.as_ref())
+        .bind(result_key_ref.as_ref())
+        .bind(result_ciphertext.as_ref())
+        .bind(result_projection.as_ref())
+        .bind(result_redaction_version)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&job.job_id)
+        .bind(job.expected_status)
+        .bind(job.attempts)
+        .bind(job.expected_lease_until.as_ref())
+        .execute(&mut **transaction)
+        .await?
+    };
+    require_single_cas(result.rows_affected(), "MemoryJobMutation")?;
     Ok(())
 }
 
@@ -7134,6 +13429,39 @@ async fn apply_tool_mutation(
             executor_generation,
             idempotency_key,
         } => {
+            // `INSERT OR IGNORE` is not enough: replay must accept only an
+            // exact identity match. A mismatch means a different tool_call_id
+            // collision or corrupted recovery state, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT command_id, run_id, executor_generation, idempotency_key, state
+                 FROM tool_executions WHERE tool_call_id = ?",
+            )
+            .bind(&tool_call_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_command_id: String = existing.try_get("command_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_generation: i64 = existing.try_get("executor_generation")?;
+                let existing_idempotency: String = existing.try_get("idempotency_key")?;
+                let existing_state: String = existing.try_get("state")?;
+                if existing_command_id != command_id
+                    || existing_run_id != run_id
+                    || existing_generation != executor_generation.as_i64()
+                    || existing_idempotency != idempotency_key
+                    || existing_state != "prepared"
+                {
+                    bail!(
+                        "Prepare identity mismatch for {tool_call_id}: \
+                         existing ({existing_command_id}, {existing_run_id}, \
+                         {existing_generation}, {existing_idempotency}, {existing_state}) \
+                         does not match requested ({command_id}, {run_id}, \
+                         {generation}, {idempotency_key}, prepared)",
+                        generation = executor_generation.as_i64()
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
                 "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
@@ -7198,10 +13526,18 @@ async fn apply_tool_mutation(
             idempotency_key,
             error_code,
         } => {
-            if error_code != "length_guard" {
-                bail!("ToolExecutionSkip only supports length_guard");
+            if !SKIP_ERROR_CODES.contains(&error_code) {
+                bail!("ToolExecutionSkip only supports {SKIP_ERROR_CODES:?}");
             }
-            let result = sqlx::query(
+            // user_steer_cancelled may resolve after a hard steer or Abort moved the
+            // original owner out of assistant_started; length_guard remains restricted
+            // to the assistant's own turn.
+            let phase_condition = if error_code == "user_steer_cancelled" {
+                "run_phase IN ('assistant_started','hard_steer_requested','cancel_requested')"
+            } else {
+                "run_phase = 'assistant_started'"
+            };
+            let sql = format!(
                 "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
                     idempotency_key, started_at, finished_at, error_code
@@ -7209,17 +13545,18 @@ async fn apply_tool_mutation(
                  SELECT ?, command_id, run_id, ?, 'not_started', ?, NULL, ?, ?
                  FROM inbound_commands
                  WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
-                   AND status = 'applying' AND run_phase = 'assistant_started'",
-            )
-            .bind(tool_call_id)
-            .bind(executor_generation.as_i64())
-            .bind(idempotency_key)
-            .bind(Utc::now().to_rfc3339())
-            .bind(error_code)
-            .bind(command_id)
-            .bind(run_id)
-            .execute(&mut **transaction)
-            .await?;
+                   AND status = 'applying' AND {phase_condition}"
+            );
+            let result = sqlx::query(&sql)
+                .bind(tool_call_id)
+                .bind(executor_generation.as_i64())
+                .bind(idempotency_key)
+                .bind(Utc::now().to_rfc3339())
+                .bind(error_code)
+                .bind(command_id)
+                .bind(run_id)
+                .execute(&mut **transaction)
+                .await?;
             require_single_cas(result.rows_affected(), "ToolExecutionSkip")?;
         }
     }
@@ -7250,6 +13587,33 @@ async fn apply_approval_mutation(
             .ok_or_else(|| {
                 anyhow!("Approval Pending requires its same-batch writer-generated request")
             })?;
+            // Replay must accept only an exact identity match. A mismatch
+            // means a corrupted recovery or request_id collision, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT tool_call_id, run_id, turn_id, state FROM approval_log WHERE id = ?",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_tool_call_id: String = existing.try_get("tool_call_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_turn_id: String = existing.try_get("turn_id")?;
+                let existing_state: String = existing.try_get("state")?;
+                if existing_tool_call_id != tool_call_id
+                    || existing_run_id != run_id
+                    || existing_turn_id != turn_id
+                    || existing_state != "pending"
+                {
+                    bail!(
+                        "Approval Pending identity mismatch for {request_id}: \
+                         existing ({existing_tool_call_id}, {existing_run_id}, \
+                         {existing_turn_id}, {existing_state}) does not match \
+                         requested ({tool_call_id}, {run_id}, {turn_id}, pending)"
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
                 "INSERT INTO approval_log(
                     id, tool_call_id, run_id, turn_id, state, request_projection,
@@ -7292,7 +13656,7 @@ async fn apply_approval_mutation(
     Ok(())
 }
 
-fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
+pub(crate) fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
     if rows_affected != 1 {
         bail!("{operation} CAS expected one row, updated {rows_affected}");
     }
@@ -7309,25 +13673,48 @@ fn sqlite_u64(value: i64, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     use anyhow::{Result, bail};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use serde_json::json;
     use sqlx::Row;
 
     use super::*;
+    use super::{
+        L0Disposition, PreparedMemoryBatchMutation, PreparedMemoryJobMutation, PreparedProjection,
+        apply_memory_batch_mutation, apply_memory_job_mutation, apply_projection,
+    };
     use crate::{
-        agent::{ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind},
-        gateway::{Command, SensitiveCommandPayload},
-        provider::types::{
-            ApiProtocol, AssistantContent, AssistantMessage, ProviderEvent, ProviderOrigin,
-            ProviderOutput, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
-            UserContent, UserMessage,
+        agent::{
+            AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
+            ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
+            SensitiveCommandPayload,
+        },
+        memory::{
+            L0_BATCH_MIN,
+            context_assembler::{bind_sumi_replay_for_origin_test, bind_sumi_replay_for_test},
+            estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+        },
+        provider::{
+            ModelSpec, RequestOptions,
+            adapters::responses::build_request as build_responses_request,
+            types::{
+                ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+                NativeCompactionCoverage, PromptContext, ProviderContextFragment,
+                ProviderContextPayload, ProviderEvent, ProviderOrigin, ProviderOutput,
+                PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
+                StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
+                UserMessage,
+            },
+        },
+        runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
-            AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
+            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
+            PhysicalRecoveryReceipt, RecoveryStep, ResumeDirective, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -7341,6 +13728,34 @@ mod tests {
 
     fn test_process_generation(raw: u64) -> ProcessGeneration {
         ProcessGeneration::from_wire(raw).expect("valid test process generation")
+    }
+
+    fn test_lease(raw: u64) -> ProcessGenerationLease {
+        ProcessGenerationLease::new(
+            "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
+            test_process_generation(raw),
+            "test-lease",
+        )
+        .expect("valid test lease")
+    }
+
+    fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
+        GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+    }
+
+    fn eviction_footprint_for_test(
+        origin: &ProviderOrigin,
+        fragments: &[ProviderContextFragment],
+    ) -> u64 {
+        let spec = ModelSpec::from_origin(origin).expect("test origin must resolve to a ModelSpec");
+        fragments
+            .iter()
+            .map(|fragment| {
+                eviction_footprint_for_payload(&spec, &fragment.payload)
+                    .expect("test payload must be footprintable")
+                    .eviction_tokens()
+            })
+            .sum()
     }
 
     #[test]
@@ -7373,6 +13788,103 @@ mod tests {
         let _ = skip(ProcessGeneration::MAX);
     }
 
+    #[tokio::test]
+    async fn tool_execution_prepare_rejects_identity_mismatch() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('call-1', 'cmd-a', 'run-a', 0, 'prepared', 'idem-a', NULL, NULL, NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed existing prepared row");
+
+        let mismatch = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-b".to_owned(),
+            run_id: "run-b".to_owned(),
+            executor_generation: test_process_generation(1),
+            idempotency_key: "idem-b".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, mismatch).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "mismatched Prepare must fail closed"
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions
+             SET state='running', started_at='2026-07-27T00:00:00Z'
+             WHERE tool_call_id='call-1'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("advance existing tool beyond prepared");
+        let stale_replay = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            executor_generation: test_process_generation(0),
+            idempotency_key: "idem-a".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, stale_replay).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "same-identity Prepare must not replay after the durable state advanced"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_rule_replay_requires_exact_identity() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        let rule = ApprovalRuleMutation {
+            id: "rule-replay".to_owned(),
+            tool: "bash".to_owned(),
+            pattern: r#"{"effect":"allow","literal_prefix":["git","status"]}"#.to_owned(),
+        };
+
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("insert approval rule");
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("exact approval rule replay is idempotent");
+
+        let mismatch = ApprovalRuleMutation {
+            pattern: r#"{"effect":"deny","literal_prefix":["git","status"]}"#.to_owned(),
+            ..rule
+        };
+        let error = apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(mismatch),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("same rule id with different identity must fail closed");
+        assert!(
+            error.to_string().contains("ApprovalRule identity mismatch"),
+            "{error:#}"
+        );
+    }
+
     struct TestKeyProvider {
         key: WrappingKey,
     }
@@ -7393,10 +13905,21 @@ mod tests {
 
     fn scope() -> AgentScope {
         AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
         }
+    }
+
+    fn test_provenance() -> DirectChatProvenanceV1 {
+        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+            .expect("valid direct-chat provenance")
+    }
+
+    fn test_user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
+        user_message_id(scope().personality_agent_id(), command_id)
+    }
+
+    fn test_injected_command(seq: u64, command_id: impl IntoCanonicalCommandId) -> InjectedCommand {
+        InjectedCommand::new(seq, command_id, test_provenance())
     }
 
     #[test]
@@ -7431,10 +13954,85 @@ mod tests {
             .into()
     }
 
+    async fn file_test_store(path: &Path) -> Arc<Store> {
+        Store::open(path, scope(), test_provider())
+            .await
+            .expect("open file-backed test store")
+            .into()
+    }
+
+    #[test]
+    fn batch_version_conversion_rejects_sqlite_overflow() {
+        let versions = BTreeMap::from([(Uuid::now_v7(), u64::MAX)]);
+        assert!(
+            convert_batch_versions(versions)
+                .expect_err("out-of-range CAS versions must be rejected")
+                .to_string()
+                .contains("source version exceeds SQLite INTEGER range")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_null_lease_cas_can_leave_running() {
+        let store = test_store().await;
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until,
+                attempts, projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(
+                'null-lease-job', 'compact', 1, '[]', '{}', 'running', NULL, 0,
+                1, zeroblob(32), ?, ?
+             )",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert running job without lease");
+
+        apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "null-lease-job".to_owned(),
+                expected_status: "running",
+                new_status: "failed",
+                attempts: 0,
+                attempts_delta: 0,
+                expected_lease_until: None,
+                new_lease_until: None,
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("NULL-safe lease CAS");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM memory_jobs WHERE id='null-lease-job'")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("load transitioned job");
+        assert_eq!(status, "failed");
+        transaction.rollback().await.expect("rollback test fixture");
+    }
+
     fn user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
+        user_command_with_provenance(seq, command_id, text, test_provenance())
+    }
+
+    fn user_command_with_provenance(
+        seq: u64,
+        command_id: &str,
+        text: &str,
+        provenance: DirectChatProvenanceV1,
+    ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance,
             command: Command::UserMessage {
                 text: text.to_owned(),
                 attachments: Vec::new(),
@@ -7446,6 +14044,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::Abort {},
         })
     }
@@ -7463,6 +14063,8 @@ mod tests {
         InboundCommand::Valid(CommandEnvelope {
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             command: Command::ApprovalDecision {
                 request_id: request_id.to_owned(),
                 decision,
@@ -7600,6 +14202,9 @@ mod tests {
                     "tool_call_id":tool_call_id,
                     "tool_name":"test",
                     "args":{},
+                    "command_id":TOOL_OWNER_COMMAND_ID,
+                    "run_id":run_id,
+                    "executor_generation":1,
                     "state":"running"
                 }))
                 .expect("typed tool start"),
@@ -7688,6 +14293,8 @@ mod tests {
                     role: "tool_result",
                     message: result,
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             },
         ]
@@ -7755,7 +14362,7 @@ mod tests {
         text: &str,
         timestamp: DateTime<Utc>,
     ) -> Vec<EventWrite> {
-        let message_id = user_message_id(command_id);
+        let message_id = test_user_message_id(command_id);
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -7816,6 +14423,8 @@ mod tests {
                         role: "user",
                         message,
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     },
                     Projection::RunPhase {
                         command_id: command_id.to_owned(),
@@ -7860,10 +14469,252 @@ mod tests {
             })
             .await
             .expect("classify injected command");
-        InjectedCommand::new(
+        test_injected_command(
             seq,
             CommandId::parse(command_id).expect("canonical test command UUID"),
         )
+    }
+
+    async fn commit_calibrated_terminal(
+        writer: &EventWriter,
+        command_seq: u64,
+        command_id: &str,
+        observed_prompt_tokens: u64,
+        uncalibrated_prompt_estimate: u64,
+    ) -> (u64, [u8; 8]) {
+        let injected =
+            classified_injection(writer, command_seq, command_id, "", "calibration").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "", "calibration"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist calibration user injection");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message_id = format!("assistant-calibration-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
+            usage: Usage {
+                input: observed_prompt_tokens,
+                total_tokens: observed_prompt_tokens,
+                ..Usage::default()
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("calibration assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open calibration assistant");
+
+        let (seqs, ratio_bits) = writer
+            .apply_with_calibration_receipt(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                &message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("calibration assistant MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "assistant",
+                                message: message.clone(),
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::MemoryCalibrationObservation {
+                                uncalibrated_prompt_estimate,
+                            },
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id,
+                                message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("calibration TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end(run_id.clone()).expect("calibration AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit calibration assistant terminal");
+        assert_eq!(seqs.len(), 4);
+        (
+            seqs[0],
+            ratio_bits.expect("calibration terminal must return exact committed bits"),
+        )
+    }
+
+    #[tokio::test]
+    async fn calibration_observations_commit_exact_ema_receipts_and_authenticate_on_restart() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!("sumi-memory-calibration-{}.sqlite", Uuid::now_v7()));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let mut expected = TokenCalibration::default();
+
+        let (first_event_seq, first_bits) = commit_calibrated_terminal(
+            &writer,
+            1,
+            "00000000-0000-4000-8000-000000000091",
+            200,
+            100,
+        )
+        .await;
+        expected
+            .update_ema(200, 100, TOKEN_CALIBRATION_EMA_ALPHA)
+            .expect("first expected EMA");
+        assert_eq!(
+            first_bits,
+            expected.ratio().to_bits().to_be_bytes(),
+            "receipt must carry the exact first committed ratio"
+        );
+
+        let (second_event_seq, second_bits) =
+            commit_calibrated_terminal(&writer, 2, "00000000-0000-4000-8000-000000000092", 50, 100)
+                .await;
+        expected
+            .update_ema(50, 100, TOKEN_CALIBRATION_EMA_ALPHA)
+            .expect("second expected EMA");
+        assert_eq!(
+            second_bits,
+            expected.ratio().to_bits().to_be_bytes(),
+            "receipt must carry the exact second committed ratio"
+        );
+
+        let row = sqlx::query(
+            "SELECT ratio_bits, projection_event_seq, projection_digest
+             FROM memory_calibration WHERE singleton = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("committed calibration row");
+        assert_eq!(row.get::<Vec<u8>, _>("ratio_bits"), second_bits);
+        assert_eq!(
+            row.get::<i64, _>("projection_event_seq"),
+            i64::try_from(second_event_seq).expect("event seq fits SQLite")
+        );
+        let row_digest = row.get::<Vec<u8>, _>("projection_digest");
+        assert_eq!(row_digest.len(), 32);
+        assert_ne!(row_digest, vec![0; 32]);
+
+        let metadata: DurableEventMetadata = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT internal_metadata FROM agent_events WHERE seq = ?",
+            )
+            .bind(i64::try_from(second_event_seq).expect("event seq fits SQLite"))
+            .fetch_one(store.pool())
+            .await
+            .expect("calibration event metadata"),
+        )
+        .expect("typed calibration event metadata");
+        let delta = metadata
+            .memory_projection
+            .expect("calibration MessageEnd carries a projection delta");
+        let change = delta
+            .changes
+            .iter()
+            .find(|change| change.entity == MemoryProjectionEntity::Calibration)
+            .expect("calibration delta entry");
+        assert_eq!(change.id, MEMORY_CALIBRATION_ID);
+        assert_eq!(
+            change
+                .previous
+                .as_ref()
+                .expect("second observation links the first")
+                .event_seq,
+            first_event_seq
+        );
+        assert_eq!(change.current_digest.as_slice(), row_digest.as_slice());
+
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let reopened_writer = EventWriter::new(reopened.clone());
+        reopened_writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("restart authenticates committed calibration");
+
+        sqlx::query("UPDATE memory_calibration SET ratio_bits = ? WHERE singleton = 1")
+            .bind(9.0_f64.to_bits().to_be_bytes().as_slice())
+            .execute(reopened.pool())
+            .await
+            .expect("tamper calibration ratio");
+        drop(reopened_writer);
+        reopened.pool().close().await;
+        drop(reopened);
+        let tampered = file_test_store(&path).await;
+        let error = EventWriter::new(tampered.clone())
+            .initialize_recovery_checkpoint()
+            .await
+            .expect_err("restart must reject calibration ratio tampering");
+        assert!(
+            format!("{error:#}").contains("memory projection digest mismatch"),
+            "{error:#}"
+        );
+
+        tampered.pool().close().await;
+        drop(tampered);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]
@@ -7933,7 +14784,7 @@ mod tests {
             injected_commands: vec![injected.clone()],
         };
         validate_batch_shape(store.redactor(), &batch).expect("valid injection shape");
-        let (prepared, _, _) = writer
+        let (prepared, _, _, _) = writer
             .prepare_batch(batch, 1)
             .await
             .expect("prepare injection");
@@ -7943,7 +14794,7 @@ mod tests {
         })
         .expect("canonical payload");
         let timestamp = durable_test_timestamp();
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = format!("run-{}", command_id.as_str());
         let turn_id = format!("turn-{}", command_id.as_str());
         let commands = [InjectionCommandSizeInput {
@@ -7952,6 +14803,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: injected.provenance(),
         }];
         let predicted = EventBatchSizer::injection_batch(
             store.redactor(),
@@ -7987,11 +14839,12 @@ mod tests {
             CommandId::parse("00000000-0000-4000-8000-000000000033").expect("canonical UUID");
         let previous_owner =
             CommandId::parse("00000000-0000-4000-8000-000000000034").expect("canonical UUID");
-        let message_id = user_message_id(&command_id);
+        let message_id = test_user_message_id(&command_id);
         let run_id = "run-application-sizer";
         let turn_id = "turn-application-sizer";
         let text = "application-specific write-set";
         let timestamp = durable_test_timestamp();
+        let provenance = test_provenance();
         let message = canonical_user_message(text, timestamp);
         let payload = serde_json::to_vec(&Command::UserMessage {
             text: text.to_owned(),
@@ -8004,6 +14857,7 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            provenance: &provenance,
         }];
 
         for application in [
@@ -8077,6 +14931,8 @@ mod tests {
                             role: "user",
                             message: message.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         },
                         Projection::RunPhase {
                             command_id: command_id.as_str().to_owned(),
@@ -8087,13 +14943,13 @@ mod tests {
                     ],
                 },
             ]);
-            let injected = InjectedCommand::new(2, command_id.clone());
+            let injected = test_injected_command(2, command_id.clone());
             let batch = EventBatch {
                 writes,
                 injected_commands: vec![injected.clone()],
             };
             validate_batch_shape(store.redactor(), &batch).expect("valid steer injection shape");
-            let (prepared, _, _) = writer
+            let (prepared, _, _, _) = writer
                 .prepare_batch(batch, 1)
                 .await
                 .expect("prepare steer injection");
@@ -8150,13 +15006,13 @@ mod tests {
             injected_commands: Vec::new(),
         };
         let projection_run_id = String::new();
-        let (_, adjusted_base, _) = writer
+        let (_, adjusted_base, _, _) = writer
             .prepare_batch(make_batch(String::new(), projection_run_id.clone()), 1)
             .await
             .expect("measure parity-adjusted real row base");
         let event_run_bytes = EVENT_BATCH_MAX_BYTES - adjusted_base;
         let exact_event_run_id = "x".repeat(event_run_bytes);
-        let (_, exact, _) = writer
+        let (_, exact, _, _) = writer
             .prepare_batch(
                 make_batch(exact_event_run_id.clone(), projection_run_id.clone()),
                 2,
@@ -8295,7 +15151,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE id=?")
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("committed message count"),
@@ -8347,7 +15203,8 @@ mod tests {
             })
             .await
             .expect("classify");
-        let message_id_before_restart = user_message_id("00000000-0000-4000-8000-000000000001");
+        let message_id_before_restart =
+            test_user_message_id("00000000-0000-4000-8000-000000000001");
         drop(writer);
         store.pool().close().await;
         drop(store);
@@ -8359,7 +15216,7 @@ mod tests {
         let reopened_writer = EventWriter::new(reopened.clone());
         assert_eq!(
             message_id_before_restart,
-            user_message_id("00000000-0000-4000-8000-000000000001"),
+            test_user_message_id("00000000-0000-4000-8000-000000000001"),
             "restart must not change the UUIDv5 projection anchor"
         );
         let invented = durable_timestamp + chrono::TimeDelta::seconds(1);
@@ -8371,7 +15228,7 @@ mod tests {
                     "timestamped",
                     invented,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -8397,7 +15254,7 @@ mod tests {
                     "timestamped",
                     durable_timestamp,
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -8405,7 +15262,7 @@ mod tests {
             .await
             .expect("inject using durable timestamp");
         let payload: String = sqlx::query_scalar("SELECT payload FROM messages WHERE id=?")
-            .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+            .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
             .fetch_one(reopened.pool())
             .await
             .expect("stored user message");
@@ -8623,6 +15480,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steer_group_injection_survives_kill_restart_at_injection_boundary() {
+        for application_kind in [ApplicationKind::SoftSteer, ApplicationKind::RetrySteer] {
+            let root = std::env::temp_dir().join(format!(
+                "sumi-steer-group-failpoint-{}-{}",
+                application_kind.as_str(),
+                uuid::Uuid::now_v7()
+            ));
+            let _ = tokio::fs::remove_dir_all(&root).await;
+            let path = root.join("agent.db");
+            let store: Arc<Store> = Store::open(&path, scope(), test_provider())
+                .await
+                .expect("open fresh file-backed store")
+                .into();
+            let writer = EventWriter::new(store.clone());
+
+            let owner_id = "00000000-0000-4000-8000-000000000001";
+            let run_id = format!("run-{owner_id}");
+            let old_turn_id = format!("turn-{owner_id}");
+            let group_turn_id = if application_kind == ApplicationKind::SoftSteer {
+                "turn-00000000-0000-4000-8000-000000000002".to_owned()
+            } else {
+                old_turn_id.clone()
+            };
+
+            let owner_injected =
+                classified_injection(&writer, 1, owner_id, "ignored", "owner").await;
+            writer
+                .apply(EventBatch {
+                    writes: injection_writes(owner_id, "ignored", "owner"),
+                    injected_commands: vec![owner_injected],
+                })
+                .await
+                .expect("inject owner");
+
+            let assistant_id = "assistant-1";
+            let assistant_stop_reason = if application_kind == ApplicationKind::SoftSteer {
+                StopReason::Stop
+            } else {
+                StopReason::Error
+            };
+            let assistant_msg = assistant_message(assistant_stop_reason);
+            let assistant_append_to_l0 = assistant_stop_reason != StopReason::Error;
+            writer
+                .apply(EventBatch {
+                    writes: vec![
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_start",
+                                    assistant_id,
+                                    &assistant_msg,
+                                    Some(run_id.clone()),
+                                    Some(old_turn_id.clone()),
+                                )
+                                .expect("assistant MessageStart"),
+                            ),
+                            projections: vec![Projection::RunPhase {
+                                command_id: owner_id.to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserCommitted,
+                                next: RunPhase::AssistantStarted,
+                            }],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_end",
+                                    assistant_id,
+                                    &assistant_msg,
+                                    Some(run_id.clone()),
+                                    Some(old_turn_id.clone()),
+                                )
+                                .expect("assistant MessageEnd"),
+                            ),
+                            projections: vec![Projection::MessageEnd {
+                                message_id: assistant_id.to_owned(),
+                                role: "assistant",
+                                message: assistant_msg.clone(),
+                                append_to_l0: assistant_append_to_l0,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            }],
+                        },
+                    ],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("close assistant message");
+
+            if application_kind == ApplicationKind::RetrySteer {
+                let retry_at = durable_test_timestamp() + Duration::seconds(4);
+                writer
+                    .apply(EventBatch {
+                        writes: vec![EventWrite {
+                            event: Some(
+                                DurableEvent::retry_scheduled(
+                                    &run_id,
+                                    &old_turn_id,
+                                    1,
+                                    4000,
+                                    retry_at,
+                                    "retryable fixture",
+                                )
+                                .expect("retry scheduled"),
+                            ),
+                            projections: Vec::new(),
+                        }],
+                        injected_commands: Vec::new(),
+                    })
+                    .await
+                    .expect("schedule retry");
+            }
+
+            let steer_id = "00000000-0000-4000-8000-000000000002";
+            writer
+                .persist_inbound(&user_command(2, steer_id, "steer now"))
+                .await
+                .expect("persist steer command");
+            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
+                .bind(durable_test_timestamp().to_rfc3339())
+                .bind(steer_id)
+                .execute(store.pool())
+                .await
+                .expect("pin steer receipt timestamp");
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: steer_id.to_owned(),
+                            application_kind,
+                            run_id: run_id.clone(),
+                            turn_id: group_turn_id.to_owned(),
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("classify steer command");
+
+            let steer_command = AdmittedCommand::new(
+                CommandEnvelope {
+                    seq: 2,
+                    command_id: CommandId::parse(steer_id).expect("canonical test UUID"),
+                    personality_agent_id: scope().personality_agent_id,
+                    provenance: test_provenance(),
+                    command: Command::UserMessage {
+                        text: "steer now".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                durable_test_timestamp(),
+            );
+
+            let previous_owner = DurableRunBinding {
+                command_id: owner_id.to_owned(),
+                command_seq: 1,
+                provenance: test_provenance(),
+                run_id: run_id.clone(),
+                turn_id: old_turn_id.clone(),
+                executor_generation: ProcessGeneration::MIN,
+            };
+            let mut group = SteerGroup::new(application_kind, run_id.clone(), group_turn_id)
+                .expect("create steer group");
+            group
+                .push(steer_command, store.redactor())
+                .expect("push steer command");
+            let closing_turn_message =
+                (application_kind == ApplicationKind::SoftSteer).then(|| assistant_msg.clone());
+            let snapshot = group.snapshot(previous_owner, closing_turn_message);
+            let batch = steer_group_injection_batch(snapshot).expect("build steer group batch");
+
+            let fail_after_writes = if application_kind == ApplicationKind::SoftSteer {
+                2
+            } else {
+                1
+            };
+            let error = writer
+                .apply_with_failpoint(batch.clone(), fail_after_writes)
+                .await
+                .expect_err("failpoint must interrupt the steer group injection");
+            assert!(error.to_string().contains("test failpoint"));
+            drop(writer);
+            drop(store);
+
+            let reopened: Arc<Store> = Store::open(&path, scope(), test_provider())
+                .await
+                .expect("restart store after interrupted steer group injection")
+                .into();
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count events after restart");
+            let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count messages after restart");
+            let (expected_pre_events, expected_pre_messages) =
+                if application_kind == ApplicationKind::SoftSteer {
+                    (6, 2)
+                } else {
+                    (7, 2)
+                };
+            assert_eq!(
+                (events, messages),
+                (expected_pre_events, expected_pre_messages),
+                "partial {} steer group injection must roll back completely",
+                application_kind.as_str()
+            );
+
+            let owner_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(owner_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("owner status after restart");
+            assert_eq!(owner_status.0, "applying", "owner must remain applying");
+            assert_eq!(
+                owner_status.1, "assistant_started",
+                "owner must remain assistant_started"
+            );
+
+            let steer_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(steer_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("steer status after restart");
+            assert_eq!(steer_status.0, "applying", "steer must remain applying");
+            assert_eq!(steer_status.1, "classified", "steer must remain classified");
+
+            EventWriter::new(reopened.clone())
+                .apply(batch)
+                .await
+                .expect("same steer group batch succeeds once after restart");
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count committed events after reapply");
+            let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count committed messages after reapply");
+            let (expected_events, expected_messages) =
+                if application_kind == ApplicationKind::SoftSteer {
+                    (12, 3)
+                } else {
+                    (11, 3)
+                };
+            assert_eq!(
+                (events, messages),
+                (expected_events, expected_messages),
+                "{} steer group must commit exactly after restart",
+                application_kind.as_str()
+            );
+
+            let owner_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(owner_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("owner status after reapply");
+            assert_eq!(
+                owner_status.0, "applied",
+                "owner must close after steer injection"
+            );
+            assert_eq!(
+                owner_status.1, "finished",
+                "owner must finish after steer injection"
+            );
+
+            let steer_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(steer_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("steer status after reapply");
+            assert_eq!(steer_status.0, "applying", "steer must remain applying");
+            assert_eq!(
+                steer_status.1, "user_committed",
+                "steer must reach user_committed"
+            );
+
+            reopened.pool().close().await;
+            tokio::fs::remove_dir_all(root)
+                .await
+                .expect("remove steer group failpoint fixture");
+        }
+    }
+
+    #[tokio::test]
     async fn restart_authenticates_existing_chain_and_never_advances_a_tampered_head() {
         fn assistant_start_batch(command_id: &str, label: &str) -> EventBatch {
             let run_id = format!("run-{command_id}");
@@ -8819,6 +15973,8 @@ mod tests {
                     role: "assistant",
                     message,
                     append_to_l0: false,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             });
             writes.push(EventWrite {
@@ -8874,6 +16030,18 @@ mod tests {
             writer.historical_rows_visited().await,
             visited_before,
             "ordinary writes after a long history must not reload historical event rows"
+        );
+        drop(writer);
+        let restarted = EventWriter::new(store);
+        restarted
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+        restarted
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("restart verifies every paged MessageEnd projection without retaining history");
+        assert!(
+            restarted.historical_rows_visited().await > EVENT_CHAIN_VERIFICATION_PAGE_ROWS as u64
         );
     }
 
@@ -8943,6 +16111,8 @@ mod tests {
                         role: "assistant",
                         message: assistant.clone(),
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 },
                 EventWrite {
@@ -9055,7 +16225,6 @@ mod tests {
             json!({"type":"future_durable_variant","payload":{}}),
             json!({"type":"error","message":"must remain volatile"}),
             json!({"type":"message_update","message_id":"message-1","delta":"volatile"}),
-            json!({"type":"memory_maintenance","kind":"T17 extension"}),
         ];
         for value in malformed {
             let error = DurableEvent::new(&value)
@@ -9288,6 +16457,8 @@ mod tests {
                             role: "assistant",
                             message: assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -9443,6 +16614,8 @@ mod tests {
                             role: "tool_result",
                             message: result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -9666,6 +16839,8 @@ mod tests {
                             role: "tool_result",
                             message: end,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -9785,6 +16960,8 @@ mod tests {
                         role: "assistant",
                         message: error_message,
                         append_to_l0: false,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -9867,6 +17044,8 @@ mod tests {
                             role: "assistant",
                             message: second_error,
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -9982,8 +17161,8 @@ mod tests {
                     },
                 ],
                 injected_commands: vec![
-                    InjectedCommand::new(1, command_a.clone()),
-                    InjectedCommand::new(2, command_b),
+                    test_injected_command(1, command_a.clone()),
+                    test_injected_command(2, command_b),
                 ],
             },
         )
@@ -9996,7 +17175,7 @@ mod tests {
         );
 
         let command_id = command_a.to_string();
-        let message_id = user_message_id(command_id.as_str());
+        let message_id = test_user_message_id(command_id.as_str());
         let user = user_message("injected");
         let assistant = assistant_message(StopReason::Stop);
         let early_assistant = validate_batch_shape(
@@ -10028,6 +17207,8 @@ mod tests {
                                 role: "user",
                                 message: user,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             Projection::RunPhase {
                                 command_id: command_id.clone(),
@@ -10038,7 +17219,7 @@ mod tests {
                         ],
                     },
                 ],
-                injected_commands: vec![InjectedCommand::new(1, command_a)],
+                injected_commands: vec![test_injected_command(1, command_a)],
             },
         )
         .err()
@@ -10103,6 +17284,8 @@ mod tests {
                             role: "assistant",
                             message: initial_assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10164,6 +17347,8 @@ mod tests {
                             role: "assistant",
                             message: continuation_assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10326,17 +17511,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_context_mutation_is_exclusive_to_one_event_batch_write() {
+        let mutation = || {
+            Projection::ProviderContextMutation(ProviderContextMutation {
+                mutation_id: "exclusive-provider-mutation".to_owned(),
+            })
+        };
+        let event = || {
+            DurableEvent::memory_maintenance(
+                "provider_context_mutation:exclusive-provider-mutation",
+            )
+            .expect("provider-context MemoryMaintenance fixture")
+        };
+        let cases = [
+            EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(event()),
+                        projections: vec![mutation()],
+                    },
+                    EventWrite {
+                        event: None,
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(event()),
+                    projections: vec![
+                        mutation(),
+                        Projection::CommandApplied {
+                            command_id: "unrelated-command".to_owned(),
+                            command_seq: 1,
+                            run_id: None,
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            },
+        ];
+
+        for batch in cases {
+            let error = validate_batch_shape(&Redactor::v1(), &batch)
+                .err()
+                .expect("ProviderContextMutation must exclude every sibling write");
+            assert_eq!(
+                error.to_string(),
+                "ProviderContextMutation must be the only projection in the only EventBatch write"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn plaintext_secret_never_appears_in_event_or_message_projections() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
-        let secret = "sk-abcdefghijklmnop";
+        let secret = format!("sk-abcdefghijklmnop github_pat_{}", "x".repeat(82));
         let injection = classified_injection(
             &writer,
             1,
             "00000000-0000-4000-8000-000000000030",
             "message-secret",
-            secret,
+            &secret,
         )
         .await;
         writer
@@ -10344,7 +17583,7 @@ mod tests {
                 writes: injection_writes(
                     "00000000-0000-4000-8000-000000000030",
                     "message-secret",
-                    secret,
+                    &secret,
                 ),
                 injected_commands: vec![injection],
             })
@@ -10360,7 +17599,11 @@ mod tests {
         .expect("read projections");
         for column in ["envelope", "payload", "search_text"] {
             let value: String = row.get(column);
-            assert!(!value.contains(secret), "{column} leaked plaintext secret");
+            assert!(!value.contains(&secret), "{column} leaked plaintext secret");
+            assert!(
+                !value.contains("github_pat_"),
+                "{column} leaked GitHub token prefix"
+            );
         }
     }
 
@@ -10454,6 +17697,8 @@ mod tests {
                             role: "assistant",
                             message: rejected,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10477,6 +17722,8 @@ mod tests {
                             role: "tool_result",
                             message,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -10597,6 +17844,8 @@ mod tests {
                         role: "tool_result",
                         message,
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -10681,6 +17930,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_replay_authenticates_exact_persisted_provenance_and_admission_record() {
+        let command_id = "00000000-0000-4000-8000-000000000031";
+        for tampered_provenance in [
+            DirectChatProvenanceV1::new("tenant-tampered", scope().personality_agent_id, "human-1")
+                .unwrap(),
+            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-tampered")
+                .unwrap(),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered_provenance).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance");
+            let matching_tamper =
+                user_command_with_provenance(1, command_id, "original", tampered_provenance);
+            let error = writer
+                .persist_inbound(&matching_tamper)
+                .await
+                .expect_err("unauthenticated provenance replacement must fail");
+            assert!(
+                error.to_string().contains("admission record HMAC mismatch"),
+                "{error:#}"
+            );
+        }
+
+        for (field, value) in [
+            ("source", serde_json::json!({"surface": "group_chat"})),
+            (
+                "personality_agent_id",
+                serde_json::json!("0198f0f4-9b72-7000-8000-000000000002"),
+            ),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let original = user_command(1, command_id, "original");
+            writer
+                .persist_inbound(&original)
+                .await
+                .expect("persist authenticated command");
+            let mut tampered = serde_json::to_value(test_provenance()).unwrap();
+            tampered[field] = value;
+            sqlx::query("UPDATE inbound_commands SET provenance_json=? WHERE command_id=?")
+                .bind(serde_json::to_string(&tampered).unwrap())
+                .bind(command_id)
+                .execute(store.pool())
+                .await
+                .expect("tamper persisted provenance field");
+            assert!(
+                writer.persist_inbound(&original).await.is_err(),
+                "tampered provenance field {field} must fail replay"
+            );
+        }
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "original");
+        writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist authenticated command");
+        sqlx::query(
+            "UPDATE inbound_commands SET admission_record_hmac=zeroblob(32)
+             WHERE command_id=?",
+        )
+        .bind(command_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper admission HMAC");
+        let error = writer
+            .persist_inbound(&original)
+            .await
+            .expect_err("tampered admission record must fail replay");
+        assert!(
+            error.to_string().contains("admission record HMAC mismatch"),
+            "{error:#}"
+        );
+
+        let root = std::env::temp_dir().join(format!("sumi-command-provenance-{}", Uuid::now_v7()));
+        let path = root.join("state").join("agent.db");
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let original = user_command(1, command_id, "restart");
+        let expected = writer
+            .persist_inbound(&original)
+            .await
+            .expect("persist command before restart");
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let replayed = EventWriter::new(reopened.clone())
+            .persist_inbound(&original)
+            .await
+            .expect("authenticate exact command provenance after restart");
+        assert_eq!(replayed, expected);
+        reopened.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove provenance restart fixture");
+    }
+
+    #[tokio::test]
     async fn live_admission_accepts_user_then_reserved_abort_without_reentering_replay_mode() {
         let store = test_store().await;
         let writer = EventWriter::new(store);
@@ -10711,6 +18070,92 @@ mod tests {
         assert_eq!(
             terminal.iter().map(|ack| ack.status).collect::<Vec<_>>(),
             vec![CommandAckStatus::Superseded, CommandAckStatus::Applied]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_checkpoint_publishes_authenticated_history_to_an_existing_receiver() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (mut prepared, _, _, event_seqs) = writer
+            .prepare_batch(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("pre-writer-authenticated-history")
+                                .expect("fixture maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect("prepare authenticated history");
+        assert_eq!(event_seqs, vec![1]);
+        let event = prepared
+            .pop()
+            .and_then(|write| write.event)
+            .expect("prepared history contains one event");
+        let mut transaction = store.pool().begin().await.expect("begin history seed");
+        let mut head = None;
+        append_prepared_event(&store, &mut transaction, event, &mut head)
+            .await
+            .expect("append authenticated history");
+        persist_event_head(
+            &store,
+            &mut transaction,
+            None,
+            head.as_ref().expect("history seed advances the event head"),
+        )
+        .await
+        .expect("persist authenticated history head");
+        transaction.commit().await.expect("commit history seed");
+
+        let receiver = store
+            .claim_post_commit_receiver()
+            .expect("claim receiver before writer checkpoint");
+        assert_eq!(receiver.published_through().unwrap(), 0);
+        let waiting = tokio::spawn(async move {
+            receiver
+                .wait_for_advance(0, &tokio_util::sync::CancellationToken::new())
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("authenticate existing event history");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("authenticated checkpoint wakes the existing receiver")
+                .expect("receiver task joins")
+                .expect("receiver observes a feed advance"),
+            Some(1)
+        );
+        assert_eq!(
+            store.committed_event_sequences(0, 1, 64).await.unwrap(),
+            vec![1],
+            "the awakened receiver scans the authenticated durable prefix"
+        );
+        assert_eq!(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("first-live-writer-commit")
+                                .expect("live maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("publish the exact event after authenticated history"),
+            vec![2]
         );
     }
 
@@ -11014,7 +18459,7 @@ mod tests {
         let wrong_seq = scope().row_aad("inbound_commands", "2", DataKeyPurpose::Command);
         assert!(decrypt_content(&key, &ciphertext, &wrong_seq).is_err());
         let wrong_conversation = AgentScope {
-            conversation_id: "conversation-2".to_owned(),
+            personality_agent_id: "0198f0f4-9b72-7000-8000-000000000002".parse().unwrap(),
             ..scope()
         }
         .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
@@ -11027,13 +18472,15 @@ mod tests {
         let writer = EventWriter::new(store.clone());
         let bytes = vec![b'x'; 1024 * 1024 + 1];
         let key = store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("command key");
         let inbound = InboundCommand::Invalid {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: bytes.len() as u64,
             },
@@ -11079,6 +18526,8 @@ mod tests {
             seq: 1,
             command_id: CommandId::parse("00000000-0000-4000-8000-000000000010")
                 .expect("canonical test command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
             reason: CommandRejectReason::Oversized {
                 actual_bytes: changed_bytes.len() as u64,
             },
@@ -11101,6 +18550,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_command_dispositions_are_public_exact_and_replay_safe() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let rejected = InboundCommand::Invalid {
+            seq: 1,
+            command_id: CommandId::parse("00000000-0000-4000-8000-000000000101")
+                .expect("canonical rejected command UUID"),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                br#"{"type":"abort",}"#.to_vec(),
+            )),
+            payload_digest: None,
+        };
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let rejected_receipt = admission
+            .receive_with_origin(&writer, &rejected)
+            .await
+            .expect("persist rejected command");
+        let rejected_ack = rejected_receipt.ack;
+        assert_eq!(rejected_ack.status, CommandAckStatus::Rejected);
+        assert_eq!(rejected_receipt.events.len(), 1);
+        assert!(matches!(
+            &rejected_receipt.events[0],
+            (
+                _,
+                AgentEvent::CommandDisposition(CommandDispositionEvent {
+                    disposition: CommandDisposition::Rejected { .. },
+                    ..
+                })
+            )
+        ));
+
+        let envelope: String = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events WHERE event_type='command_disposition'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load rejected disposition");
+        let envelope: Value = serde_json::from_str(&envelope).expect("public disposition JSON");
+        assert_eq!(
+            envelope,
+            json!({
+                "type": "command_disposition",
+                "command_id": "00000000-0000-4000-8000-000000000101",
+                "command_seq": 1,
+                "status": "rejected",
+                "reject_reason": "schema_violation"
+            }),
+            "public disposition must not expose provenance, personality-agent identity, or command body"
+        );
+
+        let replay = admission
+            .receive_with_origin(&writer, &rejected)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.ack, rejected_ack);
+        assert!(
+            replay.events.is_empty(),
+            "gateway catch-up owns replayed dispositions"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count replay-safe dispositions"),
+            1,
+            "terminal ACK replay must not append another disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_abort_cutoff_materializes_superseded_and_applied_dispositions_once() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let first = user_command(
+            1,
+            "00000000-0000-4000-8000-000000000111",
+            "first pending user",
+        );
+        let second = user_command(
+            2,
+            "00000000-0000-4000-8000-000000000112",
+            "second pending user",
+        );
+        let abort = abort_command(3, "00000000-0000-4000-8000-000000000113");
+        for command in [&first, &second, &abort] {
+            writer
+                .persist_inbound(command)
+                .await
+                .expect("persist cutoff command");
+        }
+
+        let acks = writer
+            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000113", 3)
+            .await
+            .expect("apply idle Abort cutoff");
+        assert_eq!(
+            acks.iter().map(|ack| ack.status).collect::<Vec<_>>(),
+            vec![
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Superseded,
+                CommandAckStatus::Applied,
+            ]
+        );
+
+        let envelopes: Vec<String> = sqlx::query_scalar(
+            "SELECT envelope FROM agent_events
+             WHERE event_type='command_disposition' ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load cutoff dispositions");
+        let envelopes = envelopes
+            .iter()
+            .map(|envelope| serde_json::from_str::<Value>(envelope).expect("disposition JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            envelopes,
+            vec![
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000111",
+                    "command_seq": 1,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000112",
+                    "command_seq": 2,
+                    "status": "superseded"
+                }),
+                json!({
+                    "type": "command_disposition",
+                    "command_id": "00000000-0000-4000-8000-000000000113",
+                    "command_seq": 3,
+                    "status": "applied"
+                }),
+            ]
+        );
+
+        for (command, status) in [
+            (&first, CommandAckStatus::Superseded),
+            (&second, CommandAckStatus::Superseded),
+            (&abort, CommandAckStatus::Applied),
+        ] {
+            assert_eq!(
+                writer
+                    .persist_inbound(command)
+                    .await
+                    .expect("replay terminal command")
+                    .status,
+                status
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='command_disposition'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count cutoff dispositions after replay"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_and_disposition_roll_back_together() {
+        let applied_store = test_store().await;
+        let applied_writer = EventWriter::new(applied_store.clone());
+        let abort_id = "00000000-0000-4000-8000-000000000121";
+        applied_writer
+            .persist_inbound(&abort_command(1, abort_id))
+            .await
+            .expect("persist Abort target");
+        let error = applied_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: abort_id.to_owned(),
+                            command_seq: 1,
+                            run_id: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between terminal projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(abort_id)
+            .fetch_one(applied_store.pool())
+            .await
+            .expect("load rolled-back Abort"),
+            "received"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(applied_store.pool())
+                .await
+                .expect("count rolled-back applied disposition"),
+            0
+        );
+
+        let rejected_store = test_store().await;
+        let rejected_writer = EventWriter::new(rejected_store.clone());
+        let rejected_id = "00000000-0000-4000-8000-000000000122";
+        let error = rejected_writer
+            .apply_with_failpoint(
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandRejected {
+                            seq: 1,
+                            command_id: rejected_id.to_owned(),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
+                            reason: CommandRejectReason::SchemaViolation,
+                            raw_command: RejectedCommandPayload::Present(
+                                SensitiveCommandPayload::new(br#"{"type":"abort",}"#.to_vec()),
+                            ),
+                            payload_digest: None,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("fail between rejected projection and synthesized disposition");
+        assert!(error.to_string().contains("test failpoint"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected command"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(rejected_store.pool())
+                .await
+                .expect("count rolled-back rejected disposition"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_null_and_missing_payloads_are_distinct_in_both_replay_directions() {
         for (first, replay) in [
             (
@@ -11119,6 +18826,8 @@ mod tests {
             let original = InboundCommand::Invalid {
                 seq: 1,
                 command_id: command_id.clone(),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: first,
                 payload_digest: None,
@@ -11137,6 +18846,8 @@ mod tests {
             let changed = InboundCommand::Invalid {
                 seq: 1,
                 command_id,
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 reason: CommandRejectReason::SchemaViolation,
                 raw_command: replay,
                 payload_digest: None,
@@ -11324,8 +19035,8 @@ mod tests {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
                 .fetch_one(store.pool())
                 .await
-                .expect("no unstarted close events"),
-            0
+                .expect("terminal dispositions for unstarted startup and Abort"),
+            2
         );
         drop(writer);
         store.pool().close().await;
@@ -12024,6 +19735,8 @@ mod tests {
                             role: "assistant",
                             message: old_error.clone(),
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -12100,6 +19813,8 @@ mod tests {
                             role: "assistant",
                             message: current_error,
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -12251,7 +19966,7 @@ mod tests {
                     "message-1",
                     "hello",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -12509,7 +20224,7 @@ mod tests {
             .await
             .expect("seed next owner");
             let message = user_message("next");
-            let message_id = user_message_id(next_id.as_str());
+            let message_id = test_user_message_id(next_id.as_str());
             let handoff_error = writer
                 .apply(EventBatch {
                     writes: vec![
@@ -12567,6 +20282,8 @@ mod tests {
                                     role: "user",
                                     message,
                                     append_to_l0: true,
+                                    provider_context: Vec::new(),
+                                    eviction_footprint_tokens: 0,
                                 },
                                 Projection::RunPhase {
                                     command_id: next_id.clone(),
@@ -12577,7 +20294,7 @@ mod tests {
                             ],
                         },
                     ],
-                    injected_commands: vec![InjectedCommand::new(2, next_id)],
+                    injected_commands: vec![test_injected_command(2, next_id)],
                 })
                 .await
                 .expect_err("pre-assistant owner handoff must fail");
@@ -12917,7 +20634,7 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_start",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageStart"),
@@ -12940,17 +20657,21 @@ mod tests {
                     event: Some(
                         DurableEvent::message(
                             "message_end",
-                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &test_user_message_id("00000000-0000-4000-8000-000000000018"),
                             &message,
                         )
                         .expect("MessageEnd"),
                     ),
                     projections: vec![
                         Projection::MessageEnd {
-                            message_id: user_message_id("00000000-0000-4000-8000-000000000018"),
+                            message_id: test_user_message_id(
+                                "00000000-0000-4000-8000-000000000018",
+                            ),
                             role: "user",
                             message,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         },
                         Projection::RunPhase {
                             command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
@@ -12961,7 +20682,7 @@ mod tests {
                     ],
                 },
             ],
-            injected_commands: vec![InjectedCommand::new(
+            injected_commands: vec![test_injected_command(
                 2,
                 "00000000-0000-4000-8000-000000000018",
             )],
@@ -13096,6 +20817,232 @@ mod tests {
         assert_eq!(event_count, 0);
     }
 
+    #[test]
+    fn memory_transition_nested_materialization_uses_exact_byte_boundary() {
+        let fixed_membership_bytes = DURABLE_ROW_OVERHEAD_BYTES + std::mem::size_of::<i64>();
+        let mut membership = MemoryBatchMessageRecord {
+            batch_id: String::new(),
+            message_id: "x".repeat(EVENT_BATCH_MAX_BYTES - fixed_membership_bytes),
+            ord: 1,
+        };
+        let transition = MemoryTransition {
+            membership_inserts: vec![membership.clone()],
+            ..Default::default()
+        };
+        let preflight = memory_transition_preflight_materialization(&Redactor::v1(), &transition)
+            .expect("size exact-boundary raw transition");
+        assert_eq!(preflight.bytes, EVENT_BATCH_MAX_BYTES);
+        EventBatchSizer::validate(BatchBounds::default(), preflight.bytes)
+            .expect("exact raw transition byte limit");
+        drop(transition);
+
+        let prepared = PreparedProjection::MemoryTransition {
+            expected_source_versions: BTreeMap::new(),
+            expected_source_states: BTreeMap::new(),
+            batch_mutations: Vec::new(),
+            job_mutations: Vec::new(),
+            batch_inserts: Vec::new(),
+            job_inserts: Vec::new(),
+            membership_inserts: vec![membership.clone()],
+            cursor_advance: None,
+            memory_summary_key_proofs: Vec::new(),
+        };
+        let prepared_size = prepared_memory_projection_materialization(&prepared)
+            .expect("size exact-boundary prepared transition");
+        assert_eq!(prepared_size.bytes, EVENT_BATCH_MAX_BYTES);
+        EventBatchSizer::validate(BatchBounds::default(), prepared_size.bytes)
+            .expect("exact prepared transition byte limit");
+        drop(prepared);
+
+        membership.message_id.push('x');
+        let over = memory_transition_preflight_materialization(
+            &Redactor::v1(),
+            &MemoryTransition {
+                membership_inserts: vec![membership],
+                ..Default::default()
+            },
+        )
+        .expect("size one-byte-over transition");
+        assert_eq!(over.bytes, EVENT_BATCH_MAX_BYTES + 1);
+        assert!(
+            EventBatchSizer::validate(BatchBounds::default(), over.bytes)
+                .expect_err("one byte over must fail")
+                .to_string()
+                .contains("durable bytes")
+        );
+    }
+
+    #[test]
+    fn memory_transition_nested_component_limit_is_checked_without_saturation() {
+        let mut components = 2;
+        charge_materialization_components(&mut components, MAX_MATERIALIZATION_COMPONENTS - 2)
+            .expect("exact component limit");
+        assert_eq!(components, MAX_MATERIALIZATION_COMPONENTS);
+        assert!(
+            charge_materialization_components(&mut components, 1)
+                .expect_err("one component over must fail")
+                .to_string()
+                .contains("materialization components")
+        );
+    }
+
+    #[test]
+    fn memory_job_source_identity_requires_unique_sources_and_exactly_one_target() {
+        let source = Uuid::from_u128(1).to_string();
+        let second_source = Uuid::from_u128(2).to_string();
+        let target = Uuid::from_u128(3).to_string();
+        let transition_for =
+            |source_ids: Vec<String>, source_versions: BTreeMap<String, i64>| MemoryTransition {
+                job_inserts: vec![MemoryJobRecord::new(
+                    Uuid::from_u128(4).to_string(),
+                    MemoryJobKind::CompactL0,
+                    1,
+                    source_ids,
+                    source_versions,
+                )],
+                ..Default::default()
+            };
+
+        let duplicate = transition_for(
+            vec![source.clone(), source.clone()],
+            BTreeMap::from([(source.clone(), 0), (target.clone(), 0)]),
+        );
+        assert!(
+            memory_transition_preflight_materialization(&Redactor::v1(), &duplicate)
+                .expect_err("duplicate source identity must fail")
+                .to_string()
+                .contains("repeats source id")
+        );
+
+        let missing_witness = transition_for(
+            vec![source.clone(), second_source],
+            BTreeMap::from([(source.clone(), 0), (target.clone(), 0)]),
+        );
+        assert!(
+            memory_transition_preflight_materialization(&Redactor::v1(), &missing_witness)
+                .expect_err("every source identity requires a version witness")
+                .to_string()
+                .contains("missing its version witness")
+        );
+
+        let no_target = transition_for(vec![source.clone()], BTreeMap::from([(source, 0)]));
+        assert!(
+            memory_transition_preflight_materialization(&Redactor::v1(), &no_target)
+                .expect_err("job requires one target identity outside its source set")
+                .to_string()
+                .contains("exactly one target batch witness")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_transition_rejects_oversized_job_source_set_before_json_materialization() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let source_count = MAX_MATERIALIZATION_COMPONENTS / 2;
+        let mut source_ids = Vec::with_capacity(source_count);
+        let mut source_versions = BTreeMap::new();
+        for raw in 1..=source_count {
+            let source_id = Uuid::from_u128(raw as u128).to_string();
+            source_versions.insert(source_id.clone(), 0);
+            source_ids.push(source_id);
+        }
+        let target_id = Uuid::from_u128(u128::MAX).to_string();
+        source_versions.insert(target_id, 0);
+        let encoded_identity_bytes = source_ids
+            .iter()
+            .map(String::len)
+            .chain(source_versions.keys().map(String::len))
+            .sum::<usize>();
+        assert!(
+            encoded_identity_bytes < EVENT_BATCH_MAX_BYTES,
+            "fixture must exercise component count rather than byte count"
+        );
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("oversized_job_source_set")
+                            .expect("memory maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        job_inserts: vec![MemoryJobRecord::new(
+                            Uuid::now_v7().to_string(),
+                            MemoryJobKind::CompactL0,
+                            1,
+                            source_ids,
+                            source_versions,
+                        )],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("source identity components above the cap must fail before apply");
+        assert!(
+            error.to_string().contains("materialization components"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_jobs")
+                .fetch_one(store.pool())
+                .await
+                .expect("count memory jobs"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_transition_rejects_caller_supplied_summary_ciphertext() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch_id = BatchId::from_u128(0x51);
+        let mut record = MemoryBatchRecord::new(
+            batch_id.to_string(),
+            MemoryLayer::L1,
+            0,
+            0,
+            MemoryBatchState::Compacted,
+            1,
+            0,
+        );
+        record.summary = Some(MemoryBatchSummary {
+            key_ref: "caller-key".to_owned(),
+            ciphertext: vec![1, 2, 3],
+            projection: "{}".to_owned(),
+            redaction_version: 1,
+        });
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("caller_summary_insert")
+                            .expect("memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![record],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("caller-supplied ciphertext must be rejected");
+        assert!(
+            error.to_string().contains("caller-supplied summaries"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_batches")
+                .fetch_one(store.pool())
+                .await
+                .expect("count memory batches"),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn multi_write_materialization_stops_at_the_batch_limit() {
         let store = test_store().await;
@@ -13162,47 +21109,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_destroyed_after_prepare_prevents_any_ciphertext_row_from_committing() {
-        let store = test_store().await;
-        let writer = EventWriter::new(store.clone());
-        let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
-            .await
-            .expect("event key");
-        let batch = EventBatch {
-            writes: vec![EventWrite {
-                event: Some(
-                    DurableEvent::new(&json!({"type":"agent_start","run_id":"run-key-race"}))
-                        .expect("durable event"),
-                ),
-                projections: Vec::new(),
-            }],
-            injected_commands: Vec::new(),
-        };
-        let error = writer
-            .apply_after_prepare_destroy_key(batch, &event_key.key_ref)
-            .await
-            .expect_err("destroy commit between prepare and begin must fail closed");
-        assert!(error.to_string().contains("is not active"));
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await
-            .expect("count event rows");
-        assert_eq!(events, 0);
-        let state: String = sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref=?")
-            .bind(&event_key.key_ref)
-            .fetch_one(store.pool())
-            .await
-            .expect("read destroyed key state");
-        assert_eq!(state, "destroyed");
-    }
-
-    #[tokio::test]
     async fn key_material_replaced_after_prepare_is_rejected_in_transaction() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let event_key = store
-            .conversation_key(DataKeyPurpose::Event)
+            .private_key(DataKeyPurpose::Event)
             .await
             .expect("event key");
         let batch = EventBatch {
@@ -13218,7 +21129,7 @@ mod tests {
             }],
             injected_commands: Vec::new(),
         };
-        let (prepared, _, _) = writer
+        let (prepared, _, _, _) = writer
             .prepare_batch(batch, 1)
             .await
             .expect("prepare ciphertext with original key material");
@@ -13229,9 +21140,10 @@ mod tests {
                 .expect("replacement data key");
         let aad = KeyWrapAad {
             key_ref: event_key.key_ref.clone(),
-            scope: DataKeyScope::Conversation,
+            scope: DataKeyScope::PersonalityAgent,
             purpose: DataKeyPurpose::Event,
-            conversation_id: Some(scope().conversation_id),
+            personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit: "agent".to_owned(),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) =
@@ -13262,6 +21174,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_context_key_material_replaced_after_prepare_is_rejected_in_transaction() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let mut message = assistant_message(StopReason::Stop);
+        let PublicMessage::Assistant(assistant) = &mut message else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+        let message_id = "assistant-provider-context-key-race";
+        let fragment = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "opaque",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp".to_owned(),
+                },
+            },
+        };
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::message("message_end", message_id, &message)
+                        .expect("durable message_end event"),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id: message_id.to_owned(),
+                    role: "assistant",
+                    message,
+                    append_to_l0: true,
+                    provider_context: vec![fragment],
+                    eviction_footprint_tokens: 0,
+                }],
+            }],
+            injected_commands: Vec::new(),
+        };
+        let (prepared, _, _, _) = writer
+            .prepare_batch(batch, 1)
+            .await
+            .expect("prepare message_end with provider-context key material");
+
+        let provider_context_key_ref = match &prepared[0].projections[0] {
+            PreparedProjection::MessageEnd {
+                provider_context_key_proofs,
+                ..
+            } => provider_context_key_proofs
+                .first()
+                .expect("one provider-context key proof")
+                .0
+                .clone(),
+            _ => panic!("prepared MessageEnd must carry a provider-context key proof"),
+        };
+
+        let wrapping_key = WrappingKey::new("test-wrap-v1", [0x53; DATA_KEY_BYTES]);
+        let replacement = DataKeyMaterial::generate(
+            provider_context_key_ref.clone(),
+            DataKeyPurpose::ProviderContext,
+        )
+        .expect("replacement provider-context data key");
+        let retention_unit: String =
+            sqlx::query_scalar("SELECT retention_unit FROM data_keys WHERE key_ref=?")
+                .bind(&provider_context_key_ref)
+                .fetch_one(store.pool())
+                .await
+                .expect("load provider-context retention unit");
+        let aad = KeyWrapAad {
+            key_ref: provider_context_key_ref.clone(),
+            scope: DataKeyScope::PersonalityAgent,
+            purpose: DataKeyPurpose::ProviderContext,
+            personality_agent_id: scope().personality_agent_id.to_string(),
+            retention_unit,
+            wrap_key_id: wrapping_key.key_id().to_owned(),
+        };
+        let (wrap_nonce, wrapped_key) =
+            wrap_data_key(&replacement, &wrapping_key, &aad).expect("wrap replacement key");
+        sqlx::query(
+            "UPDATE data_keys SET wrap_nonce=?, wrapped_key=? WHERE key_ref=? AND state='active'",
+        )
+        .bind(wrap_nonce.as_slice())
+        .bind(wrapped_key)
+        .bind(&provider_context_key_ref)
+        .execute(store.pool())
+        .await
+        .expect("replace wrapped provider-context key material between prepare and transaction");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = super::revalidate_prepared_key_refs(&store, &mut transaction, &prepared)
+            .await
+            .expect_err("changed provider-context material must fail closed");
+        assert!(error.to_string().contains("changed material"), "{error:#}");
+        transaction.rollback().await.expect("roll back validation");
+    }
+
+    #[tokio::test]
     async fn writer_derives_command_limits_from_durable_inbound_payloads() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -13273,7 +21283,7 @@ mod tests {
                 }],
                 injected_commands: (0_u64..17)
                     .map(|index| {
-                        InjectedCommand::new(
+                        test_injected_command(
                             index + 1,
                             format!("00000000-0000-4000-8000-{index:012}"),
                         )
@@ -13398,8 +21408,14 @@ mod tests {
     #[tokio::test]
     async fn injected_user_message_uuid_v5_is_canonical_and_replay_stable() {
         let command_id = "018f0000-0000-7000-8000-000000000001";
-        let canonical = user_message_id(command_id);
-        assert_eq!(canonical, user_message_id(command_id));
+        let canonical = test_user_message_id(command_id);
+        assert_eq!(canonical, test_user_message_id(command_id));
+        assert_eq!(
+            canonical,
+            crate::gateway::wire::user_message_id_from_command_id(command_id)
+                .expect("public wire message id"),
+            "Store projection must use the public command-to-message namespace"
+        );
         assert_eq!(
             Uuid::parse_str(&canonical)
                 .expect("derived message UUID")
@@ -13408,7 +21424,7 @@ mod tests {
         );
         assert_ne!(
             canonical,
-            user_message_id("018f0000-0000-7000-8000-000000000002")
+            test_user_message_id("018f0000-0000-7000-8000-000000000002")
         );
         assert_ne!(
             canonical,
@@ -13428,6 +21444,7 @@ mod tests {
             1,
             CommandId::parse(command_id).expect("canonical test command UUID"),
             "caller-choice",
+            test_provenance(),
         );
         let rejected = writer
             .apply(EventBatch {
@@ -13448,7 +21465,7 @@ mod tests {
         writer
             .apply(EventBatch {
                 writes: injection_writes(command_id, "ignored", "stable"),
-                injected_commands: vec![InjectedCommand::new(1, command_id)],
+                injected_commands: vec![test_injected_command(1, command_id)],
             })
             .await
             .expect("canonical UUIDv5 injection");
@@ -13461,8 +21478,8 @@ mod tests {
             canonical
         );
         assert_eq!(
-            user_message_id(command_id),
-            InjectedCommand::new(1, command_id).message_id(),
+            test_user_message_id(command_id),
+            test_injected_command(1, command_id).message_id(),
             "reclassification/replay must derive the same ID"
         );
     }
@@ -13474,6 +21491,8 @@ mod tests {
                 seq: 1,
                 command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                     .expect("canonical test command UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
                 command: Command::Abort {},
             },
         };
@@ -13975,6 +21994,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_allowed_prepare_and_start_are_one_retryable_transaction() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-atomic-start").await;
+
+        let mut start = tool_start_write("tool-atomic-start", "run-atomic-start");
+        start.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-atomic-start".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-atomic-start".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-atomic-start".to_owned(),
+            }),
+        );
+        let batch = EventBatch {
+            writes: vec![start],
+            injected_commands: Vec::new(),
+        };
+
+        let interrupted = writer
+            .apply_with_failpoint(batch.clone(), 1)
+            .await
+            .expect_err("failure after the combined write must roll back Prepare and Start");
+        assert!(
+            interrupted.to_string().contains("test failpoint"),
+            "unexpected failure: {interrupted:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back execution"),
+            0,
+            "a failed start commit must not leave a replay-blocking prepared row"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back start event"),
+            0
+        );
+
+        writer
+            .apply(batch)
+            .await
+            .expect("retry after rollback must not hit a duplicate idempotency key");
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT
+                    (SELECT state FROM tool_executions
+                     WHERE tool_call_id='tool-atomic-start'),
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type='tool_execution_start'
+                       AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("coherent durable start lifecycle"),
+            ("running".to_owned(), 1)
+        );
+    }
+
+    #[tokio::test]
     async fn tool_prepare_and_start_require_ordered_canonical_assistant_message_end() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -14041,6 +22132,8 @@ mod tests {
                             role: "assistant",
                             message: assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -14071,6 +22164,8 @@ mod tests {
                                 role: "assistant",
                                 message: assistant,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             prepare("tool-origin-a"),
                             prepare("tool-origin-b"),
@@ -14182,6 +22277,8 @@ mod tests {
                             role: "assistant",
                             message: rejected,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -14487,6 +22584,8 @@ mod tests {
                             role: "tool_result",
                             message: result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -14569,6 +22668,220 @@ mod tests {
                 "prepared".to_owned(),
                 "assistant_started".to_owned()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_approval_resolution_cannot_authorize_prepared_tool_cleanup() {
+        let run_id = "run-unrelated";
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, run_id).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-1", "tool-1", "mutating"),
+                            }))
+                            .expect("approval request 1"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-1".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-1".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-1".to_owned(),
+                                tool_call_id: "tool-1".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-2", "tool-2", "mutating"),
+                            }))
+                            .expect("approval request 2"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-2".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-2".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-2".to_owned(),
+                                tool_call_id: "tool-2".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed two pending approvals with prepared tools");
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000020",
+                "request-1",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-1");
+
+        let bad_result = tool_result("tool-2", "unrelated denial cleanup", true);
+        let bad_error = writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-1",
+                        "denied",
+                        "user-1",
+                        Some(("00000000-0000-4000-8000-000000000020", 2, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": bad_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("unrelated cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-result".to_owned(),
+                            role: "tool_result",
+                            message: bad_result,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("unrelated approval denial must not authorize tool-2 cleanup");
+        assert!(bad_error
+            .to_string()
+            .contains("prepared ToolExecutionEnd for tool-2 is permitted only for cancellation or denial cleanup"));
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000021",
+                "request-2",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-2");
+
+        let ok_result = tool_result("tool-2", "denied for tool-2", true);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-2",
+                        "denied",
+                        "user-2",
+                        Some(("00000000-0000-4000-8000-000000000021", 3, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": ok_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("exact cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-ok".to_owned(),
+                            role: "tool_result",
+                            message: ok_result,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("exact request-2 denial may authorize tool-2 cleanup");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-2'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-2')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("exact denial cleanup state"),
+            ("denied".to_owned(), "cancelled".to_owned())
         );
     }
 
@@ -14764,6 +23077,8 @@ mod tests {
                             role: "tool_result",
                             message: tool_result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -14830,30 +23145,32 @@ mod tests {
 
         writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-1",
-                    "cancelled",
-                    "runtime",
-                    None,
-                )],
+                writes: vec![
+                    approval_resolution_write("request-1", "cancelled", "runtime", None),
+                    EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        }],
+                    },
+                ],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("terminalize approval");
-        writer
-            .apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![Projection::CommandApplied {
-                        command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                        command_seq: 2,
-                        run_id: None,
-                    }],
-                }],
-                injected_commands: Vec::new(),
-            })
+            .expect("same-batch runtime cancellation permits the terminal no-op");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-1')",
+            )
+            .fetch_one(store.pool())
             .await
-            .expect("terminal approval permits a no-op");
+            .expect("atomic cancellation and command state"),
+            ("applied".to_owned(), "cancelled".to_owned())
+        );
         assert_eq!(
             writer
                 .persist_inbound(&pending_decision)
@@ -15201,9 +23518,18 @@ mod tests {
             .expect_err("approval can start only its pending tool");
         assert!(wrong_tool.to_string().contains("pending tool tool-2b"));
 
+        let approve_always_rule = json!({
+            "id":"rule-3",
+            "tool":"bash",
+            "literal_prefix":["git","status"],
+            "effect":"allow",
+            "workspace_only":true,
+            "allowed_permissions":["exec"],
+            "allowed_network_domains":[]
+        });
         let approve_always: ApprovalDecision = serde_json::from_value(json!({
             "type":"approve_always",
-            "rule":{"tool_name":"test","literal_prefix":["test"]}
+            "rule": approve_always_rule.clone()
         }))
         .expect("closed deferred ApproveAlways decision");
         let store = test_store().await;
@@ -15218,19 +23544,38 @@ mod tests {
             ))
             .await
             .expect("persist authenticated ApproveAlways");
-        let unsupported = writer
+        let mut resolution = approval_resolution_write(
+            "request-3",
+            "approved_always",
+            "user-3",
+            Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-3".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&approve_always_rule).expect("serialize rule"),
+            }));
+        writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-3",
-                    "approved_always",
-                    "user-3",
-                    Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
-                )],
+                writes: vec![resolution],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("T12 must not invent a durable policy mutation");
-        assert!(unsupported.to_string().contains("T22/T23"));
+            .expect("ApproveAlways resolves with its durable policy mutation");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands
+                     WHERE command_id='00000000-0000-4000-8000-000000000035'),
+                    (SELECT tool FROM approval_rules WHERE id='rule-3')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("durable ApproveAlways state"),
+            ("applied".to_owned(), "bash".to_owned())
+        );
 
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -15302,6 +23647,293 @@ mod tests {
             .await
             .expect_err("tampered durable command must not resolve approval");
         assert!(format!("{tampered:#}").contains("HMAC"));
+    }
+
+    #[tokio::test]
+    async fn approve_always_accepts_only_broker_authorized_normalizations() {
+        fn deferred_rule(value: Value) -> ApprovalDecision {
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(value)
+                    .expect("object deferred rule"),
+            }
+        }
+
+        let unsafe_rule = json!({
+            "id": "rule-unsafe",
+            "tool": "bash",
+            "literal_prefix": ["git"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-normalized",
+            "tool-normalized",
+            "run-normalized",
+        )
+        .await;
+        let normalized_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000210",
+            "request-normalized",
+            deferred_rule(unsafe_rule.clone()),
+        );
+        writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("persist authenticated ApproveAlways");
+
+        let missing_start = writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-normalized",
+                    "approved_once",
+                    "user-normalized",
+                    Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("one-shot normalization must atomically start the pending tool");
+        assert!(
+            missing_start
+                .to_string()
+                .contains("must atomically start its pending tool")
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-normalized",
+                        "approved_once",
+                        "user-normalized",
+                        Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                    ),
+                    tool_start_write("tool-normalized", "run-normalized"),
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("broker-authorized one-shot normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-normalized'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-normalized'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable state"),
+            (
+                "applied".to_owned(),
+                "approved_once".to_owned(),
+                "running".to_owned(),
+                0
+            )
+        );
+        let replay = writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("replay normalized command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-rejected",
+            "tool-rejected",
+            "run-rejected",
+        )
+        .await;
+        let rejected_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000211",
+            "request-rejected",
+            deferred_rule(json!({"malformed": true})),
+        );
+        writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("persist malformed authenticated ApproveAlways");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-rejected",
+                    "denied",
+                    "user-rejected",
+                    Some(("00000000-0000-4000-8000-000000000211", 2, "run-rejected")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("conservative denial normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-rejected'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("denied durable state"),
+            ("applied".to_owned(), "denied".to_owned(), 0)
+        );
+        let replay = writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(&store, &writer, "request-empty", "tool-empty", "run-empty").await;
+        let empty_id_rule = json!({
+            "id": "",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000212",
+                "request-empty",
+                deferred_rule(empty_id_rule),
+            ))
+            .await
+            .expect("persist empty-id ApproveAlways");
+        let normalized_rule = json!({
+            "id": "request-empty",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let mut resolution = approval_resolution_write(
+            "request-empty",
+            "approved_always",
+            "user-empty",
+            Some(("00000000-0000-4000-8000-000000000212", 2, "run-empty")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "request-empty".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&normalized_rule).expect("normalized rule"),
+            }));
+        writer
+            .apply(EventBatch {
+                writes: vec![resolution],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("empty id is normalized to the authenticated request id");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT id, tool FROM approval_rules WHERE id='request-empty'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable rule"),
+            ("request-empty".to_owned(), "bash".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_approval_rule_id_in_one_batch_is_rejected() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-dup-rule";
+        seed_pending_approval(&store, &writer, "request-dup-1", "tool-dup-1", run_id).await;
+        seed_pending_approval(&store, &writer, "request-dup-2", "tool-dup-2", run_id).await;
+
+        let rule_value = json!({
+            "id": "rule-dup",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let decision = ApprovalDecision::ApproveAlways {
+            rule: serde_json::from_value::<DeferredApprovalRule>(rule_value.clone())
+                .expect("deferred rule"),
+        };
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000200",
+                "request-dup-1",
+                decision.clone(),
+            ))
+            .await
+            .expect("persist first approval command");
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000201",
+                "request-dup-2",
+                decision,
+            ))
+            .await
+            .expect("persist second approval command");
+
+        let mut write1 = approval_resolution_write(
+            "request-dup-1",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000200", 2, run_id)),
+        );
+        write1
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let mut write2 = approval_resolution_write(
+            "request-dup-2",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000201", 3, run_id)),
+        );
+        write2
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![write1, write2],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("duplicate approval rule id in one batch must fail");
+        assert!(error.to_string().contains("duplicate approval rule insert"));
     }
 
     #[tokio::test]
@@ -15557,6 +24189,8 @@ mod tests {
                                 role: "tool_result",
                                 message,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             }],
                         },
                     ],
@@ -15792,6 +24426,8 @@ mod tests {
                             role,
                             message,
                             append_to_l0,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     }],
                     injected_commands: Vec::new(),
@@ -15831,6 +24467,543 @@ mod tests {
             l0_disposition(&assistant_message(StopReason::Stop), true)
                 .expect("normal assistant is appended"),
             L0Disposition::Append
+        );
+    }
+
+    #[tokio::test]
+    async fn message_end_append_creates_l0_membership_excluded_does_not() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let command_id = "00000000-0000-4000-8000-000000000100";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "append me").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "append me"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("apply user message end with append_to_l0=true");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count membership");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=true must insert explicit L0 batch membership"
+        );
+
+        let l0_batches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_batches WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count open L0 batches");
+        assert_eq!(
+            l0_batches, 1,
+            "append_to_l0=true must create an open L0 batch"
+        );
+
+        // Retry-error assistant messages are excluded from L0: they still create
+        // a durable message row, but no memory_batch_messages membership.
+        let exclude_id = "00000000-0000-4000-8000-000000000101";
+        let exclude_run = format!("run-{command_id}");
+        let exclude_turn = format!("turn-{command_id}");
+        let exclude_message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run.clone()),
+                                Some(exclude_turn.clone()),
+                            )
+                            .expect("MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: exclude_run.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run),
+                                Some(exclude_turn),
+                            )
+                            .expect("MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: exclude_id.to_owned(),
+                            role: "assistant",
+                            message: exclude_message,
+                            append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply assistant retry-error message end");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count membership after exclude");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=false must not add L0 batch membership"
+        );
+
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count messages");
+        assert_eq!(
+            messages, 2,
+            "both message ends must be persisted as messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn l0_seal_at_boundary_reserves_compaction_job() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // A sufficiently large first user message creates an open L0 batch
+        // already beyond the ordinary boundary.
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN + 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", &first).await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", &first),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+
+        // Second user message should seal the first batch, reserve an L1
+        // compaction job, and append to a fresh open L0 batch.
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect("apply second user message");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(first_state, "compacting", "first batch must be sealed");
+
+        let first_version: i64 =
+            sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch version");
+        assert_eq!(first_version, 1, "seal must bump source version");
+
+        let first_est_after_seal: i64 =
+            sqlx::query_scalar("SELECT est_tokens FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch est_tokens after seal");
+        assert_eq!(
+            first_est_after_seal, bumped_est,
+            "seal must not overwrite the current est_tokens with a stale prepare-time value"
+        );
+
+        let open_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_batches WHERE layer = ? AND state = 'open'",
+        )
+        .bind(crate::store::MemoryLayer::L0.as_i64())
+        .fetch_one(store.pool())
+        .await
+        .expect("count open L0 batches");
+        assert_eq!(
+            open_count, 1,
+            "exactly one open L0 batch must remain for the new message"
+        );
+
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_jobs WHERE kind = 'compact_l0' AND status = 'pending'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count pending compaction jobs");
+        assert_eq!(job_count, 1, "seal must insert a pending L0 compaction job");
+    }
+
+    #[tokio::test]
+    async fn multi_message_end_in_batch_forces_seal_split() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // Open an L0 batch with a user message; later append an assistant and
+        // then a soft-steer group of two user messages that forces a seal/split.
+        let command_id = "00000000-0000-4000-8000-000000000001";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN - 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection = classified_injection(&writer, 1, command_id, "msg-1", &first).await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "msg-1", &first),
+                injected_commands: vec![injection],
+            })
+            .await
+            .expect("apply first user message");
+
+        // Append an assistant message to the same turn so the owner reaches
+        // AssistantStarted; the soft-steer group will hand off from it.
+        let assistant_msg = assistant_message(StopReason::Stop);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-1",
+                                &assistant_msg,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-1",
+                                &assistant_msg,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-1".to_owned(),
+                            role: "assistant",
+                            message: assistant_msg.clone(),
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("append assistant message");
+
+        // The first persisted message is exactly one estimated token below the
+        // ordinary boundary, so the first steer does not seal and the second
+        // does after the first appends its token.
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+
+        // Inject two user messages as a soft-steer group. The first appends to
+        // the existing open batch; the second forces a normal seal/split.
+        let new_turn_id = "turn-00000000-0000-4000-8000-000000000002";
+        let steer_1_id = "00000000-0000-4000-8000-000000000002";
+        let steer_2_id = "00000000-0000-4000-8000-000000000003";
+        for (seq, steer_id, text) in [(2, steer_1_id, "a"), (3, steer_2_id, "b")] {
+            writer
+                .persist_inbound(&user_command(seq, steer_id, text))
+                .await
+                .expect("persist steer command");
+            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
+                .bind(durable_test_timestamp().to_rfc3339())
+                .bind(steer_id)
+                .execute(store.pool())
+                .await
+                .expect("pin steer receipt timestamp");
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: steer_id.to_owned(),
+                            application_kind: ApplicationKind::SoftSteer,
+                            run_id: run_id.clone(),
+                            turn_id: new_turn_id.to_owned(),
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("classify steer command");
+        }
+
+        let steer_1 = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse(steer_1_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
+                command: Command::UserMessage {
+                    text: "a".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            durable_test_timestamp(),
+        );
+        let steer_2 = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 3,
+                command_id: CommandId::parse(steer_2_id).expect("canonical test UUID"),
+                personality_agent_id: scope().personality_agent_id,
+                provenance: test_provenance(),
+                command: Command::UserMessage {
+                    text: "b".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            durable_test_timestamp(),
+        );
+
+        let previous_owner = DurableRunBinding {
+            command_id: command_id.to_owned(),
+            command_seq: 1,
+            provenance: test_provenance(),
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            executor_generation: ProcessGeneration::MIN,
+        };
+
+        let mut group = SteerGroup::new(ApplicationKind::SoftSteer, run_id.clone(), new_turn_id)
+            .expect("create steer group");
+        group
+            .push(steer_1, store.redactor())
+            .expect("push first steer command");
+        group
+            .push(steer_2, store.redactor())
+            .expect("push second steer command");
+        let snapshot = group.snapshot(previous_owner, Some(assistant_msg));
+        let batch = steer_group_injection_batch(snapshot).expect("build steer group batch");
+
+        writer
+            .apply(batch)
+            .await
+            .expect("apply two user messages in one batch");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(first_state, "compacting", "first batch must be sealed");
+
+        let membership: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT mbm.batch_id, mb.batch_seq, mbm.ord
+             FROM memory_batch_messages mbm
+             JOIN memory_batches mb ON mb.id = mbm.batch_id
+             ORDER BY mb.batch_seq, mbm.ord",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load membership");
+        assert_eq!(
+            membership.len(),
+            4,
+            "owner, assistant, and both steer messages must have L0 membership"
+        );
+        assert_eq!(
+            membership[0].0, first_batch_id,
+            "owner stays in the first batch"
+        );
+        assert_eq!(membership[0].2, 1, "owner is ord 1");
+
+        assert_eq!(
+            membership[1].0, first_batch_id,
+            "assistant stays in the first batch"
+        );
+        assert_eq!(membership[1].2, 2, "assistant is ord 2");
+
+        assert_eq!(
+            membership[2].0, first_batch_id,
+            "first steer message appends to the first batch"
+        );
+        assert_eq!(membership[2].2, 3, "first steer message is ord 3");
+
+        let second_batch_id = &membership[3].0;
+        assert_ne!(
+            second_batch_id, &first_batch_id,
+            "second steer message must be in a fresh batch"
+        );
+        assert!(
+            membership[3].1 > membership[0].1,
+            "second batch has the later batch_seq"
+        );
+        assert_eq!(
+            membership[3].2, 1,
+            "second steer message is ord 1 in new batch"
+        );
+    }
+    #[tokio::test]
+    async fn l0_boundary_decision_uses_payload_not_decrypt() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // Open an L0 batch with a user message beyond the normal boundary.
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN + 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", &first).await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", &first),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        // Corrupt the durable ciphertext of the existing user message while
+        // leaving the redacted payload intact. The old boundary decision
+        // decrypted every row and would now fail; the new decision uses payload
+        // and must succeed.
+        let (message_id,): (String,) =
+            sqlx::query_as("SELECT id FROM messages WHERE role = 'user' ORDER BY seq LIMIT 1")
+                .fetch_one(store.pool())
+                .await
+                .expect("load user message");
+        sqlx::query("UPDATE messages SET raw_ciphertext = X'000000' WHERE id = ?")
+            .bind(&message_id)
+            .execute(store.pool())
+            .await
+            .expect("corrupt user message ciphertext");
+
+        // A second user message forces the boundary decision to touch the
+        // corrupted row. If the decision still used AEAD decryption it would
+        // fail; using payload it succeeds and seals the batch.
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect("boundary decision must use payload, not decrypt corrupted ciphertext");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(
+            first_state, "compacting",
+            "boundary decision must complete and seal the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn l0_seal_version_overflow_is_rejected() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", "first"),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        sqlx::query("UPDATE memory_batches SET version = ?, est_tokens = ? WHERE id = ?")
+            .bind(i64::MAX)
+            .bind(bumped_est)
+            .bind(&first_batch_id)
+            .execute(store.pool())
+            .await
+            .expect("set open batch to max version");
+
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        let error = writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect_err("seal must reject version overflow");
+        assert!(
+            format!("{error:#}").contains("version overflow"),
+            "expected version overflow error, got {error:#}"
         );
     }
 
@@ -15893,7 +25066,7 @@ mod tests {
     async fn migration_rejects_invalid_command_and_tool_state_fixtures() {
         let store = test_store().await;
         store
-            .conversation_key(DataKeyPurpose::Command)
+            .private_key(DataKeyPurpose::Command)
             .await
             .expect("create command key");
         let key_ref: String = sqlx::query_scalar(
@@ -16243,6 +25416,8 @@ mod tests {
                             seq: 1,
                             command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
                                 .expect("canonical test command UUID"),
+                            personality_agent_id: scope().personality_agent_id,
+                            provenance: test_provenance(),
                             command: Command::Abort {},
                         },
                     }],
@@ -16255,6 +25430,8 @@ mod tests {
                     projections: vec![Projection::CommandRejected {
                         seq: 1,
                         command_id: "00000000-0000-4000-8000-000000000021".to_owned(),
+                        personality_agent_id: scope().personality_agent_id,
+                        provenance: test_provenance(),
                         reason: CommandRejectReason::SchemaViolation,
                         raw_command: RejectedCommandPayload::Present(
                             crate::gateway::SensitiveCommandPayload::new(
@@ -16284,7 +25461,7 @@ mod tests {
                     "message-1",
                     "inject",
                 ),
-                injected_commands: vec![InjectedCommand::new(
+                injected_commands: vec![test_injected_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 )],
@@ -16458,6 +25635,8 @@ mod tests {
                                 role: "tool_result",
                                 message: result,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             }],
                         },
                     ],
@@ -16511,7 +25690,7 @@ mod tests {
                         (SELECT COUNT(*) FROM inbound_commands
                          WHERE command_id='00000000-0000-4000-8000-000000000001' AND run_phase='user_committed')",
                 )
-                .bind(user_message_id("00000000-0000-4000-8000-000000000001"))
+                .bind(test_user_message_id("00000000-0000-4000-8000-000000000001"))
                 .fetch_one(store.pool())
                 .await
                 .expect("injection state");
@@ -16539,7 +25718,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("startup Abort state");
-                state == (1, 1, 0)
+                state == (1, 1, 2)
             }
             "approval_pending" => {
                 let state: (i64, i64, i64) = sqlx::query_as(
@@ -16569,7 +25748,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("approval resolved state");
-                state == (1, 1, 1, 3)
+                state == (1, 1, 1, 4)
             }
             "tool_prepared" => {
                 sqlx::query_scalar::<_, i64>(
@@ -16646,6 +25825,7 @@ mod tests {
                 &scenario,
                 boundary == "after_commit",
                 &readiness_path,
+                None,
             )
             .await
             .expect("abrupt failpoint must not return");
@@ -16714,6 +25894,531 @@ mod tests {
                 tokio::fs::remove_dir_all(root)
                     .await
                     .expect("remove hard-kill fixture");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_RUN_ID: &str = "run-00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_TURN_ID: &str = "turn-00000000-0000-4000-8000-000000000096";
+    #[cfg(unix)]
+    const ERROR_CONTEXT_KILL_MESSAGE_ID: &str = "error-context-kill-assistant";
+
+    #[cfg(unix)]
+    fn error_context_kill_message() -> PublicMessage {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified crash-boundary partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("provider crash-boundary error".to_owned()),
+            provider_code: Some("network_error".to_owned()),
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn error_context_kill_message_end() -> EventWrite {
+        let message = error_context_kill_message();
+        let PublicMessage::Assistant(assistant) = &message else {
+            unreachable!("fixture assistant")
+        };
+        let fragments = vec![
+            ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "id": "cmp-error-kill",
+                        "type": "compaction",
+                        "encrypted_content": "opaque-native-error-kill",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 4,
+                        context_fingerprint: "error-kill-native-fingerprint".to_owned(),
+                    },
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "id": "rs-error-kill",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-error-kill",
+                    }),
+                },
+            },
+        ];
+        let eviction_footprint_tokens = eviction_footprint_for_test(&assistant.origin, &fragments);
+        EventWrite {
+            event: Some(
+                DurableEvent::message_in_turn(
+                    "message_end",
+                    ERROR_CONTEXT_KILL_MESSAGE_ID,
+                    &message,
+                    Some(ERROR_CONTEXT_KILL_RUN_ID.to_owned()),
+                    Some(ERROR_CONTEXT_KILL_TURN_ID.to_owned()),
+                )
+                .expect("Error MessageEnd"),
+            ),
+            projections: vec![Projection::MessageEnd {
+                message_id: ERROR_CONTEXT_KILL_MESSAGE_ID.to_owned(),
+                role: "assistant",
+                message,
+                append_to_l0: false,
+                eviction_footprint_tokens,
+                provider_context: fragments,
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    async fn error_context_kill_target(writer: &EventWriter, scenario: &str) -> EventBatch {
+        let injected = classified_injection(
+            writer,
+            1,
+            ERROR_CONTEXT_KILL_COMMAND_ID,
+            "ignored",
+            "Error kill fixture",
+        )
+        .await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(
+                    ERROR_CONTEXT_KILL_COMMAND_ID,
+                    "ignored",
+                    "Error kill fixture",
+                ),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist Error kill user injection");
+        let message = error_context_kill_message();
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            ERROR_CONTEXT_KILL_MESSAGE_ID,
+                            &message,
+                            Some(ERROR_CONTEXT_KILL_RUN_ID.to_owned()),
+                            Some(ERROR_CONTEXT_KILL_TURN_ID.to_owned()),
+                        )
+                        .expect("Error kill MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: ERROR_CONTEXT_KILL_COMMAND_ID.to_owned(),
+                        run_id: ERROR_CONTEXT_KILL_RUN_ID.to_owned(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist Error kill MessageStart");
+
+        if scenario == "error_context_message_end" {
+            return EventBatch {
+                writes: vec![error_context_kill_message_end()],
+                injected_commands: Vec::new(),
+            };
+        }
+
+        writer
+            .apply(EventBatch {
+                writes: vec![error_context_kill_message_end()],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist Error kill MessageEnd");
+        let message_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(ERROR_CONTEXT_KILL_MESSAGE_ID)
+            .fetch_one(writer.store().pool())
+            .await
+            .expect("load Error kill MessageEnd sequence");
+        let disposition = writer
+            .build_error_context_disposition(
+                ERROR_CONTEXT_KILL_MESSAGE_ID,
+                u64::try_from(message_seq).expect("positive MessageEnd sequence"),
+            )
+            .await
+            .expect("build Error kill disposition");
+        let prepare_batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::turn_end(
+                        ERROR_CONTEXT_KILL_RUN_ID,
+                        ERROR_CONTEXT_KILL_TURN_ID,
+                        message,
+                        Vec::new(),
+                    )
+                    .expect("Error kill TurnEnd"),
+                ),
+                projections: vec![Projection::ProviderContextMutationPrepare(
+                    disposition.clone(),
+                )],
+            }],
+            injected_commands: Vec::new(),
+        };
+        if scenario == "error_context_disposition_prepare" {
+            return prepare_batch;
+        }
+        assert_eq!(scenario, "error_context_disposition_apply");
+        writer
+            .apply(prepare_batch)
+            .await
+            .expect("persist Error kill disposition prepare");
+        EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::memory_maintenance(format!(
+                        "provider_context_mutation:{}",
+                        disposition.mutation_id()
+                    ))
+                    .expect("Error kill provider-context mutation event"),
+                ),
+                projections: vec![Projection::ProviderContextMutation(
+                    ProviderContextMutation {
+                        mutation_id: disposition.mutation_id().to_owned(),
+                    },
+                )],
+            }],
+            injected_commands: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_memory_recovery_and_provider_mutation_share_one_post_commit_dispatcher() {
+        #[derive(Clone)]
+        struct RecordingTarget(Arc<std::sync::Mutex<Vec<u64>>>);
+
+        #[async_trait::async_trait]
+        impl crate::gateway::supervisor::post_commit::PostCommitAdmissionTarget for RecordingTarget {
+            fn bind_post_commit_epoch(
+                &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn admit_committed(
+                &self,
+                _epoch: &crate::store::PostCommitEpochCapability,
+                _personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
+                seq: u64,
+            ) -> Result<crate::gateway::supervisor::session::DurableEventAdmission> {
+                self.0.lock().unwrap().push(seq);
+                Ok(
+                    crate::gateway::supervisor::session::DurableEventAdmission::Deferred {
+                        after_epoch: None,
+                    },
+                )
+            }
+        }
+
+        let store = test_store().await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut dispatcher =
+            crate::gateway::supervisor::post_commit::OrderedPostCommitDispatcher::start(
+                store.clone(),
+                RecordingTarget(calls.clone()),
+                0,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .expect("one dispatcher claims the Store");
+        let client = dispatcher.client();
+        let writer = EventWriter::new(store.clone());
+
+        // Provider-context mutation uses its real prepared/apply contract.
+        let provider_mutation =
+            error_context_kill_target(&writer, "error_context_disposition_apply").await;
+        let session_event_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM agent_events WHERE event_type='message_end'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            session_event_seq > 0,
+            "the real Session fixture must commit lifecycle output"
+        );
+        let mut committed = writer.apply(provider_mutation).await.unwrap();
+
+        // Idle/background memory maintenance uses the same EventWriter.
+        committed.extend(
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("background-memory")
+                                .expect("memory maintenance event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+
+        // Cold-boot recovery retains the writer gate but still publishes from
+        // the common post-COMMIT boundary.
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(41),
+            "post-commit-recovery-lease",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "post-commit-recovery-fence").unwrap();
+        let mut recovery = writer
+            .begin_bootstrap_recovery(&lease, &fence)
+            .await
+            .unwrap();
+        committed.extend(
+            recovery
+                .apply_recovery_batch(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::memory_maintenance("bootstrap-recovery")
+                                .expect("recovery event"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap(),
+        );
+        drop(recovery);
+
+        let final_seq = *committed
+            .last()
+            .expect("producer commits returned receipts");
+        client
+            .admission_for(&store.scope().personality_agent_id, final_seq)
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            (1..=final_seq).collect::<Vec<_>>(),
+            "every producer must enter the one exact durable FIFO"
+        );
+        let quiescence = EventWriter::new(store.clone())
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await
+            .unwrap();
+        dispatcher.shutdown(quiescence).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for Error-context abrupt transaction tests"]
+    async fn error_context_kill_restart_child() {
+        let scenario =
+            std::env::var("SUMI_ERROR_CONTEXT_SCENARIO").expect("Error scenario environment");
+        let boundary =
+            std::env::var("SUMI_ERROR_CONTEXT_BOUNDARY").expect("Error boundary environment");
+        let database_path = std::path::PathBuf::from(
+            std::env::var("SUMI_ERROR_CONTEXT_DATABASE").expect("Error database environment"),
+        );
+        let readiness_path = std::path::PathBuf::from(
+            std::env::var("SUMI_ERROR_CONTEXT_READY").expect("Error readiness environment"),
+        );
+        let store: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+            .await
+            .expect("child opens Error-context store")
+            .into();
+        let writer = EventWriter::new(store);
+        let target = error_context_kill_target(&writer, &scenario).await;
+        writer
+            .apply_with_abrupt_transaction_failpoint(
+                target,
+                &scenario,
+                boundary == "after_commit",
+                &readiness_path,
+                None,
+            )
+            .await
+            .expect("Error-context abrupt failpoint must not return");
+        panic!("Error-context abrupt failpoint returned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn error_context_kill_restart_boundaries_converge_without_duplicate_attempts() {
+        for scenario in [
+            "error_context_message_end",
+            "error_context_disposition_prepare",
+            "error_context_disposition_apply",
+        ] {
+            for boundary in ["before_commit", "after_commit"] {
+                let root = std::env::temp_dir()
+                    .join(format!("sumi-{scenario}-{boundary}-{}", Uuid::now_v7()));
+                std::fs::create_dir_all(&root).expect("create Error kill fixture root");
+                let database_path = root.join("agent.db");
+                let readiness_path = root.join("ready");
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("current unit test executable"),
+                )
+                .arg("--exact")
+                .arg("store::event_writer::tests::error_context_kill_restart_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("SUMI_ERROR_CONTEXT_SCENARIO", scenario)
+                .env("SUMI_ERROR_CONTEXT_BOUNDARY", boundary)
+                .env("SUMI_ERROR_CONTEXT_DATABASE", &database_path)
+                .env("SUMI_ERROR_CONTEXT_READY", &readiness_path)
+                .output()
+                .expect("run Error-context abrupt child");
+                assert_eq!(
+                    output.status.code(),
+                    Some(86),
+                    "{scenario}.{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+                    format!("{scenario}.{boundary}\n")
+                );
+
+                // Hydration owns the common post-prepare recovery boundary
+                // while holding the bootstrap writer gate. Opening validates
+                // startup state but deliberately does not mutate it.
+                let reopened: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+                    .await
+                    .expect("reopen Error-context kill store")
+                    .into();
+                let prepare_committed = scenario != "error_context_message_end"
+                    && (scenario == "error_context_disposition_apply"
+                        || boundary == "after_commit");
+                if prepare_committed {
+                    let lease = test_lease(1);
+                    let fence = test_fence(&lease);
+                    let recovery_steps = match reopened
+                        .hydrate(&lease, &fence)
+                        .await
+                        .expect("hydrate committed Error disposition")
+                    {
+                        HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+                        HydrationOutcome::Complete(_) => {
+                            panic!("open Error run must retain a logical resume suffix")
+                        }
+                        HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                            panic!(
+                                "committed Error disposition needs logical, not physical, recovery: {intents:?}"
+                            )
+                        }
+                    };
+                    assert!(matches!(
+                        recovery_steps.as_slice(),
+                        [RecoveryStep::ResumeAssistantFromDurableEvents {
+                            pending_error_context: None,
+                            ..
+                        }]
+                    ));
+                }
+                let (message_ends, turn_ends, agent_ends, context_rows, mutations): (
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ) = sqlx::query_as(
+                    "SELECT
+                        (SELECT COUNT(*) FROM agent_events
+                         WHERE event_type='message_end'
+                           AND json_extract(envelope, '$.message_id')='error-context-kill-assistant'),
+                        (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
+                        (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
+                        (SELECT COUNT(*) FROM provider_context),
+                        (SELECT COUNT(*) FROM provider_context_mutations)",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read Error kill convergence state");
+                assert_eq!(
+                    agent_ends, 0,
+                    "AgentEnd must remain fenced at every boundary"
+                );
+                assert!(message_ends <= 1, "Error attempt MessageEnd duplicated");
+                assert!(turn_ends <= 1, "Error attempt disposition duplicated");
+                assert!(mutations <= 1, "Error disposition intent duplicated");
+
+                if prepare_committed {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (1, 1, 0, 1)
+                    );
+                    let state: String =
+                        sqlx::query_scalar("SELECT state FROM provider_context_mutations LIMIT 1")
+                            .fetch_one(reopened.pool())
+                            .await
+                            .expect("read recovered Error disposition state");
+                    assert_eq!(state, "applied");
+                    let active_item_keys: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM data_keys
+                         WHERE purpose='provider_context' AND state='active'",
+                    )
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("count active Error item keys");
+                    assert_eq!(active_item_keys, 0);
+                } else if scenario == "error_context_message_end" && boundary == "before_commit" {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (0, 0, 0, 0)
+                    );
+                } else {
+                    assert_eq!(
+                        (message_ends, turn_ends, context_rows, mutations),
+                        (1, 0, 2, 0)
+                    );
+                    let lease = test_lease(1);
+                    let fence = test_fence(&lease);
+                    let recovery_steps = match reopened
+                        .hydrate(&lease, &fence)
+                        .await
+                        .expect("hydrate pre-disposition Error kill state")
+                    {
+                        HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+                        HydrationOutcome::Complete(_) => {
+                            panic!("undisposed Error context must keep hydration fail-closed")
+                        }
+                        HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                            panic!(
+                                "Error context needs logical, not physical, recovery: {intents:?}"
+                            )
+                        }
+                    };
+                    assert!(matches!(
+                        recovery_steps.as_slice(),
+                        [RecoveryStep::ResumeAssistantFromDurableEvents {
+                            pending_error_context: Some(pending),
+                            ..
+                        }] if pending.message_id == "error-context-kill-assistant"
+                            && pending.item_count == 2
+                    ));
+                }
+                reopened.pool().close().await;
+                tokio::fs::remove_dir_all(root)
+                    .await
+                    .expect("remove Error kill fixture");
             }
         }
     }
@@ -16880,8 +26585,10 @@ mod tests {
             })
             .await
             .expect("persist projected provider terminal");
-        let [terminal_message_end_seq, _, _] = terminal_sequences.as_slice() else {
-            panic!("terminal batch must persist MessageEnd, TurnEnd, and AgentEnd");
+        let [terminal_message_end_seq, _, _, _] = terminal_sequences.as_slice() else {
+            panic!(
+                "terminal batch must persist MessageEnd, TurnEnd, AgentEnd, and command disposition"
+            );
         };
         let terminal_message_end_seq = i64::try_from(*terminal_message_end_seq)
             .expect("terminal MessageEnd sequence fits SQLite INTEGER");
@@ -16900,7 +26607,11 @@ mod tests {
         let durable = load_authenticated_event(&store, &mut transaction, terminal_message_end_seq)
             .await
             .expect("authenticated MessageEnd");
+        let authenticated: () = authenticate_event_log_snapshot(&store, &mut transaction)
+            .await
+            .expect("authenticate exact transcript projection set without retaining history");
         transaction.rollback().await.expect("rollback event read");
+        assert_eq!(authenticated, ());
         assert_eq!(durable.kind, "message_end");
         assert_eq!(
             durable.envelope,
@@ -16912,11 +26623,3518 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn message_end_persists_encrypted_provider_context_and_eviction_tokens() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-provider-context-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000073";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "context fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "context fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let timestamp = durable_test_timestamp();
+        let message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "answer with reasoning".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        };
+        let assistant_id = "assistant-with-context";
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+
+        let coverage_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM messages WHERE role = 'user' ORDER BY seq DESC")
+                .fetch_one(store.pool())
+                .await
+                .expect("load durable user message coverage");
+        let coverage_seq =
+            u64::try_from(coverage_seq).expect("durable user message coverage is positive");
+        let reasoning = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": "rs-durable-context",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-durable-reasoning",
+                }),
+            },
+        };
+        let window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "compact",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: coverage_seq,
+                    context_fingerprint: "fp-1".to_owned(),
+                },
+            },
+        };
+        let expected_items = vec![
+            ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                },
+                origin_message: None,
+                wire_item_index: window.wire_item_index,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: window.payload.clone(),
+            },
+            ProviderContextItem {
+                retention_owner: ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                },
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                }),
+                wire_item_index: reasoning.wire_item_index,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: reasoning.payload.clone(),
+            },
+        ];
+        let expected_context: Vec<ProviderContextItemWithFootprint> = expected_items
+            .into_iter()
+            .map(|item| {
+                let footprint = eviction_footprint_for_payload(&spec, &item.payload)
+                    .expect("valid footprint for expected context");
+                ProviderContextItemWithFootprint::new(item, footprint)
+            })
+            .collect();
+
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: vec![reasoning, window],
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), true)
+            .expect("terminal write with context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist terminal with provider context");
+
+        let rows = sqlx::query(
+            "SELECT id, message_id, message_seq, item_ordinal, wire_item_index, kind,
+                    coverage_through_seq, context_fingerprint, eviction_tokens,
+                    key_ref, ciphertext
+             FROM provider_context
+             ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("fetch provider context rows");
+        assert_eq!(rows.len(), 2, "expected two provider-context records");
+
+        for row in &rows {
+            let ordinal: i64 = row.get("item_ordinal");
+            assert_eq!(ordinal, 0, "item_ordinal must be zero");
+        }
+
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("kind"))
+            .collect();
+        assert!(kinds.contains(&"encrypted_reasoning".to_owned()));
+        assert!(kinds.contains(&"open_ai_compacted_window".to_owned()));
+
+        let reasoning_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "encrypted_reasoning")
+            .expect("reasoning row");
+        let reasoning_eviction: i64 = reasoning_row.get("eviction_tokens");
+        assert!(
+            reasoning_eviction > 0,
+            "encrypted reasoning must pay eviction tokens"
+        );
+
+        let window_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "open_ai_compacted_window")
+            .expect("window row");
+        let window_eviction: i64 = window_row.get("eviction_tokens");
+        assert_eq!(
+            window_eviction, 0,
+            "compaction window has zero eviction tokens"
+        );
+        assert_eq!(
+            window_row
+                .get::<Option<String>, _>("context_fingerprint")
+                .as_deref(),
+            Some("fp-1")
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("coverage_through_seq"),
+            Some(i64::try_from(coverage_seq).expect("coverage fits SQLite INTEGER"))
+        );
+
+        let message_seq: i64 = reasoning_row.get("message_seq");
+        assert!(
+            message_seq > 0,
+            "reasoning provider context must be bound to message seq"
+        );
+        assert_eq!(
+            window_row.get::<Option<String>, _>("message_id"),
+            None,
+            "native compaction must not acquire an assistant anchor"
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("message_seq"),
+            None,
+            "native compaction must not acquire an assistant sequence"
+        );
+
+        // Plaintext must never appear in any textual column; ciphertext is opaque.
+        let mut leak_check = String::new();
+        for row in &rows {
+            let id: String = row.get("id");
+            let message_id: Option<String> = row.get("message_id");
+            let context_fingerprint: Option<String> = row.get("context_fingerprint");
+            leak_check.push_str(&id);
+            if let Some(value) = message_id {
+                leak_check.push_str(&value);
+            }
+            if let Some(value) = context_fingerprint {
+                leak_check.push_str(&value);
+            }
+        }
+        for secret in ["opaque-durable-reasoning", "compact"] {
+            assert!(
+                !leak_check.contains(secret),
+                "provider_context textual columns leaked plaintext: {secret}"
+            );
+        }
+
+        // Round-trip: decrypt each record and verify it matches the original item.
+        for row in &rows {
+            let id: String = row.get("id");
+            let key_ref: String = row.get("key_ref");
+            let ciphertext: Vec<u8> = row.get("ciphertext");
+            let data_key = store
+                .data_key_by_ref(&key_ref)
+                .await
+                .expect("provider-context data key");
+            let aad =
+                store
+                    .scope()
+                    .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
+            let plaintext = decrypt_content(&data_key, &ciphertext, &aad)
+                .expect("decrypt provider-context ciphertext");
+            let item: ProviderContextItem =
+                serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
+            match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { item, .. } => {
+                    assert_eq!(
+                        item.get("encrypted_content"),
+                        Some(&json!("opaque-durable-reasoning"))
+                    );
+                }
+                ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
+                    assert_eq!(
+                        items,
+                        &vec![json!({
+                            "type": "compaction",
+                            "id": "cmp-1",
+                            "encrypted_content": "compact",
+                        })]
+                    );
+                }
+                _ => panic!("unexpected provider-context payload"),
+            }
+        }
+
+        let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
+        let mut expected_context = expected_context;
+        for item in &mut expected_context {
+            item.item.retention_owner.message_seq = message_seq;
+            if let Some(anchor) = item.item.origin_message.as_mut() {
+                anchor.message_seq = message_seq;
+            }
+        }
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let hydrated = match reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect("canonical cold-boot hydration after MessageEnd reopen")
+        {
+            HydrationOutcome::Complete(state) => state,
+            other => panic!("completed assistant turn must not require recovery: {other:?}"),
+        };
+        assert_eq!(hydrated.provider_context, expected_context);
+
+        let mut second_turn_messages = hydrated.messages.clone();
+        second_turn_messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "continue after restart".to_owned(),
+                }],
+                timestamp: durable_test_timestamp(),
+            }),
+        });
+        let mut second_turn_prompt = PromptContext::new(
+            "continue the durable conversation".to_owned(),
+            Vec::new(),
+            second_turn_messages,
+            expected_context.iter().map(|i| i.item.clone()).collect(),
+            Vec::new(),
+        );
+        bind_sumi_replay_for_test(&mut second_turn_prompt, Some(message_seq))
+            .expect("bind exact normalized restart view");
+        let second_turn =
+            build_responses_request(&spec, &second_turn_prompt, &RequestOptions::default())
+                .expect("build second-turn Responses request from canonical HydratedRunState");
+        let second_turn_wire = second_turn.to_string();
+        assert_eq!(second_turn["store"], false);
+        assert!(second_turn_wire.contains("opaque-durable-reasoning"));
+        assert!(second_turn_wire.contains("continue after restart"));
+
+        // Re-authenticate the deliberately inconsistent metadata so this test
+        // reaches the inner plaintext/metadata binding check rather than being
+        // rejected first by the outer exact-set commitment.
+        let mut transaction = reopened
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated metadata tamper");
+        let checkpoint = verify_provider_context_projection_set(&reopened, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before metadata tamper");
+        sqlx::query(
+            "UPDATE provider_context
+             SET provider_instance_id = 'tampered-provider-origin'
+             WHERE kind = 'encrypted_reasoning'",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("tamper stored provider origin after successful restart proof");
+        commit_provider_context_projection_set(&reopened, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent provider metadata");
+        transaction
+            .commit()
+            .await
+            .expect("commit provider metadata tamper");
+        let error = reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("canonical hydration must reject tampered provider origin metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("stored provider origin does not match authenticated plaintext origin"),
+            "{error:#}"
+        );
+        reopened.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn error_context_survives_restart_but_is_excluded_from_next_responses_send_view() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-error-provider-context-restart-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000093";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "restart fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "restart fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+        let native_coverage_seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .expect("load native Error coverage endpoint"),
+        )
+        .expect("coverage endpoint is positive");
+
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let assistant_id = "error-assistant-with-context";
+        let error_message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "ERROR_MESSAGE_MUST_NOT_REPLAY".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("provider failed".to_owned()),
+            provider_code: Some("fixture_error".to_owned()),
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        };
+        let error_context = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id": "cmp-error-restart",
+                    "type": "compaction",
+                    "encrypted_content": "ERROR_NATIVE_CONTEXT_MUST_NOT_REPLAY",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: native_coverage_seq,
+                    context_fingerprint: "error-native-restart-fingerprint".to_owned(),
+                },
+            },
+        };
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Error {
+                reason: StopReason::Error,
+                output: ProviderOutput {
+                    message: error_message,
+                    provider_context: vec![error_context],
+                },
+            })
+            .expect("Error terminal projection")
+        else {
+            panic!("expected Error terminal");
+        };
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), false)
+            .expect("durable Error terminal with provider context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open Error assistant attempt");
+        writer
+            .apply(EventBatch {
+                writes: vec![terminal_write],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit pre-disposition Error terminal with provider context");
+
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+
+        let reopened = file_test_store(&path).await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let recovery_steps = match reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect("cold hydration after Error provider-context commit")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+            HydrationOutcome::Complete(_) => {
+                panic!("undisposed Error context must keep hydration fail-closed")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("completed Error turn must not require physical recovery: {intents:?}")
+            }
+        };
+
+        // Logical recovery deliberately exposes no ready HydratedRunState.
+        // Re-authenticate the cold snapshot directly to prove that the Error
+        // context survived durably while remaining excluded from the next
+        // provider send view.
+        let mut transaction = reopened
+            .pool()
+            .begin()
+            .await
+            .expect("begin authenticated Error snapshot");
+        authenticate_event_log_snapshot(&reopened, &mut transaction)
+            .await
+            .expect("authenticate Error event log");
+        verify_provider_context_projection_set(&reopened, &mut transaction)
+            .await
+            .expect("authenticate Error provider-context set");
+        let hydrated_messages = reopened
+            .hydrate_messages(&mut transaction)
+            .await
+            .expect("hydrate authenticated Error transcript");
+        let hydrated_provider_context = reopened
+            .hydrate_provider_context(&hydrated_messages, &mut transaction)
+            .await
+            .expect("hydrate authenticated Error provider context");
+        transaction
+            .rollback()
+            .await
+            .expect("close authenticated Error snapshot");
+        assert_eq!(
+            hydrated_provider_context.len(),
+            1,
+            "authenticated durable Error context must survive hydration"
+        );
+        assert!(
+            hydrated_provider_context[0].item.origin_message.is_none(),
+            "native Error context must remain semantically unanchored"
+        );
+        assert!(hydrated_messages.iter().any(|message| {
+            matches!(
+                message,
+                ContextMessage::Persisted {
+                    id,
+                    message: Message::Assistant(assistant),
+                    ..
+                } if id == assistant_id && assistant.stop_reason == StopReason::Error
+            )
+        }));
+        assert!(matches!(
+            recovery_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: Some(pending),
+                ..
+            }] if pending.message_id == assistant_id
+                && pending.item_count == 1
+        ));
+
+        let mut durable_messages = hydrated_messages;
+        durable_messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "continue after error restart".to_owned(),
+                }],
+                timestamp: durable_test_timestamp(),
+            }),
+        });
+        let send_messages = crate::memory::transform::transform(&durable_messages, &spec.origin());
+        let send_provider_context = crate::memory::transform::provider_context_for_send_view(
+            &send_messages,
+            &hydrated_provider_context,
+        );
+        assert!(
+            send_provider_context.is_empty(),
+            "context anchored to a transformed-away Error assistant must not be sent"
+        );
+        let mut next_prompt = PromptContext::new(
+            "continue the durable conversation".to_owned(),
+            Vec::new(),
+            send_messages,
+            send_provider_context
+                .into_iter()
+                .map(|entry| entry.item)
+                .collect(),
+            Vec::new(),
+        );
+        bind_sumi_replay_for_origin_test(
+            &mut next_prompt,
+            spec.origin(),
+            Some(native_coverage_seq),
+        )
+        .expect("bind exact normalized Error restart view");
+        let next_request = build_responses_request(&spec, &next_prompt, &RequestOptions::default())
+            .expect("next Responses request after Error restart");
+        let wire = next_request.to_string();
+        assert!(wire.contains("continue after error restart"));
+        assert!(!wire.contains("ERROR_MESSAGE_MUST_NOT_REPLAY"));
+        assert!(!wire.contains("ERROR_NATIVE_CONTEXT_MUST_NOT_REPLAY"));
+
+        let item_key_ref: String = sqlx::query_scalar("SELECT key_ref FROM provider_context")
+            .fetch_one(reopened.pool())
+            .await
+            .expect("load native Error item key ref");
+        let error_message_seq = recovery_steps
+            .iter()
+            .find_map(|step| match step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    pending_error_context: Some(pending),
+                    ..
+                } => Some(pending.message_seq),
+                _ => None,
+            })
+            .expect("authenticated pending Error recovery packet");
+        let reopened_writer = EventWriter::new(reopened.clone());
+        let fenced_next_attempt = reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            "error-restart-next-attempt",
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("candidate next-attempt MessageStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("next attempt must remain fenced before Error disposition");
+        assert!(
+            fenced_next_attempt
+                .to_string()
+                .contains("fenced until Error-context Invalidate is applied"),
+            "{fenced_next_attempt:#}"
+        );
+        let disposition = reopened_writer
+            .build_error_context_disposition(assistant_id, error_message_seq)
+            .await
+            .expect("recovery consumer builds fixed Error Invalidate");
+        reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_end(
+                            run_id.clone(),
+                            turn_id.clone(),
+                            terminal_message.clone(),
+                            Vec::new(),
+                        )
+                        .expect("terminal Error TurnEnd"),
+                    ),
+                    projections: vec![Projection::ProviderContextMutationPrepare(
+                        disposition.clone(),
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("terminal Error disposition and Invalidate prepare commit atomically");
+
+        let prepared_state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(disposition.mutation_id())
+        .fetch_one(reopened.pool())
+        .await
+        .expect("read prepared Error disposition");
+        assert_eq!(prepared_state, "prepared");
+        let retained_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count retained rows after prepare");
+        assert_eq!(
+            retained_rows, 1,
+            "prepare is durable but common application owns deletion"
+        );
+        let fenced_agent_end = reopened_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: command_id.to_owned(),
+                        command_seq: 1,
+                        run_id: Some(run_id.clone()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("AgentEnd must remain fenced after prepare and before apply");
+        assert!(
+            fenced_agent_end
+                .to_string()
+                .contains("fenced until Error-context Invalidate is applied"),
+            "{fenced_agent_end:#}"
+        );
+
+        drop(reopened_writer);
+        reopened.pool().close().await;
+        drop(reopened);
+
+        // Hydration owns common mutation recovery under the bootstrap writer
+        // gate. At the post-prepare crash boundary it must authenticate and
+        // apply the intent once, erase the target/key, and only then expose
+        // the logical suffix needed to close the run.
+        let recovered = file_test_store(&path).await;
+        let recovered_steps = match recovered
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate through common Error mutation recovery")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+            HydrationOutcome::Complete(_) => {
+                panic!("open assistant suffix must keep hydration fail-closed")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("Error disposition has no physical process recovery: {intents:?}")
+            }
+        };
+        let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(recovered.pool())
+            .await
+            .expect("count recovered Error rows");
+        assert_eq!(recovered_rows, 0);
+        let (item_key_state, wrapped_key): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT state, wrapped_key FROM data_keys WHERE key_ref = ?")
+                .bind(&item_key_ref)
+                .fetch_one(recovered.pool())
+                .await
+                .expect("read recovered Error item key");
+        assert_eq!(item_key_state, "destroyed");
+        assert!(
+            wrapped_key.is_none(),
+            "destroyed item key keeps no wrapped bytes"
+        );
+        let recovered_mutation_state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(disposition.mutation_id())
+        .fetch_one(recovered.pool())
+        .await
+        .expect("read recovered Error mutation");
+        assert_eq!(recovered_mutation_state, "applied");
+
+        let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(recovered.pool())
+            .await
+            .expect("confirm recovered Error context remains absent");
+        assert_eq!(recovered_rows, 0);
+        assert!(matches!(
+            recovered_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: None,
+                ..
+            }]
+        ));
+        EventWriter::new(recovered.clone())
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end(run_id).expect("AgentEnd after recovery")),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: command_id.to_owned(),
+                        command_seq: 1,
+                        run_id: Some(format!("run-{command_id}")),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("AgentEnd is eligible only after Error context reaches applied");
+
+        recovered.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn message_end_opaque_provider_context_does_not_leak_to_public_transcript() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-opaque-leak-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000079";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "leak fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "leak fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let timestamp = durable_test_timestamp();
+        let message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "visible answer".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "model-leak".to_owned(),
+            provider: "provider-leak".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-leak".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "model-leak".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        };
+        let assistant_id = "assistant-with-opaque";
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+
+        let reasoning_marker = "OPAQUE_PROVIDER_REASONING_a1b2c3d4";
+        let compact_marker = "OPAQUE_PROVIDER_COMPACT_e5f6a7b8";
+
+        let reasoning = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": "rs-leak",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": reasoning_marker,
+                }),
+            },
+        };
+        let window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-leak",
+                    "encrypted_content": compact_marker,
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-2".to_owned(),
+                },
+            },
+        };
+
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: vec![reasoning, window],
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), true)
+            .expect("terminal write with context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist terminal with opaque provider context");
+
+        // Ensure the public transcript actually recorded the visible assistant message.
+        let message_payload: String =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE id=? AND role='assistant'")
+                .bind(assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("durable message projection");
+        assert!(
+            message_payload.contains("visible answer"),
+            "public payload must contain the visible assistant text"
+        );
+
+        for marker in [reasoning_marker, compact_marker] {
+            let like = format!("%{marker}%");
+
+            let message_hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE payload LIKE ? OR search_text LIKE ?",
+            )
+            .bind(&like)
+            .bind(&like)
+            .fetch_one(store.pool())
+            .await
+            .expect("scan messages for opaque marker");
+
+            let event_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE envelope LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan agent_events for opaque marker");
+
+            let fts_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE search_text LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan messages_fts for opaque marker");
+
+            assert_eq!(
+                message_hits, 0,
+                "opaque provider bytes leaked into messages.payload or search_text: {marker}"
+            );
+            assert_eq!(
+                event_hits, 0,
+                "opaque provider bytes leaked into agent_events.envelope: {marker}"
+            );
+            assert_eq!(
+                fts_hits, 0,
+                "opaque provider bytes leaked into messages_fts: {marker}"
+            );
+        }
+
+        store.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn abrupt_subprocess_failpoints_are_unavailable_without_process_exit_semantics() {
         eprintln!(
             "T12 abrupt transaction acceptance is Unix-only because this target has no _exit/SIGKILL-equivalent harness"
         );
+    }
+
+    #[tokio::test]
+    async fn require_exact_live_owner_turn_rejects_multiple_applying_owners() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner = "00000000-0000-4000-8000-000000000001";
+        let classified = "00000000-0000-4000-8000-000000000002";
+        writer
+            .persist_inbound(&user_command(1, owner, "owner one"))
+            .await
+            .expect("persist owner");
+        writer
+            .persist_inbound(&user_command(2, classified, "classified command"))
+            .await
+            .expect("persist classified command");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='user_started'
+             WHERE command_id = ?",
+        )
+        .bind(owner)
+        .execute(store.pool())
+        .await
+        .expect("mark owner applying");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='classified'
+             WHERE command_id = ?",
+        )
+        .bind(classified)
+        .execute(store.pool())
+        .await
+        .expect("mark classified applying");
+
+        let prepared = vec![super::PreparedWrite {
+            event: None,
+            projections: vec![super::PreparedProjection::Plain(
+                super::Projection::RunPhase {
+                    command_id: classified.to_owned(),
+                    run_id: "run-1".to_owned(),
+                    expected: super::RunPhase::Classified,
+                    next: super::RunPhase::UserStarted,
+                },
+            )],
+        }];
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = super::require_exact_live_owner_turn(
+            &mut transaction,
+            &prepared,
+            "run-1",
+            "turn-1",
+            "test",
+            super::OwnerHandoffAccounting::Account,
+        )
+        .await
+        .expect_err("multiple applying owners must fail closed");
+        assert!(format!("{error:#}").contains("exactly one live owner"));
+    }
+
+    #[tokio::test]
+    async fn tool_execution_skip_user_steer_cancelled_accepts_post_abort_phases() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000001";
+        writer
+            .persist_inbound(&user_command(1, owner_id, "original owner"))
+            .await
+            .expect("persist original owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='cancel_requested'
+             WHERE command_id = ?",
+        )
+        .bind(owner_id)
+        .execute(store.pool())
+        .await
+        .expect("seed owner in cancel_requested");
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+
+        super::apply_tool_mutation(
+            &mut transaction,
+            super::ToolExecutionMutation::Skip {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: owner_id.to_owned(),
+                run_id: "run-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-skip-1".to_owned(),
+                error_code: "user_steer_cancelled",
+            },
+        )
+        .await
+        .expect("user_steer_cancelled must resolve after abort moves owner to cancel_requested");
+
+        let row = sqlx::query(
+            "SELECT command_id, run_id, state, error_code FROM tool_executions WHERE tool_call_id = ?",
+        )
+        .bind("tool-1")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("skip row exists");
+        assert_eq!(row.try_get::<String, _>("command_id").unwrap(), owner_id);
+        assert_eq!(row.try_get::<String, _>("run_id").unwrap(), "run-1");
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "not_started");
+        assert_eq!(
+            row.try_get::<Option<String>, _>("error_code")
+                .unwrap()
+                .as_deref(),
+            Some("user_steer_cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_skip_length_guard_requires_assistant_started() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000001";
+        writer
+            .persist_inbound(&user_command(1, owner_id, "original owner"))
+            .await
+            .expect("persist original owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='cancel_requested'
+             WHERE command_id = ?",
+        )
+        .bind(owner_id)
+        .execute(store.pool())
+        .await
+        .expect("seed owner in cancel_requested");
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+
+        let error = super::apply_tool_mutation(
+            &mut transaction,
+            super::ToolExecutionMutation::Skip {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: owner_id.to_owned(),
+                run_id: "run-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-skip-1".to_owned(),
+                error_code: "length_guard",
+            },
+        )
+        .await
+        .expect_err("length_guard must not match cancel_requested owner");
+        assert!(format!("{error:#}").contains("ToolExecutionSkip"));
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_event_is_persisted_and_recovered() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let kind = "compact_applied";
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(&json!({"type": "memory_maintenance", "kind": kind}))
+                        .expect("typed memory maintenance event"),
+                ),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        };
+        let seqs = writer.apply(batch).await.expect("apply memory maintenance");
+        assert_eq!(seqs, vec![1]);
+
+        let row = sqlx::query(
+            "SELECT event_type, internal_metadata, envelope FROM agent_events WHERE seq = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch memory maintenance event");
+        assert_eq!(
+            row.try_get::<String, _>("event_type").unwrap(),
+            "memory_maintenance"
+        );
+        let internal_metadata: String = row.try_get("internal_metadata").unwrap();
+        assert!(serde_json::from_str::<Value>(&internal_metadata).is_ok());
+        let envelope: String = row.try_get("envelope").unwrap();
+        assert!(envelope.contains("\"kind\":\"compact_applied\""));
+
+        let steps = SuffixRecovery::plan(&store)
+            .await
+            .expect("recovery accepts memory maintenance");
+        assert!(
+            steps.is_empty(),
+            "no pending commands means empty recovery plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_rejects_empty_kind() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(&json!({"type": "memory_maintenance", "kind": ""}))
+                        .expect("typed memory maintenance event"),
+                ),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        };
+        let error = writer
+            .apply(batch)
+            .await
+            .expect_err("empty MemoryMaintenance kind must be rejected");
+        assert!(error.to_string().contains("kind must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn memory_transition_failpoint_rolls_back_before_commit() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch_id = BatchId::from_u128(1);
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("fixture_batch_insert")
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![MemoryBatchRecord::new(
+                            batch_id.to_string(),
+                            MemoryLayer::L1,
+                            0,
+                            0,
+                            MemoryBatchState::Sealed,
+                            0,
+                            0,
+                        )],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed authenticated memory batch");
+
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(&json!({
+                        "type": "memory_maintenance",
+                        "kind": "compact_applied"
+                    }))
+                    .expect("typed memory maintenance event"),
+                ),
+                projections: vec![Projection::MemoryTransition(MemoryTransition {
+                    expected_source_versions: BTreeMap::new(),
+                    batch_mutations: vec![MemoryBatchMutation {
+                        batch_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacting,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    }],
+                    job_mutations: Vec::new(),
+                    cursor_advance: None,
+                    ..Default::default()
+                })],
+            }],
+            injected_commands: Vec::new(),
+        };
+
+        let error = writer
+            .apply_with_failpoint(batch, 1)
+            .await
+            .expect_err("failpoint must interrupt memory transition");
+        assert!(error.to_string().contains("test failpoint"), "{error:#}");
+
+        let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
+            .bind(batch_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(row.get::<i64, _>("version"), 0);
+        assert_eq!(row.get::<String, _>("state"), "sealed");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("count agent events");
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn error_message_end_durably_stores_context_without_l0_membership_or_footprint() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000050";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "error").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "error"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let mut error_message = assistant_message(StopReason::Error);
+        let message_id = "assistant-error-with-context";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-error",
+                    "encrypted_content": "opaque-error",
+                    "summary": [],
+                }),
+            },
+        };
+        let origin = match &mut error_message {
+            PublicMessage::Assistant(assistant) => {
+                assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+                &assistant.origin
+            }
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
+        assert!(footprint > 0);
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("error MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("error MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message: error_message,
+                        append_to_l0: false,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist authoritative Error terminal and provider context");
+
+        let provider_row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT message_id, eviction_tokens
+             FROM provider_context
+             WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("durable Error provider-context row");
+        assert_eq!(provider_row.0, message_id);
+        assert_eq!(
+            provider_row.1,
+            i64::try_from(footprint).expect("footprint fits SQLite")
+        );
+
+        let l0_membership: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count Error L0 membership");
+        assert_eq!(l0_membership, 0, "Error assistant must remain outside L0");
+
+        let l0_footprint: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(eviction_footprint_tokens), 0) FROM memory_batches",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("sum L0 provider-context footprint");
+        assert_eq!(
+            l0_footprint, 0,
+            "durable Error context must not become replay or eviction footprint"
+        );
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let recovery_steps = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("cold hydration accepts an Error assistant excluded from L0")
+        {
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => steps,
+            HydrationOutcome::Complete(_) => {
+                panic!("undisposed Error context must remain a logical recovery boundary")
+            }
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                panic!("Error context needs logical, not physical, recovery: {intents:?}")
+            }
+        };
+        assert!(matches!(
+            recovery_steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                pending_error_context: Some(pending),
+                ..
+            }] if pending.message_id == message_id && pending.item_count == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_mismatched_eviction_footprint_tokens() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000051";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "hello"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let mut message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-stop-with-context";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
+            },
+        };
+        let origin = match &mut message {
+            PublicMessage::Assistant(assistant) => {
+                assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+                &assistant.origin
+            }
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint + 1,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("MessageEnd must reject mismatched eviction footprint");
+        assert!(
+            error
+                .to_string()
+                .contains("eviction_footprint_tokens mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_end_accepts_sparse_openai_responses_reasoning() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000090";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "responses").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "responses"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-responses-opaque";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(99),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
+            },
+        };
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("sparse Responses encrypted reasoning must be accepted");
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_native_compaction_with_wire_item_index() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000091";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "native").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "native"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-native-anchored";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compact"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp".to_owned(),
+                },
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("native compaction must not carry a wire_item_index");
+        assert!(error.to_string().contains("unanchored"));
+    }
+
+    #[test]
+    fn native_compaction_requires_its_provider_protocol() {
+        let PublicMessage::Assistant(mut responses) = assistant_message(StopReason::Stop) else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        responses.origin.protocol = ApiProtocol::OpenAiResponses;
+        let openai_window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type": "compaction"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-openai".to_owned(),
+                },
+            },
+        };
+        let anthropic_window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type": "compaction"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-anthropic".to_owned(),
+                },
+            },
+        };
+
+        assert!(
+            EventWriter::validate_provider_context_fragment(&openai_window, &responses).is_ok(),
+            "Responses native compaction must match a Responses assistant"
+        );
+        let error = EventWriter::validate_provider_context_fragment(&anthropic_window, &responses)
+            .expect_err("Anthropic native compaction must not attach to a Responses assistant");
+        assert!(error.to_string().contains("Anthropic"));
+
+        responses.origin.protocol = ApiProtocol::AnthropicMessages;
+        assert!(
+            EventWriter::validate_provider_context_fragment(&anthropic_window, &responses).is_ok(),
+            "Anthropic native compaction must match an Anthropic assistant"
+        );
+        let error = EventWriter::validate_provider_context_fragment(&openai_window, &responses)
+            .expect_err("Responses native compaction must not attach to an Anthropic assistant");
+        assert!(error.to_string().contains("OpenAI"));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_encrypted_reasoning_without_wire_item_index() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000092";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "noanchor").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "noanchor"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-unanchored-reasoning";
+        let fragment = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("encrypted reasoning must be anchored");
+        assert!(error.to_string().contains("anchored"));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_encrypted_reasoning_protocol_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000093";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "mismatch").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "mismatch"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-protocol-mismatch";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("encrypted reasoning protocol must match assistant origin");
+        assert!(error.to_string().contains("protocol"));
+    }
+
+    #[tokio::test]
+    async fn message_end_accepts_anthropic_encrypted_reasoning_with_thinking_slot() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000094";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "anthropic").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "anthropic"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Thinking {
+                thinking: "redacted".to_owned(),
+                signature_field: "signature".to_owned(),
+                wire_item_index: 7,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-anthropic-signature";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(7),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: json!({
+                    "type": "thinking_signature",
+                    "signature": "opaque-signature",
+                }),
+            },
+        };
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("Anthropic encrypted reasoning must match a public Thinking wire slot");
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_anthropic_encrypted_reasoning_without_thinking_slot() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000095";
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "anthropic-bad").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "anthropic-bad"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "answer".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-anthropic-no-thinking";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: json!({"signature": "opaque-signature"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Anthropic encrypted reasoning must match a Thinking wire slot");
+        assert!(error.to_string().contains("Thinking wire slot"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_clean_store_returns_complete_state() {
+        let store = test_store().await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => {
+                assert!(state.messages.is_empty());
+                assert!(state.provider_context.is_empty());
+                assert!(state.memory.is_empty());
+                assert_eq!(state.resume, ResumeDirective::AdmitCommands);
+                assert_eq!(state.receipt.intent_count, 0);
+            }
+            other => panic!("clean store must not require recovery: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_mismatched_lease_and_fence() {
+        let store = test_store().await;
+        let lease = test_lease(1);
+        let fence = test_fence(&test_lease(2));
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "mismatched lease/fence must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("lease"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_returns_recovery_required_for_running_tool() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let decision_id = "00000000-0000-4000-8000-000000000002";
+        seed_pending_approval(&store, &writer, "request-1", tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, "request-1"))
+            .await
+            .expect("persist approval decision");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-1",
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool");
+
+        let lease = test_lease(2);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                assert_eq!(intents.len(), 1);
+                assert_eq!(intents[0].tool_call_id, tool_call_id);
+                assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
+                assert_eq!(intents[0].run_id, run_id);
+                assert_eq!(intents[0].executor_generation, test_process_generation(1));
+            }
+            other => panic!("running tool must keep boot fail-closed: {other:?}"),
+        }
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation + 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper running projection attestation");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("tampered running projection must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated ToolExecutionStart")
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation - 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("restore running projection attestation");
+        sqlx::query(
+            "DELETE FROM agent_events
+             WHERE event_type = 'tool_execution_start'
+               AND json_extract(envelope, '$.tool_call_id') = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("remove durable start evidence");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("orphan running projection must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("durable event history")
+                || rendered.contains("durable event chain")
+                || rendered.contains("exactly one durable"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_message_role_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000101";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "hello"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("commit user message");
+
+        let message_id = test_user_message_id(command_id);
+        sqlx::query("UPDATE messages SET role = 'assistant' WHERE id = ?")
+            .bind(&message_id)
+            .execute(store.pool())
+            .await
+            .expect("tamper stored message role");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "role mismatch must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("role"));
+    }
+
+    async fn seed_assistant_with_reasoning(
+        _store: &Arc<Store>,
+        writer: &EventWriter,
+    ) -> (String, String, String) {
+        let command_id = "00000000-0000-4000-8000-000000000102";
+        let injected = classified_injection(writer, 1, command_id, "ignored", "seed").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "seed"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("commit user message");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let mut message = assistant_message(StopReason::Stop);
+        let PublicMessage::Assistant(assistant) = &mut message else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+        let message_id = "assistant-reasoning-hydrate";
+        // Native compaction coverage must identify an actual persisted message.
+        let user_message_id = test_user_message_id(command_id);
+        let user_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(&user_message_id)
+            .fetch_one(writer.store.pool())
+            .await
+            .expect("user message seq");
+        // Persist deliberately out of wire order. Hydration must reconstruct
+        // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`.
+        let fragments = vec![
+            ProviderContextFragment {
+                wire_item_index: Some(2),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-later",
+                        "encrypted_content": "opaque-later",
+                        "summary": [],
+                    }),
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-earlier",
+                        "encrypted_content": "opaque-earlier",
+                        "summary": [],
+                    }),
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "type": "compaction",
+                        "id": "cmp-hydrate",
+                        "encrypted_content": "opaque",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: user_seq as u64,
+                        context_fingerprint: "hydrate-fingerprint".to_owned(),
+                    },
+                },
+            },
+        ];
+        let footprint = eviction_footprint_for_test(&assistant.origin, &fragments);
+        let terminal_message = message.clone();
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: message_id.to_owned(),
+                            role: "assistant",
+                            message: message.clone(),
+                            append_to_l0: true,
+                            provider_context: fragments,
+                            eviction_footprint_tokens: footprint,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message,
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id.clone()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit assistant message with reasoning");
+        (run_id, turn_id, message_id.to_owned())
+    }
+
+    #[tokio::test]
+    async fn hydrate_round_trips_assistant_and_provider_context() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (_, _, message_id) = seed_assistant_with_reasoning(&store, &writer).await;
+        let key_refs: Vec<String> =
+            sqlx::query_scalar("SELECT key_ref FROM provider_context ORDER BY id")
+                .fetch_all(store.pool())
+                .await
+                .expect("load exact provider-context retention keys");
+        assert_eq!(key_refs.len(), 3);
+        assert_eq!(
+            key_refs.iter().collect::<BTreeSet<_>>().len(),
+            3,
+            "each reasoning item and native window must use an independent retention key"
+        );
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => {
+                assert_eq!(state.messages.len(), 2, "user and assistant messages");
+                let assistant = state
+                    .messages
+                    .iter()
+                    .find(
+                        |m| matches!(m, ContextMessage::Persisted { id, .. } if id == &message_id),
+                    )
+                    .expect("assistant message round-trips");
+                assert!(
+                    matches!(assistant, ContextMessage::Persisted { message, .. } if matches!(message, Message::Assistant(_))),
+                    "hydrated assistant must be an Assistant message"
+                );
+                assert_eq!(state.provider_context.len(), 3);
+                assert_eq!(
+                    state
+                        .provider_context
+                        .iter()
+                        .map(|item| item.item.wire_item_index)
+                        .collect::<Vec<_>>(),
+                    vec![None, Some(1), Some(2)],
+                    "hydration must place the native window before reasoning with a later message seq"
+                );
+                assert!(
+                    state.provider_context[1..].iter().all(|item| {
+                        item.item
+                            .origin_message
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.message_id == message_id)
+                            && matches!(
+                                &item.item.payload,
+                                ProviderContextPayload::EncryptedReasoning { .. }
+                            )
+                    }),
+                    "reasoning must remain anchored to its persisted assistant"
+                );
+                assert!(
+                    matches!(
+                        &state.provider_context[0].item.payload,
+                        ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    ) && state.provider_context[0].item.origin_message.is_none(),
+                    "native compaction must not acquire an assistant anchor"
+                );
+
+                let expected_footprint = state
+                    .provider_context
+                    .iter()
+                    .filter(|item| {
+                        item.item
+                            .origin_message
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.message_id == message_id)
+                    })
+                    .map(|item| item.footprint.eviction_tokens())
+                    .sum::<u64>();
+                let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+                    .expect("EventWriter output must reconstruct as live memory");
+                assert_eq!(memory.l0().len(), 1);
+                assert_eq!(memory.l0()[0].messages.len(), 2);
+                assert_eq!(memory.l0()[0].eviction_footprint_tokens, expected_footprint);
+            }
+            other => panic!("clean assistant turn must complete: {other:?}"),
+        }
+
+        let message_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load non-Error assistant sequence");
+        let error = writer
+            .build_error_context_disposition(
+                &message_id,
+                u64::try_from(message_seq).expect("positive assistant sequence"),
+            )
+            .await
+            .expect_err("a non-Error assistant cannot authorize Error-context disposition");
+        assert!(
+            error
+                .to_string()
+                .contains("not the exact authenticated Error MessageEnd event")
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_memory_row_and_membership_tampering() {
+        for tamper in ["row", "delete", "reorder", "extra"] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            seed_assistant_with_reasoning(&store, &writer).await;
+            let batch_id: String =
+                sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 0")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("load authenticated L0 batch");
+
+            match tamper {
+                "row" => {
+                    sqlx::query(
+                        "UPDATE memory_batches
+                         SET est_tokens = est_tokens + 1
+                         WHERE id = ?",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("tamper committed memory row");
+                }
+                "delete" => {
+                    sqlx::query(
+                        "DELETE FROM memory_batch_messages
+                         WHERE batch_id = ? AND ord = 2",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("delete committed membership");
+                }
+                "reorder" => {
+                    sqlx::query(
+                        "UPDATE memory_batch_messages
+                         SET ord = 3
+                         WHERE batch_id = ? AND ord = 2",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("reorder committed membership");
+                }
+                "extra" => {
+                    let key = store
+                        .private_key(DataKeyPurpose::Transcript)
+                        .await
+                        .expect("mint transcript key");
+                    let message = user_message("uncommitted extra member");
+                    let record = crate::store::transcript::TranscriptRecord::encrypt(
+                        &message,
+                        "extra-memory-member",
+                        100,
+                        &key,
+                        store.scope(),
+                        store.redactor(),
+                    )
+                    .expect("encrypt extra transcript row");
+                    record
+                        .insert(store.pool())
+                        .await
+                        .expect("insert extra transcript row");
+                    sqlx::query(
+                        "INSERT INTO memory_batch_messages(batch_id, message_id, ord)
+                         VALUES(?, 'extra-memory-member', 3)",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("insert uncommitted extra membership");
+                }
+                _ => unreachable!(),
+            }
+
+            let lease = test_lease(1);
+            let fence = test_fence(&lease);
+            let error = store
+                .hydrate(&lease, &fence)
+                .await
+                .expect_err("tampered memory projection must fail hydration");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("memory") || rendered.contains("membership"),
+                "{tamper} tamper failed for an unexpected reason: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_provider_context_kind_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_assistant_with_reasoning(&store, &writer).await;
+
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated kind tamper");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before kind tamper");
+        sqlx::query(
+            "UPDATE provider_context SET kind = 'open_ai_compacted_window' WHERE message_id = ?",
+        )
+        .bind("assistant-reasoning-hydrate")
+        .execute(&mut *transaction)
+        .await
+        .expect("tamper stored provider-context kind");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent provider-context kind");
+        transaction.commit().await.expect("commit kind tamper");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(
+            error.is_err(),
+            "provider-context kind mismatch must fail hydration"
+        );
+        assert!(error.unwrap_err().to_string().contains("kind"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_reasoning_idempotency_key_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_assistant_with_reasoning(&store, &writer).await;
+
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated idempotency tamper");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before idempotency tamper");
+        sqlx::query(
+            "UPDATE provider_context
+             SET idempotency_key = 'tampered'
+             WHERE message_id = 'assistant-reasoning-hydrate'
+               AND wire_item_index = 1",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("tamper provider-context idempotency key");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent idempotency key");
+        transaction
+            .commit()
+            .await
+            .expect("commit idempotency tamper");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "idempotency mismatch must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("idempotency key"));
+    }
+
+    #[cfg(unix)]
+    async fn t17_setup_running_tool(
+        store: &Arc<Store>,
+        writer: &EventWriter,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            test_process_generation(1),
+            "test-lease",
+        )
+        .expect("test process generation lease");
+        let fence = GenerationRecoveryFence::new(&lease, "test-fence")
+            .expect("test generation recovery fence");
+        let decision_id = "00000000-0000-4000-8000-000000000003";
+        seed_pending_approval(store, writer, "request-1", tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, "request-1"))
+            .await
+            .expect("persist approval decision for physical recovery fixture");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-1",
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool for physical recovery fixture");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool for physical recovery fixture");
+        (lease, fence)
+    }
+
+    #[cfg(unix)]
+    async fn t17_physical_recovery_batch(
+        store: &Store,
+        run_id: &str,
+        tool_call_id: &str,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> (EventBatch, PhysicalRecoveryReceipt) {
+        let head: Option<(i64, i64)> =
+            sqlx::query_as("SELECT last_seq, event_count FROM event_log_heads")
+                .fetch_optional(store.pool())
+                .await
+                .expect("read event-log head for physical recovery batch");
+        let next_seq = head.map_or(1, |(last, _)| last as u64 + 1);
+
+        let mut writes = tool_finish_writes(
+            tool_call_id,
+            "running",
+            "indeterminate",
+            Some("indeterminate"),
+            "recovered",
+            true,
+        );
+        let intent = PhysicalRecoveryIntent {
+            tool_call_id: tool_call_id.to_owned(),
+            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+            run_id: run_id.to_owned(),
+            executor_generation: test_process_generation(1),
+            indeterminate_terminal_seq: next_seq,
+        };
+        let mut receipt = PhysicalRecoveryReceipt {
+            receipt_id: format!("receipt-{tool_call_id}"),
+            lease: lease.clone(),
+            fence: fence.clone(),
+            intents: vec![intent],
+            logical_suffix_first_seq: next_seq,
+            logical_suffix_last_seq: next_seq + 2,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.canonical_digest();
+        writes.push(EventWrite {
+            event: None,
+            projections: vec![Projection::PhysicalRecovery(receipt.clone())],
+        });
+        (
+            EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            },
+            receipt,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generic_apply_rejects_unbound_physical_recovery_but_dedicated_apply_replays() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let (batch, receipt) =
+            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+
+        let error = writer
+            .apply(batch.clone())
+            .await
+            .expect_err("generic apply must not admit an unbound physical recovery receipt");
+        assert!(
+            format!("{error:#}").contains(
+                "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+            ),
+            "{error:#}"
+        );
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(&lease, &fence, receipt.clone(), batch)
+            .await
+            .expect("dedicated physical recovery apply must accept the bound receipt");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+        assert_eq!(seqs.len(), 3);
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(
+                &lease,
+                &fence,
+                receipt,
+                EventBatch {
+                    writes: Vec::new(),
+                    injected_commands: Vec::new(),
+                },
+            )
+            .await
+            .expect("dedicated physical recovery replay must be idempotent");
+        assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);
+        assert!(seqs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for T17 abrupt transaction tests"]
+    async fn t17_logical_suffix_transaction_child() {
+        let scenario = std::env::var("SUMI_T17_SCENARIO").expect("child scenario environment");
+        let boundary = std::env::var("SUMI_T17_BOUNDARY").expect("child boundary environment");
+        let database_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T17_DATABASE").expect("child database environment"),
+        );
+        let readiness_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T17_READY").expect("child readiness environment"),
+        );
+        let store: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+            .await
+            .expect("child opens store")
+            .into();
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let (batch, receipt) =
+            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+        let physical_recovery = Some(PhysicalRecoveryContext {
+            lease: &lease,
+            fence: &fence,
+            receipt: &receipt,
+        });
+        writer
+            .apply_with_abrupt_transaction_failpoint(
+                batch,
+                &scenario,
+                boundary == "after_commit",
+                &readiness_path,
+                physical_recovery,
+            )
+            .await
+            .expect("abrupt failpoint must not return");
+        panic!("abrupt failpoint returned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t17_logical_suffix_transaction_is_atomic_before_and_after_commit() {
+        for boundary in ["before_commit", "after_commit"] {
+            let root = std::env::temp_dir().join(format!(
+                "sumi-t17-failpoint-{boundary}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&root).expect("create T17 failpoint root");
+            let database_path = root.join("agent.db");
+            let readiness_path = root.join("ready");
+            let scenario = format!("t17_{boundary}");
+
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current unit test executable"),
+            )
+            .arg("--exact")
+            .arg("store::event_writer::tests::t17_logical_suffix_transaction_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("SUMI_T17_SCENARIO", &scenario)
+            .env("SUMI_T17_BOUNDARY", boundary)
+            .env("SUMI_T17_DATABASE", &database_path)
+            .env("SUMI_T17_READY", &readiness_path)
+            .output()
+            .expect("run T17 abrupt transaction child");
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{scenario}.{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+                format!("{scenario}.{boundary}\n")
+            );
+
+            let reopened: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+                .await
+                .expect("reopen after T17 hard kill")
+                .into();
+            const SETUP_EVENTS: i64 = 4;
+            const RECOVERY_EVENTS: i64 = 3;
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count events after restart");
+            let tool_state: String = sqlx::query_scalar(
+                "SELECT state FROM tool_executions WHERE tool_call_id = 'tool-1'",
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("tool state after restart");
+            let messages: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = 'tool-1-result'")
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("count tool result messages");
+            let ledger_parents: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications WHERE receipt_id = 'receipt-tool-1'"
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count ledger parents");
+            let ledger_children: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_intents WHERE receipt_id = 'receipt-tool-1'"
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count ledger children");
+
+            let expected_applied = boundary == "after_commit";
+            assert_eq!(
+                (
+                    events,
+                    tool_state.as_str(),
+                    messages,
+                    ledger_parents,
+                    ledger_children
+                ),
+                if expected_applied {
+                    (SETUP_EVENTS + RECOVERY_EVENTS, "indeterminate", 1, 1, 1)
+                } else {
+                    (SETUP_EVENTS, "running", 0, 0, 0)
+                },
+                "{scenario}.{boundary} was not all-or-none"
+            );
+
+            let (first_seq, last_seq) = if expected_applied {
+                let row = sqlx::query(
+                    "SELECT logical_suffix_first_seq, logical_suffix_last_seq
+                     FROM physical_recovery_receipt_applications
+                     WHERE receipt_id = 'receipt-tool-1'",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read committed physical recovery suffix bounds");
+                (
+                    row.get::<i64, _>("logical_suffix_first_seq"),
+                    row.get::<i64, _>("logical_suffix_last_seq"),
+                )
+            } else {
+                // The before-commit kill rolled back the logical suffix and the
+                // application ledger. Replaying the exact same recovery batch must
+                // converge to a committed state.
+                let lease = ProcessGenerationLease::new(
+                    reopened.scope().personality_agent_id.clone(),
+                    test_process_generation(1),
+                    "test-lease",
+                )
+                .expect("test lease");
+                let fence = GenerationRecoveryFence::new(&lease, "test-fence").expect("test fence");
+                let writer = EventWriter::new(reopened.clone());
+                let (batch, receipt) =
+                    t17_physical_recovery_batch(&reopened, "run-1", "tool-1", &lease, &fence).await;
+                let (outcome, seqs) = writer
+                    .apply_physical_recovery(&lease, &fence, receipt, batch)
+                    .await
+                    .expect("physical recovery converges after rollback");
+                assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+                assert_eq!(seqs.len(), RECOVERY_EVENTS as usize);
+
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                        .fetch_one(reopened.pool())
+                        .await
+                        .expect("event count after convergence"),
+                    SETUP_EVENTS + RECOVERY_EVENTS
+                );
+
+                let row = sqlx::query(
+                    "SELECT logical_suffix_first_seq, logical_suffix_last_seq
+                     FROM physical_recovery_receipt_applications
+                     WHERE receipt_id = 'receipt-tool-1'",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read committed physical recovery suffix bounds after convergence");
+                (
+                    row.get::<i64, _>("logical_suffix_first_seq"),
+                    row.get::<i64, _>("logical_suffix_last_seq"),
+                )
+            };
+
+            // A bare receipt replay must be idempotent and must not duplicate any
+            // suffix event, ledger parent, or ledger child.
+            let intent = PhysicalRecoveryIntent {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                indeterminate_terminal_seq: u64::try_from(first_seq)
+                    .expect("terminal seq fits u64"),
+            };
+            let mut receipt = PhysicalRecoveryReceipt {
+                receipt_id: "receipt-tool-1".to_owned(),
+                lease: test_lease(1),
+                fence: test_fence(&test_lease(1)),
+                intents: vec![intent],
+                logical_suffix_first_seq: u64::try_from(first_seq).expect("first seq fits u64"),
+                logical_suffix_last_seq: u64::try_from(last_seq).expect("last seq fits u64"),
+                digest: String::new(),
+            };
+            receipt.digest = receipt.canonical_digest();
+            let lease = receipt.lease.clone();
+            let fence = receipt.fence.clone();
+            let writer = EventWriter::new(reopened.clone());
+            let (outcome, seqs) = writer
+                .apply_physical_recovery(
+                    &lease,
+                    &fence,
+                    receipt,
+                    EventBatch {
+                        writes: vec![],
+                        injected_commands: Vec::new(),
+                    },
+                )
+                .await
+                .expect("bare receipt replay is idempotent");
+            assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);
+            assert!(seqs.is_empty());
+
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("event count after idempotent replay"),
+                SETUP_EVENTS + RECOVERY_EVENTS,
+                "idempotent replay must not emit new events"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM physical_recovery_receipt_intents WHERE receipt_id = 'receipt-tool-1'"
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("ledger child count after idempotent replay"),
+                1,
+                "idempotent replay must not duplicate ledger children"
+            );
+
+            reopened.pool().close().await;
+            tokio::fs::remove_dir_all(root)
+                .await
+                .expect("remove T17 fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_end_eviction_footprint_overflow_fails_closed() {
+        let store = test_store().await;
+        let key = store
+            .private_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        use sqlx::Connection as _;
+        let mut conn = store.pool().acquire().await.expect("acquire connection");
+        let mut transaction = conn.begin().await.expect("begin transaction");
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                summary_projection, summary_redaction_version,
+                projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                ?, 0, 0, 0, 1, 'open', 0, ?, NULL, NULL, NULL, NULL,
+                1, zeroblob(32), ?
+             )",
+        )
+        .bind("batch-1")
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-1".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            provider_context: vec![],
+            provider_context_key_proofs: Vec::new(),
+            eviction_footprint_tokens: 1,
+            public_est: 0,
+            create_l0_batch: None,
+            l0_batch_id: Some("batch-1".to_owned()),
+            l0_batch_message_ord: Some(1),
+            seal_transition: None,
+        };
+
+        let error = apply_projection(&store, &mut transaction, projection, &[], None, Some(1))
+            .await
+            .expect_err("eviction footprint overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback test fixture transaction");
+    }
+
+    #[tokio::test]
+    async fn memory_job_terminal_clears_lease_until() {
+        let store = test_store().await;
+        let lease = Utc::now().to_rfc3339();
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until,
+                attempts, projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(
+                'lease-job', 'compact', 1, '[]', '{}', 'running', ?, 1,
+                1, zeroblob(32), ?, ?
+             )",
+        )
+        .bind(&lease)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert running job with lease");
+
+        apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "running",
+                new_status: "failed",
+                attempts: 1,
+                attempts_delta: 0,
+                new_lease_until: None,
+                expected_lease_until: Some(lease.clone()),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("terminal transition must clear lease");
+
+        let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("lease-job")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("load job");
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
+        assert!(
+            row.try_get::<Option<String>, _>("lease_until")
+                .unwrap()
+                .is_none(),
+            "terminal job must have NULL lease_until"
+        );
+
+        let error = apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "failed",
+                new_status: "applied",
+                attempts: 1,
+                attempts_delta: 0,
+                new_lease_until: None,
+                expected_lease_until: Some(lease),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect_err("stale lease CAS must fail");
+        assert!(
+            error.to_string().contains("CAS expected one row"),
+            "{error:#}"
+        );
+        transaction.rollback().await.expect("rollback test fixture");
+    }
+
+    #[tokio::test]
+    async fn memory_mutations_reject_cross_unit_summary_keys_before_writes() {
+        let store = test_store().await;
+        let wrong_batch_key = store
+            .memory_summary_key("batch", "different-batch")
+            .await
+            .unwrap();
+        let wrong_job_key = store
+            .memory_summary_key("job", "different-job")
+            .await
+            .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+
+        let batch_error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "target-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: Some(MemoryBatchSummary {
+                    key_ref: wrong_batch_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+                est_tokens: 0,
+                footprint_delta: 0,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect_err("batch summary key from another batch must fail before commit");
+        assert!(
+            batch_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        let job_error = apply_memory_job_mutation(
+            &store,
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "target-job".to_owned(),
+                expected_status: "running",
+                new_status: "ready",
+                attempts: 1,
+                attempts_delta: 0,
+                expected_lease_until: None,
+                new_lease_until: None,
+                source_versions: None,
+                result: Some(MemoryJobResult {
+                    key_ref: wrong_job_key.key_ref.clone(),
+                    ciphertext: vec![1],
+                    projection: String::new(),
+                    redaction_version: 1,
+                }),
+            },
+        )
+        .await
+        .expect_err("job result key from another job must fail before commit");
+        assert!(
+            job_error
+                .to_string()
+                .contains("outside its exact retention unit")
+        );
+
+        transaction.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_batch_mutation_rejects_footprint_overflow_and_underflow() {
+        let store = test_store().await;
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'overflow-batch', 0, 0, 0, 1, 'open', 0, ?,
+                1, zeroblob(32), ?
+             )",
+        )
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "overflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: 1,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect_err("overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'underflow-batch', 0, 0, 0, 1, 'open', 0, 1,
+                1, zeroblob(32), ?
+             )",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch with small footprint");
+
+        apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect("decrement to zero must succeed");
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("underflow-batch")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read footprint");
+        assert_eq!(footprint, 0);
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+                delete_membership: false,
+            },
+            &store,
+        )
+        .await
+        .expect_err("underflow must fail closed");
+        assert!(error.to_string().contains("underflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn message_end_creates_l0_membership_and_attributes_footprint() {
+        let store = test_store().await;
+        let key = store
+            .private_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'l0-batch', 0, 0, 0, 1, 'open', 0, 0,
+                1, zeroblob(32), ?
+             )",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed open L0 batch");
+
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-l0".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            create_l0_batch: None,
+            l0_batch_id: Some("l0-batch".to_owned()),
+            l0_batch_message_ord: Some(1),
+            provider_context: vec![],
+            provider_context_key_proofs: Vec::new(),
+            eviction_footprint_tokens: 42,
+            public_est: 0,
+            seal_transition: None,
+        };
+        apply_projection(&store, &mut transaction, projection, &[], None, Some(1))
+            .await
+            .expect("attribute footprint to open L0 batch");
+
+        let membership =
+            sqlx::query("SELECT batch_id FROM memory_batch_messages WHERE message_id = ?")
+                .bind("msg-l0")
+                .fetch_optional(&mut *transaction)
+                .await
+                .expect("load membership");
+        assert!(
+            membership.is_some(),
+            "message must be linked to an L0 batch"
+        );
+        assert_eq!(
+            membership
+                .unwrap()
+                .try_get::<String, _>("batch_id")
+                .unwrap(),
+            "l0-batch"
+        );
+
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("l0-batch")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read batch footprint");
+        assert_eq!(footprint, 42);
+        transaction.rollback().await.expect("rollback test fixture");
     }
 }

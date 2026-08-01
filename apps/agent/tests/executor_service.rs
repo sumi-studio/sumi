@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 const GENERATION: u64 = 19;
 const NONCE: &str = "executor-service-test";
+const PERSONALITY_AGENT_ID: &str = "018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6e";
+const OTHER_PERSONALITY_AGENT_ID: &str = "018f8a9e-65c0-7a5b-8d3c-1f2a3b4c5d6f";
 
 struct Fixture {
     root: PathBuf,
@@ -40,6 +42,7 @@ impl Fixture {
         let broker = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
             .arg("--artifact-broker")
             .env_clear()
+            .env("SUMI_PERSONALITY_AGENT_ID", PERSONALITY_AGENT_ID)
             .env("SUMI_RPC_GENERATION", GENERATION.to_string())
             .env("SUMI_RPC_NONCE", NONCE)
             .env("SUMI_ARTIFACT_ROOT", &artifacts)
@@ -76,7 +79,7 @@ impl Fixture {
             .env("SUMI_RPC_GENERATION", GENERATION.to_string())
             .env("SUMI_RPC_NONCE", NONCE)
             .env("SUMI_WORKSPACE", &self.workspace)
-            .env("SUMI_CONVERSATION_ID", "conversation-1")
+            .env("SUMI_PERSONALITY_AGENT_ID", PERSONALITY_AGENT_ID)
             .env("SUMI_ARTIFACT_BROKER_SOCKET", &self.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -115,6 +118,7 @@ impl Drop for Fixture {
 
 fn request(id: &str, operation: Value) -> Value {
     json!({
+        "personality_agent_id": PERSONALITY_AGENT_ID,
         "generation": GENERATION,
         "nonce": NONCE,
         "request_id": id,
@@ -154,6 +158,21 @@ async fn read_frame(reader: &mut BufReader<tokio::process::ChildStdout>) -> Valu
     serde_json::from_str(&line).unwrap()
 }
 
+// Backpressure tests intentionally produce many drop warnings. Drain stderr
+// while the child runs so its diagnostic pipe cannot become a second,
+// unintended source of service backpressure.
+fn drain_executor_stderr(child: &mut Child) -> tokio::task::JoinHandle<String> {
+    let mut stderr = child.stderr.take().expect("piped executor stderr");
+    tokio::spawn(async move {
+        let mut output = String::new();
+        stderr
+            .read_to_string(&mut output)
+            .await
+            .expect("read executor stderr");
+        output
+    })
+}
+
 #[tokio::test]
 async fn service_mode_dispatch_precedes_runtime_config() {
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
@@ -164,7 +183,7 @@ async fn service_mode_dispatch_precedes_runtime_config() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("SUMI_RPC_GENERATION"), "{stderr}");
+    assert!(stderr.contains("SUMI_PERSONALITY_AGENT_ID"), "{stderr}");
     assert!(stderr.contains("low-trust-local"), "{stderr}");
     assert!(!stderr.contains("SUMI_CONFIG"), "{stderr}");
     assert!(!stderr.contains("wrapping key"), "{stderr}");
@@ -178,8 +197,7 @@ async fn idle_or_nonreading_broker_clients_do_not_starve_later_clients() {
     let mut bytes = serde_json::to_vec(&request(
         "nonreader",
         json!({
-            "type":"begin_tool_output", "conversation_id":"conversation-1",
-            "execution_id":"nonreader", "content":[120]
+            "type":"begin_tool_output", "execution_id":"nonreader", "content":[120]
         }),
     ))
     .unwrap();
@@ -194,8 +212,7 @@ async fn idle_or_nonreading_broker_clients_do_not_starve_later_clients() {
             &request(
                 "later",
                 json!({
-                    "type":"begin_tool_output", "conversation_id":"conversation-1",
-                    "execution_id":"later", "content":[121]
+                    "type":"begin_tool_output", "execution_id":"later", "content":[121]
                 }),
             ),
         ),
@@ -211,12 +228,45 @@ async fn idle_or_nonreading_broker_clients_do_not_starve_later_clients() {
 #[tokio::test]
 async fn broker_fences_identity_and_round_trips_begin_append_finish() {
     let fixture = Fixture::new().await;
+    let cross_owner = broker_rpc(
+        &fixture.socket,
+        &request(
+            "cross-owner",
+            json!({
+                "type": "read_artifact",
+                "handle": format!(
+                    "artifact://{OTHER_PERSONALITY_AGENT_ID}/tool-output/execution-1"
+                ),
+                "offset": 0,
+                "limit": 10,
+            }),
+        ),
+    )
+    .await
+    .expect("authenticated cross-owner request receives a typed rejection");
+    assert_eq!(cross_owner["result"]["Err"]["code"], "invalid_path");
+
+    let nested_owner = request(
+        "nested-owner",
+        json!({
+            "type": "read_artifact",
+            "personality_agent_id": OTHER_PERSONALITY_AGENT_ID,
+            "handle": format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/execution-1"),
+            "offset": 0,
+            "limit": 10,
+        }),
+    );
+    assert_eq!(
+        broker_rpc(&fixture.socket, &nested_owner).await,
+        None,
+        "artifact operations must reject nested owner fields"
+    );
+
     let stale = request(
         "stale",
         json!({
             "type": "read_artifact",
-            "conversation_id": "conversation-1",
-            "handle": "artifact://conversation-1/tool-output/execution-1",
+            "handle": format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/execution-1"),
             "offset": 0,
             "limit": 10,
         }),
@@ -231,7 +281,6 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "begin",
             json!({
                 "type": "begin_tool_output",
-                "conversation_id": "conversation-1",
                 "execution_id": "execution-1",
                 "content": [104, 101, 108, 108, 111],
             }),
@@ -247,7 +296,6 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "append",
             json!({
                 "type": "append_tool_output",
-                "conversation_id": "conversation-1",
                 "handle": handle,
                 "offset": 5,
                 "content": [32, 119, 111, 114, 108, 100],
@@ -263,7 +311,6 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
             "finish",
             json!({
                 "type": "finish_tool_output",
-                "conversation_id": "conversation-1",
                 "handle": handle,
             }),
         ),
@@ -275,7 +322,7 @@ async fn broker_fences_identity_and_round_trips_begin_append_finish() {
         std::fs::read(
             fixture
                 .artifacts
-                .join("conversation-1/tool-output/execution-1")
+                .join(format!("{PERSONALITY_AGENT_ID}/tool-output/execution-1"))
         )
         .unwrap(),
         b"hello world"
@@ -290,15 +337,16 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
         &request(
             "begin-slow",
             json!({
-                "type":"begin_tool_output", "conversation_id":"conversation-1",
-                "execution_id":"slow", "content":[97]
+                "type":"begin_tool_output", "execution_id":"slow", "content":[97]
             }),
         ),
     )
     .await
     .unwrap();
     let handle = begun["result"]["Ok"]["handle"].as_str().unwrap().to_owned();
-    let artifact_path = fixture.artifacts.join("conversation-1/tool-output/slow");
+    let artifact_path = fixture
+        .artifacts
+        .join(format!("{PERSONALITY_AGENT_ID}/tool-output/slow"));
     let locked = OpenOptions::new()
         .read(true)
         .write(true)
@@ -310,8 +358,7 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
     let append = request(
         "append-slow",
         json!({
-            "type":"append_tool_output", "conversation_id":"conversation-1",
-            "handle":handle, "offset":1, "content":[98,99]
+            "type":"append_tool_output", "handle":handle, "offset":1, "content":[98,99]
         }),
     );
     let timed_out = tokio::spawn(async move { broker_rpc(&socket, &append).await });
@@ -336,8 +383,7 @@ async fn timed_out_accepted_broker_mutation_finishes_and_replay_is_exact() {
         &request(
             "append-replay",
             json!({
-                "type":"append_tool_output", "conversation_id":"conversation-1",
-                "handle":"artifact://conversation-1/tool-output/slow",
+                "type":"append_tool_output", "handle":format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/slow"),
                 "offset":1, "content":[98,99]
             }),
         ),
@@ -357,7 +403,6 @@ async fn executor_routes_workspace_and_artifact_reads_and_grep() {
             "begin-route",
             json!({
                 "type": "begin_tool_output",
-                "conversation_id": "conversation-1",
                 "execution_id": "route-output",
                 "content": [97, 108, 112, 104, 97, 10, 110, 101, 101, 100, 108, 101, 10],
             }),
@@ -479,6 +524,7 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
 async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_terminal() {
     let fixture = Fixture::new().await;
     let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let stderr = drain_executor_stderr(&mut child);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     assert_ne!(
@@ -540,14 +586,7 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
 
     drop(stdin);
     assert!(child.wait().await.unwrap().success());
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .await
-        .unwrap();
+    let stderr = stderr.await.expect("stderr drain task");
     assert!(
         stderr.contains("dropping volatile executor progress update"),
         "test did not drive either bounded progress queue beyond capacity: {stderr}"
@@ -655,6 +694,7 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
     let fixture = Fixture::new().await;
     let secret_id = "request-secret-must-not-enter-stderr";
     let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let stderr = drain_executor_stderr(&mut child);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     send_request(
@@ -679,14 +719,7 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
         .expect("executor must cancel/reap despite stdout backpressure")
         .unwrap();
     assert!(!status.success(), "output failure closes the service epoch");
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .await
-        .unwrap();
+    let stderr = stderr.await.expect("stderr drain task");
     assert!(
         stderr.contains("executor output") || stderr.contains("terminal write deadline"),
         "{stderr}"
@@ -965,13 +998,13 @@ async fn bash_archives_large_output_through_the_broker_client() {
     };
     assert_eq!(
         terminal["result"]["Ok"]["result"]["artifact_handle"],
-        "artifact://conversation-1/tool-output/bash-archive-1"
+        format!("artifact://{PERSONALITY_AGENT_ID}/tool-output/bash-archive-1")
     );
     assert_eq!(
         std::fs::metadata(
             fixture
                 .artifacts
-                .join("conversation-1/tool-output/bash-archive-1")
+                .join(format!("{PERSONALITY_AGENT_ID}/tool-output/bash-archive-1"))
         )
         .unwrap()
         .len(),

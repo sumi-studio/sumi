@@ -10,32 +10,45 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    memory::transform,
+    memory::{
+        ThreeLayerMemory,
+        compactor::apply_ready_memory,
+        context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
+        estimate::{ProviderContextItemWithFootprint, TokenCalibration},
+        overflow::AssemblyMode,
+    },
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
         RequestOptions, stream_observed, timing_observation_channel,
         types::{
-            ContextMessage, PromptContext, ProviderEventStream, PublicAssistantMessage,
-            PublicMessage, StopReason, ToolCall, ToolResultMessage, Usage,
+            AssistantMessage, ContextMessage, PromptContext, ProviderContextFragment,
+            ProviderEventStream, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
+            ToolResultMessage, Usage,
         },
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease, RpcIdentity,
+    },
+    store::{HydratedRunState, HydrationOutcome, Store},
+    tools::executor::ArtifactBrokerClient,
     tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
 };
 
 use super::{
     OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunCore, RunDriver,
+    run::ProviderCallAttempt,
 };
 
-type StreamStarter = dyn Fn(
+pub(crate) type StreamStarter = dyn Fn(
         ModelSpec,
         PromptContext,
         RequestOptions,
@@ -129,13 +142,27 @@ impl RunTimingSamples {
 pub(crate) struct InjectedRunDriver {
     spec: ModelSpec,
     options: RequestOptions,
-    prompt: PromptContext,
+    assembler: ContextAssembler,
     registry: ToolRegistry,
     workspace: WorkspacePaths,
     executor_generation: ProcessGeneration,
     stream_starter: Arc<StreamStarter>,
     timings: RunTimingSamples,
     timing_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    memory_maintenance: Option<HydratedMemoryMaintenance>,
+    send_view_progress: Mutex<SendViewProgress>,
+}
+
+struct HydratedMemoryMaintenance {
+    store: Arc<Store>,
+    lease: ProcessGenerationLease,
+    fence: GenerationRecoveryFence,
+}
+
+#[derive(Default)]
+struct SendViewProgress {
+    last_sent: Option<[u8; 32]>,
+    pending_recovery: Option<[u8; 32]>,
 }
 
 impl InjectedRunDriver {
@@ -173,6 +200,14 @@ impl InjectedRunDriver {
         if prompt.tools != registry.definitions() {
             bail!("prompt tool definitions do not exactly match the frozen tool registry");
         }
+        let mode = if options.native_compaction {
+            AssemblyMode::ProviderNative
+        } else {
+            AssemblyMode::SumiThreeLayer
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone())?
+            .with_calibration(TokenCalibration::default())
+            .with_mode(mode);
         let workspace = workspace.ok_or_else(|| anyhow!("workspace paths were not supplied"))?;
         let executor_generation = executor_generation
             .ok_or_else(|| anyhow!("executor generation identity was not supplied"))?;
@@ -180,13 +215,15 @@ impl InjectedRunDriver {
         Ok(Self {
             spec,
             options,
-            prompt,
+            assembler,
             registry,
             workspace,
             executor_generation,
             stream_starter,
             timings: RunTimingSamples::default(),
             timing_tasks: Mutex::new(Vec::new()),
+            memory_maintenance: None,
+            send_view_progress: Mutex::new(SendViewProgress::default()),
         })
     }
 
@@ -196,6 +233,48 @@ impl InjectedRunDriver {
 
     pub(crate) fn executor_generation(&self) -> ProcessGeneration {
         self.executor_generation
+    }
+
+    pub(crate) fn with_broker(mut self, broker: ArtifactBrokerClient) -> Self {
+        self.assembler.set_broker(broker);
+        self
+    }
+
+    /// Bind an authenticated T17 memory snapshot and its Store refresh
+    /// authority to this production-shaped driver.
+    ///
+    /// T26 remains responsible for choosing and composing the dependencies;
+    /// this method only makes the completed T17→T21 handoff expressible.
+    pub(crate) fn with_hydrated_memory(
+        mut self,
+        store: Arc<Store>,
+        expected_lease: &ProcessGenerationLease,
+        expected_fence: &GenerationRecoveryFence,
+        hydrated: &HydratedRunState,
+    ) -> Result<Self> {
+        if store.scope() != &hydrated.scope {
+            bail!("hydrated memory Store scope does not match the authenticated run scope");
+        }
+        validate_hydrated_authority(
+            hydrated,
+            self.executor_generation,
+            expected_lease,
+            expected_fence,
+        )?;
+
+        let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
+            .map_err(|error| anyhow!("hydrated memory graph is invalid: {error}"))?;
+        self.assembler.install_hydrated_memory(
+            memory,
+            &hydrated.messages,
+            hydrated.provider_context.clone(),
+        )?;
+        self.memory_maintenance = Some(HydratedMemoryMaintenance {
+            store,
+            lease: expected_lease.clone(),
+            fence: expected_fence.clone(),
+        });
+        Ok(self)
     }
 
     fn initial_message(&self) -> PublicMessage {
@@ -212,44 +291,34 @@ impl InjectedRunDriver {
             timestamp: Utc::now(),
         })
     }
-}
 
-#[async_trait]
-impl RunDriver for InjectedRunDriver {
-    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        if generation != self.executor_generation {
-            bail!(
-                "injected driver executor generation {} does not match Session generation {generation}",
-                self.executor_generation
-            );
-        }
-        Ok(())
-    }
-
-    async fn start_provider_for_command(
+    async fn start_provider_from_assembled(
         &self,
-        _attempt: usize,
-        context: &[ContextMessage],
+        attempt: usize,
+        trigger: ProviderCallTrigger,
+        assembled: AssembledPrompt,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        let mut prompt = self.prompt.clone();
-        // Derive the send view immediately before the provider call.  The
-        // runner's retained runtime_context anchors must not be mutated.
-        prompt.messages = transform::transform(context, &self.spec.origin());
+        let prompt = assembled.prompt;
+        let uncalibrated_prompt_estimate = assembled.uncalibrated_prompt_estimate;
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
             bail!("provider prompt tools diverged from the frozen registry");
         }
+        self.record_actual_send_view(&prompt, trigger)?;
+        let mut options = self.options.clone();
+        if attempt > 0
+            && options
+                .tool_choice
+                .as_ref()
+                .is_some_and(|choice| choice == "required")
+        {
+            options.tool_choice = None;
+        }
         let (observer, observations) = timing_observation_channel();
         let timing_cancel = cancel.clone();
-        let events = (self.stream_starter)(
-            self.spec.clone(),
-            prompt,
-            self.options.clone(),
-            cancel,
-            observer,
-        );
+        let events = (self.stream_starter)(self.spec.clone(), prompt, options, cancel, observer);
         let samples = self.timings.clone();
         let timing_task = tokio::spawn(collect_timing(
             observations,
@@ -263,8 +332,198 @@ impl RunDriver for InjectedRunDriver {
         Ok(ProviderAttempt {
             message_id: Uuid::now_v7().to_string(),
             initial_message: self.initial_message(),
+            uncalibrated_prompt_estimate,
             events,
         })
+    }
+
+    fn record_actual_send_view(
+        &self,
+        prompt: &PromptContext,
+        trigger: ProviderCallTrigger,
+    ) -> Result<()> {
+        let digest = provider_send_view_digest(prompt)?;
+        let mut progress = self
+            .send_view_progress
+            .lock()
+            .expect("send view progress lock");
+        if trigger == ProviderCallTrigger::FirstAfterUser {
+            // A durable recovery retry may be preempted by a newly injected
+            // user turn after its plan was staged. The new turn is an
+            // independent send-view lineage and must not inherit that staged
+            // digest.
+            progress.pending_recovery = None;
+        }
+        if let Some(expected) = progress.pending_recovery.take()
+            && expected != digest
+        {
+            bail!("overflow recovery preview diverged from the actual next provider send view");
+        }
+        progress.last_sent = Some(digest);
+        Ok(())
+    }
+
+    fn stage_recovered_send_view(&self, digest: [u8; 32]) -> Result<()> {
+        let mut progress = self
+            .send_view_progress
+            .lock()
+            .expect("send view progress lock");
+        let last_sent = progress.last_sent.ok_or_else(|| {
+            anyhow!("overflow recovery has no actual previous provider send view")
+        })?;
+        if last_sent == digest {
+            bail!("overflow recovery did not change the actual previous provider send view");
+        }
+        progress.pending_recovery = Some(digest);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RunDriver for InjectedRunDriver {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        if identity.generation() != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {}",
+                self.executor_generation,
+                identity.generation()
+            );
+        }
+        self.registry.validate_executor_identity(identity)?;
+        Ok(())
+    }
+
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        if generation != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {generation}",
+                self.executor_generation
+            );
+        }
+        Ok(())
+    }
+
+    fn set_hydrated_provider_context(
+        &self,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) {
+        self.assembler.set_provider_context(provider_context);
+    }
+
+    async fn apply_idle_memory_maintenance(&self, core: &mut RunCore) -> Result<bool> {
+        let maintenance = self.memory_maintenance.as_ref().ok_or_else(|| {
+            anyhow!("idle memory maintenance has no authenticated Store/hydration binding")
+        })?;
+        let applied = apply_ready_memory(maintenance.store.clone()).await?;
+        if applied == 0 {
+            return Ok(false);
+        }
+
+        let hydrated = maintenance
+            .store
+            .hydrate(&maintenance.lease, &maintenance.fence)
+            .await
+            .context("rehydrate memory after durable idle apply")?;
+        let hydrated = match hydrated {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
+                bail!(
+                    "idle memory apply committed but authenticated rehydration remains pending physical recovery for {} execution(s)",
+                    intents.len()
+                );
+            }
+            HydrationOutcome::LogicalRecoveryRequired { steps, .. } => {
+                bail!(
+                    "idle memory apply committed but authenticated rehydration remains pending logical recovery for {} step(s)",
+                    steps.len()
+                );
+            }
+        };
+        validate_hydrated_authority(
+            &hydrated,
+            self.executor_generation,
+            &maintenance.lease,
+            &maintenance.fence,
+        )
+        .context("rehydrated memory authority changed after idle apply")?;
+        let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
+            .context("rehydrated memory graph is invalid after idle apply")?;
+
+        // Session calls this only while it uniquely owns RunCore. Prepare
+        // every fallible value first, then refresh assembler and core before
+        // reporting success; provider admission cannot observe the old view.
+        self.assembler.install_hydrated_memory(
+            memory,
+            &hydrated.messages,
+            hydrated.provider_context.clone(),
+        )?;
+        core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+        Ok(true)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        // Derive the send view immediately before the provider call.  The
+        // runner's retained runtime_context anchors must not be mutated.
+        let trigger = if attempt == 0 {
+            ProviderCallTrigger::FirstAfterUser
+        } else {
+            ProviderCallTrigger::Continuation
+        };
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, trigger)
+            .await?;
+        self.start_provider_from_assembled(attempt, trigger, assembled, command_received_at, cancel)
+            .await
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.assembler
+            .set_provider_context(provider_context.to_vec());
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, trigger)
+            .await?;
+        self.start_provider_from_assembled(attempt, trigger, assembled, command_received_at, cancel)
+            .await
+    }
+
+    async fn start_provider_for_user_turn(
+        &self,
+        call: ProviderCallAttempt,
+        context: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.assembler
+            .set_provider_context(provider_context.to_vec());
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, call.trigger)
+            .await?;
+        self.start_provider_from_assembled(
+            call.user_turn_attempt,
+            call.trigger,
+            assembled,
+            command_received_at,
+            cancel,
+        )
+        .await
     }
 
     async fn execute_tool_observed(
@@ -321,10 +580,74 @@ impl RunDriver for InjectedRunDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[ContextMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
-        bail!("overflow context assembly is not supplied; T21 must provide it explicitly")
+        let replacement = self.assembler.recover_overflow(active_context)?;
+        if self.memory_maintenance.is_some() {
+            let recovered = self
+                .assembler
+                .assemble_for_call_with_estimate(active_context, ProviderCallTrigger::Continuation)
+                .await?;
+            self.stage_recovered_send_view(provider_send_view_digest(&recovered.prompt)?)?;
+            Ok(OverflowRecoveryOutcome::RetainCanonicalContext {
+                validated_send_view: replacement,
+            })
+        } else {
+            Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+        }
     }
+
+    fn install_committed_calibration(&self, ratio_bits: [u8; 8]) -> Result<()> {
+        self.assembler.install_committed_calibration(ratio_bits)
+    }
+
+    async fn apply_terminal(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+        message: &AssistantMessage,
+        provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        self.assembler
+            .apply_terminal(message_id, message_seq, message, provider_context)
+    }
+}
+
+fn validate_hydrated_authority(
+    hydrated: &HydratedRunState,
+    executor_generation: ProcessGeneration,
+    expected_lease: &ProcessGenerationLease,
+    expected_fence: &GenerationRecoveryFence,
+) -> Result<()> {
+    if expected_lease.generation() != executor_generation {
+        bail!("expected memory lease generation does not match the injected executor generation");
+    }
+    if expected_fence.generation() != expected_lease.generation()
+        || expected_fence.lease_id() != expected_lease.lease_id()
+    {
+        bail!("expected memory fence is not bound to the independently supplied lease");
+    }
+    if hydrated.lease != *expected_lease {
+        bail!("hydrated memory lease does not match the independently supplied authority");
+    }
+    if hydrated.fence != *expected_fence {
+        bail!("hydrated memory fence does not match the independently supplied authority");
+    }
+    if hydrated.receipt.intent_count != 0
+        || hydrated.receipt.personality_agent_id != *expected_lease.personality_agent_id()
+        || hydrated.receipt.generation != expected_lease.generation()
+        || hydrated.receipt.lease_id != expected_lease.lease_id()
+        || hydrated.receipt.fence_id != expected_fence.fence_id()
+    {
+        bail!("hydrated memory receipt does not prove the expected clean authenticated snapshot");
+    }
+    Ok(())
+}
+
+fn provider_send_view_digest(prompt: &PromptContext) -> Result<[u8; 32]> {
+    let encoded =
+        serde_json::to_vec(prompt).context("serialize actual provider send view for progress")?;
+    Ok(Sha256::digest(encoded).into())
 }
 
 impl Drop for InjectedRunDriver {
@@ -427,14 +750,20 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+    const OTHER_PAID: &str = "0198f0f4-9b72-7000-8000-000000000002";
     use crate::{
         agent::{RunCore, SequentialRunWorker, Session, SessionResult},
         gateway::InjectedStdioGateway,
         provider::{
-            ProviderTimingObservation, stream_with_api_key_observed,
+            ProviderTimingObservation,
+            overflow::OverflowSource,
+            stream_with_api_key_observed,
             types::{
-                AssistantContent, AssistantMessage, ContextMessage, Message, ProviderEvent,
-                ProviderOutput, StopReason, ToolDefinition, Usage, UserContent, UserMessage,
+                AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextAnchor,
+                ProviderContextItem, ProviderContextPayload, ProviderEvent, ProviderOutput,
+                StopReason, ToolDefinition, Usage, UserContent, UserMessage,
                 ValidatedToolArguments,
             },
         },
@@ -450,17 +779,34 @@ mod tests {
         ProcessGeneration::from_wire(raw).expect("valid test generation")
     }
 
+    fn json_lines_user_command(text: &str) -> Vec<u8> {
+        let mut command = serde_json::to_vec(&json!({
+            "seq": 1,
+            "command_id": "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "command": {
+                "type": "user_message",
+                "text": text,
+                "attachments": [],
+            },
+        }))
+        .expect("serialize authenticated JSON-lines command fixture");
+        command.push(b'\n');
+        command
+    }
+
     fn expected_tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
         let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
         let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
         let mut pair_digest = [0_u8; 64];
         pair_digest[..32].copy_from_slice(&assistant_digest);
         pair_digest[32..].copy_from_slice(&tool_call_digest);
-        let namespace = uuid::Uuid::from_bytes([
-            0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69,
-            0x9f, 0x31,
-        ]);
-        uuid::Uuid::new_v5(&namespace, &pair_digest).to_string()
+        uuid::Uuid::new_v5(
+            &super::super::run::TOOL_RESULT_MESSAGE_ID_NAMESPACE,
+            &pair_digest,
+        )
+        .to_string()
     }
 
     struct FakeTool {
@@ -520,6 +866,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: Vec::new(),
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         (
             ModelSpec::preset("kimi-k3").expect("preset"),
@@ -608,6 +955,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let driver = InjectedRunDriver::with_stream_starter(
             spec,
@@ -650,11 +998,11 @@ mod tests {
     }
 
     #[test]
-    fn construction_binds_remote_registry_to_executor_generation() {
+    fn construction_binds_remote_registry_to_complete_executor_identity() {
+        let identity = RpcIdentity::from_wire(PAID, 7, "boot-nonce").expect("identity");
         let client = Arc::new(ExecutorClient::new(
             "/tmp/sumi-unused-executor.sock",
-            RpcIdentity::from_wire(7, "boot-nonce").expect("identity"),
-            "conversation-1",
+            identity.clone(),
         ));
         let registry = remote_executor_registry(client).expect("remote registry");
         let prompt = PromptContext {
@@ -663,6 +1011,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let spec = ModelSpec::preset("kimi-k3").expect("preset");
         let workspace = WorkspacePaths::new("/workspace").expect("workspace");
@@ -693,6 +1042,260 @@ mod tests {
         )
         .expect("matching remote generation");
         assert_eq!(driver.executor_generation(), generation(7));
+        driver
+            .validate_runtime_identity(&identity)
+            .expect("complete executor identity matches");
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(OTHER_PAID, 7, "boot-nonce")
+                        .expect("wrong-PAID identity"),
+                )
+                .is_err()
+        );
+        assert!(
+            driver
+                .validate_runtime_identity(
+                    &RpcIdentity::from_wire(PAID, 7, "stale-boot-nonce")
+                        .expect("wrong-nonce identity"),
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrated_binding_rejects_same_generation_different_lease_or_fence() {
+        let store = Arc::new(
+            Store::session_test_store("injected-hydrated-authority")
+                .await
+                .expect("store"),
+        );
+        let generation = generation(7);
+        let hydrated_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "hydrated-lease",
+        )
+        .expect("hydrated lease");
+        let hydrated_fence = GenerationRecoveryFence::new(&hydrated_lease, "hydrated-fence")
+            .expect("hydrated fence");
+        let hydrated = match store
+            .hydrate(&hydrated_lease, &hydrated_fence)
+            .await
+            .expect("hydrate clean store")
+        {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("clean store must hydrate completely: {other:?}"),
+        };
+
+        let make_driver = || {
+            let (spec, prompt, registry, workspace) = dependencies();
+            InjectedRunDriver::with_stream_starter(
+                spec,
+                RequestOptions::default(),
+                Some(prompt),
+                Some(registry),
+                Some(workspace),
+                Some(generation),
+                inert_starter(),
+            )
+            .expect("driver")
+        };
+
+        let sumi_driver = make_driver()
+            .with_hydrated_memory(store.clone(), &hydrated_lease, &hydrated_fence, &hydrated)
+            .expect("matching authority binds authenticated Sumi memory");
+        let maintenance = sumi_driver
+            .memory_maintenance
+            .as_ref()
+            .expect("authenticated maintenance binding");
+        assert_eq!(maintenance.lease, hydrated_lease);
+        assert_eq!(maintenance.fence, hydrated_fence);
+        let mut clean_core = RunCore::new();
+        assert!(
+            !RunDriver::apply_idle_memory_maintenance(&sumi_driver, &mut clean_core)
+                .await
+                .expect("clean Sumi binding has no ready maintenance")
+        );
+
+        let stale_lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "same-generation-stale-lease",
+        )
+        .expect("stale lease");
+        let stale_lease_fence =
+            GenerationRecoveryFence::new(&stale_lease, hydrated_fence.fence_id())
+                .expect("stale lease fence");
+        let lease_error = make_driver()
+            .with_hydrated_memory(store.clone(), &stale_lease, &stale_lease_fence, &hydrated)
+            .err()
+            .expect("same-generation different lease must be rejected");
+        assert!(
+            lease_error
+                .to_string()
+                .contains("independently supplied authority")
+        );
+
+        let stale_fence = GenerationRecoveryFence::new(&hydrated_lease, "same-lease-stale-fence")
+            .expect("stale fence");
+        let fence_error = make_driver()
+            .with_hydrated_memory(store, &hydrated_lease, &stale_fence, &hydrated)
+            .err()
+            .expect("same-generation different fence must be rejected");
+        assert!(
+            fence_error
+                .to_string()
+                .contains("independently supplied authority")
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_canonical_overflow_blocks_an_identical_third_provider_view() {
+        let store = Arc::new(
+            Store::session_test_store("injected-overflow-send-progress")
+                .await
+                .expect("store"),
+        );
+        let generation = generation(9);
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "overflow-lease",
+        )
+        .expect("fixture lease");
+        let fence = GenerationRecoveryFence::new(&lease, "overflow-fence").expect("fixture fence");
+        let hydrated = match store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate clean store")
+        {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("clean store must hydrate completely: {other:?}"),
+        };
+
+        let (spec, prompt, registry, workspace) = dependencies();
+        let observed_prompts = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
+        let observed = observed_prompts.clone();
+        let starter: Arc<StreamStarter> = Arc::new(move |spec, prompt, _, cancel, _| {
+            observed.lock().expect("prompt capture lock").push(prompt);
+            let (_tx, rx) = mpsc::channel(1);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        });
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec.clone(),
+            RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation),
+            starter,
+        )
+        .expect("driver")
+        .with_hydrated_memory(store, &lease, &fence, &hydrated)
+        .expect("bind authenticated memory");
+
+        // The first-user hard threshold admits this ~42.5k-token view. A
+        // continuation recovery must drop the large assistant to the ordinary
+        // 40k limit while retaining the active user.
+        let canonical = vec![
+            ContextMessage::Synthetic {
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::Text {
+                        text: "x".repeat(170_000),
+                        wire_item_index: 0,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: Utc::now(),
+                }),
+            },
+            ContextMessage::Synthetic {
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "latest active user".to_owned(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            },
+        ];
+        let core = RunCore::new();
+
+        let _first = RunDriver::start_provider_with_context(
+            &driver,
+            0,
+            &canonical,
+            &[],
+            ProviderCallTrigger::FirstAfterUser,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first provider view");
+        let first_recovery = RunDriver::plan_overflow_recovery(
+            &driver,
+            &core,
+            OverflowRecoveryRequest {
+                source: OverflowSource::ProviderCode,
+                ordinal: 1,
+            },
+            &canonical,
+        )
+        .await
+        .expect("first recovery changes the send view");
+        assert!(matches!(
+            first_recovery,
+            OverflowRecoveryOutcome::RetainCanonicalContext { .. }
+        ));
+
+        let _second = RunDriver::start_provider_with_context(
+            &driver,
+            1,
+            &canonical,
+            &[],
+            ProviderCallTrigger::Continuation,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second provider view matches staged recovery");
+        let no_progress = RunDriver::plan_overflow_recovery(
+            &driver,
+            &core,
+            OverflowRecoveryRequest {
+                source: OverflowSource::ProviderCode,
+                ordinal: 2,
+            },
+            &canonical,
+        )
+        .await
+        .expect_err("an identical third send view must fail closed");
+        assert!(
+            no_progress
+                .to_string()
+                .contains("did not change the actual previous provider send view")
+        );
+
+        let prompts = observed_prompts.lock().expect("prompt capture lock");
+        assert_eq!(prompts.len(), 2, "no identical third provider call is made");
+        assert_ne!(prompts[0], prompts[1]);
+        assert_eq!(prompts[0].messages.len(), 2);
+        assert_eq!(prompts[1].messages.len(), 1);
+        assert!(matches!(
+            prompts[1].messages[0],
+            ContextMessage::Synthetic {
+                message: Message::User(_)
+            }
+        ));
     }
 
     #[test]
@@ -765,6 +1368,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let driver = Arc::new(
             InjectedRunDriver::with_stream_starter(
@@ -785,7 +1389,7 @@ mod tests {
         let session = Session::start(
             store,
             zero_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(0),
         )
@@ -816,6 +1420,20 @@ mod tests {
             .await
             .expect("store");
         let pool = store.pool().clone();
+        let tables = [
+            "data_keys",
+            "agent_events",
+            "inbound_commands",
+            "tool_executions",
+        ];
+        let mut counts_before_start = Vec::with_capacity(tables.len());
+        for table in tables {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .expect("count before mismatched Session start");
+            counts_before_start.push((table, count));
+        }
         let gateway_store = Store::session_test_store("injected-generation-mismatch-gateway")
             .await
             .expect("gateway store");
@@ -823,7 +1441,7 @@ mod tests {
         let error = match Session::start(
             store,
             mismatch_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -838,17 +1456,15 @@ mod tests {
                 .contains("does not match Session generation")
         );
         assert_eq!(starts.load(Ordering::SeqCst), 0);
-        for table in [
-            "data_keys",
-            "agent_events",
-            "inbound_commands",
-            "tool_executions",
-        ] {
+        for (table, count_before_start) in counts_before_start {
             let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&pool)
                 .await
                 .expect("count");
-            assert_eq!(count, 0, "mismatch mutated {table}");
+            assert_eq!(
+                count, count_before_start,
+                "generation mismatch mutated {table}"
+            );
         }
     }
 
@@ -951,6 +1567,7 @@ mod tests {
             messages: Vec::new(),
             provider_context: Vec::new(),
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let driver = InjectedRunDriver::with_stream_starter(
             ModelSpec::preset("kimi-k3").expect("preset"),
@@ -1026,6 +1643,52 @@ mod tests {
                 .iter()
                 .all(|sample| sample.request_sent_to_first_public_delta
                     == Some(Duration::from_millis(100)))
+        );
+    }
+
+    #[tokio::test]
+    async fn required_tool_choice_applies_only_to_the_first_attempt() {
+        let (spec, prompt, registry, workspace) = dependencies();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let starter: Arc<StreamStarter> =
+            Arc::new(move |spec, _context, options, cancel, observer| {
+                sink.lock()
+                    .expect("observed options")
+                    .push(options.tool_choice);
+                let sent = Instant::now();
+                observer.observe(ProviderTimingObservation::RequestSent(sent));
+                let (tx, rx) = mpsc::channel(1);
+                tx.try_send(ProviderEvent::Start).expect("start");
+                drop(tx);
+                ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+            });
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions {
+                tool_choice: Some(json!("required")),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(1)),
+            starter,
+        )
+        .expect("driver");
+
+        driver
+            .start_provider_for_command(0, &[], None, CancellationToken::new())
+            .await
+            .expect("first attempt");
+        driver
+            .start_provider_for_command(1, &[], None, CancellationToken::new())
+            .await
+            .expect("continuation attempt");
+
+        assert_eq!(
+            *observed.lock().expect("observed options"),
+            vec![Some(json!("required")), None]
         );
     }
 
@@ -1277,14 +1940,17 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"fail\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("fail"))
+            .await
+            .expect("command");
         let mut lines = BufReader::new(event_read).lines();
         let mut frames = Vec::new();
         loop {
@@ -1328,6 +1994,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ]
         );
         assert!(
@@ -1461,15 +2128,19 @@ mod tests {
             .expect("driver"),
         );
         let worker = Arc::new(SequentialRunWorker::new(driver.clone()));
-        let session = Session::start(store, gateway, RunCore::new(), worker, generation(11))
-            .await
-            .expect("session");
+        let session = Session::start(
+            store,
+            gateway,
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            generation(11),
+        )
+        .await
+        .expect("session");
         let session_task = tokio::spawn(session.run());
 
         command_write
-            .write_all(
-                b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"run\",\"attachments\":[]}}\n",
-            )
+            .write_all(&json_lines_user_command("run"))
             .await
             .expect("command");
         let mut lines = BufReader::new(event_read).lines();
@@ -1537,6 +2208,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ],
             "user_message -> public event sequence changed: {event_types:?}"
         );
@@ -1569,6 +2241,7 @@ mod tests {
                 "message_end",
                 "turn_end",
                 "agent_end",
+                "command_disposition",
             ],
             "durable event sequence changed: {durable_types:?}"
         );
@@ -1607,7 +2280,10 @@ mod tests {
         );
         assert_eq!(
             start_ids[0],
-            user_message_id("018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a")
+            user_message_id(
+                &crate::gateway::test_personality_agent_id(),
+                "018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a",
+            )
         );
         assert_eq!(
             message_ends[2].pointer("/envelope/event/message/content"),
@@ -1808,7 +2484,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver.clone())),
             generation(11),
         )
@@ -1910,14 +2586,17 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold"))
+            .await
+            .expect("command");
         started_rx.await.expect("provider started");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)
@@ -1993,6 +2672,7 @@ mod tests {
             messages: vec![],
             provider_context: vec![],
             tools: registry.definitions(),
+            replay_provenance: None,
         };
         let (base_url, server, _) = serve_tool_then_text().await;
         let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
@@ -2029,14 +2709,17 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
         .await
         .expect("session");
         let session_task = tokio::spawn(session.run());
-        command_write.write_all(b"{\"seq\":1,\"command_id\":\"018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a\",\"command\":{\"type\":\"user_message\",\"text\":\"hold tool\",\"attachments\":[]}}\n").await.expect("command");
+        command_write
+            .write_all(&json_lines_user_command("hold tool"))
+            .await
+            .expect("command");
         entered_rx.await.expect("tool entered");
         drop(command_write);
         let result = tokio::time::timeout(Duration::from_secs(2), session_task)
@@ -2056,16 +2739,17 @@ mod tests {
 
     #[tokio::test]
     async fn provider_send_view_is_transformed_without_mutating_active_context() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(None));
         let captured = sent.clone();
         let starter: Arc<StreamStarter> =
             Arc::new(move |spec, prompt, _options, cancel, _observer| {
-                *captured.lock().expect("sent") = prompt.messages;
+                *captured.lock().expect("sent") = Some(prompt);
                 let (tx, rx) = mpsc::channel(1);
                 drop(tx);
                 ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
             });
-        let (spec, prompt, registry, workspace) = dependencies();
+        let (_, prompt, registry, workspace) = dependencies();
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let driver = InjectedRunDriver::with_stream_starter(
             spec.clone(),
             RequestOptions::default(),
@@ -2129,32 +2813,137 @@ mod tests {
                 timestamp: Utc::now(),
             }),
         };
-        let active_context = vec![user, error, cross_model];
+        let same_model_owner = ContextMessage::Persisted {
+            id: "a2".to_owned(),
+            seq: 4,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Text {
+                        text: "same-model visible".to_owned(),
+                        wire_item_index: 0,
+                    },
+                    AssistantContent::Thinking {
+                        thinking: "same-model private".to_owned(),
+                        signature_field: "reasoning_content".to_owned(),
+                        wire_item_index: 1,
+                    },
+                ],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let active_context = vec![user, error, cross_model, same_model_owner];
         let active_context_clone = active_context.clone();
+        let error_provider_context = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "e1".to_owned(),
+                message_seq: 2,
+            },
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "e1".to_owned(),
+                message_seq: 2,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: spec.protocol,
+                item: json!({
+                    "id": "rs-error",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-error-reasoning",
+                }),
+            },
+        };
+        let error_provider_context = ProviderContextItemWithFootprint::new(
+            error_provider_context.clone(),
+            crate::memory::estimate::eviction_footprint_for_payload(
+                &spec,
+                &error_provider_context.payload,
+            )
+            .expect("error context footprint"),
+        );
+        let surviving_provider_context = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "a2".to_owned(),
+                message_seq: 4,
+            },
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "a2".to_owned(),
+                message_seq: 4,
+            }),
+            wire_item_index: Some(1),
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: spec.protocol,
+                item: json!({
+                    "id": "rs-survives",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-surviving-reasoning",
+                }),
+            },
+        };
+        let surviving_provider_context_with_footprint = ProviderContextItemWithFootprint::new(
+            surviving_provider_context.clone(),
+            crate::memory::estimate::eviction_footprint_for_payload(
+                &spec,
+                &surviving_provider_context.payload,
+            )
+            .expect("surviving context footprint"),
+        );
         driver
-            .start_provider_for_command(0, &active_context, None, CancellationToken::new())
+            .start_provider_with_context(
+                0,
+                &active_context,
+                &[
+                    error_provider_context,
+                    surviving_provider_context_with_footprint,
+                ],
+                ProviderCallTrigger::FirstAfterUser,
+                None,
+                CancellationToken::new(),
+            )
             .await
             .expect("start");
 
-        let captured = sent.lock().expect("captured").clone();
+        let captured = sent
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("provider prompt");
         let expected = crate::memory::transform::transform(&active_context, &spec.origin());
         assert_eq!(
-            captured, expected,
+            captured.messages, expected,
             "provider must receive the transformed send view"
+        );
+        assert_eq!(
+            captured.provider_context,
+            vec![surviving_provider_context],
+            "only provider context whose exact anchor survives transform may be sent"
         );
         assert_eq!(
             active_context, active_context_clone,
             "retained active context must not be mutated"
         );
         assert_eq!(
-            captured.len(),
-            2,
-            "Error assistant must be excluded while cross-model visible text is retained"
+            captured.messages.len(),
+            3,
+            "Error assistant must be excluded while cross-model visible text and same-model owner are retained"
         );
         let ContextMessage::Persisted {
             message: Message::Assistant(assistant),
             ..
-        } = &captured[1]
+        } = &captured.messages[1]
         else {
             panic!("expected transformed cross-model assistant");
         };

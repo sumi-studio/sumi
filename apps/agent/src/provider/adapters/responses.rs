@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{self, Write},
+};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
@@ -14,7 +16,7 @@ use crate::provider::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent, UserMessage,
+        Usage, UserContent, UserMessage, VerifiedReplayProvenance,
     },
 };
 
@@ -74,6 +76,7 @@ pub struct ResponsesTerminal {
     pub usage: Usage,
     pub error_message: Option<String>,
     pub provider_code: Option<String>,
+    pub response_model: Option<String>,
     pub provider_context: Vec<ProviderContextFragment>,
 }
 
@@ -190,10 +193,13 @@ fn build_replay_probe_request_with_usage(
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 1,
     };
+    let origin = spec.origin();
     let mut provider_context = vec![ProviderContextItem {
+        retention_owner: anchor.clone(),
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::OpenAiResponses,
             item: json!({
@@ -206,9 +212,11 @@ fn build_replay_probe_request_with_usage(
     }];
     if let Some(fragment) = fragment {
         provider_context.push(ProviderContextItem {
+            retention_owner: anchor.clone(),
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin,
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: fragment.clone(),
@@ -248,6 +256,7 @@ fn build_replay_probe_request_with_usage(
         ],
         provider_context,
         tools: Vec::new(),
+        replay_provenance: None,
     };
     build_request(&spec, &context, &RequestOptions::default())
 }
@@ -288,9 +297,6 @@ pub fn build_compact_request(
         "input".into(),
         Value::Array(convert_input(spec, context, true)?),
     );
-    if compat.supports_store {
-        request.insert("store".into(), json!(false));
-    }
     Ok(Value::Object(request))
 }
 
@@ -302,36 +308,25 @@ pub(in crate::provider) fn derive_compaction_coverage(
     if !compat.supports_native_compact {
         return Err(ResponsesAdapterError::UnsupportedProtocol);
     }
-    let mut previous: Option<u64> = None;
-    let mut persisted_started = false;
-    for message in &context.messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(ResponsesAdapterError::InvalidContext(
-                    "native compaction requires persisted messages to form a trailing suffix"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "persisted message sequence must be greater than zero".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(*seq)
-        {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "persisted message sequence is duplicated, nonmonotonic, or gapped".into(),
-            ));
-        }
-        previous = Some(*seq);
+    let through_message_seq = match context
+        .verified_replay_provenance_for(&spec.origin())
+        .map_err(ResponsesAdapterError::InvalidContext)?
+    {
+        Some(VerifiedReplayProvenance::SumiNormalized {
+            canonical_through_seq,
+            ..
+        }) => canonical_through_seq,
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            native_coverage_through_seq,
+            canonical_suffix_through_seq,
+            ..
+        }) => Some(canonical_suffix_through_seq.unwrap_or(native_coverage_through_seq)),
+        None => crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(ResponsesAdapterError::InvalidContext)?,
     }
-    let through_message_seq = previous.ok_or_else(|| {
+    .ok_or_else(|| {
         ResponsesAdapterError::InvalidContext(
-            "native compaction requires at least one persisted message".into(),
+            "native compaction requires authenticated persisted coverage".into(),
         )
     })?;
     let context_fingerprint = context_fingerprint(spec, context)?;
@@ -346,21 +341,22 @@ fn context_fingerprint(
     context: &PromptContext,
 ) -> Result<String, ResponsesAdapterError> {
     ensure_responses_spec(spec)?;
-    let tools = serde_json::to_vec(&context.tools)
-        .map_err(|error| ResponsesAdapterError::InvalidContext(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    for bytes in [
-        spec.provider_instance_id().as_bytes(),
-        b"open_ai_responses",
-        spec.id.as_bytes(),
-        context.system_prompt.as_bytes(),
-        tools.as_slice(),
-        b"", // Responses currently has no request beta header.
-    ] {
-        hasher.update(bytes.len().to_be_bytes());
-        hasher.update(bytes);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    crate::provider::context_fingerprint::compute_context_fingerprint(
+        spec,
+        &context.system_prompt,
+        &context.tools,
+    )
+    .map_err(|error| match error {
+        crate::provider::context_fingerprint::ContextFingerprintError::UnsupportedProtocol(_) => {
+            ResponsesAdapterError::UnsupportedProtocol
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ToolsSerialize(error) => {
+            ResponsesAdapterError::InvalidContext(error.to_string())
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ProtocolCompatMismatch {
+            ..
+        } => ResponsesAdapterError::UnsupportedProtocol,
+    })
 }
 
 pub(in crate::provider) fn parse_compact_response(
@@ -883,6 +879,15 @@ fn convert_input(
     native_compaction: bool,
 ) -> Result<Vec<Value>, ResponsesAdapterError> {
     let compat = ensure_responses_spec(spec)?;
+    crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
+        .map_err(ResponsesAdapterError::InvalidContext)?;
+    let replay_provenance = context
+        .verified_replay_provenance_for(&spec.origin())
+        .map_err(ResponsesAdapterError::InvalidContext)?;
+    if replay_provenance.is_none() {
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(ResponsesAdapterError::InvalidContext)?;
+    }
     let replay_encrypted_reasoning = spec.reasoning && compat.supports_encrypted_reasoning;
     let mut output = Vec::new();
     let has_foreign_native = context.provider_context.iter().any(|item| {
@@ -901,18 +906,43 @@ fn convert_input(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
-        match prepare_native_window(spec, context, &compacted) {
-            Ok(native) => native,
-            Err(error) => {
-                tracing::warn!(reason = %error, "discarded stale Responses native context");
-                None
+    let native_enabled = native_compaction && compat.supports_native_compact && !has_foreign_native;
+    let native = match &replay_provenance {
+        Some(VerifiedReplayProvenance::ProviderNativeExact {
+            provider_origin,
+            native_coverage_through_seq,
+            ..
+        }) => {
+            if !native_enabled {
+                return Err(ResponsesAdapterError::InvalidContext(
+                    "bound native Responses replay cannot be discarded".into(),
+                ));
             }
+            Some(
+                prepare_native_window(
+                    spec,
+                    context,
+                    &compacted,
+                    provider_origin,
+                    *native_coverage_through_seq,
+                )
+                .map_err(ResponsesAdapterError::InvalidContext)?
+                .ok_or_else(|| {
+                    ResponsesAdapterError::InvalidContext(
+                        "bound native Responses replay is missing its compacted window".into(),
+                    )
+                })?,
+            )
         }
-    } else {
-        None
+        Some(VerifiedReplayProvenance::SumiNormalized { .. }) => None,
+        None if compacted.is_empty() && !has_foreign_native => None,
+        None => {
+            return Err(ResponsesAdapterError::InvalidContext(
+                "unbound prompt cannot replay or discard native provider context".into(),
+            ));
+        }
     };
-    let (coverage_seq, mut native_items) = native
+    let (coverage_seq, native_items) = native
         .map(|(coverage, items)| (Some(coverage), Some(items)))
         .unwrap_or((None, None));
     for memory in &context.memory_blocks {
@@ -931,6 +961,9 @@ fn convert_input(
                 ),
             }],
         }));
+    }
+    if let Some(items) = native_items {
+        output.extend(items);
     }
 
     let mut context_by_anchor: BTreeMap<(String, u64), Vec<&ProviderContextItem>> = BTreeMap::new();
@@ -965,16 +998,9 @@ fn convert_input(
 
     let mut previous_suffix_seq = None;
     let mut suffix_started = false;
-    let mut persisted_started = false;
     for message in &context.messages {
         let (anchor, message) = match message {
             ContextMessage::Persisted { id, seq, message } => {
-                if !persisted_started {
-                    persisted_started = true;
-                    if let Some(items) = native_items.take() {
-                        output.extend(items);
-                    }
-                }
                 if coverage_seq.is_some_and(|coverage| *seq <= coverage) {
                     if suffix_started {
                         return Err(ResponsesAdapterError::InvalidContext(
@@ -1001,15 +1027,7 @@ fn convert_input(
                     message,
                 )
             }
-            ContextMessage::Synthetic { message } => {
-                if coverage_seq.is_some() && persisted_started {
-                    return Err(ResponsesAdapterError::InvalidContext(
-                        "native compacted window suffix requires persisted message sequence numbers"
-                            .into(),
-                    ));
-                }
-                (None, message)
-            }
+            ContextMessage::Synthetic { message } => (None, message),
         };
         match message {
             Message::User(user) => {
@@ -1043,7 +1061,22 @@ fn convert_input(
                     // at the exact provider origin. Cross-origin state is omitted from the
                     // send view alongside raw Thinking, while public transcript content
                     // remains replayable.
-                    for item in items.into_iter().filter(|_| same_origin) {
+                    for item in items {
+                        if item.provider_origin != assistant.origin {
+                            return Err(ResponsesAdapterError::InvalidContext(
+                                "encrypted reasoning provider_origin does not match its anchored assistant origin"
+                                    .into(),
+                            ));
+                        }
+                        if !same_origin {
+                            continue;
+                        }
+                        if item.provider_origin != spec.origin() {
+                            return Err(ResponsesAdapterError::InvalidContext(
+                                "encrypted reasoning provider_origin does not match the selected Responses origin"
+                                    .into(),
+                            ));
+                        }
                         let wire = item.wire_item_index.ok_or_else(|| {
                             ResponsesAdapterError::InvalidContext(
                                 "encrypted reasoning is missing wire_item_index".into(),
@@ -1179,11 +1212,6 @@ fn convert_input(
             }
         }
     }
-    if native_items.is_some() {
-        return Err(ResponsesAdapterError::InvalidContext(
-            "native compacted window requires a persisted message suffix".into(),
-        ));
-    }
     if !context_by_anchor.is_empty() {
         return Err(ResponsesAdapterError::InvalidContext(
             "provider context anchor was not found in L0".into(),
@@ -1196,6 +1224,8 @@ fn prepare_native_window(
     spec: &ModelSpec,
     context: &PromptContext,
     compacted: &[(&Vec<Value>, &NativeCompactionCoverage)],
+    bound_origin: &crate::provider::types::ProviderOrigin,
+    bound_coverage: u64,
 ) -> Result<Option<(u64, Vec<Value>)>, String> {
     let Some((items, coverage)) = compacted.first().copied() else {
         return Ok(None);
@@ -1213,6 +1243,17 @@ fn prepare_native_window(
             )
         })
         .expect("compacted entry came from provider_context");
+    if native_item.provider_origin != spec.origin() {
+        return Err(
+            "native compacted window provider_origin does not match the selected Responses origin"
+                .into(),
+        );
+    }
+    if native_item.provider_origin != *bound_origin
+        || coverage.through_message_seq != bound_coverage
+    {
+        return Err("native compacted window does not match its assembler replay binding".into());
+    }
     if native_item.origin_message.is_some() || native_item.wire_item_index.is_some() {
         return Err("native compacted window has reasoning placement metadata".into());
     }
@@ -1236,49 +1277,7 @@ fn prepare_native_window(
             .map_err(|error| format!("invalid native compacted window item: {error}"))?;
         validated.push(item.clone());
     }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)?;
     Ok(Some((coverage.through_message_seq, validated)))
-}
-
-fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(
-                    "native suffix contains synthetic content after persisted history".into(),
-                );
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            );
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
-            {
-                return Err("native suffix must begin exactly at coverage + 1".into());
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err("covered history appears after the native suffix".into());
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous
-        .ok_or_else(|| "native compacted window requires persisted replay history".to_owned())?;
-    if coverage > max_seq {
-        return Err(
-            "native compacted window coverage exceeds the latest persisted message sequence".into(),
-        );
-    }
-    Ok(())
 }
 
 fn escape_memory_text(text: &str) -> String {
@@ -2176,8 +2175,9 @@ impl ResponsesReceiveState {
                 Ok(ResponsesPush::default())
             }
             "reasoning" => {
+                validate_canonical_reasoning_item(item)
+                    .map_err(ResponsesAdapterError::InvalidEvent)?;
                 let final_summary = reasoning_summary_text(item)?;
-                validate_reasoning_content(item).map_err(ResponsesAdapterError::InvalidEvent)?;
                 let Some(OutputSlot::Reasoning {
                     id,
                     summary_slot,
@@ -2207,7 +2207,11 @@ impl ResponsesReceiveState {
                 let started = *started;
                 let summary_slot = *summary_slot;
                 let encrypted = optional_encrypted_content(item)?;
-                self.commit_charges(encrypted.map_or(0, str::len), usize::from(started), 0)?;
+                // Durability replays the canonical JSON object as a whole, so
+                // its complete compact footprint belongs to adapter state.
+                let retained_item_bytes =
+                    serialized_json_bytes(item, self.budget.max_content_bytes)?;
+                self.commit_charges(retained_item_bytes, usize::from(started), 0)?;
                 self.completed_items
                     .insert(index, Value::Object(item.clone()));
                 self.slots.remove(&index);
@@ -2258,6 +2262,11 @@ impl ResponsesReceiveState {
         let snapshot = self.snapshot();
         let result = (|| -> Result<ResponsesPush, ResponsesAdapterError> {
             self.observe_response_identity(object)?;
+            if self.response_model.is_none() {
+                return Err(ResponsesAdapterError::InvalidEvent(
+                    "terminal response must include or follow a non-empty response.model".into(),
+                ));
+            }
             if self
                 .slots
                 .values()
@@ -2327,8 +2336,12 @@ impl ResponsesReceiveState {
             } else {
                 (String::new(), String::new())
             };
-            let (provider_context, opaque_bytes) =
-                backfilled_reasoning_fragments(response, &self.reasoning_fragments)?;
+            let (provider_context, opaque_bytes) = backfilled_reasoning_fragments(
+                response,
+                &self.reasoning_fragments,
+                self.content_bytes,
+                self.budget.max_content_bytes,
+            )?;
             let mut events = Vec::new();
             self.commit_charges(opaque_bytes, self.slots.len().saturating_add(1), 0)?;
             self.reasoning_fragments = provider_context;
@@ -2380,6 +2393,7 @@ impl ResponsesReceiveState {
                     } else {
                         None
                     },
+                    response_model: self.response_model.clone(),
                     provider_context: self.provider_context(),
                 }),
             })
@@ -2420,9 +2434,19 @@ impl ResponsesReceiveState {
             .ok_or_else(|| {
                 ResponsesAdapterError::InvalidEvent("response.output must be an array".into())
             })?;
-        if output.len() != self.completed_items.len()
-            || self.completed_items.len() != self.output_identities.len()
-        {
+        if self.completed_items.len() != self.output_identities.len() {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "terminal response output is missing or reordered".into(),
+            ));
+        }
+        // The ChatGPT Codex Responses endpoint sends each canonical item through
+        // output_item.done, then deliberately omits the repeated terminal copy.
+        // An empty terminal output is therefore complete only when every
+        // observed identity already has a validated item.done record.
+        if output.is_empty() {
+            return Ok(());
+        }
+        if output.len() != self.completed_items.len() {
             return Err(ResponsesAdapterError::InvalidEvent(
                 "terminal response output is missing or reordered".into(),
             ));
@@ -2497,6 +2521,7 @@ impl ResponsesReceiveState {
                     usage: self.usage.clone(),
                     error_message: Some(message),
                     provider_code: Some(code),
+                    response_model: self.response_model.clone(),
                     provider_context: self.provider_context(),
                 }),
             })
@@ -2543,9 +2568,11 @@ impl ResponsesReceiveState {
                 .as_deref()
                 .is_some_and(|known| known != model)
         {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "response identity changed during stream".into(),
-            ));
+            tracing::debug!(
+                observed_model = model,
+                prior_model = ?self.response_model,
+                "provider reported a different model string during stream; retaining first observed"
+            );
         }
         let new_id = self.response_id.is_none();
         let new_model = self.response_model.is_none().then_some(model).flatten();
@@ -2619,6 +2646,46 @@ fn checked_counter(
         return Err(ResponsesAdapterError::ResponseLimitExceeded { resource, limit });
     }
     Ok(next)
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(bytes) = self.bytes.checked_add(buffer.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::other("serialized JSON byte count overflowed"));
+        };
+        self.bytes = bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes(
+    value: &Map<String, Value>,
+    limit: usize,
+) -> Result<usize, ResponsesAdapterError> {
+    let mut counter = JsonByteCounter::default();
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if counter.overflowed {
+            return Err(ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit,
+            });
+        }
+        return Err(ResponsesAdapterError::InvalidEvent(format!(
+            "reasoning item serialization failed: {error}"
+        )));
+    }
+    Ok(counter.bytes)
 }
 
 fn required_str<'a>(
@@ -2907,6 +2974,8 @@ fn item_identity_bytes(item: &Map<String, Value>) -> Result<usize, ResponsesAdap
 fn backfilled_reasoning_fragments(
     response: &Map<String, Value>,
     fragments: &[(String, ProviderContextFragment)],
+    current_content_bytes: usize,
+    max_content_bytes: usize,
 ) -> Result<(Vec<(String, ProviderContextFragment)>, usize), ResponsesAdapterError> {
     let output = response
         .get("output")
@@ -2914,6 +2983,14 @@ fn backfilled_reasoning_fragments(
         .ok_or_else(|| {
             ResponsesAdapterError::InvalidEvent("response.output must be an array".into())
         })?;
+    if output.is_empty() {
+        return Ok((fragments.to_vec(), 0));
+    }
+    let retained_ids = fragments
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    let mut additional_bytes = 0usize;
     let mut encrypted = HashMap::new();
     for (index, item) in output.iter().enumerate() {
         let Some(item) = item.as_object() else {
@@ -2932,10 +3009,28 @@ fn backfilled_reasoning_fragments(
         } else {
             None
         };
-        if let Some(encrypted_content) = encrypted_content
-            && encrypted
+        if encrypted_content.is_some() {
+            let id = required_str(item, "id")?;
+            if !retained_ids.contains(id) {
+                // Preflight a terminal-only opaque item before cloning it into
+                // the retained context returned to the consumer.
+                let retained_item_bytes = serialized_json_bytes(item, max_content_bytes)?;
+                additional_bytes = additional_bytes.checked_add(retained_item_bytes).ok_or(
+                    ResponsesAdapterError::ResponseLimitExceeded {
+                        resource: "content_bytes",
+                        limit: max_content_bytes,
+                    },
+                )?;
+                checked_counter(
+                    current_content_bytes,
+                    additional_bytes,
+                    max_content_bytes,
+                    "content_bytes",
+                )?;
+            }
+            if encrypted
                 .insert(
-                    required_str(item, "id")?.to_owned(),
+                    id.to_owned(),
                     (
                         u32::try_from(index).map_err(|_| {
                             ResponsesAdapterError::InvalidEvent(
@@ -2943,14 +3038,14 @@ fn backfilled_reasoning_fragments(
                             )
                         })?,
                         item.clone(),
-                        encrypted_content.len(),
                     ),
                 )
                 .is_some()
-        {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "duplicate encrypted reasoning id in terminal output".into(),
-            ));
+            {
+                return Err(ResponsesAdapterError::InvalidEvent(
+                    "duplicate encrypted reasoning id in terminal output".into(),
+                ));
+            }
         }
     }
     let mut result = fragments.to_vec();
@@ -2961,7 +3056,7 @@ fn backfilled_reasoning_fragments(
                 "duplicate retained reasoning fragment id".into(),
             ));
         }
-        let Some((index, item, _)) = encrypted.remove(id) else {
+        let Some((index, item)) = encrypted.remove(id) else {
             return Err(ResponsesAdapterError::InvalidEvent(
                 "retained encrypted reasoning is orphaned from terminal output".into(),
             ));
@@ -2976,14 +3071,7 @@ fn backfilled_reasoning_fragments(
             item: Value::Object(item),
         };
     }
-    let mut additional_bytes = 0usize;
-    for (id, (index, item, encrypted_len)) in encrypted {
-        additional_bytes = additional_bytes.checked_add(encrypted_len).ok_or(
-            ResponsesAdapterError::ResponseLimitExceeded {
-                resource: "content_bytes",
-                limit: usize::MAX,
-            },
-        )?;
+    for (id, (index, item)) in encrypted {
         result.push((
             id,
             ProviderContextFragment {
@@ -3112,52 +3200,7 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
             validate_optional_caller(object.get("caller"), "function_call_output", true)?;
         }
         "reasoning" => {
-            ensure_only_fields(
-                object,
-                &[
-                    "id",
-                    "summary",
-                    "type",
-                    "content",
-                    "encrypted_content",
-                    "status",
-                ],
-                "reasoning",
-            )?;
-            if !object.get("id").is_some_and(Value::is_string)
-                || !object.get("summary").is_some_and(Value::is_array)
-            {
-                return Err("invalid reasoning item".into());
-            }
-            for part in object["summary"]
-                .as_array()
-                .expect("checked reasoning summary array")
-            {
-                let part = part
-                    .as_object()
-                    .ok_or_else(|| "reasoning summary part must be an object".to_owned())?;
-                ensure_only_fields(part, &["text", "type"], "reasoning summary part")?;
-                if part.get("type").and_then(Value::as_str) != Some("summary_text")
-                    || !part.get("text").is_some_and(Value::is_string)
-                {
-                    return Err(
-                        "reasoning summary part must be summary_text with string text".into(),
-                    );
-                }
-            }
-            validate_reasoning_content(object)?;
-            if let Some(encrypted) = object.get("encrypted_content") {
-                match encrypted {
-                    Value::Null => {}
-                    Value::String(encrypted) if !encrypted.is_empty() => {}
-                    _ => {
-                        return Err(
-                            "reasoning encrypted_content must be null or a non-empty string".into(),
-                        );
-                    }
-                }
-            }
-            validate_optional_status(object, "reasoning", false)?;
+            validate_canonical_reasoning_item(object)?;
         }
         "compaction" => {
             ensure_only_fields(
@@ -3423,6 +3466,53 @@ fn require_u64(object: &Map<String, Value>, field: &str, parent: &str) -> Result
     }
 }
 
+fn validate_canonical_reasoning_item(object: &Map<String, Value>) -> Result<(), String> {
+    ensure_only_fields(
+        object,
+        &[
+            "id",
+            "summary",
+            "type",
+            "content",
+            "encrypted_content",
+            "status",
+        ],
+        "reasoning",
+    )?;
+    if !object.get("id").is_some_and(Value::is_string)
+        || !object.get("summary").is_some_and(Value::is_array)
+    {
+        return Err("invalid reasoning item".into());
+    }
+    for part in object["summary"]
+        .as_array()
+        .expect("checked reasoning summary array")
+    {
+        let part = part
+            .as_object()
+            .ok_or_else(|| "reasoning summary part must be an object".to_owned())?;
+        ensure_only_fields(part, &["text", "type"], "reasoning summary part")?;
+        if part.get("type").and_then(Value::as_str) != Some("summary_text")
+            || !part.get("text").is_some_and(Value::is_string)
+        {
+            return Err("reasoning summary part must be summary_text with string text".into());
+        }
+    }
+    validate_reasoning_content(object)?;
+    if let Some(encrypted) = object.get("encrypted_content") {
+        match encrypted {
+            Value::Null => {}
+            Value::String(encrypted) if !encrypted.is_empty() => {}
+            _ => {
+                return Err(
+                    "reasoning encrypted_content must be null or a non-empty string".into(),
+                );
+            }
+        }
+    }
+    validate_optional_status(object, "reasoning", false)
+}
+
 fn validate_reasoning_content(object: &Map<String, Value>) -> Result<(), String> {
     let Some(content) = object.get("content") else {
         return Ok(());
@@ -3581,6 +3671,9 @@ fn validate_prompt_cache_breakpoint(value: Option<&Value>, parent: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::context_assembler::{
+        bind_native_replay_for_test, bind_sumi_replay_for_origin_test,
+    };
     use crate::provider::types::{
         AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
@@ -3646,6 +3739,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let body = build_request(&spec(), &context, &RequestOptions::default()).expect("request");
         assert_eq!(body["instructions"], "constitution");
@@ -3674,6 +3768,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         context.tools = vec![
             ToolDefinition {
@@ -3896,6 +3991,7 @@ mod tests {
                     }],
                     provider_context: vec![],
                     tools: vec![],
+                    replay_provenance: None,
                 },
                 &RequestOptions {
                     temperature: Some(temperature),
@@ -3923,6 +4019,7 @@ mod tests {
                 }],
                 provider_context: vec![],
                 tools: vec![],
+                replay_provenance: None,
             },
             &RequestOptions {
                 temperature: Some(0.7),
@@ -3935,9 +4032,9 @@ mod tests {
 
     #[test]
     fn official_sse_fixture_normalizes_all_supported_events() {
-        // Adapted from the official Responses streaming API example. Durable encrypted
-        // round-trip and live two-turn/tool evidence remain release-blocking until
-        // T17/T25; this fixture does not claim either gate.
+        // Adapted from the official Responses streaming API example. This test covers
+        // normalization only; the provenance ledger binds the separate durable
+        // round-trip, replay-order, and store=false gates that complete T25.
         let fixture = include_str!("../../../tests/fixtures/openai_responses_official.sse");
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         let mut events = Vec::new();
@@ -4073,6 +4170,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_may_omit_repeated_output_after_all_items_are_done() {
+        let mut values = fixture_values();
+        values.last_mut().unwrap()["response"]["output"] = json!([]);
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let mut terminal = None;
+        for value in values {
+            terminal = state
+                .push_json(&value.to_string())
+                .expect("Codex terminal omission is valid after item.done")
+                .terminal
+                .or(terminal);
+        }
+        let terminal = terminal.expect("terminal");
+        assert_eq!(terminal.reason, StopReason::ToolUse);
+        assert_eq!(terminal.provider_context.len(), 1);
+    }
+
+    #[test]
+    fn empty_terminal_output_requires_every_observed_item_to_finish() {
+        let mut values = fixture_values();
+        values[16]["type"] = json!("response.future.event");
+        values.last_mut().unwrap()["response"]["output"] = json!([]);
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        for value in &values[..values.len() - 1] {
+            state
+                .push_json(&value.to_string())
+                .expect("unknown event preserves its sequence slot");
+        }
+        assert!(
+            state
+                .push_json(&values.last().unwrap().to_string())
+                .expect_err("an empty terminal output cannot hide an unfinished item")
+                .to_string()
+                .contains("unfinished output items")
+        );
+    }
+
+    #[test]
     fn terminal_may_only_backfill_reasoning_encrypted_content() {
         let mut values = fixture_values();
         values[12]["item"]
@@ -4105,17 +4240,18 @@ mod tests {
     }
 
     #[test]
-    fn compaction_coverage_is_internal_canonical_and_requires_contiguous_persistence() {
+    fn compaction_coverage_is_internal_canonical_and_requires_strictly_increasing_persistence() {
         let spec = spec();
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(7), persisted_user(8)],
+            messages: vec![persisted_user(5), persisted_user(8), persisted_user(12)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let coverage = derive_compaction_coverage(&spec, &context).expect("coverage");
-        assert_eq!(coverage.through_message_seq, 8);
+        assert_eq!(coverage.through_message_seq, 12);
         assert_eq!(coverage.context_fingerprint.len(), 64);
         context.messages.insert(
             0,
@@ -4130,7 +4266,7 @@ mod tests {
             derive_compaction_coverage(&spec, &context)
                 .expect("leading synthetic prefix with persisted suffix")
                 .through_message_seq,
-            8
+            12
         );
         context.messages.remove(0);
 
@@ -4160,7 +4296,7 @@ mod tests {
             }],
             vec![persisted_user(7), persisted_user(7)],
             vec![persisted_user(8), persisted_user(7)],
-            vec![persisted_user(7), persisted_user(9)],
+            vec![persisted_user(0)],
             vec![
                 persisted_user(7),
                 ContextMessage::Synthetic {
@@ -4177,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_request_disables_provider_storage_when_supported() {
+    fn compact_request_omits_provider_storage_field() {
         let body = build_compact_request(
             &spec(),
             &PromptContext {
@@ -4186,10 +4322,14 @@ mod tests {
                 messages: vec![persisted_user(1)],
                 provider_context: vec![],
                 tools: vec![],
+                replay_provenance: None,
             },
         )
         .expect("compact request");
-        assert_eq!(body["store"], false);
+        assert!(
+            body.get("store").is_none(),
+            "compact responses must not include store"
+        );
     }
 
     #[test]
@@ -4235,9 +4375,11 @@ mod tests {
                 message: Message::Assistant(assistant),
             }],
             provider_context: vec![ProviderContextItem {
+                retention_owner: anchor.clone(),
                 origin_message: Some(anchor),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: source.origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -4249,12 +4391,24 @@ mod tests {
                 },
             }],
             tools: vec![],
+            replay_provenance: None,
         };
         let request = build_request(&target, &context, &RequestOptions::default()).unwrap();
         let wire = request.to_string();
         assert!(wire.contains("PUBLIC_TEXT_MARKER"));
         assert!(!wire.contains("RAW_THINKING_MARKER"));
         assert!(!wire.contains("OPAQUE_MARKER"));
+
+        let mut tampered_item_origin = context.clone();
+        tampered_item_origin.provider_context[0].provider_origin = target.origin();
+        let error = build_request(&target, &tampered_item_origin, &RequestOptions::default())
+            .expect_err("provider context must remain bound to its anchored assistant");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its anchored assistant origin"),
+            "{error}"
+        );
 
         let mut same_origin = context;
         if let Message::Assistant(assistant) = match &mut same_origin.messages[0] {
@@ -4265,6 +4419,7 @@ mod tests {
             assistant.model.clone_from(&target.id);
             assistant.provider.clone_from(&target.provider);
         }
+        same_origin.provider_context[0].provider_origin = target.origin();
         same_origin.provider_context[0].payload = ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::AnthropicMessages,
             item: json!({"malformed":"SAME_ORIGIN_MARKER"}),
@@ -4367,6 +4522,7 @@ mod tests {
                     messages: vec![],
                     provider_context: vec![],
                     tools: vec![],
+                    replay_provenance: None,
                 },
                 &RequestOptions::default()
             ),
@@ -4522,19 +4678,23 @@ mod tests {
                         timestamp: Utc::now(),
                     }),
                 },
-                persisted_user(7),
-                persisted_user(8),
                 persisted_user(9),
                 persisted_user(10),
             ],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let fingerprint = context_fingerprint(&spec, &context).unwrap();
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: window.clone(),
                 coverage: NativeCompactionCoverage {
@@ -4543,18 +4703,24 @@ mod tests {
                 },
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 8, Some(10))
+            .expect("bind exact assembler replay");
 
         let input = convert_input(&spec, &context, true).expect("valid native replay");
-        assert_eq!(input[0]["content"][0]["text"], "leading-synthetic");
-        assert_eq!(&input[1..=window.len()], window.as_slice());
+        assert_eq!(&input[..window.len()], window.as_slice());
+        assert_eq!(
+            input[window.len()]["content"][0]["text"],
+            "leading-synthetic"
+        );
         assert_eq!(input.len(), window.len() + 3);
         assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
         assert_eq!(input[window.len() + 2]["content"][0]["text"], "message-10");
 
-        let default_request = build_request(&spec, &context, &RequestOptions::default())
-            .expect("default three-layer request");
-        assert!(!default_request.to_string().contains("opaque"));
-        assert!(default_request.to_string().contains("message-7"));
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
 
         let request = build_request(
             &spec,
@@ -4569,68 +4735,160 @@ mod tests {
     }
 
     #[test]
-    fn stale_native_context_falls_back_to_durable_three_layer_view() {
+    fn native_compacted_window_replays_gapped_persisted_suffix() {
         let spec = spec();
+        let window = vec![
+            json!({"id":"m-old","type":"message","role":"user","content":[{"type":"input_text","text":"old"}]}),
+            json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"}),
+            json!({"type":"function_call_output","call_id":"old-call","output":[{"type":"input_text","text":"done"}]}),
+        ];
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(8), persisted_user(9)],
+            messages: vec![persisted_user(7), persisted_user(9)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
-        let native = ProviderContextItem {
+        let fingerprint = context_fingerprint(&spec, &context).unwrap();
+        context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-5".into(),
+                message_seq: 5,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: window.clone(),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 5,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        });
+        bind_native_replay_for_test(&mut context, spec.origin(), 5, Some(9))
+            .expect("bind exact gapped assembler replay");
+
+        let input = convert_input(&spec, &context, true)
+            .expect("valid native replay with global event gaps");
+        assert_eq!(input[..window.len()], window);
+        assert_eq!(input.len(), window.len() + 2);
+        assert_eq!(input[window.len()]["content"][0]["text"], "message-7");
+        assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
+
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("request reuses gapped canonical replay ordering");
+        assert_eq!(request["input"], Value::Array(input));
+    }
+
+    #[test]
+    fn sumi_bound_stale_native_context_falls_back_to_durable_three_layer_view() {
+        let spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![crate::provider::types::MemoryBlock {
+                layer: MemoryLayer::L1,
+                text: "memory".into(),
+                time_range: None,
+            }],
+            messages: vec![persisted_user(8), persisted_user(9)],
+            provider_context: vec![],
+            tools: vec![],
+            replay_provenance: None,
+        };
+        let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"})],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 8,
-                    context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+                    context_fingerprint: "stale".into(),
                 },
             },
         };
-        context.provider_context = vec![native.clone(), native.clone()];
-        let fallback = convert_input(&spec, &context, true).expect("duplicate fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
-
-        context.provider_context = vec![native.clone()];
-        context
-            .memory_blocks
-            .push(crate::provider::types::MemoryBlock {
-                layer: MemoryLayer::L1,
-                text: "memory".into(),
-                time_range: None,
-            });
-        let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
-        assert!(Value::Array(fallback).to_string().contains("memory"));
-        context.memory_blocks.clear();
-
-        if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
-            &mut context.provider_context[0].payload
-        {
-            coverage.context_fingerprint = "wrong".into();
-        }
-        let fallback = convert_input(&spec, &context, true).expect("fingerprint fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
-
         context.provider_context = vec![native];
-        context.messages = vec![persisted_user(10)];
-        let fallback = convert_input(&spec, &context, true).expect("suffix gap fallback");
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(9))
+            .expect("bind exact normalized assembler replay");
+        let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
         let fallback = Value::Array(fallback).to_string();
-        assert!(fallback.contains("message-10"));
+        assert!(fallback.contains("memory"));
+        assert!(fallback.contains("message-8"));
+        assert!(fallback.contains("message-9"));
         assert!(!fallback.contains("opaque"));
-        context.messages = vec![
-            persisted_user(9),
-            ContextMessage::Synthetic {
-                message: Message::User(UserMessage {
-                    content: vec![],
-                    timestamp: Utc::now(),
-                }),
-            },
-        ];
-        let fallback = convert_input(&spec, &context, true).expect("placement fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
+    }
+
+    #[test]
+    fn sumi_replay_destination_is_enforced_for_requests_and_coverage() {
+        let spec = spec();
+        let unbound = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(1)],
+            provider_context: vec![],
+            tools: vec![],
+            replay_provenance: None,
+        };
+        let mut context = unbound.clone();
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind Responses destination");
+
+        build_request(&spec, &context, &RequestOptions::default())
+            .expect("matching request destination");
+        assert_eq!(
+            derive_compaction_coverage(&spec, &context)
+                .expect("matching coverage destination")
+                .through_message_seq,
+            1
+        );
+
+        let mut different_model = spec.clone();
+        different_model.set_model_id("different-model");
+        let mut different_instance = spec.clone();
+        different_instance.account_scope = "different-account".into();
+        for destination in [different_model, different_instance] {
+            assert!(matches!(
+                build_request(&destination, &context, &RequestOptions::default()),
+                Err(ResponsesAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+            assert!(matches!(
+                derive_compaction_coverage(&destination, &context),
+                Err(ResponsesAdapterError::InvalidContext(message))
+                    if message.contains("destination does not match")
+            ));
+        }
+
+        let mut foreign_origin = spec.origin();
+        foreign_origin.protocol = ApiProtocol::AnthropicMessages;
+        let mut foreign_protocol = unbound;
+        bind_sumi_replay_for_origin_test(&mut foreign_protocol, foreign_origin, Some(1))
+            .expect("bind foreign protocol destination");
+        assert!(matches!(
+            build_request(&spec, &foreign_protocol, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
+        assert!(matches!(
+            derive_compaction_coverage(&spec, &foreign_protocol),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("destination does not match")
+        ));
     }
 
     #[test]
@@ -4673,39 +4931,46 @@ mod tests {
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(1), persisted_user(2)],
+            messages: vec![persisted_user(2)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let coverage = NativeCompactionCoverage {
             through_message_seq: 1,
             context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"NATIVE"})],
                 coverage,
             },
         });
+        bind_native_replay_for_test(&mut context, spec.origin(), 1, Some(2))
+            .expect("bind exact assembler replay");
         if let ProtocolCompat::Responses(compat) = &mut spec.compat {
             compat.supports_native_compact = false;
         }
-        let request = build_request(
-            &spec,
-            &context,
-            &RequestOptions {
-                native_compaction: true,
-                ..RequestOptions::default()
-            },
-        )
-        .expect("capability loss falls back");
-        let request = request.to_string();
-        assert!(!request.contains("NATIVE"));
-        assert!(request.contains("message-1"));
-        assert!(request.contains("message-2"));
+        assert!(matches!(
+            build_request(
+                &spec,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("cannot be discarded")
+        ));
     }
 
     #[test]
@@ -4717,11 +4982,17 @@ mod tests {
             messages: vec![persisted_user(1)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-1".into(),
+                message_seq: 1,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"FOREIGN_NATIVE"}),
                 coverage: NativeCompactionCoverage {
@@ -4730,6 +5001,8 @@ mod tests {
                 },
             },
         });
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(1))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &context,
@@ -4741,6 +5014,57 @@ mod tests {
         .expect("foreign native state falls back");
         assert!(!request.to_string().contains("FOREIGN_NATIVE"));
         assert!(request.to_string().contains("message-1"));
+    }
+
+    #[test]
+    fn forged_matching_fingerprint_cannot_cross_native_provider_origin() {
+        let spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(2)],
+            provider_context: vec![],
+            tools: vec![],
+            replay_provenance: None,
+        };
+        let mut foreign_origin = spec.origin();
+        foreign_origin.provider_instance_id.push_str("-foreign");
+        context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-2".into(),
+                message_seq: 2,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: foreign_origin.clone(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id":"cmp",
+                    "type":"compaction",
+                    "encrypted_content":"FOREIGN_NATIVE_MARKER",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+                },
+            },
+        });
+        bind_native_replay_for_test(&mut context, foreign_origin, 1, Some(2))
+            .expect("bind exact foreign replay");
+
+        assert!(matches!(
+            build_request(
+                &spec,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("provider_origin")
+        ));
     }
 
     #[test]
@@ -4824,8 +5148,32 @@ mod tests {
             r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
         ).is_err());
 
+        let retained = json!({
+            "id":"r",
+            "type":"reasoning",
+            "summary":[],
+            "content":[{"type":"reasoning_text","text":"retained"}],
+            "encrypted_content":"x"
+        });
+        let retained_bytes =
+            serialized_json_bytes(retained.as_object().expect("item object"), usize::MAX).unwrap();
+        assert!(retained_bytes > 2);
+        let without_encrypted = json!({"id":"r","type":"reasoning","summary":[]});
+        let without_encrypted_bytes = serialized_json_bytes(
+            without_encrypted.as_object().expect("item object"),
+            usize::MAX,
+        )
+        .unwrap();
+        let terminal_backfill =
+            json!({"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"});
+        let terminal_backfill_bytes = serialized_json_bytes(
+            terminal_backfill.as_object().expect("item object"),
+            usize::MAX,
+        )
+        .unwrap();
         let budget = ResponseBudget {
-            max_content_bytes: 1,
+            // The old accounting of id + encrypted_content would accept this item.
+            max_content_bytes: 2,
             max_wire_bytes: usize::MAX,
             max_events: usize::MAX,
             max_preview_work_bytes: usize::MAX,
@@ -4837,14 +5185,22 @@ mod tests {
         ).unwrap();
         assert!(matches!(
             state.push_json(
-                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}}"#,
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"retained"}],"encrypted_content":"x"}}"#,
             ),
             Err(ResponsesAdapterError::ResponseLimitExceeded { resource: "content_bytes", .. })
         ));
         assert!(state.provider_context().is_empty());
+        assert!(state.completed_items.is_empty());
+        state.budget.max_content_bytes = 1 + without_encrypted_bytes;
         state.push_json(
             r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
         ).expect("failed opaque charge did not mutate semantic state");
+        assert_eq!(state.content_bytes, 1 + without_encrypted_bytes);
+
+        // A terminal-only encrypted-content backfill retains another complete
+        // canonical item, not only the encrypted string.
+        state.budget.max_content_bytes =
+            state.content_bytes + "resp".len() + "gpt-5.6".len() + terminal_backfill_bytes - 1;
         let terminal = r#"{"type":"response.completed","sequence_number":2,"response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}}"#;
         assert!(matches!(
             state.push_json(terminal),
@@ -4854,6 +5210,13 @@ mod tests {
             })
         ));
         assert!(state.provider_context().is_empty());
+        state.budget.max_content_bytes += 1;
+        let terminal = state
+            .push_json(terminal)
+            .expect("exact full-item backfill budget is accepted")
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.provider_context.len(), 1);
     }
 
     #[test]
@@ -4892,6 +5255,7 @@ mod tests {
             }],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         assert!(build_request(&spec, &context, &RequestOptions::default()).is_err());
 
@@ -4904,12 +5268,17 @@ mod tests {
             }]),
         };
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant".into(),
                 message_seq: 1,
             }),
             wire_item_index: Some(1),
             ordinal: 1,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4921,12 +5290,17 @@ mod tests {
             },
         });
         context.provider_context.push(ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            },
             origin_message: Some(ProviderContextAnchor {
                 message_id: "assistant".into(),
                 message_seq: 1,
             }),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4947,7 +5321,7 @@ mod tests {
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("duplicate encrypted reasoning placement")
+                if message.contains("must be unique and contiguous from zero")
         ));
 
         context.provider_context[1].ordinal = 0;
@@ -4955,14 +5329,14 @@ mod tests {
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("missing wire_item_index")
+                if message.contains("missing a wire_item_index")
         ));
         context.provider_context[1].wire_item_index = Some(1);
         context.provider_context[1].origin_message = None;
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("missing an origin anchor")
+                if message.contains("missing an origin message")
         ));
     }
 
@@ -5232,9 +5606,11 @@ mod tests {
                 }),
             }],
             provider_context: vec![ProviderContextItem {
+                retention_owner: anchor.clone(),
                 origin_message: Some(anchor.clone()),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: spec.origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -5246,6 +5622,7 @@ mod tests {
                 },
             }],
             tools: vec![],
+            replay_provenance: None,
         };
 
         let enabled =
@@ -5278,11 +5655,17 @@ mod tests {
             messages: vec![persisted_user(7), persisted_user(8)],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         };
         let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "message-8".into(),
+                message_seq: 8,
+            },
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id": "cmp",
@@ -5296,6 +5679,8 @@ mod tests {
             },
         };
         context.provider_context.push(native);
+        bind_sumi_replay_for_origin_test(&mut context, spec.origin(), Some(8))
+            .expect("bind exact normalized assembler replay");
         let request = build_request(
             &spec,
             &context,
@@ -5430,7 +5815,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_item_content_is_validated_before_stream_state_or_context_mutation() {
+    fn reasoning_items_are_canonical_before_stream_state_or_context_mutation() {
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         assert!(state
             .push_json(
@@ -5452,6 +5837,21 @@ mod tests {
             state.event_count,
             state.completed_items.len(),
             state.reasoning_fragments.len(),
+        );
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"future_provider_field":"not canonical","encrypted_content":"opaque"}}"#,
+            )
+            .is_err());
+        assert_eq!(
+            (
+                state.next_sequence_number,
+                state.content_bytes,
+                state.event_count,
+                state.completed_items.len(),
+                state.reasoning_fragments.len(),
+            ),
+            before_done
         );
         assert!(state
             .push_json(
@@ -5599,13 +5999,27 @@ mod tests {
             )
             .expect("later response event establishes model");
         assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
-        assert!(state
+        // A dated/resolved/variant model string reported later in the stream must not
+        // invalidate an otherwise valid response; the first observed model is retained
+        // for telemetry.
+        state
             .push_json(
                 r#"{"type":"response.in_progress","sequence_number":2,"response":{"id":"resp","model":"other","status":"in_progress","created_at":1}}"#,
             )
-            .is_err());
+            .expect("later model variant is accepted");
         assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
-        assert_eq!(state.next_sequence_number, 2);
+        assert_eq!(state.next_sequence_number, 3);
+
+        let mut missing = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let error = missing
+            .push_json(
+                r#"{"type":"response.completed","sequence_number":0,"response":{"id":"resp","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#,
+            )
+            .expect_err("successful terminal cannot omit model identity");
+        assert!(error.to_string().contains("response.model"), "{error}");
+        assert!(missing.response_id.is_none());
+        assert!(missing.response_model.is_none());
+        assert_eq!(missing.next_sequence_number, 0);
     }
 
     #[test]

@@ -8,12 +8,19 @@ use std::{
 use sqlx::{Connection, Row, sqlite::SqliteConnectOptions};
 
 static DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+const COMMAND_FIELD: &[u8] = br#""command":"#;
+const DIRECT_CHAT_BINDING: &[u8] = br#""personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","provenance":{"version":1,"tenant_id":"tenant-test","personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","actor":{"kind":"human","principal_id":"human-test"},"source":{"surface":"direct_chat"}},"command":"#;
 
 fn agent_command(database_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sumi-agent"));
     command
+        .arg("--low-trust")
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
+        .env(
+            "SUMI_PERSONALITY_AGENT_ID",
+            "0198f0f4-9b72-7000-8000-000000000001",
+        )
         .env(
             "SUMI_STATE_DIR",
             database_path
@@ -46,7 +53,9 @@ fn run_agent_at(database_path: &Path, input: &[u8]) -> (bool, Vec<serde_json::Va
         .expect("start sumi-agent");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    stdin.write_all(input).expect("write command stream");
+    stdin
+        .write_all(&bind_direct_chat(input))
+        .expect("write command stream");
     drop(stdin);
 
     let output = child.wait_with_output().expect("wait for sumi-agent");
@@ -57,6 +66,21 @@ fn run_agent_at(database_path: &Path, input: &[u8]) -> (bool, Vec<serde_json::Va
         .collect::<Vec<_>>();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     (output.status.success(), frames, stderr)
+}
+
+fn bind_direct_chat(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len() + DIRECT_CHAT_BINDING.len());
+    let mut remaining = input;
+    while let Some(index) = remaining
+        .windows(COMMAND_FIELD.len())
+        .position(|window| window == COMMAND_FIELD)
+    {
+        output.extend_from_slice(&remaining[..index]);
+        output.extend_from_slice(DIRECT_CHAT_BINDING);
+        remaining = &remaining[index + COMMAND_FIELD.len()..];
+    }
+    output.extend_from_slice(remaining);
+    output
 }
 
 fn run_agent(input: &[u8]) -> (bool, Vec<serde_json::Value>, String) {
@@ -305,7 +329,9 @@ fn ack_writer_failure_after_commit_replays_terminal_ack_from_fresh_process() {
     let stdout = child.stdout.take().expect("first epoch stdout pipe");
     drop(stdout);
     let mut stdin = child.stdin.take().expect("first epoch stdin");
-    stdin.write_all(command).expect("write Abort");
+    stdin
+        .write_all(&bind_direct_chat(command))
+        .expect("write Abort");
     drop(stdin);
     let first = child
         .wait_with_output()

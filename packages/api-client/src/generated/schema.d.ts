@@ -21,10 +21,623 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/direct-chat/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a direct-chat user command
+         * @description Admits content from the authenticated direct-chat browser session. The
+         *     signed HttpOnly `sumi_session` cookie supplies the target personality
+         *     agent and human provenance; neither is accepted from the browser body.
+         *     The request Origin must exactly match the configured browser origin
+         *     allowlist. Origin rejection occurs before session or body processing;
+         *     all rejections occur before command_id or seq allocation.
+         */
+        post: operations["createDirectChatCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/direct-chat/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Browser-facing WebSocket
+         * @description Upgrades to a WebSocket for browser clients. After the handshake the
+         *     client sends `BrowserClientFrame` messages and the server pushes
+         *     `BrowserServerFrame` messages. The caller is authenticated by the signed
+         *     HttpOnly `sumi_session` browser cookie.
+         */
+        get: operations["browserWebSocket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agent/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Agent-facing WebSocket
+         * @description Upgrades to a WebSocket for agent workers. After the handshake the agent
+         *     sends `AgentHello` followed by `OutboundFrame` messages, and the server
+         *     replies with `ApiHello` followed by `CommandEnvelope` messages. The
+         *     caller is authenticated by a short-lived `Authorization: Bearer` token.
+         */
+        get: operations["agentWebSocket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
-    schemas: never;
+    schemas: {
+        /** @description non-negative integer representable exactly by JavaScript number clients */
+        JsonSafeInteger: number;
+        /**
+         * Format: canonical-process-generation
+         * @description canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
+         */
+        ProcessGeneration: string;
+        /**
+         * Format: canonical-decimal-u64
+         * @description canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+         */
+        CanonicalDecimalU64: string;
+        CommandEnvelope: {
+            seq: components["schemas"]["JsonSafeInteger"];
+            /**
+             * Format: uuid
+             * @description canonical lower-case hyphenated UUID
+             */
+            command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            provenance: components["schemas"]["DirectChatProvenanceV1"];
+            command: components["schemas"]["Command"];
+        };
+        /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
+        PersonalityAgentId: string;
+        DirectChatProvenanceV1: {
+            /** @constant */
+            version: 1;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @constant */
+                kind: "human";
+                principal_id: components["schemas"]["PrincipalId"];
+            };
+            source: {
+                /** @constant */
+                surface: "direct_chat";
+            };
+        };
+        AgentHello: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            generation: components["schemas"]["ProcessGeneration"];
+            last_sent_event_seq: components["schemas"]["CanonicalDecimalU64"];
+            last_received_command_seq: components["schemas"]["CanonicalDecimalU64"];
+            last_applied_command_seq: components["schemas"]["CanonicalDecimalU64"];
+        };
+        ApiHello: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            accepted_generation: components["schemas"]["ProcessGeneration"];
+            last_received_event_seq: components["schemas"]["CanonicalDecimalU64"];
+            next_command_seq: components["schemas"]["CanonicalDecimalU64"];
+        };
+        OutboundFrame: {
+            /** @constant */
+            frame_type: "event";
+            envelope: components["schemas"]["Envelope"];
+        } | {
+            /** @constant */
+            frame_type: "command_ack";
+            ack: components["schemas"]["CommandAck"];
+        };
+        BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
+        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
+        DirectChatUserMessageCommand: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            attachments: components["schemas"]["Attachment"][];
+        };
+        DirectChatCommandReceipt: {
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        DirectChatCommandRejectedResponse: {
+            /** @constant */
+            error: "invalid_command";
+            idempotency_key?: string;
+            /** @enum {string} */
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        };
+        DirectChatCommandIdempotencyConflictResponse: {
+            /** @constant */
+            error: "idempotency_conflict";
+            idempotency_key: string;
+            /** @constant */
+            reject_reason: "idempotency_conflict";
+        };
+        /** @description placeholder for v1; no attachments are accepted yet */
+        Attachment: {
+            [key: string]: unknown;
+        };
+        BrowserHello: {
+            /** @constant */
+            type: "hello";
+            last_event_seq: components["schemas"]["JsonSafeInteger"];
+        };
+        /** @description any JSON value */
+        AnyJSON: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
+        /** @description object boundary preserved for T22/T23; properties are intentionally open */
+        DeferredApprovalRule: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        };
+        ApprovalDecision: {
+            /** @constant */
+            type: "approve_once";
+        } | {
+            /** @constant */
+            type: "approve_always";
+            rule: components["schemas"]["DeferredApprovalRule"];
+        } | {
+            /** @constant */
+            type: "deny";
+        };
+        Command: {
+            /** @constant */
+            type: "user_message";
+            text: string;
+            /** @description reserved for v1; must be an empty array */
+            attachments: components["schemas"]["Attachment"][];
+        } | {
+            /** @constant */
+            type: "abort";
+        } | {
+            /** @constant */
+            type: "approval_decision";
+            request_id: string;
+            decision: components["schemas"]["ApprovalDecision"];
+        };
+        BrowserCommandFrame: {
+            /** @constant */
+            type: "command";
+            idempotency_key: string;
+            command: components["schemas"]["Command"];
+        };
+        AgentStartEvent: {
+            /** @constant */
+            type: "agent_start";
+        };
+        AgentEndEvent: {
+            /** @constant */
+            type: "agent_end";
+        };
+        TurnStartEvent: {
+            /** @constant */
+            type: "turn_start";
+        };
+        UserContent: {
+            /** @constant */
+            type: "text";
+            text: string;
+        } | {
+            /** @constant */
+            type: "image";
+            data: string;
+            mime_type: string;
+        };
+        UserMessage: {
+            /** @constant */
+            role: "user";
+            content: components["schemas"]["UserContent"][];
+            /** Format: date-time */
+            timestamp: string;
+        };
+        ToolCall: {
+            id: string;
+            name: string;
+            /** @description JSON object validated against the tool schema at execution time */
+            arguments: {
+                [key: string]: components["schemas"]["AnyJSON"];
+            };
+        };
+        /** @enum {string} */
+        ToolArgumentError: "invalid_json" | "non_object" | "schema_violation" | "incomplete_response" | "too_large";
+        RejectedToolCall: {
+            id: string;
+            name: string;
+            error: components["schemas"]["ToolArgumentError"];
+        };
+        PublicAssistantContent: {
+            /** @constant */
+            type: "text";
+            text: string;
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+        } | {
+            /** @constant */
+            type: "thinking";
+            thinking: string;
+            signature_field: string;
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+        } | {
+            /** @constant */
+            type: "tool_call";
+            tool_call: components["schemas"]["ToolCall"];
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+        } | {
+            /** @constant */
+            type: "rejected_tool_call";
+            rejected: components["schemas"]["RejectedToolCall"];
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+        };
+        /** @enum {string} */
+        ApiProtocol: "open_ai_chat_completions" | "open_ai_responses" | "anthropic_messages";
+        ProviderOrigin: {
+            provider_instance_id: string;
+            protocol: components["schemas"]["ApiProtocol"];
+            model: string;
+        };
+        Usage: {
+            input: components["schemas"]["JsonSafeInteger"];
+            output: components["schemas"]["JsonSafeInteger"];
+            cache_read: components["schemas"]["JsonSafeInteger"];
+            cache_write: components["schemas"]["JsonSafeInteger"];
+            reasoning: components["schemas"]["JsonSafeInteger"];
+            total_tokens: components["schemas"]["JsonSafeInteger"];
+        };
+        /** @enum {string} */
+        StopReason: "stop" | "length" | "tool_use" | "error" | "aborted";
+        PublicAssistantMessage: {
+            /** @constant */
+            role: "assistant";
+            content: components["schemas"]["PublicAssistantContent"][];
+            model: string;
+            provider: string;
+            origin: components["schemas"]["ProviderOrigin"];
+            usage: components["schemas"]["Usage"];
+            stop_reason: components["schemas"]["StopReason"];
+            error_message: string | null;
+            provider_code: string | null;
+            interrupted: boolean;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        ToolResultMessage: {
+            /** @constant */
+            role: "tool_result";
+            tool_call_id: string;
+            tool_name: string;
+            content: components["schemas"]["UserContent"][];
+            details: components["schemas"]["AnyJSON"];
+            is_error: boolean;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        PublicMessage: components["schemas"]["UserMessage"] | components["schemas"]["PublicAssistantMessage"] | components["schemas"]["ToolResultMessage"];
+        /** @description tool result nested in TurnEnd; the enclosing event supplies its type */
+        ToolResultPayload: {
+            tool_call_id: string;
+            tool_name: string;
+            content: components["schemas"]["UserContent"][];
+            details: components["schemas"]["AnyJSON"];
+            is_error: boolean;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        TurnEndEvent: {
+            /** @constant */
+            type: "turn_end";
+            message: null | components["schemas"]["PublicMessage"];
+            tool_results: components["schemas"]["ToolResultPayload"][];
+        };
+        MessageStartEvent: {
+            /** @constant */
+            type: "message_start";
+            /**
+             * Format: uuid
+             * @description durable messages.id; user messages are UUIDv5(command_id, namespace)
+             */
+            message_id: string;
+            message: components["schemas"]["PublicMessage"];
+        };
+        MessageEndEvent: {
+            /** @constant */
+            type: "message_end";
+            /**
+             * Format: uuid
+             * @description durable messages.id; user messages are UUIDv5(command_id, namespace)
+             */
+            message_id: string;
+            message: components["schemas"]["PublicMessage"];
+        };
+        /** @description any JSON object whose property values are JSON-safe AnyJSON values */
+        AnyJSONObject: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        };
+        ToolExecutionStartEvent: {
+            /** @constant */
+            type: "tool_execution_start";
+            tool_call_id: string;
+            tool_name: string;
+            args: components["schemas"]["AnyJSONObject"];
+        };
+        ToolExecutionEndEvent: {
+            /** @constant */
+            type: "tool_execution_end";
+            tool_call_id: string;
+            result: components["schemas"]["AnyJSON"];
+            is_error: boolean;
+        };
+        ReviewProjection: {
+            reviewable: components["schemas"]["AnyJSON"];
+        } | {
+            insufficient_evidence: {
+                reason: string;
+            };
+        };
+        /** @enum {string} */
+        AuditOutcome: "allow" | "deny";
+        /** @enum {string} */
+        RiskLevel: "low" | "medium" | "high" | "critical";
+        /** @enum {string} */
+        UserAuthorization: "unknown" | "low" | "medium" | "high";
+        AuditDecision: {
+            outcome: components["schemas"]["AuditOutcome"];
+            risk: components["schemas"]["RiskLevel"];
+            authorization: components["schemas"]["UserAuthorization"];
+            rationale: string;
+        };
+        ApprovalRequest: {
+            id: string;
+            tool_call_id: string;
+            tool_name: string;
+            action: components["schemas"]["ReviewProjection"];
+            args_summary: components["schemas"]["AnyJSON"];
+            reason?: string | null;
+            audit?: components["schemas"]["AuditDecision"] | null;
+        };
+        ApprovalRequestedEvent: {
+            /** @constant */
+            type: "approval_requested";
+            request: components["schemas"]["ApprovalRequest"];
+        };
+        ApprovalResolution: "cancelled" | {
+            decision: components["schemas"]["ApprovalDecision"];
+        };
+        ApprovalResolvedEvent: {
+            /** @constant */
+            type: "approval_resolved";
+            request_id: string;
+            resolution: components["schemas"]["ApprovalResolution"];
+        };
+        /** @enum {string} */
+        SteerMode: "hard" | "soft";
+        SteeredEvent: {
+            /** @constant */
+            type: "steered";
+            mode: components["schemas"]["SteerMode"];
+        };
+        MemoryMaintenanceEvent: {
+            /** @constant */
+            type: "memory_maintenance";
+            /** @description unresolved T17 vocabulary; consumers must not assume a closed enum */
+            kind: string;
+        };
+        RetryScheduledEvent: {
+            /** @constant */
+            type: "retry_scheduled";
+            attempt: components["schemas"]["JsonSafeInteger"];
+            delay_ms: components["schemas"]["JsonSafeInteger"];
+            /** Format: date-time */
+            retry_at: string;
+            error_message: string;
+        };
+        /** @enum {string} */
+        CommandRejectReason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        CommandDispositionEvent: {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "applied";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "superseded";
+        } | {
+            /** @constant */
+            type: "command_disposition";
+            /** Format: uuid */
+            command_id: string;
+            command_seq: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            status: "rejected";
+            reject_reason: components["schemas"]["CommandRejectReason"];
+        };
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
+        /** @description non-negative index representable exactly by JavaScript number clients */
+        ContentIndex: number;
+        PublicStreamEvent: {
+            /** @constant */
+            type: "text_start";
+            content_index: components["schemas"]["ContentIndex"];
+        } | {
+            /** @constant */
+            type: "text_delta";
+            content_index: components["schemas"]["ContentIndex"];
+            delta: string;
+        } | {
+            /** @constant */
+            type: "text_end";
+            content_index: components["schemas"]["ContentIndex"];
+            content: string;
+        } | {
+            /** @constant */
+            type: "thinking_start";
+            content_index: components["schemas"]["ContentIndex"];
+        } | {
+            /** @constant */
+            type: "thinking_delta";
+            content_index: components["schemas"]["ContentIndex"];
+            delta: string;
+        } | {
+            /** @constant */
+            type: "thinking_end";
+            content_index: components["schemas"]["ContentIndex"];
+            content: string;
+        } | {
+            /** @constant */
+            type: "tool_call_start";
+            content_index: components["schemas"]["ContentIndex"];
+        } | {
+            /** @constant */
+            type: "tool_call_delta";
+            content_index: components["schemas"]["ContentIndex"];
+            delta: string;
+        } | {
+            /** @constant */
+            type: "tool_call_preview";
+            content_index: components["schemas"]["ContentIndex"];
+            preview: components["schemas"]["AnyJSON"];
+        } | {
+            /** @constant */
+            type: "tool_call_end";
+            content_index: components["schemas"]["ContentIndex"];
+            tool_call: components["schemas"]["ToolCall"];
+        } | {
+            /** @constant */
+            type: "tool_call_rejected";
+            content_index: components["schemas"]["ContentIndex"];
+            rejected: components["schemas"]["RejectedToolCall"];
+        } | {
+            /** @constant */
+            type: "reasoning_summary_start";
+            content_index: components["schemas"]["ContentIndex"];
+        } | {
+            /** @constant */
+            type: "reasoning_summary_delta";
+            content_index: components["schemas"]["ContentIndex"];
+            delta: string;
+        } | {
+            /** @constant */
+            type: "reasoning_summary_end";
+            content_index: components["schemas"]["ContentIndex"];
+            content: string;
+        };
+        MessageUpdateEvent: {
+            /** @constant */
+            type: "message_update";
+            /** Format: uuid */
+            message_id: string;
+            event: components["schemas"]["PublicStreamEvent"];
+        };
+        ToolExecutionUpdateEvent: {
+            /** @constant */
+            type: "tool_execution_update";
+            tool_call_id: string;
+            partial: components["schemas"]["AnyJSON"];
+        };
+        ErrorEvent: {
+            /** @constant */
+            type: "error";
+            message: string;
+        };
+        VolatileAgentEvent: components["schemas"]["MessageUpdateEvent"] | components["schemas"]["ToolExecutionUpdateEvent"] | components["schemas"]["ErrorEvent"];
+        BrowserEventEnvelope: {
+            seq: components["schemas"]["JsonSafeInteger"];
+            event: components["schemas"]["DurableAgentEvent"];
+        } | {
+            event: components["schemas"]["VolatileAgentEvent"];
+        };
+        BrowserEventFrame: {
+            /** @constant */
+            type: "event";
+            envelope: components["schemas"]["BrowserEventEnvelope"];
+        };
+        BrowserCommandAcceptedFrame: {
+            /** @constant */
+            type: "command_accepted";
+            idempotency_key: string;
+            /** Format: uuid */
+            command_id: string;
+            seq: components["schemas"]["JsonSafeInteger"];
+            /** @description Exact durable terminal disposition for this command when already committed at idempotent acceptance time. Its command_id and command_seq must equal this receipt's command_id and seq. */
+            disposition?: components["schemas"]["CommandDispositionEvent"];
+        };
+        BrowserCommandRejectedFrame: {
+            /** @constant */
+            type: "command_rejected";
+            idempotency_key: string;
+            /** @enum {string} */
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable";
+        };
+        DirectChatStatusFrame: {
+            /** @constant */
+            type: "direct_chat_status";
+            /** @enum {string} */
+            status: "ready" | "unavailable";
+        };
+        /** @description opaque ASCII tenant identity */
+        TenantId: string;
+        /** @description opaque ASCII principal identity */
+        PrincipalId: string;
+        DurableEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["DurableAgentEvent"];
+            seq: components["schemas"]["JsonSafeInteger"];
+        };
+        VolatileEnvelope: {
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            event: components["schemas"]["VolatileAgentEvent"];
+        };
+        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
+        CommandAck: {
+            seq: components["schemas"]["JsonSafeInteger"];
+            /** Format: uuid */
+            command_id: string;
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            /** @enum {string} */
+            status: "received" | "applied" | "superseded" | "rejected";
+            reject_reason?: components["schemas"]["CommandRejectReason"];
+        };
+    };
     responses: never;
     parameters: never;
     requestBodies: never;
@@ -53,6 +666,142 @@ export interface operations {
                         status: "ok";
                     };
                 };
+            };
+        };
+    };
+    createDirectChatCommand: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectChatUserMessageCommand"];
+            };
+        };
+        responses: {
+            /** @description Target-free command receipt */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandReceipt"];
+                };
+            };
+            /** @description Command rejected before seq/command_id allocation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandRejectedResponse"];
+                };
+            };
+            /** @description Missing or invalid browser session cookie */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Origin not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Idempotency key was already used for different content */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
+                };
+            };
+        };
+    };
+    browserWebSocket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The first WebSocket frame (BrowserHello) */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["BrowserClientFrame"];
+            };
+        };
+        responses: {
+            /** @description WebSocket upgrade */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrowserServerFrame"];
+                };
+            };
+            /** @description Missing or invalid browser session cookie */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Origin not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    agentWebSocket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The first WebSocket frame (AgentHello) */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AgentHello"];
+            };
+        };
+        responses: {
+            /** @description WebSocket upgrade */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiHello"];
+                };
+            };
+            /** @description Missing or invalid agent token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Origin not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

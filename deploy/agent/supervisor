@@ -1,0 +1,928 @@
+#!/bin/bash -p
+# Local single-host Compose supervisor. Cloud workload identity, scheduling,
+# resource recovery, and central transport are separate deployment paths.
+# Privileged Bash startup ignores BASH_ENV. This supervisor must not inherit a
+# caller's shell hooks before it establishes its process-group invariant.
+set -euo pipefail
+# A foreground service manager must not let a caller-provided monitor setting
+# turn `setsid ... &` into a forking wrapper whose PID is not the new group.
+set +m
+
+readonly SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly COMPOSE_FILE="${SUPERVISOR_DIR}/compose.yaml"
+readonly PREPARE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.prepare.yaml"
+readonly LIFECYCLE_COMPOSE_FILE="${SUPERVISOR_DIR}/compose.lifecycle.yaml"
+readonly SUPERVISOR_LOCK_ROOT=/run/sumi/supervisor-locks
+readonly LOCAL_CONTROL_HOST_ROOT=/run/sumi/local-control
+readonly RUNTIME_SECRET_HOST_ROOT="${SUMI_RUNTIME_SECRET_HOST_ROOT:-/run/sumi/runtime-secrets}"
+readonly RUNTIME_SECRET_UID=10001
+readonly RUNTIME_SECRET_GID=10001
+SUMI_CONFIG_FILE="${SUMI_CONFIG_FILE:-${SUPERVISOR_DIR}/config.env}"
+
+if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if ! [[ -v "${key}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < "${SUMI_CONFIG_FILE}"
+fi
+
+: "${SUMI_COMPOSE_TIMEOUT:=30}"
+[[ "${SUMI_COMPOSE_TIMEOUT}" =~ ^[1-9][0-9]{0,2}$ ]] || {
+  printf '[sumi-supervisor] ERROR: SUMI_COMPOSE_TIMEOUT must be an integer from 1 to 999 seconds\n' >&2
+  exit 1
+}
+
+SUPERVISOR_CONTROL_ENABLED=0
+if [[ -n "${SUMI_SUPERVISOR_CONTROL_FD:-}" ]]; then
+  [[ "${SUMI_SUPERVISOR_CONTROL_FD}" == 3 ]] || {
+    printf '[sumi-supervisor] ERROR: SUMI_SUPERVISOR_CONTROL_FD must be the internal descriptor 3\n' >&2
+    exit 1
+  }
+  SUPERVISOR_CONTROL_ENABLED=1
+else
+  # Reserve the internal descriptor so child-close redirections are valid for
+  # direct operator/test invocations that do not install the control channel.
+  exec 3>/dev/null
+fi
+
+publish_supervisor_control() {
+  (( SUPERVISOR_CONTROL_ENABLED )) || return 0
+  printf '%s\n' "$1" >&3 || true
+}
+
+log() {
+  printf '[sumi-supervisor] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_paid() {
+  : "${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}"
+  [[ "${SUMI_PERSONALITY_AGENT_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || fail "docker is required"
+  docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
+}
+
+require_tracked_compose_support() {
+  command -v setsid >/dev/null 2>&1 || fail "setsid is required for supervised Compose launch"
+}
+
+configure_apparmor_profile() {
+  local enabled=
+  if [[ -r /sys/module/apparmor/parameters/enabled ]]; then
+    enabled="$(< /sys/module/apparmor/parameters/enabled)"
+  fi
+  if [[ "${enabled}" == "Y" ]]; then
+    export SUMI_DOCKER_APPARMOR_PROFILE=docker-default
+    return
+  fi
+  if [[ "${SUMI_DEV_ALLOW_APPARMOR_UNCONFINED:-false}" != "true" ]]; then
+    fail "AppArmor is unavailable; production agent launch remains fail-closed"
+  fi
+  export SUMI_DOCKER_APPARMOR_PROFILE=unconfined
+  log "WARNING: local-dev AppArmor fallback active; seccomp, no-new-privileges, caps, read-only mounts, namespaces, and PAID fencing remain enforced"
+}
+
+validate_root_owned_anchor() {
+  local path="$1"
+  local owner mode canonical
+  [[ -d "${path}" && ! -L "${path}" ]] ||
+    fail "trusted path must be a real directory: ${path}"
+  canonical="$(readlink -e -- "${path}")" ||
+    fail "cannot canonicalize trusted path: ${path}"
+  [[ "${canonical}" == "${path}" ]] ||
+    fail "trusted path must be canonical: ${path}"
+  owner="$(stat -c '%u' -- "${path}")"
+  mode="$(stat -c '%a' -- "${path}")"
+  [[ "${owner}" == "0" ]] ||
+    fail "trusted path must be owned by root: ${path}"
+  (( (8#${mode} & 0022) == 0 )) ||
+    fail "trusted path must not be writable by group or other: ${path}"
+}
+
+ensure_host_trust_roots() {
+  [[ ! -L /run/sumi ]] ||
+    fail "trusted host root must not be a symlink: /run/sumi"
+  if [[ ! -e /run/sumi ]]; then
+    [[ "${EUID}" -eq 0 ]] ||
+      fail "trusted host root does not exist: /run/sumi"
+    install -d -m 0755 -o root -g root /run/sumi
+  fi
+  [[ ! -L "${SUPERVISOR_LOCK_ROOT}" ]] ||
+    fail "trusted lock root must not be a symlink: ${SUPERVISOR_LOCK_ROOT}"
+  if [[ ! -e "${SUPERVISOR_LOCK_ROOT}" ]]; then
+    [[ "${EUID}" -eq 0 ]] ||
+      fail "trusted lock root does not exist: ${SUPERVISOR_LOCK_ROOT}"
+    install -d -m 0755 -o root -g root "${SUPERVISOR_LOCK_ROOT}"
+  fi
+  for path in / /run /run/sumi "${SUPERVISOR_LOCK_ROOT}"; do
+    validate_root_owned_anchor "${path}"
+  done
+}
+
+acquire_supervisor_lock() {
+  local lock_path lock_owner lock_mode lock_links path_identity fd_identity
+  command -v flock >/dev/null 2>&1 || fail "flock is required"
+  ensure_host_trust_roots
+  lock_path="${SUPERVISOR_LOCK_ROOT}/${SUMI_COMPOSE_PROJECT}.lock"
+  [[ ! -L "${lock_path}" ]] ||
+    fail "supervisor lock must not be a symlink"
+  if [[ ! -e "${lock_path}" ]]; then
+    [[ "${EUID}" -eq 0 ]] ||
+      fail "trusted per-PAID lock does not exist: ${lock_path}"
+    (umask 077 && set -o noclobber && : > "${lock_path}") ||
+      fail "cannot create supervisor lock"
+  fi
+  [[ -f "${lock_path}" && ! -L "${lock_path}" ]] ||
+    fail "supervisor lock must be a regular non-symlink"
+  lock_owner="$(stat -c '%u' -- "${lock_path}")"
+  lock_mode="$(stat -c '%a' -- "${lock_path}")"
+  lock_links="$(stat -c '%h' -- "${lock_path}")"
+  [[ "${lock_owner}" == "${EUID}" ]] ||
+    fail "supervisor lock must be owned by the invoking uid"
+  [[ "${lock_mode}" == "600" ]] ||
+    fail "supervisor lock mode must be 0600"
+  [[ "${lock_links}" == "1" ]] ||
+    fail "supervisor lock must have exactly one link"
+  path_identity="$(stat -Lc '%d:%i' -- "${lock_path}")"
+  exec {SUPERVISOR_LOCK_FD}<>"${lock_path}" ||
+    fail "cannot open supervisor lock"
+  fd_identity="$(stat -Lc '%d:%i' -- "/proc/$$/fd/${SUPERVISOR_LOCK_FD}")"
+  [[ "${path_identity}" == "${fd_identity}" ]] ||
+    fail "supervisor lock changed while it was opened"
+  flock -n "${SUPERVISOR_LOCK_FD}" ||
+    fail "another supervisor invocation owns ${SUMI_COMPOSE_PROJECT}"
+  [[ "$(stat -Lc '%d:%i' -- "${lock_path}")" == "${fd_identity}" ]] ||
+    fail "supervisor lock changed after acquisition"
+}
+
+validate_linux_id() {
+  local name="$1"
+  local value="$2"
+  [[ "${value}" =~ ^(0|[1-9][0-9]{0,9})$ ]] ||
+    fail "${name} must be canonical decimal"
+  (( 10#${value} <= 4294967294 )) ||
+    fail "${name} is outside the Linux uid/gid range"
+}
+
+local_control_snapshot() {
+  local path canonical
+  local directory_owner directory_gid directory_mode
+  local socket_owner socket_gid socket_mode socket_links
+  for path in / /run /run/sumi; do
+    validate_root_owned_anchor "${path}"
+  done
+  [[ -d "${LOCAL_CONTROL_HOST_ROOT}" && ! -L "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
+    fail "local-control registry root must be a real directory"
+  canonical="$(readlink -e -- "${LOCAL_CONTROL_HOST_ROOT}")" ||
+    fail "cannot canonicalize local-control registry root"
+  [[ "${canonical}" == "${LOCAL_CONTROL_HOST_ROOT}" ]] ||
+    fail "local-control registry root must be canonical"
+  [[ "$(stat -c '%u:%g:%a' -- "${LOCAL_CONTROL_HOST_ROOT}")" == \
+    "${SUMI_LOCAL_CONTROL_SERVER_UID}:${SUMI_LOCAL_CONTROL_SOCKET_GID}:750" ]] ||
+    fail "local-control registry root owner, group, or mode is not trusted"
+
+  [[ -d "${SUMI_LOCAL_CONTROL_HOST_DIR}" && ! -L "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
+    fail "local-control parent must pre-exist as a real directory"
+  canonical="$(readlink -e -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")" ||
+    fail "cannot canonicalize local-control parent"
+  [[ "${canonical}" == "${SUMI_LOCAL_CONTROL_HOST_DIR}" ]] ||
+    fail "local-control parent must be canonical"
+  directory_owner="$(stat -c '%u' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_gid="$(stat -c '%g' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  directory_mode="$(stat -c '%a' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}")"
+  [[ "${directory_owner}" == "${SUMI_LOCAL_CONTROL_SERVER_UID}" ]] ||
+    fail "local-control parent uid does not match SUMI_LOCAL_CONTROL_SERVER_UID"
+  [[ "${directory_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
+    fail "local-control parent gid does not match SUMI_LOCAL_CONTROL_SOCKET_GID"
+  [[ "${directory_mode}" == "750" ]] ||
+    fail "local-control parent mode must be 0750"
+
+  local socket="${SUMI_LOCAL_CONTROL_HOST_DIR}/control.sock"
+  [[ -S "${socket}" && ! -L "${socket}" ]] ||
+    fail "local-control socket must pre-exist"
+  canonical="$(readlink -e -- "${socket}")" ||
+    fail "cannot canonicalize local-control socket"
+  [[ "${canonical}" == "${socket}" ]] ||
+    fail "local-control socket must be canonical"
+  socket_owner="$(stat -c '%u' -- "${socket}")"
+  socket_gid="$(stat -c '%g' -- "${socket}")"
+  socket_mode="$(stat -c '%a' -- "${socket}")"
+  socket_links="$(stat -c '%h' -- "${socket}")"
+  [[ "${socket_owner}" == "${SUMI_LOCAL_CONTROL_SERVER_UID}" ]] ||
+    fail "local-control socket uid does not match SUMI_LOCAL_CONTROL_SERVER_UID"
+  [[ "${socket_gid}" == "${SUMI_LOCAL_CONTROL_SOCKET_GID}" ]] ||
+    fail "local-control socket gid does not match SUMI_LOCAL_CONTROL_SOCKET_GID"
+  [[ "${socket_mode}" == "660" ]] ||
+    fail "local-control socket mode must be 0660"
+  [[ "${socket_links}" == "1" ]] ||
+    fail "local-control socket must have exactly one link"
+
+  stat -c '%d:%i:%u:%g:%a:%h' -- "${SUMI_LOCAL_CONTROL_HOST_DIR}" "${socket}"
+}
+
+validate_local_control_socket() {
+  [[ "${SUMI_LOCAL_CONTROL_SOCKET_GID}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "SUMI_LOCAL_CONTROL_SOCKET_GID must be canonical decimal"
+  validate_linux_id SUMI_LOCAL_CONTROL_SOCKET_GID "${SUMI_LOCAL_CONTROL_SOCKET_GID}"
+  validate_linux_id SUMI_LOCAL_CONTROL_SERVER_UID "${SUMI_LOCAL_CONTROL_SERVER_UID}"
+  (( 10#${SUMI_LOCAL_CONTROL_SERVER_UID} != 0 )) ||
+    fail "SUMI_LOCAL_CONTROL_SERVER_UID must identify a non-root server"
+  if (( 10#${SUMI_LOCAL_CONTROL_SOCKET_GID} <= 999 )) ||
+    [[ "${SUMI_LOCAL_CONTROL_SOCKET_GID}" == "65534" ]]; then
+    fail "SUMI_LOCAL_CONTROL_SOCKET_GID must not use a reserved gid"
+  fi
+  case "${SUMI_LOCAL_CONTROL_SOCKET_GID}" in
+    10000|10001|10002|10003|10020|10021)
+      fail "SUMI_LOCAL_CONTROL_SOCKET_GID collides with a deployment role gid"
+      ;;
+  esac
+
+  SUMI_LOCAL_CONTROL_HOST_DIR="${LOCAL_CONTROL_HOST_ROOT}/${PAID_COMPACT}"
+  export SUMI_LOCAL_CONTROL_HOST_DIR SUMI_LOCAL_CONTROL_SOCKET_GID
+  export SUMI_LOCAL_CONTROL_SERVER_UID
+  LOCAL_CONTROL_TRUST_SNAPSHOT="$(local_control_snapshot)"
+}
+
+revalidate_local_control_socket() {
+  local current
+  current="$(local_control_snapshot)"
+  [[ "${current}" == "${LOCAL_CONTROL_TRUST_SNAPSHOT}" ]] ||
+    fail "local-control bind source changed during launch"
+}
+
+validate_runtime_secret_anchor() {
+  local path="$1"
+  local expected_owner=0
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
+    expected_owner="${EUID}"
+  fi
+  [[ -d "${path}" && ! -L "${path}" ]] ||
+    fail "runtime secret trust path must be a real directory"
+  [[ "$(readlink -e -- "${path}")" == "${path}" ]] ||
+    fail "runtime secret trust path must be canonical"
+  [[ "$(stat -c '%u:%g:%a' -- "${path}")" == "${expected_owner}:${expected_owner}:700" ]] ||
+    fail "runtime secret trust path owner, group, or mode is not trusted"
+}
+
+ensure_runtime_secret_root() {
+  local expected_owner=0
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
+    expected_owner="${EUID}"
+  else
+    [[ "${EUID}" -eq 0 ]] || fail "runtime secrets require a root supervisor"
+    [[ "${RUNTIME_SECRET_HOST_ROOT}" == /run/sumi/runtime-secrets ]] ||
+      fail "production runtime secret root is fixed"
+  fi
+  [[ ! -L "${RUNTIME_SECRET_HOST_ROOT}" ]] ||
+    fail "runtime secret registry root must not be a symlink"
+  if [[ ! -e "${RUNTIME_SECRET_HOST_ROOT}" ]]; then
+    install -d -m 0700 -o "${expected_owner}" -g "${expected_owner}" \
+      "${RUNTIME_SECRET_HOST_ROOT}"
+  fi
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}"
+}
+
+set_runtime_secret_host_dir() {
+  local generation="$1"
+  [[ "${generation}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "runtime secret generation must be canonical base-10"
+  SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}/${generation}"
+  export SUMI_RUNTIME_SECRET_HOST_DIR
+}
+
+remove_runtime_secret_tree() {
+  local paid_root="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
+  [[ -e "${RUNTIME_SECRET_HOST_ROOT}" ]] || return 0
+  ensure_runtime_secret_root
+  [[ ! -L "${paid_root}" ]] || fail "runtime secret PAID root must not be a symlink"
+  if [[ -e "${paid_root}" ]]; then
+    validate_runtime_secret_anchor "${paid_root}"
+    rm -rf -- "${paid_root}"
+  fi
+}
+
+remove_runtime_secret_generation() {
+  local generation_root="${SUMI_RUNTIME_SECRET_HOST_DIR}"
+  [[ -e "${generation_root}" ]] || return 0
+  ensure_runtime_secret_root
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
+  validate_runtime_secret_anchor "${generation_root}"
+  rm -rf -- "${generation_root}"
+  rmdir -- "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}" 2>/dev/null || true
+}
+
+runtime_secret_snapshot() {
+  local path canonical
+  local secret_owner="${RUNTIME_SECRET_UID}"
+  local secret_group="${RUNTIME_SECRET_GID}"
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
+    secret_owner="${EUID}"
+    secret_group="${EUID}"
+  fi
+  local -a names=(
+    sumi_local_control_bearer
+    sumi_agent_wrapping_key
+    sumi_approval_secret_digest_key
+    sumi_provider_api_key
+  )
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}"
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
+  validate_runtime_secret_anchor "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+  for path in "${names[@]}"; do
+    path="${SUMI_RUNTIME_SECRET_HOST_DIR}/${path}"
+    [[ -f "${path}" && ! -L "${path}" ]] ||
+      fail "runtime secret must be a regular non-symlink"
+    canonical="$(readlink -e -- "${path}")" || fail "cannot canonicalize runtime secret"
+    [[ "${canonical}" == "${path}" ]] || fail "runtime secret path must be canonical"
+    [[ "$(stat -c '%u:%g:%a:%h' -- "${path}")" == \
+      "${secret_owner}:${secret_group}:400:1" ]] ||
+      fail "runtime secret owner, group, mode, or link count is not trusted"
+    stat -c '%d:%i:%u:%g:%a:%h:%s' -- "${path}"
+  done
+}
+
+materialize_runtime_secrets() {
+  local paid_root="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
+  local name path
+  local -a mappings=(
+    'SUMI_LOCAL_CONTROL_BEARER:sumi_local_control_bearer'
+    'SUMI_AGENT_WRAPPING_KEY:sumi_agent_wrapping_key'
+    'SUMI_APPROVAL_SECRET_DIGEST_KEY:sumi_approval_secret_digest_key'
+    'SUMI_PROVIDER_API_KEY:sumi_provider_api_key'
+  )
+  ensure_runtime_secret_root
+  [[ ! -e "${paid_root}" && ! -L "${paid_root}" ]] ||
+    fail "runtime secret PAID root already exists"
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
+    install -d -m 0700 "${paid_root}" "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+  else
+    install -d -m 0700 -o root -g root "${paid_root}"
+    install -d -m 0700 -o root -g root "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+  fi
+  for name in "${mappings[@]}"; do
+    path="${SUMI_RUNTIME_SECRET_HOST_DIR}/${name#*:}"
+    name="${name%%:*}"
+    (umask 077; set -o noclobber; printf '%s' "${!name}" > "${path}") ||
+      fail "cannot materialize runtime secret"
+    if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == "true" ]]; then
+      chmod 0400 "${path}"
+    else
+      chown "${RUNTIME_SECRET_UID}:${RUNTIME_SECRET_GID}" "${path}"
+      chmod 0400 "${path}"
+    fi
+  done
+  RUNTIME_SECRET_TRUST_SNAPSHOT="$(runtime_secret_snapshot)"
+}
+
+revalidate_runtime_secrets() {
+  [[ "$(runtime_secret_snapshot)" == "${RUNTIME_SECRET_TRUST_SNAPSHOT}" ]] ||
+    fail "runtime secret bind source changed during launch"
+}
+
+require_launch_environment() {
+  local name
+  for name in \
+    SUMI_GATEWAY_URL \
+    SUMI_LOCAL_CONTROL_BEARER \
+    SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX \
+    SUMI_LOCAL_CONTROL_SERVER_UID \
+    SUMI_LOCAL_CONTROL_SOCKET_GID \
+    SUMI_AGENT_WRAPPING_KEY \
+    SUMI_AGENT_WRAPPING_KEY_ID \
+    SUMI_APPROVAL_SECRET_DIGEST_KEY \
+    SUMI_PROVIDER_API_KEY
+  do
+    [[ -n "${!name:-}" ]] || fail "${name} is required"
+  done
+  for name in \
+    SUMI_LOCAL_CONTROL_BEARER \
+    SUMI_AGENT_WRAPPING_KEY \
+    SUMI_APPROVAL_SECRET_DIGEST_KEY \
+    SUMI_PROVIDER_API_KEY
+  do
+    [[ "${!name}" != *$'\n'* && "${!name}" != *$'\r'* ]] ||
+      fail "${name} must not contain newline or carriage return"
+  done
+  [[ "${SUMI_APPROVAL_SECRET_DIGEST_KEY}" =~ ^[0-9A-Fa-f]{64}$ ]] ||
+    fail "SUMI_APPROVAL_SECRET_DIGEST_KEY must be exactly 64 hexadecimal characters"
+  [[ "${SUMI_AGENT_WRAPPING_KEY}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "SUMI_AGENT_WRAPPING_KEY must be exactly 64 lowercase hexadecimal characters"
+  if [[ -v SUMI_MODEL_ID && -z "${SUMI_MODEL_ID}" ]]; then
+    fail "SUMI_MODEL_ID must not be empty when set"
+  fi
+  validate_local_control_socket
+}
+
+require_paid
+readonly PAID_COMPACT="${SUMI_PERSONALITY_AGENT_ID//-/}"
+readonly SUMI_COMPOSE_PROJECT="sumi-${PAID_COMPACT}"
+declare SUPERVISOR_LOCK_FD
+declare LOCAL_CONTROL_TRUST_SNAPSHOT
+declare SUMI_LOCAL_CONTROL_HOST_DIR
+declare RUNTIME_SECRET_TRUST_SNAPSHOT
+declare SUMI_RUNTIME_SECRET_HOST_DIR="${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}/unresolved"
+export SUMI_RUNTIME_SECRET_HOST_DIR
+declare CLEANUP_ARMED=0
+declare ACTIVE_COMPOSE_PID=
+readonly CLEANUP_MAX_ATTEMPTS=3
+readonly CLEANUP_RETRY_DELAY_SECONDS=0.1
+readonly COMPOSE_CHILD_TERM_ATTEMPTS=20
+readonly COMPOSE_CHILD_TERM_DELAY_SECONDS=0.1
+# One explicit bound covers termination of the active detached Compose session,
+# every cleanup retry at the configured Compose timeout, verification calls,
+# retry delays, and a small scheduling margin. The provisioner receives this
+# exact contract over its private control descriptor before lifecycle work.
+readonly SUPERVISOR_CLEANUP_BOUND_SECONDS=$((
+  CLEANUP_MAX_ATTEMPTS * SUMI_COMPOSE_TIMEOUT + 10
+))
+publish_supervisor_control "cleanup-bound-ms $((SUPERVISOR_CLEANUP_BOUND_SECONDS * 1000))"
+
+launch_compose() {
+  docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${COMPOSE_FILE}" \
+    "$@"
+}
+
+lifecycle_compose() {
+  docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${LIFECYCLE_COMPOSE_FILE}" \
+    "$@"
+}
+
+prepare_compose() {
+  docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${PREPARE_COMPOSE_FILE}" \
+    "$@"
+}
+
+run_tracked_compose() {
+  local compose_file="$1"
+  local require_live_group="$2"
+  shift 2
+  local status
+  setsid docker compose \
+    --project-name "${SUMI_COMPOSE_PROJECT}" \
+    --file "${compose_file}" \
+    "$@" 3>&- &
+  ACTIVE_COMPOSE_PID=$!
+  publish_supervisor_control "nested-start ${ACTIVE_COMPOSE_PID}"
+  if ! wait_for_tracked_compose_child_isolation "${ACTIVE_COMPOSE_PID}"; then
+    # A no-op lifecycle `down` can legitimately finish before /proc is
+    # inspected. A launch must instead remain live and prove the PID/group
+    # ownership that later signal cleanup relies on.
+    if tracked_compose_child_is_zombie "${ACTIVE_COMPOSE_PID}" ||
+      ! kill -0 "${ACTIVE_COMPOSE_PID}" 2>/dev/null; then
+      if wait "${ACTIVE_COMPOSE_PID}"; then
+        status=0
+      else
+        status=$?
+      fi
+      publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
+      ACTIVE_COMPOSE_PID=
+      return "${status}"
+    fi
+    if (( require_live_group )); then
+      log "ERROR: supervised Compose child did not become its own live session and process group"
+      terminate_active_compose
+      return 125
+    fi
+  fi
+  if wait "${ACTIVE_COMPOSE_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  publish_supervisor_control "nested-done ${ACTIVE_COMPOSE_PID}"
+  ACTIVE_COMPOSE_PID=
+  return "${status}"
+}
+
+tracked_compose_child_isolated() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${state}" != Z && "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+}
+
+wait_for_tracked_compose_child_isolation() {
+  local pid="$1"
+  local attempt
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    tracked_compose_child_isolated "${pid}" && return 0
+    tracked_compose_child_is_zombie "${pid}" && return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    sleep 0.01
+  done
+  return 1
+}
+
+tracked_compose_child_is_zombie() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${state}" == Z ]]
+}
+
+tracked_compose_group_isolated() {
+  local pid="$1"
+  local stat state ppid pgid sid remainder
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat##*) }"
+  [[ "${remainder}" != "${stat}" ]] || return 1
+  read -r state ppid pgid sid _ <<< "${remainder}"
+  [[ "${pgid}" == "${pid}" && "${sid}" == "${pid}" ]]
+}
+
+terminate_active_compose() {
+  local pid="${ACTIVE_COMPOSE_PID:-}"
+  local attempt
+  [[ -n "${pid}" ]] || return 0
+  ACTIVE_COMPOSE_PID=
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    if tracked_compose_group_isolated "${pid}"; then
+      kill -TERM -- "-${pid}" 2>/dev/null || true
+    else
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
+    for ((attempt = 0; attempt < COMPOSE_CHILD_TERM_ATTEMPTS; attempt++)); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep "${COMPOSE_CHILD_TERM_DELAY_SECONDS}"
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      if tracked_compose_group_isolated "${pid}"; then
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+      else
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
+    fi
+  fi
+  wait "${pid}" 2>/dev/null || true
+  publish_supervisor_control "nested-done ${pid}"
+}
+
+validate_compose_redacted() {
+  if ! launch_compose config --quiet >/dev/null 2>&1; then
+    fail "Compose validation failed (details redacted)"
+  fi
+}
+
+validate_prepare_compose_redacted() {
+  if ! prepare_compose config --quiet >/dev/null 2>&1; then
+    fail "prepare Compose validation failed (details redacted)"
+  fi
+}
+
+prepare_roles_exited_successfully() {
+  local role container state
+  for role in allocator prepare; do
+    container="$(prepare_compose ps --all --quiet "${role}" 2>/dev/null)" || return 1
+    [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+    state="$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "${container}" 2>/dev/null)" || return 1
+    [[ "${state}" == "exited:0" ]] || return 1
+  done
+}
+
+report_long_lived_role_states() {
+  local role container
+  for role in runtime executor broker; do
+    container="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || continue
+    [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || continue
+    docker inspect --format \
+      'role={{index .Config.Labels "com.docker.compose.service"}} status={{.State.Status}} exit={{.State.ExitCode}} error={{json .State.Error}}' \
+      "${container}" >&2 || true
+  done
+}
+
+redact_activation_diagnostic_stream() {
+  local line name value
+  local -a names=(
+    SUMI_LOCAL_CONTROL_BEARER
+    SUMI_AGENT_WRAPPING_KEY
+    SUMI_APPROVAL_SECRET_DIGEST_KEY
+    SUMI_PROVIDER_API_KEY
+    SUMI_EXPECTED_RPC_NONCE
+  )
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    for name in "${names[@]}"; do
+      value="${!name:-}"
+      [[ -z "${value}" ]] || line="${line//"${value}"/<redacted:${name}>}"
+    done
+    printf '%s\n' "${line}"
+  done
+}
+
+report_long_lived_role_logs() {
+  local role container
+  for role in runtime executor broker; do
+    container="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || continue
+    [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || continue
+    printf '[sumi-supervisor] bounded role=%s logs follow\n' "${role}" >&2
+    docker logs --tail 80 "${container}" 2>&1 |
+      tail -c 8192 |
+      redact_activation_diagnostic_stream >&2 || true
+  done
+}
+
+epoch_identity() {
+  local output line key value
+  local paid= generation= nonce=
+  declare -A seen=()
+  output="$(prepare_compose run --rm --no-deps --entrypoint /bin/bash allocator \
+    -c 'cat /var/lib/sumi-allocator-root/identity-output/runtime/identity.env' 2>/dev/null)" ||
+    return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == *=* ]] || return 1
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ -z "${seen[${key}]+set}" && -n "${value}" ]] || return 1
+    seen["${key}"]=1
+    case "${key}" in
+      SUMI_PERSONALITY_AGENT_ID) paid="${value}" ;;
+      SUMI_RPC_GENERATION) generation="${value}" ;;
+      SUMI_RPC_NONCE) nonce="${value}" ;;
+      SUMI_PROCESS_GENERATION_LEASE_ID|SUMI_GENERATION_RECOVERY_FENCE_ID) ;;
+      *) return 1 ;;
+    esac
+  done <<< "${output}"
+  [[ "${paid}" == "${SUMI_PERSONALITY_AGENT_ID}" ]] || return 1
+  [[ "${generation}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  [[ -n "${nonce}" && "${nonce}" != *'"'* && "${nonce}" != *'\\'* ]] || return 1
+  EPOCH_GENERATION="${generation}"
+  EPOCH_NONCE="${nonce}"
+}
+
+running_role_count() {
+  local role id count=0
+  for role in runtime executor broker; do
+    id="$(lifecycle_compose ps --status running --quiet "${role}" 2>/dev/null)" || return 1
+    [[ -z "${id//[[:space:]]/}" ]] || count=$((count + 1))
+  done
+  printf '%s\n' "${count}"
+}
+
+prepared_containers_exist() {
+  local allocator_id prepare_id
+  allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" || return 1
+  prepare_id="$(lifecycle_compose ps --all --quiet prepare 2>/dev/null)" || return 1
+  [[ -n "${allocator_id//[[:space:]]/}" && -n "${prepare_id//[[:space:]]/}" ]]
+}
+
+long_lived_containers_exist() {
+  local role id
+  for role in runtime executor broker; do
+    id="$(lifecycle_compose ps --all --quiet "${role}" 2>/dev/null)" || return 1
+    [[ -z "${id//[[:space:]]/}" ]] || return 0
+  done
+  return 1
+}
+
+print_epoch_json() {
+  local phase="$1"
+  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
+}
+
+print_unknown_json() {
+  printf '{"personality_agent_id":"%s","phase":"unknown"}\n' "${SUMI_PERSONALITY_AGENT_ID}"
+}
+
+inspect_epoch() {
+  local running
+  running="$(running_role_count)" || fail "cannot inspect Compose role state"
+  if [[ "${running}" == 3 ]]; then
+    epoch_identity || fail "active project has no coherent prepared epoch"
+    print_epoch_json active
+    return
+  fi
+  [[ "${running}" == 0 ]] || fail "project contains a partial active generation"
+  ! long_lived_containers_exist ||
+    fail "project contains a failed active generation; reconcile before reuse"
+  if prepared_containers_exist; then
+    epoch_identity || fail "prepared project has no coherent epoch"
+    print_epoch_json prepared
+  else
+    print_unknown_json
+  fi
+}
+
+require_expected_epoch() {
+  : "${SUMI_EXPECTED_RPC_GENERATION:?SUMI_EXPECTED_RPC_GENERATION is required}"
+  : "${SUMI_EXPECTED_RPC_NONCE:?SUMI_EXPECTED_RPC_NONCE is required}"
+  epoch_identity || fail "prepared epoch is unavailable"
+  [[ "${EPOCH_GENERATION}" == "${SUMI_EXPECTED_RPC_GENERATION}" && \
+    "${EPOCH_NONCE}" == "${SUMI_EXPECTED_RPC_NONCE}" ]] ||
+    fail "prepared epoch does not match requested activation handle"
+}
+
+cleanup_project_is_empty() {
+  local containers
+  containers="$(lifecycle_compose ps --all --quiet 2>/dev/null)" || return 1
+  [[ -z "${containers//[[:space:]]/}" ]]
+}
+
+cleanup_partial_generation() {
+  local status="$1"
+  local attempt
+  local cleanup_complete=0
+  trap - ERR EXIT
+  # Once teardown starts, do not let a repeated terminal signal interrupt the
+  # synchronous join. The saved launch/signal status is returned afterward.
+  trap '' INT TERM
+  set +e
+  terminate_active_compose
+  if (( CLEANUP_ARMED )); then
+    CLEANUP_ARMED=0
+    # A nonzero `down` can still leave an empty project, while a zero status is
+    # not the cleanup contract by itself. Bound retries on observed emptiness.
+    for ((attempt = 1; attempt <= CLEANUP_MAX_ATTEMPTS; attempt++)); do
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1
+      if cleanup_project_is_empty; then
+        cleanup_complete=1
+        break
+      fi
+      if (( attempt < CLEANUP_MAX_ATTEMPTS )); then
+        sleep "${CLEANUP_RETRY_DELAY_SECONDS}"
+      fi
+    done
+    if (( ! cleanup_complete )); then
+      log "ERROR: partial-generation cleanup incomplete after ${CLEANUP_MAX_ATTEMPTS} attempts (details redacted)"
+    fi
+    remove_runtime_secret_generation ||
+      log "ERROR: partial-generation secret cleanup incomplete (details redacted)"
+  fi
+  exit "${status}"
+}
+
+arm_partial_generation_cleanup() {
+  CLEANUP_ARMED=1
+  trap 'cleanup_partial_generation $?' ERR
+  trap 'cleanup_partial_generation $?' EXIT
+  trap 'cleanup_partial_generation 130' INT
+  trap 'cleanup_partial_generation 143' TERM
+}
+
+disarm_partial_generation_cleanup() {
+  CLEANUP_ARMED=0
+  trap - ERR EXIT INT TERM
+}
+
+action="${1:-inspect-epoch}"
+case "${action}" in
+  project-name)
+    printf '%s\n' "${SUMI_COMPOSE_PROJECT}"
+    ;;
+  validate)
+    require_docker
+    require_launch_environment
+    configure_apparmor_profile
+    validate_compose_redacted
+    revalidate_local_control_socket
+    ;;
+  prepare)
+    acquire_supervisor_lock
+    require_docker
+    require_tracked_compose_support
+    configure_apparmor_profile
+    validate_prepare_compose_redacted
+    # The API installs exact-generation authorization and creates the PAID
+    # local-control listener only after this action returns PreparedEpoch.
+    # Socket trust is therefore activation-only and remains fail-closed there.
+    arm_partial_generation_cleanup
+    # `down` synchronously stops and joins every old-generation container.
+    # Only after it returns may the allocator issue a replacement generation.
+    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" 0 \
+      down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null 2>&1
+    remove_runtime_secret_tree
+    prepare_status=0
+    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" 1 up --detach --wait \
+      >/dev/null 2>&1; then
+      prepare_status=0
+    else
+      prepare_status=$?
+    fi
+    # Compose v2 reports a nonzero `up --wait` status when a one-shot service
+    # reaches its intended exited(0) state. Accept only the exact two-role
+    # terminal state; every real build/start/container failure remains fatal.
+    if (( prepare_status != 0 )) && ! prepare_roles_exited_successfully; then
+      exit "${prepare_status}"
+    fi
+    epoch_identity || fail "allocator completed without a coherent epoch"
+    disarm_partial_generation_cleanup
+    print_epoch_json prepared
+    ;;
+  activate)
+    acquire_supervisor_lock
+    require_docker
+    require_tracked_compose_support
+    require_expected_epoch
+    set_runtime_secret_host_dir "${EPOCH_GENERATION}"
+    require_launch_environment
+    configure_apparmor_profile
+    validate_compose_redacted
+    revalidate_local_control_socket
+    materialize_runtime_secrets
+    revalidate_runtime_secrets
+    arm_partial_generation_cleanup
+    # --no-deps is the critical phase boundary: activation must never restart
+    # the completed allocator or issue another generation.
+    activation_status=0
+    # The provisioner captures and value-redacts this bounded stderr stream on
+    # failure. Keep activation diagnostics available so a daemon rejection is
+    # classified instead of collapsing to an opaque timeout.
+    if run_tracked_compose "${COMPOSE_FILE}" 1 up --detach --no-deps \
+      executor broker runtime >/dev/null; then
+      activation_status=0
+    else
+      activation_status=$?
+    fi
+    if (( activation_status != 0 )); then
+      report_long_lived_role_states
+      report_long_lived_role_logs
+      exit "${activation_status}"
+    fi
+    revalidate_local_control_socket
+    revalidate_runtime_secrets
+    require_expected_epoch
+    disarm_partial_generation_cleanup
+    log "project ${SUMI_COMPOSE_PROJECT} epoch activated; runtime owns authenticated Health and Ready"
+    ;;
+  abort)
+    acquire_supervisor_lock
+    require_docker
+    if prepared_containers_exist; then
+      require_expected_epoch
+    fi
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+      >/dev/null 2>&1
+    remove_runtime_secret_tree
+    ;;
+  stop-epoch)
+    acquire_supervisor_lock
+    require_docker
+    require_expected_epoch
+    set_runtime_secret_host_dir "${EPOCH_GENERATION}"
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    remove_runtime_secret_tree
+    ;;
+  stop|down)
+    acquire_supervisor_lock
+    require_docker
+    lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}"
+    remove_runtime_secret_tree
+    ;;
+  status|ps)
+    require_docker
+    lifecycle_compose ps
+    ;;
+  logs)
+    require_docker
+    lifecycle_compose logs "${@:2}"
+    ;;
+  inspect-epoch)
+    acquire_supervisor_lock
+    require_docker
+    inspect_epoch
+    ;;
+  reconcile)
+    acquire_supervisor_lock
+    require_docker
+    running="$(running_role_count)" || fail "cannot inspect Compose role state"
+    if [[ "${running}" != 0 && "${running}" != 3 ]] ||
+      { [[ "${running}" == 0 ]] && long_lived_containers_exist; }; then
+      lifecycle_compose down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" \
+        >/dev/null 2>&1
+      remove_runtime_secret_tree
+      print_unknown_json
+    else
+      inspect_epoch
+    fi
+    ;;
+  *)
+    fail "usage: supervisor {prepare|activate|abort|inspect-epoch|reconcile|stop|status|logs|validate|project-name}"
+    ;;
+esac

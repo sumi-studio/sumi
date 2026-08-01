@@ -141,6 +141,13 @@ UI 要件というよりアーキテクチャ制約。最初から効かせる�
 4. エージェント側: 3 層メモリの圧縮・昇格はリクエスト経路に乗せず非同期バッチ。システムプロンプト + メモリ層はプロンプトキャッシュが効く順序で組む
 5. 単一スレッドで会話が無限に伸びるため、メッセージリストは最初から仮想化 (TanStack Virtual)
 
+#### WebSocket と認証境界
+
+- direct chat 画面は targetless な `GET /direct-chat/ws` を1本だけ常時接続し、送信・durable event replay・live-only delta を同じ接続で扱う。URL、browser command、browser eventへ内部の宛先identityを含めない。再接続時は最後に消費した durable event seq を hello で送り、API はその次から catch-up する。volatile delta は replay しない。
+- この接続は `sumi_session` HttpOnly cookie の別署名 session (`tenant_id`、`user_id`、内部targetの`personality_agent_id`、expiry、`sumi:web:direct-chat` audience) だけを受け入れる。APIが検証済みsessionから宛先とdirect-chat provenanceを構成する。agent の short-lived bearer token、`PersonalityAgentId`、`ProcessGeneration`、provenance はbrowserへ渡さない。
+- API は `SUMI_BROWSER_SESSION_SECRET`（base64 HMAC key）、任意の `SUMI_BROWSER_SESSION_AUDIENCE`、および browser origin allowlist `SUMI_BROWSER_WS_ALLOWED_ORIGINS` を必要とする。現在は `GET /auth/csrf`、`POST/GET /auth/session`、`POST /auth/logout` を実装済みで、Firebase Admin が検証した ID token と server-owned な UID/tenant/user/PersonalityAgent binding から session を発行する。ローカルの正式な入口は既定の `http://127.0.0.1:5173`、または明示した literal Tailnet IPv4 の `http://<ip>:5173` で、API はその 1 origin だけを許可し、Vite が `/auth` と `/direct-chat` を同一 origin proxy する。設定と human smoke は [Real local stack](local-development.md) を参照。
+- browser-session cookie の署名鍵は上記base secretからprotocol-version付きの `v2` domainで導出する。pre-lineage cookieはupgrade後に局所検証で失効し、次のFirebase exchangeだけがv2 cookieを発行する一方、authority binding IDは元のbase secretから導出し続けるため同じbindingでは変わらない。この境界をまたぐ旧版とv2版のAPI replicaは互いのcookieを受理できないため、同一deploymentで混在させず、全replicaをdrainして同時に切り替える。このcutoverはone-wayであり、v2を有効化した後に同じ `SUMI_BROWSER_SESSION_SECRET` のまま旧binaryへrollbackしてはならない。rollbackが不可避ならsecretをrotateして全browser sessionとauthority bindingを安全側へresetするか、v2を最大session TTLの1時間より長く停止して既発行cookieがすべて失効してから旧版またはv2を再開する。
+
 ### C. 権限リクエストフロー
 
 「権限を要求する権限」の受け皿。専用画面は作らず、**チャット内のシステムカード + 通知タブのキュー**の 2 箇所に同じ承認 UI を出す。

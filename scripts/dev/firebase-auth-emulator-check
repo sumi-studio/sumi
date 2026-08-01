@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+compose_file="${repo_root}/deploy/firebase/compose.yaml"
+project_id="sumi-emulator-check-$RANDOM-$RANDOM"
+compose_project="sumi_firebase_auth_check_$RANDOM$RANDOM"
+image_tag="local-check-$$-$RANDOM-$RANDOM"
+image_ref="ghcr.io/sumi-studio/sumi-firebase:${image_tag}"
+base_url="http://127.0.0.1:9099"
+email="persistence-${RANDOM}-${RANDOM}@example.test"
+export SUMI_FIREBASE_IMAGE_TAG="${image_tag}"
+
+compose=(docker compose --project-name "${compose_project}" --file "${compose_file}")
+
+cleanup() {
+  "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker image rm "${image_ref}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+wait_for_auth() {
+  local attempt
+  for attempt in $(seq 1 90); do
+    if curl --fail --silent --show-error --max-time 1 \
+      "${base_url}/emulator/v1/projects/${project_id}/config" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  "${compose[@]}" logs >&2 || true
+  echo "Firebase Auth emulator did not become ready" >&2
+  return 1
+}
+
+# This lifecycle check validates the current worktree, not an already-published
+# GHCR image. Use the production image name with a unique local-only tag and
+# override the Compose pull policy so the tag is never resolved from GHCR.
+docker build \
+  --file "${repo_root}/deploy/firebase/Dockerfile" \
+  --tag "${image_ref}" \
+  "${repo_root}"
+
+FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 FIREBASE_PROJECT_ID="${project_id}" \
+  "${compose[@]}" up --detach --pull never
+wait_for_auth
+
+curl --fail --silent --show-error --max-time 5 \
+  --header 'content-type: application/json' \
+  --data "{\"email\":\"${email}\",\"password\":\"not-a-real-secret\",\"returnSecureToken\":true}" \
+  "${base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake-api-key" >/dev/null
+
+# A normal Compose stop sends SIGTERM, exercising Firebase's export-on-exit.
+"${compose[@]}" down
+FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 FIREBASE_PROJECT_ID="${project_id}" \
+  "${compose[@]}" up --detach --pull never
+wait_for_auth
+
+curl --fail --silent --show-error --max-time 5 \
+  --header 'content-type: application/json' \
+  --data "{\"email\":\"${email}\",\"password\":\"not-a-real-secret\",\"returnSecureToken\":true}" \
+  "${base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake-api-key" >/dev/null
+
+echo "Firebase Auth emulator retained ${email} across restart."

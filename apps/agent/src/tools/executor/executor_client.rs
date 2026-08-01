@@ -19,12 +19,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::protocol::{parse_artifact_handle, validate_conversation_id};
+use super::manager::RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE;
+use super::protocol::{RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, parse_artifact_handle};
 use super::{
-    ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
-    RpcOperationValidation, RpcRequest, decode_rpc_frame,
+    ArtifactResponse, ExecutorOperation, ExecutorResponse, ExecutorServiceRole, MAX_RPC_LINE_BYTES,
+    RpcError, RpcFrame, RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
-use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
+use crate::runtime::contracts::{PersonalityAgentId, ProcessGeneration, RpcIdentity};
 use crate::tools::{
     ToolError,
     fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
@@ -32,6 +33,26 @@ use crate::tools::{
 };
 
 const MAX_EXECUTOR_UPDATES: usize = 65_536;
+const GENERATION_ROLLOVER_REQUIRED_MESSAGE: &str = "executor generation rollover required";
+const REPLAY_OUTCOME_UNAVAILABLE_MESSAGE: &str = "executor replay outcome is no longer retained";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutorErrorClassification {
+    GenerationRolloverRequired,
+    ReplayOutcomeUnavailable,
+}
+
+pub fn classify_executor_error(error: &ToolError) -> Option<ExecutorErrorClassification> {
+    match error {
+        ToolError::Rpc(message) if message == GENERATION_ROLLOVER_REQUIRED_MESSAGE => {
+            Some(ExecutorErrorClassification::GenerationRolloverRequired)
+        }
+        ToolError::Rpc(message) if message == REPLAY_OUTCOME_UNAVAILABLE_MESSAGE => {
+            Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Deadlines {
@@ -69,20 +90,14 @@ impl Default for Deadlines {
 pub struct ExecutorClient {
     socket: PathBuf,
     identity: RpcIdentity,
-    conversation_id: String,
     deadlines: Deadlines,
 }
 
 impl ExecutorClient {
-    pub fn new(
-        socket: impl Into<PathBuf>,
-        identity: RpcIdentity,
-        conversation_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(socket: impl Into<PathBuf>, identity: RpcIdentity) -> Self {
         Self {
             socket: socket.into(),
             identity,
-            conversation_id: conversation_id.into(),
             deadlines: Deadlines::default(),
         }
     }
@@ -95,15 +110,64 @@ impl ExecutorClient {
         self.identity.generation()
     }
 
+    pub(crate) const fn identity(&self) -> &RpcIdentity {
+        &self.identity
+    }
+
+    pub async fn health(&self) -> Result<(), ToolError> {
+        self.health_with_cancellation(CancellationToken::new(), self.deadlines.overall)
+            .await
+    }
+
+    /// Run one authenticated Health exchange on a fresh Unix connection.
+    ///
+    /// Health has no execution identity, so cancellation is prompt only before
+    /// request emission. After emission the short `overall` bound closes the
+    /// connection without manufacturing an invalid empty Cancel operation.
+    pub async fn health_with_cancellation(
+        &self,
+        cancel: CancellationToken,
+        overall: Duration,
+    ) -> Result<(), ToolError> {
+        match self
+            .execute_with_overall(
+                ExecutorOperation::Health {
+                    service_role: ExecutorServiceRole::ToolExecutor,
+                },
+                cancel,
+                Arc::new(|_| {}),
+                overall,
+            )
+            .await?
+        {
+            ExecutorResponse::Healthy {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            } => Ok(()),
+            _ => Err(ToolError::Protocol(
+                "executor health returned a non-health response".to_owned(),
+            )),
+        }
+    }
+
     pub async fn execute(
         &self,
         operation: ExecutorOperation,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
-        validate_conversation_id(&self.conversation_id)?;
+        self.execute_with_overall(operation, cancel, on_update, self.deadlines.overall)
+            .await
+    }
+
+    async fn execute_with_overall(
+        &self,
+        operation: ExecutorOperation,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+        overall: Duration,
+    ) -> Result<ExecutorResponse, ToolError> {
         operation.validate()?;
-        validate_operation_for_conversation(&operation, &self.conversation_id)?;
+        validate_operation_for_personality_agent(&operation, self.identity.personality_agent_id())?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
             return Err(ToolError::Protocol(
                 "ExecutorClient owns cancel request construction".to_owned(),
@@ -115,7 +179,7 @@ impl ExecutorClient {
 
         let request_emitted = Arc::new(AtomicBool::new(false));
         let execution = self.execute_inner(operation, cancel, on_update, request_emitted.clone());
-        match timeout(self.deadlines.overall, execution).await {
+        match timeout(overall, execution).await {
             Ok(result) => result,
             Err(_) if request_emitted.load(Ordering::Acquire) => {
                 Err(indeterminate("executor overall exchange deadline elapsed"))
@@ -133,7 +197,7 @@ impl ExecutorClient {
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ExecutorResponse, ToolError> {
-        let cancellable_bash = matches!(operation, ExecutorOperation::Bash { .. });
+        let cancellation_mode = cancellation_mode(&operation);
         let execution_id = operation_execution_id(&operation).to_owned();
         let request_id = format!("executor-{}", Uuid::now_v7());
         let encoded = encode_request(&self.identity, &request_id, operation.clone())?;
@@ -195,7 +259,7 @@ impl ExecutorClient {
                 cancel_deadline.unwrap_or_else(|| Instant::now() + self.deadlines.frame);
             tokio::select! {
                 biased;
-                _ = cancel.cancelled(), if cancel_request_id.is_none() => {
+                _ = cancel.cancelled(), if cancel_request_id.is_none() && cancellation_mode.sends_cancel() => {
                     let id = format!("executor-cancel-{}", Uuid::now_v7());
                     let cancel_bytes = encode_request(
                         &self.identity,
@@ -244,10 +308,10 @@ impl ExecutorClient {
                             }
                             let response = result.map_err(|error| map_rpc_error(&operation, error));
                             if let Ok(response) = &response {
-                                validate_response_for_conversation(
+                                validate_response_for_personality_agent(
                                     &operation,
                                     response,
-                                    &self.conversation_id,
+                                    self.identity.personality_agent_id(),
                                 )
                                     .map_err(as_indeterminate)?;
                             }
@@ -281,7 +345,7 @@ impl ExecutorClient {
             .ok_or_else(|| indeterminate("executor response lacked operation terminal"))?;
         validate_cancel_settlement(
             cancel_request_id.is_some(),
-            cancellable_bash,
+            cancellation_mode.is_active_bash(),
             cancel_terminal,
             &result,
         )?;
@@ -343,12 +407,51 @@ enum CancelTerminal {
     TooLate,
 }
 
+#[derive(Clone, Copy)]
+enum CancellationMode {
+    /// Health authenticates a fixed endpoint but has no execution identity.
+    /// It is cancellable only before its request is emitted.
+    None,
+    /// Synchronous executor operations cannot be actively stopped, but a
+    /// post-emission cancellation must be settled against their terminal.
+    SettlementOnly,
+    /// Bash is the one executor operation the service can actively stop.
+    ActiveBash,
+}
+
+impl CancellationMode {
+    const fn sends_cancel(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn is_active_bash(self) -> bool {
+        matches!(self, Self::ActiveBash)
+    }
+}
+
+fn cancellation_mode(operation: &ExecutorOperation) -> CancellationMode {
+    match operation {
+        ExecutorOperation::Health { .. } | ExecutorOperation::Cancel { .. } => {
+            CancellationMode::None
+        }
+        ExecutorOperation::Bash { .. } => CancellationMode::ActiveBash,
+        ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::WriteFile { .. }
+        | ExecutorOperation::EditFile { .. }
+        | ExecutorOperation::RemoveFile { .. }
+        | ExecutorOperation::ListDir { .. }
+        | ExecutorOperation::Glob { .. }
+        | ExecutorOperation::Grep { .. } => CancellationMode::SettlementOnly,
+    }
+}
+
 fn encode_request(
     identity: &RpcIdentity,
     request_id: &str,
     operation: ExecutorOperation,
 ) -> Result<Vec<u8>, ToolError> {
     let request = RpcRequest {
+        personality_agent_id: identity.personality_agent_id().clone(),
         generation: identity.generation().to_wire(),
         nonce: identity.nonce().as_str().to_owned(),
         request_id: request_id.to_owned(),
@@ -441,6 +544,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
 
 fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     match operation {
+        ExecutorOperation::Health { .. } => "",
         ExecutorOperation::ReadFile { execution_id, .. }
         | ExecutorOperation::WriteFile { execution_id, .. }
         | ExecutorOperation::EditFile { execution_id, .. }
@@ -453,13 +557,21 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     }
 }
 
-fn validate_response_for_conversation(
+fn validate_response_for_personality_agent(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
-    conversation_id: &str,
+    personality_agent_id: &PersonalityAgentId,
 ) -> Result<(), ToolError> {
-    validate_operation_for_conversation(operation, conversation_id)?;
+    validate_operation_for_personality_agent(operation, personality_agent_id)?;
     let valid = match (operation, response) {
+        (
+            ExecutorOperation::Health {
+                service_role: requested,
+            },
+            ExecutorResponse::Healthy {
+                service_role: responding,
+            },
+        ) => requested == responding && *responding == ExecutorServiceRole::ToolExecutor,
         (
             ExecutorOperation::ReadFile { path, limit, .. },
             ExecutorResponse::ReadFile { result },
@@ -494,7 +606,7 @@ fn validate_response_for_conversation(
                     parse_artifact_handle(handle).is_ok_and(|parsed| {
                         parsed.kind == super::protocol::ArtifactKind::ToolOutput
                             && parsed.artifact_id == execution_id
-                            && parsed.conversation_id == conversation_id
+                            && &parsed.personality_agent_id == personality_agent_id
                     })
                 })
         }
@@ -509,9 +621,9 @@ fn validate_response_for_conversation(
     }
 }
 
-fn validate_operation_for_conversation(
+fn validate_operation_for_personality_agent(
     operation: &ExecutorOperation,
-    conversation_id: &str,
+    personality_agent_id: &PersonalityAgentId,
 ) -> Result<(), ToolError> {
     let path = match operation {
         ExecutorOperation::ReadFile { path, .. } | ExecutorOperation::Grep { path, .. } => path,
@@ -521,11 +633,11 @@ fn validate_operation_for_conversation(
         return Ok(());
     }
     let parsed = parse_artifact_handle(path)?;
-    if parsed.conversation_id == conversation_id {
+    if &parsed.personality_agent_id == personality_agent_id {
         Ok(())
     } else {
         Err(ToolError::InvalidPath(
-            "artifact belongs to another conversation".to_owned(),
+            "artifact belongs to another personality agent".to_owned(),
         ))
     }
 }
@@ -535,7 +647,12 @@ fn validate_response(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
 ) -> Result<(), ToolError> {
-    validate_response_for_conversation(operation, response, "conversation-1")
+    validate_response_for_personality_agent(
+        operation,
+        response,
+        &PersonalityAgentId::parse("0198f0f4-9b72-7000-8000-000000000001")
+            .expect("canonical UUIDv7"),
+    )
 }
 
 fn read_file_result_within_limit(
@@ -605,6 +722,12 @@ fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
             | ExecutorOperation::RemoveFile { .. }
     );
     match (error.code.as_str(), error.resource_limit) {
+        (RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE, None) => {
+            ToolError::Rpc(GENERATION_ROLLOVER_REQUIRED_MESSAGE.to_owned())
+        }
+        (RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE, None) => {
+            ToolError::Rpc(REPLAY_OUTCOME_UNAVAILABLE_MESSAGE.to_owned())
+        }
         ("resource_limit", Some(limit)) => ToolError::ResourceLimit(limit),
         ("cancelled", None) if !mutating => ToolError::Cancelled,
         ("invalid_arguments", None) => ToolError::InvalidArguments,
@@ -635,6 +758,8 @@ fn indeterminate(message: &str) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";
     use crate::tools::{
         executor::{
             ArtifactBrokerClient,
@@ -654,12 +779,13 @@ mod tests {
     };
 
     fn identity() -> RpcIdentity {
-        RpcIdentity::from_wire(7, "boot-nonce").unwrap()
+        RpcIdentity::from_wire(PAID, 7, "boot-nonce").unwrap()
     }
 
     #[test]
     fn outgoing_request_rejects_out_of_domain_generation_before_encoding() {
         let error = RpcIdentity::from_wire(
+            PAID,
             crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
             "boot-nonce",
         )
@@ -699,8 +825,7 @@ mod tests {
                 let broker_socket = broker_socket.clone();
                 sessions.push(tokio::spawn(async move {
                     let fs = WorkspaceFs::open(&workspace).unwrap();
-                    let broker =
-                        ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+                    let broker = ArtifactBrokerClient::new(broker_socket, identity());
                     let (read, write) = stream.into_split();
                     run_executor_service(read, write, identity(), workspace, fs, broker)
                         .await
@@ -727,7 +852,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let fs = WorkspaceFs::open(&workspace).unwrap();
-            let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+            let broker = ArtifactBrokerClient::new(broker_socket, identity());
             let (read, write) = stream.into_split();
             run_executor_service_with_cancel_delay(
                 read,
@@ -759,7 +884,7 @@ mod tests {
             let (read, write) = tokio::io::split(executor_stream);
             let service = tokio::spawn(async move {
                 let fs = WorkspaceFs::open(&workspace).unwrap();
-                let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+                let broker = ArtifactBrokerClient::new(broker_socket, identity());
                 run_executor_service(read, write, identity(), workspace, fs, broker)
                     .await
                     .unwrap();
@@ -811,8 +936,7 @@ mod tests {
     async fn real_service_success_and_ordered_updates() {
         let root = temp_root("success-updates");
         let (socket, service) = spawn_real_service(&root, 2);
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let response = client
             .execute(
                 write_operation("write-1", "written.txt", "content"),
@@ -864,7 +988,7 @@ mod tests {
         let (socket, service) = spawn_real_service(&root, 1);
         let updates = Arc::new(Mutex::new(Vec::new()));
         let updates_callback = updates.clone();
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -895,8 +1019,7 @@ mod tests {
     async fn real_service_cancellation_waits_for_ack_and_terminal() {
         let root = temp_root("cancel");
         let (socket, service) = spawn_real_service(&root, 1);
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         let started = Arc::new(Semaphore::new(0));
@@ -964,7 +1087,7 @@ mod tests {
         let mut deadlines = test_deadlines();
         deadlines.frame = Duration::from_secs(15);
         deadlines.overall = Duration::from_secs(20);
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(deadlines)
             .execute(
                 ExecutorOperation::Bash {
@@ -995,10 +1118,8 @@ mod tests {
     async fn concurrent_clients_remain_execution_isolated() {
         let root = temp_root("concurrent");
         let (socket, service) = spawn_real_service(&root, 2);
-        let first = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
-        let second = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let first = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
+        let second = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
         let (first, second) = tokio::join!(
             first.execute(
                 write_operation("execution-a", "a.txt", "alpha"),
@@ -1026,6 +1147,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_authenticates_real_service_and_rejects_untrusted_endpoints() {
+        let root = temp_root("health-real");
+        let (socket, service) = spawn_real_service(&root, 1);
+        ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .health()
+            .await
+            .expect("healthy executor");
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        for mode in [
+            "wrong-paid",
+            "wrong-generation",
+            "wrong-nonce",
+            "wrong-role",
+            "malformed",
+            "stalled",
+            "eof",
+            "trailing",
+            "duplicate",
+            "wrong-request-id",
+            "rpc-error",
+        ] {
+            let root = temp_root(&format!("health-{mode}"));
+            let socket = root.join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let request = read_request(&mut BufReader::new(read)).await;
+                match mode {
+                    "wrong-paid" | "wrong-generation" | "wrong-nonce" | "wrong-role" => {
+                        let personality_agent_id = if mode == "wrong-paid" {
+                            "0198f0f4-9b72-7000-8000-000000000002"
+                        } else {
+                            PAID
+                        };
+                        let generation = if mode == "wrong-generation" { 8 } else { 7 };
+                        let nonce = if mode == "wrong-nonce" {
+                            "wrong"
+                        } else {
+                            "boot-nonce"
+                        };
+                        let service_role = if mode == "wrong-role" {
+                            "artifact_broker"
+                        } else {
+                            "tool_executor"
+                        };
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":personality_agent_id,
+                                "generation":generation,
+                                "nonce":nonce,
+                                "request_id":request["request_id"],
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":service_role
+                                }}
+                            }),
+                        )
+                        .await;
+                    }
+                    "malformed" => write.write_all(b"not-json\n").await.unwrap(),
+                    "stalled" => tokio::time::sleep(Duration::from_secs(1)).await,
+                    "eof" => {}
+                    "trailing" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":request["request_id"],
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":"tool_executor"
+                                }}
+                            }),
+                        )
+                        .await;
+                        write.write_all(b"x").await.unwrap();
+                    }
+                    "duplicate" => {
+                        for _ in 0..2 {
+                            write_json_line(
+                                &mut write,
+                                json!({
+                                    "type":"terminal",
+                                    "personality_agent_id":PAID,
+                                    "generation":7,
+                                    "nonce":"boot-nonce",
+                                    "request_id":request["request_id"],
+                                    "result":{"Ok":{
+                                        "type":"healthy",
+                                        "service_role":"tool_executor"
+                                    }}
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "wrong-request-id" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":"wrong-request",
+                                "result":{"Ok":{
+                                    "type":"healthy",
+                                    "service_role":"tool_executor"
+                                }}
+                            }),
+                        )
+                        .await;
+                    }
+                    "rpc-error" => {
+                        write_json_line(
+                            &mut write,
+                            json!({
+                                "type":"terminal",
+                                "personality_agent_id":PAID,
+                                "generation":7,
+                                "nonce":"boot-nonce",
+                                "request_id":request["request_id"],
+                                "result":{"Err":{"code":"protocol"}}
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let mut deadlines = test_deadlines();
+            deadlines.frame = Duration::from_millis(80);
+            deadlines.overall = Duration::from_millis(250);
+            let error = ExecutorClient::new(&socket, identity())
+                .with_deadlines(deadlines)
+                .health()
+                .await
+                .expect_err("untrusted health endpoint");
+            if mode == "rpc-error" {
+                assert!(matches!(error, ToolError::Protocol(_)), "{mode}: {error:?}");
+            } else {
+                assert!(
+                    matches!(error, ToolError::RpcIndeterminate(_)),
+                    "{mode}: {error:?}"
+                );
+            }
+            server.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn health_cancellation_after_emission_never_sends_an_empty_cancel() {
+        let root = temp_root("health-cancel-after-emission");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_server = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let request = read_request(&mut read).await;
+            assert_eq!(request["operation"]["type"], "health");
+
+            // The request is now on the wire, but the executor has not replied.
+            // Health has no execution identity to cancel, so the client must wait
+            // for its authenticated terminal rather than emit Cancel { "" }.
+            cancel_server.cancel();
+            assert!(
+                timeout(Duration::from_millis(100), read_request(&mut read))
+                    .await
+                    .is_err(),
+                "health cancellation must not send a follow-up cancel request"
+            );
+            write_json_line(
+                &mut write,
+                json!({
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
+                    "request_id":request["request_id"],
+                    "result":{"Ok":{"type":"healthy", "service_role":"tool_executor"}}
+                }),
+            )
+            .await;
+        });
+
+        let response = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .execute(
+                ExecutorOperation::Health {
+                    service_role: ExecutorServiceRole::ToolExecutor,
+                },
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("post-emission health cancellation must preserve health result");
+        assert_eq!(
+            response,
+            ExecutorResponse::Healthy {
+                service_role: ExecutorServiceRole::ToolExecutor,
+            }
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_health_deadline_closes_the_probe_without_sending_cancel() {
+        let root = temp_root("health-short-deadline");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let request = read_request(&mut read).await;
+            assert_eq!(request["operation"]["type"], "health");
+            let mut trailing = String::new();
+            let count = timeout(Duration::from_millis(250), read.read_line(&mut trailing))
+                .await
+                .expect("short Health deadline must close its Unix connection")
+                .expect("read Health connection close");
+            assert_eq!(count, 0, "deadline must close without a Cancel frame");
+            assert!(trailing.is_empty());
+        });
+
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .health_with_cancellation(CancellationToken::new(), Duration::from_millis(40))
+            .await
+            .expect_err("stalled Health must obey its short probe deadline");
+        assert!(matches!(error, ToolError::RpcIndeterminate(_)));
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn wrong_identity_and_request_id_fail_closed() {
         for mode in ["identity", "request"] {
             let root = temp_root(mode);
@@ -1048,13 +1416,13 @@ mod tests {
                 write_json_line(
                     &mut write,
                     json!({
-                        "type":"terminal", "generation":7, "nonce":nonce,
+                        "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":nonce,
                         "request_id":request_id, "result":{"Ok":{"type":"written"}}
                     }),
                 )
                 .await;
             });
-            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let error = ExecutorClient::new(&socket, identity())
                 .with_deadlines(test_deadlines())
                 .execute(
                     write_operation("wrong-frame", "x", "x"),
@@ -1073,12 +1441,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_conversation_artifact_routes_fail_before_service_contact() {
-        let root = temp_root("cross-conversation-preflight");
+    async fn cross_personality_agent_artifact_routes_fail_before_service_contact() {
+        let root = temp_root("xpaid");
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
 
         for operation in [
             ExecutorOperation::ReadFile {
@@ -1088,13 +1455,14 @@ mod tests {
                 execution_id: "malformed-read".to_owned(),
             },
             ExecutorOperation::ReadFile {
-                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/read".to_owned(),
                 offset: 0,
                 limit: 4,
                 execution_id: "cross-read".to_owned(),
             },
             ExecutorOperation::Grep {
-                path: "artifact://conversation-2/attachments/input".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/attachments/input"
+                    .to_owned(),
                 pattern: "needle".to_owned(),
                 execution_id: "cross-grep".to_owned(),
             },
@@ -1173,7 +1541,7 @@ mod tests {
         );
 
         let artifact_read = ExecutorOperation::ReadFile {
-            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read".to_owned(),
             offset: 0,
             limit: 4,
             execution_id: "read-artifact".to_owned(),
@@ -1207,7 +1575,8 @@ mod tests {
                 &artifact_read,
                 &ExecutorResponse::Artifact {
                     response: ArtifactResponse::Begun {
-                        handle: "artifact://conversation-1/tool-output/read".to_owned(),
+                        handle: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read"
+                            .to_owned(),
                         offset: 0,
                     },
                 },
@@ -1216,7 +1585,7 @@ mod tests {
         );
 
         let artifact_grep = ExecutorOperation::Grep {
-            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/read".to_owned(),
             pattern: "needle".to_owned(),
             execution_id: "grep-artifact".to_owned(),
         };
@@ -1246,13 +1615,13 @@ mod tests {
 
         for forged_operation in [
             ExecutorOperation::ReadFile {
-                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/read".to_owned(),
                 offset: 0,
                 limit: 4,
                 execution_id: "forged-read".to_owned(),
             },
             ExecutorOperation::Grep {
-                path: "artifact://conversation-2/tool-output/grep".to_owned(),
+                path: "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/grep".to_owned(),
                 pattern: "needle".to_owned(),
                 execution_id: "forged-grep".to_owned(),
             },
@@ -1272,13 +1641,13 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(
-                validate_response_for_conversation(
+                validate_response_for_personality_agent(
                     &forged_operation,
                     &forged_response,
-                    "conversation-1",
+                    &PAID.parse().unwrap(),
                 )
                 .is_err(),
-                "accepted a bounded cross-conversation artifact response"
+                "accepted a bounded cross-personality-agent artifact response"
             );
         }
     }
@@ -1369,7 +1738,7 @@ mod tests {
         assert!(validate_response(&grep, &ExecutorResponse::Grepped { matches }).is_err());
 
         let artifact_grep = ExecutorOperation::Grep {
-            path: "artifact://conversation-1/tool-output/grep".to_owned(),
+            path: "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/grep".to_owned(),
             pattern: "x".to_owned(),
             execution_id: "artifact-grep-lines".to_owned(),
         };
@@ -1563,9 +1932,9 @@ mod tests {
         );
 
         for handle in [
-            "artifact://conversation-2/tool-output/bash-bounds",
-            "artifact://conversation-1/attachments/bash-bounds",
-            "artifact://conversation-1/tool-output/other-execution",
+            "artifact://0198f0f4-9b72-7000-8000-000000000002/tool-output/bash-bounds",
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/attachments/bash-bounds",
+            "artifact://0198f0f4-9b72-7000-8000-000000000001/tool-output/other-execution",
         ] {
             let mut wrong_claim = result.clone();
             wrong_claim.artifact_handle = Some(handle.to_owned());
@@ -1727,6 +2096,40 @@ mod tests {
     }
 
     #[test]
+    fn executor_control_errors_have_stable_external_classification() {
+        let mutation = write_operation("control-mapping", "note.txt", "content");
+        let rollover = map_rpc_error(
+            &mutation,
+            RpcError {
+                code: RPC_BOOT_UNIQUENESS_EXHAUSTED_CODE.to_owned(),
+                resource_limit: None,
+            },
+        );
+        assert_eq!(
+            classify_executor_error(&rollover),
+            Some(ExecutorErrorClassification::GenerationRolloverRequired)
+        );
+        assert!(matches!(rollover, ToolError::Rpc(_)));
+
+        let replay_unavailable = map_rpc_error(
+            &mutation,
+            RpcError {
+                code: RPC_REPLAY_OUTCOME_UNAVAILABLE_CODE.to_owned(),
+                resource_limit: None,
+            },
+        );
+        assert_eq!(
+            classify_executor_error(&replay_unavailable),
+            Some(ExecutorErrorClassification::ReplayOutcomeUnavailable)
+        );
+        assert!(matches!(replay_unavailable, ToolError::Rpc(_)));
+        assert_eq!(
+            classify_executor_error(&ToolError::Rpc("different".to_owned())),
+            None
+        );
+    }
+
+    #[test]
     fn executor_response_unit_variants_reject_unknown_fields() {
         let parsed = serde_json::from_value::<ExecutorResponse>(
             serde_json::json!({"type": "written", "extra": 1}),
@@ -1753,7 +2156,7 @@ mod tests {
                     "timeout" => tokio::time::sleep(Duration::from_secs(1)).await,
                     "trailing" => {
                         let terminal = json!({
-                            "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                            "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                             "request_id":request["request_id"],
                             "result":{"Ok":{"type":"written"}}
                         });
@@ -1766,7 +2169,7 @@ mod tests {
             let mut deadlines = test_deadlines();
             deadlines.frame = Duration::from_millis(80);
             deadlines.overall = Duration::from_millis(250);
-            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let error = ExecutorClient::new(&socket, identity())
                 .with_deadlines(deadlines)
                 .execute(
                     write_operation("bad-reply", "x", "x"),
@@ -1807,7 +2210,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         // A token cancelled before emission must produce no service contact.
-        let pre = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let pre = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(write_operation("pre", "x", "x"), cancel, Arc::new(|_| {}))
             .await;
@@ -1819,7 +2222,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let error = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let error = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -1855,7 +2258,7 @@ mod tests {
             } else {
                 write_operation("sync-write", "written.txt", "written")
             };
-            let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+            let response = ExecutorClient::new(&socket, identity())
                 .with_deadlines(test_deadlines())
                 .execute(operation, cancel, Arc::new(|_| {}))
                 .await
@@ -1892,7 +2295,7 @@ mod tests {
             write_json_line(
                 &mut write,
                 json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                     "request_id":cancel["request_id"],
                     "result":{"Ok":{"type":"cancel_too_late"}}
                 }),
@@ -1901,7 +2304,7 @@ mod tests {
             write_json_line(
                 &mut write,
                 json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "type":"terminal", "personality_agent_id":PAID, "generation":7, "nonce":"boot-nonce",
                     "request_id":operation["request_id"],
                     "result":{"Ok":{"type":"bash","result":{
                         "output":"done", "truncation":truncation,
@@ -1918,7 +2321,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+        let response = ExecutorClient::new(&socket, identity())
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {

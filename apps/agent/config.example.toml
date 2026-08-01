@@ -4,7 +4,8 @@
 # Load it explicitly with SUMI_ENV_FILE=.env.local. Existing process
 # environment variables take precedence over values in the file.
 
-conversation_id = "default"
+# Required unless SUMI_PERSONALITY_AGENT_ID is set; must be a canonical UUIDv7.
+personality_agent_id = "0198f0f4-9b72-7000-8000-000000000001"
 workspace = "/workspace"
 # 相対パスはこの設定ファイルの場所を基準に解決される。
 # system_prompt (インライン文字列) との同時指定はエラー。

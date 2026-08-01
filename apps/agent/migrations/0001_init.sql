@@ -1,16 +1,17 @@
 CREATE TABLE agent_scope (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  tenant_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL UNIQUE,
+  personality_agent_id TEXT NOT NULL UNIQUE
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   created_at TEXT NOT NULL
 );
 
 CREATE TABLE data_keys (
   key_ref TEXT NOT NULL PRIMARY KEY,
-  scope TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope = 'personality_agent'),
   purpose TEXT NOT NULL,
-  conversation_id TEXT,
+  personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
+  retention_unit TEXT NOT NULL CHECK (length(retention_unit) BETWEEN 1 AND 96),
   algorithm TEXT NOT NULL,
   wrap_key_id TEXT NOT NULL,
   wrap_nonce BLOB,
@@ -18,22 +19,29 @@ CREATE TABLE data_keys (
   state TEXT NOT NULL,
   created_at TEXT NOT NULL,
   destroyed_at TEXT,
-  CHECK (scope IN ('conversation', 'agent')),
   CHECK (purpose IN (
     'transcript', 'event', 'memory_summary', 'provider_context',
     'command', 'mutation', 'artifact', 'workspace'
   )),
   CHECK (
-    (scope = 'conversation'
-      AND conversation_id IS NOT NULL
-      AND purpose IN (
-        'transcript', 'event', 'memory_summary', 'provider_context',
-        'command', 'mutation', 'artifact'
-      ))
+    (purpose IN (
+      'transcript', 'event', 'command', 'mutation', 'workspace'
+    ) AND retention_unit = 'agent')
     OR
-    (scope = 'agent'
-      AND conversation_id IS NULL
-      AND purpose = 'workspace')
+    (purpose = 'provider_context'
+      AND length(retention_unit) = 81
+      AND substr(retention_unit, 1, 17) = 'provider_context:'
+      AND substr(retention_unit, 18) NOT GLOB '*[^0-9a-f]*')
+    OR
+    (purpose = 'memory_summary'
+      AND length(retention_unit) = 79
+      AND substr(retention_unit, 1, 15) = 'memory_summary:'
+      AND substr(retention_unit, 16) NOT GLOB '*[^0-9a-f]*')
+    OR
+    (purpose = 'artifact'
+      AND length(retention_unit) = 73
+      AND substr(retention_unit, 1, 9) = 'artifact:'
+      AND substr(retention_unit, 10) NOT GLOB '*[^0-9a-f]*')
   ),
   CHECK (
     (state = 'active'
@@ -48,9 +56,9 @@ CREATE TABLE data_keys (
   )
 );
 
-CREATE UNIQUE INDEX one_active_shared_data_key
-ON data_keys(scope, purpose, COALESCE(conversation_id, ''))
-WHERE state = 'active' AND purpose <> 'provider_context';
+CREATE UNIQUE INDEX one_active_retention_data_key
+ON data_keys(personality_agent_id, purpose, retention_unit)
+WHERE state = 'active';
 
 CREATE TABLE messages (
   id TEXT NOT NULL PRIMARY KEY,
@@ -95,7 +103,8 @@ ON agent_events(json_extract(envelope, '$.message_id'))
 WHERE event_type = 'message_start';
 
 CREATE TABLE event_log_heads (
-  conversation_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_scope(conversation_id),
+  personality_agent_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
   last_seq INTEGER NOT NULL CHECK (last_seq >= 1),
   event_count INTEGER NOT NULL CHECK (event_count >= 1),
   chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32),
@@ -108,6 +117,9 @@ CREATE TABLE event_log_heads (
 CREATE TABLE inbound_commands (
   seq INTEGER PRIMARY KEY CHECK (seq >= 0),
   command_id TEXT NOT NULL UNIQUE,
+  personality_agent_id TEXT NOT NULL REFERENCES agent_scope(personality_agent_id)
+    CHECK (sumi_is_canonical_uuid_v7(personality_agent_id) = 1),
+  provenance_json TEXT NOT NULL,
   command_kind TEXT NOT NULL,
   payload_ciphertext BLOB,
   payload_key_ref TEXT REFERENCES data_keys(key_ref),
@@ -115,6 +127,8 @@ CREATE TABLE inbound_commands (
   status TEXT NOT NULL,
   reject_reason TEXT,
   reject_actual_bytes INTEGER,
+  admission_record_version INTEGER NOT NULL CHECK (admission_record_version = 2),
+  admission_record_hmac BLOB NOT NULL CHECK (length(admission_record_hmac) = 32),
   application_kind TEXT,
   run_id TEXT,
   turn_id TEXT,

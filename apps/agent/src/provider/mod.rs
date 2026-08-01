@@ -2,7 +2,8 @@
 
 pub mod adapters;
 pub mod assembler;
-mod canonical_request;
+pub(crate) mod canonical_request;
+pub(crate) mod context_fingerprint;
 pub mod model;
 pub mod overflow;
 pub mod partial_json;
@@ -54,10 +55,10 @@ use types::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const TIMING_OBSERVATION_CAPACITY: usize = 2;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
-const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
 
 enum RequestWait<T, E> {
     Response {
@@ -91,6 +92,7 @@ pub enum NativeCompactionError {
 struct ProducerChannels {
     normal: mpsc::Sender<ProviderEvent>,
     priority_terminal: mpsc::Sender<ProviderEvent>,
+    ordered_prefix_drain: Option<mpsc::Sender<()>>,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
     timing: Option<ProviderTimingObserver>,
 }
@@ -197,7 +199,7 @@ impl TtftObservation {
     }
 }
 
-fn http_client() -> Result<&'static reqwest::Client, String> {
+pub(crate) fn http_client() -> Result<&'static reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -433,6 +435,7 @@ fn stream_chat_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: None,
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -463,6 +466,7 @@ fn stream_responses_with_api_key(
 ) -> ProviderEventStream {
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+    let (ordered_prefix_drain_tx, ordered_prefix_drain_rx) = mpsc::channel(1);
     let origin = spec.origin();
     let provider = spec.provider.clone();
     let stream_budget = responses_requested_output_tokens(&spec, &options)
@@ -489,6 +493,7 @@ fn stream_responses_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: Some(ordered_prefix_drain_tx),
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -506,6 +511,7 @@ fn stream_responses_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .with_ordered_prefix_drain(ordered_prefix_drain_rx)
     .own_producer(producer_task)
 }
 
@@ -545,6 +551,7 @@ fn stream_anthropic_with_api_key(
                 ProducerChannels {
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
+                    ordered_prefix_drain: None,
                     success_terminal_committed: producer_terminal_committed,
                     timing: observer,
                 },
@@ -576,6 +583,7 @@ async fn run_anthropic_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain: _,
         success_terminal_committed,
         timing,
     } = channels;
@@ -975,6 +983,7 @@ async fn run_responses_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain,
         success_terminal_committed,
         timing,
     } = channels;
@@ -1175,7 +1184,10 @@ async fn run_responses_stream(
         match transport.next_event().await {
             Ok(Some(event)) => {
                 if let Err(error) = validate_event_name(event.event.as_deref(), &event.data) {
-                    close_responses_partial(&mut receive, &mut assembler);
+                    mark_responses_partial_rejection_prefix(
+                        &ordered_prefix_drain,
+                        close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                    );
                     finish_responses_error(
                         &priority_terminal_tx,
                         &mut assembler,
@@ -1191,7 +1203,11 @@ async fn run_responses_stream(
                 let pushed = match receive.push_json(&event.data) {
                     Ok(pushed) => pushed,
                     Err(error) => {
-                        close_responses_partial(&mut receive, &mut assembler);
+                        mark_responses_partial_rejection_prefix(
+                            &ordered_prefix_drain,
+                            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
+                                .await,
+                        );
                         finish_responses_error(
                             &priority_terminal_tx,
                             &mut assembler,
@@ -1216,7 +1232,11 @@ async fn run_responses_stream(
                         EmitResult::Sent => {}
                         EmitResult::Closed => return,
                         EmitResult::Cancelled => {
-                            close_responses_partial(&mut receive, &mut assembler);
+                            mark_responses_partial_rejection_prefix(
+                                &ordered_prefix_drain,
+                                close_responses_partial(&tx, &mut receive, &mut assembler, &cancel)
+                                    .await,
+                            );
                             finish_failure_with_context(
                                 &priority_terminal_tx,
                                 &mut assembler,
@@ -1264,7 +1284,10 @@ async fn run_responses_stream(
                 let error = receive
                     .finish_eof()
                     .expect_err("loop returns immediately after a terminal response");
-                close_responses_partial(&mut receive, &mut assembler);
+                mark_responses_partial_rejection_prefix(
+                    &ordered_prefix_drain,
+                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                );
                 finish_responses_error(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1278,7 +1301,10 @@ async fn run_responses_stream(
                 return;
             }
             Err(error) => {
-                close_responses_partial(&mut receive, &mut assembler);
+                mark_responses_partial_rejection_prefix(
+                    &ordered_prefix_drain,
+                    close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+                );
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1307,6 +1333,7 @@ async fn run_chat_stream(
     let ProducerChannels {
         normal: tx,
         priority_terminal: priority_terminal_tx,
+        ordered_prefix_drain: _,
         success_terminal_committed,
         timing,
     } = channels;
@@ -1714,12 +1741,51 @@ fn close_partial(receive: &mut ChatReceiveState, assembler: &mut MessageAssemble
     }
 }
 
-fn close_responses_partial(receive: &mut ResponsesReceiveState, assembler: &mut MessageAssembler) {
+async fn close_responses_partial(
+    tx: &mpsc::Sender<ProviderEvent>,
+    receive: &mut ResponsesReceiveState,
+    assembler: &mut MessageAssembler,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut rejection_sent = false;
     for event in receive.fail() {
+        // Reserve the ordered-lane slot before mutating the authoritative
+        // producer snapshot. A cancellation must still be able to abandon an
+        // unread normal backlog; in that case an unsent synthetic rejection
+        // cannot be allowed into the abort terminal.
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            permit = tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            }
+        };
         if let Err(error) = assembler.apply(&event) {
+            drop(permit);
             tracing::error!(%error, "failed to close partial Responses output");
             break;
         }
+        let is_rejection = matches!(event, ProviderEvent::ToolCallRejected { .. });
+        permit.send(event);
+        rejection_sent |= is_rejection;
+    }
+    rejection_sent
+}
+
+fn mark_responses_partial_rejection_prefix(
+    ordered_prefix_drain: &Option<mpsc::Sender<()>>,
+    rejection_sent: bool,
+) {
+    if !rejection_sent {
+        return;
+    }
+    let Some(ordered_prefix_drain) = ordered_prefix_drain else {
+        tracing::error!("Responses partial rejection has no ordered-prefix drain channel");
+        return;
+    };
+    if ordered_prefix_drain.try_send(()).is_err() {
+        tracing::error!("failed to mark Responses partial rejection ordered-prefix drain");
     }
 }
 
@@ -1923,6 +1989,15 @@ async fn finish_responses_terminal(
     cancel: &CancellationToken,
     success_terminal_committed: &SuccessTerminalCommit,
 ) {
+    if let Some(observed_model) = terminal.response_model.as_deref()
+        && observed_model != spec.id
+    {
+        tracing::debug!(
+            observed_model,
+            canonical_model = spec.id,
+            "provider reported a different model string; using canonical spec model"
+        );
+    }
     for event in terminal.events {
         match emit(tx, assembler, event, cancel).await {
             EmitResult::Sent => {}
@@ -2394,6 +2469,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
             "stream_ended_without_finish_reason".to_owned(),
         ),
         ChatAdapterError::UnsupportedProtocol
+        | ChatAdapterError::InvalidContext(_)
         | ChatAdapterError::InvalidMaxTokens { .. }
         | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
@@ -2482,6 +2558,13 @@ mod tests {
         AssistantContent, ContextMessage, Message, RejectedToolCall, ToolArgumentError, ToolCall,
         ToolDefinition, ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
     };
+
+    #[test]
+    fn chat_context_validation_is_classified_as_invalid_provider_request() {
+        let (message, code) = adapter_error(&ChatAdapterError::InvalidContext("fixture".into()));
+        assert!(message.contains("fixture"));
+        assert_eq!(code, "invalid_provider_request");
+    }
 
     struct CaptureCommandFixture {
         root: PathBuf,
@@ -2666,7 +2749,10 @@ fi
 
     fn opencode_capture_script() -> &'static str {
         let readme = include_str!("../../tests/fixtures/README.md");
-        let (_, fenced) = readme
+        let (_, capture_section) = readme
+            .split_once("The OpenCode capture script below is retained for future qualification.")
+            .expect("README OpenCode capture section");
+        let (_, fenced) = capture_section
             .split_once("```sh\n")
             .expect("README capture shell fence");
         fenced
@@ -2916,6 +3002,7 @@ fi
             messages: vec![],
             provider_context: vec![],
             tools: vec![],
+            replay_provenance: None,
         }
     }
 
@@ -3862,6 +3949,7 @@ fi
                 usage: Usage::default(),
                 error_message: Some("late error".into()),
                 provider_code: Some("late_error".into()),
+                response_model: None,
                 provider_context: vec![],
             },
             &cancel,
@@ -3947,6 +4035,110 @@ fi
             Some("normalized_event_contract_violation")
         );
         assert!(!committed.is_committed());
+    }
+
+    #[tokio::test]
+    async fn responses_terminal_uses_canonical_origin_despite_observed_model() {
+        let spec = ModelSpec::preset("openai-responses").expect("preset");
+        let cancel = CancellationToken::new();
+
+        // Matching observed model -> success and origin model is the canonical spec value.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        let committed = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx,
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            ResponsesTerminal {
+                events: vec![],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some(spec.id.clone()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed,
+        )
+        .await;
+        let ProviderEvent::Done { output, .. } = rx.recv().await.expect("terminal") else {
+            panic!("expected Done terminal")
+        };
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
+        assert!(committed.is_committed());
+
+        // Mismatched observed model -> still a normal success terminal, with canonical
+        // origin/model preserved and terminal events still delivered on the normal lane.
+        let (tx2, mut rx2) = mpsc::channel(10);
+        let (priority_tx2, mut priority_rx2) = mpsc::channel(1);
+        let mut assembler2 = MessageAssembler::new();
+        assembler2.apply(&ProviderEvent::Start).expect("Start");
+        let committed2 = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx2,
+            &priority_tx2,
+            &mut assembler2,
+            &spec,
+            ResponsesTerminal {
+                events: vec![
+                    ProviderEvent::TextStart { content_index: 0 },
+                    ProviderEvent::TextDelta {
+                        content_index: 0,
+                        delta: "hello".to_owned(),
+                    },
+                    ProviderEvent::TextEnd {
+                        content_index: 0,
+                        content: "hello".to_owned(),
+                    },
+                ],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some("other-model".to_owned()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed2,
+        )
+        .await;
+        let mut output = None;
+        let mut _normal_lane_events = 0;
+        while let Some(event) = rx2.recv().await {
+            _normal_lane_events += 1;
+            if let ProviderEvent::Done {
+                output: done_output,
+                ..
+            } = event
+            {
+                output = Some(done_output);
+                break;
+            }
+        }
+        let output = output.expect("expected Done terminal");
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
+        assert_eq!(output.message.content.len(), 1);
+        assert!(committed2.is_committed());
+        assert!(priority_rx2.try_recv().is_err());
+
+        drop(tx2);
+        let mut remaining_events = 0;
+        while rx2.recv().await.is_some() {
+            remaining_events += 1;
+        }
+        assert_eq!(
+            remaining_events, 0,
+            "all terminal events were already delivered on the normal lane"
+        );
     }
 
     #[tokio::test]
@@ -5238,58 +5430,102 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "live OpenCode Go gate; requires non-empty OPENCODE_GO_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
     async fn live_opencode_go_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Moonshot proof not completed or substituted"]
     async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("kimi-k3").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Z.ai proof not completed or substituted"]
     async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("glm-5.2").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Umans proof not completed or substituted"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
     }
 
     #[tokio::test]
-    async fn live_direct_provider_release_gate() {
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
+    async fn live_opencode_go_provider_release_gate() {
         if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
-
-        for preset in ["kimi-k3", "glm-5.2", "umans"] {
-            run_live_chat_tool_roundtrip(preset).await;
-        }
+        run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
-    #[test]
-    fn live_release_opt_in_without_credentials_fails_before_network() {
-        let output = Command::new(env::current_exe().expect("current test executable"))
+    /// T25 release gate: OpenAI Responses through the local development-only
+    /// Codex OAuth bridge. `SUMI_LIVE_TEST=1` selects this non-ignored gate.
+    /// Missing or empty `SUMI_CODEX_RESPONSES_BASE_URL` or
+    /// `SUMI_CODEX_RESPONSES_PROXY_SECRET` fails before any network call.
+    #[tokio::test]
+    async fn live_codex_responses_provider_release_gate() {
+        // `provider` is also compiled into the doctest-only library target,
+        // which has no agent runtime. The identically named binary-target test
+        // below is the sole release gate and owns the canonical Session.
+        if !crate::canonical_live_responses_harness_available() {
+            if env::var("SUMI_LIVE_TEST").as_deref() == Ok("1") {
+                eprintln!(
+                    "skipping duplicate doctest-library target; the sumi-agent binary target owns the live Responses release gate"
+                );
+            }
+            return;
+        }
+        if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        run_live_codex_responses_bridge().await;
+    }
+
+    fn run_codex_responses_release_dispatcher(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
             .args([
                 "--exact",
-                "provider::tests::live_direct_provider_release_gate",
+                "provider::tests::live_codex_responses_provider_release_gate",
                 "--nocapture",
             ])
             .env("SUMI_LIVE_TEST", "1")
             .env_remove("SUMI_ENV_FILE")
+            .env_remove("SUMI_CODEX_RESPONSES_BASE_URL")
+            .env_remove("SUMI_CODEX_RESPONSES_PROXY_SECRET")
+            .env_remove("SUMI_CODEX_RESPONSES_MODEL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENCODE_GO_API_KEY")
             .env_remove("MOONSHOT_API_KEY")
             .env_remove("ZAI_API_KEY")
-            .env_remove("UMANS_API_KEY")
+            .env_remove("UMANS_API_KEY");
+        if let Some(base_url) = base_url {
+            command.env("SUMI_CODEX_RESPONSES_BASE_URL", base_url);
+        }
+        if let Some(proxy_secret) = proxy_secret {
+            command.env("SUMI_CODEX_RESPONSES_PROXY_SECRET", proxy_secret);
+        }
+        command
             .output()
-            .expect("run isolated live release dispatcher");
+            .expect("run isolated live release dispatcher")
+    }
+
+    fn assert_codex_responses_config_failure(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+        expected: &str,
+    ) {
+        let output = run_codex_responses_release_dispatcher(base_url, proxy_secret);
         assert!(
             !output.status.success(),
-            "credential-free live release opt-in must not report green"
+            "invalid live release dispatcher configuration must not report green"
         );
         let diagnostics = format!(
             "{}{}",
@@ -5297,8 +5533,76 @@ fi
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostics.contains("kimi-k3 live gate requires MOONSHOT_API_KEY"),
+            diagnostics.contains(expected),
             "unexpected dispatcher failure: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            None,
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some(""),
+            Some("unused-test-secret"),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            Some(""),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn codex_responses_proxy_self_test_passes() {
+        let proxy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/dev/codex-responses-proxy.py");
+        let output = Command::new("python3")
+            .arg(&proxy)
+            .arg("--self-test")
+            .output()
+            .expect("spawn proxy self-test");
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "Codex Responses proxy self-test failed:\n{diagnostics}"
         );
     }
 
@@ -5340,6 +5644,7 @@ fi
             }],
             provider_context: vec![],
             tools: vec![tool.clone()],
+            replay_provenance: None,
         };
         let first = run_live_request(
             spec.clone(),
@@ -5399,6 +5704,7 @@ fi
             ],
             provider_context: vec![],
             tools: vec![tool],
+            replay_provenance: None,
         };
         let second = run_live_request(
             spec,
@@ -5424,12 +5730,82 @@ fi
         );
     }
 
+    async fn run_live_codex_responses_bridge() {
+        if let Some(path) = env::var_os("SUMI_ENV_FILE") {
+            dotenvy::from_path(path).expect("load SUMI_ENV_FILE for live test");
+        }
+
+        let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL")
+        });
+        assert!(
+            !base_url.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL"
+        );
+        let proxy_secret = env::var("SUMI_CODEX_RESPONSES_PROXY_SECRET").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET")
+        });
+        assert!(
+            !proxy_secret.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET"
+        );
+
+        let ten_turn_stress = match env::var("SUMI_LIVE_TEST_TURNS") {
+            Err(env::VarError::NotPresent) => false,
+            Ok(value) if value == "10" => true,
+            Ok(value) => panic!(
+                "SUMI_LIVE_TEST_TURNS must be unset (the two-turn release gate) or exactly 10, got {value:?}"
+            ),
+            Err(env::VarError::NotUnicode(_)) => {
+                panic!("SUMI_LIVE_TEST_TURNS must be unset or UTF-8 value exactly 10")
+            }
+        };
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.id = match env::var("SUMI_CODEX_RESPONSES_MODEL") {
+            Ok(model)
+                if !model.trim().is_empty() && (!ten_turn_stress || model == "gpt-5.6-terra") =>
+            {
+                model
+            }
+            Ok(model) if ten_turn_stress => panic!(
+                "SUMI_LIVE_TEST_TURNS=10 requires SUMI_CODEX_RESPONSES_MODEL=gpt-5.6-terra, got {model:?}"
+            ),
+            Ok(_) => panic!(
+                "live Codex Responses release gate requires a non-empty SUMI_CODEX_RESPONSES_MODEL when set"
+            ),
+            Err(_) if ten_turn_stress => "gpt-5.6-terra".to_owned(),
+            // The release gate must exercise encrypted reasoning provider context.
+            // gpt-5.6-luna is the cost-optimized tier and adaptively emits zero
+            // reasoning tokens for simple tool-use turns, so the canonical first
+            // turn produces no provider context. gpt-5.6-sol is the frontier
+            // reasoning model and reliably emits reasoning items here.
+            Err(_) => "gpt-5.6-sol".to_owned(),
+        };
+        spec.base_url = base_url;
+        spec.api_key_env = "SUMI_CODEX_RESPONSES_PROXY_SECRET".to_owned();
+        run_live_responses_tool_roundtrip(spec, proxy_secret).await;
+    }
+
+    async fn run_live_responses_tool_roundtrip(spec: ModelSpec, api_key: String) {
+        crate::run_canonical_live_responses_roundtrip(spec, api_key).await;
+    }
     async fn run_live_request(
         spec: ModelSpec,
         context: PromptContext,
         options: RequestOptions,
         api_key: String,
     ) -> AssistantMessage {
+        run_live_output(spec, context, options, api_key)
+            .await
+            .message
+    }
+
+    async fn run_live_output(
+        spec: ModelSpec,
+        context: PromptContext,
+        options: RequestOptions,
+        api_key: String,
+    ) -> types::ProviderOutput {
         let mut events = stream_with_api_key(
             spec,
             context,
@@ -5440,7 +5816,7 @@ fi
         tokio::time::timeout(Duration::from_secs(180), async {
             while let Some(event) = events.recv().await {
                 match event {
-                    ProviderEvent::Done { output, .. } => return output.message,
+                    ProviderEvent::Done { output, .. } => return output,
                     ProviderEvent::Error { output, .. } => {
                         panic!(
                             "live provider error {}: {}",
@@ -5488,6 +5864,7 @@ fi
                     "additionalProperties":false
                 }),
             }],
+            replay_provenance: None,
         };
         let mut stream = stream_with_api_key(
             spec,
@@ -5515,6 +5892,298 @@ fi
         assert!(output.message.content.iter().any(
             |content| matches!(content, AssistantContent::ToolCall { tool_call, .. } if tool_call.name == "weather")
         ));
+    }
+
+    const RESPONSES_PARTIAL_TOOL_PREFIX: &str = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-partial\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc-partial\",\"type\":\"function_call\",\"call_id\":\"call-partial\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n"
+    );
+
+    fn partial_responses_tool_context() -> PromptContext {
+        PromptContext {
+            tools: vec![ToolDefinition {
+                name: "weather".to_owned(),
+                description: "Weather".to_owned(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }),
+            }],
+            ..empty_context()
+        }
+    }
+
+    fn assert_responses_partial_rejection_before_failure(
+        events: &[ProviderEvent],
+        expected_provider_code: &str,
+    ) {
+        assert_eq!(
+            event_types(events),
+            ["start", "tool_call_start", "tool_call_rejected", "error"],
+            "the consumer must receive the synthetic result before terminal validation"
+        );
+        let [
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 0 },
+            ProviderEvent::ToolCallRejected {
+                content_index: 0,
+                rejected,
+                synthetic_result,
+            },
+            ProviderEvent::Error {
+                reason: StopReason::Error,
+                output,
+            },
+        ] = events
+        else {
+            panic!("unexpected partial Responses failure sequence: {events:?}");
+        };
+        assert_eq!(rejected.id, "call-partial");
+        assert_eq!(rejected.name, "weather");
+        assert_eq!(synthetic_result.tool_call_id, rejected.id);
+        assert_eq!(synthetic_result.tool_name, rejected.name);
+        assert!(synthetic_result.is_error);
+        assert_eq!(output.message.stop_reason, StopReason::Error);
+        assert!(!output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some(expected_provider_code)
+        );
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [AssistantContent::RejectedToolCall { rejected: terminal_rejected, .. }]
+                if terminal_rejected == rejected
+        ));
+        assert_eq!(
+            reconstruct_terminal(events),
+            output.message.clone(),
+            "the consumer assembler must accept the emitted rejection/result before the authoritative terminal"
+        );
+    }
+
+    enum PartialResponsesFailure {
+        MalformedInput,
+        Eof,
+        Transport,
+    }
+
+    async fn partial_responses_failure_events(
+        failure: PartialResponsesFailure,
+    ) -> Vec<ProviderEvent> {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let schemas = FrozenToolSchemaRegistry::compile(&partial_responses_tool_context().tools)
+            .expect("tool schema");
+        let mut receive = ResponsesReceiveState::with_budget(schemas, ResponseBudget::default());
+        let mut assembler = MessageAssembler::new();
+        assembler
+            .apply(&ProviderEvent::Start)
+            .expect("producer Start");
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let (ordered_prefix_drain_tx, ordered_prefix_drain_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+
+        let pushed = receive
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"weather","arguments":""}}"#,
+            )
+            .expect("partial function call");
+        assert_eq!(pushed.events.len(), 1);
+        assert!(matches!(
+            emit(
+                &tx,
+                &mut assembler,
+                pushed.events.into_iter().next().expect("tool start"),
+                &cancel
+            )
+            .await,
+            EmitResult::Sent
+        ));
+        mark_responses_partial_rejection_prefix(
+            &Some(ordered_prefix_drain_tx),
+            close_responses_partial(&tx, &mut receive, &mut assembler, &cancel).await,
+        );
+
+        match failure {
+            PartialResponsesFailure::MalformedInput => {
+                let error = receive
+                    .push_json("fixture malformed input")
+                    .expect_err("malformed input must fail Responses normalization");
+                finish_responses_error(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error,
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+            PartialResponsesFailure::Eof => {
+                let error = receive
+                    .finish_eof()
+                    .expect_err("unfinished Responses output must reject EOF");
+                finish_responses_error(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error,
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+            PartialResponsesFailure::Transport => {
+                let error = SseError::Transport("fixture transport failure".to_owned());
+                finish_failure_with_context(
+                    &priority_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    &transport_error_code(&error),
+                    false,
+                    receive.provider_context(),
+                )
+                .await;
+            }
+        }
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            committed,
+        )
+        .with_ordered_prefix_drain(ordered_prefix_drain_rx);
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn responses_partial_tool_rejection_reaches_consumer_before_failure_terminal() {
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::MalformedInput).await,
+            "invalid_provider_stream",
+        );
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::Eof).await,
+            "stream_ended_without_terminal_event",
+        );
+        assert_responses_partial_rejection_before_failure(
+            &partial_responses_failure_events(PartialResponsesFailure::Transport).await,
+            "transport_error",
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_priority_error_does_not_drain_normal_backlog() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::ToolCallStart { content_index: 0 })
+            .await
+            .expect("queue ordinary normal event");
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler
+            .apply(&ProviderEvent::Start)
+            .expect("producer Start");
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            "fixture ordinary failure".to_owned(),
+            "ordinary_failure",
+            false,
+        )
+        .await;
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            CancellationToken::new(),
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            Arc::new(SuccessTerminalCommit::new()),
+        );
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        assert_eq!(event_types(&events), ["start", "error"]);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Error { output, .. })
+                if output.message.provider_code.as_deref() == Some("ordinary_failure")
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_partial_tool_cancellation_keeps_priority_over_unsent_rejection() {
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let prefix = stream::once(async {
+                    Ok::<String, Infallible>(RESPONSES_PARTIAL_TOOL_PREFIX.to_owned())
+                });
+                let stalled = stream::pending::<Result<String, Infallible>>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(prefix.chain(stalled)))
+                    .expect("response")
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.base_url = base_url;
+        let cancel = CancellationToken::new();
+        let mut stream = stream_with_api_key(
+            spec,
+            partial_responses_tool_context(),
+            RequestOptions::default(),
+            cancel.clone(),
+            Some("test-key".to_owned()),
+        );
+        assert!(matches!(stream.recv().await, Some(ProviderEvent::Start)));
+        assert!(matches!(
+            stream.recv().await,
+            Some(ProviderEvent::ToolCallStart { content_index: 0 })
+        ));
+        cancel.cancel();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("Responses cancellation must retain priority")
+            .expect("priority terminal");
+        let ProviderEvent::Error {
+            reason: StopReason::Aborted,
+            output,
+        } = terminal
+        else {
+            panic!("cancellation must emit an Aborted terminal");
+        };
+        assert!(output.message.interrupted);
+        assert!(output.message.content.is_empty());
+        assert!(
+            stream.recv().await.is_none(),
+            "terminal must fuse the stream"
+        );
+        server.abort();
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     pin::Pin,
     sync::{
         Arc,
@@ -11,6 +12,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{Stream, task::AtomicWaker};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +34,71 @@ pub enum PublicMessage {
     ToolResult(ToolResultMessage),
 }
 
+impl From<PublicMessage> for Message {
+    fn from(message: PublicMessage) -> Self {
+        match message {
+            PublicMessage::User(message) => Message::User(message),
+            PublicMessage::ToolResult(message) => Message::ToolResult(message),
+            PublicMessage::Assistant(assistant) => Message::Assistant(AssistantMessage {
+                content: assistant
+                    .content
+                    .into_iter()
+                    .map(|content| match content {
+                        PublicAssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        } => AssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        } => AssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        } => AssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        } => AssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        },
+                    })
+                    .collect(),
+                model: assistant.model,
+                provider: assistant.provider,
+                origin: assistant.origin,
+                usage: assistant.usage,
+                stop_reason: assistant.stop_reason,
+                error_message: assistant.error_message,
+                provider_code: assistant.provider_code,
+                interrupted: assistant.interrupted,
+                timestamp: assistant.timestamp,
+            }),
+        }
+    }
+}
+
+impl PublicMessage {
+    pub fn usage(&self) -> Usage {
+        match self {
+            PublicMessage::Assistant(assistant) => assistant.usage.clone(),
+            _ => Usage::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
@@ -46,7 +113,7 @@ pub struct MemoryBlock {
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProtocol {
     OpenAiChatCompletions,
@@ -65,10 +132,167 @@ pub struct ProviderOrigin {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderContextItem {
+    /// Exact durable MessageEnd that owns this retention unit. This is
+    /// deliberately separate from `origin_message`: native compaction has no
+    /// semantic transcript origin, but still has one authenticated lifecycle
+    /// owner for recovery and erasure.
+    pub retention_owner: ProviderContextAnchor,
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
+    /// Tie-breaker within the same `wire_item_index`, zero-based and assigned
+    /// deterministically by the consumer that assembles the context list.
     pub ordinal: u32,
+    pub provider_origin: ProviderOrigin,
     pub payload: ProviderContextPayload,
+}
+
+/// Validates the stable ordering metadata shared by durable hydration and
+/// provider replay. Every authenticated anchor/wire group starts at ordinal
+/// zero and has no duplicate or missing ordinal. Native windows form an
+/// unanchored group scoped by their exact provider origin and payload kind.
+impl AsRef<ProviderContextItem> for ProviderContextItem {
+    fn as_ref(&self) -> &ProviderContextItem {
+        self
+    }
+}
+
+pub fn validate_provider_context_ordinals<T: AsRef<ProviderContextItem>>(
+    items: &[T],
+) -> Result<(), String> {
+    validate_provider_context_ordinal_refs(items.iter().map(AsRef::as_ref))
+}
+
+pub(crate) fn validate_provider_context_ordinal_refs<'a>(
+    items: impl IntoIterator<Item = &'a ProviderContextItem>,
+) -> Result<(), String> {
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Group {
+        Anchored {
+            message_id: String,
+            message_seq: u64,
+            wire_item_index: u32,
+        },
+        Native {
+            retention_owner_message_id: String,
+            retention_owner_message_seq: u64,
+            provider_instance_id: String,
+            protocol: ApiProtocol,
+            model: String,
+            kind: u8,
+        },
+    }
+
+    let mut groups = BTreeMap::<Group, Vec<u32>>::new();
+    for item in items {
+        if item.retention_owner.message_id.is_empty() {
+            return Err("provider context retention owner message_id is empty".to_owned());
+        }
+        let group = match &item.payload {
+            ProviderContextPayload::EncryptedReasoning { .. } => {
+                let anchor = item
+                    .origin_message
+                    .as_ref()
+                    .ok_or_else(|| "encrypted reasoning is missing an origin message".to_owned())?;
+                if anchor != &item.retention_owner {
+                    return Err(
+                        "encrypted reasoning origin message does not match its retention owner"
+                            .to_owned(),
+                    );
+                }
+                let wire_item_index = item
+                    .wire_item_index
+                    .ok_or_else(|| "encrypted reasoning is missing a wire_item_index".to_owned())?;
+                Group::Anchored {
+                    message_id: anchor.message_id.clone(),
+                    message_seq: anchor.message_seq,
+                    wire_item_index,
+                }
+            }
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                if item.origin_message.is_some() || item.wire_item_index.is_some() {
+                    return Err(
+                        "native provider context must be unanchored and have no wire_item_index"
+                            .to_owned(),
+                    );
+                }
+                Group::Native {
+                    retention_owner_message_id: item.retention_owner.message_id.clone(),
+                    retention_owner_message_seq: item.retention_owner.message_seq,
+                    provider_instance_id: item.provider_origin.provider_instance_id.clone(),
+                    protocol: item.provider_origin.protocol,
+                    model: item.provider_origin.model.clone(),
+                    kind: match &item.payload {
+                        ProviderContextPayload::OpenAiCompactedWindow { .. } => 1,
+                        ProviderContextPayload::AnthropicCompaction { .. } => 2,
+                        ProviderContextPayload::EncryptedReasoning { .. } => unreachable!(),
+                    },
+                }
+            }
+        };
+        groups.entry(group).or_default().push(item.ordinal);
+    }
+
+    for (group, mut ordinals) in groups {
+        ordinals.sort_unstable();
+        for (expected, actual) in ordinals.into_iter().enumerate() {
+            let expected = u32::try_from(expected).map_err(|_| {
+                format!("provider context ordinal count overflows u32 for {group:?}")
+            })?;
+            if actual != expected {
+                return Err(format!(
+                    "provider context ordinals for {group:?} must be unique and contiguous from zero; expected {expected}, found {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds terminal fragments to the exact durable MessageEnd receipt anchor.
+/// Ordinals are assigned independently within each wire slot.
+pub fn bind_provider_context_fragments(
+    fragments: Vec<ProviderContextFragment>,
+    anchor: ProviderContextAnchor,
+    provider_origin: ProviderOrigin,
+) -> Result<Vec<ProviderContextItem>, String> {
+    let mut next_ordinal = BTreeMap::<Option<u32>, u32>::new();
+    let mut items = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let ordinal = next_ordinal.entry(fragment.wire_item_index).or_insert(0);
+        let item = ProviderContextItem {
+            retention_owner: anchor.clone(),
+            origin_message: match &fragment.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => Some(anchor.clone()),
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => None,
+            },
+            wire_item_index: fragment.wire_item_index,
+            ordinal: *ordinal,
+            provider_origin: provider_origin.clone(),
+            payload: fragment.payload,
+        };
+        *ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| "provider context ordinal overflows u32".to_owned())?;
+        items.push(item);
+    }
+    validate_provider_context_ordinals(&items)?;
+    Ok(items)
+}
+
+#[cfg(test)]
+impl ProviderContextItem {
+    /// Test-only origin fixture for provider-context item construction.
+    /// Production callers must supply the real provider origin that produced
+    /// the assistant turn or compaction window.
+    pub fn test_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "test-provider-instance".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "test-model".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,12 +689,17 @@ impl SuccessTerminalCommit {
 pub struct ProviderEventStream {
     rx: Option<mpsc::Receiver<ProviderEvent>>,
     priority_terminal_rx: Option<mpsc::Receiver<ProviderEvent>>,
+    ordered_prefix_drain_rx: Option<mpsc::Receiver<()>>,
     cancel: CancellationToken,
     provider: String,
     origin: ProviderOrigin,
     shadow: MessageAssembler,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
     producer_task: Option<tokio::task::JoinHandle<()>>,
+    // Only an explicitly marked terminal waits for its already-enqueued normal
+    // prefix. Responses partial tool-call rejections carry their synthetic
+    // result only in that prefix; ordinary failure terminals retain priority.
+    pending_priority_terminal: Option<ProviderEvent>,
     start_emitted: bool,
     terminal_emitted: bool,
 }
@@ -485,12 +714,14 @@ impl ProviderEventStream {
         Self {
             rx: Some(rx),
             priority_terminal_rx: None,
+            ordered_prefix_drain_rx: None,
             cancel,
             provider: provider.into(),
             origin,
             shadow: MessageAssembler::new(),
             success_terminal_committed: Arc::new(SuccessTerminalCommit::new()),
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -508,12 +739,14 @@ impl ProviderEventStream {
         Self {
             rx: Some(rx),
             priority_terminal_rx: Some(priority_terminal_rx),
+            ordered_prefix_drain_rx: None,
             cancel,
             provider: provider.into(),
             origin,
             shadow: MessageAssembler::with_budget(budget),
             success_terminal_committed,
             producer_task: None,
+            pending_priority_terminal: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -524,6 +757,13 @@ impl ProviderEventStream {
     /// observe cooperative cancellation.
     pub(crate) fn own_producer(mut self, producer_task: tokio::task::JoinHandle<()>) -> Self {
         self.producer_task = Some(producer_task);
+        self
+    }
+
+    /// Opts in only explicitly marked priority terminals to draining their
+    /// already-queued normal prefix before consumer terminal validation.
+    pub(crate) fn with_ordered_prefix_drain(mut self, rx: mpsc::Receiver<()>) -> Self {
+        self.ordered_prefix_drain_rx = Some(rx);
         self
     }
 
@@ -726,10 +966,53 @@ impl Stream for ProviderEventStream {
             success_committed = self.success_terminal_committed.is_committed();
         }
         if !success_committed {
+            if let Some(terminal) = self.pending_priority_terminal.take() {
+                if self.cancel.is_cancelled() {
+                    return Poll::Ready(Some(self.accept_event(terminal)));
+                }
+                if let Some(rx) = self.rx.as_mut() {
+                    match rx.poll_recv(cx) {
+                        Poll::Ready(Some(ProviderEvent::Start)) => {
+                            tracing::warn!("discarded duplicate producer Start event");
+                            self.pending_priority_terminal = Some(terminal);
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Some(event)) => {
+                            self.pending_priority_terminal = Some(terminal);
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        Poll::Ready(None) | Poll::Pending => {}
+                    }
+                }
+                return Poll::Ready(Some(self.accept_event(terminal)));
+            }
             if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
                 match priority_rx.poll_recv(cx) {
                     Poll::Ready(Some(event)) => {
                         debug_assert!(event.is_terminal());
+                        if self.cancel.is_cancelled() {
+                            return Poll::Ready(Some(self.accept_event(event)));
+                        }
+                        let drain_prefix = self
+                            .ordered_prefix_drain_rx
+                            .as_mut()
+                            .is_some_and(|rx| matches!(rx.poll_recv(cx), Poll::Ready(Some(()))));
+                        if drain_prefix && let Some(rx) = self.rx.as_mut() {
+                            match rx.poll_recv(cx) {
+                                Poll::Ready(Some(ProviderEvent::Start)) => {
+                                    tracing::warn!("discarded duplicate producer Start event");
+                                    self.pending_priority_terminal = Some(event);
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Some(normal)) => {
+                                    self.pending_priority_terminal = Some(event);
+                                    return Poll::Ready(Some(self.accept_event(normal)));
+                                }
+                                Poll::Ready(None) | Poll::Pending => {}
+                            }
+                        }
                         return Poll::Ready(Some(self.accept_event(event)));
                     }
                     Poll::Ready(None) => self.priority_terminal_rx = None,
@@ -789,6 +1072,92 @@ pub struct PromptContext {
     pub messages: Vec<ContextMessage>,
     pub provider_context: Vec<ProviderContextItem>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(skip)]
+    pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum VerifiedReplayProvenance {
+    SumiNormalized {
+        provider_origin: ProviderOrigin,
+        canonical_through_seq: Option<u64>,
+    },
+    ProviderNativeExact {
+        provider_origin: ProviderOrigin,
+        native_coverage_through_seq: u64,
+        canonical_suffix_through_seq: Option<u64>,
+    },
+}
+
+impl PromptContext {
+    pub fn new(
+        system_prompt: String,
+        memory_blocks: Vec<MemoryBlock>,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            system_prompt,
+            memory_blocks,
+            messages,
+            provider_context,
+            tools,
+            replay_provenance: None,
+        }
+    }
+
+    pub(crate) fn verified_replay_provenance(
+        &self,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let Some(provenance) = &self.replay_provenance else {
+            return Ok(None);
+        };
+        provenance.verify(self.replay_send_view_digest()?).map(Some)
+    }
+
+    pub(crate) fn verified_replay_provenance_for(
+        &self,
+        destination: &ProviderOrigin,
+    ) -> Result<Option<VerifiedReplayProvenance>, String> {
+        let provenance = self.verified_replay_provenance()?;
+        if provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.provider_origin() != destination)
+        {
+            return Err(
+                "bound replay destination does not match the selected provider_origin".into(),
+            );
+        }
+        Ok(provenance)
+    }
+
+    pub(crate) fn replay_send_view_digest(&self) -> Result<[u8; 32], String> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("failed to serialize replay send view: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"sumi.prompt-replay-binding.v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| "replay send view length exceeds u64".to_owned())?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
+}
+
+impl VerifiedReplayProvenance {
+    pub(crate) fn provider_origin(&self) -> &ProviderOrigin {
+        match self {
+            Self::SumiNormalized {
+                provider_origin, ..
+            }
+            | Self::ProviderNativeExact {
+                provider_origin, ..
+            } => provider_origin,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -809,6 +1178,70 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+/// Validate native compaction invariants for `messages`.
+///
+/// Persisted message `seq` values are the global `agent_events.seq` assigned to
+/// each `MessageEnd`, so non-message durable events create gaps. This validator
+/// enforces:
+///
+/// 1. Persisted messages are strictly increasing with positive `seq`.
+/// 2. Synthetic messages may appear only before the first persisted message.
+/// 3. If `coverage` is `Some(seq)`, that `seq` must identify one of the persisted
+///    messages — it is the global event sequence of the last transcript message
+///    replaced by the window.
+///
+/// Returns the maximum persisted `seq` when at least one persisted message
+/// exists and validation succeeds. Returns `None` only when `coverage` is
+/// `None` and there are no persisted messages, so callers that only need
+/// coverage can treat that as "no persisted history".
+pub fn validate_native_suffix(
+    messages: &[ContextMessage],
+    coverage: Option<u64>,
+) -> Result<Option<u64>, String> {
+    let mut previous: Option<u64> = None;
+    let mut persisted_started = false;
+    let mut coverage_seen = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(
+                    "native suffix contains synthetic content after persisted history".into(),
+                );
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 {
+            return Err("persisted native replay sequence must be greater than zero".into());
+        }
+        if previous.is_some_and(|value: u64| value >= *seq) {
+            return Err(
+                "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
+            );
+        }
+        if coverage.is_some_and(|value| value == *seq) {
+            coverage_seen = true;
+        }
+        previous = Some(*seq);
+    }
+    if coverage.is_some() && !coverage_seen {
+        return Err("native compaction coverage does not identify a persisted message".into());
+    }
+    Ok(previous)
+}
+
+/// Hydration alias for [`validate_native_suffix`].
+///
+/// This is a convenience wrapper that retains the old `coverage: u64` signature
+/// used by T17 hydration; it returns the maximum persisted `seq` on success.
+pub fn validate_native_suffix_for_hydration(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<u64, String> {
+    validate_native_suffix(messages, Some(coverage))?
+        .ok_or_else(|| "native compaction requires persisted replay history".into())
 }
 
 #[cfg(test)]
@@ -1065,6 +1498,7 @@ mod tests {
                     "required": ["path"]
                 }),
             }],
+            replay_provenance: None,
         };
 
         assert_round_trip(&context);
@@ -1432,6 +1866,101 @@ mod tests {
         assert!(stream.recv().await.is_none());
     }
 
+    #[tokio::test]
+    async fn priority_provider_error_drops_observed_unsigned_thinking_without_synthesis() {
+        let expected_origin = ProviderOrigin {
+            provider_instance_id: "anthropic:https://api.anthropic.com".to_owned(),
+            protocol: ApiProtocol::AnthropicMessages,
+            model: "claude-sonnet-4-20250514".to_owned(),
+        };
+        let verified = AssistantContent::Text {
+            text: "verified prior text".to_owned(),
+            wire_item_index: 0,
+        };
+        let expected_output = ProviderOutput {
+            message: AssistantMessage {
+                content: vec![verified],
+                model: expected_origin.model.clone(),
+                provider: "anthropic".to_owned(),
+                origin: expected_origin.clone(),
+                usage: Usage {
+                    input: 21,
+                    output: 8,
+                    cache_read: 5,
+                    cache_write: 3,
+                    reasoning: 4,
+                    total_tokens: 41,
+                },
+                stop_reason: StopReason::Error,
+                error_message: Some("upstream overloaded".to_owned()),
+                provider_code: Some("overloaded_error".to_owned()),
+                interrupted: false,
+                timestamp: timestamp(),
+            },
+            provider_context: vec![ProviderContextFragment {
+                wire_item_index: Some(0),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::AnthropicMessages,
+                    item: json!({"type": "redacted_thinking", "data": "verified-context"}),
+                },
+            }],
+        };
+        let (tx, rx) = mpsc::channel(5);
+        for event in [
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "verified prior text".to_owned(),
+            },
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "verified prior text".to_owned(),
+            },
+            ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "signature".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "unsigned prefix".to_owned(),
+            },
+        ] {
+            tx.send(event).await.expect("normal event");
+        }
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            CancellationToken::new(),
+            "anthropic",
+            expected_origin,
+            ResponseBudget::default(),
+            Arc::new(SuccessTerminalCommit::new()),
+        );
+        let mut consumer = MessageAssembler::new();
+        for _ in 0..=5 {
+            let event = stream.recv().await.expect("observed prefix");
+            consumer.apply(&event).expect("consumer accepts prefix");
+        }
+
+        let expected_terminal = ProviderEvent::Error {
+            reason: StopReason::Error,
+            output: expected_output.clone(),
+        };
+        priority_tx
+            .send(expected_terminal.clone())
+            .await
+            .expect("provider error");
+        let terminal = stream.recv().await.expect("provider terminal");
+        assert_eq!(terminal, expected_terminal);
+        let message = consumer
+            .apply(&terminal)
+            .expect("consumer reconciles provider terminal")
+            .expect("terminal message");
+        assert_eq!(message, expected_output.message);
+        assert!(stream.recv().await.is_none());
+    }
+
     #[test]
     fn terminal_queue_audit_reports_when_more_events_remain() {
         let (tx, mut rx) = mpsc::channel(34);
@@ -1626,5 +2155,198 @@ mod tests {
 
         assert_eq!(usage.input, u64::MAX);
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn validate_native_suffix_accepts_gapped_positive_sequences() {
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert_eq!(
+            validate_native_suffix(&messages, Some(4))
+                .expect("gapped coverage must identify a persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, Some(6))
+                .expect("coverage may be the last persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, None)
+                .expect("gapped messages without coverage should return max seq"),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn validate_native_suffix_accepts_leading_synthetic_then_positive_seq() {
+        let messages = vec![
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-2".to_owned(),
+                seq: 2,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-5".to_owned(),
+                seq: 5,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        validate_native_suffix(&messages, Some(5))
+            .expect("leading synthetic + gapped persisted must pass");
+    }
+
+    #[test]
+    fn validate_native_suffix_returns_none_when_no_persisted_messages_and_no_coverage() {
+        assert_eq!(validate_native_suffix(&[], None), Ok(None));
+    }
+
+    #[test]
+    fn validate_native_suffix_rejects_invalid_order_and_missing_coverage() {
+        let ordered = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        let error = validate_native_suffix(&ordered, Some(5))
+            .expect_err("coverage must identify a persisted message");
+        assert!(
+            error.contains("does not identify a persisted message"),
+            "{error}"
+        );
+
+        let reordered = vec![ordered[1].clone(), ordered[0].clone()];
+        let error = validate_native_suffix(&reordered, Some(4))
+            .expect_err("persisted messages must remain ordered");
+        assert!(error.contains("reordered"), "{error}");
+
+        let duplicate = vec![
+            ordered[0].clone(),
+            ContextMessage::Persisted {
+                id: "m-4b".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&duplicate, Some(4)).is_err());
+
+        let seq_zero = vec![ContextMessage::Persisted {
+            id: "m-0".to_owned(),
+            seq: 0,
+            message: Message::Assistant(assistant_message()),
+        }];
+        assert!(validate_native_suffix(&seq_zero, Some(0)).is_err());
+
+        let synthetic_after_persisted = vec![
+            ordered[0].clone(),
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
+    }
+
+    #[test]
+    fn provider_context_ordinals_are_zero_based_unique_and_contiguous_per_wire() {
+        let anchor = ProviderContextAnchor {
+            message_id: "assistant-1".to_owned(),
+            message_seq: 7,
+        };
+        let item = |wire_item_index, ordinal| ProviderContextItem {
+            retention_owner: anchor.clone(),
+            origin_message: Some(anchor.clone()),
+            wire_item_index: Some(wire_item_index),
+            ordinal,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": format!("reasoning-{wire_item_index}-{ordinal}"),
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                }),
+            },
+        };
+
+        validate_provider_context_ordinals(&[item(0, 0), item(0, 1), item(2, 0)])
+            .expect("each wire group is independently contiguous");
+        for invalid in [
+            vec![item(0, 1)],
+            vec![item(0, 0), item(0, 0)],
+            vec![item(0, 0), item(0, 2)],
+        ] {
+            assert!(
+                validate_provider_context_ordinals(&invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let native = ProviderContextItem {
+            retention_owner: anchor,
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type":"compaction","encrypted_content":"opaque"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fingerprint".to_owned(),
+                },
+            },
+        };
+        assert!(validate_provider_context_ordinals(&[native]).is_err());
+    }
+
+    #[test]
+    fn native_binding_keeps_semantic_origin_none_and_authenticates_retention_owner() {
+        let owner = ProviderContextAnchor {
+            message_id: "assistant-error".to_owned(),
+            message_seq: 11,
+        };
+        let items = bind_provider_context_fragments(
+            vec![ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "id": "cmp-error",
+                        "type": "compaction",
+                        "encrypted_content": "opaque",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 9,
+                        context_fingerprint: "fp-error".to_owned(),
+                    },
+                },
+            }],
+            owner.clone(),
+            origin(),
+        )
+        .expect("bind native Error context");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].retention_owner, owner);
+        assert_eq!(items[0].origin_message, None);
     }
 }

@@ -1,0 +1,14 @@
+# Non-secret lifecycle descriptor. It intentionally contains no launch
+# interpolation: stop/status/logs must remain available after credentials,
+# endpoint configuration, or the local-control process are gone.
+services:
+  allocator:
+    image: local/sumi-agent-lifecycle-placeholder:unused
+  prepare:
+    image: local/sumi-agent-lifecycle-placeholder:unused
+  runtime:
+    image: local/sumi-agent-lifecycle-placeholder:unused
+  executor:
+    image: local/sumi-agent-lifecycle-placeholder:unused
+  broker:
+    image: local/sumi-agent-lifecycle-placeholder:unused

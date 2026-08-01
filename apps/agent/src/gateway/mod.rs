@@ -1,6 +1,20 @@
 //! Connections between an agent session and its external command/event transport.
 
-mod stdio;
+#[allow(dead_code)]
+pub mod wire;
+
+pub(crate) mod duplicate;
+
+pub(crate) mod local_control;
+pub(crate) mod local_runtime;
+pub mod stdio;
+pub mod supervisor;
+pub mod ws;
+
+/// Maximum size in bytes of a single gateway frame/message.
+pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+pub(crate) const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
 
 use std::fmt;
 
@@ -11,12 +25,28 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+
+#[cfg(test)]
+pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
+    PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical test UUIDv7")
+}
+
+#[cfg(test)]
+pub(crate) fn test_direct_chat_provenance() -> DirectChatProvenanceV1 {
+    DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+        .expect("valid direct-chat provenance")
+}
+
 #[allow(
     unused_imports,
     reason = "T15 injected loop harness; T26 constructs production IO"
 )]
-pub(crate) use stdio::InjectedStdioGateway;
-pub use stdio::{InvalidCommand, StdioGateway};
+pub(crate) use stdio::{InjectedStdioGateway, read_command};
+
+#[allow(unused_imports)]
+pub use supervisor::DeliveryAuthorization;
+pub use supervisor::{AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -87,6 +117,8 @@ where
 pub struct CommandEnvelope {
     pub seq: u64,
     pub command_id: CommandId,
+    pub personality_agent_id: PersonalityAgentId,
+    pub provenance: DirectChatProvenanceV1,
     pub command: Command,
 }
 
@@ -151,6 +183,8 @@ pub enum InboundCommand {
     Invalid {
         seq: u64,
         command_id: CommandId,
+        personality_agent_id: PersonalityAgentId,
+        provenance: DirectChatProvenanceV1,
         reason: CommandRejectReason,
         /// Transient bytes used only to authenticate the durable receipt. The
         /// EventWriter encrypts valid-size rejects and discards oversized bytes
@@ -160,6 +194,32 @@ pub enum InboundCommand {
         /// command value after incrementally authenticating its exact raw bytes.
         payload_digest: Option<KeyedCommandDigest>,
     },
+}
+
+impl InboundCommand {
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Valid(envelope) => envelope.seq,
+            Self::Invalid { seq, .. } => *seq,
+        }
+    }
+
+    pub fn personality_agent_id(&self) -> &PersonalityAgentId {
+        match self {
+            Self::Valid(envelope) => &envelope.personality_agent_id,
+            Self::Invalid {
+                personality_agent_id,
+                ..
+            } => personality_agent_id,
+        }
+    }
+
+    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+        match self {
+            Self::Valid(envelope) => &envelope.provenance,
+            Self::Invalid { provenance, .. } => provenance,
+        }
+    }
 }
 
 pub(crate) const MISSING_COMMAND_PAYLOAD: &[u8] = b"\0sumi/inbound-command/missing-field/v1";
@@ -293,6 +353,7 @@ pub enum CommandAckStatus {
 pub struct CommandAck {
     pub seq: u64,
     pub command_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub status: CommandAckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
@@ -302,7 +363,7 @@ pub struct CommandAck {
 pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    pub conversation_id: String,
+    pub personality_agent_id: PersonalityAgentId,
     pub event: serde_json::Value,
 }
 
@@ -317,6 +378,40 @@ pub enum OutboundFrame {
 #[error("gateway input closed")]
 pub struct GatewayClosed;
 
+/// Errors raised during the agent/API hello exchange.
+///
+/// `AuthRejected` is reserved for authentication failures that should be retried
+/// with a fresh credential, subject to `max_auth_attempts`. `Fatal` is for
+/// non-recoverable claim mismatches. `Reconnect` covers transient failures.
+#[derive(Debug, Error)]
+pub enum HelloError {
+    // `AuthRejected` is only constructed by test gateways today; keep it
+    // available for the T26 authentication-rejection wiring.
+    #[allow(dead_code, reason = "T26 gateway authentication path")]
+    #[error("authentication rejected")]
+    AuthRejected,
+    #[error("fatal: {0}")]
+    Fatal(#[source] anyhow::Error),
+    #[error("hello failed: {0}")]
+    Reconnect(#[source] anyhow::Error),
+}
+
+impl From<anyhow::Error> for HelloError {
+    fn from(e: anyhow::Error) -> Self {
+        HelloError::Reconnect(e)
+    }
+}
+
+/// A permanent outbound-frame size violation. The supervisor treats this as a
+/// fatal error because retrying from the same durable cursor would replay the
+/// same oversized frame forever.
+#[derive(Debug, Error, Clone, Copy)]
+#[error("outbound frame exceeds MAX_FRAME_BYTES: {actual} bytes (limit {max})")]
+pub struct OversizedFrameError {
+    pub actual: usize,
+    pub max: usize,
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
     async fn next_command(&mut self) -> Result<InboundCommand>;
@@ -325,15 +420,31 @@ pub trait GatewayReader: Send {
 #[async_trait]
 pub trait GatewayWriter: Send {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()>;
+
+    /// Sends one Session-owned committed group without losing its ordering
+    /// boundary between frames. Most transports only need FIFO iteration;
+    /// SessionGateway overrides this so every terminal ACK in the group stays
+    /// behind the same durable replay barrier.
+    async fn send_batch(&mut self, frames: Vec<OutboundFrame>) -> Result<()> {
+        for frame in frames {
+            self.send(frame).await?;
+        }
+        Ok(())
+    }
 }
 
 /// An established transport that can transfer each half to its sole owner.
 /// Neither half is shared behind a mutex: the Session owns the reader and a
 /// dedicated task owns the writer.
+#[async_trait]
 pub trait Gateway: Send + 'static {
     type Reader: GatewayReader + 'static;
     type Writer: GatewayWriter + 'static;
 
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError>;
     fn split(self) -> (Self::Reader, Self::Writer);
 }
 
@@ -421,7 +532,9 @@ mod tests {
         let encoded = serde_json::to_value(OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
-                conversation_id: "conversation-1".to_owned(),
+                personality_agent_id: "018f3f8d-7b2c-7a10-8f9e-123456789abc"
+                    .parse()
+                    .expect("canonical UUIDv7"),
                 event: json!({"type": "text_delta"}),
             },
         })
@@ -437,6 +550,7 @@ mod tests {
             ack: CommandAck {
                 seq: 7,
                 command_id: "00000000-0000-4000-8000-000000000007".to_owned(),
+                personality_agent_id: test_personality_agent_id(),
                 status: CommandAckStatus::Rejected,
                 reject_reason: Some("oversized".to_owned()),
             },
@@ -450,6 +564,7 @@ mod tests {
                 "ack": {
                     "seq": 7,
                     "command_id": "00000000-0000-4000-8000-000000000007",
+                    "personality_agent_id": TEST_PERSONALITY_AGENT_ID,
                     "status": "rejected",
                     "reject_reason": "oversized",
                 }
