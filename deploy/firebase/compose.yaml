@@ -7,7 +7,8 @@
 services:
   firebase-auth:
     build:
-      context: .
+      context: ../..
+      dockerfile: deploy/firebase/Dockerfile
     environment:
       FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-sumi-studio}
       FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth
