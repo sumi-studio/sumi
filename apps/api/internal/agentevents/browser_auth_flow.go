@@ -58,11 +58,13 @@ type FailProviderOperationRequest struct {
 }
 
 type ProviderOperationResult struct {
-	OperationID     string    `json:"operation_id,omitempty"`
-	Outcome         string    `json:"outcome"`
-	ClientOperation string    `json:"client_operation,omitempty"`
-	ExpiresAt       time.Time `json:"expires_at,omitempty"`
-	NoticeRequired  bool      `json:"notice_required,omitempty"`
+	OperationID              string    `json:"operation_id,omitempty"`
+	Outcome                  string    `json:"outcome"`
+	ClientOperation          string    `json:"client_operation,omitempty"`
+	CreatedAt                time.Time `json:"created_at,omitempty"`
+	CompletionTokenNotBefore time.Time `json:"completion_token_not_before,omitempty"`
+	ExpiresAt                time.Time `json:"expires_at,omitempty"`
+	NoticeRequired           bool      `json:"notice_required,omitempty"`
 }
 
 var (

@@ -130,7 +130,12 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 	if request.Operation == "unlink" {
 		clientOperation = "firebase_unlink_provider"
 	}
-	return agentevents.ProviderOperationResult{OperationID: operation.OperationID, Outcome: "client_operation_required", ClientOperation: clientOperation, ExpiresAt: operation.ExpiresAt}, nil
+	return agentevents.ProviderOperationResult{
+		OperationID: operation.OperationID, Outcome: "client_operation_required",
+		ClientOperation: clientOperation, CreatedAt: operation.CreatedAt,
+		CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt:                operation.ExpiresAt,
+	}, nil
 }
 
 func usableProviderCount(subjects map[string][]string) int {
@@ -154,6 +159,9 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 	if operation.HumanID != claims.UserID || operation.FirebaseUID != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
+	if identity.IssuedAt.IsZero() || identity.IssuedAt.Before(completionTokenNotBefore(operation.CreatedAt)) {
+		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
+	}
 	if operation.Operation == "link" {
 		subjects := identity.ProviderSubjects[operation.Provider]
 		if len(subjects) != 1 {
@@ -165,7 +173,11 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 			_, _ = c.store.FailProviderOperation(ctx, request.OperationID, request.Nonce, "credential_in_use")
 		}
 		if err == nil && event.TerminalOutcome == "already_linked" {
-			return agentevents.ProviderOperationResult{OperationID: operation.OperationID, Outcome: "provider_already_linked"}, nil
+			return agentevents.ProviderOperationResult{
+				OperationID: operation.OperationID, Outcome: "provider_already_linked",
+				CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+				ExpiresAt: operation.ExpiresAt,
+			}, nil
 		}
 	} else {
 		if len(identity.ProviderSubjects[operation.Provider]) != 0 {
@@ -187,7 +199,24 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 	if operation.Operation == "unlink" {
 		outcome = "provider_unlinked"
 	}
-	return agentevents.ProviderOperationResult{OperationID: operation.OperationID, Outcome: outcome, NoticeRequired: true}, nil
+	return agentevents.ProviderOperationResult{
+		OperationID: operation.OperationID, Outcome: outcome,
+		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt: operation.ExpiresAt, NoticeRequired: true,
+	}, nil
+}
+
+// Firebase ID token iat has one-second precision while Postgres created_at has
+// sub-second precision. If an operation begins during a second, only a token
+// from the next whole second can unambiguously have been issued afterwards.
+// An exact whole-second operation timestamp may safely accept the same instant.
+func completionTokenNotBefore(createdAt time.Time) time.Time {
+	createdAt = createdAt.UTC()
+	truncated := createdAt.Truncate(time.Second)
+	if createdAt.Equal(truncated) {
+		return truncated
+	}
+	return truncated.Add(time.Second)
 }
 
 func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.FailProviderOperationRequest) (agentevents.ProviderOperationResult, error) {
@@ -205,7 +234,11 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	return agentevents.ProviderOperationResult{OperationID: operation.OperationID, Outcome: request.Outcome}, nil
+	return agentevents.ProviderOperationResult{
+		OperationID: operation.OperationID, Outcome: request.Outcome,
+		CreatedAt: operation.CreatedAt, CompletionTokenNotBefore: completionTokenNotBefore(operation.CreatedAt),
+		ExpiresAt: operation.ExpiresAt,
+	}, nil
 }
 
 func mapFlowError(err error) error {

@@ -19,6 +19,7 @@ type ProviderOperation struct {
 	Operation    string
 	Status       string
 	DecisionPath string
+	CreatedAt    time.Time
 	ExpiresAt    time.Time
 }
 
@@ -50,10 +51,10 @@ func (s *Store) BeginProviderOperation(ctx context.Context, humanID, firebaseUID
 		(operation_id, nonce_hash, human_id, firebase_uid, provider, operation, decision_path, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT (nonce_hash) DO UPDATE SET nonce_hash=provider_operations.nonce_hash
-		RETURNING operation_id, human_id, firebase_uid, provider, operation, status, decision_path, expires_at`,
+		RETURNING operation_id, human_id, firebase_uid, provider, operation, status, decision_path, created_at, expires_at`,
 		operationID, nonceHash, humanID, firebaseUID, provider, operation, decisionPath, expiresAt).Scan(
 		&result.OperationID, &result.HumanID, &result.FirebaseUID, &result.Provider,
-		&result.Operation, &result.Status, &result.DecisionPath, &result.ExpiresAt)
+		&result.Operation, &result.Status, &result.DecisionPath, &result.CreatedAt, &result.ExpiresAt)
 	if err != nil {
 		return ProviderOperation{}, fmt.Errorf("begin provider operation: %w", err)
 	}
@@ -80,11 +81,11 @@ func scanProviderOperation(ctx context.Context, tx pgx.Tx, operationID, nonce st
 	}
 	var operation ProviderOperation
 	err = tx.QueryRow(ctx, `SELECT operation_id, human_id, firebase_uid, provider,
-		operation, status, decision_path, expires_at FROM provider_operations
+		operation, status, decision_path, created_at, expires_at FROM provider_operations
 		WHERE operation_id=$1 AND nonce_hash=$2 FOR UPDATE`, operationID, nonceHash).Scan(
 		&operation.OperationID, &operation.HumanID, &operation.FirebaseUID,
 		&operation.Provider, &operation.Operation, &operation.Status,
-		&operation.DecisionPath, &operation.ExpiresAt)
+		&operation.DecisionPath, &operation.CreatedAt, &operation.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ProviderOperation{}, ErrInvalidAuthFlow
 	}
