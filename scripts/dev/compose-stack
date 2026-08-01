@@ -4,9 +4,11 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
+readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
 readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
 
 log() {
   printf '[sumi-compose-stack] %s\n' "$*" >&2
@@ -19,6 +21,10 @@ fail() {
 
 random_token() {
   openssl rand -hex 32
+}
+
+random_base64() {
+  openssl rand -base64 48 | tr -d '\n'
 }
 
 require_value() {
@@ -39,6 +45,41 @@ load_env_file() {
   fi
 }
 
+ensure_runtime_env_file() {
+  local directory temporary metadata
+  directory="$(dirname "${RUNTIME_ENV_FILE}")"
+  mkdir -p "${directory}"
+
+  if [[ ! -e "${RUNTIME_ENV_FILE}" && ! -L "${RUNTIME_ENV_FILE}" ]]; then
+    temporary="${RUNTIME_ENV_FILE}.tmp.$$"
+    (
+      umask 077
+      {
+        printf 'SUMI_LOCAL_CONTROL_BEARER=%s\n' "$(random_token)"
+        printf 'SUMI_AGENT_WRAPPING_KEY=%s\n' "$(random_token)"
+        printf 'SUMI_APPROVAL_SECRET_DIGEST_KEY=%s\n' "$(random_token)"
+        printf 'SUMI_AGENT_TOKEN_SECRET=%s\n' "$(random_base64)"
+      } > "${temporary}"
+    )
+    # A hard-link publish is atomic and refuses to replace an existing file.
+    # A concurrent launcher may win; in that case its complete file is used.
+    if ln "${temporary}" "${RUNTIME_ENV_FILE}" 2>/dev/null; then
+      :
+    elif [[ ! -f "${RUNTIME_ENV_FILE}" || -L "${RUNTIME_ENV_FILE}" ]]; then
+      rm -f "${temporary}"
+      fail "cannot create trusted runtime env file: ${RUNTIME_ENV_FILE}"
+    fi
+    rm -f "${temporary}"
+  fi
+
+  [[ -f "${RUNTIME_ENV_FILE}" && ! -L "${RUNTIME_ENV_FILE}" ]] ||
+    fail "runtime env file must be a regular non-symlink: ${RUNTIME_ENV_FILE}"
+  metadata="$(stat -Lc '%u:%a:%h' -- "${RUNTIME_ENV_FILE}")" ||
+    fail "cannot inspect runtime env file: ${RUNTIME_ENV_FILE}"
+  [[ "${metadata}" == "$(id -u):600:1" ]] ||
+    fail "runtime env file must be owned by the current user with mode 0600 and one link"
+}
+
 usage() {
   cat <<'EOF'
 Usage: scripts/dev/compose-stack up|down|config
@@ -50,9 +91,12 @@ Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 EOF
 }
 
-# Optional Firebase values are inherited from the env file; the agent secrets
-# are generated on the fly and exported for this command only.
+# Optional Firebase values are inherited from the user env file. Generated
+# runtime secrets live in a separate ignored 0600 file so durable state remains
+# decryptable and verifiable after a Compose restart.
 load_env_file "${ENV_FILE}"
+ensure_runtime_env_file
+load_env_file "${RUNTIME_ENV_FILE}"
 
 # Use a stable dev PAID. The API and the agent container share it. The API
 # grants the legacy env-agent authorization so the container can connect.
@@ -69,9 +113,45 @@ export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral
 export SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER:-$(random_token)}"
 export SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY:-$(random_token)}"
 export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
-# The container entrypoint rejects an empty provider key. A placeholder lets
-# the runtime start; real calls need a key in .env.local or the environment.
-export SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY:-dummy}"
+
+# Agent token and local-control secrets. These are used by the API to verify
+# agent WebSocket connections and by the runtime container to authenticate its
+# local-control socket. Browser auth is left unconfigured unless the user sets
+# SUMI_BROWSER_SESSION_SECRET and SUMI_AUTH_FIREBASE_PROJECT_ID, which requires
+# a real Firebase ADC to start the API.
+export SUMI_AGENT_TOKEN_SECRET="${SUMI_AGENT_TOKEN_SECRET:-$(random_base64)}"
+export SUMI_LOCAL_CONTROL_TENANT_ID="${SUMI_LOCAL_CONTROL_TENANT_ID:-${SUMI_AUTH_TENANT_ID:-sumi-dev}}"
+export SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION:-0}"
+export SUMI_RPC_NONCE="${SUMI_RPC_NONCE:-$(random_token)}"
+# The API's local-control fixture and the runtime identity must agree on the
+# boot nonce, so derive both from the same value.
+export SUMI_LOCAL_CONTROL_GENERATION="${SUMI_LOCAL_CONTROL_GENERATION:-$SUMI_RPC_GENERATION}"
+export SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE="${SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE:-$SUMI_RPC_NONCE}"
+export SUMI_RPC_NONCE="$SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"
+export SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID:-$(random_token)}"
+export SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID:-$(random_token)}"
+export SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION="${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}"
+
+# Web Firebase project ID. Default to the auth project if set, otherwise a
+# placeholder. This only matters for browser login; the dev server starts with
+# the placeholder.
+export VITE_FIREBASE_PROJECT_ID="${VITE_FIREBASE_PROJECT_ID:-${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}}"
+# Resolve the configured provider credential exactly as the host real-stack
+# launcher does. A placeholder is allowed only when no credential variable was
+# configured at all, so compose/config smoke checks remain available without a
+# live model account.
+if [[ -n "${SUMI_MODEL_API_KEY_ENV:-}" ]]; then
+  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
+  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
+  [[ -n "${provider_api_key}" ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured model provider"
+  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
+  export SUMI_PROVIDER_API_KEY="${provider_api_key}"
+else
+  export SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY:-dummy}"
+fi
 
 if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
   log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"

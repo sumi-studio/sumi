@@ -279,6 +279,10 @@ func newApplicationFromEnv() (*application, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("control-plane database: %w", err)
 	}
+	var databasePool *pgxpool.Pool
+	if database != nil {
+		databasePool = database.Pool
+	}
 	closeOnError := func() {
 		_ = store.Close()
 		if database != nil {
@@ -297,20 +301,18 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var authServer *agentevents.BrowserAuthServer
 	var authEnabled bool
-	if database == nil {
-		authServer, authEnabled, err = browserAuthServerFromEnv(context.Background(), sv, browserOrigins)
-	} else {
-		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(context.Background(), sv, browserOrigins, database.Pool)
-	}
-	if err != nil {
-		closeOnError()
-		return nil, fmt.Errorf("browser auth: %w", err)
+	if browserAuthConfiguredFromEnv() {
+		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(context.Background(), sv, browserOrigins, databasePool)
+		if err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("browser auth: %w", err)
+		}
 	}
 	if authEnabled {
 		authServer.Connections = browser
 		authServer.RegisterRoutes(mux)
 	}
-	localControl, enabled, err := localControlServerFromEnvWithDB(runtime, database.Pool)
+	localControl, enabled, err := localControlServerFromEnvWithDB(runtime, databasePool)
 	if err != nil {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
