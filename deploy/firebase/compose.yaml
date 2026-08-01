@@ -1,0 +1,28 @@
+# Standalone Firebase Auth emulator for the WSL/Tailnet development host.
+#
+# Choose one exact host address; do not use 0.0.0.0 for the published port.
+# Examples:
+#   FIREBASE_AUTH_EMULATOR_BIND_HOST=100.116.25.99 docker compose -f deploy/firebase/compose.yaml up -d --build
+#   FIREBASE_AUTH_EMULATOR_BIND_HOST=127.0.0.1 docker compose -f deploy/firebase/compose.yaml up -d --build
+services:
+  firebase-auth:
+    build:
+      context: .
+    environment:
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-sumi-studio}
+      FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth
+    ports:
+      - "${FIREBASE_AUTH_EMULATOR_BIND_HOST:-127.0.0.1}:9099:9099"
+    volumes:
+      # The CLI replaces the export directory atomically, so mount its parent
+      # rather than the export directory itself.
+      - firebase-auth-data:/var/lib/firebase
+    # Firebase writes its export during graceful shutdown. Its CLI handles the
+    # terminal interrupt used by Ctrl-C, so use that signal rather than Docker's
+    # default SIGTERM and leave enough time for the export to complete.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  firebase-auth-data: {}
