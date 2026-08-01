@@ -138,6 +138,11 @@ describe("provider settings", () => {
     const add = screen.getByRole("button", { name: "Googleを追加" });
     expect(add).toHaveClass("h-11");
     fireEvent.click(add);
+    const continueWithGoogle = await screen.findByRole("button", {
+      name: "Googleで認証を続ける",
+    });
+    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
+    fireEvent.click(continueWithGoogle);
 
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -187,7 +192,7 @@ describe("provider settings", () => {
     expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
   });
 
-  it("retries a request-not-sent start with the same persisted nonce", async () => {
+  it("retries start with the same nonce, then opens OAuth synchronously on the second click", async () => {
     settingsMocks.startProviderOperation
       .mockRejectedValueOnce(new TypeError("request not sent"))
       .mockResolvedValueOnce({
@@ -210,6 +215,13 @@ describe("provider settings", () => {
     expect(settingsMocks.startProviderOperation.mock.calls[1]?.[0].nonce).toBe(
       "n".repeat(43),
     );
+    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
+    const continueWithGoogle = await screen.findByRole("button", {
+      name: "Googleで認証を続ける",
+    });
+    fireEvent.click(continueWithGoogle);
+    // This assertion intentionally runs in the same test task as the second
+    // click. A deferred effect or post-await call would still be zero here.
     expect(settingsMocks.linkWithPopup).toHaveBeenCalledTimes(1);
   });
 
@@ -224,6 +236,11 @@ describe("provider settings", () => {
     render(<ProviderSettings humanId="human-a" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Googleで認証を続ける",
+      }),
+    );
 
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -245,6 +262,11 @@ describe("provider settings", () => {
     render(<ProviderSettings humanId="human-a" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Googleで認証を続ける",
+      }),
+    );
 
     await waitFor(
       () => {
@@ -255,7 +277,7 @@ describe("provider settings", () => {
       { timeout: 2_500 },
     );
     expect(
-      screen.getByRole("button", { name: "Googleの追加を再開" }),
+      screen.getByRole("button", { name: "Googleの追加結果を確認" }),
     ).toBeVisible();
     expect(
       JSON.parse(
@@ -272,7 +294,7 @@ describe("provider settings", () => {
     settingsMocks.statusProviderOperation.mockResolvedValue(linkedResult);
     render(<ProviderSettings humanId="human-a" />);
     const resume = await screen.findByRole("button", {
-      name: "Googleの追加を再開",
+      name: "Googleの追加結果を確認",
     });
     fireEvent.click(resume);
 
@@ -281,10 +303,8 @@ describe("provider settings", () => {
         "Googleを追加しました",
       ),
     );
-    expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(2);
-    expect(settingsMocks.startProviderOperation.mock.calls[0]?.[0].nonce).toBe(
-      settingsMocks.startProviderOperation.mock.calls[1]?.[0].nonce,
-    );
+    expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(1);
+    expect(settingsMocks.linkWithPopup).toHaveBeenCalledTimes(1);
   });
 
   it("replays a backend-owned unlink with the same nonce and tolerates transient status loss", async () => {
@@ -392,6 +412,63 @@ describe("provider settings", () => {
     );
     act(() => settingsMocks.authObserver?.(null));
     expect(sessionStorage.getItem("sumi.auth.provider-notice.v1")).toBeNull();
+  });
+
+  it("preserves scoped recovery state through an initial null before auth restoration", async () => {
+    settingsMocks.currentUser = null;
+    settingsMocks.onAuthStateChanged.mockImplementation((_auth, observer) => {
+      settingsMocks.authObserver = observer;
+      return vi.fn();
+    });
+    sessionStorage.setItem(
+      "sumi.auth.provider-notice.v1",
+      JSON.stringify({
+        version: 1,
+        firebaseUid: "firebase-user-a",
+        humanId: "human-a",
+        provider: "google.com",
+        operation: "linked",
+      }),
+    );
+    sessionStorage.setItem(
+      "sumi.auth.provider-pending.v1",
+      JSON.stringify({
+        version: 1,
+        firebaseUid: "firebase-user-a",
+        humanId: "human-a",
+        provider: "github.com",
+        operation: "link",
+        nonce: "n".repeat(43),
+        phase: "link_ready",
+        operationId: "operation-restored",
+        completionTokenNotBefore: "2020-01-01T00:00:00Z",
+      }),
+    );
+
+    render(<ProviderSettings humanId="human-a" />);
+    expect(
+      sessionStorage.getItem("sumi.auth.provider-notice.v1"),
+    ).not.toBeNull();
+    expect(
+      sessionStorage.getItem("sumi.auth.provider-pending.v1"),
+    ).not.toBeNull();
+
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }],
+    };
+    act(() => settingsMocks.authObserver?.(settingsMocks.currentUser));
+
+    expect(await screen.findByText("Googleを追加しました")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "GitHubで認証を続ける" }),
+    ).toBeVisible();
+    expect(
+      sessionStorage.getItem("sumi.auth.provider-notice.v1"),
+    ).not.toBeNull();
+    expect(
+      sessionStorage.getItem("sumi.auth.provider-pending.v1"),
+    ).not.toBeNull();
   });
 
   it("cannot repopulate provider state from an old account's in-flight callback", async () => {

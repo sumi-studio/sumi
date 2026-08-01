@@ -111,10 +111,11 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
           setPendingOperation(null);
         }
       };
-      observe(auth.currentUser);
+      // Firebase may expose a synchronous null currentUser while restoring its
+      // persisted session. The first auth-state emission is authoritative;
+      // clearing scoped recovery state before it would abandon valid work.
       return onAuthStateChanged(auth, observe);
     } catch {
-      clearProviderSessionState();
       setFirebaseUser(null);
     }
   }, []);
@@ -234,14 +235,13 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
     [persistPending, scope, scopedPendingOperation],
   );
 
-  const linkProvider = useCallback(
+  const prepareLinkProvider = useCallback(
     async (provider: ManagedProvider) => {
       if (!firebaseUser || busyProvider) return;
       setBusyProvider(provider);
-      setBusyLabel(`${providerLabel(provider)}の変更を確認中`);
+      setBusyLabel(`${providerLabel(provider)}の追加を準備中`);
       setError(null);
       let operation: PendingProviderOperation | null = null;
-      let firebaseLinked = false;
       try {
         operation = operationFor(provider, "link");
         const started = await startWithSameNonce(
@@ -268,46 +268,23 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
           phase: linkedProviders.has(provider) ? "link_mutated" : "link_ready",
         };
         persistPending(operation);
-
-        let linkedUser = firebaseUser;
-        if (!linkedProviders.has(provider)) {
-          setBusyLabel(`${providerLabel(provider)}で認証中`);
-          const linked = await linkWithPopup(
-            firebaseUser,
-            createFirebaseProvider(provider),
-          );
-          linkedUser = linked.user;
-          firebaseLinked = true;
-          setProviderRevision((revision) => revision + 1);
-          operation = { ...operation, phase: "link_mutated" };
-          persistPending(operation);
-        } else {
-          firebaseLinked = true;
-        }
-
-        setBusyLabel(`${providerLabel(provider)}の追加を確定中`);
-        const completed = await reconcileLinkCompletion(operation, linkedUser);
-        await finishSuccessfulOperation(
-          completed,
-          operation,
-          linkedUser,
-          refreshUser,
-          clearPending,
-          publishNotice,
-        );
-      } catch (nextError) {
-        if (
-          operation?.operationId &&
-          operation.phase === "link_ready" &&
-          !firebaseLinked &&
-          isFirebasePopupFailure(nextError)
-        ) {
-          const settled = await settleKnownLinkFailure(
+        if (operation.phase === "link_mutated") {
+          setBusyLabel(`${providerLabel(provider)}の追加結果を確認中`);
+          const completed = await reconcileLinkCompletion(
             operation,
-            providerFailureOutcome(nextError),
+            firebaseUser,
           );
-          if (settled) clearPending(operation);
-        } else if (isDefinitiveStartFailure(nextError, operation)) {
+          await finishSuccessfulOperation(
+            completed,
+            operation,
+            firebaseUser,
+            refreshUser,
+            clearPending,
+            publishNotice,
+          );
+        }
+      } catch (nextError) {
+        if (isDefinitiveStartFailure(nextError, operation)) {
           if (operation) clearPending(operation);
         } else if (nextError instanceof TerminalProviderOperationError) {
           if (operation) clearPending(operation);
@@ -333,6 +310,110 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       persistPending,
       publishNotice,
       refreshUser,
+    ],
+  );
+
+  const continueLinkProvider = useCallback(
+    (provider: ManagedProvider) => {
+      if (!firebaseUser || busyProvider) return;
+      const operation = scopedPendingOperation;
+      if (
+        !operation ||
+        operation.provider !== provider ||
+        operation.operation !== "link" ||
+        (operation.phase !== "link_ready" && operation.phase !== "link_mutated")
+      ) {
+        setError(
+          "追加の準備が完了していません。先に追加操作を再開してください。",
+        );
+        return;
+      }
+      setBusyProvider(provider);
+      setBusyLabel(`${providerLabel(provider)}で認証中`);
+      setError(null);
+
+      let popupPromise: ReturnType<typeof linkWithPopup> | null = null;
+      if (operation.phase === "link_ready" && !linkedProviders.has(provider)) {
+        // This call must remain in the second click's synchronous task. Any
+        // token, backend, or timer await before it can trigger popup blocking.
+        try {
+          popupPromise = linkWithPopup(
+            firebaseUser,
+            createFirebaseProvider(provider),
+          );
+        } catch (popupError) {
+          popupPromise = Promise.reject(popupError);
+        }
+      }
+
+      void (async () => {
+        let currentOperation = operation;
+        try {
+          let linkedUser = firebaseUser;
+          if (popupPromise) {
+            const linked = await popupPromise;
+            linkedUser = linked.user;
+            setProviderRevision((revision) => revision + 1);
+            currentOperation = {
+              ...currentOperation,
+              phase: "link_mutated",
+            };
+            persistPending(currentOperation);
+          } else if (currentOperation.phase !== "link_mutated") {
+            currentOperation = {
+              ...currentOperation,
+              phase: "link_mutated",
+            };
+            persistPending(currentOperation);
+          }
+
+          setBusyLabel(`${providerLabel(provider)}の追加を確定中`);
+          const completed = await reconcileLinkCompletion(
+            currentOperation,
+            linkedUser,
+          );
+          await finishSuccessfulOperation(
+            completed,
+            currentOperation,
+            linkedUser,
+            refreshUser,
+            clearPending,
+            publishNotice,
+          );
+        } catch (nextError) {
+          if (
+            currentOperation.phase === "link_ready" &&
+            isFirebasePopupFailure(nextError)
+          ) {
+            const settled = await settleKnownLinkFailure(
+              currentOperation,
+              providerFailureOutcome(nextError),
+            );
+            if (settled) clearPending(currentOperation);
+          } else if (nextError instanceof TerminalProviderOperationError) {
+            clearPending(currentOperation);
+          }
+          if (
+            activeScopeRef.current &&
+            sameScope(currentOperation, activeScopeRef.current)
+          ) {
+            setError(providerSettingsError(nextError));
+          }
+        } finally {
+          setBusyProvider(null);
+          setBusyLabel(null);
+        }
+      })();
+    },
+    [
+      busyProvider,
+      clearPending,
+      firebaseUser,
+      linkedProviders,
+      persistPending,
+      publishNotice,
+      refreshUser,
+      scopedPendingOperation,
     ],
   );
 
@@ -453,9 +534,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         >
           <RotateCcw className="size-3.5 shrink-0" aria-hidden="true" />
           <span className="flex-1">
-            {providerLabel(scopedPendingOperation.provider)}の
-            {scopedPendingOperation.operation === "link" ? "追加" : "解除"}
-            を再開できます
+            {pendingOperationMessage(scopedPendingOperation)}
           </span>
         </div>
       )}
@@ -480,6 +559,11 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
               pending && scopedPendingOperation.operation === "link";
             const resumeUnlink =
               pending && scopedPendingOperation.operation === "unlink";
+            const linkPhase = resumeLink ? scopedPendingOperation.phase : null;
+            const needsProviderGesture = linkPhase === "link_ready" && !linked;
+            const confirmsLinkedResult =
+              linkPhase === "link_mutated" ||
+              (linkPhase === "link_ready" && linked);
             return (
               <ProviderRow
                 key={id}
@@ -492,11 +576,25 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
                       variant="ghost"
                       className="h-11 min-w-11 px-2"
                       disabled={busyProvider !== null}
-                      onClick={() => void linkProvider(id)}
-                      aria-label={`${label}の追加を再開`}
+                      onClick={() =>
+                        linkPhase === "starting"
+                          ? void prepareLinkProvider(id)
+                          : continueLinkProvider(id)
+                      }
+                      aria-label={
+                        needsProviderGesture
+                          ? `${label}で認証を続ける`
+                          : confirmsLinkedResult
+                            ? `${label}の追加結果を確認`
+                            : `${label}の追加準備を再開`
+                      }
                     >
                       <RotateCcw className="size-3.5" />
-                      再開
+                      {needsProviderGesture
+                        ? `${label}で続ける`
+                        : confirmsLinkedResult
+                          ? "結果を確認"
+                          : "準備を再開"}
                     </Button>
                   ) : linked ? (
                     <Button
@@ -524,7 +622,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
                       variant="ghost"
                       className="h-11 min-w-11 px-2"
                       disabled={busyProvider !== null || blockedByOtherPending}
-                      onClick={() => void linkProvider(id)}
+                      onClick={() => void prepareLinkProvider(id)}
                       aria-label={`${label}を${pending ? "再開" : "追加"}`}
                     >
                       {pending ? (
@@ -961,6 +1059,23 @@ function providerSettingsError(error: unknown): string {
 
 function providerLabel(provider: ManagedProvider): string {
   return provider === "github.com" ? "GitHub" : "Google";
+}
+
+function pendingOperationMessage(operation: PendingProviderOperation): string {
+  const label = providerLabel(operation.provider);
+  if (operation.operation === "unlink") {
+    return `${label}の解除を再開できます`;
+  }
+  switch (operation.phase) {
+    case "starting":
+      return `${label}の追加準備を再開できます`;
+    case "link_ready":
+      return `${label}で認証を続けてください`;
+    case "link_mutated":
+      return `${label}の追加結果を確認できます`;
+    default:
+      return `${label}の変更を再開できます`;
+  }
 }
 
 function loadScopedNotice(scope: ProviderScope): ProviderNotice | null {
