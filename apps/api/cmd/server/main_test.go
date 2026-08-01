@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,17 @@ type testCommandReceipt struct {
 	CommandID      string `json:"command_id"`
 	Seq            uint64 `json:"seq"`
 }
+
+type readyingDirectChatSpawner struct {
+	gateway *agentevents.DurableGateway
+}
+
+func (s *readyingDirectChatSpawner) EnsureRunning(_ context.Context, personalityAgentID string) error {
+	receipt := "ready-" + personalityAgentID
+	return s.gateway.PublishRuntimeState(personalityAgentID, 1, &receipt)
+}
+
+func (*readyingDirectChatSpawner) Touch(string) {}
 
 type fakeFirebaseIDTokenClient struct {
 	token *firebaseauth.Token
@@ -188,6 +200,10 @@ func postAuthorized(t *testing.T, serverURL, personalityAgentID string, body []b
 }
 
 func postWithSessionCookie(t *testing.T, serverURL, personalityAgentID string, body []byte) *http.Response {
+	return postWithSessionCookieAndKey(t, serverURL, personalityAgentID, "test-key", body)
+}
+
+func postWithSessionCookieAndKey(t *testing.T, serverURL, personalityAgentID, idempotencyKey string, body []byte) *http.Response {
 	t.Helper()
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
@@ -201,7 +217,7 @@ func postWithSessionCookie(t *testing.T, serverURL, personalityAgentID string, b
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", "test-key")
+	req.Header.Set("Idempotency-Key", idempotencyKey)
 	req.Header.Set("Origin", testBrowserOrigin)
 	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: session})
 	resp, err := http.DefaultClient.Do(req)
@@ -568,6 +584,71 @@ func TestNewRouter_CommandRouteRejectsUnavailableWithoutDurableAppend(t *testing
 	defer observer.Close()
 	if hasCommands, err := observer.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
 		t.Fatalf("unavailable HTTP command reached durable log: hasCommands=%v err=%v", hasCommands, err)
+	}
+}
+
+func TestDirectCommandLazySpawnIsolatesThreePAIDLogsAndRejectsTargetInjection(t *testing.T) {
+	setSessionSecret(t)
+	commandDir := t.TempDir()
+	t.Setenv("SUMI_COMMAND_LOG_DIR", commandDir)
+	app, err := newApplicationFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	app.browser.SetSpawner(&readyingDirectChatSpawner{gateway: app.browser.Events})
+	server := httptest.NewServer(app.publicMux)
+	defer server.Close()
+
+	paids := []string{
+		"0198f0f4-9b72-7000-8000-000000000001",
+		"0198f0f4-9b72-7000-8000-000000000002",
+		"0198f0f4-9b72-7000-8000-000000000003",
+	}
+	for index, paid := range paids {
+		body := []byte(fmt.Sprintf(`{"type":"user_message","text":"own-%d","attachments":[]}`, index))
+		response := postWithSessionCookieAndKey(t, server.URL, paid, fmt.Sprintf("own-%d", index), body)
+		if response.StatusCode != http.StatusCreated {
+			var rejection map[string]any
+			_ = json.NewDecoder(response.Body).Decode(&rejection)
+			response.Body.Close()
+			t.Fatalf("own command for %s status=%d rejection=%v", paid, response.StatusCode, rejection)
+		}
+		response.Body.Close()
+	}
+
+	injected := []byte(fmt.Sprintf(
+		`{"type":"user_message","text":"cross-target","attachments":[],"personality_agent_id":%q}`,
+		paids[1],
+	))
+	response := postWithSessionCookieAndKey(t, server.URL, paids[0], "cross-injection", injected)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-PAID injection status=%d, want 400", response.StatusCode)
+	}
+	var rejection struct {
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&rejection); err != nil {
+		t.Fatal(err)
+	}
+	if rejection.RejectReason != "schema_violation" {
+		t.Fatalf("cross-PAID injection rejection=%q", rejection.RejectReason)
+	}
+
+	observer, err := agentevents.OpenCommandStore(commandDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	for _, paid := range paids {
+		next, err := observer.NextCommandSeq(context.Background(), paid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next != 2 {
+			t.Fatalf("PAID %s next sequence=%d, want exactly one isolated command", paid, next)
+		}
 	}
 }
 

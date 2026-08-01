@@ -59,7 +59,7 @@ func TestProviderUnlinkIsBackendOwnedAndCountsOnlyProvedMethods(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	registered, err := store.AutoRegister(ctx, "firebase", "unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +223,7 @@ func TestProviderLinkRejectsPreOperationTokenAndAcceptsForcedRefresh(t *testing.
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	registered, err := store.AutoRegister(ctx, "firebase", "link-uid")
 	if err != nil {
 		t.Fatal(err)

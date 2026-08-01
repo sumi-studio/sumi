@@ -26,6 +26,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	"golang.org/x/sys/unix"
 )
@@ -79,6 +80,11 @@ func run(ctx context.Context) (runErr error) {
 	}
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
+	if app.spawnManager != nil {
+		reaperCtx, cancelReaper := context.WithCancel(ctx)
+		defer cancelReaper()
+		go runIdleReaper(reaperCtx, app.spawnManager)
+	}
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
@@ -90,11 +96,6 @@ func run(ctx context.Context) (runErr error) {
 		WriteTimeout:      5 * time.Second,
 		IdleTimeout:       15 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
-	}
-	if app.spawnManager != nil {
-		reaperCtx, cancelReaper := context.WithCancel(ctx)
-		defer cancelReaper()
-		go runIdleReaper(reaperCtx, app.spawnManager)
 	}
 	log.Printf("sumi local control listening on %s", app.localListener.description())
 	return serveHTTPServers(
@@ -211,6 +212,7 @@ type application struct {
 	browser       *agentevents.BrowserServer
 	database      *db.Pool
 	spawnManager  *spawn.Manager
+	localRuntimes *agentevents.LocalControlListenerRegistry
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -227,6 +229,11 @@ func (a *application) Close() error {
 		}
 		if a.spawnManager != nil {
 			a.closeErr = errors.Join(a.closeErr, a.spawnManager.StopAll())
+		}
+		if a.localRuntimes != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			a.closeErr = errors.Join(a.closeErr, a.localRuntimes.Close(ctx))
+			cancel()
 		}
 		if a.store != nil {
 			a.closeErr = errors.Join(a.closeErr, a.store.Close())
@@ -324,23 +331,33 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var localMux *http.ServeMux
 	if enabled {
-		localMux = http.NewServeMux()
-		if err := localControl.RegisterRoutes(localMux); err != nil {
-			closeOnError()
-			return nil, fmt.Errorf("register local control fixture: %w", err)
+		if localListener != nil {
+			localMux = http.NewServeMux()
+			if err := localControl.RegisterRoutes(localMux); err != nil {
+				closeOnError()
+				return nil, fmt.Errorf("register local control fixture: %w", err)
+			}
 		}
+	}
+	localRuntimes, err := localControlListenerRegistryFromEnv(localControl, enabled)
+	if err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("local control listener registry: %w", err)
 	}
 	var resolver spawn.AgentResolver
 	if database != nil {
 		resolver = koseki.New(database.Pool)
 	}
-	spawnManager, err := spawnManagerFromEnv(resolver, localListener)
+	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime)
 	if err != nil {
+		if localRuntimes != nil {
+			_ = localRuntimes.Close(context.Background())
+		}
 		closeOnError()
 		return nil, fmt.Errorf("spawn manager: %w", err)
 	}
 	if spawnManager != nil {
-		browser.Spawner = spawnManager
+		browser.SetSpawner(spawnManager)
 	}
 	mux.HandleFunc("GET /health", handler.Health)
 	return &application{
@@ -351,6 +368,7 @@ func newApplicationFromEnv() (*application, error) {
 		browser:       browser,
 		database:      database,
 		spawnManager:  spawnManager,
+		localRuntimes: localRuntimes,
 	}, nil
 }
 
@@ -419,6 +437,12 @@ func localControlListenerFromEnv(enabled bool) (*localControlListenerConfig, err
 		}
 		return nil, nil
 	}
+	if runtimeProvisioningEnabledFromEnv() {
+		if socketPath != "" || loopback != "" {
+			return nil, errors.New("runtime provisioning uses PAID-bound listeners; singular local-control transport settings are forbidden")
+		}
+		return nil, nil
+	}
 	if (socketPath == "") == (loopback == "") {
 		return nil, errors.New("exactly one of SUMI_LOCAL_CONTROL_UNIX_SOCKET or SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN is required")
 	}
@@ -450,6 +474,43 @@ func localControlListenerFromEnv(enabled bool) (*localControlListenerConfig, err
 		socketGID:          int(gid),
 		personalityAgentID: personalityAgentID,
 	}, nil
+}
+
+func localControlListenerRegistryFromEnv(
+	control *agentevents.LocalControlServer,
+	enabled bool,
+) (*agentevents.LocalControlListenerRegistry, error) {
+	if !runtimeProvisioningEnabledFromEnv() {
+		if os.Getenv("SUMI_LOCAL_CONTROL_ROOT") != "" {
+			return nil, errors.New("SUMI_LOCAL_CONTROL_ROOT requires SUMI_RUNTIME_PROVISIONER_SOCKET")
+		}
+		return nil, nil
+	}
+	if !enabled || control == nil {
+		return nil, errors.New("runtime provisioning requires SUMI_LOCAL_CONTROL_ENABLED=1")
+	}
+	root := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_ROOT"))
+	if root == "" {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_ROOT not set")
+	}
+	gidRaw := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_SOCKET_GID"))
+	if gidRaw == "" {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_SOCKET_GID not set")
+	}
+	gid, err := strconv.ParseUint(gidRaw, 10, 31)
+	if err != nil {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_SOCKET_GID must be a nonnegative decimal GID")
+	}
+	return agentevents.NewLocalControlListenerRegistry(
+		control,
+		agentevents.LocalControlListenerRegistryConfig{
+			RootDir:   root,
+			SocketGID: int(gid),
+			OpenListener: func(socketPath string, socketGID int, personalityAgentID string) (net.Listener, error) {
+				return listenTrustedUnixSocket(socketPath, socketGID, personalityAgentID)
+			},
+		},
+	)
 }
 
 func validateLoopbackListen(address string) error {
@@ -1717,23 +1778,16 @@ func localControlServerFromEnvWithDB(runtime *agentevents.DurableGateway, pool *
 		}
 		return value, nil
 	}
-	bearer, err := required("SUMI_LOCAL_CONTROL_BEARER")
-	if err != nil {
-		return nil, false, err
+	dynamicProvisioning := runtimeProvisioningEnabledFromEnv()
+	var bearer string
+	if !dynamicProvisioning {
+		var err error
+		bearer, err = required("SUMI_LOCAL_CONTROL_BEARER")
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	tenantID, err := required("SUMI_LOCAL_CONTROL_TENANT_ID")
-	if err != nil {
-		return nil, false, err
-	}
-	generationRaw, err := required("SUMI_LOCAL_CONTROL_GENERATION")
-	if err != nil {
-		return nil, false, err
-	}
-	generation, err := strconv.ParseUint(generationRaw, 10, 64)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse SUMI_LOCAL_CONTROL_GENERATION: %w", err)
-	}
-	rpcBootNonce, err := required("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE")
 	if err != nil {
 		return nil, false, err
 	}
@@ -1761,12 +1815,32 @@ func localControlServerFromEnvWithDB(runtime *agentevents.DurableGateway, pool *
 		return nil, false, errors.New("SUMI_LOCAL_CONTROL_AUDIENCE must match SUMI_AGENT_TOKEN_AUDIENCE")
 	}
 
-	authorizations, err := buildLocalControlAuthorizations(
-		bearer, tenantID, rpcBootNonce, generation, controlAudience,
-		agentevents.LocalDeliveryAuthorization(deliveryRaw), pool,
-	)
-	if err != nil {
-		return nil, false, err
+	var authorizations []agentevents.LocalRuntimeAuthorization
+	if dynamicProvisioning {
+		if strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")) != "" ||
+			strings.TrimSpace(os.Getenv("SUMI_AGENT_BINARY")) != "" {
+			return nil, false, errors.New("runtime provisioning cannot be combined with legacy env-agent or host ExecSpawner settings")
+		}
+	} else {
+		generationRaw, err := required("SUMI_LOCAL_CONTROL_GENERATION")
+		if err != nil {
+			return nil, false, err
+		}
+		generation, err := strconv.ParseUint(generationRaw, 10, 64)
+		if err != nil {
+			return nil, false, fmt.Errorf("parse SUMI_LOCAL_CONTROL_GENERATION: %w", err)
+		}
+		rpcBootNonce, err := required("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE")
+		if err != nil {
+			return nil, false, err
+		}
+		authorizations, err = buildLocalControlAuthorizations(
+			bearer, tenantID, rpcBootNonce, generation, controlAudience,
+			agentevents.LocalDeliveryAuthorization(deliveryRaw), pool,
+		)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	control, err := agentevents.NewLocalControlServerWithPreviousSigningSecrets(
 		runtime,
@@ -1778,6 +1852,10 @@ func localControlServerFromEnvWithDB(runtime *agentevents.DurableGateway, pool *
 		return nil, false, err
 	}
 	return control, true, nil
+}
+
+func runtimeProvisioningEnabledFromEnv() bool {
+	return strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET")) != ""
 }
 
 // buildLocalControlAuthorizations assembles the runtime authorization list. In
@@ -1860,31 +1938,29 @@ func deriveAgentCredential(shared, agentID string) string {
 	return shared + "/" + agentID
 }
 
-// spawnManagerFromEnv builds the lazy agent spawner when SUMI_AGENT_BINARY is
-// set. It requires the 戸籍 database and a loopback local-control listener so
-// spawned agents can connect back to the API. A nil listener or unset binary
-// yields a nil manager, which keeps the legacy single-process dev mode working.
-func spawnManagerFromEnv(resolver spawn.AgentResolver, listener *localControlListenerConfig) (*spawn.Manager, error) {
-	binaryPath := strings.TrimSpace(os.Getenv("SUMI_AGENT_BINARY"))
-	if binaryPath == "" {
+// spawnManagerFromEnv builds the lazy runtime controller around the typed
+// privileged provisioner. The API never executes host processes and never
+// receives a Docker socket.
+func spawnManagerFromEnv(
+	resolver spawn.AgentResolver,
+	control *agentevents.LocalControlServer,
+	listeners *agentevents.LocalControlListenerRegistry,
+	readiness runtimeReadinessController,
+) (*spawn.Manager, error) {
+	socketPath := strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET"))
+	if socketPath == "" {
+		if strings.TrimSpace(os.Getenv("SUMI_AGENT_BINARY")) != "" {
+			return nil, errors.New("SUMI_AGENT_BINARY host ExecSpawner is unsupported; configure SUMI_RUNTIME_PROVISIONER_SOCKET")
+		}
 		return nil, nil
 	}
 	if resolver == nil {
-		return nil, errors.New("SUMI_AGENT_BINARY requires a 戸籍 database (SUMI_DB_URL)")
+		return nil, errors.New("runtime provisioning requires a 戸籍 database (SUMI_DB_URL)")
 	}
-	if listener == nil || listener.loopbackListen == "" {
-		return nil, errors.New("SUMI_AGENT_BINARY requires SUMI_LOCAL_CONTROL_ENABLED=1 with SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN")
+	if control == nil || listeners == nil {
+		return nil, errors.New("runtime provisioning requires dynamic local-control authorization and listeners")
 	}
-
-	execSpawner, err := spawn.NewExecSpawner(binaryPath, spawn.SharedAgentEnvFromOS())
-	if err != nil {
-		return nil, fmt.Errorf("exec spawner: %w", err)
-	}
-	stateRoot, err := requireDirFromEnv("SUMI_SPAWN_STATE_ROOT")
-	if err != nil {
-		return nil, err
-	}
-	workspaceRoot, err := requireDirFromEnv("SUMI_SPAWN_WORKSPACE_ROOT")
+	client, err := runtimeprovision.NewUnixClient(socketPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1892,17 +1968,74 @@ func spawnManagerFromEnv(resolver spawn.AgentResolver, listener *localControlLis
 	if err != nil {
 		return nil, err
 	}
-	generation, err := requiredUintFromEnv("SUMI_LOCAL_CONTROL_GENERATION")
+	require := func(name string) (string, error) {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return "", fmt.Errorf("%s not set", name)
+		}
+		return value, nil
+	}
+	tenantID, err := require("SUMI_LOCAL_CONTROL_TENANT_ID")
 	if err != nil {
 		return nil, err
 	}
-	bearer := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_BEARER"))
-	if bearer == "" {
-		return nil, errors.New("SUMI_LOCAL_CONTROL_BEARER not set")
+	audience := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_AUDIENCE"))
+	if audience == "" {
+		audience = strings.TrimSpace(os.Getenv("SUMI_AGENT_TOKEN_AUDIENCE"))
 	}
-	nonce := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"))
-	if nonce == "" {
-		return nil, errors.New("SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE not set")
+	if audience == "" {
+		audience = agentevents.DefaultAgentAudience()
+	}
+	delivery := agentevents.LocalDeliveryAuthorization(strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION")))
+	gid, err := requiredUintFromEnv("SUMI_LOCAL_CONTROL_SOCKET_GID")
+	if err != nil {
+		return nil, err
+	}
+	if gid == 0 || gid > uint64(^uint32(0)-1) {
+		return nil, errors.New("SUMI_LOCAL_CONTROL_SOCKET_GID must be a nonzero Linux GID")
+	}
+	if os.Geteuid() == 0 {
+		return nil, errors.New("API runtime provisioning control plane must run as a non-root UID")
+	}
+	approvalKey, err := require("SUMI_APPROVAL_SECRET_DIGEST_KEY")
+	if err != nil {
+		return nil, err
+	}
+	if err := runtimeprovision.ValidateApprovalSecretDigestKey(approvalKey); err != nil {
+		return nil, fmt.Errorf("SUMI_APPROVAL_SECRET_DIGEST_KEY: %w", err)
+	}
+	providerKey, err := require("SUMI_PROVIDER_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	allowInsecure := false
+	if raw := strings.TrimSpace(os.Getenv("SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY")); raw != "" {
+		allowInsecure, err = strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: %w", err)
+		}
+	}
+	provisionedSpawner, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
+		Provisioner:    client,
+		Authorizations: control,
+		Listeners:      listeners,
+		Readiness:      readiness,
+		TenantID:       tenantID,
+		Audience:       audience,
+		Delivery:       delivery,
+		Activation: runtimeprovision.ActivationConfig{
+			LocalControlServerUID:        uint32(os.Geteuid()),
+			LocalControlSocketGID:        uint32(gid),
+			ApprovalSecretDigestKey:      approvalKey,
+			ProviderAPIKey:               providerKey,
+			ModelPreset:                  strings.TrimSpace(os.Getenv("SUMI_MODEL_PRESET")),
+			ModelID:                      strings.TrimSpace(os.Getenv("SUMI_MODEL_ID")),
+			AllowInsecureLoopbackGateway: allowInsecure,
+			LogFilter:                    strings.TrimSpace(os.Getenv("SUMI_LOG")),
+		},
+	})
+	if err != nil {
+		return nil, err
 	}
 	idleTimeout := 5 * time.Minute
 	if v := os.Getenv("SUMI_SPAWN_IDLE_TIMEOUT"); v != "" {
@@ -1912,24 +2045,11 @@ func spawnManagerFromEnv(resolver spawn.AgentResolver, listener *localControlLis
 		}
 		idleTimeout = d
 	}
-	var skip []string
-	if id := strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID")); id != "" {
-		skip = append(skip, id)
-	}
-
 	mgr, err := spawn.New(spawn.Config{
-		Spawner:         execSpawner,
-		Resolver:        resolver,
-		StateRoot:       stateRoot,
-		WorkspaceRoot:   workspaceRoot,
-		GatewayURL:      gatewayURL,
-		ExecutorSocket:  os.Getenv("SUMI_EXECUTOR_SOCKET"),
-		LocalControlURL: "http://" + listener.loopbackListen,
-		Generation:      generation,
-		SharedBearer:    bearer,
-		SharedNonce:     nonce,
-		IdleTimeout:     idleTimeout,
-		SkipAgentIDs:    skip,
+		Spawner:     provisionedSpawner,
+		Resolver:    resolver,
+		GatewayURL:  gatewayURL,
+		IdleTimeout: idleTimeout,
 	})
 	if err != nil {
 		return nil, err

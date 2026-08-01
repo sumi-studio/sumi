@@ -7,10 +7,13 @@ readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
 readonly BASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
 readonly REAL_FIREBASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.real-firebase.yaml"
-readonly REAL_FIREBASE_ADC_VOLUME=sumi-dev_firebase-adc-runtime
+readonly REAL_FIREBASE_ADC_VOLUME_SUFFIX=firebase-adc-runtime
+readonly CONTROL_PLANE_NETWORK=sumi-control-plane
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
 RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
+COMPOSE_PROJECT="${SUMI_LOCAL_COMPOSE_PROJECT:-sumi-dev}"
+COMPOSE_OVERRIDE_FILE="${SUMI_LOCAL_COMPOSE_OVERRIDE_FILE:-}"
 RUNTIME_ENV_FD=
 ACTION=
 FIREBASE_MODE=emulator
@@ -28,6 +31,34 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+ensure_control_plane_network() {
+  local metadata
+  if ! docker network inspect "${CONTROL_PLANE_NETWORK}" >/dev/null 2>&1; then
+    docker network create --driver bridge --internal \
+      --label dev.sumi.network-role=agent-control-plane \
+      "${CONTROL_PLANE_NETWORK}" >/dev/null
+  fi
+  metadata="$(docker network inspect --format '{{.Name}}:{{.Driver}}:{{.Internal}}' "${CONTROL_PLANE_NETWORK}")" ||
+    fail "cannot inspect ${CONTROL_PLANE_NETWORK}"
+  [[ "${metadata}" == "${CONTROL_PLANE_NETWORK}:bridge:true" ]] ||
+    fail "${CONTROL_PLANE_NETWORK} must be an internal bridge network"
+}
+
+configure_local_apparmor_fallback() {
+  local enabled=
+  if [[ -r /sys/module/apparmor/parameters/enabled ]]; then
+    enabled="$(< /sys/module/apparmor/parameters/enabled)"
+  fi
+  if [[ "${enabled}" == "Y" ]]; then
+    export SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=false
+    return
+  fi
+  export SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true
+  printf '%s\n' \
+    'WARNING: AppArmor is unavailable; using the explicit local-dev unconfined fallback.' \
+    'This is not AppArmor or microVM isolation.' >&2
 }
 
 random_token() {
@@ -151,8 +182,6 @@ ensure_runtime_env_file() {
     (
       umask 077
       {
-        printf 'SUMI_LOCAL_CONTROL_BEARER=%s\n' "$(random_token)"
-        printf 'SUMI_AGENT_WRAPPING_KEY=%s\n' "$(random_token)"
         printf 'SUMI_APPROVAL_SECRET_DIGEST_KEY=%s\n' "$(random_token)"
         printf 'SUMI_AGENT_TOKEN_SECRET=%s\n' "$(random_base64)"
         printf 'SUMI_BROWSER_SESSION_SECRET=%s\n' "$(random_base64)"
@@ -227,8 +256,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/dev/compose-stack [--firebase emulator|real] up|down|config [compose arguments]
 
-Starts or stops the full local Sumi stack in Docker Compose:
-Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+Starts or stops the local Sumi control plane in Docker Compose. PersonalityAgent
+runtimes are provisioned lazily as isolated PAID-derived Compose projects.
 Sumi service images are pulled from ghcr.io/sumi-studio; authenticate the
 Compose host first when the packages are private.
 
@@ -237,6 +266,8 @@ real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
 non-root API container. config validates quietly and never renders secrets.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
+Set SUMI_LOCAL_COMPOSE_PROJECT to target an explicitly named local stack and
+SUMI_LOCAL_COMPOSE_OVERRIDE_FILE to add one exact Compose override file.
 EOF
 }
 
@@ -272,6 +303,18 @@ case "${FIREBASE_MODE}" in
   *) fail "--firebase must be emulator or real" ;;
 esac
 readonly ACTION FIREBASE_MODE
+
+[[ "${COMPOSE_PROJECT}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+  fail "SUMI_LOCAL_COMPOSE_PROJECT must be a canonical Compose project name"
+# Compose receives the project name explicitly through `-p`, so its named
+# volume is exactly this project-qualified name. Keep the cleanup scoped to the
+# selected stack rather than assuming the default `sumi-dev` project.
+readonly REAL_FIREBASE_ADC_VOLUME="${COMPOSE_PROJECT}_${REAL_FIREBASE_ADC_VOLUME_SUFFIX}"
+if [[ -n "${COMPOSE_OVERRIDE_FILE}" ]]; then
+  [[ -f "${COMPOSE_OVERRIDE_FILE}" && ! -L "${COMPOSE_OVERRIDE_FILE}" ]] ||
+    fail "SUMI_LOCAL_COMPOSE_OVERRIDE_FILE must be a regular non-symlink"
+  COMPOSE_FILES+=(-f "${COMPOSE_OVERRIDE_FILE}")
+fi
 
 # Optional Firebase values are inherited from the user env file. Generated
 # runtime secrets live in a separate ignored 0600 file so durable state remains
@@ -338,27 +381,14 @@ export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
 # lock before Docker Compose runs so a foreground stack does not block `down`.
 unlock_runtime_env_file
 
-# Runtime secrets. These are also read by the agent container through compose
-# secrets and by the API to authorize the container.
-export SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER:-$(random_token)}"
-export SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY:-$(random_token)}"
+# Runtime activation secrets stay in the API until they cross the typed
+# provisioner activation request for one exact prepared epoch.
 export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
 
-# Agent token and local-control secrets. These are used by the API to verify
-# agent WebSocket connections and by the runtime container to authenticate its
-# local-control socket. Browser auth uses the persisted session secret above;
-# Firebase Admin uses either the configured emulator or ambient ADC.
+# Agent token and local-control signing secrets stay in the API. Browser auth
+# uses the persisted session secret; Firebase Admin uses the emulator or ADC.
 export SUMI_AGENT_TOKEN_SECRET="${SUMI_AGENT_TOKEN_SECRET:-$(random_base64)}"
 export SUMI_LOCAL_CONTROL_TENANT_ID="${SUMI_LOCAL_CONTROL_TENANT_ID:-${SUMI_AUTH_TENANT_ID:-sumi-dev}}"
-export SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION:-0}"
-export SUMI_RPC_NONCE="${SUMI_RPC_NONCE:-$(random_token)}"
-# The API's local-control fixture and the runtime identity must agree on the
-# boot nonce, so derive both from the same value.
-export SUMI_LOCAL_CONTROL_GENERATION="${SUMI_LOCAL_CONTROL_GENERATION:-$SUMI_RPC_GENERATION}"
-export SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE="${SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE:-$SUMI_RPC_NONCE}"
-export SUMI_RPC_NONCE="$SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"
-export SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID:-$(random_token)}"
-export SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID:-$(random_token)}"
 export SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION="${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}"
 
 # An explicit Firebase web configuration is forwarded as a complete set from
@@ -387,10 +417,12 @@ fi
 
 case "${ACTION}" in
   up)
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" up "${COMPOSE_ARGUMENTS[@]}"
+    configure_local_apparmor_fallback
+    ensure_control_plane_network
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" up "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
     if [[ "${FIREBASE_MODE}" == "real" ]]; then
       # Unlike durable database/runtime state, the staged ADC must not survive
       # an ordinary stack shutdown. Ignore only the already-absent case.
@@ -402,6 +434,6 @@ case "${ACTION}" in
     ;;
   config)
     ((${#COMPOSE_ARGUMENTS[@]} == 0)) || fail "config accepts no additional Compose arguments"
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" config --quiet
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" config --quiet
     ;;
 esac

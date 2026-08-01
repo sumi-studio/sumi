@@ -44,6 +44,7 @@ func NewProductionMux(
 	mux.Handle("POST /direct-chat/commands", ingress)
 
 	browser := NewBrowserServer(sv, runtime, runtime)
+	browser.commandIngress = ingress
 	browser.AllowedOrigins = browserOrigins
 	browser.Authorizer = authorizer
 	mux.Handle("GET /direct-chat/ws", browser)

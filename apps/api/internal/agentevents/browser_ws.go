@@ -41,12 +41,23 @@ type BrowserServer struct {
 	AuthorizationPollInterval time.Duration
 	MaxReadLimit              int64
 
-	upgrader      websocket.Upgrader
-	connectionsMu sync.Mutex
-	connections   map[*websocket.Conn]browserConnection
-	accepted      uint64
-	closing       bool
-	beforeWrite   func()
+	upgrader       websocket.Upgrader
+	connectionsMu  sync.Mutex
+	connections    map[*websocket.Conn]browserConnection
+	accepted       uint64
+	closing        bool
+	beforeWrite    func()
+	commandIngress *UserCommandIngress
+}
+
+// SetSpawner installs one lazy-runtime controller for both direct-chat
+// transports. HTTP command admission waits for the newly spawned runtime's
+// authenticated Ready publication before allocating a durable sequence.
+func (s *BrowserServer) SetSpawner(spawner DirectChatSpawner) {
+	s.Spawner = spawner
+	if s.commandIngress != nil {
+		s.commandIngress.Spawner = spawner
+	}
 }
 
 type browserConnection struct {

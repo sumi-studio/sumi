@@ -18,6 +18,7 @@ test("Compose pulls published Sumi images from GHCR", async () => {
     local,
     realFirebase,
     agent,
+    agentPrepare,
     firebase,
     composeLauncher,
     supervisor,
@@ -26,13 +27,14 @@ test("Compose pulls published Sumi images from GHCR", async () => {
     source("deploy/local/compose.dev.yaml"),
     source("deploy/local/compose.real-firebase.yaml"),
     source("deploy/agent/compose.yaml"),
+    source("deploy/agent/compose.prepare.yaml"),
     source("deploy/firebase/compose.yaml"),
     source("scripts/dev/compose-stack"),
     source("deploy/agent/supervisor"),
     source("scripts/dev/firebase-auth-emulator-check"),
   ]);
 
-  for (const compose of [local, realFirebase, agent, firebase]) {
+  for (const compose of [local, realFirebase, agent, agentPrepare, firebase]) {
     assert.doesNotMatch(compose, /^\s+build:/m);
     const ghcrImages =
       compose.match(/^\s+image: ghcr\.io\/sumi-studio\//gm) ?? [];
@@ -42,7 +44,10 @@ test("Compose pulls published Sumi images from GHCR", async () => {
   }
 
   assert.match(local, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
-  assert.match(local, /sumi-agent:\$\{SUMI_AGENT_IMAGE_TAG:-latest\}/);
+  assert.match(
+    local,
+    /sumi-provisioner:\$\{SUMI_PROVISIONER_IMAGE_TAG:-latest\}/,
+  );
   assert.match(local, /sumi-web:\$\{SUMI_WEB_IMAGE_TAG:-latest\}/);
   assert.match(local, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
   assert.match(realFirebase, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
