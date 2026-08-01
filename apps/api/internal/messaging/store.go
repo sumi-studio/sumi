@@ -469,32 +469,39 @@ func (s *Store) shareActiveWorkspace(ctx context.Context, a, b ParticipantRef) (
 
 // activeMembers lists a place's active members with 戸籍 display names.
 func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]MemberProfile, error) {
-	var (
-		rows pgx.Rows
-		err  error
-	)
 	if place.Kind == PlaceChannel {
-		rows, err = q.Query(ctx,
-			`SELECT wm.member_kind, wm.member_id, wm.role,
-			        COALESCE(h.display_name, a.display_name, '') AS display_name
-			 FROM workspace_members wm
-			 LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
-			 LEFT JOIN agents a ON wm.member_kind = 'personality_agent' AND a.personality_agent_id = wm.member_id
-			 WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
-			 ORDER BY wm.workspace_member_id`, place.WorkspaceID)
-	} else {
-		rows, err = q.Query(ctx,
-			`SELECT pm.member_kind, pm.member_id, '' AS role,
-			        COALESCE(h.display_name, a.display_name, '') AS display_name
-			 FROM place_members pm
-			 LEFT JOIN humans h ON pm.member_kind = 'human' AND h.human_id = pm.member_id
-			 LEFT JOIN agents a ON pm.member_kind = 'personality_agent' AND a.personality_agent_id = pm.member_id
-			 WHERE pm.place_id = $1 AND pm.left_at IS NULL
-			 ORDER BY pm.place_member_id`, place.PlaceID)
+		return s.workspaceMemberProfiles(ctx, q, place.WorkspaceID)
 	}
+	rows, err := q.Query(ctx,
+		`SELECT pm.member_kind, pm.member_id, '' AS role,
+		        COALESCE(h.display_name, a.display_name, '') AS display_name
+		 FROM place_members pm
+		 LEFT JOIN humans h ON pm.member_kind = 'human' AND h.human_id = pm.member_id
+		 LEFT JOIN agents a ON pm.member_kind = 'personality_agent' AND a.personality_agent_id = pm.member_id
+		 WHERE pm.place_id = $1 AND pm.left_at IS NULL
+		 ORDER BY pm.place_member_id`, place.PlaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query active members: %w", err)
 	}
+	return scanMemberProfiles(rows)
+}
+
+func (s *Store) workspaceMemberProfiles(ctx context.Context, q querier, workspaceID string) ([]MemberProfile, error) {
+	rows, err := q.Query(ctx,
+		`SELECT wm.member_kind, wm.member_id, wm.role,
+		        COALESCE(h.display_name, a.display_name, '') AS display_name
+		 FROM workspace_members wm
+		 LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
+		 LEFT JOIN agents a ON wm.member_kind = 'personality_agent' AND a.personality_agent_id = wm.member_id
+		 WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
+		 ORDER BY wm.workspace_member_id`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("query workspace members: %w", err)
+	}
+	return scanMemberProfiles(rows)
+}
+
+func scanMemberProfiles(rows pgx.Rows) ([]MemberProfile, error) {
 	defer rows.Close()
 	var members []MemberProfile
 	for rows.Next() {
@@ -510,6 +517,55 @@ func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]Me
 		return nil, fmt.Errorf("iterate members: %w", err)
 	}
 	return members, nil
+}
+
+// WorkspacesFor lists the workspaces where the viewer is an active member.
+func (s *Store) WorkspacesFor(ctx context.Context, viewer ParticipantRef) ([]Workspace, error) {
+	if err := viewer.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT w.workspace_id, w.name
+		 FROM workspaces w
+		 JOIN workspace_members wm ON wm.workspace_id = w.workspace_id
+		 WHERE wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
+		 ORDER BY w.created_at, w.workspace_id`,
+		viewer.Kind, viewer.ID)
+	if err != nil {
+		return nil, fmt.Errorf("query workspaces: %w", err)
+	}
+	defer rows.Close()
+	var out []Workspace
+	for rows.Next() {
+		var w Workspace
+		if err := rows.Scan(&w.WorkspaceID, &w.Name); err != nil {
+			return nil, fmt.Errorf("scan workspace: %w", err)
+		}
+		out = append(out, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspaces: %w", err)
+	}
+	return out, nil
+}
+
+// WorkspaceMemberProfiles lists a workspace's active members for a viewer who
+// is one of them. Non-members are not told the workspace exists.
+func (s *Store) WorkspaceMemberProfiles(ctx context.Context, workspaceID string, viewer ParticipantRef) ([]MemberProfile, error) {
+	if err := viewer.Validate(); err != nil {
+		return nil, err
+	}
+	active, _, err := s.workspaceMembership(ctx, s.pool, workspaceID, viewer)
+	if err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			return nil, ErrWorkspaceNotFound
+		}
+		return nil, err
+	}
+	if !active {
+		return nil, ErrWorkspaceNotFound
+	}
+	return s.workspaceMemberProfiles(ctx, s.pool, workspaceID)
 }
 
 // dmPairKey builds the canonical sorted participant key for a dm pair, the

@@ -24,6 +24,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"golang.org/x/sys/unix"
 )
 
@@ -275,6 +276,20 @@ func newApplicationFromEnv() (*application, error) {
 	if authEnabled {
 		authServer.Connections = browser
 		authServer.RegisterRoutes(mux)
+	}
+	// The /messaging surface requires the control-plane database. Without a
+	// session verifier the routes stay mounted but fail closed (401), matching
+	// the direct-chat browser routes. sv is a concrete pointer, so guard the
+	// nil before it becomes a non-nil interface.
+	if database != nil {
+		var messagingSessions agentevents.UserSessionAuthorizer
+		if sv != nil {
+			messagingSessions = sv
+		}
+		messagingServer := messaging.NewServer(messaging.New(database.Pool), messagingSessions)
+		messagingServer.AllowedOrigins = browserOrigins
+		messagingServer.RegisterRoutes(mux)
+		log.Print("messaging routes ready")
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)
 	if err != nil {
