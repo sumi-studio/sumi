@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,7 +51,7 @@ test("real Firebase mode selects both Compose files without rendering credential
   }
 });
 
-test("emulator mode selects only the base Compose file", async () => {
+test("config remains quiet without a Docker credential file", async () => {
   const fixture = await createFixture(0o600);
   try {
     await runLauncher(fixture, "emulator");
@@ -61,6 +63,98 @@ test("emulator mode selects only the base Compose file", async () => {
       baseCompose,
       "config",
       "--quiet",
+    ]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("up validates and forwards a file-scoped Docker config", async () => {
+  const fixture = await createFixture(0o600);
+  try {
+    await runLauncher(fixture, "emulator", ["up", "runtime-provisioner"], {
+      SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+    });
+    assert.deepEqual(await dockerArguments(fixture), [
+      "compose",
+      "-p",
+      "sumi-dev",
+      "-f",
+      baseCompose,
+      "up",
+      "runtime-provisioner",
+    ]);
+    assert.equal(
+      (await readFile(fixture.dockerConfigEnvLog, "utf8")).trim(),
+      fixture.dockerConfigFile,
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("up rejects an unsafe Docker config file", async (t) => {
+  await t.test("world-readable", async () => {
+    const fixture = await createFixture(0o600);
+    try {
+      await chmod(fixture.dockerConfigFile, 0o644);
+      await assert.rejects(
+        runLauncher(fixture, "emulator", ["up"], {
+          SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+        }),
+        /mode 0400 or 0600/,
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("symlink", async () => {
+    const fixture = await createFixture(0o600);
+    try {
+      const linkedConfig = join(fixture.root, "linked-config.json");
+      await symlink(fixture.dockerConfigFile, linkedConfig);
+      await assert.rejects(
+        runLauncher(fixture, "emulator", ["up"], {
+          SUMI_DOCKER_CONFIG_FILE: linkedConfig,
+        }),
+        /regular non-symlink/,
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("hard link", async () => {
+    const fixture = await createFixture(0o600);
+    try {
+      await link(
+        fixture.dockerConfigFile,
+        join(fixture.root, "config-copy.json"),
+      );
+      await assert.rejects(
+        runLauncher(fixture, "emulator", ["up"], {
+          SUMI_DOCKER_CONFIG_FILE: fixture.dockerConfigFile,
+        }),
+        /with one link/,
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("down remains available without a Docker credential file", async () => {
+  const fixture = await createFixture(0o600);
+  try {
+    await runLauncher(fixture, "emulator", ["down"]);
+    assert.deepEqual(await dockerArguments(fixture), [
+      "compose",
+      "-p",
+      "sumi-dev",
+      "-f",
+      baseCompose,
+      "down",
     ]);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -188,12 +282,21 @@ async function createFixture(adcMode, { fakeDocker = true } = {}) {
   const envFile = join(root, "local.env");
   const runtimeEnvFile = join(root, "runtime.env");
   const adcFile = join(root, "adc.json");
+  const dockerConfigFile = join(root, "config.json");
   const dockerLog = join(root, "docker.args");
+  const dockerConfigEnvLog = join(root, "docker-config.env");
   await mkdir(bin);
   if (fakeDocker) {
     await writeExecutable(
       join(bin, "docker"),
-      `#!/bin/sh\nprintf '%s\\n' "$@" > "$SUMI_TEST_DOCKER_LOG"\n`,
+      `#!/bin/sh
+if [ "$1" = network ] && [ "$2" = inspect ]; then
+  printf '%s\\n' 'sumi-control-plane:bridge:true'
+  exit 0
+fi
+printf '%s\\n' "$@" > "$SUMI_TEST_DOCKER_LOG"
+printf '%s\\n' "$SUMI_DOCKER_CONFIG_FILE" > "$SUMI_TEST_DOCKER_CONFIG_ENV_LOG"
+`,
     );
   }
   await writeExecutable(
@@ -211,6 +314,8 @@ async function createFixture(adcMode, { fakeDocker = true } = {}) {
     { mode: adcMode },
   );
   await chmod(adcFile, adcMode);
+  await writeFile(dockerConfigFile, "{}\n", { mode: 0o600 });
+  await chmod(dockerConfigFile, 0o600);
   await writeFile(
     envFile,
     [
@@ -225,7 +330,16 @@ async function createFixture(adcMode, { fakeDocker = true } = {}) {
     ].join("\n"),
     { mode: 0o600 },
   );
-  return { root, bin, envFile, runtimeEnvFile, adcFile, dockerLog };
+  return {
+    root,
+    bin,
+    envFile,
+    runtimeEnvFile,
+    adcFile,
+    dockerConfigFile,
+    dockerLog,
+    dockerConfigEnvLog,
+  };
 }
 
 async function runLauncher(fixture, mode, action = ["config"], extraEnv = {}) {
@@ -237,6 +351,7 @@ async function runLauncher(fixture, mode, action = ["config"], extraEnv = {}) {
       SUMI_LOCAL_ENV_FILE: fixture.envFile,
       SUMI_LOCAL_RUNTIME_ENV_FILE: fixture.runtimeEnvFile,
       SUMI_TEST_DOCKER_LOG: fixture.dockerLog,
+      SUMI_TEST_DOCKER_CONFIG_ENV_LOG: fixture.dockerConfigEnvLog,
       FIREBASE_AUTH_EMULATOR_HOST: "must-be-cleared",
       VITE_FIREBASE_AUTH_EMULATOR_URL: "must-be-cleared",
       ...extraEnv,

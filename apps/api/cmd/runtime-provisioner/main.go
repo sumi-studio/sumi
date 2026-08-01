@@ -91,7 +91,7 @@ func run() error {
 }
 
 func hostEnvironment() []string {
-	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG"}
+	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_AGENT_IMAGE_TAG", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG"}
 	environment := make([]string, 0, len(names))
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {

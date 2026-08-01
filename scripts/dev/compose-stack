@@ -159,6 +159,24 @@ validate_real_firebase() {
   export SUMI_FIREBASE_ADC_FILE="${adc_file}"
 }
 
+validate_docker_config_file() {
+  require_value SUMI_DOCKER_CONFIG_FILE
+  local docker_config_file owner mode links
+  [[ ! -L "${SUMI_DOCKER_CONFIG_FILE}" ]] ||
+    fail "SUMI_DOCKER_CONFIG_FILE must be a readable regular non-symlink"
+  docker_config_file="$(realpath -e -- "${SUMI_DOCKER_CONFIG_FILE}")" ||
+    fail "cannot resolve SUMI_DOCKER_CONFIG_FILE"
+  [[ "${docker_config_file}" == "${SUMI_DOCKER_CONFIG_FILE}" ]] ||
+    fail "SUMI_DOCKER_CONFIG_FILE must be an absolute canonical path"
+  [[ -f "${docker_config_file}" && -r "${docker_config_file}" ]] ||
+    fail "SUMI_DOCKER_CONFIG_FILE must be a readable regular non-symlink"
+  IFS=: read -r owner mode links <<< "$(stat -Lc '%u:%a:%h' -- "${docker_config_file}")" ||
+    fail "cannot inspect SUMI_DOCKER_CONFIG_FILE"
+  [[ "${owner}" == "$(id -u)" && "${mode}" =~ ^[46]00$ && "${links}" == "1" ]] ||
+    fail "SUMI_DOCKER_CONFIG_FILE must be owned by the current user, mode 0400 or 0600, with one link"
+  export SUMI_DOCKER_CONFIG_FILE="${docker_config_file}"
+}
+
 load_env_file() {
   local file="$1"
   if [[ -f "${file}" ]]; then
@@ -265,6 +283,11 @@ Firebase Auth defaults to the integrated emulator. --firebase real selects the
 real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
 non-root API container. config validates quietly and never renders secrets.
 
+`up` requires SUMI_DOCKER_CONFIG_FILE: an absolute canonical path to the
+current user's 0400/0600 Docker config.json. It is mounted read-only only into
+the runtime provisioner so lazily provisioned private GHCR agent images can be
+pulled. `config` and `down` do not require the credential file.
+
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
 Set SUMI_LOCAL_COMPOSE_PROJECT to target an explicitly named local stack and
 SUMI_LOCAL_COMPOSE_OVERRIDE_FILE to add one exact Compose override file.
@@ -320,6 +343,15 @@ fi
 # runtime secrets live in a separate ignored 0600 file so durable state remains
 # decryptable and verifiable after a Compose restart.
 load_env_file "${ENV_FILE}"
+# Docker image pulls for lazy runtime provisioning happen inside the privileged
+# provisioner container. A file-scoped read-only mount is the only credential
+# handoff; never mount the host's Docker configuration directory. Config and
+# teardown still work after the credential has been rotated or removed.
+if [[ "${ACTION}" == "up" ]]; then
+  validate_docker_config_file
+else
+  export SUMI_DOCKER_CONFIG_FILE=/dev/null
+fi
 ensure_runtime_env_file
 lock_runtime_env_file
 load_env_file "${RUNTIME_ENV_FILE}"
