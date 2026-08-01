@@ -12,8 +12,8 @@
     "build": "turbo run build",
     "lint": "biome check . && turbo run lint",
     "check-types": "turbo run check-types",
-    "test": "node --test scripts/dev/real-stack-static.test.mjs && turbo run test",
-    "test:operability": "node --test scripts/dev/real-stack-static.test.mjs",
+    "test": "pnpm run test:operability && turbo run test",
+    "test:operability": "node --test scripts/dev/real-stack-static.test.mjs scripts/dev/compose-stack.test.mjs",
     "format": "biome format --write ."
   },
   "devDependencies": {
