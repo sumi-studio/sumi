@@ -287,6 +287,13 @@ agentにとってより適した方法があるときだけそちらで代替す
    quiet hours、retry、dedupeは所有しない。HumanのWeb Pushとagentのattention
    triggerは同じintentから分かれる別adapter。
 
+   *未確定（ADR 0011 Open questions）*: この記述と ADR 0011 §9「通知設定の保管と
+   評価は shared messaging service 側」は、quiet hours の保持者について割れて
+   いる。messaging backend / notification service / Employerの資源gate /
+   agent-private attention の四境界を一つに確定するまで、どちらも正本としない。
+   確定していないのは**保持場所**だけで、**所有者が本人であること**（ADR 0011
+   §8・§9）は割れていない。
+
 ### 契約修正（v0.1 — 本ドラフトと apps/web/src/messaging/model.ts へ反映済み）
 
 - `ParticipantRef.kind`: `"agent"` → `"personality_agent"`（worker/subagent/appとの混同防止）

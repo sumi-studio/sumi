@@ -75,7 +75,7 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
     launcher,
     /SUMI_AUTH_PERSONALITY_AGENT_ID must equal SUMI_PERSONALITY_AGENT_ID/,
   );
-  assert.match(launcher, /SUMI_BROWSER_SESSION_AUDIENCE=sumi:web:direct-chat/);
+  assert.match(launcher, /SUMI_BROWSER_SESSION_AUDIENCE=sumi:web/);
   assert.match(launcher, /SUMI_BROWSER_WS_ALLOWED_ORIGINS=\$\{WEB_ORIGIN\}/);
   assert.match(launcher, /SUMI_AUTH_ALLOW_INSECURE_COOKIES=true/);
   assert.match(launcher, /"SUMI_PUBLIC_LISTEN=\$\{SUMI_PUBLIC_LISTEN\}"/);

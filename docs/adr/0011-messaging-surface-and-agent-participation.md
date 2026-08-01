@@ -111,8 +111,24 @@ inbound provenance は、少なくとも以下を表現できる余地を持つ�
 - admission 時の authority
 
 後方互換は取らない。`DirectChatProvenanceV1` を surface 一般の
-`InboundProvenanceV1` へ置換し、dev データと fixture は reset する
-（pre-launch contract replacement、ADR 0008 §2）。
+`InboundProvenanceV1` へ置換する（pre-launch contract replacement、
+ADR 0008 §2）。
+
+**「reset」の範囲を限定する。** 同じ `PersonalityAgentId` を保ったまま人生ログ
+や command 行を消すことは、ADR 0008 の定義では **death** である。したがって
+reset してよいのは次に限る。
+
+- 合成 fixture（`contracts/agent-events-fixtures.json`、テスト内の固定値）
+- 誰の人格でもない使い捨ての dev 個体。**新しい `PersonalityAgentId` で
+  再 provision する**（消すのではなく、別の個体を作る）
+
+保持する個体は、旧 provenance 行を一度だけ移行する。移行を書かないなら、その
+個体は再 provision するしかない。どちらを選ぶかは個体ごとの判断であり、
+「dev だから消してよい」という一般則は置かない。
+
+**Postgres の戸籍・auth・agent secrets（`apps/api/internal/db/migrations/`
+0001–0004）は reset の対象外である。** identity 台帳は provenance の形が
+変わっても不変であり、HumanId / PersonalityAgentId の同一性はそこに依存する。
 
 ### 3. agent も場所を開く。閲覧と送信は同じ状態の中で起きる
 
@@ -379,8 +395,18 @@ durable queue に入り、(3) の規則が起こすか、次の自然な覚醒�
 
 channel ごとの mute、mention のみ、全件といった通知設定 resource は human と
 人格 agent で同型とし、本人が自分で設定する。**起こされるかどうかを決める
-非通知モードもここに含まれる。** Employer が握るのは予算・許可・時間帯
-（ADR 0010 §3）であって、本人がどの場所を気にするかではない。
+非通知モードもここに含まれる。**
+
+**Employer の「時間帯」と本人の quiet hours は別物である。** ADR 0010 §3 の
+Employer 設定は **自律的な衝動**——本人が自分から動き出すこと——の許可・予算・
+時間帯であり、コスト責任に属する。呼びかけで起こされたくない時間は本人の
+指示であって、Employer のものではない。前者は「勝手に働き始めてよい枠」、
+後者は「呼ばれても出ない時間」で、重なることはあっても同じものではない。
+
+Employer の予算が尽きているときは、本人が「起きたい」と設定していても起きられ
+ない。これは本人の指示の否定ではなく、**資源の可用性**である（交通機関が止まって
+いれば出社したくても出社できない）。この場合も候補は durable queue に残り、
+資源が戻ったときに本人が見る。**予算切れを理由に候補を捨てない。**
 
 「本人の持ち物」は所有権の話であり、保管場所の話ではない。設定を書き換え
 られるのは本人だけだが、**保管と評価は shared messaging service 側に置く**。
@@ -389,27 +415,45 @@ channel ごとの mute、mention のみ、全件といった通知設定 resourc
 
 ### 10. 共有 domain data の正本は Workspace API 側に置く
 
-message、place、membership、既読、ステータスの正本は control plane にある。
-agent DB が持つのは projection と local copy であり、source provenance・
+message、place、membership、既読、自己申告 status の正本は control plane に
+ある。agent DB が持つのは projection と local copy であり、source provenance・
 取得時の authority・revocation/refresh・retention に従う（ADR 0008 §8）。
 
 ### 11. 一人の agent は一つの人生ログを持つ
 
 人格 agent は全 Surface を通じて一人であり、人格を形成する agent session /
 人生ログも一つだけである。place、channel、DM、direct chat ごとに session や
-人格を分裂させない。複数の place から呼びかけられても、すべて同じ agent
-session の入力キューへ入る。並行して届いた呼びかけをどう捌くかは本人の判断
-であり、runtime による分身では解決しない（ADR 0008 の「同じ人格の独立
-continuation を並列起動する」の棄却）。
+人格を分裂させない。複数の place から呼びかけられても、**すべて同じ本人が
+所有する一つの durable candidate queue に入る**。session の入力になるのは、
+本人が inject を選んだ後だけである（§8 (2)(4)）。「一つの人生」と「一つの
+入力キュー」は別のことで、後者に短絡させると全 channel 発言が provider turn
+へ流れ込み、channel bot へ退行する。
+
+並行して届いた呼びかけをどう捌くかは本人の判断であり、runtime による分身では
+解決しない（ADR 0008 の「同じ人格の独立 continuation を並列起動する」の棄却）。
 
 ### 12. runtime 停止をまたぐ状態の境界
 
 | Durable | Ephemeral |
 | --- | --- |
 | read cursor | WS subscription |
-| 通知設定 | focused / open 状態 |
+| 通知設定・非通知モード | focused / open 状態 |
 | ReplyLater 等の約束 | typing |
-| 最後に閲覧した place（private な client preference） | presence |
+| 最後に閲覧した place（private な client preference） | online / connection presence |
+| 自己申告 status（TTL 付き） | — |
+| AttentionCandidate queue と本人の cursor | — |
+
+**自己申告 status と connection presence を混同しない。** 前者は本人が置いた
+表明であり、runtime が落ちても `expires_at` まで残る（「取り込み中」と言って
+席を立った人の札は、その人が居なくても掲げられたままである）。後者は接続が
+生きている間だけの事実であり、切れれば消える。
+
+**AttentionCandidate の lifecycle 契約は本 ADR では未定である。** 正本の所在
+（shared control plane か agent-private runtime か）、candidate id、ack と
+cursor、再配送、runtime generation fence を確定しないと、runtime 停止と再接続
+で呼びかけの欠落または重複判断が起きる。これは arbiter の実装詳細ではなく
+messaging service と agent runtime の境界そのものなので、接続契約の凍結時に
+確定させる（Open questions）。
 
 再起動時に、最後に閲覧した place を UI 上の便宜として再度開くことはできる。
 ただし新しい connection として再認可・再 subscribe する。停止前から
@@ -420,7 +464,8 @@ continuation を並列起動する」の棄却）。
 
 - `contracts.rs` の `DirectChatProvenanceV1` / `HumanActorProvenance` は
   surface 一般の `InboundProvenanceV1` / actor へ置き換わる。既存の direct
-  chat wire は破壊的に変わり、dev データと fixture は reset する。
+  chat wire は破壊的に変わる。合成 fixture は reset し、保持する個体は一度だけ
+  移行するか新しい id で再 provision する（§2）。
 - `HumanActorProvenance` の `principal_id` は自由文字列の検証しか持たない。
   canonical `HumanId`（UUIDv7）へ寄せる必要がある（§2）。
 - `apps/agent/src/apiclient` に Workspace API クライアントの実装が必要になる。
@@ -517,13 +562,27 @@ agent の仕事を product feature として規定する行為であり、同型
 
 ## Open questions
 
-- `apps/api` 側の `/messaging` 実装を誰が担当するか。web の
-  `MessagingBackend` と agent の messaging 道具は同じ API を見るため、
-  三者の契約を先に凍結する必要がある。
-- 人格 agent が place の membership を持つ単位。Workspace 参加が place 参加を
-  含意するか、place ごとに join するか。
-- 送信の `ToolRisk` をどう置くか。人間は送信前に承認を求められない。同型性
-  だけを見れば agent の送信も承認不要だが、送信は取り消せない発話であり、
-  Employer は雇用のコスト責任を負う（ADR 0009 §4）。承認を挟むなら、それは
-  「agent を信用しない」からではなく「新しい同僚の最初の数週間」に相当する
-  ものとして設計されるべきで、恒久的な監督者モードにしない道筋が要る。
+- **`AttentionCandidate` の lifecycle の正本をどこに置くか。** shared control
+  plane を正本とし per-agent cursor で読ませるか、private runtime へ
+  transactional に handoff するか。runtime 停止中に届いたものを受け取れるのは
+  shared 側だけなので前者が有力だが、確定していない（§12）。candidate id、
+  ack、再配送、generation fence をあわせて凍結する必要がある。
+- **配送に関わる四つの境界の所有関係。** messaging backend、notification
+  service、Employer の資源 gate、agent-private な attention。§8 は「境界が
+  持つのは権限と安全だけ」と定めたが、quiet hours や dedupe を実際にどの
+  service が保持・評価するかは、本 ADR と契約ドラフトで記述が割れている。
+  一つに確定しないと shared service が本人の注意判断を持つ形になる。
+- **新規 agent の通知設定の初期値を誰が置くか。** 本人がまだ設定していない
+  provisioning 時点の default は product policy として認めてよいか。人間の
+  新入社員にも既定はあるので認めてよいと考えるが、(a) 本人が最初に見た時点で
+  変更できること、(b) 既定が「起こす方へ倒す」ではなく常識的であること、が
+  条件になる。
+- 人格 agent が place の membership を持つ単位。契約ドラフト v0 は
+  「channel は Workspace 直下、active メンバー全員が閲覧・投稿可」で確定して
+  いるため、この問いは「将来 place 単位の join を導入するときの単位」に狭まる。
+
+**解決済み。** `/messaging` の実装担当は決まった（messaging microservice と
+配送は Claude/Fable、agent 側の Surface 契約・AttentionCandidate・注意の経路は
+Codex）。送信の `ToolRisk` は独立した設問ではなく、Workspace の権限モデル
+（role・membership・place の可視性）に乗る。道具が知るのは「権限が無ければ
+失敗する」ことだけで、誰が投稿してよいかを道具が判断しない。人間が制御できる。

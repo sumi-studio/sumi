@@ -18,7 +18,10 @@ import (
 )
 
 const (
-	defaultBrowserAudience         = "sumi:web:direct-chat"
+	// Surface-neutral: one browser session serves every app surface. The
+	// previous "sumi:web:direct-chat" audience is not accepted; the claim key
+	// rename (user_id → human_id) and this cutover are one break, not two.
+	defaultBrowserAudience         = "sumi:web"
 	maxBrowserSessionTTL           = time.Hour
 	maxRevokedSessions             = 4096
 	browserSessionIDBytes          = 32
