@@ -28,6 +28,7 @@ use crate::{
         InjectedRunDriver, RunWorker, SequentialRunWorker, Session, SessionResult,
         SessionStartAuthority,
     },
+    apiclient::messaging::MessagingApi,
     approval::{
         ApprovalBroker, Policy, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
         TrustedEnvironment,
@@ -54,13 +55,16 @@ use crate::{
         Redactor, Store,
     },
     tools::{
-        WorkspacePaths,
-        executor::{ExecutorClient, remote_executor_registry},
+        Tool, WorkspacePaths,
+        executor::{ExecutorClient, remote_executor_registry_with_tools},
+        messaging::MessagingTool,
     },
 };
 
 #[cfg(test)]
 use crate::gateway::local_runtime::LocalPublicationError;
+#[cfg(test)]
+use crate::tools::executor::remote_executor_registry;
 
 struct BootstrapContext {
     authority: RuntimeEpochAuthority,
@@ -929,6 +933,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         }
     }
     .context("construct local-control HTTP client")?;
+    let messaging_api: Arc<dyn MessagingApi> = Arc::new(control_client.clone());
     let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> =
         Arc::new(control_client);
     let publisher = LocalRuntimePublisher::new(context.authority.clone(), control.clone());
@@ -937,12 +942,13 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         .await
         .context("publish startup NotReady")?;
 
-    run_after_not_ready(&context, control, &publisher).await
+    run_after_not_ready(&context, control, messaging_api, &publisher).await
 }
 
 async fn run_after_not_ready(
     context: &BootstrapContext,
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
+    messaging_api: Arc<dyn MessagingApi>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
     // Own and poll the process signal before any Session construction,
@@ -1015,8 +1021,12 @@ async fn run_after_not_ready(
             ExecutorHealthPolicy::PRODUCTION,
         )
         .await?;
-        let registry = remote_executor_registry(executor_client.clone())
-            .context("build exact remote executor registry")?;
+        let messaging_tool: Arc<dyn Tool> = Arc::new(MessagingTool::new(messaging_api));
+        let registry = remote_executor_registry_with_tools(
+            executor_client.clone(),
+            std::iter::once(messaging_tool),
+        )
+        .context("build exact remote executor and messaging registry")?;
         let prompt = PromptContext {
             system_prompt: config.system_prompt.clone(),
             memory_blocks: Vec::new(),

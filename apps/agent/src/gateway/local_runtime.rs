@@ -35,6 +35,10 @@ use super::supervisor::seams::T17HydrationLatch;
 use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
+use crate::apiclient::messaging::{
+    MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
+    WriteMessagingMessageRequest,
+};
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 use crate::store::HydrationReceiptIdentity;
@@ -450,6 +454,35 @@ impl LocalControlPlane for LocalControlHttpClient {
         )
         .map_err(LocalPublicationError::terminal)?;
         self.post_runtime_state(&publication).await
+    }
+}
+
+#[async_trait]
+impl MessagingApi for LocalControlHttpClient {
+    async fn overview(&self) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:overview",
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    async fn open(&self, request: OpenMessagingPlaceRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:open", &request)
+            .await
+    }
+
+    async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:write", &request)
+            .await
+    }
+
+    async fn read_through(
+        &self,
+        request: ReadMessagingThroughRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:read-through", &request)
+            .await
     }
 }
 

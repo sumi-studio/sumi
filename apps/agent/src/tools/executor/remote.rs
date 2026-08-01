@@ -57,6 +57,15 @@ impl ExecutorInvoker for ExecutorClient {
 /// supervisor-issued client. The critical Unix endpoint exposes only bounded,
 /// workspace-confined read and discovery operations.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
+    remote_executor_registry_with_tools(client, std::iter::empty())
+}
+
+/// Compose the generation-bound executor tools with control-plane-backed
+/// domain tools owned by the same PersonalityAgent runtime.
+pub(crate) fn remote_executor_registry_with_tools(
+    client: Arc<ExecutorClient>,
+    extra_tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+) -> Result<ToolRegistry, ToolError> {
     let identity = client.identity().clone();
     let mut builder = ToolRegistryBuilder::default();
     for kind in [
@@ -69,6 +78,9 @@ pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegis
             kind,
             client: client.clone(),
         }))?;
+    }
+    for tool in extra_tools {
+        builder.register(tool)?;
     }
     Ok(builder.build_for_executor_identity(identity))
 }
