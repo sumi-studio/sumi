@@ -33,19 +33,15 @@ func (r *PostgresRepository) Create(ctx context.Context, ownerUserID string, inp
 			dueAt = input.Due.At
 		}
 	}
-	completedAt := any(nil)
-	if input.Status == StatusDone {
-		completedAt = input.Now
-	}
 	row := r.pool.QueryRow(ctx, `
 INSERT INTO todos (
   id, owner_user_id, title, description, status, priority,
-  due_kind, due_on, due_at, due_timezone, via_agent, completed_at,
-  created_at, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+  due_kind, due_on, due_at, due_timezone, via_agent, completed_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+  CASE WHEN $5 = 'done' THEN now() ELSE NULL END)
 RETURNING `+todoColumns,
 		input.ID, ownerUserID, input.Title, input.Description, input.Status, input.Priority,
-		dueKind, dueOn, dueAt, dueTimezone, input.ViaAgent, completedAt, input.Now)
+		dueKind, dueOn, dueAt, dueTimezone, input.ViaAgent)
 	return scanTodo(row)
 }
 

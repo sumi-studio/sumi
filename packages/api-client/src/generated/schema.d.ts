@@ -251,7 +251,7 @@ export interface components {
             total: number;
         };
         /** @enum {string} */
-        ErrorCode: "validation_failed" | "unauthenticated" | "todo_not_found" | "version_conflict" | "internal_error";
+        ErrorCode: "validation_failed" | "unauthenticated" | "csrf_failed" | "unsupported_media_type" | "todo_not_found" | "version_conflict" | "internal_error";
         ErrorResponse: {
             error: {
                 code: components["schemas"]["ErrorCode"];
@@ -838,12 +838,6 @@ export interface components {
     };
     parameters: {
         TodoID: string;
-        /**
-         * @description Informational marker set to true by the Sumi Todo tool client. It only
-         *     controls `via_agent` and never grants authority; ownership still comes
-         *     exclusively from the authenticated session.
-         */
-        ViaAgent: boolean;
         /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
         TodoCSRF: "1";
     };
@@ -1081,12 +1075,6 @@ export interface operations {
             header: {
                 /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
                 "X-Sumi-CSRF": components["parameters"]["TodoCSRF"];
-                /**
-                 * @description Informational marker set to true by the Sumi Todo tool client. It only
-                 *     controls `via_agent` and never grants authority; ownership still comes
-                 *     exclusively from the authenticated session.
-                 */
-                "X-Sumi-Via-Agent"?: components["parameters"]["ViaAgent"];
             };
             path?: never;
             cookie?: never;
@@ -1177,12 +1165,6 @@ export interface operations {
             header: {
                 /** @description Required on every Todo mutation to prevent cookie-based CSRF. */
                 "X-Sumi-CSRF": components["parameters"]["TodoCSRF"];
-                /**
-                 * @description Informational marker set to true by the Sumi Todo tool client. It only
-                 *     controls `via_agent` and never grants authority; ownership still comes
-                 *     exclusively from the authenticated session.
-                 */
-                "X-Sumi-Via-Agent"?: components["parameters"]["ViaAgent"];
             };
             path: {
                 id: components["parameters"]["TodoID"];

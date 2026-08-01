@@ -239,10 +239,21 @@ for (const { name, def, value } of counterexamples) {
   }
 }
 
+const declaredErrorCodes = new Set(openApi.components.schemas.ErrorCode.enum);
+for (const [name, response] of Object.entries(openApi.components.responses)) {
+  const code = response?.content?.["application/json"]?.example?.error?.code;
+  if (code && !declaredErrorCodes.has(code)) {
+    console.error(
+      `OpenAPI response ${name} uses undeclared ErrorCode '${code}'`,
+    );
+    failed = true;
+  }
+}
+
 if (failed) {
   process.exit(1);
 }
 
 console.log(
-  "All contract fixtures, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
+  "All contract fixtures, bounded-decimal cases, Todo error codes, and extra-property counterexamples passed schema validation.",
 );

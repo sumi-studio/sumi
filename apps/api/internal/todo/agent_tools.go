@@ -27,7 +27,7 @@ func AgentToolDefinitions() []AgentToolDefinition {
 		{Name: "update_todo", Description: "Update one Todo when its expected version still matches", Parameters: objectSchema([]string{"id", "expected_version", "patch"}, map[string]any{
 			"id":               map[string]any{"type": "string", "format": "uuid"},
 			"expected_version": map[string]any{"type": "integer", "minimum": 1},
-			"patch": objectSchema(nil, map[string]any{
+			"patch": objectSchemaWithMinimumProperties(1, map[string]any{
 				"title":       map[string]any{"type": "string", "minLength": 1, "maxLength": 200},
 				"description": map[string]any{"type": "string"},
 				"status":      map[string]any{"type": "string", "enum": []string{"open", "done"}},
@@ -46,6 +46,12 @@ func objectSchema(required []string, properties map[string]any) map[string]any {
 	if len(required) > 0 {
 		schema["required"] = required
 	}
+	return schema
+}
+
+func objectSchemaWithMinimumProperties(minimum int, properties map[string]any) map[string]any {
+	schema := objectSchema(nil, properties)
+	schema["minProperties"] = minimum
 	return schema
 }
 

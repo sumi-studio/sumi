@@ -191,7 +191,6 @@ paths:
         - sumiSession: []
       parameters:
         - $ref: "#/components/parameters/TodoCSRF"
-        - $ref: "#/components/parameters/ViaAgent"
       requestBody:
         required: true
         content:
@@ -304,7 +303,6 @@ paths:
         - sumiSession: []
       parameters:
         - $ref: "#/components/parameters/TodoCSRF"
-        - $ref: "#/components/parameters/ViaAgent"
       requestBody:
         required: true
         content:
@@ -383,17 +381,6 @@ components:
       schema:
         type: string
         format: uuid
-    ViaAgent:
-      name: X-Sumi-Via-Agent
-      in: header
-      required: false
-      description: |
-        Informational marker set to true by the Sumi Todo tool client. It only
-        controls `via_agent` and never grants authority; ownership still comes
-        exclusively from the authenticated session.
-      schema:
-        type: boolean
-        default: false
     TodoCSRF:
       name: X-Sumi-CSRF
       in: header
@@ -656,6 +643,8 @@ components:
       enum:
         - validation_failed
         - unauthenticated
+        - csrf_failed
+        - unsupported_media_type
         - todo_not_found
         - version_conflict
         - internal_error

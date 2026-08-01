@@ -11,8 +11,10 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -37,11 +39,19 @@ func NewHandler(service *Service, principals PrincipalVerifier) *Handler {
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/todos", h.create)
-	mux.HandleFunc("GET /v1/todos", h.list)
-	mux.HandleFunc("GET /v1/todos/{id}", h.get)
-	mux.HandleFunc("PATCH /v1/todos/{id}", h.update)
-	mux.HandleFunc("DELETE /v1/todos/{id}", h.delete)
+	mux.HandleFunc("POST /v1/todos", privateResponse(h.create))
+	mux.HandleFunc("GET /v1/todos", privateResponse(h.list))
+	mux.HandleFunc("GET /v1/todos/{id}", privateResponse(h.get))
+	mux.HandleFunc("PATCH /v1/todos/{id}", privateResponse(h.update))
+	mux.HandleFunc("DELETE /v1/todos/{id}", privateResponse(h.delete))
+}
+
+func privateResponse(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Add("Vary", "Cookie")
+		next(w, r)
+	}
 }
 
 func (h *Handler) principal(w http.ResponseWriter, r *http.Request) (Principal, bool) {
@@ -74,7 +84,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request createRequest
-	if err := readJSON(r, &request); err != nil {
+	if err := readJSON(r, &request, "due"); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
@@ -83,15 +93,10 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
-	viaAgent, err := requestViaAgent(r)
-	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
-		return
-	}
 	item, err := h.service.Create(r.Context(), principal.UserID, CreateInput{
 		Title: request.Title, Description: request.Description, Status: request.Status,
 		Priority: request.Priority, Due: due,
-	}, viaAgent)
+	}, false)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -168,7 +173,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request updateRequest
-	if err := readJSON(r, &request); err != nil {
+	if err := readJSON(r, &request, "due"); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
@@ -177,15 +182,10 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
 		return
 	}
-	viaAgent, err := requestViaAgent(r)
-	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "validation_failed", err.Error(), 0)
-		return
-	}
 	item, err := h.service.Update(r.Context(), principal.UserID, r.PathValue("id"), UpdateInput{
 		ExpectedVersion: request.ExpectedVersion, Title: request.Title, Description: request.Description,
 		Status: request.Status, Priority: request.Priority, DueSet: dueSet, Due: due,
-	}, viaAgent)
+	}, false)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -257,13 +257,19 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, err error) {
 	}
 }
 
-func readJSON(r *http.Request, target any) error {
+func readJSON(r *http.Request, target any, nullableFields ...string) error {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
 	if err != nil {
 		return fmt.Errorf("read JSON body: %w", err)
 	}
 	if len(raw) > maxRequestBodyBytes {
 		return fmt.Errorf("JSON body exceeds %d bytes", maxRequestBodyBytes)
+	}
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("JSON body must be valid UTF-8")
+	}
+	if err := rejectDuplicateJSONFields(raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -273,7 +279,103 @@ func readJSON(r *http.Request, target any) error {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("request body must contain one JSON object")
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	allowedFields := exactJSONFieldNames(target)
+	nullable := make(map[string]struct{}, len(nullableFields))
+	for _, field := range nullableFields {
+		nullable[field] = struct{}{}
+	}
+	for name, value := range fields {
+		if _, ok := allowedFields[name]; !ok {
+			return fmt.Errorf("unknown field %q", name)
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			if _, ok := nullable[name]; !ok {
+				return fmt.Errorf("%s must not be null", name)
+			}
+		}
+	}
 	return nil
+}
+
+func exactJSONFieldNames(target any) map[string]struct{} {
+	typeOfTarget := reflect.TypeOf(target)
+	for typeOfTarget.Kind() == reflect.Pointer {
+		typeOfTarget = typeOfTarget.Elem()
+	}
+	fields := make(map[string]struct{}, typeOfTarget.NumField())
+	for i := 0; i < typeOfTarget.NumField(); i++ {
+		field := typeOfTarget.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "" {
+			name = field.Name
+		}
+		if name != "-" {
+			fields[name] = struct{}{}
+		}
+	}
+	return fields
+}
+
+func rejectDuplicateJSONFields(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key must be a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate field %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected delimiter %q", delimiter)
+	}
 }
 
 func decodeDue(raw json.RawMessage) (*DueInput, bool, error) {
@@ -284,6 +386,9 @@ func decodeDue(raw json.RawMessage) (*DueInput, bool, error) {
 		return nil, true, nil
 	}
 	var due DueInput
+	if err := rejectUnknownJSONFields(raw, &due); err != nil {
+		return nil, true, &ValidationError{Message: "invalid due value"}
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&due); err != nil {
@@ -292,23 +397,26 @@ func decodeDue(raw json.RawMessage) (*DueInput, bool, error) {
 	return &due, true, nil
 }
 
+func rejectUnknownJSONFields(raw []byte, target any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	allowedFields := exactJSONFieldNames(target)
+	for name := range fields {
+		if _, ok := allowedFields[name]; !ok {
+			return fmt.Errorf("unknown field %q", name)
+		}
+	}
+	return nil
+}
+
 func parseIntQuery(r *http.Request, name string, defaultValue int) (int, error) {
 	raw := r.URL.Query().Get(name)
 	if raw == "" {
 		return defaultValue, nil
 	}
 	return strconv.Atoi(raw)
-}
-
-func requestViaAgent(r *http.Request) (bool, error) {
-	raw := r.Header.Get("X-Sumi-Via-Agent")
-	if raw == "" || raw == "false" {
-		return false, nil
-	}
-	if raw == "true" {
-		return true, nil
-	}
-	return false, &ValidationError{Message: "X-Sumi-Via-Agent must be true or false"}
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

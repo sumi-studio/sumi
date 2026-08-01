@@ -73,6 +73,7 @@ POST, PATCH, and DELETE also require `X-Sumi-CSRF: 1`; JSON mutations require
 The Go `AgentTools` adapter exposes `list_todos`, `get_todo`, `create_todo`,
 `update_todo`, and `propose_delete`. It deliberately provides no `delete_todo`; only
 the authenticated HTTP DELETE route can perform the physical deletion after UI
-confirmation. An HTTP tool client uses the same signed user session and sends
-`X-Sumi-Via-Agent: true` on POST/PATCH. This header is informational only and never
-changes ownership or authorization.
+confirmation. Human HTTP requests always record `via_agent=false`; callers cannot
+self-assert agent provenance. A future authenticated agent authority adapter will
+invoke the application service through `AgentTools`, which records agent writes
+without trusting a browser-supplied marker.

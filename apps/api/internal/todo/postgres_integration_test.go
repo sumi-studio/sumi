@@ -49,11 +49,16 @@ func TestPostgresTodoContract(t *testing.T) {
 	}
 
 	service := newTestService(t, NewPostgresRepository(pool))
+	futureAppNow := time.Now().UTC().Add(24 * time.Hour)
+	service.now = func() time.Time { return futureAppNow }
 	item, err := service.Create(ctx, ownerA, CreateInput{
 		Title: "postgres", Due: &DueInput{Kind: DueKindDatetime, At: "2026-08-01T15:00:00+09:00", Timezone: "Asia/Tokyo"},
 	}, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !item.CreatedAt.Equal(item.UpdatedAt) || !item.CreatedAt.Before(futureAppNow.Add(-time.Hour)) {
+		t.Fatalf("PostgreSQL timestamps followed the application clock: %+v", item)
 	}
 	if item.Due == nil || item.Due.At == nil || item.Due.At.Format(time.RFC3339) != "2026-08-01T15:00:00+09:00" {
 		t.Fatalf("datetime response lost its timezone offset: %+v", item.Due)

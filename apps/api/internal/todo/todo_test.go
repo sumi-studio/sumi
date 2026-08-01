@@ -261,6 +261,10 @@ func TestAgentToolsDoNotExposeDelete(t *testing.T) {
 	if len(definitions) != 5 || definitions[4].Name != "propose_delete" {
 		t.Fatalf("unexpected tool surface: %+v", definitions)
 	}
+	updatePatch := definitions[3].Parameters["properties"].(map[string]any)["patch"].(map[string]any)
+	if updatePatch["minProperties"] != 1 {
+		t.Fatalf("update_todo patch allows an empty mutation: %+v", updatePatch)
+	}
 }
 
 func TestTitleQueryEscapesLikeWildcards(t *testing.T) {
@@ -293,7 +297,7 @@ func TestAgentVersionConflictIsNotRetried(t *testing.T) {
 	}
 }
 
-func TestHTTPAgentMarkerSetsViaAgentWithoutChangingOwner(t *testing.T) {
+func TestHumanHTTPDoesNotTrustAgentMarker(t *testing.T) {
 	repository := newMemoryRepository()
 	service := newTestService(t, repository)
 	mux := http.NewServeMux()
@@ -311,8 +315,8 @@ func TestHTTPAgentMarkerSetsViaAgentWithoutChangingOwner(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &item); err != nil {
 		t.Fatal(err)
 	}
-	if !item.ViaAgent {
-		t.Fatal("agent HTTP marker did not set via_agent")
+	if item.ViaAgent {
+		t.Fatal("untrusted HTTP header set via_agent")
 	}
 	if _, ok := repository.items[ownerA][item.ID]; !ok {
 		t.Fatal("Todo was not scoped to the authenticated owner")
@@ -378,5 +382,60 @@ func TestTodoMutationRequiresJSONContentType(t *testing.T) {
 	mux.ServeHTTP(response, request)
 	if response.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("got status %d, want 415: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTodoJSONContractRejectsInvalidBodies(t *testing.T) {
+	service := newTestService(t, newMemoryRepository())
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
+	tests := []struct {
+		name string
+		path string
+		body []byte
+	}{
+		{name: "null description", path: "/v1/todos", body: []byte(`{"title":"x","description":null}`)},
+		{name: "null status", path: "/v1/todos", body: []byte(`{"title":"x","status":null}`)},
+		{name: "null priority", path: "/v1/todos", body: []byte(`{"title":"x","priority":null}`)},
+		{name: "null patch field", path: "/v1/todos/019c0000-0000-7000-8000-000000000010", body: []byte(`{"expected_version":1,"title":null,"priority":"high"}`)},
+		{name: "duplicate top-level field", path: "/v1/todos", body: []byte(`{"title":"first","title":"second"}`)},
+		{name: "case-variant field", path: "/v1/todos", body: []byte(`{"title":"first","Title":"second"}`)},
+		{name: "duplicate nested field", path: "/v1/todos", body: []byte(`{"title":"x","due":{"kind":"date","date":"2026-08-01","date":"2026-08-02"}}`)},
+		{name: "case-variant nested field", path: "/v1/todos", body: []byte(`{"title":"x","due":{"Kind":"date","Date":"2026-08-01"}}`)},
+		{name: "invalid UTF-8", path: "/v1/todos", body: []byte{'{', '"', 't', 'i', 't', 'l', 'e', '"', ':', '"', 0xff, '"', '}'}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			method := http.MethodPost
+			if strings.Contains(test.path, "/019c") {
+				method = http.MethodPatch
+			}
+			request := httptest.NewRequest(method, test.path, bytes.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set(todoCSRFHeaderName, todoCSRFHeaderValue)
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("got status %d, want 400: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestTodoResponsesAreNotCacheable(t *testing.T) {
+	service := newTestService(t, newMemoryRepository())
+	mux := http.NewServeMux()
+	NewHandler(service, fixedPrincipal{userID: ownerA}).Register(mux)
+	request := httptest.NewRequest(http.MethodGet, "/v1/todos", nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("got status %d: %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := response.Header().Get("Vary"); got != "Cookie" {
+		t.Fatalf("Vary = %q", got)
 	}
 }
