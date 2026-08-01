@@ -21,7 +21,7 @@ use super::{
     MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
     SensitiveCommandPayload,
 };
-use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{InboundProvenanceV1, PersonalityAgentId};
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
@@ -245,7 +245,7 @@ struct RawCommandIdentityEnvelope {
     seq: u64,
     command_id: CommandId,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: InboundProvenanceV1,
     #[serde(default)]
     command: CommandFieldPresence,
 }
@@ -343,6 +343,22 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
         .get("type")
         .and_then(serde_json::Value::as_str);
 
+    // messaging surface からの inbound は、届いたというだけで provider turn に
+    // なってはならない。interrupt / inject / defer / observe の判断は本人が持ち、
+    // その注意の経路はまだ存在しない（ADR 0011 §8）。経路ができるまでは、
+    // 黙って direct chat と同じ扱いにするのではなく fail-closed で拒否する。
+    if provenance_is_messaging(&raw.provenance) {
+        return Ok(InboundCommand::Invalid {
+            seq: raw.seq,
+            command_id: raw.command_id,
+            personality_agent_id: raw.personality_agent_id,
+            provenance: raw.provenance,
+            reason: CommandRejectReason::NotAllowed,
+            raw_command: RejectedCommandPayload::Present(sensitive_payload),
+            payload_digest: None,
+        });
+    }
+
     let reason = if command_type == Some("user_message")
         && command_value
             .get("attachments")
@@ -388,6 +404,11 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
             payload_digest: None,
         }),
     }
+}
+
+/// メッセージング Surface 由来かどうか。direct chat だけが今の受信口である。
+fn provenance_is_messaging(provenance: &InboundProvenanceV1) -> bool {
+    provenance.source().messaging().is_some()
 }
 
 fn parse_outer_identity(bytes: &[u8]) -> serde_json::Result<RawCommandIdentityEnvelope> {
@@ -1067,9 +1088,7 @@ mod tests {
     use crate::gateway::{
         AgentHello, Command, ConnectorError, DeliveryAuthorization, GatewayCredential,
     };
-    use crate::runtime::contracts::{
-        DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration,
-    };
+    use crate::runtime::contracts::{InboundProvenanceV1, PersonalityAgentId, ProcessGeneration};
 
     const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
 
@@ -1077,9 +1096,13 @@ mod tests {
         PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical UUIDv7")
     }
 
-    fn test_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
-            .expect("valid direct-chat provenance")
+    fn test_provenance() -> InboundProvenanceV1 {
+        InboundProvenanceV1::direct_chat(
+            "tenant-test",
+            test_personality_agent_id(),
+            crate::gateway::test_human_id(),
+        )
+        .expect("valid direct-chat provenance")
     }
 
     fn test_provenance_value() -> serde_json::Value {
@@ -1304,7 +1327,7 @@ mod tests {
 
         cases.push(
             format!(
-                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{{"version":1,"version":1,"tenant_id":"tenant-test","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","actor":{{"kind":"human","principal_id":"human-test"}},"source":{{"surface":"direct_chat"}}}},"command":{{"type":"abort"}}}}"#
+                r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{{"version":1,"version":1,"tenant_id":"tenant-test","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","actor":{{"kind":"human","human_id":"018f3f8d-7b2c-7a10-8f9e-00000000ab01"}},"source":{{"surface":"direct_chat"}},"authority":{{"basis":"employer","decision_id":null}}}},"command":{{"type":"abort"}}}}"#
             )
             .into_bytes(),
         );
@@ -1520,6 +1543,62 @@ mod tests {
                 "command: {command}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn messaging_surface_inbound_is_rejected_until_the_attention_path_exists() {
+        let provenance = crate::runtime::contracts::InboundProvenanceV1::messaging(
+            crate::runtime::contracts::MessagingProvenance {
+                tenant_id: "tenant-test".to_owned(),
+                personality_agent_id: test_personality_agent_id(),
+                actor: crate::runtime::contracts::ActorRef::Human {
+                    human_id: crate::gateway::test_human_id(),
+                },
+                workspace_id: None,
+                place: crate::runtime::contracts::PlaceRef::Channel {
+                    channel_id: crate::runtime::contracts::ProvenanceId::new("ch-general").unwrap(),
+                },
+                delivery: crate::runtime::contracts::DeliveryProvenance::new(
+                    crate::runtime::contracts::ProvenanceId::new("msg-1").unwrap(),
+                    crate::runtime::contracts::PlaceSeq::new(7).unwrap(),
+                    crate::runtime::contracts::TriggerReason::Mention,
+                    crate::runtime::contracts::Urgency::Urgent,
+                ),
+                authority: crate::runtime::contracts::AdmissionAuthority::new(
+                    crate::runtime::contracts::AuthorityBasis::PlaceMembership,
+                    None,
+                ),
+            },
+        )
+        .expect("valid messaging provenance");
+        let command =
+            r#"{"type":"user_message","text":"@secretary 見てもらえますか","attachments":[]}"#;
+        let bytes = format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{TEST_PERSONALITY_AGENT_ID}","provenance":{},"command":{command}}}"#,
+            serde_json::to_string(&provenance).expect("serialize messaging provenance")
+        )
+        .into_bytes();
+        let mut input = BufReader::new(bytes.as_slice());
+
+        // 届いたというだけで provider turn にはしない。注意の判断は本人が持ち、
+        // その経路がまだ無いので fail-closed で拒否する（ADR 0011 §8）。
+        assert_eq!(
+            read_test_command(&mut input)
+                .await
+                .expect("messaging inbound keeps its outer identity"),
+            InboundCommand::Invalid {
+                seq: 1,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
+                    .expect("canonical test UUID"),
+                personality_agent_id: test_personality_agent_id(),
+                provenance,
+                reason: CommandRejectReason::NotAllowed,
+                raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                    command.as_bytes().to_vec(),
+                )),
+                payload_digest: None,
+            }
+        );
     }
 
     #[tokio::test]

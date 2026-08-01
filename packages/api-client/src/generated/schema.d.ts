@@ -116,25 +116,20 @@ export interface components {
              */
             command_id: string;
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            provenance: components["schemas"]["DirectChatProvenanceV1"];
+            provenance: components["schemas"]["InboundProvenanceV1"];
             command: components["schemas"]["Command"];
         };
         /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
         PersonalityAgentId: string;
-        DirectChatProvenanceV1: {
+        InboundProvenanceV1: {
             /** @constant */
             version: 1;
             tenant_id: components["schemas"]["TenantId"];
+            /** @description 受け手。この private store の持ち主である人格 agent。 */
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            actor: {
-                /** @constant */
-                kind: "human";
-                principal_id: components["schemas"]["PrincipalId"];
-            };
-            source: {
-                /** @constant */
-                surface: "direct_chat";
-            };
+            actor: components["schemas"]["ActorRef"];
+            source: components["schemas"]["InboundSource"];
+            authority: components["schemas"]["AdmissionAuthority"];
         };
         AgentHello: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
@@ -616,8 +611,74 @@ export interface components {
         };
         /** @description opaque ASCII tenant identity */
         TenantId: string;
-        /** @description opaque ASCII principal identity */
-        PrincipalId: string;
+        /**
+         * @description exact lower-case hyphenated UUIDv7 human identity (ADR 0009 §1). Firebase
+         *     principals are credentials, not identity, and never appear here.
+         */
+        HumanId: string;
+        /** @description 発話者。human と人格 agent を同型に扱う (ADR 0011 §2)。宛先ではない。 */
+        ActorRef: {
+            /** @constant */
+            kind: "human";
+            human_id: components["schemas"]["HumanId"];
+        } | {
+            /** @constant */
+            kind: "personality_agent";
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+        };
+        /** @description opaque ASCII identity carried by provenance (place, message, correlation) */
+        ProvenanceId: string;
+        NullableProvenanceId: components["schemas"]["ProvenanceId"] | null;
+        /** @description メッセージングの場所 (ADR 0011 §1) */
+        PlaceRef: {
+            /** @constant */
+            kind: "channel";
+            channel_id: components["schemas"]["ProvenanceId"];
+        } | {
+            /** @constant */
+            kind: "dm";
+            dm_id: components["schemas"]["ProvenanceId"];
+        } | {
+            /** @constant */
+            kind: "group_dm";
+            dm_id: components["schemas"]["ProvenanceId"];
+        };
+        /** @description 配送された一件のメッセージについての admission 時点の事実 */
+        DeliveryProvenance: {
+            message_id: components["schemas"]["ProvenanceId"];
+            seq: components["schemas"]["JsonSafeInteger"];
+            /** @description admission が解決した宛先。alias を place 全体へ展開した結果は載せない。 */
+            addressees: components["schemas"]["ActorRef"][];
+            /** @enum {string} */
+            trigger_reason: "mention" | "direct_message" | "place_activity";
+            /** @enum {string} */
+            urgency: "urgent" | "normal" | "fyi";
+            correlation_id: components["schemas"]["NullableProvenanceId"];
+            causation_id: components["schemas"]["NullableProvenanceId"];
+        };
+        /**
+         * @description この inbound が届いた Surface (ADR 0011 §1)。messaging は必ず place と配送
+         *     された一件のメッセージを伴い、direct chat はどちらも持たない。
+         */
+        InboundSource: {
+            /** @constant */
+            surface: "direct_chat";
+        } | {
+            /** @constant */
+            surface: "messaging";
+            workspace_id: components["schemas"]["NullableProvenanceId"];
+            place: components["schemas"]["PlaceRef"];
+            delivery: components["schemas"]["DeliveryProvenance"];
+        };
+        /**
+         * @description admission 時にこの配送を許可した根拠 (ADR 0011 §8)。配送の可否は決定論的
+         *     境界が判断し、agent 側は再判定しない。
+         */
+        AdmissionAuthority: {
+            /** @enum {string} */
+            basis: "employer" | "place_membership" | "connection";
+            decision_id: components["schemas"]["NullableProvenanceId"];
+        };
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             event: components["schemas"]["DurableAgentEvent"];

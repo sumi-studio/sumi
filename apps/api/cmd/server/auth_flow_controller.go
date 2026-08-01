@@ -82,7 +82,7 @@ func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.
 		return result
 	}
 	result.Outcome = flow.TerminalOutcome
-	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, UserID: flow.HumanID, PersonalityAgentID: flow.AgentID}
+	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, HumanID: flow.HumanID, PersonalityAgentID: flow.AgentID}
 	return result
 }
 
@@ -105,7 +105,7 @@ func verifiedKosekiIdentity(identity agentevents.FirebaseIdentity) (koseki.Verif
 }
 
 func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, claims agentevents.UserSessionClaims, request agentevents.StartProviderOperationRequest, identity agentevents.FirebaseIdentity) (agentevents.ProviderOperationResult, error) {
-	uid, err := c.store.FirebaseUIDForHuman(ctx, claims.UserID)
+	uid, err := c.store.FirebaseUIDForHuman(ctx, claims.HumanID)
 	if err != nil || uid != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
@@ -121,7 +121,7 @@ func (c *kosekiAuthFlowController) StartProviderOperation(ctx context.Context, c
 			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
 		}
 	}
-	operation, err := c.store.BeginProviderOperation(ctx, claims.UserID, uid, request.Provider,
+	operation, err := c.store.BeginProviderOperation(ctx, claims.HumanID, uid, request.Provider,
 		request.Operation, request.DecisionPath, request.Nonce)
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
@@ -156,7 +156,7 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	if operation.HumanID != claims.UserID || operation.FirebaseUID != identity.UID {
+	if operation.HumanID != claims.HumanID || operation.FirebaseUID != identity.UID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
 	if identity.IssuedAt.IsZero() || identity.IssuedAt.Before(completionTokenNotBefore(operation.CreatedAt)) {
@@ -186,7 +186,7 @@ func (c *kosekiAuthFlowController) CompleteProviderOperation(ctx context.Context
 		if usableProviderCount(identity.ProviderSubjects) < 1 {
 			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthLastMethod
 		}
-		subject, subjectErr := c.store.ActiveProviderSubject(ctx, claims.UserID, operation.Provider)
+		subject, subjectErr := c.store.ActiveProviderSubject(ctx, claims.HumanID, operation.Provider)
 		if subjectErr != nil {
 			return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 		}
@@ -224,7 +224,7 @@ func (c *kosekiAuthFlowController) FailProviderOperation(ctx context.Context, cl
 	if err != nil {
 		return agentevents.ProviderOperationResult{}, mapFlowError(err)
 	}
-	if operation.HumanID != claims.UserID {
+	if operation.HumanID != claims.HumanID {
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
 	if request.Outcome != "provider_already_linked" && request.Outcome != "credential_in_use" && request.Outcome != "firebase_operation_failed" && request.Outcome != "cancelled" {

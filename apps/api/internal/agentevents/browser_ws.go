@@ -44,7 +44,7 @@ type browserConnection struct {
 type idempotencyAwareCommandAppender interface {
 	AppendWithIdempotencyStatus(
 		ctx context.Context,
-		provenance DirectChatProvenance,
+		provenance InboundProvenance,
 		idempotencyKey string,
 		command json.RawMessage,
 	) (CommandEnvelope, bool, error)

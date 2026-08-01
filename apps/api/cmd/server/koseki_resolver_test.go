@@ -40,10 +40,10 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if first.TenantID != "local" {
 		t.Fatalf("tenant id: got %q want local", first.TenantID)
 	}
-	if first.UserID == "" || first.PersonalityAgentID == "" {
+	if first.HumanID == "" || first.PersonalityAgentID == "" {
 		t.Fatal("auto-registration must produce a HumanId and PersonalityAgentID")
 	}
-	if first.UserID == first.PersonalityAgentID {
+	if first.HumanID == first.PersonalityAgentID {
 		t.Fatal("HumanId and PersonalityAgentID must differ")
 	}
 	// Per-agent wrapping key is generated at registration.
@@ -56,7 +56,7 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve known identity: %v", err)
 	}
-	if firstAgain.UserID != first.UserID || firstAgain.PersonalityAgentID != first.PersonalityAgentID {
+	if firstAgain.HumanID != first.HumanID || firstAgain.PersonalityAgentID != first.PersonalityAgentID {
 		t.Fatalf("known credential resolved differently: first=%+v again=%+v", first, firstAgain)
 	}
 
@@ -65,7 +65,7 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve second identity: %v", err)
 	}
-	if second.UserID == first.UserID || second.PersonalityAgentID == first.PersonalityAgentID {
+	if second.HumanID == first.HumanID || second.PersonalityAgentID == first.PersonalityAgentID {
 		t.Fatal("second account must get a distinct HumanId and PersonalityAgentID")
 	}
 	if _, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID); err != nil {
@@ -73,7 +73,7 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	}
 
 	// Each Human has exactly one Secretary that round-trips through the store.
-	firstAgent, err := store.AgentForHuman(ctx, first.UserID)
+	firstAgent, err := store.AgentForHuman(ctx, first.HumanID)
 	if err != nil {
 		t.Fatalf("agent for first human: %v", err)
 	}

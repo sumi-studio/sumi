@@ -716,34 +716,133 @@ $defs:
     pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
     description: opaque ASCII tenant identity
 
-  PrincipalId:
+  HumanId:
+    type: string
+    pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    description: |
+      exact lower-case hyphenated UUIDv7 human identity (ADR 0009 §1). Firebase
+      principals are credentials, not identity, and never appear here.
+
+  ProvenanceId:
     type: string
     minLength: 1
     maxLength: 256
     pattern: '^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$'
-    description: opaque ASCII principal identity
+    description: opaque ASCII identity carried by provenance (place, message, correlation)
 
-  DirectChatProvenanceV1:
-    type: object
-    required: [version, tenant_id, personality_agent_id, actor, source]
-    additionalProperties: false
-    properties:
-      version: { const: 1 }
-      tenant_id: { $ref: '#/$defs/TenantId' }
-      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
-      actor:
-        type: object
-        required: [kind, principal_id]
+  ActorRef:
+    description: |
+      発話者。human と人格 agent を同型に扱う (ADR 0011 §2)。宛先ではない。
+    oneOf:
+      - type: object
+        required: [kind, human_id]
         additionalProperties: false
         properties:
           kind: { const: human }
-          principal_id: { $ref: '#/$defs/PrincipalId' }
-      source:
-        type: object
+          human_id: { $ref: '#/$defs/HumanId' }
+      - type: object
+        required: [kind, personality_agent_id]
+        additionalProperties: false
+        properties:
+          kind: { const: personality_agent }
+          personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+
+  PlaceRef:
+    description: メッセージングの場所 (ADR 0011 §1)
+    oneOf:
+      - type: object
+        required: [kind, channel_id]
+        additionalProperties: false
+        properties:
+          kind: { const: channel }
+          channel_id: { $ref: '#/$defs/ProvenanceId' }
+      - type: object
+        required: [kind, dm_id]
+        additionalProperties: false
+        properties:
+          kind: { const: dm }
+          dm_id: { $ref: '#/$defs/ProvenanceId' }
+      - type: object
+        required: [kind, dm_id]
+        additionalProperties: false
+        properties:
+          kind: { const: group_dm }
+          dm_id: { $ref: '#/$defs/ProvenanceId' }
+
+  NullableProvenanceId:
+    oneOf:
+      - { $ref: '#/$defs/ProvenanceId' }
+      - { type: 'null' }
+
+  DeliveryProvenance:
+    type: object
+    description: 配送された一件のメッセージについての admission 時点の事実
+    required:
+      [message_id, seq, addressees, trigger_reason, urgency, correlation_id, causation_id]
+    additionalProperties: false
+    properties:
+      message_id: { $ref: '#/$defs/ProvenanceId' }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+      addressees:
+        type: array
+        maxItems: 64
+        items: { $ref: '#/$defs/ActorRef' }
+        description: |
+          admission が解決した宛先。alias を place 全体へ展開した結果は載せない。
+      trigger_reason:
+        type: string
+        enum: [mention, direct_message, place_activity]
+      urgency:
+        type: string
+        enum: [urgent, normal, fyi]
+      correlation_id: { $ref: '#/$defs/NullableProvenanceId' }
+      causation_id: { $ref: '#/$defs/NullableProvenanceId' }
+
+  InboundSource:
+    description: |
+      この inbound が届いた Surface (ADR 0011 §1)。messaging は必ず place と配送
+      された一件のメッセージを伴い、direct chat はどちらも持たない。
+    oneOf:
+      - type: object
         required: [surface]
         additionalProperties: false
         properties:
           surface: { const: direct_chat }
+      - type: object
+        required: [surface, workspace_id, place, delivery]
+        additionalProperties: false
+        properties:
+          surface: { const: messaging }
+          workspace_id: { $ref: '#/$defs/NullableProvenanceId' }
+          place: { $ref: '#/$defs/PlaceRef' }
+          delivery: { $ref: '#/$defs/DeliveryProvenance' }
+
+  AdmissionAuthority:
+    type: object
+    description: |
+      admission 時にこの配送を許可した根拠 (ADR 0011 §8)。配送の可否は決定論的
+      境界が判断し、agent 側は再判定しない。
+    required: [basis, decision_id]
+    additionalProperties: false
+    properties:
+      basis:
+        type: string
+        enum: [employer, place_membership, connection]
+      decision_id: { $ref: '#/$defs/NullableProvenanceId' }
+
+  InboundProvenanceV1:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source, authority]
+    additionalProperties: false
+    properties:
+      version: { const: 1 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id:
+        $ref: '#/$defs/PersonalityAgentId'
+        description: 受け手。この private store の持ち主である人格 agent。
+      actor: { $ref: '#/$defs/ActorRef' }
+      source: { $ref: '#/$defs/InboundSource' }
+      authority: { $ref: '#/$defs/AdmissionAuthority' }
 
   CommandEnvelope:
     type: object
@@ -757,7 +856,7 @@ $defs:
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         description: canonical lower-case hyphenated UUID
       personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
-      provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
+      provenance: { $ref: '#/$defs/InboundProvenanceV1' }
       command: { $ref: '#/$defs/Command' }
     $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
 

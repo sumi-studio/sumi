@@ -9,7 +9,7 @@ use sqlx::{Connection, Row, sqlite::SqliteConnectOptions};
 
 static DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 const COMMAND_FIELD: &[u8] = br#""command":"#;
-const DIRECT_CHAT_BINDING: &[u8] = br#""personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","provenance":{"version":1,"tenant_id":"tenant-test","personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","actor":{"kind":"human","principal_id":"human-test"},"source":{"surface":"direct_chat"}},"command":"#;
+const DIRECT_CHAT_BINDING: &[u8] = br#""personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","provenance":{"version":1,"tenant_id":"tenant-test","personality_agent_id":"0198f0f4-9b72-7000-8000-000000000001","actor":{"kind":"human","human_id":"018f3f8d-7b2c-7a10-8f9e-00000000ab01"},"source":{"surface":"direct_chat"},"authority":{"basis":"employer","decision_id":null}},"command":"#;
 
 fn agent_command(database_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sumi-agent"));

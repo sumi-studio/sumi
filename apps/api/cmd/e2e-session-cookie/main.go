@@ -51,7 +51,7 @@ func run(ctx context.Context, output io.Writer) error {
 	}
 	session, err := issuer.IssueSession(ctx, agentevents.UserSessionClaims{
 		TenantID:           tenantID,
-		UserID:             userID,
+		HumanID:            userID,
 		PersonalityAgentID: personalityAgentID,
 	}, sessionTTL)
 	if err != nil {

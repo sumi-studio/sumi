@@ -2619,13 +2619,15 @@ mod tests {
         Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand,
         OutboundFrame,
     };
+    use crate::gateway::{TEST_HUMAN_ID, TEST_OTHER_HUMAN_ID};
     use crate::provider::types::{
         ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
         StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
         ValidatedToolArguments,
     };
     use crate::runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease,
+        GenerationRecoveryFence, HumanId, InboundProvenanceV1, PersonalityAgentId,
+        ProcessGenerationLease,
     };
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
@@ -3668,7 +3670,7 @@ mod tests {
     fn valid_command(seq: u64, command_id: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
             command: Command::Abort {},
@@ -3680,7 +3682,7 @@ mod tests {
             "seq": seq,
             "command_id": command_id,
             "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "provenance": crate::gateway::test_inbound_provenance(),
             "command": command,
         }))
         .expect("serialize authenticated command fixture")
@@ -3691,13 +3693,13 @@ mod tests {
         command_id: &str,
         personality_agent_id: PersonalityAgentId,
         tenant_id: &str,
-        principal_id: &str,
+        human_id: &str,
     ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
-            provenance: DirectChatProvenanceV1::new(
+            provenance: InboundProvenanceV1::direct_chat(
                 tenant_id,
                 personality_agent_id.clone(),
-                principal_id,
+                HumanId::parse(human_id).expect("canonical test HumanId"),
             )
             .expect("valid direct-chat provenance"),
             personality_agent_id,
@@ -3712,7 +3714,7 @@ mod tests {
             seq,
             command_id: CommandId::parse(command_id).unwrap(),
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             reason: CommandRejectReason::Oversized { actual_bytes },
             raw_command: crate::gateway::RejectedCommandPayload::DiscardedOversized,
             payload_digest: Some(crate::gateway::KeyedCommandDigest::new("test-key", [0; 32])),
@@ -4878,7 +4880,7 @@ mod tests {
                 "00000000-0000-4000-8000-000000000001",
                 different,
                 "tenant-a",
-                "human-a",
+                TEST_HUMAN_ID,
             ),
             &expected,
             1,
@@ -4908,7 +4910,7 @@ mod tests {
                 "00000000-0000-4000-8000-000000000001",
                 personality_agent_id.clone(),
                 "tenant-a",
-                "human-a",
+                TEST_HUMAN_ID,
             ),
             &personality_agent_id,
             1,
@@ -4924,7 +4926,7 @@ mod tests {
                 "00000000-0000-4000-8000-000000000002",
                 personality_agent_id.clone(),
                 "tenant-b",
-                "human-b",
+                TEST_OTHER_HUMAN_ID,
             ),
             &personality_agent_id,
             next,
@@ -4944,8 +4946,8 @@ mod tests {
             second.provenance().tenant_id()
         );
         assert_ne!(
-            first.provenance().actor().principal_id(),
-            second.provenance().actor().principal_id()
+            first.provenance().actor().key(),
+            second.provenance().actor().key()
         );
     }
 
@@ -6604,7 +6606,7 @@ mod tests {
         let first = format!(
             r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"{}","provenance":{},"command":{{"#,
             crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            serde_json::to_string(&crate::gateway::test_direct_chat_provenance())
+            serde_json::to_string(&crate::gateway::test_inbound_provenance())
                 .expect("serialize direct-chat provenance fixture"),
         )
         .into_bytes();
@@ -10493,7 +10495,7 @@ mod tests {
 
         let user_command = InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {
@@ -10689,7 +10691,7 @@ mod tests {
         let writer_release = Arc::new(Notify::new());
         let command = InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq: 1,
             command_id: CommandId::parse(COMMAND_ID).unwrap(),
             command: Command::UserMessage {

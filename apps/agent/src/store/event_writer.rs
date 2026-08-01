@@ -49,7 +49,7 @@ use crate::{
         },
     },
     runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
+        GenerationRecoveryFence, InboundProvenanceV1, PersonalityAgentId, ProcessGeneration,
         ProcessGenerationLease,
     },
 };
@@ -166,7 +166,7 @@ pub(crate) struct DurableEvent {
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) direct_chat_provenance: Option<DirectChatProvenanceV1>,
+    pub(super) inbound_provenance: Option<InboundProvenanceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -752,7 +752,7 @@ pub(crate) struct InjectedCommand {
     seq: u64,
     command_id: CommandId,
     message_id: String,
-    provenance: DirectChatProvenanceV1,
+    provenance: InboundProvenanceV1,
 }
 
 /// Temporary local namespace for Error-context disposition identities.
@@ -828,7 +828,7 @@ impl InjectedCommand {
     pub(crate) fn new(
         seq: u64,
         command_id: impl IntoCanonicalCommandId,
-        provenance: DirectChatProvenanceV1,
+        provenance: InboundProvenanceV1,
     ) -> Self {
         let command_id = command_id.into_canonical_command_id();
         let message_id = user_message_id(provenance.personality_agent_id(), &command_id);
@@ -855,7 +855,7 @@ impl InjectedCommand {
         &self.message_id
     }
 
-    pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
+    pub(crate) const fn provenance(&self) -> &InboundProvenanceV1 {
         &self.provenance
     }
 
@@ -864,7 +864,7 @@ impl InjectedCommand {
         seq: u64,
         command_id: CommandId,
         message_id: impl Into<String>,
-        provenance: DirectChatProvenanceV1,
+        provenance: InboundProvenanceV1,
     ) -> Self {
         Self {
             seq,
@@ -1126,7 +1126,7 @@ pub(crate) enum Projection {
         seq: u64,
         command_id: String,
         personality_agent_id: PersonalityAgentId,
-        provenance: DirectChatProvenanceV1,
+        provenance: InboundProvenanceV1,
         reason: CommandRejectReason,
         raw_command: RejectedCommandPayload,
         payload_digest: Option<KeyedCommandDigest>,
@@ -1610,7 +1610,7 @@ struct CommandInsertInput<'a> {
     seq: u64,
     command_id: String,
     personality_agent_id: &'a PersonalityAgentId,
-    provenance: &'a DirectChatProvenanceV1,
+    provenance: &'a InboundProvenanceV1,
     command_kind: &'static str,
     canonical_payload: &'a [u8],
     rejection: Option<CommandRejectReason>,
@@ -3408,7 +3408,7 @@ impl EventWriter {
             command_plaintext_bytes: 0,
         };
         EventBatchSizer::validate(bounds, 0)?;
-        let injected_provenance: HashMap<String, DirectChatProvenanceV1> = batch
+        let injected_provenance: HashMap<String, InboundProvenanceV1> = batch
             .injected_commands
             .iter()
             .map(|command| (command.message_id.clone(), command.provenance.clone()))
@@ -3487,11 +3487,11 @@ impl EventWriter {
                         } if matches!(message.as_ref(), PublicMessage::User(_)) => Some(message_id),
                         _ => None,
                     };
-                    if event.metadata.direct_chat_provenance.is_some() {
+                    if event.metadata.inbound_provenance.is_some() {
                         bail!("callers cannot supply direct-chat provenance event metadata");
                     }
                     if let Some(message_id) = user_message_id {
-                        event.metadata.direct_chat_provenance =
+                        event.metadata.inbound_provenance =
                             Some(injected_provenance.get(message_id).cloned().ok_or_else(|| {
                                 anyhow!(
                                     "user event {message_id} has no authenticated injected command provenance"
@@ -4997,9 +4997,8 @@ impl EventWriter {
             verify_command_payload_digest(&key, &plaintext, &digest)?;
             let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
             let provenance_json: String = row.try_get("provenance_json")?;
-            let persisted_provenance: DirectChatProvenanceV1 =
-                serde_json::from_str(&provenance_json)
-                    .context("durable injected command provenance is invalid")?;
+            let persisted_provenance: InboundProvenanceV1 = serde_json::from_str(&provenance_json)
+                .context("durable injected command provenance is invalid")?;
             if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
                 || persisted_provenance != command.provenance
                 || serde_json::to_string(&persisted_provenance)? != provenance_json
@@ -5165,7 +5164,7 @@ impl EventWriter {
         command_id: &str,
         incoming_kind: &str,
         incoming_rejection: Option<&CommandRejectReason>,
-        incoming_provenance: &DirectChatProvenanceV1,
+        incoming_provenance: &InboundProvenanceV1,
         canonical_payload: &[u8],
         incoming_digest: Option<&KeyedCommandDigest>,
     ) -> Result<Option<CommandAck>> {
@@ -5231,7 +5230,7 @@ impl EventWriter {
             bail!("command replay personality-agent identity mismatch");
         }
         let provenance_json: String = row.try_get("provenance_json")?;
-        let stored_provenance: DirectChatProvenanceV1 = serde_json::from_str(&provenance_json)
+        let stored_provenance: InboundProvenanceV1 = serde_json::from_str(&provenance_json)
             .context("persisted command provenance is invalid")?;
         let canonical_stored_provenance = serde_json::to_string(&stored_provenance)
             .context("failed to canonicalize persisted command provenance")?;
@@ -6128,6 +6127,7 @@ fn rejection_disposition(reason: &CommandRejectReason) -> CommandDisposition {
             CommandDispositionRejectReason::AttachmentsNotEmpty
         }
         CommandRejectReason::Oversized { .. } => CommandDispositionRejectReason::Oversized,
+        CommandRejectReason::NotAllowed => CommandDispositionRejectReason::NotAllowed,
     };
     CommandDisposition::Rejected { reject_reason }
 }
@@ -10939,10 +10939,10 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
     }
 
     let writer = EventWriter::new(Arc::new(store.clone()));
-    let provenance = DirectChatProvenanceV1::new(
+    let provenance = InboundProvenanceV1::direct_chat(
         "tenant-test",
         store.scope().personality_agent_id.clone(),
-        "human-test",
+        crate::gateway::test_human_id(),
     )?;
     let command_key = store.private_key(DataKeyPurpose::Command).await?;
     let command_seq_base: i64 =
@@ -13909,9 +13909,13 @@ mod tests {
         }
     }
 
-    fn test_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
-            .expect("valid direct-chat provenance")
+    fn test_provenance() -> InboundProvenanceV1 {
+        InboundProvenanceV1::direct_chat(
+            "tenant-1",
+            scope().personality_agent_id,
+            crate::gateway::test_human_id(),
+        )
+        .expect("valid direct-chat provenance")
     }
 
     fn test_user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
@@ -14026,7 +14030,7 @@ mod tests {
         seq: u64,
         command_id: &str,
         text: &str,
-        provenance: DirectChatProvenanceV1,
+        provenance: InboundProvenanceV1,
     ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
@@ -17933,10 +17937,19 @@ mod tests {
     async fn command_replay_authenticates_exact_persisted_provenance_and_admission_record() {
         let command_id = "00000000-0000-4000-8000-000000000031";
         for tampered_provenance in [
-            DirectChatProvenanceV1::new("tenant-tampered", scope().personality_agent_id, "human-1")
-                .unwrap(),
-            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-tampered")
-                .unwrap(),
+            InboundProvenanceV1::direct_chat(
+                "tenant-tampered",
+                scope().personality_agent_id,
+                crate::gateway::test_human_id(),
+            )
+            .unwrap(),
+            InboundProvenanceV1::direct_chat(
+                "tenant-1",
+                scope().personality_agent_id,
+                crate::runtime::contracts::HumanId::parse(crate::gateway::TEST_OTHER_HUMAN_ID)
+                    .unwrap(),
+            )
+            .unwrap(),
         ] {
             let store = test_store().await;
             let writer = EventWriter::new(store.clone());

@@ -69,7 +69,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		startResult:   BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "proof_required", ExpiresAt: time.Now().Add(time.Minute)},
 		resolveResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "confirmation_required", NextAction: "create_account"},
 		confirmResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "account_created", Claims: UserSessionClaims{
-			TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
+			TenantID: "local", HumanID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 		}},
 	}
 	server.Flows = controller
@@ -101,7 +101,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		t.Fatal("terminal outcome did not issue session")
 	}
 	claims, err := sessions.VerifySession(context.Background(), sessionCookie.Value)
-	if err != nil || claims.UserID != controller.confirmResult.Claims.UserID {
+	if err != nil || claims.HumanID != controller.confirmResult.Claims.HumanID {
 		t.Fatalf("session claims: %+v %v", claims, err)
 	}
 

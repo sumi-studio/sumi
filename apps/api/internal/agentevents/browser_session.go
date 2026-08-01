@@ -48,7 +48,7 @@ func DefaultBrowserAudience() string { return defaultBrowserAudience }
 // never comes from a public route or browser-authored command.
 type UserSessionClaims struct {
 	TenantID           string
-	UserID             string
+	HumanID            string
 	PersonalityAgentID string
 	sessionID          string
 	expiresAt          time.Time
@@ -149,7 +149,7 @@ type BrowserSessionLifecycle interface {
 
 type userSessionWireClaims struct {
 	TenantID           string `json:"tenant_id"`
-	UserID             string `json:"user_id"`
+	HumanID            string `json:"human_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
 	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
@@ -237,7 +237,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	default:
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
-		!provenanceIDRegexp.MatchString(claims.UserID) {
+		ValidateHumanID(claims.HumanID) != nil {
 		return preparedBrowserSession{}, errors.New("browser session has invalid tenant or user binding")
 	}
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
@@ -256,7 +256,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	headerPart := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	wireClaims := userSessionWireClaims{
 		TenantID:           claims.TenantID,
-		UserID:             claims.UserID,
+		HumanID:            claims.HumanID,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Iat:                now.Unix(),
 		Exp:                now.Add(ttl).Unix(),
@@ -278,7 +278,7 @@ func (v *HMACUserSessionVerifier) prepareSession(
 	return preparedBrowserSession{
 		claims: UserSessionClaims{
 			TenantID:           wireClaims.TenantID,
-			UserID:             wireClaims.UserID,
+			HumanID:            wireClaims.HumanID,
 			PersonalityAgentID: wireClaims.PersonalityAgentID,
 			sessionID:          wireClaims.SID,
 			expiresAt:          time.Unix(wireClaims.Exp, 0),
@@ -371,7 +371,7 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 		return UserSessionClaims{}, fmt.Errorf("parse browser session claims: %w", err)
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
-		!provenanceIDRegexp.MatchString(claims.UserID) ||
+		ValidateHumanID(claims.HumanID) != nil ||
 		claims.PersonalityAgentID == "" ||
 		claims.Iat == 0 ||
 		claims.Exp == 0 ||
@@ -391,7 +391,7 @@ func (v *HMACUserSessionVerifier) verifySignedSession(ctx context.Context, signe
 	}
 	return UserSessionClaims{
 		TenantID:           claims.TenantID,
-		UserID:             claims.UserID,
+		HumanID:            claims.HumanID,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		sessionID:          claims.SID,
 		expiresAt:          time.Unix(claims.Exp, 0),
@@ -428,7 +428,7 @@ func deriveBrowserAuthorityBindingID(
 	var length [4]byte
 	for _, value := range []string{
 		claims.TenantID,
-		claims.UserID,
+		claims.HumanID,
 		claims.PersonalityAgentID,
 	} {
 		binary.BigEndian.PutUint32(length[:], uint32(len(value)))

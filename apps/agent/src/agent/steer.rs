@@ -829,7 +829,7 @@ mod tests {
     fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq,
             command_id: CommandId::parse(command_id).expect("canonical test UUID"),
             command: Command::UserMessage {
@@ -843,7 +843,7 @@ mod tests {
         AdmittedCommand::new(
             CommandEnvelope {
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
-                provenance: crate::gateway::test_direct_chat_provenance(),
+                provenance: crate::gateway::test_inbound_provenance(),
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::UserMessage {
@@ -855,19 +855,15 @@ mod tests {
         )
     }
 
-    fn test_admitted_by(
-        seq: u64,
-        command_id: &str,
-        text: &str,
-        principal_id: &str,
-    ) -> AdmittedCommand {
+    fn test_admitted_by(seq: u64, command_id: &str, text: &str, human_id: &str) -> AdmittedCommand {
         let personality_agent_id = crate::gateway::test_personality_agent_id();
         AdmittedCommand::new(
             CommandEnvelope {
-                provenance: crate::runtime::contracts::DirectChatProvenanceV1::new(
+                provenance: crate::runtime::contracts::InboundProvenanceV1::direct_chat(
                     "tenant-test",
                     personality_agent_id.clone(),
-                    principal_id,
+                    crate::runtime::contracts::HumanId::parse(human_id)
+                        .expect("canonical test HumanId"),
                 )
                 .expect("valid direct-chat provenance"),
                 personality_agent_id,
@@ -919,7 +915,7 @@ mod tests {
         phase: RunPhase,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -1017,7 +1013,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
-                    crate::gateway::test_direct_chat_provenance(),
+                    crate::gateway::test_inbound_provenance(),
                 )],
             })
             .await
@@ -1181,7 +1177,7 @@ mod tests {
             run_id: "run-group-actors".to_owned(),
             turn_id: "turn-group-actors".to_owned(),
             previous_owner: DurableRunBinding {
-                provenance: crate::gateway::test_direct_chat_provenance(),
+                provenance: crate::gateway::test_inbound_provenance(),
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                 command_seq: 1,
                 run_id: "run-group-actors".to_owned(),
@@ -1193,13 +1189,13 @@ mod tests {
                     2,
                     "00000000-0000-4000-8000-000000000002",
                     "first",
-                    "human-a",
+                    crate::gateway::TEST_HUMAN_ID,
                 ),
                 test_admitted_by(
                     3,
                     "00000000-0000-4000-8000-000000000003",
                     "second",
-                    "human-b",
+                    crate::gateway::TEST_OTHER_HUMAN_ID,
                 ),
             ],
             closing_turn_message: None,
@@ -1210,10 +1206,16 @@ mod tests {
         let actors = batch
             .injected_commands
             .iter()
-            .map(|command| command.provenance().actor().principal_id())
+            .map(|command| command.provenance().actor().key())
             .collect::<Vec<_>>();
 
-        assert_eq!(actors, ["human-a", "human-b"]);
+        assert_eq!(
+            actors,
+            [
+                format!("human:{}", crate::gateway::TEST_HUMAN_ID),
+                format!("human:{}", crate::gateway::TEST_OTHER_HUMAN_ID)
+            ]
+        );
     }
 
     #[tokio::test]

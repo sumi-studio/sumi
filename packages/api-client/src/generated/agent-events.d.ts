@@ -342,12 +342,79 @@ export type Command =
  */
 export type TenantId = string;
 /**
- * opaque ASCII principal identity
+ * exact lower-case hyphenated UUIDv7 human identity (ADR 0009 §1). Firebase
+ * principals are credentials, not identity, and never appear here.
+ *
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "PrincipalId".
+ * via the `definition` "HumanId".
  */
-export type PrincipalId = string;
+export type HumanId = string;
+/**
+ * opaque ASCII identity carried by provenance (place, message, correlation)
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ProvenanceId".
+ */
+export type ProvenanceId = string;
+/**
+ * 発話者。human と人格 agent を同型に扱う (ADR 0011 §2)。宛先ではない。
+ *
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ActorRef".
+ */
+export type ActorRef =
+  | {
+      kind: "human";
+      human_id: HumanId;
+    }
+  | {
+      kind: "personality_agent";
+      personality_agent_id: PersonalityAgentId;
+    };
+/**
+ * メッセージングの場所 (ADR 0011 §1)
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "PlaceRef".
+ */
+export type PlaceRef =
+  | {
+      kind: "channel";
+      channel_id: ProvenanceId;
+    }
+  | {
+      kind: "dm";
+      dm_id: ProvenanceId;
+    }
+  | {
+      kind: "group_dm";
+      dm_id: ProvenanceId;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "NullableProvenanceId".
+ */
+export type NullableProvenanceId = ProvenanceId | null;
+/**
+ * この inbound が届いた Surface (ADR 0011 §1)。messaging は必ず place と配送
+ * された一件のメッセージを伴い、direct chat はどちらも持たない。
+ *
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundSource".
+ */
+export type InboundSource =
+  | {
+      surface: "direct_chat";
+    }
+  | {
+      surface: "messaging";
+      workspace_id: NullableProvenanceId;
+      place: PlaceRef;
+      delivery: DeliveryProvenance;
+    };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "OutboundFrame".
@@ -705,20 +772,52 @@ export interface ErrorEvent {
   message: string;
 }
 /**
+ * 配送された一件のメッセージについての admission 時点の事実
+ *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "DirectChatProvenanceV1".
+ * via the `definition` "DeliveryProvenance".
  */
-export interface DirectChatProvenanceV1 {
+export interface DeliveryProvenance {
+  message_id: ProvenanceId;
+  seq: JsonSafeInteger;
+  /**
+   * admission が解決した宛先。alias を place 全体へ展開した結果は載せない。
+   *
+   *
+   * @maxItems 64
+   */
+  addressees: ActorRef[];
+  trigger_reason: "mention" | "direct_message" | "place_activity";
+  urgency: "urgent" | "normal" | "fyi";
+  correlation_id: NullableProvenanceId;
+  causation_id: NullableProvenanceId;
+}
+/**
+ * admission 時にこの配送を許可した根拠 (ADR 0011 §8)。配送の可否は決定論的
+ * 境界が判断し、agent 側は再判定しない。
+ *
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AdmissionAuthority".
+ */
+export interface AdmissionAuthority {
+  basis: "employer" | "place_membership" | "connection";
+  decision_id: NullableProvenanceId;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "InboundProvenanceV1".
+ */
+export interface InboundProvenanceV1 {
   version: 1;
   tenant_id: TenantId;
-  personality_agent_id: PersonalityAgentId;
-  actor: {
-    kind: "human";
-    principal_id: PrincipalId;
-  };
-  source: {
-    surface: "direct_chat";
-  };
+  /**
+   * exact lower-case hyphenated UUIDv7 personality-agent identity
+   */
+  personality_agent_id: string;
+  actor: ActorRef;
+  source: InboundSource;
+  authority: AdmissionAuthority;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -731,7 +830,7 @@ export interface CommandEnvelope {
    */
   command_id: string;
   personality_agent_id: PersonalityAgentId;
-  provenance: DirectChatProvenanceV1;
+  provenance: InboundProvenanceV1;
   command: Command;
 }
 /**

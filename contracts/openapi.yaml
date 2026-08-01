@@ -157,8 +157,8 @@ components:
       $ref: "./agent-events.yaml#/$defs/CommandEnvelope"
     PersonalityAgentId:
       $ref: "./agent-events.yaml#/$defs/PersonalityAgentId"
-    DirectChatProvenanceV1:
-      $ref: "./agent-events.yaml#/$defs/DirectChatProvenanceV1"
+    InboundProvenanceV1:
+      $ref: "./agent-events.yaml#/$defs/InboundProvenanceV1"
     AgentHello:
       $ref: "./agent-events.yaml#/$defs/AgentHello"
     ApiHello:

@@ -79,7 +79,7 @@ func NewStaticIdentityBindingResolverForTenant(
 		return nil, errors.New("Firebase tenant binding must not exceed 128 bytes")
 	}
 	if !provenanceIDRegexp.MatchString(claims.TenantID) ||
-		!provenanceIDRegexp.MatchString(claims.UserID) {
+		ValidateHumanID(claims.HumanID) != nil {
 		return nil, errors.New("identity binding has invalid tenant or user ID")
 	}
 	if err := ValidatePersonalityAgentID(claims.PersonalityAgentID); err != nil {
@@ -311,7 +311,7 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 		AuthorityBindingID: claims.authorityBindingID,
 		User: struct {
 			ID string `json:"id"`
-		}{ID: claims.UserID},
+		}{ID: claims.HumanID},
 	})
 }
 

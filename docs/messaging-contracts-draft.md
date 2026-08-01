@@ -176,6 +176,17 @@
 agentにとってより適した方法があるときだけそちらで代替する。AXとUXが高い精度で
 一致していることが目的である。
 
+> **実装状態（2026-08-01）**: ADR 0011 Decision 1・2 のみ実装済み。
+> `InboundProvenanceV1` は surface一般（direct chat / messaging）になり、actorは
+> human | personality_agent、humanはcanonical `HumanId`（UUIDv7）である
+> （`apps/agent/src/runtime/contracts.rs`、`contracts/agent-events.yaml`、
+> `apps/api/internal/agentevents/wire.go`）。**注意の経路はまだ無い。** そのため
+> messaging surface由来のinboundは agent の受信口で `not_allowed` として
+> fail-closedに拒否する（`apps/agent/src/gateway/stdio.rs`）。黙ってdirect chatと
+> 同じ扱いにすると、届いた瞬間にprovider turnになる＝channel botになるため。
+> この門は AttentionCandidate と本人の判断（interrupt / inject / defer / observe）
+> が実装された時点で外す。
+
 1. **呼びかけは AttentionCandidate として届く**: 決定論的なdelivery eligibility
    （block/mute、本人の通知設定、quiet hours、明示signal、membership・authority、
    rate limit）を通過した出来事が、認証済みprovenance付きの候補として本人の

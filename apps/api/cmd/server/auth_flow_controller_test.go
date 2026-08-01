@@ -27,7 +27,7 @@ func TestProviderUnlinkRequiresOtherRecentMethodAndVerifiedCompletion(t *testing
 	controller := newKosekiAuthFlowController(store, "local")
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
-	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{Provider: "github.com", Operation: "unlink", DecisionPath: "notice_action", Nonce: controllerNonce(t), IDToken: "verified"}
 
 	stale := agentevents.FirebaseIdentity{UID: "unlink-uid", AuthTime: now.Add(-6 * time.Minute), SignInProvider: "password", ProviderSubjects: map[string][]string{"password": {"human@example.com"}, "github.com": {"github-subject"}}}
@@ -97,7 +97,7 @@ func TestProviderLinkRejectsPreOperationTokenAndAcceptsForcedRefresh(t *testing.
 		t.Fatal(err)
 	}
 	controller := newKosekiAuthFlowController(store, "local")
-	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	claims := agentevents.UserSessionClaims{HumanID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
 	request := agentevents.StartProviderOperationRequest{
 		Provider: "github.com", Operation: "link", DecisionPath: "same_email_recovery",
 		Nonce: controllerNonce(t), IDToken: "before-link",

@@ -218,28 +218,73 @@ func parseCanonicalDecimal(value string, max uint64) (uint64, error) {
 	return parsed, nil
 }
 
-// DirectChatProvenance is immutable server-authored admission metadata. It is
+// InboundProvenance is immutable server-authored admission metadata. It is
 // kept separate from caller-authored Command bytes and persists with them.
-type DirectChatProvenance struct {
-	Version            uint8            `json:"version"`
-	TenantID           string           `json:"tenant_id"`
-	PersonalityAgentID string           `json:"personality_agent_id"`
-	Actor              ProvenanceActor  `json:"actor"`
-	Source             ProvenanceSource `json:"source"`
+//
+// The shape is surface-general (ADR 0011 §1/§2): direct chat and messaging use
+// the same provenance. This API only *mints* direct chat provenance, because
+// direct chat is the Employer's private surface (ADR 0009 §5); messaging
+// provenance is minted by the shared Workspace API, which owns the canonical
+// membership and place data (ADR 0011 §10). Carrying both is required because
+// every surface reaches the agent through this durable command path.
+type InboundProvenance struct {
+	Version            uint8              `json:"version"`
+	TenantID           string             `json:"tenant_id"`
+	PersonalityAgentID string             `json:"personality_agent_id"`
+	Actor              ProvenanceActor    `json:"actor"`
+	Source             ProvenanceSource   `json:"source"`
+	Authority          AdmissionAuthority `json:"authority"`
 }
 
+// ProvenanceActor is the speaker, never the addressee (ADR 0011 §2). Humans and
+// personality agents are the same kind of participant.
 type ProvenanceActor struct {
-	Kind        string `json:"kind"`
-	PrincipalID string `json:"principal_id"`
+	Kind string `json:"kind"`
+	// HumanID is the canonical 戸籍 HumanId (ADR 0009 §1), not a credential.
+	HumanID string `json:"human_id,omitempty"`
+	// PersonalityAgentID is set when a personality agent is the speaker.
+	PersonalityAgentID string `json:"personality_agent_id,omitempty"`
 }
 
+// ProvenanceSource is the surface this inbound arrived on. Messaging always
+// carries a place and the delivered message; direct chat carries neither.
 type ProvenanceSource struct {
-	Surface string `json:"surface"`
+	Surface     string
+	WorkspaceID *string
+	Place       *ProvenancePlace
+	Delivery    *ProvenanceDelivery
 }
+
+type ProvenancePlace struct {
+	Kind      string `json:"kind"`
+	ChannelID string `json:"channel_id,omitempty"`
+	DmID      string `json:"dm_id,omitempty"`
+}
+
+// ProvenanceDelivery is the admission-time fact about one delivered message.
+type ProvenanceDelivery struct {
+	MessageID string `json:"message_id"`
+	Seq       uint64 `json:"seq"`
+	// Addressees are resolved at admission; raw "@name" text is never matched.
+	Addressees    []ProvenanceActor `json:"addressees"`
+	TriggerReason string            `json:"trigger_reason"`
+	Urgency       string            `json:"urgency"`
+	CorrelationID *string           `json:"correlation_id"`
+	CausationID   *string           `json:"causation_id"`
+}
+
+// AdmissionAuthority records the right under which this delivery was admitted
+// (ADR 0011 §8). Direct chat is admitted on the Employer's own authority.
+type AdmissionAuthority struct {
+	Basis      string  `json:"basis"`
+	DecisionID *string `json:"decision_id"`
+}
+
+const maxProvenanceAddressees = 64
 
 var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
 
-func (p DirectChatProvenance) Validate() error {
+func (p InboundProvenance) Validate() error {
 	if p.Version != 1 {
 		return errors.New("provenance version must be 1")
 	}
@@ -249,25 +294,199 @@ func (p DirectChatProvenance) Validate() error {
 	if err := ValidatePersonalityAgentID(p.PersonalityAgentID); err != nil {
 		return fmt.Errorf("provenance: %w", err)
 	}
-	if p.Actor.Kind != "human" || !provenanceIDRegexp.MatchString(p.Actor.PrincipalID) {
-		return errors.New("provenance actor must be an authenticated human principal")
+	if err := p.Actor.Validate(); err != nil {
+		return fmt.Errorf("provenance actor: %w", err)
 	}
-	if p.Source.Surface != "direct_chat" {
-		return errors.New("provenance source surface must be direct_chat")
+	if err := p.Source.Validate(); err != nil {
+		return fmt.Errorf("provenance source: %w", err)
+	}
+	if err := p.Authority.Validate(); err != nil {
+		return fmt.Errorf("provenance authority: %w", err)
 	}
 	return nil
 }
 
-func (p *DirectChatProvenance) UnmarshalJSON(data []byte) error {
+func (a ProvenanceActor) Validate() error {
+	switch a.Kind {
+	case "human":
+		if a.PersonalityAgentID != "" {
+			return errors.New("a human actor must not carry a personality_agent_id")
+		}
+		return ValidateHumanID(a.HumanID)
+	case "personality_agent":
+		if a.HumanID != "" {
+			return errors.New("a personality agent actor must not carry a human_id")
+		}
+		return ValidatePersonalityAgentID(a.PersonalityAgentID)
+	default:
+		return fmt.Errorf("actor kind must be human or personality_agent, got %q", a.Kind)
+	}
+}
+
+func (s ProvenanceSource) Validate() error {
+	switch s.Surface {
+	case "direct_chat":
+		if s.WorkspaceID != nil || s.Place != nil || s.Delivery != nil {
+			return errors.New("direct chat has no workspace, place, or delivered message")
+		}
+		return nil
+	case "messaging":
+		if s.WorkspaceID != nil && !provenanceIDRegexp.MatchString(*s.WorkspaceID) {
+			return errors.New("workspace_id must be 1..256 ASCII identifier bytes")
+		}
+		if s.Place == nil {
+			return errors.New("messaging must carry a place")
+		}
+		if err := s.Place.Validate(); err != nil {
+			return err
+		}
+		if s.Delivery == nil {
+			return errors.New("messaging must carry the delivered message")
+		}
+		return s.Delivery.Validate()
+	default:
+		return fmt.Errorf("surface must be direct_chat or messaging, got %q", s.Surface)
+	}
+}
+
+func (p ProvenancePlace) Validate() error {
+	switch p.Kind {
+	case "channel":
+		if p.DmID != "" {
+			return errors.New("a channel place must not carry a dm_id")
+		}
+		if !provenanceIDRegexp.MatchString(p.ChannelID) {
+			return errors.New("channel_id must be 1..256 ASCII identifier bytes")
+		}
+	case "dm", "group_dm":
+		if p.ChannelID != "" {
+			return errors.New("a DM place must not carry a channel_id")
+		}
+		if !provenanceIDRegexp.MatchString(p.DmID) {
+			return errors.New("dm_id must be 1..256 ASCII identifier bytes")
+		}
+	default:
+		return fmt.Errorf("place kind must be channel, dm, or group_dm, got %q", p.Kind)
+	}
+	return nil
+}
+
+func (d ProvenanceDelivery) Validate() error {
+	if !provenanceIDRegexp.MatchString(d.MessageID) {
+		return errors.New("message_id must be 1..256 ASCII identifier bytes")
+	}
+	if d.Seq > maxJSONSafeInteger {
+		return errors.New("delivery seq exceeds the JSON-safe integer range")
+	}
+	if d.Addressees == nil {
+		return errors.New("addressees must be present, empty when nobody was addressed")
+	}
+	if len(d.Addressees) > maxProvenanceAddressees {
+		return fmt.Errorf("at most %d resolved addressees may be carried", maxProvenanceAddressees)
+	}
+	for i, addressee := range d.Addressees {
+		if err := addressee.Validate(); err != nil {
+			return fmt.Errorf("addressee %d: %w", i, err)
+		}
+	}
+	switch d.TriggerReason {
+	case "mention", "direct_message", "place_activity":
+	default:
+		return fmt.Errorf("unknown trigger_reason %q", d.TriggerReason)
+	}
+	switch d.Urgency {
+	case "urgent", "normal", "fyi":
+	default:
+		return fmt.Errorf("unknown urgency %q", d.Urgency)
+	}
+	if d.CorrelationID != nil && !provenanceIDRegexp.MatchString(*d.CorrelationID) {
+		return errors.New("correlation_id must be 1..256 ASCII identifier bytes")
+	}
+	if d.CausationID != nil && !provenanceIDRegexp.MatchString(*d.CausationID) {
+		return errors.New("causation_id must be 1..256 ASCII identifier bytes")
+	}
+	return nil
+}
+
+func (a AdmissionAuthority) Validate() error {
+	switch a.Basis {
+	case "employer", "place_membership", "connection":
+	default:
+		return fmt.Errorf("unknown authority basis %q", a.Basis)
+	}
+	if a.DecisionID != nil && !provenanceIDRegexp.MatchString(*a.DecisionID) {
+		return errors.New("decision_id must be 1..256 ASCII identifier bytes")
+	}
+	return nil
+}
+
+// directChatSourceJSON and messagingSourceJSON keep the wire shape closed per
+// surface: a direct chat source carries only "surface", and a messaging source
+// always carries every messaging field, nulls included.
+type directChatSourceJSON struct {
+	Surface string `json:"surface"`
+}
+
+type messagingSourceJSON struct {
+	Surface     string              `json:"surface"`
+	WorkspaceID *string             `json:"workspace_id"`
+	Place       *ProvenancePlace    `json:"place"`
+	Delivery    *ProvenanceDelivery `json:"delivery"`
+}
+
+func (s ProvenanceSource) MarshalJSON() ([]byte, error) {
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+	if s.Surface == "direct_chat" {
+		return json.Marshal(directChatSourceJSON{Surface: s.Surface})
+	}
+	return json.Marshal(messagingSourceJSON{
+		Surface:     s.Surface,
+		WorkspaceID: s.WorkspaceID,
+		Place:       s.Place,
+		Delivery:    s.Delivery,
+	})
+}
+
+func (s *ProvenanceSource) UnmarshalJSON(data []byte) error {
+	var decoded messagingSourceJSON
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Surface == "direct_chat" {
+		// Explicit nulls are indistinguishable from absent fields once decoded,
+		// so re-decode against the closed direct chat shape. Otherwise Go would
+		// accept {"surface":"direct_chat","place":null} that the canonical
+		// schema and the agent both reject.
+		var directChat directChatSourceJSON
+		if err := unmarshalStrict(data, &directChat); err != nil {
+			return err
+		}
+	}
+	value := ProvenanceSource{
+		Surface:     decoded.Surface,
+		WorkspaceID: decoded.WorkspaceID,
+		Place:       decoded.Place,
+		Delivery:    decoded.Delivery,
+	}
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	*s = value
+	return nil
+}
+
+func (p *InboundProvenance) UnmarshalJSON(data []byte) error {
 	if err := checkDuplicateKeys(data); err != nil {
 		return fmt.Errorf("provenance json: %w", err)
 	}
-	type wire DirectChatProvenance
+	type wire InboundProvenance
 	var decoded wire
 	if err := unmarshalStrict(data, &decoded); err != nil {
 		return err
 	}
-	value := DirectChatProvenance(decoded)
+	value := InboundProvenance(decoded)
 	if err := value.Validate(); err != nil {
 		return err
 	}
@@ -279,11 +498,11 @@ func (p *DirectChatProvenance) UnmarshalJSON(data []byte) error {
 // API to the agent. The top-level target is intentionally repeated so internal
 // routing can verify it exactly matches authenticated provenance.
 type CommandEnvelope struct {
-	Seq                uint64               `json:"seq"`
-	CommandID          string               `json:"command_id"`
-	PersonalityAgentID string               `json:"personality_agent_id"`
-	Provenance         DirectChatProvenance `json:"provenance"`
-	Command            json.RawMessage      `json:"command"`
+	Seq                uint64            `json:"seq"`
+	CommandID          string            `json:"command_id"`
+	PersonalityAgentID string            `json:"personality_agent_id"`
+	Provenance         InboundProvenance `json:"provenance"`
+	Command            json.RawMessage   `json:"command"`
 }
 
 func (c CommandEnvelope) Validate() error {
@@ -315,11 +534,11 @@ func (c *CommandEnvelope) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("command envelope json: %w", err)
 	}
 	type rawEnvelope struct {
-		Seq                *uint64               `json:"seq"`
-		CommandID          *string               `json:"command_id"`
-		PersonalityAgentID *string               `json:"personality_agent_id"`
-		Provenance         *DirectChatProvenance `json:"provenance"`
-		Command            json.RawMessage       `json:"command"`
+		Seq                *uint64            `json:"seq"`
+		CommandID          *string            `json:"command_id"`
+		PersonalityAgentID *string            `json:"personality_agent_id"`
+		Provenance         *InboundProvenance `json:"provenance"`
+		Command            json.RawMessage    `json:"command"`
 	}
 	var raw rawEnvelope
 	if err := unmarshalStrict(data, &raw); err != nil {

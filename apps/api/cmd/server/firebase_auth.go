@@ -161,7 +161,7 @@ func browserAuthServerFromEnvWithDB(
 			firebaseTenantID,
 			agentevents.UserSessionClaims{
 				TenantID:           tenantID,
-				UserID:             userID,
+				HumanID:            userID,
 				PersonalityAgentID: personalityAgentID,
 			},
 		)

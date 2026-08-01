@@ -42,7 +42,7 @@ use crate::provider::types::{
     RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
     UserContent, UserMessage,
 };
-use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{InboundProvenanceV1, PersonalityAgentId};
 
 /// UUIDv5 namespace for deriving a user `message_id` from a canonical
 /// `command_id`. API and web consumers must use the same namespace so they can
@@ -302,7 +302,7 @@ pub struct WireCommandEnvelope {
     seq: u64,
     command_id: String,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: InboundProvenanceV1,
     command: WireCommand,
 }
 
@@ -319,7 +319,7 @@ impl WireCommandEnvelope {
         &self.personality_agent_id
     }
 
-    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+    pub fn provenance(&self) -> &InboundProvenanceV1 {
         &self.provenance
     }
 
@@ -334,7 +334,7 @@ struct WireCommandEnvelopeInput {
     seq: u64,
     command_id: String,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: InboundProvenanceV1,
     command: WireCommand,
 }
 
@@ -2025,7 +2025,7 @@ mod tests {
     fn command_envelope_round_trips() {
         let envelope = CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq: 7,
             command_id: uuid_command_id(),
             command: Command::UserMessage {
@@ -2051,7 +2051,7 @@ mod tests {
                 "seq": 1,
                 "command_id": command_id,
                 "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-                "provenance": crate::gateway::test_direct_chat_provenance(),
+                "provenance": crate::gateway::test_inbound_provenance(),
                 "command": {"type": "abort"},
             });
             assert!(
@@ -2067,7 +2067,7 @@ mod tests {
             "seq": 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
             "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "provenance": crate::gateway::test_inbound_provenance(),
             "command": {"type": "abort"},
         });
         assert!(serde_json::from_value::<WireCommandEnvelope>(valid.clone()).is_ok());
@@ -3064,7 +3064,7 @@ mod tests {
     fn try_from_command_envelope_rejects_non_empty_attachments() {
         let envelope = CommandEnvelope {
             personality_agent_id: crate::gateway::test_personality_agent_id(),
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: crate::gateway::test_inbound_provenance(),
             seq: 1,
             command_id: uuid_command_id(),
             command: Command::UserMessage {
@@ -3269,7 +3269,7 @@ mod tests {
             "seq": MAX_JSON_SAFE_INTEGER + 1,
             "command_id": "00000000-0000-4000-8000-000000000001",
             "personality_agent_id": crate::gateway::TEST_PERSONALITY_AGENT_ID,
-            "provenance": crate::gateway::test_direct_chat_provenance(),
+            "provenance": crate::gateway::test_inbound_provenance(),
             "command": { "type": "abort" }
         });
         assert!(

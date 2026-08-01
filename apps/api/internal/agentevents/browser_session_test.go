@@ -173,7 +173,7 @@ func (s *testBrowserSessionRevocationStore) RotateBrowserSession(
 
 type testSessionClaims struct {
 	TenantID           string `json:"tenant_id"`
-	UserID             string `json:"user_id"`
+	HumanID            string `json:"human_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
 	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
@@ -246,7 +246,7 @@ func TestHMACUserSessionVerifierFencesPreLineageCookies(t *testing.T) {
 	verifier.now = func() time.Time { return now }
 	claims := testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Iat:                now.Add(-time.Minute).Unix(),
 		Exp:                now.Add(time.Minute).Unix(),
@@ -292,7 +292,7 @@ func TestHMACUserSessionVerifierRequiresBoundedLifecycleClaims(t *testing.T) {
 	v.now = func() time.Time { return now }
 	valid := testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Iat:                now.Add(-time.Minute).Unix(),
 		Exp:                now.Add(time.Minute).Unix(),
@@ -335,7 +335,7 @@ func TestHMACUserSessionVerifierRevocationIsAnAdmissionBarrier(t *testing.T) {
 	}
 	session, err := v.IssueSession(context.Background(), UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}, time.Minute)
 	if err != nil {
@@ -401,7 +401,7 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRevocations(t *testing.T) {
 	revocations.max = 1
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	first, err := v.IssueSession(context.Background(), claims, time.Minute)
@@ -439,7 +439,7 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRotationLineage(t *testing.T) {
 	verifier.now = func() time.Time { return now }
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	current, err := verifier.IssueSession(
@@ -534,7 +534,7 @@ func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T)
 	}
 	session, err := first.IssueSession(context.Background(), UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}, time.Minute)
 	if err != nil {
@@ -592,7 +592,7 @@ func TestDurableBrowserSessionRevocationRejectsCorruptionAndResetsPreLineageStat
 		context.Background(),
 		UserSessionClaims{
 			TenantID:           "tenant-1",
-			UserID:             "user-1",
+			HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		},
 		time.Minute,
@@ -678,7 +678,7 @@ func TestV2BrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
 	second.now = func() time.Time { return now }
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	ancestor, err := first.IssueSession(
@@ -763,7 +763,7 @@ func TestV2BrowserSessionRotationThenLogoutRevokesSuccessorAcrossRestart(
 	}
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	current, err := first.IssueSession(
@@ -904,7 +904,7 @@ func TestDurableBrowserSessionLogoutThenRotationRejectsSuccessor(
 	}
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	current, err := first.IssueSession(
@@ -1015,7 +1015,7 @@ func TestDurableBrowserSessionRevocationFailuresFailClosed(t *testing.T) {
 	}
 	claims := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	first, err := verifier.IssueSession(context.Background(), claims, time.Minute)
@@ -1064,7 +1064,7 @@ func TestHMACUserSessionVerifierAcceptsValidSession(t *testing.T) {
 
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -1074,7 +1074,7 @@ func TestHMACUserSessionVerifierAcceptsValidSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify valid session: %v", err)
 	}
-	if claims.TenantID != "tenant-1" || claims.UserID != "user-1" || claims.PersonalityAgentID != "018f47a2-9b3c-7def-8abc-0123456789ab" {
+	if claims.TenantID != "tenant-1" || claims.HumanID != "018f47a2-9b3c-7def-8abc-00000000ab01" || claims.PersonalityAgentID != "018f47a2-9b3c-7def-8abc-0123456789ab" {
 		t.Fatalf("unexpected claims: %+v", claims)
 	}
 }
@@ -1086,7 +1086,7 @@ func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
 	}
 	want := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}
 	session, err := v.IssueSession(context.Background(), want, 5*time.Minute)
@@ -1098,7 +1098,7 @@ func TestHMACUserSessionVerifierIssuesItsOwnVerifiableSession(t *testing.T) {
 		t.Fatalf("verify issued session: %v", err)
 	}
 	if got.TenantID != want.TenantID ||
-		got.UserID != want.UserID ||
+		got.HumanID != want.HumanID ||
 		got.PersonalityAgentID != want.PersonalityAgentID {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
@@ -1117,7 +1117,7 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 	v.now = func() time.Time { return now }
 	binding := UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		authorityBindingID: strings.Repeat("caller-authored", 4),
 	}
@@ -1167,7 +1167,7 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 		testSessionSecret,
 		userSessionWireClaims{
 			TenantID:           binding.TenantID,
-			UserID:             binding.UserID,
+			HumanID:            binding.HumanID,
 			PersonalityAgentID: binding.PersonalityAgentID,
 		},
 	)
@@ -1189,7 +1189,7 @@ func TestHMACUserSessionVerifierScopesOpaqueAuthorityBinding(t *testing.T) {
 		},
 		{
 			name:   "human principal",
-			mutate: func(claims *UserSessionClaims) { claims.UserID = "user-2" },
+			mutate: func(claims *UserSessionClaims) { claims.HumanID = "018f47a2-9b3c-7def-8abc-00000000ab02" },
 		},
 		{
 			name: "target personality agent",
@@ -1235,7 +1235,7 @@ func TestHMACUserSessionVerifierRejectsWrongAudience(t *testing.T) {
 
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                "other-audience",
@@ -1260,22 +1260,22 @@ func TestHMACUserSessionVerifierRejectsDuplicateKeysUnknownFieldsAndWrongTyp(t *
 		{
 			name:   "duplicate header keys",
 			header: `{"alg":"HS256","alg":"HS256","typ":"JWT"}`,
-			claims: `{"tenant_id":"tenant-1","user_id":"user-1","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
+			claims: `{"tenant_id":"tenant-1","user_id":"018f47a2-9b3c-7def-8abc-00000000ab01","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
 		},
 		{
 			name:   "duplicate claims keys",
 			header: `{"alg":"HS256","typ":"JWT"}`,
-			claims: `{"tenant_id":"tenant-1","tenant_id":"tenant-1","user_id":"user-1","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
+			claims: `{"tenant_id":"tenant-1","tenant_id":"tenant-1","user_id":"018f47a2-9b3c-7def-8abc-00000000ab01","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
 		},
 		{
 			name:   "unknown header field",
 			header: `{"alg":"HS256","typ":"JWT","extra":"field"}`,
-			claims: `{"tenant_id":"tenant-1","user_id":"user-1","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
+			claims: `{"tenant_id":"tenant-1","user_id":"018f47a2-9b3c-7def-8abc-00000000ab01","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
 		},
 		{
 			name:   "wrong typ",
 			header: `{"alg":"HS256","typ":"session"}`,
-			claims: `{"tenant_id":"tenant-1","user_id":"user-1","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
+			claims: `{"tenant_id":"tenant-1","user_id":"018f47a2-9b3c-7def-8abc-00000000ab01","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultBrowserAudience + `"}`,
 		},
 	}
 
@@ -1307,7 +1307,7 @@ func TestHMACUserSessionVerifierRejectsTamperedSignature(t *testing.T) {
 
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,
@@ -1329,7 +1329,7 @@ func TestHMACUserSessionVerifierRejectsPaddedInput(t *testing.T) {
 
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                defaultBrowserAudience,

@@ -60,7 +60,7 @@ func (r *kosekiIdentityBindingResolver) ResolveIdentity(
 func (r *kosekiIdentityBindingResolver) claims(humanID, agentID string) agentevents.UserSessionClaims {
 	return agentevents.UserSessionClaims{
 		TenantID:           r.tenantID,
-		UserID:             humanID,
+		HumanID:            humanID,
 		PersonalityAgentID: agentID,
 	}
 }

@@ -41,7 +41,7 @@ type testTokenClaims struct {
 
 type testSessionClaims struct {
 	TenantID           string `json:"tenant_id"`
-	UserID             string `json:"user_id"`
+	HumanID            string `json:"human_id"`
 	PersonalityAgentID string `json:"personality_agent_id"`
 	Iat                int64  `json:"iat"`
 	Exp                int64  `json:"exp"`
@@ -97,7 +97,7 @@ func signTestSession(t *testing.T, secret []byte, claims testSessionClaims) stri
 		context.Background(),
 		agentevents.UserSessionClaims{
 			TenantID:           claims.TenantID,
-			UserID:             claims.UserID,
+			HumanID:            claims.HumanID,
 			PersonalityAgentID: claims.PersonalityAgentID,
 		},
 		time.Duration(claims.Exp-claims.Iat)*time.Second,
@@ -191,7 +191,7 @@ func postWithSessionCookie(t *testing.T, serverURL, personalityAgentID string, b
 	t.Helper()
 	session := signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: personalityAgentID,
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                agentevents.DefaultBrowserAudience(),
@@ -337,7 +337,7 @@ func TestApplicationCloseOwnsAndDrainsHijackedBrowserSocketsBeforeStoreClose(t *
 
 	session, err := sessions.IssueSession(context.Background(), agentevents.UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}, time.Minute)
 	if err != nil {
@@ -632,7 +632,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	req1.Header.Set("Origin", testBrowserOrigin)
 	req1.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                agentevents.DefaultBrowserAudience(),
@@ -663,7 +663,7 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	req2.Header.Set("Origin", testBrowserOrigin)
 	req2.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signTestSession(t, testSessionSecret, testSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Exp:                time.Now().Add(time.Hour).Unix(),
 		Aud:                agentevents.DefaultBrowserAudience(),

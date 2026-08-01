@@ -31,7 +31,7 @@ type fakeCommandAppender struct {
 
 type appendCall struct {
 	PersonalityAgentID string
-	Provenance         DirectChatProvenance
+	Provenance         InboundProvenance
 	IdempotencyKey     string
 	Command            json.RawMessage
 }
@@ -99,7 +99,7 @@ func (f *fakeSessionVerifier) VerifySession(ctx context.Context, cookie string) 
 	}
 	return UserSessionClaims{
 		TenantID:           "tenant-1",
-		UserID:             "user-1",
+		HumanID:            "018f47a2-9b3c-7def-8abc-00000000ab01",
 		PersonalityAgentID: conv,
 	}, nil
 }
@@ -125,7 +125,7 @@ func signTestIngressSession(personalityAgentID string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	claims, _ := json.Marshal(map[string]any{
 		"tenant_id":            "tenant-1",
-		"user_id":              "user-1",
+		"user_id":              "018f47a2-9b3c-7def-8abc-00000000ab01",
 		"personality_agent_id": personalityAgentID,
 		"exp":                  1893456000,
 		"aud":                  defaultBrowserAudience,
@@ -148,7 +148,7 @@ func (errorReadCloser) Close() error {
 	return nil
 }
 
-func (f *fakeCommandAppender) Append(ctx context.Context, provenance DirectChatProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
+func (f *fakeCommandAppender) Append(ctx context.Context, provenance InboundProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextSeq++
@@ -239,7 +239,7 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	if appender.callCount() != 1 {
 		t.Fatalf("expected 1 append call, got %d", appender.callCount())
 	}
-	wantProvenance := testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab")
+	wantProvenance := testInboundProvenance("018f47a2-9b3c-7def-8abc-0123456789ab")
 	if got := appender.calls[0].Provenance; got != wantProvenance {
 		t.Fatalf("server-authored provenance mismatch: got %+v want %+v", got, wantProvenance)
 	}

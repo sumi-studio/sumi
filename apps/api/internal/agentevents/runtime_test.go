@@ -132,7 +132,7 @@ func TestDurableGatewayFencesStaleAckDurableAndVolatileEvents(t *testing.T) {
 	stale := currentRuntimeClaims(t, gateway, personalityAgentID)
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(personalityAgentID),
+		testInboundProvenance(personalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -540,7 +540,7 @@ func TestBrowserCommandAdmissionFencesNotReadyAcrossGateways(t *testing.T) {
 		t.Fatal(err)
 	}
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
-	provenance := testDirectChatProvenance(personalityAgentID)
+	provenance := testInboundProvenance(personalityAgentID)
 	command := json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)
 
 	if err := first.PublishRuntimeState(personalityAgentID, 7, nil); err != nil {
@@ -602,7 +602,7 @@ func TestBrowserCommandAdmissionSerializesGenerationRolloverWithDurableAppend(t 
 	go func() {
 		_, err := first.Append(
 			context.Background(),
-			testDirectChatProvenance(personalityAgentID),
+			testInboundProvenance(personalityAgentID),
 			"before-rollover",
 			json.RawMessage(`{"type":"user_message","text":"before","attachments":[]}`),
 		)
@@ -656,7 +656,7 @@ appendHoldsRuntimeLock:
 	}
 	if _, err := second.Append(
 		context.Background(),
-		testDirectChatProvenance(personalityAgentID),
+		testInboundProvenance(personalityAgentID),
 		"after-rollover",
 		json.RawMessage(`{"type":"user_message","text":"after","attachments":[]}`),
 	); !errors.Is(err, errBrowserRuntimeUnavailable) {
@@ -881,7 +881,7 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -934,11 +934,11 @@ func TestDurableGatewayNextCommandSeqUsesDurableTerminalAckStateAcrossRestart(t 
 		t.Fatal(err)
 	}
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678982")
-	first, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"one","attachments":[]}`))
+	first, err := store.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"one","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"two","attachments":[]}`))
+	second, err := store.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"two","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -975,7 +975,7 @@ func TestDurableGatewayNextCommandSeqSupportsOutOfOrderTerminalAcks(t *testing.T
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678986")
 	commands := make([]CommandEnvelope, 0, 3)
 	for i := 0; i < 3; i++ {
-		command, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+		command, err := gateway.commands.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1066,11 +1066,11 @@ func TestDurableGatewayNextCommandSeqDoesNotBlockOtherPersonalityAgentAck(t *tes
 	gateway := openRuntimeGateway(t)
 	firstClaims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678980")
 	secondClaims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678981")
-	first, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(firstClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
+	first, err := gateway.commands.Append(context.Background(), testInboundProvenance(firstClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(secondClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
+	second, err := gateway.commands.Append(context.Background(), testInboundProvenance(secondClaims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1131,7 +1131,7 @@ func TestFoldAckCursorRecordRejectsInvalidTransitionWithoutStateChange(t *testin
 func TestDurableGatewayNextCommandSeqFlockHonorsCancellation(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678983")
-	if _, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+	if _, err := gateway.commands.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.OpenFile(gateway.ackPath(claims.PersonalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
@@ -1183,7 +1183,7 @@ func TestDurableGatewayNextCommandSeqRejectsContradictoryRestartAckHistory(t *te
 				t.Fatal(err)
 			}
 			claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678984")
-			command, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			command, err := store.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1238,7 +1238,7 @@ func TestDurableGatewayNextCommandSeqRejectsMalformedRestartAck(t *testing.T) {
 				t.Fatal(err)
 			}
 			claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-012345678985")
-			command, err := store.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
+			command, err := store.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1317,7 +1317,7 @@ func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1385,7 +1385,7 @@ func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		if _, err := gateway.commands.Append(context.Background(), testDirectChatProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+		if _, err := gateway.commands.Append(context.Background(), testInboundProvenance(claims.PersonalityAgentID), "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1582,7 +1582,7 @@ func TestDurableGatewayAckLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1614,7 +1614,7 @@ func TestDurableGatewayAckLogRejectsCorruptRecordOnFindAckLookup(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1645,7 +1645,7 @@ func TestDurableGatewayAckAppendRollsBackOnWriteFailure(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1678,7 +1678,7 @@ func TestDurableGatewayAckAppendRollsBackOnSyncFailure(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1711,7 +1711,7 @@ func TestDurableGatewayAckRecoversFromIncompleteFinalRecord(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	command, err := gateway.commands.Append(
 		context.Background(),
-		testDirectChatProvenance(claims.PersonalityAgentID),
+		testInboundProvenance(claims.PersonalityAgentID),
 		"",
 		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
 	)
@@ -1772,7 +1772,7 @@ func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
 				t.Helper()
 				command, err := g.commands.Append(
 					context.Background(),
-					testDirectChatProvenance(claims.PersonalityAgentID),
+					testInboundProvenance(claims.PersonalityAgentID),
 					"",
 					json.RawMessage(`{"type":"abort"}`),
 				)
@@ -1830,7 +1830,7 @@ func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
 	// Append a command after Live has returned its channels. Because Live starts
 	// polling from fromSeq, the next tick must deliver it rather than advance
 	// past it.
-	env, err := gateway.commands.Append(ctx, testDirectChatProvenance(claims.PersonalityAgentID), "key-1", raw)
+	env, err := gateway.commands.Append(ctx, testInboundProvenance(claims.PersonalityAgentID), "key-1", raw)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
