@@ -13,7 +13,6 @@ import { useNavigate } from "@tanstack/react-router";
 import {
   Check,
   ChevronRight,
-  DoorOpen,
   LogOut,
   Monitor,
   Moon,
@@ -49,31 +48,24 @@ export function AppNavigation() {
       <nav className="flex flex-col gap-1 px-1 py-2" aria-label="Sumi">
         {LOCAL_APP_DESCRIPTORS.map((app) => {
           const Icon = app.icon;
+          const active = app.id === "direct";
           return (
             <NavigationTooltip key={app.id} label={app.label}>
               <Button
                 variant="ghost"
                 size="icon"
                 aria-label={app.label}
-                onClick={() => void navigate({ to: app.route })}
-                className="size-10"
+                aria-current={active ? "page" : undefined}
+                onClick={
+                  active ? undefined : () => void navigate({ to: app.route })
+                }
+                className={`size-10 ${active ? "bg-interactive-active" : ""}`}
               >
                 <Icon className="size-4" />
               </Button>
             </NavigationTooltip>
           );
         })}
-        <NavigationTooltip label="直通">
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="直通"
-            aria-current="page"
-            className="size-10 bg-interactive-active"
-          >
-            <DoorOpen className="size-4" />
-          </Button>
-        </NavigationTooltip>
       </nav>
       <div className="mt-auto px-2 pb-3">
         <SettingsPopover />

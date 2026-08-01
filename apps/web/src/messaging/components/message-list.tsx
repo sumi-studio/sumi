@@ -22,6 +22,9 @@ import { MessageItem } from "./message-item";
 const NO_PENDING: PendingMessage[] = [];
 const NO_NAMES: string[] = [];
 
+/** placeごとのスクロール位置記憶。最下部付近はInfinity（=常に最新へ）。 */
+const placeScrollMemory = new Map<string, number>();
+
 interface OlderRow {
   id: "__older__";
   kind: "older";
@@ -155,23 +158,77 @@ export function MessageList({
     [flashMessage, seqToId],
   );
 
-  // placeを開いたとき: 未読ラインがあればそこへ、なければ最下部へ。
+  // 現在位置をplaceごとに記憶し続ける（自前実装。routerの要素復元は
+  // 「直前ページの位置を新placeへ引き継ぐ」仕様が仮想リストと衝突するため不使用）。
+  const activeKeyRef = useRef(activePlaceKey);
+  activeKeyRef.current = activePlaceKey;
+  useEffect(() => {
+    const element = virtualizerRef.current?.getScrollElement();
+    if (!element) return;
+    const remember = () => {
+      const key = activeKeyRef.current;
+      if (!key) return;
+      const nearEnd =
+        element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      placeScrollMemory.set(
+        key,
+        nearEnd ? Number.POSITIVE_INFINITY : element.scrollTop,
+      );
+    };
+    element.addEventListener("scroll", remember, { passive: true });
+    return () => element.removeEventListener("scroll", remember);
+  }, []);
+
+  // placeを開いたとき: routerが覚えた位置 → 未読ライン → 最下部 の優先で復元する。
+  // 仮想リストは行高が測定済みになるまでscrollToが一発で効かないことがあるため、
+  // 数フレームに分けて同じ位置指定を再適用して収束させる。
   useEffect(() => {
     if (!activePlaceKey || rows.length === 0) return;
     if (positionedPlaceRef.current === activePlaceKey) return;
     positionedPlaceRef.current = activePlaceKey;
-    const frame = window.requestAnimationFrame(() => {
-      const hasUnread = rows.some((row) => row.kind === "unread");
-      if (hasUnread) {
-        virtualizerRef.current?.scrollToMessage("unread", {
-          align: "center",
-          behavior: "auto",
-        });
-      } else {
-        virtualizerRef.current?.scrollToEnd({ behavior: "auto" });
+    // 入室時点の記憶をスナップショットする（位置決め中のscrollイベントで
+    // 記憶が自己上書きされても目標がブレないように）。
+    const remembered = placeScrollMemory.get(activePlaceKey);
+    const hasUnread = rows.some((row) => row.kind === "unread");
+    const timers: number[] = [];
+    let applied = false;
+    // place切替直後はvirtualizer経由のscrollToが効かないことがあるため、
+    // 目標オフセットを計算して直接scrollToする。
+    const apply = () => {
+      const handle = virtualizerRef.current;
+      const element = handle?.getScrollElement();
+      if (!handle || !element) return;
+      applied = true;
+      const maxOffset = Math.max(
+        0,
+        element.scrollHeight - element.clientHeight,
+      );
+      if (remembered !== undefined) {
+        handle.scrollToOffset(
+          remembered === Number.POSITIVE_INFINITY
+            ? maxOffset
+            : Math.min(remembered, maxOffset),
+        );
+        return;
       }
-    });
-    return () => window.cancelAnimationFrame(frame);
+      if (hasUnread) {
+        const offset = handle.getMessageOffset("unread", "center");
+        if (offset !== null) handle.scrollToOffset(Math.max(0, offset));
+        return;
+      }
+      handle.scrollToOffset(maxOffset);
+    };
+    for (const delay of [0, 120, 300]) {
+      timers.push(window.setTimeout(apply, delay));
+    }
+    return () => {
+      for (const timer of timers) window.clearTimeout(timer);
+      // StrictModeの二重マウントで未発火のままcleanupされた場合は
+      // ガードを解除し、再マウント側で位置決めをやり直せるようにする。
+      if (!applied && positionedPlaceRef.current === activePlaceKey) {
+        positionedPlaceRef.current = null;
+      }
+    };
   }, [activePlaceKey, rows]);
 
   // 最下部にいるときだけ新着へ自動追従する（読んでいる視点は奪わない）。

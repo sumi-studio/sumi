@@ -1,4 +1,4 @@
-import { MessageCircle } from "lucide-react";
+import { DoorOpen, MessageCircle } from "lucide-react";
 import type { ComponentType } from "react";
 
 /**
@@ -20,6 +20,14 @@ export const LOCAL_APP_DESCRIPTORS: AppDescriptor[] = [
     label: "Sumi",
     icon: MessageCircle,
     route: "/",
+    renderer: "builtin",
+  },
+  {
+    // 直通 = 自分が雇う人格agent本人への生の回線。既存のトーク画面を使う。
+    id: "direct",
+    label: "直通",
+    icon: DoorOpen,
+    route: "/direct",
     renderer: "builtin",
   },
   // Mail、Calendar、Tasks…は実ルートを持ったときにここへ増える。
