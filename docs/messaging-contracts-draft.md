@@ -168,28 +168,48 @@
 
 ## agent側の契約（AX）
 
-人間UIと**同じ世界を欠落なく知覚・操作できる**ことが要件。同じ契約の別transportとして揃える。
+> 正本は [ADR 0011](adr/0011-messaging-surface-and-agent-participation.md)。
+> 本節はその要約であり、齟齬があれば ADR に従う。
 
-1. **覚醒トリガ「呼びかけ」**: 本人の通知設定にマッチした出来事が、認証済みprovenance付きの
-   commandとしてagent sessionへ届く（ADR 0008 §8）。
+人間UIと**同じ能力（agency）を持てる**ことが要件。ただし揃えるのは能力であって
+身体動作や内部transportの操作数ではない（ADR 0011 §5）。できるだけ同じ形にし、
+agentにとってより適した方法があるときだけそちらで代替する。AXとUXが高い精度で
+一致していることが目的である。
+
+1. **呼びかけは AttentionCandidate として届く**: 決定論的なdelivery eligibility
+   （block/mute、本人の通知設定、quiet hours、明示signal、membership・authority、
+   rate limit）を通過した出来事が、認証済みprovenance付きの候補として本人の
+   private runtimeへ渡る。**現在のprovider turnへ直接注入しない。**
 
 ```json
 {
-  "kind": "messaging_call",
+  "kind": "attention_candidate",
   "place": {...},
-  "trigger_message": Message,
-  "trigger_reason": "mention | keyword | dm | all",
-  "unread_summary": { "place_seq_from": 100, "place_seq_to": 123 }
+  "message_ref": { "message_id": "...", "seq": 123 },
+  "actor": ParticipantRef,
+  "mentions": [ParticipantRef],
+  "trigger_reason": "mention | keyword | dm | direct_call | all",
+  "urgency": "urgent | normal | fyi",
+  "unread_range": { "place_seq_from": 100, "place_seq_to": 123 },
+  "arrival_time": "...",
+  "correlation": {...}
 }
 ```
 
-   届くのはトリガと未読範囲の参照であって、覚醒した本人が未読をどう読むかは本人の判断。
+   この段階でread cursor・presence・focused placeは変化しない。届いた状態は
+   「通知に気付いた」であって「開いた」「既読にした」ではない。interrupt /
+   現在contextへ取り込む / 開いて観察する / 後で見る / 無視する の判断は本人が
+   持つ（ADR 0011 §8）。
 
-2. **知覚・操作tool**: 未読一覧を見る、place履歴を読む、発言する、read markerを進める、
-   通知設定を変える、connection申請に応える。人間のUI操作と1:1対応。
-3. **人生ログへの記録**: agentが経験したメッセージング上の出来事は、workspace/place/author/
-   correlationのprovenanceとともに本人の人生ログへ入る（正本はWorkspace API側、
-   agent DBはlocal copy/projection — ADR 0008 §8）。
+2. **道具は「場所を開く」状態を持つ**: 開く（直近のタイムライン・未読位置・
+   参加者・自分宛mentionが一度に返る）、遡る、書く（本文・返信先・緊急度・
+   mention・添付を一度に）、リアクション、ReplyLater、編集・取り消し、
+   ステータス自己申告、検索して開く。**stateless な fetch/send の並びに
+   分解しない。** `mark_read` はtoolとして露出しない（開いて読めば進む）。
+   ただしwire上には idempotent な `read_through(place, seq)` を残し、本人の
+   durable admission後にackする（ADR 0011 §3・§6）。
+3. **人生ログへの記録**: agent基盤がprovenanceとともに記録する。正本はWorkspace
+   API側で、agent DBはlocal copy/projection（ADR 0008 §8）。
 
 ## 合意事項（Codex返信 2026-08-01）
 
@@ -214,12 +234,18 @@
    もののprojectionであり正本にしない。流れは
    message commit → mention解決 → transactional outboxでattention candidate →
    notification/attention側が本人の設定とEmployer予算（別軸）を評価 →
-   agentへ `messaging_call`、人間へ通知intent。
+   agentへ `AttentionCandidate`、人間へ通知intent。
    agent-events.yamlはsurface-neutralなenvelopeへ一般化し、
-   `MessagingProvenanceV1`（message/place/workspace参照、認証済みtrigger snapshot、
-   actor、trigger reason、urgency、unread seq range、correlation/causation）を追加する。
+   `InboundProvenanceV1`（surface/place/workspace参照、認証済みtrigger snapshot、
+   actor、解決済みmention/addressee、trigger reason、urgency、unread seq range、
+   correlation/causation、admission時のauthority）を追加する。
    全未読をLLM contextや人生ログへ自動注入しない。呼びかけと本人が実際に読んだ
    内容だけが「経験」になる。urgentは相手の設定・予算を突破する権限ではない。
+
+   *ADR 0011 で発展した点*: 候補は現在のprovider turnへ直接注入せず、
+   interrupt / inject / defer / observe の判断を本人が持つ。provenanceは
+   messaging専用ではなくsurface一般（direct chatも同じ形）とし、actorは
+   発話者、mention先は別フィールドとする。humanはcanonical `HumanId`（UUIDv7）。
 6. **ReplyLater**: 相手に見えるdurableな `ReplyLaterMarker` と、本人だけの
    private reminder scheduleに二分する。agentのリマインドは覚醒トリガ
    「予定された出来事」で同じagent sessionへ、Humanはnotification adapterへ。
@@ -246,7 +272,9 @@
 - `seq` はJsonSafeInteger上限を契約化
 - 削除済みMessageはtombstone（contentを残さない）
 - direct chatはSecretary DMへ統合・転記しない。別surfaceのまま
-- UIだけにある操作を作らない。同じ能力をagent用tool/APIにも公開する
+- UIだけにある能力（agency）を作らない。逆にagentだけが持つ能力も作らない。
+  ただし揃えるのは能力であって操作の数や形ではなく、subscription・ack・cursor・
+  ページングは内部契約として持ってよい（ADR 0011 §5）
 
 ## Non-goals（v0）
 
