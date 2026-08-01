@@ -48,6 +48,21 @@ type IdentityBindingResolver interface {
 	ResolveIdentity(ctx context.Context, identity FirebaseIdentity) (UserSessionClaims, error)
 }
 
+// DirectChatAuthorizer gates the 私信 Surface (raw direct chat) on the calling
+// Human being the current Employer of the target agent (ADR 0009 §5). A nil
+// authorizer permits all verified sessions, preserving the legacy single-user
+// contract for tests and the static binding fallback.
+type DirectChatAuthorizer interface {
+	AuthorizeDirectChat(ctx context.Context, humanID, personalityAgentID string) error
+}
+
+// DirectChatSpawner lazily starts an agent runtime on 呼びかけ (ADR 0010). A nil
+// spawner disables lazy spawn (the agent is assumed already running).
+type DirectChatSpawner interface {
+	EnsureRunning(ctx context.Context, agentID string) error
+	Touch(agentID string)
+}
+
 // StaticIdentityBindingResolver is the deliberately narrow hackathon binding:
 // exactly one configured Firebase UID maps to exactly one server-owned Sumi
 // principal. Every other external identity is denied.

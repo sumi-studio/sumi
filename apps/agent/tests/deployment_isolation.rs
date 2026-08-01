@@ -854,6 +854,7 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
     assert_eq!(
         volume_sources(allocator),
         string_set(&[
+            "allocator-root",
             "allocator-state",
             "broker-identity",
             "executor-identity",
@@ -888,8 +889,9 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
     );
     for long_lived in [runtime, executor, broker] {
         assert!(
-            !volume_sources(long_lived).contains("allocator-state"),
-            "allocator state leaked into a long-lived role"
+            !volume_sources(long_lived).contains("allocator-state")
+                && !volume_sources(long_lived).contains("allocator-root"),
+            "allocator trust state leaked into a long-lived role"
         );
     }
 
@@ -923,7 +925,8 @@ fn allocator_state_and_role_identity_are_not_shared_with_long_lived_services() {
     for mount in volume_strings(allocator) {
         let target = mount.split(':').nth(1).unwrap();
         assert!(
-            target.starts_with("/var/lib/sumi-allocator-root/"),
+            target == "/var/lib/sumi-allocator-root"
+                || target.starts_with("/var/lib/sumi-allocator-root/"),
             "allocator mount escaped the pinned trust root: {mount}"
         );
     }

@@ -1,0 +1,30 @@
+# Build artifacts and caches
+node_modules
+apps/*/node_modules
+packages/*/node_modules
+.pnpm-store
+.pnpm-debug.log
+
+# Git and IDE state
+.git
+.claude
+.vscode
+.idea
+
+# Local environment (should be injected, not baked into images)
+.env
+.env.local
+.env.*
+
+# Temporary and artifact directories
+target
+apps/agent/target
+dist
+build
+*.log
+
+# Generated local Go binary (the API image builds its own binary).
+apps/api/server
+
+# Docker and compose volumes we should never copy
+.deploy/local/volumes

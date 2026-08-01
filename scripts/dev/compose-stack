@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
+readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
+readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
+
+ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
+RUNTIME_ENV_FD=
+
+log() {
+  printf '[sumi-compose-stack] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+random_token() {
+  openssl rand -hex 32
+}
+
+random_base64() {
+  openssl rand -base64 48 | tr -d '\n'
+}
+
+require_value() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "${name} is required"
+}
+
+lock_runtime_env_file() {
+  require_command flock
+  exec {RUNTIME_ENV_FD}<>"${RUNTIME_ENV_FILE}"
+  flock -x "${RUNTIME_ENV_FD}"
+}
+
+unlock_runtime_env_file() {
+  flock -u "${RUNTIME_ENV_FD}"
+  exec {RUNTIME_ENV_FD}>&-
+  RUNTIME_ENV_FD=
+}
+
+validate_firebase_web_config() {
+  local configured=0 name
+  for name in \
+    VITE_FIREBASE_API_KEY \
+    VITE_FIREBASE_AUTH_DOMAIN \
+    VITE_FIREBASE_PROJECT_ID \
+    VITE_FIREBASE_APP_ID
+  do
+    [[ -n "${!name:-}" ]] && configured=1
+  done
+  if ((configured)); then
+    for name in \
+      VITE_FIREBASE_API_KEY \
+      VITE_FIREBASE_AUTH_DOMAIN \
+      VITE_FIREBASE_PROJECT_ID \
+      VITE_FIREBASE_APP_ID
+    do
+      require_value "${name}"
+    done
+  fi
+}
+
+load_env_file() {
+  local file="$1"
+  if [[ -f "${file}" ]]; then
+    while IFS='=' read -r key value; do
+      [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+      [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      if ! [[ -v "${key}" ]]; then
+        export "${key}=${value}"
+      fi
+    done < "${file}"
+  fi
+}
+
+ensure_runtime_env_file() {
+  local directory temporary metadata
+  directory="$(dirname "${RUNTIME_ENV_FILE}")"
+  mkdir -p "${directory}"
+
+  if [[ ! -e "${RUNTIME_ENV_FILE}" && ! -L "${RUNTIME_ENV_FILE}" ]]; then
+    temporary="${RUNTIME_ENV_FILE}.tmp.$$"
+    (
+      umask 077
+      {
+        printf 'SUMI_LOCAL_CONTROL_BEARER=%s\n' "$(random_token)"
+        printf 'SUMI_AGENT_WRAPPING_KEY=%s\n' "$(random_token)"
+        printf 'SUMI_APPROVAL_SECRET_DIGEST_KEY=%s\n' "$(random_token)"
+        printf 'SUMI_AGENT_TOKEN_SECRET=%s\n' "$(random_base64)"
+        printf 'SUMI_BROWSER_SESSION_SECRET=%s\n' "$(random_base64)"
+      } > "${temporary}"
+    )
+    # A hard-link publish is atomic and refuses to replace an existing file.
+    # A concurrent launcher may win; in that case its complete file is used.
+    if ln "${temporary}" "${RUNTIME_ENV_FILE}" 2>/dev/null; then
+      :
+    elif [[ ! -f "${RUNTIME_ENV_FILE}" || -L "${RUNTIME_ENV_FILE}" ]]; then
+      rm -f "${temporary}"
+      fail "cannot create trusted runtime env file: ${RUNTIME_ENV_FILE}"
+    fi
+    rm -f "${temporary}"
+  fi
+
+  [[ -f "${RUNTIME_ENV_FILE}" && ! -L "${RUNTIME_ENV_FILE}" ]] ||
+    fail "runtime env file must be a regular non-symlink: ${RUNTIME_ENV_FILE}"
+  metadata="$(stat -Lc '%u:%a:%h' -- "${RUNTIME_ENV_FILE}")" ||
+    fail "cannot inspect runtime env file: ${RUNTIME_ENV_FILE}"
+  [[ "${metadata}" == "$(id -u):600:1" ]] ||
+    fail "runtime env file must be owned by the current user with mode 0600 and one link"
+}
+
+ensure_persisted_runtime_secret() {
+  local name="$1"
+  local value
+  [[ "${name}" =~ ^[A-Z][A-Z0-9_]*$ ]] || fail "invalid runtime secret name"
+  [[ -n "${!name:-}" ]] && return
+  if grep -q "^${name}=" "${RUNTIME_ENV_FILE}"; then
+    fail "${name} is empty in ${RUNTIME_ENV_FILE}"
+  fi
+  value="$(random_base64)"
+  printf '%s=%s\n' "${name}" "${value}" >> "${RUNTIME_ENV_FILE}"
+  export "${name}=${value}"
+}
+
+validate_exact_ipv4() {
+  local value="$1"
+  local label="$2"
+  local octet
+  local -a octets
+  [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    fail "${label} must be an exact IPv4 address"
+  IFS='.' read -r -a octets <<< "${value}"
+  [[ "${#octets[@]}" -eq 4 ]] || fail "${label} must be an exact IPv4 address"
+  for octet in "${octets[@]}"; do
+    [[ "${octet}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || fail "${label} must be an exact IPv4 address"
+    ((10#${octet} <= 255)) || fail "${label} contains an invalid IPv4 octet"
+  done
+  [[ "${value}" != "0.0.0.0" ]] || fail "${label} must not be a wildcard address"
+}
+
+validate_local_development_host() {
+  local value="$1"
+  local require_assigned="$2"
+  local first_octet second_octet third_octet fourth_octet
+  validate_exact_ipv4 "${value}" SUMI_DEV_BIND_HOST
+  if [[ "${value}" != "127.0.0.1" ]]; then
+    IFS='.' read -r first_octet second_octet third_octet fourth_octet <<< "${value}"
+    [[ "${first_octet}" == "100" && 10#${second_octet} -ge 64 && 10#${second_octet} -le 127 ]] ||
+      fail "SUMI_DEV_BIND_HOST must use 127.0.0.1 or an assigned Tailnet IPv4 in 100.64.0.0/10"
+  fi
+  if [[ "${require_assigned}" == "true" ]]; then
+    require_command ip
+    ip -4 -o address show | awk '{ sub(/\/.*/, "", $4); print $4 }' | grep -Fxq "${value}" ||
+      fail "SUMI_DEV_BIND_HOST is not assigned to this host"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev/compose-stack up|down|config
+
+Starts or stops the full local Sumi stack in Docker Compose:
+Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+
+Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
+EOF
+}
+
+if (($# == 0)); then
+  usage
+  exit 1
+fi
+readonly ACTION="$1"
+case "${ACTION}" in
+  up|down|config) ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *) fail "unknown command: ${ACTION}" ;;
+esac
+
+# Optional Firebase values are inherited from the user env file. Generated
+# runtime secrets live in a separate ignored 0600 file so durable state remains
+# decryptable and verifiable after a Compose restart.
+load_env_file "${ENV_FILE}"
+ensure_runtime_env_file
+lock_runtime_env_file
+load_env_file "${RUNTIME_ENV_FILE}"
+ensure_persisted_runtime_secret SUMI_BROWSER_SESSION_SECRET
+
+# Bind only one exact host address. Accept the existing real-stack listen
+# setting when it uses the full-stack API port so the same ignored env file can
+# launch either path during the migration to Compose.
+if [[ -z "${SUMI_DEV_BIND_HOST:-}" && -n "${SUMI_PUBLIC_LISTEN:-}" ]]; then
+  [[ "${SUMI_PUBLIC_LISTEN}" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}):8080$ ]] ||
+    fail "SUMI_PUBLIC_LISTEN must use an exact IPv4 address on port 8080"
+  export SUMI_DEV_BIND_HOST="${BASH_REMATCH[1]}"
+fi
+export SUMI_DEV_BIND_HOST="${SUMI_DEV_BIND_HOST:-127.0.0.1}"
+export SUMI_DEV_BROWSER_HOST="${SUMI_DEV_BIND_HOST}"
+if [[ "${ACTION}" == "down" ]]; then
+  validate_local_development_host "${SUMI_DEV_BIND_HOST}" false
+else
+  validate_local_development_host "${SUMI_DEV_BIND_HOST}" true
+fi
+export SUMI_DEV_WEB_ORIGIN="http://${SUMI_DEV_BROWSER_HOST}:5173"
+
+# Compose owns one durable emulator. API traffic uses service DNS while the
+# browser uses the same exact host address as the web and API ports.
+export FIREBASE_AUTH_EMULATOR_HOST="firebase-auth:9099"
+export VITE_FIREBASE_AUTH_EMULATOR_URL="http://${SUMI_DEV_BROWSER_HOST}:9099"
+validate_firebase_web_config
+
+# Use a stable dev PAID. The API and the agent container share it. The API
+# grants the legacy env-agent authorization so the container can connect.
+export SUMI_PERSONALITY_AGENT_ID="0198f0f4-9b72-7000-8000-00000000000d"
+export SUMI_RPC_NONCE="dev-compose-0001"
+
+# Provide compose-scoped defaults if not already set by the env file.
+export SUMI_DB_URL="${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}"
+export SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}"
+export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}"
+export SUMI_AUTH_TENANT_ID="${SUMI_AUTH_TENANT_ID:-sumi-dev}"
+export SUMI_AUTH_FIREBASE_PROJECT_ID="${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}"
+export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-${SUMI_AUTH_FIREBASE_PROJECT_ID}}"
+[[ "${VITE_FIREBASE_PROJECT_ID:-sumi-studio}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
+  fail "Firebase web and Admin project IDs must match"
+export SUMI_BROWSER_SESSION_AUDIENCE="${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web:direct-chat}"
+export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${SUMI_DEV_WEB_ORIGIN}"
+export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
+
+# The only mutable compatibility upgrade is complete. Release the advisory
+# lock before Docker Compose runs so a foreground stack does not block `down`.
+unlock_runtime_env_file
+
+# Runtime secrets. These are also read by the agent container through compose
+# secrets and by the API to authorize the container.
+export SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER:-$(random_token)}"
+export SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY:-$(random_token)}"
+export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
+
+# Agent token and local-control secrets. These are used by the API to verify
+# agent WebSocket connections and by the runtime container to authenticate its
+# local-control socket. Browser auth uses the persisted session secret above;
+# Firebase Admin uses either the configured emulator or ambient ADC.
+export SUMI_AGENT_TOKEN_SECRET="${SUMI_AGENT_TOKEN_SECRET:-$(random_base64)}"
+export SUMI_LOCAL_CONTROL_TENANT_ID="${SUMI_LOCAL_CONTROL_TENANT_ID:-${SUMI_AUTH_TENANT_ID:-sumi-dev}}"
+export SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION:-0}"
+export SUMI_RPC_NONCE="${SUMI_RPC_NONCE:-$(random_token)}"
+# The API's local-control fixture and the runtime identity must agree on the
+# boot nonce, so derive both from the same value.
+export SUMI_LOCAL_CONTROL_GENERATION="${SUMI_LOCAL_CONTROL_GENERATION:-$SUMI_RPC_GENERATION}"
+export SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE="${SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE:-$SUMI_RPC_NONCE}"
+export SUMI_RPC_NONCE="$SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE"
+export SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID:-$(random_token)}"
+export SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID:-$(random_token)}"
+export SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION="${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}"
+
+# An explicit Firebase web configuration is forwarded as a complete set from
+# the ignored env file. When it is entirely absent, Vite development uses the
+# checked-in local public configuration rather than receiving a partial set.
+# Resolve the configured provider credential exactly as the host real-stack
+# launcher does. A placeholder is allowed only when no credential variable was
+# configured at all, so compose/config smoke checks remain available without a
+# live model account.
+if [[ -n "${SUMI_MODEL_API_KEY_ENV:-}" ]]; then
+  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
+  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
+  [[ -n "${provider_api_key}" ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured model provider"
+  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
+  export SUMI_PROVIDER_API_KEY="${provider_api_key}"
+else
+  export SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY:-dummy}"
+fi
+
+if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
+  log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"
+fi
+
+case "$1" in
+  up)
+    shift
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" up --build "$@"
+    ;;
+  down)
+    shift
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" down "$@"
+    ;;
+  config)
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" config
+    ;;
+esac
