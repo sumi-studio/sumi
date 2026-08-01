@@ -186,6 +186,18 @@ func (s *Store) ListAgents(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// AgentWarmth returns the warmth setting (cold/warm) of an agent, or
+// pgx.ErrNoRows when the agent is not registered.
+func (s *Store) AgentWarmth(ctx context.Context, agentID string) (string, error) {
+	var warmth string
+	err := s.pool.QueryRow(ctx,
+		"SELECT warmth FROM agents WHERE personality_agent_id = $1", agentID).Scan(&warmth)
+	if err != nil {
+		return "", err
+	}
+	return warmth, nil
+}
+
 // Registration is the result of auto-registering a previously unbound credential
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
 // and the per-agent wrapping key generated at hire time.

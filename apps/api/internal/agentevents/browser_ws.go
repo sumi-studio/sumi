@@ -23,6 +23,9 @@ type BrowserServer struct {
 	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
 	// ADR 0009 §5). A nil Authorizer permits any verified session.
 	Authorizer DirectChatAuthorizer
+	// Spawner optionally lazily starts the target agent runtime on connect
+	// (ADR 0010). A nil Spawner assumes the agent is already running.
+	Spawner DirectChatSpawner
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration
@@ -330,6 +333,12 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if s.Spawner != nil {
+		if err := s.Spawner.EnsureRunning(r.Context(), claims.PersonalityAgentID); err != nil {
+			http.Error(w, "agent runtime unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -487,6 +496,9 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	// next PongWait interval.
 	if s.pongWait() > 0 {
 		conn.SetPongHandler(func(string) error {
+			if s.Spawner != nil {
+				s.Spawner.Touch(claims.PersonalityAgentID)
+			}
 			_ = conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait()))
 			return nil
 		})
@@ -632,6 +644,9 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, personalityAgentID
 			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
 				return err
 			}
+			if s.Spawner != nil {
+				s.Spawner.Touch(personalityAgentID)
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
@@ -690,6 +705,9 @@ func (s *BrowserServer) browserReadPump(
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
+		}
+		if s.Spawner != nil {
+			s.Spawner.Touch(claims.PersonalityAgentID)
 		}
 		if s.pongWait() > 0 {
 			if err := conn.SetReadDeadline(s.sessionReadDeadline(claims, s.pongWait())); err != nil {
