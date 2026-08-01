@@ -20,6 +20,14 @@ const (
 	WarmthWarm = "warm"
 )
 
+// ErrManagerClosed rejects runtime admission after StopAll begins.
+var ErrManagerClosed = errors.New("spawn manager is closed")
+
+// ErrStartShutdownTimeout reports that an in-flight start did not return within
+// StopAll's wait bound. Its completion remains fenced and will stop any process
+// that arrives after the timeout.
+var ErrStartShutdownTimeout = errors.New("timed out waiting for agent starts to stop")
+
 // AgentRuntimeConfig is the per-agent configuration a ProcessSpawner receives.
 type AgentRuntimeConfig struct {
 	AgentID                   string
@@ -72,6 +80,7 @@ type Config struct {
 	SharedNonce     string
 	BearerTTL       time.Duration // lifetime of the local-control bearer; 0 uses 8h
 	IdleTimeout     time.Duration // cold-mode idle stop delay; 0 disables auto-stop
+	ShutdownTimeout time.Duration // bound for in-flight starts during StopAll; 0 uses 5s
 	Now             func() time.Time
 	// SkipAgentIDs are agents already managed externally (e.g. the legacy
 	// single-process dev agent). EnsureRunning is a no-op for them.
@@ -84,8 +93,10 @@ type Manager struct {
 	mu       sync.Mutex
 	running  map[string]*agentRuntime
 	starting map[string]*startAttempt
+	closing  bool
 	now      func() time.Time
 	idleStop time.Duration
+	stopWait time.Duration
 	skip     map[string]bool
 }
 
@@ -96,8 +107,10 @@ type agentRuntime struct {
 }
 
 type startAttempt struct {
-	done chan struct{}
-	err  error
+	done       chan struct{}
+	cancel     context.CancelFunc
+	err        error
+	cleanupErr error
 }
 
 // New returns a Manager. A nil Spawner or Resolver is an error.
@@ -115,6 +128,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.BearerTTL <= 0 {
 		cfg.BearerTTL = 8 * time.Hour
 	}
+	if cfg.ShutdownTimeout <= 0 {
+		cfg.ShutdownTimeout = 5 * time.Second
+	}
 	skip := make(map[string]bool, len(cfg.SkipAgentIDs))
 	for _, id := range cfg.SkipAgentIDs {
 		skip[id] = true
@@ -125,6 +141,7 @@ func New(cfg Config) (*Manager, error) {
 		starting: make(map[string]*startAttempt),
 		now:      now,
 		idleStop: cfg.IdleTimeout,
+		stopWait: cfg.ShutdownTimeout,
 		skip:     skip,
 	}, nil
 }
@@ -133,10 +150,15 @@ func New(cfg Config) (*Manager, error) {
 // call as activity. It is called on 呼びかけ (direct-chat connection). Agents
 // in the SkipAgentIDs set are left to their external manager.
 func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return ErrManagerClosed
+	}
 	if m.skip[agentID] {
+		m.mu.Unlock()
 		return nil
 	}
-	m.mu.Lock()
 	if rt, ok := m.running[agentID]; ok {
 		rt.lastActive = m.now()
 		m.mu.Unlock()
@@ -151,20 +173,42 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 			return ctx.Err()
 		}
 	}
-	attempt := &startAttempt{done: make(chan struct{})}
+	startContext, cancelStart := context.WithCancel(ctx)
+	attempt := &startAttempt{
+		done:   make(chan struct{}),
+		cancel: cancelStart,
+	}
 	m.starting[agentID] = attempt
 	m.mu.Unlock()
 
-	runtime, err := m.startRuntime(ctx, agentID)
+	runtime, err := m.startRuntime(startContext, agentID)
+	cancelStart()
 	m.mu.Lock()
-	if err == nil {
-		m.running[agentID] = runtime
+	if !m.closing {
+		if err == nil {
+			m.running[agentID] = runtime
+		}
+		attempt.err = err
+		delete(m.starting, agentID)
+		close(attempt.done)
+		m.mu.Unlock()
+		return err
 	}
-	attempt.err = err
+	m.mu.Unlock()
+
+	// StopAll won the publication race. A spawner that returned success after
+	// manager cancellation must not escape shutdown or enter the running map.
+	if runtime != nil {
+		if stopErr := runtime.process.Stop(); stopErr != nil {
+			attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
+		}
+	}
+	m.mu.Lock()
+	attempt.err = errors.Join(ErrManagerClosed, attempt.cleanupErr)
 	delete(m.starting, agentID)
 	close(attempt.done)
 	m.mu.Unlock()
-	return err
+	return attempt.err
 }
 
 func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRuntime, error) {
@@ -268,18 +312,64 @@ func (m *Manager) Warmth(agentID string) string {
 	return ""
 }
 
-// StopAll stops every running agent. Used on graceful shutdown.
+// StopAll permanently closes runtime admission, cancels in-flight starts,
+// waits boundedly for them to finish, and stops every published runtime. A
+// spawner that returns success after the wait bound is still fenced by the
+// closing state: its process is stopped instead of being registered.
 func (m *Manager) StopAll() error {
 	m.mu.Lock()
-	ids := make([]string, 0, len(m.running))
-	for id := range m.running {
-		ids = append(ids, id)
+	m.closing = true
+	runtimes := make(map[string]*agentRuntime, len(m.running))
+	for id, runtime := range m.running {
+		runtimes[id] = runtime
+		delete(m.running, id)
+	}
+	type pendingStart struct {
+		agentID string
+		attempt *startAttempt
+	}
+	starts := make([]pendingStart, 0, len(m.starting))
+	for agentID, attempt := range m.starting {
+		starts = append(starts, pendingStart{agentID: agentID, attempt: attempt})
 	}
 	m.mu.Unlock()
+
+	for _, start := range starts {
+		start.attempt.cancel()
+	}
 	var errs []error
-	for _, id := range ids {
-		if err := m.Stop(id); err != nil {
+	for id, runtime := range runtimes {
+		if err := runtime.process.Stop(); err != nil {
 			errs = append(errs, fmt.Errorf("stop agent %s: %w", id, err))
+		}
+	}
+	if len(starts) == 0 {
+		return errors.Join(errs...)
+	}
+	waitContext, cancelWait := context.WithTimeout(context.Background(), m.stopWait)
+	defer cancelWait()
+	for _, start := range starts {
+		select {
+		case <-start.attempt.done:
+			if start.attempt.cleanupErr != nil {
+				errs = append(errs, start.attempt.cleanupErr)
+			}
+		case <-waitContext.Done():
+			// Prefer completion when it races the wait deadline.
+			select {
+			case <-start.attempt.done:
+				if start.attempt.cleanupErr != nil {
+					errs = append(errs, start.attempt.cleanupErr)
+				}
+				continue
+			default:
+			}
+			errs = append(errs, fmt.Errorf(
+				"%w: %s",
+				ErrStartShutdownTimeout,
+				start.agentID,
+			))
+			return errors.Join(errs...)
 		}
 	}
 	return errors.Join(errs...)

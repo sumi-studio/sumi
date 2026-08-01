@@ -66,6 +66,30 @@ type blockingSpawner struct {
 	release chan struct{}
 }
 
+type lateSuccessSpawner struct {
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	process  *fakeProcess
+}
+
+func newLateSuccessSpawner() *lateSuccessSpawner {
+	return &lateSuccessSpawner{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		process:  &fakeProcess{},
+	}
+}
+
+func (s *lateSuccessSpawner) Spawn(ctx context.Context, _ AgentRuntimeConfig) (Process, error) {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	<-s.release
+	return s.process, nil
+}
+
 func newBlockingSpawner() *blockingSpawner {
 	return &blockingSpawner{
 		started: make(chan struct{}),
@@ -189,6 +213,85 @@ func TestEnsureRunningCoalescesConcurrentStarts(t *testing.T) {
 	}
 	if got := spawner.spawnCount(); got != 1 {
 		t.Fatalf("running agent spawned again: got %d starts, want 1", got)
+	}
+}
+
+func TestStopAllCancelsBlockedStartAndClosesAdmission(t *testing.T) {
+	spawner := newBlockingSpawner()
+	mgr, err := New(Config{
+		Spawner:      spawner,
+		Resolver:     fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer: "bearer",
+		SharedNonce:  "nonce",
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+	if err := mgr.StopAll(); err != nil {
+		t.Fatalf("StopAll: %v", err)
+	}
+	if err := <-startResult; !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("canceled start error = %v, want ErrManagerClosed", err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "a1"); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("post-shutdown start error = %v, want ErrManagerClosed", err)
+	}
+	if got := spawner.spawnCount(); got != 1 {
+		t.Fatalf("shutdown admitted another start: got %d starts, want 1", got)
+	}
+	if mgr.Running("a1") {
+		t.Fatal("canceled start was published after StopAll")
+	}
+}
+
+func TestStopAllStopsLateSuccessfulProcessAfterWaitTimeout(t *testing.T) {
+	spawner := newLateSuccessSpawner()
+	mgr, err := New(Config{
+		Spawner:         spawner,
+		Resolver:        fakeResolver{keys: map[string]string{"a1": "k1"}},
+		SharedBearer:    "bearer",
+		SharedNonce:     "nonce",
+		ShutdownTimeout: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- mgr.EnsureRunning(context.Background(), "a1")
+	}()
+	<-spawner.started
+	if err := mgr.StopAll(); !errors.Is(err, ErrStartShutdownTimeout) {
+		t.Fatalf("StopAll error = %v, want ErrStartShutdownTimeout", err)
+	}
+	select {
+	case <-spawner.canceled:
+	default:
+		t.Fatal("StopAll did not cancel the manager-owned start context")
+	}
+	if err := mgr.EnsureRunning(context.Background(), "a1"); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("post-shutdown start error = %v, want ErrManagerClosed", err)
+	}
+
+	close(spawner.release)
+	if err := <-startResult; !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("late successful start error = %v, want ErrManagerClosed", err)
+	}
+	if !spawner.process.isStopped() {
+		t.Fatal("late successful process survived StopAll")
+	}
+	if mgr.Running("a1") {
+		t.Fatal("late successful process was registered after StopAll")
+	}
+	if err := mgr.StopAll(); err != nil {
+		t.Fatalf("repeated StopAll after late cleanup: %v", err)
 	}
 }
 
