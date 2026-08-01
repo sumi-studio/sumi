@@ -3,6 +3,7 @@ import { DoorOpen, Hash } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
+import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
 import { mentionCount, unreadCount } from "../timeline";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -42,12 +43,12 @@ function PlaceRow({
   mentions: number;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
-  const selectPlace = useMessaging((state) => state.selectPlace);
+  const placeNavigate = usePlaceNavigate();
   const active = activePlaceKey === key;
   return (
     <button
       type="button"
-      onClick={() => selectPlace(key)}
+      onClick={() => placeNavigate(key)}
       className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
         active
           ? "bg-accent text-foreground"

@@ -2,6 +2,7 @@ import { Clock, Hash, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
 import { type PlaceKey, participantKey } from "../model";
+import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
@@ -227,11 +228,12 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   );
 }
 
-export function MessagingScreen() {
+export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const init = useMessaging((state) => state.init);
   const ready = useMessaging((state) => state.ready);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const selectPlace = useMessaging((state) => state.selectPlace);
+  const placeNavigate = usePlaceNavigate();
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
   const display = usePlaceDisplay(activePlaceKey);
   const lastReadByPlace = useMessaging((state) => state.lastReadByPlace);
@@ -243,6 +245,12 @@ export function MessagingScreen() {
   useEffect(() => {
     init();
   }, [init]);
+
+  // URLが現在地の正本。route paramのplaceをstoreへ同期する。
+  useEffect(() => {
+    if (!ready || !placeKey) return;
+    if (placeKey !== activePlaceKey) selectPlace(placeKey);
+  }, [ready, placeKey, activePlaceKey, selectPlace]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   useEffect(() => {
@@ -267,25 +275,23 @@ export function MessagingScreen() {
     document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
   }, [messagesByPlace, lastReadByPlace, selfKey]);
 
-  // permalink (?place=…&m=…) で開かれたら該当placeへ移動してジャンプする。
+  // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || !placeKey) return;
     const params = new URLSearchParams(window.location.search);
-    const place = params.get("place");
     const seq = params.get("m");
-    if (place) {
-      selectPlace(place);
-      if (seq) setPendingJump({ placeKey: place, seq: Number(seq) });
+    if (seq) {
+      setPendingJump({ placeKey, seq: Number(seq) });
       window.history.replaceState(null, "", window.location.pathname);
     }
-  }, [ready, selectPlace]);
+  }, [ready, placeKey]);
 
   const requestJump = useCallback(
     (jump: PendingJump) => {
-      selectPlace(jump.placeKey);
+      placeNavigate(jump.placeKey);
       setPendingJump(jump);
     },
-    [selectPlace],
+    [placeNavigate],
   );
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。

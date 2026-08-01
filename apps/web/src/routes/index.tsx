@@ -1,11 +1,40 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { MessagingScreen } from "../messaging/components/messaging-screen";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect } from "react";
+import { useMessaging } from "../messaging/store";
 
 /**
- * ルート = Sumiのホーム面（Workspaceのchannel / DM / 直通）。
- * 現在はモックbackendで動くため認証ゲートを挟んでいない。
- * 実API統合時にAuthGate配下へ移す。
+ * ルートはホームの入口。最初のchannelへリダイレクトし、以降の現在地は
+ * URL（/c/:id、/dm/:id）が正本になる。
  */
 export const Route = createFileRoute("/")({
-  component: MessagingScreen,
+  component: HomeRedirect,
 });
+
+function HomeRedirect() {
+  const init = useMessaging((state) => state.init);
+  const ready = useMessaging((state) => state.ready);
+  const channels = useMessaging((state) => state.channels);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    init();
+  }, [init]);
+
+  useEffect(() => {
+    if (!ready) return;
+    const first = channels[0];
+    if (first) {
+      void navigate({
+        to: "/c/$channelId",
+        params: { channelId: first.channelId },
+        replace: true,
+      });
+    }
+  }, [ready, channels, navigate]);
+
+  return (
+    <div className="flex h-dvh items-center justify-center bg-background text-muted-foreground text-sm">
+      読み込み中…
+    </div>
+  );
+}

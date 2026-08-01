@@ -295,12 +295,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
           replyLaterById,
           employedAgents: snapshot.employedAgents,
         });
-        const first = snapshot.channels[0];
-        if (first) {
-          get().selectPlace(
-            placeKey({ kind: "channel", channelId: first.channelId }),
-          );
-        }
       });
     },
 
