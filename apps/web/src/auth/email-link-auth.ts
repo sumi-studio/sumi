@@ -13,8 +13,10 @@ import {
   startAuthFlow,
 } from "./auth-flow-client";
 import {
+  cleanupPendingEmailFlowStorage,
   clearEmailFlowLocation,
   clearPendingEmailFlow,
+  consumePendingCredentialRecovery,
   createEmailFlowState,
   emailFlowContinuation,
   emailFlowStateFromLocation,
@@ -52,6 +54,7 @@ export async function beginEmailLinkAuth(
     credential: SerializedOAuthCredential;
   },
 ): Promise<void> {
+  cleanupPendingEmailFlowStorage();
   const email = rawEmail.trim();
   if (!email || email.length > 320) {
     throw new AuthAPIError("Invalid email address.", 0);
@@ -121,6 +124,10 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
       0,
     );
   }
+  const consumesCredential = pending.credentialRecovery !== undefined;
+  if (consumesCredential) {
+    consumePendingCredentialRecovery(state, pending);
+  }
   const auth = getFirebaseAuth();
   let user = auth.currentUser;
   if (pending.stage === "link_sent") {
@@ -134,7 +141,7 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
     );
     user = credential.user;
     pending.stage = "firebase_complete";
-    savePendingEmailFlow(state, pending);
+    if (!consumesCredential) savePendingEmailFlow(state, pending);
   }
   if (!user) {
     throw new AuthAPIError("Firebase email verification is unavailable.", 0);
@@ -145,7 +152,7 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
     nonce: pending.nonce,
     idToken,
   });
-  clearPendingEmailFlow(state);
+  if (!consumesCredential) clearPendingEmailFlow(state);
   clearEmailFlowLocation();
   return {
     flow: pending,

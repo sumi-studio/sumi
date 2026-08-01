@@ -103,10 +103,10 @@ vi.mock("firebase/auth", () => ({
 
 afterEach(() => {
   cleanup();
-  vi.clearAllMocks();
 });
 
 beforeEach(() => {
+  vi.resetAllMocks();
   sessionStorage.clear();
   authMocks.startAuthFlow.mockResolvedValue({
     flowId: "flow-id",
@@ -126,9 +126,15 @@ beforeEach(() => {
     expiresAt: "2026-08-01T01:00:00Z",
   });
   authMocks.logoutSumiSession.mockResolvedValue(undefined);
+  authMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
+  authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
+  authMocks.completeSameEmailCredentialRecovery.mockResolvedValue(
+    "provider_linked",
+  );
   authMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
   authMocks.hasEmailLinkCallback.mockReturnValue(false);
   authMocks.isSameEmailCredentialCollision.mockReturnValue(false);
+  authMocks.clearDirectChatAuthority.mockReturnValue(true);
   authMocks.onAuthStateChanged.mockImplementation((_auth, _observer) =>
     vi.fn(),
   );

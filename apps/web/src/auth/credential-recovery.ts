@@ -14,6 +14,7 @@ import type {
   SerializedOAuthCredential,
 } from "./auth-flow-state";
 import { beginEmailLinkAuth } from "./email-link-auth";
+import { getFirebaseAuth } from "./firebase";
 import {
   completeProviderOperation,
   failProviderOperation,
@@ -63,12 +64,25 @@ export async function completeSameEmailCredentialRecovery({
   }
   const credential = deserializeCredential(recovery);
   const nonce = createAuthFlowNonce();
+  if (!isCurrentFirebaseUser(user.uid)) {
+    throw new AuthAPIError(
+      "Firebase account changed before provider recovery.",
+      0,
+    );
+  }
+  const emailProofToken = await getIdToken(user, true);
+  if (!isCurrentFirebaseUser(user.uid)) {
+    throw new AuthAPIError(
+      "Firebase account changed before provider recovery.",
+      0,
+    );
+  }
   const started = await startProviderOperation({
     provider: recovery.provider,
     operation: "link",
     decisionPath: "same_email_recovery",
     nonce,
-    idToken: await getIdToken(user, true),
+    idToken: emailProofToken,
   });
   if (
     started.outcome !== "client_operation_required" ||
@@ -80,6 +94,10 @@ export async function completeSameEmailCredentialRecovery({
     throw new AuthAPIError("Provider recovery could not be started.", 0);
   }
 
+  if (!isCurrentFirebaseUser(user.uid)) {
+    await failChangedUserRecovery(started.operationId, nonce, "before");
+  }
+
   let linkedUser: User;
   try {
     const linked = await linkWithCredential(user, credential);
@@ -88,24 +106,20 @@ export async function completeSameEmailCredentialRecovery({
     await failStartedRecovery(started.operationId, nonce, error);
     throw error;
   }
-  if (linkedUser.uid !== user.uid) {
-    await failProviderOperation({
-      operationId: started.operationId,
-      nonce,
-      outcome: "firebase_operation_failed",
-    }).catch(() => undefined);
-    throw new AuthAPIError(
-      "Firebase account changed during provider recovery.",
-      0,
-    );
+  if (linkedUser.uid !== user.uid || !isCurrentFirebaseUser(user.uid)) {
+    await failChangedUserRecovery(started.operationId, nonce, "during");
   }
 
   await waitUntil(started.completionTokenNotBefore);
+  const completionToken = await getIdToken(linkedUser, true);
+  if (!isCurrentFirebaseUser(user.uid)) {
+    await failChangedUserRecovery(started.operationId, nonce, "during");
+  }
   try {
     const completed = await completeProviderOperation({
       operationId: started.operationId,
       nonce,
-      idToken: await getIdToken(linkedUser, true),
+      idToken: completionToken,
     });
     if (
       completed.outcome === "provider_linked" ||
@@ -221,6 +235,30 @@ async function failStartedRecovery(
       : "firebase_operation_failed";
   await failProviderOperation({ operationId, nonce, outcome }).catch(
     () => undefined,
+  );
+}
+
+function isCurrentFirebaseUser(uid: string): boolean {
+  try {
+    return getFirebaseAuth().currentUser?.uid === uid;
+  } catch {
+    return false;
+  }
+}
+
+async function failChangedUserRecovery(
+  operationId: string,
+  nonce: string,
+  timing: "before" | "during",
+): Promise<never> {
+  await failProviderOperation({
+    operationId,
+    nonce,
+    outcome: "firebase_operation_failed",
+  }).catch(() => undefined);
+  throw new AuthAPIError(
+    `Firebase account changed ${timing} provider recovery.`,
+    0,
   );
 }
 

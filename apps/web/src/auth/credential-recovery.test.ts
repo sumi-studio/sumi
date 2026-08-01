@@ -8,6 +8,9 @@ import {
 } from "./credential-recovery";
 
 const recoveryMocks = vi.hoisted(() => ({
+  auth: {
+    currentUser: null as null | { uid: string },
+  },
   credentialFromError: vi.fn(),
   credentialFromJSON: vi.fn(),
   getIdToken: vi.fn(),
@@ -44,6 +47,10 @@ vi.mock("./email-link-auth", () => ({
   beginEmailLinkAuth: recoveryMocks.beginEmailLinkAuth,
 }));
 
+vi.mock("./firebase", () => ({
+  getFirebaseAuth: () => recoveryMocks.auth,
+}));
+
 vi.mock("./auth-flow-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./auth-flow-client")>()),
   createAuthFlowNonce: recoveryMocks.createAuthFlowNonce,
@@ -57,7 +64,8 @@ vi.mock("./provider-operation-client", () => ({
 }));
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
+  recoveryMocks.auth.currentUser = { uid: "firebase-existing" };
   recoveryMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
   recoveryMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
   recoveryMocks.getIdToken
@@ -173,6 +181,108 @@ describe("same-email Firebase credential recovery", () => {
       outcome: "credential_in_use",
     });
     expect(recoveryMocks.completeProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("fails the operation if Firebase changed users before the link mutation", async () => {
+    const user = { uid: "firebase-existing" };
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+    });
+    recoveryMocks.startProviderOperation.mockImplementationOnce(async () => {
+      recoveryMocks.auth.currentUser = { uid: "different-firebase-user" };
+      return {
+        operationId: "provider-operation",
+        outcome: "client_operation_required",
+        clientOperation: "firebase_link_with_credential",
+        completionTokenNotBefore: new Date(Date.now() - 1_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        noticeRequired: false,
+      };
+    });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: user as never,
+      }),
+    ).rejects.toThrow("account changed");
+    expect(recoveryMocks.linkWithCredential).not.toHaveBeenCalled();
+    expect(recoveryMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "provider-operation",
+      nonce: "n".repeat(43),
+      outcome: "firebase_operation_failed",
+    });
+  });
+
+  it("terminalizes without completion when Firebase changes users during link", async () => {
+    const user = { uid: "firebase-existing" };
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+    });
+    recoveryMocks.linkWithCredential.mockImplementationOnce(async () => {
+      recoveryMocks.auth.currentUser = { uid: "different-firebase-user" };
+      return { user };
+    });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: user as never,
+      }),
+    ).rejects.toThrow("account changed during");
+    expect(recoveryMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "provider-operation",
+      nonce: "n".repeat(43),
+      outcome: "firebase_operation_failed",
+    });
+    expect(recoveryMocks.completeProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the Firebase user after obtaining the fresh completion token", async () => {
+    const user = { uid: "firebase-existing" };
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+    });
+    recoveryMocks.linkWithCredential.mockResolvedValue({ user });
+    recoveryMocks.getIdToken
+      .mockReset()
+      .mockResolvedValueOnce("email-proof-token")
+      .mockImplementationOnce(async () => {
+        recoveryMocks.auth.currentUser = { uid: "different-firebase-user" };
+        return "fresh-linked-token";
+      });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: user as never,
+      }),
+    ).rejects.toThrow("account changed during");
+    expect(recoveryMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "provider-operation",
+      nonce: "n".repeat(43),
+      outcome: "firebase_operation_failed",
+    });
+    expect(recoveryMocks.completeProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a reconstructed credential for a different provider", async () => {
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "google.com",
+      signInMethod: "google.com",
+    });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: { uid: "firebase-existing" } as never,
+      }),
+    ).rejects.toThrow("credential is invalid");
+    expect(recoveryMocks.startProviderOperation).not.toHaveBeenCalled();
+    expect(recoveryMocks.linkWithCredential).not.toHaveBeenCalled();
   });
 
   it("rejects an expired recovery before starting any backend mutation", async () => {

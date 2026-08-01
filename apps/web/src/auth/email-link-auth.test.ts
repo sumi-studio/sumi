@@ -47,7 +47,7 @@ beforeEach(() => {
   emailMocks.startAuthFlow.mockResolvedValue({
     flowId: "flow-email",
     outcome: "proof_required",
-    expiresAt: "2026-08-01T01:00:00Z",
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
   });
   emailMocks.sendSignInLinkToEmail.mockResolvedValue(undefined);
 });
@@ -116,5 +116,68 @@ describe("Firebase email-link Koseki flow", () => {
       idToken: "id-token",
     });
     expect(location.search).toBe("");
+  });
+
+  it("consumes a recovery credential before Firebase proof and rejects replay", async () => {
+    await beginEmailLinkAuth("human@example.com", "sign_in", {
+      provider: "github.com",
+      requestedIntent: "sign_in",
+      credential: {
+        providerId: "github.com",
+        signInMethod: "github.com",
+        pendingToken: "pending-oauth-token",
+      },
+    });
+    const settings = emailMocks.sendSignInLinkToEmail.mock.calls[0]?.[2];
+    const state = new URL(settings.url).searchParams.get("sumi_auth_state");
+    if (!state) throw new Error("missing email flow state");
+    history.replaceState(
+      null,
+      "",
+      `/?sumi_auth_state=${state}&mode=signIn&oobCode=proof`,
+    );
+    emailMocks.isSignInWithEmailLink.mockReturnValue(true);
+    emailMocks.signInWithEmailLink.mockImplementation(async () => {
+      expect(
+        localStorage.getItem(`sumi.auth.email-flow.v1.${state}`),
+      ).toBeNull();
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (key) {
+          expect(localStorage.getItem(key)).not.toContain(
+            "pending-oauth-token",
+          );
+        }
+      }
+      return {
+        user: {
+          uid: "firebase-user",
+          displayName: "Human",
+          email: "human@example.com",
+        },
+      };
+    });
+    emailMocks.getIdToken.mockResolvedValue("id-token");
+    emailMocks.resolveAuthFlow.mockResolvedValue({
+      flowId: "flow-email",
+      outcome: "signed_in",
+      continuation: "/",
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    });
+
+    const completion = await completeEmailLinkAuth();
+    expect(completion.flow.credentialRecovery?.credential).toMatchObject({
+      pendingToken: "pending-oauth-token",
+    });
+
+    history.replaceState(
+      null,
+      "",
+      `/?sumi_auth_state=${state}&mode=signIn&oobCode=proof`,
+    );
+    await expect(completeEmailLinkAuth()).rejects.toThrow(
+      "must be opened in the browser that requested it",
+    );
+    expect(emailMocks.signInWithEmailLink).toHaveBeenCalledTimes(1);
   });
 });
