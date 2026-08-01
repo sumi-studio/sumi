@@ -187,6 +187,7 @@ impl LogicalRecoveryExecutor {
         // this recovery writer exclusive through the final atomic batch.
         let writer = EventWriter::new(Arc::new(store.clone()));
         let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
+        let active_turn_id = recovery.authenticated_open_turn(run_id)?.to_owned();
         let mut transaction = store
             .pool()
             .begin()
@@ -199,9 +200,15 @@ impl LogicalRecoveryExecutor {
             .hydrate_messages(&mut transaction)
             .await
             .context("failed to authenticate logical-recovery transcript")?;
-        let snapshot =
-            ToolUseRecoverySnapshot::load(&mut transaction, &messages, command_id, run_id, turn_id)
-                .await?;
+        let snapshot = ToolUseRecoverySnapshot::load(
+            &mut transaction,
+            &messages,
+            command_id,
+            run_id,
+            turn_id,
+            &active_turn_id,
+        )
+        .await?;
         transaction
             .commit()
             .await
@@ -221,7 +228,8 @@ impl ToolUseRecoverySnapshot {
         messages: &[ContextMessage],
         command_id: &str,
         run_id: &str,
-        turn_id: &str,
+        owner_turn_id: &str,
+        active_turn_id: &str,
     ) -> Result<Self> {
         let command = sqlx::query(
             "SELECT seq, command_kind, status, application_kind, run_id, turn_id, run_phase
@@ -244,7 +252,7 @@ impl ToolUseRecoverySnapshot {
             || status != "applying"
             || application_kind.as_deref() != Some("idle_run")
             || stored_run_id.as_deref() != Some(run_id)
-            || stored_turn_id.as_deref() != Some(turn_id)
+            || stored_turn_id.as_deref() != Some(owner_turn_id)
             || run_phase != "assistant_started"
         {
             bail!(
@@ -253,7 +261,9 @@ impl ToolUseRecoverySnapshot {
         }
 
         // Multiple assistant attempts may exist after retries. The latest
-        // authenticated MessageEnd in this open turn is the suffix owner.
+        // authenticated MessageEnd in the currently open turn is the suffix
+        // owner. The command row's turn authenticates the original owner only;
+        // provider/tool continuation may have advanced the run to another turn.
         let assistant_row = sqlx::query(
             "SELECT m.id, m.seq
              FROM messages AS m
@@ -265,13 +275,13 @@ impl ToolUseRecoverySnapshot {
              ORDER BY m.seq DESC LIMIT 1",
         )
         .bind(run_id)
-        .bind(turn_id)
+        .bind(active_turn_id)
         .fetch_optional(&mut **transaction)
         .await
         .context("failed to locate assistant logical-recovery owner")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "logical-recovery turn {run_id}/{turn_id} has no authenticated assistant MessageEnd"
+                "logical-recovery turn {run_id}/{active_turn_id} has no authenticated assistant MessageEnd"
             )
         })?;
         let assistant_message_id: String = assistant_row.try_get("id")?;
@@ -375,7 +385,7 @@ impl ToolUseRecoverySnapshot {
             if let Some(approval) = approval_row.as_ref() {
                 let approval_run: String = approval.try_get("run_id")?;
                 let approval_turn: String = approval.try_get("turn_id")?;
-                if approval_run != run_id || approval_turn != turn_id {
+                if approval_run != run_id || approval_turn != active_turn_id {
                     bail!(
                         "ToolCall {} approval belongs to another run or turn",
                         call.id
@@ -473,7 +483,7 @@ impl ToolUseRecoverySnapshot {
             command_id: command_id.to_owned(),
             command_seq,
             run_id: run_id.to_owned(),
-            turn_id: turn_id.to_owned(),
+            turn_id: active_turn_id.to_owned(),
             assistant,
             tool_results,
             missing_results,
@@ -1607,6 +1617,8 @@ mod tests {
     const TOOL_USE_RECOVERY_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000091";
     const TOOL_USE_RECOVERY_RUN_ID: &str = "run-tool-use-recovery";
     const TOOL_USE_RECOVERY_TURN_ID: &str = "turn-tool-use-recovery";
+    const TOOL_USE_RECOVERY_CONTINUATION_TURN_ID: &str = "turn-tool-use-recovery-continuation";
+    const TOOL_USE_RECOVERY_INITIAL_ASSISTANT_ID: &str = "assistant-tool-use-recovery-initial";
     const TOOL_USE_RECOVERY_ASSISTANT_ID: &str = "assistant-tool-use-recovery";
 
     fn test_personality_agent_id() -> PersonalityAgentId {
@@ -1687,6 +1699,28 @@ mod tests {
             },
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn tool_use_recovery_initial_assistant() -> PublicMessage {
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "continuing with tools".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-provider-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
             error_message: None,
             provider_code: None,
             interrupted: false,
@@ -1813,7 +1847,7 @@ mod tests {
             .expect("finish terminal ToolCall fixture");
     }
 
-    async fn seed_tool_use_restart_seam(writer: &EventWriter) {
+    async fn seed_tool_use_restart_seam(writer: &EventWriter, continuation_turn: bool) {
         persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
         writer
             .apply(EventBatch {
@@ -1918,7 +1952,91 @@ mod tests {
             .await
             .expect("persist ToolUse recovery user turn");
 
+        if continuation_turn {
+            let initial_assistant = tool_use_recovery_initial_assistant();
+            writer
+                .apply(EventBatch {
+                    writes: vec![
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_start",
+                                    TOOL_USE_RECOVERY_INITIAL_ASSISTANT_ID,
+                                    &initial_assistant,
+                                    Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                                    Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                                )
+                                .expect("initial assistant MessageStart"),
+                            ),
+                            projections: vec![Projection::RunPhase {
+                                command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                                expected: RunPhase::UserCommitted,
+                                next: RunPhase::AssistantStarted,
+                            }],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_end",
+                                    TOOL_USE_RECOVERY_INITIAL_ASSISTANT_ID,
+                                    &initial_assistant,
+                                    Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                                    Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                                )
+                                .expect("initial assistant MessageEnd"),
+                            ),
+                            projections: vec![Projection::MessageEnd {
+                                message_id: TOOL_USE_RECOVERY_INITIAL_ASSISTANT_ID.to_owned(),
+                                role: "assistant",
+                                message: initial_assistant.clone(),
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            }],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::turn_end(
+                                    TOOL_USE_RECOVERY_RUN_ID,
+                                    TOOL_USE_RECOVERY_TURN_ID,
+                                    initial_assistant,
+                                    Vec::new(),
+                                )
+                                .expect("initial TurnEnd"),
+                            ),
+                            projections: Vec::new(),
+                        },
+                    ],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("persist initial assistant turn");
+
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(
+                                TOOL_USE_RECOVERY_RUN_ID,
+                                TOOL_USE_RECOVERY_CONTINUATION_TURN_ID,
+                            )
+                            .expect("continuation TurnStart"),
+                        ),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("open continuation turn");
+        }
+
         let assistant = tool_use_recovery_assistant();
+        let active_turn_id = if continuation_turn {
+            TOOL_USE_RECOVERY_CONTINUATION_TURN_ID
+        } else {
+            TOOL_USE_RECOVERY_TURN_ID
+        };
         writer
             .apply(EventBatch {
                 writes: vec![
@@ -1929,16 +2047,20 @@ mod tests {
                                 TOOL_USE_RECOVERY_ASSISTANT_ID,
                                 &assistant,
                                 Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
-                                Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                                Some(active_turn_id.to_owned()),
                             )
-                            .expect("assistant MessageStart"),
+                            .expect("ToolUse assistant MessageStart"),
                         ),
-                        projections: vec![Projection::RunPhase {
-                            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
-                            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
-                            expected: RunPhase::UserCommitted,
-                            next: RunPhase::AssistantStarted,
-                        }],
+                        projections: if continuation_turn {
+                            Vec::new()
+                        } else {
+                            vec![Projection::RunPhase {
+                                command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                                expected: RunPhase::UserCommitted,
+                                next: RunPhase::AssistantStarted,
+                            }]
+                        },
                     },
                     EventWrite {
                         event: Some(
@@ -1947,9 +2069,9 @@ mod tests {
                                 TOOL_USE_RECOVERY_ASSISTANT_ID,
                                 &assistant,
                                 Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
-                                Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                                Some(active_turn_id.to_owned()),
                             )
-                            .expect("assistant MessageEnd"),
+                            .expect("ToolUse assistant MessageEnd"),
                         ),
                         projections: vec![Projection::MessageEnd {
                             message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned(),
@@ -1964,7 +2086,7 @@ mod tests {
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("persist ToolUse assistant restart seam");
+            .expect("persist ToolUse restart seam");
 
         persist_terminal_tool(writer, "tool-terminal-success", "read_file", 0, false).await;
         persist_terminal_tool(writer, "tool-terminal-failure", "write_file", 1, true).await;
@@ -1989,7 +2111,7 @@ mod tests {
             .expect("open first restart fixture")
             .into();
         let writer = EventWriter::new(store.clone());
-        seed_tool_use_restart_seam(&writer).await;
+        seed_tool_use_restart_seam(&writer, false).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
@@ -2160,10 +2282,12 @@ mod tests {
                    (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
                    (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
                    (SELECT json_array_length(json_extract(envelope, '$.tool_results'))
-                    FROM agent_events WHERE event_type='turn_end' LIMIT 1)",
+                    FROM agent_events WHERE event_type='turn_end'
+                      AND json_extract(internal_metadata, '$.turn_id')=?)",
             )
             .bind(TOOL_USE_RECOVERY_COMMAND_ID)
             .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .bind(TOOL_USE_RECOVERY_TURN_ID)
             .fetch_one(first_restart.pool())
             .await
             .expect("recovered lifecycle closure"),
@@ -2185,6 +2309,146 @@ mod tests {
         second_restart.pool().close().await;
         drop(second_restart);
         std::fs::remove_dir_all(root).expect("remove logical ToolUse recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn logical_tool_use_recovery_closes_the_authenticated_continuation_turn() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam(&writer, true).await;
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-continuation-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "logical-recovery-continuation-fence")
+            .expect("logical-recovery fence");
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate continuation-turn restart")
+        else {
+            panic!("continuation-turn restart must require the ToolUse logical suffix")
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [RecoveryStep::ResumeAssistantFromDurableEvents {
+                command_id,
+                run_id,
+                turn_id,
+                pending_error_context: None,
+            }] if command_id == TOOL_USE_RECOVERY_COMMAND_ID
+                && run_id == TOOL_USE_RECOVERY_RUN_ID
+                && turn_id == TOOL_USE_RECOVERY_TURN_ID
+        ));
+
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect("close authenticated continuation ToolUse seam");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id='tool-rowless-messaging'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("continuation synthetic tool disposition"),
+            "not_started"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT
+                   (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'
+                      AND json_extract(internal_metadata, '$.turn_id')=?),
+                   (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'
+                      AND json_extract(internal_metadata, '$.turn_id')=?),
+                   (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end')",
+            )
+            .bind(TOOL_USE_RECOVERY_TURN_ID)
+            .bind(TOOL_USE_RECOVERY_CONTINUATION_TURN_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("continuation lifecycle closure"),
+            (1, 1, 1),
+            "recovery must preserve owner turn A and close only active turn B"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("continuation owner terminal state"),
+            ("applied".to_owned(), "finished".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_tool_use_recovery_without_an_authenticated_open_turn_fails_atomically() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam(&writer, true).await;
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "logical-recovery-no-open-turn-lease",
+        )
+        .expect("logical-recovery lease");
+        let fence = GenerationRecoveryFence::new(&lease, "logical-recovery-no-open-turn-fence")
+            .expect("logical-recovery fence");
+        let steps = vec![RecoveryStep::ResumeAssistantFromDurableEvents {
+            command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+            run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+            turn_id: TOOL_USE_RECOVERY_TURN_ID.to_owned(),
+            pending_error_context: None,
+        }];
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect("first recovery closes the authenticated run");
+        let event_count_before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count before rejected recovery");
+        let tool_count_before =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")
+                .fetch_one(store.pool())
+                .await
+                .expect("tool count before rejected recovery");
+
+        let error = LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect_err("recovery without an authenticated open turn must fail");
+        assert!(
+            error.to_string().contains("has no authenticated open turn"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("event count after rejected recovery"),
+            event_count_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")
+                .fetch_one(store.pool())
+                .await
+                .expect("tool count after rejected recovery"),
+            tool_count_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("command status after rejected recovery"),
+            "applied"
+        );
     }
 
     async fn seed_pending_approval_decision(

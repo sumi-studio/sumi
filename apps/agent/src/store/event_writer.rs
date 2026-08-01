@@ -5355,6 +5355,36 @@ impl EventWriter {
 }
 
 impl BootstrapRecoveryGuard<'_> {
+    /// Returns the turn currently open in the authenticated lifecycle prefix.
+    ///
+    /// Recovery callers use this identity for lifecycle-bound suffixes.  The
+    /// inbound command's stored turn remains its original ownership evidence,
+    /// but a continued provider/tool loop may have advanced the same run to a
+    /// later turn before the process stopped.
+    pub(in crate::store) fn authenticated_open_turn(&self, run_id: &str) -> Result<&str> {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap recovery initializes the lifecycle checkpoint")
+            .lifecycle;
+        let turn_id = lifecycle
+            .open_turns
+            .get(run_id)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                anyhow!("logical recovery run {run_id} has no authenticated open turn")
+            })?;
+        if lifecycle.inferred_owner_turns.contains(run_id)
+            || !lifecycle
+                .seen_turn_starts
+                .contains(&(run_id.to_owned(), turn_id.to_owned()))
+        {
+            bail!("logical recovery run {run_id} has no authenticated open turn");
+        }
+        Ok(turn_id)
+    }
+
     pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT mutation_id FROM provider_context_mutations
@@ -9491,38 +9521,6 @@ async fn validate_required_projection_sets(
                 binding.run_id
             );
         }
-        let approval_turn_id = prepared
-            .iter()
-            .flat_map(|write| &write.projections)
-            .find_map(|projection| match projection {
-                PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
-                    request_id: candidate,
-                    turn_id,
-                    ..
-                })) if candidate == request_id => Some(turn_id.as_str()),
-                _ => None,
-            })
-            .expect("approval pending projection was collected");
-        let owner_turn_id: String = sqlx::query_scalar(
-            "SELECT turn_id FROM inbound_commands
-             WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
-               AND status = 'applying'",
-        )
-        .bind(&binding.command_id)
-        .bind(approval_run_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "Approval Pending {request_id} has no durable owner turn for {}",
-                binding.command_id
-            )
-        })?;
-        if owner_turn_id != approval_turn_id {
-            bail!(
-                "Approval Pending {request_id} turn {approval_turn_id} does not match durable owner turn {owner_turn_id}"
-            );
-        }
         require_tool_owner_binding(
             transaction,
             tool_call_id,
@@ -11518,6 +11516,30 @@ async fn validate_durable_lifecycle_suffix(
                     run_id,
                     "ToolExecutionPrepare",
                 )?,
+                PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                })) if request_id.is_empty()
+                    || tool_call_id.is_empty()
+                    || run_id.is_empty()
+                    || turn_id.is_empty() =>
+                {
+                    bail!("Approval Pending identity and run/turn context must not be empty")
+                }
+                PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                })) => require_canonical_pending_approval_turn(
+                    &state,
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    turn_id,
+                )?,
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Start {
                         tool_call_id,
@@ -11687,6 +11709,42 @@ fn require_canonical_tool_call_origin(
             "{operation} for {tool_call_id} does not bind the exact open turn {} from assistant MessageEnd {}",
             origin.turn_id,
             origin.assistant_message_id
+        );
+    }
+    Ok(())
+}
+
+fn require_canonical_pending_approval_turn(
+    state: &DurableLifecycleState,
+    request_id: &str,
+    tool_call_id: &str,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if state.inferred_owner_turns.contains(run_id) {
+        let active_turn_id = state.open_turns.get(run_id).ok_or_else(|| {
+            anyhow!(
+                "Approval Pending {request_id} has no authenticated active turn for run {run_id}"
+            )
+        })?;
+        if active_turn_id != turn_id {
+            bail!(
+                "Approval Pending {request_id} turn {turn_id} does not match authenticated active turn {active_turn_id}"
+            );
+        }
+        return Ok(());
+    }
+
+    require_canonical_tool_call_origin(state, tool_call_id, run_id, "Approval Pending")?;
+    let origin = state
+        .tool_call_origins
+        .get(tool_call_id)
+        .expect("canonical tool-call origin was validated");
+    if origin.turn_id != turn_id {
+        bail!(
+            "Approval Pending {request_id} turn {turn_id} does not match authenticated active turn {} for canonical ToolCall {tool_call_id}",
+            origin.turn_id
         );
     }
     Ok(())
@@ -14177,6 +14235,137 @@ mod tests {
             })
             .await
             .expect("seed pending approval and prepared tool");
+    }
+
+    async fn continuation_tool_fixture(
+        command_id: &str,
+        tool_call_id: &str,
+    ) -> (Arc<Store>, EventWriter, String, String, String) {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "continue").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "continue"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open original owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let owner_turn_id = format!("turn-{command_id}");
+        let owner_assistant = assistant_message(StopReason::Stop);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-owner",
+                                &owner_assistant,
+                                Some(run_id.clone()),
+                                Some(owner_turn_id.clone()),
+                            )
+                            .expect("owner assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-owner",
+                                &owner_assistant,
+                                Some(run_id.clone()),
+                                Some(owner_turn_id.clone()),
+                            )
+                            .expect("owner assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-owner".to_owned(),
+                            role: "assistant",
+                            message: owner_assistant.clone(),
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                &run_id,
+                                &owner_turn_id,
+                                owner_assistant,
+                                Vec::new(),
+                            )
+                            .expect("owner TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("close original owner turn");
+
+        let active_turn_id = format!("continuation-{command_id}");
+        let tool_assistant = assistant_tool_message(&[tool_call_id]);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(&run_id, &active_turn_id)
+                                .expect("continuation TurnStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-continuation-tool",
+                                &tool_assistant,
+                                Some(run_id.clone()),
+                                Some(active_turn_id.clone()),
+                            )
+                            .expect("continuation assistant MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-continuation-tool",
+                                &tool_assistant,
+                                Some(run_id.clone()),
+                                Some(active_turn_id.clone()),
+                            )
+                            .expect("continuation assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-continuation-tool".to_owned(),
+                            role: "assistant",
+                            message: tool_assistant,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open continuation turn with canonical tool call");
+
+        (store, writer, run_id, owner_turn_id, active_turn_id)
     }
 
     fn approval_resolution_write(
@@ -21776,8 +21965,12 @@ mod tests {
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("approval turn cannot differ from its durable owner turn");
-        assert!(error.to_string().contains("durable owner turn turn-1"));
+            .expect_err("approval turn cannot differ from its authenticated active turn");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated active turn turn-1")
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM approval_log")
                 .fetch_one(wrong_turn_store.pool())
@@ -21852,6 +22045,105 @@ mod tests {
                 .to_string()
                 .contains("no matching durable owner command")
         );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_uses_the_authenticated_active_continuation_turn() {
+        let command_id = "00000000-0000-4000-8000-000000000092";
+        let tool_call_id = "tool-continuation-approval";
+        let (store, writer, run_id, owner_turn_id, active_turn_id) =
+            continuation_tool_fixture(command_id, tool_call_id).await;
+
+        let mut pending =
+            pending_approval_write("request-continuation-approval", tool_call_id, &run_id);
+        pending.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: tool_call_id.to_owned(),
+                command_id: command_id.to_owned(),
+                run_id: run_id.clone(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-continuation-approval".to_owned(),
+            }),
+        );
+        let Projection::Approval(ApprovalMutation::Pending { turn_id, .. }) =
+            &mut pending.projections[1]
+        else {
+            panic!("pending approval fixture shape changed")
+        };
+        *turn_id = active_turn_id.clone();
+        writer
+            .apply(EventBatch {
+                writes: vec![pending],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approval in the authenticated active continuation turn must commit");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT turn_id FROM approval_log WHERE id='request-continuation-approval'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("read continuation approval turn"),
+            active_turn_id
+        );
+
+        for (command_id, suffix, wrong_turn_id) in [
+            (
+                "00000000-0000-4000-8000-000000000093",
+                "owner",
+                owner_turn_id,
+            ),
+            (
+                "00000000-0000-4000-8000-000000000094",
+                "unknown",
+                "turn-never-opened".to_owned(),
+            ),
+        ] {
+            let tool_call_id = format!("tool-wrong-{suffix}-approval");
+            let (store, writer, run_id, _, active_turn_id) =
+                continuation_tool_fixture(command_id, &tool_call_id).await;
+            let request_id = format!("request-wrong-{suffix}-approval");
+            let mut pending = pending_approval_write(&request_id, &tool_call_id, &run_id);
+            pending.projections.insert(
+                0,
+                Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id: command_id.to_owned(),
+                    run_id: run_id.clone(),
+                    executor_generation: test_process_generation(1),
+                    idempotency_key: format!("idem-wrong-{suffix}-approval"),
+                }),
+            );
+            let Projection::Approval(ApprovalMutation::Pending { turn_id, .. }) =
+                &mut pending.projections[1]
+            else {
+                panic!("pending approval fixture shape changed")
+            };
+            *turn_id = wrong_turn_id;
+
+            let error = writer
+                .apply(EventBatch {
+                    writes: vec![pending],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect_err("approval outside the authenticated active turn must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("authenticated active turn {active_turn_id}")),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM approval_log")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("wrong continuation turn rollback"),
+                0
+            );
+        }
     }
 
     #[tokio::test]
