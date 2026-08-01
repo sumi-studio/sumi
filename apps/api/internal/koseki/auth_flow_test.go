@@ -275,6 +275,13 @@ func TestProviderLifecycleIsAuditedAndHistoricalBindingCannotMove(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if link.CreatedAt.IsZero() || !link.ExpiresAt.After(link.CreatedAt) {
+		t.Fatalf("provider operation timestamps: %+v", link)
+	}
+	pendingLink, err := store.PendingProviderOperation(ctx, link.OperationID, linkNonce)
+	if err != nil || !pendingLink.CreatedAt.Equal(link.CreatedAt) {
+		t.Fatalf("persisted provider operation created_at: %+v %v", pendingLink, err)
+	}
 	event, err := store.CompleteProviderLink(ctx, link.OperationID, linkNonce, "provider-owner", "github-subject")
 	if err != nil {
 		t.Fatal(err)

@@ -389,6 +389,7 @@ func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 	client := &fakeFirebaseIDTokenClient{token: &firebaseauth.Token{
 		UID:      "firebase-user",
 		AuthTime: time.Now().Add(-time.Minute).Unix(),
+		IssuedAt: time.Now().Add(-30 * time.Second).Unix(),
 		Claims: map[string]interface{}{
 			"email":          "Human@Example.com",
 			"email_verified": true,
@@ -412,7 +413,8 @@ func TestFirebaseAdminVerifierChecksRevocationAndReturnsTenant(t *testing.T) {
 	if identity.Email != "Human@Example.com" || !identity.EmailVerified ||
 		identity.SignInProvider != "github.com" ||
 		len(identity.ProviderSubjects["github.com"]) != 1 ||
-		identity.ProviderSubjects["github.com"][0] != "github-subject" || identity.AuthTime.IsZero() {
+		identity.ProviderSubjects["github.com"][0] != "github-subject" || identity.AuthTime.IsZero() || identity.IssuedAt.IsZero() ||
+		identity.IssuedAt.Unix() != client.token.IssuedAt {
 		t.Fatalf("verified proof claims were not preserved: %+v", identity)
 	}
 }
