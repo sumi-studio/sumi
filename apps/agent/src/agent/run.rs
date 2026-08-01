@@ -42,7 +42,7 @@ use crate::{
         },
     },
     runtime::contracts::{ProcessGeneration, RpcIdentity},
-    store::user_message_id,
+    store::{tool_result_message_id, user_message_id},
     tools::ToolError,
 };
 
@@ -60,9 +60,6 @@ pub(super) const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
 const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
 const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
-pub(super) const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
-]);
 const SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x94, 0x76, 0x9e, 0x72, 0xc9, 0x5b, 0x4d, 0xa8, 0x9c, 0x59, 0x8e, 0x36, 0xa2, 0x53, 0xa1, 0x70,
 ]);
@@ -3263,17 +3260,6 @@ fn error_tool_result(call: &ToolCall, message: &str) -> ToolResultMessage {
         is_error: true,
         timestamp: Utc::now(),
     }
-}
-
-fn tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
-    // Hash each variable-length identity independently so pair framing is
-    // unambiguous without constructing an unbounded concatenated name.
-    let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
-    let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
-    let mut pair_digest = [0_u8; 64];
-    pair_digest[..32].copy_from_slice(&assistant_digest);
-    pair_digest[32..].copy_from_slice(&tool_call_digest);
-    Uuid::new_v5(&TOOL_RESULT_MESSAGE_ID_NAMESPACE, &pair_digest).to_string()
 }
 
 fn synthetic_attempt_message_id(

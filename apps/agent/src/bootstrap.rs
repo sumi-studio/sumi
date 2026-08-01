@@ -51,8 +51,8 @@ use crate::{
     provider::{RequestOptions, types::PromptContext},
     runtime::{allocator::SupervisorAllocation, authority::RuntimeEpochAuthority},
     store::{
-        AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome, RecoveryStep,
-        Redactor, Store,
+        AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome,
+        LogicalRecoveryExecutor as StoreLogicalRecoveryExecutor, RecoveryStep, Redactor, Store,
     },
     tools::{
         Tool, WorkspacePaths,
@@ -297,8 +297,29 @@ trait LogicalRecoveryExecutor: Send + Sync {
     ) -> Result<()>;
 }
 
+#[cfg(test)]
 struct LogicalRecoveryExecutorUnavailable;
 
+#[async_trait]
+impl LogicalRecoveryExecutor for StoreLogicalRecoveryExecutor {
+    async fn execute(
+        &self,
+        store: &Store,
+        steps: &[RecoveryStep],
+        authority: &RuntimeEpochAuthority,
+    ) -> Result<()> {
+        StoreLogicalRecoveryExecutor::execute(
+            self,
+            store,
+            steps,
+            authority.lease(),
+            authority.fence(),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
 #[async_trait]
 impl LogicalRecoveryExecutor for LogicalRecoveryExecutorUnavailable {
     async fn execute(
@@ -988,7 +1009,7 @@ async fn run_after_not_ready(
         let hydrated = hydrate_to_fixed_point(
             store.as_ref(),
             &context.authority,
-            &LogicalRecoveryExecutorUnavailable,
+            &StoreLogicalRecoveryExecutor,
         )
         .await?;
 

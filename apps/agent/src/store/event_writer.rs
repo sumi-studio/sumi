@@ -820,6 +820,22 @@ pub(crate) fn user_message_id(
     .to_string()
 }
 
+const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
+]);
+
+/// Stable transcript identity shared by the live run loop and cold-boot
+/// logical recovery. Hashing each variable-length component independently
+/// keeps the pair framing unambiguous.
+pub(crate) fn tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
+    let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
+    let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
+    let mut pair_digest = [0_u8; 64];
+    pair_digest[..32].copy_from_slice(&assistant_digest);
+    pair_digest[32..].copy_from_slice(&tool_call_digest);
+    Uuid::new_v5(&TOOL_RESULT_MESSAGE_ID_NAMESPACE, &pair_digest).to_string()
+}
+
 impl InjectedCommand {
     #[allow(
         dead_code,
@@ -1232,6 +1248,7 @@ const SKIP_ERROR_CODES: &[&str] = &[
     "user_steer_cancelled",
     "approval_denied",
     "approval_cancelled",
+    "process_restarted",
 ];
 
 #[allow(
