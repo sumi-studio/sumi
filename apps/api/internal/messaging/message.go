@@ -233,6 +233,34 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	return messages, nil
 }
 
+// MessagesSince returns up to limit messages with seq strictly greater than
+// sinceSeq, ascending. It is the catch-up read behind WebSocket reconnect
+// cursors (契約ドラフト v0.1: subscribeはcursor catch-upを持つ).
+func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer ParticipantRef, sinceSeq int64, limit int) ([]Message, error) {
+	if _, err := s.PlaceFor(ctx, placeID, viewer); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > MaxHistoryLimit {
+		limit = MaxHistoryLimit
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT message_id, place_id, seq, author_kind, author_id, content, urgency,
+		        reply_to, client_nonce, created_at, edited_at, deleted_at
+		 FROM messages WHERE place_id = $1 AND seq > $2
+		 ORDER BY seq ASC LIMIT $3`, placeID, sinceSeq, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query messages since: %w", err)
+	}
+	messages, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachMentions(ctx, messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 // EditMessage replaces the content of the author's own live message. Mentions
 // are re-resolved against active membership at edit time (the edit is a new
 // admission).
@@ -304,62 +332,65 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 // DeleteMessage tombstones a message: content is removed, the fact and the seq
 // remain. Allowed for the author, and — in channels — for workspace admins and
 // owners (契約ドラフト: メッセージ削除は本人 + admin). Deleting an already
-// deleted message is a no-op.
-func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, actor ParticipantRef) error {
+// deleted message is a no-op. The returned message is the tombstone.
+func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, actor ParticipantRef) (Message, error) {
 	if err := actor.Validate(); err != nil {
-		return err
+		return Message{}, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin delete: %w", err)
+		return Message{}, fmt.Errorf("begin delete: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	place, err := s.loadPlace(ctx, tx, placeID)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 	visible, err := s.canAccess(ctx, tx, place, actor)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 	if !visible {
-		return ErrPlaceNotFound
+		return Message{}, ErrPlaceNotFound
 	}
 	msg, err := lockMessage(ctx, tx, placeID, messageID)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 	if msg.Deleted {
-		return tx.Commit(ctx)
+		return msg, tx.Commit(ctx)
 	}
 	if msg.Author != actor {
 		allowed := false
 		if place.Kind == PlaceChannel {
 			_, role, err := s.workspaceMembership(ctx, tx, place.WorkspaceID, actor)
 			if err != nil {
-				return err
+				return Message{}, err
 			}
 			allowed = role == RoleAdmin || role == RoleOwner
 		}
 		if !allowed {
-			return ErrForbidden
+			return Message{}, ErrForbidden
 		}
 	}
 	if _, err := tx.Exec(ctx,
 		"UPDATE messages SET content = NULL, deleted_at = now() WHERE message_id = $1",
 		messageID); err != nil {
-		return fmt.Errorf("tombstone message: %w", err)
+		return Message{}, fmt.Errorf("tombstone message: %w", err)
 	}
 	// A tombstone no longer addresses anyone; mention-unread must not count it.
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
-		return fmt.Errorf("clear mentions: %w", err)
+		return Message{}, fmt.Errorf("clear mentions: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit delete: %w", err)
+		return Message{}, fmt.Errorf("commit delete: %w", err)
 	}
-	return nil
+	msg.Content = ""
+	msg.Mentions = nil
+	msg.Deleted = true
+	return msg, nil
 }
 
 // ReadThrough advances the participant's read marker to seq. Idempotent and

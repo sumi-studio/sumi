@@ -286,10 +286,16 @@ func newApplicationFromEnv() (*application, error) {
 		if sv != nil {
 			messagingSessions = sv
 		}
-		messagingServer := messaging.NewServer(messaging.New(database.Pool), messagingSessions)
+		messagingStore := messaging.New(database.Pool)
+		messagingHub := messaging.NewHub(messagingStore)
+		messagingServer := messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
+		messagingServer.Hub = messagingHub
 		messagingServer.RegisterRoutes(mux)
-		log.Print("messaging routes ready")
+		messagingWS := messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
+		messagingWS.AllowedOrigins = browserOrigins
+		mux.Handle("GET /messaging/ws", messagingWS)
+		log.Print("messaging routes ready (REST + WS)")
 	}
 	localControl, enabled, err := localControlServerFromEnv(runtime)
 	if err != nil {

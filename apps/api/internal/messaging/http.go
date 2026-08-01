@@ -26,6 +26,10 @@ type Server struct {
 	Store          *Store
 	Sessions       agentevents.UserSessionAuthorizer
 	AllowedOrigins []string
+	// Hub, when set, receives durable events from REST mutations so live
+	// WebSocket subscribers see messages regardless of which transport
+	// committed them. Nil is fine: durable truth lives in the store.
+	Hub *Hub
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -573,6 +577,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		// An idempotent replay: the original receipt, not a new message.
 		status = http.StatusOK
 	}
+	if created {
+		wire := messageToWire(place, msg)
+		s.Hub.Publish(r.Context(), Event{Type: EventMessageCreated, PlaceID: placeID, Message: &wire})
+	}
 	writeJSON(w, status, struct {
 		MessageID string      `json:"message_id"`
 		Seq       int64       `json:"seq"`
@@ -614,9 +622,11 @@ func (s *Server) serveEdit(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	wire := messageToWire(place, msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventMessageEdited, PlaceID: placeID, Message: &wire})
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`
-	}{Message: messageToWire(place, msg)})
+	}{Message: wire})
 }
 
 func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
@@ -624,8 +634,17 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	placeID := r.PathValue("place_id")
+	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var msg Message
 	done, err := s.mutate(w, r, claims, func() error {
-		return s.Store.DeleteMessage(r.Context(), r.PathValue("place_id"), r.PathValue("message_id"), viewer)
+		var opErr error
+		msg, opErr = s.Store.DeleteMessage(r.Context(), placeID, r.PathValue("message_id"), viewer)
+		return opErr
 	})
 	if !done {
 		return
@@ -634,6 +653,8 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	wire := messageToWire(place, msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
 	w.WriteHeader(http.StatusNoContent)
 }
 

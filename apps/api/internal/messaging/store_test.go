@@ -313,14 +313,14 @@ func TestEditAndDeleteAuthorization(t *testing.T) {
 	}
 
 	// A plain member cannot delete another's message; a workspace owner can.
-	if err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.agent); !errors.Is(err, ErrForbidden) {
+	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.agent); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("member delete: got %v, want ErrForbidden", err)
 	}
-	if err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA); err != nil {
+	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanA); err != nil {
 		t.Fatalf("owner delete: %v", err)
 	}
 	// Idempotent: deleting a tombstone is a no-op.
-	if err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanB); err != nil {
+	if _, err := w.store.DeleteMessage(ctx, ch.PlaceID, msg.MessageID, w.humanB); err != nil {
 		t.Fatalf("delete tombstone: %v", err)
 	}
 
