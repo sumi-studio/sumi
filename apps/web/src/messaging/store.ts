@@ -670,6 +670,35 @@ export function getMessagingSessionIdentity(): string | null {
   return messagingSessionIdentity;
 }
 
+/**
+ * Re-read authoritative presentation profiles after a canonical Human rename.
+ * A rename may also change contextual agent labels (for example `Sumi（たっけ）`),
+ * so patching only the signed-in Human would leave the current view inconsistent.
+ */
+export async function refreshMessagingMemberProfiles(): Promise<void> {
+  const state = useMessaging.getState();
+  if (!state.ready || !state.selfKey) return;
+
+  const currentBackend = backend;
+  const currentIdentity = messagingSessionIdentity;
+  const expectedSelfKey = state.selfKey;
+  const snapshot = await currentBackend.bootstrap();
+  if (
+    backend !== currentBackend ||
+    messagingSessionIdentity !== currentIdentity ||
+    useMessaging.getState().selfKey !== expectedSelfKey ||
+    participantKey(snapshot.self) !== expectedSelfKey
+  ) {
+    throw new Error("Messaging session changed during profile refresh");
+  }
+
+  const membersByKey: Record<ParticipantKey, MemberProfile> = {};
+  for (const member of snapshot.members) {
+    membersByKey[participantKey(member.participant)] = member;
+  }
+  useMessaging.setState({ membersByKey });
+}
+
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;

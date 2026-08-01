@@ -18,6 +18,7 @@ const authorityBindingB = `${"B".repeat(42)}E`;
 const authMocks = vi.hoisted(() => ({
   getSumiSession: vi.fn(),
   logoutSumiSession: vi.fn(),
+  updateSumiProfile: vi.fn(),
   verifyCommittedSumiSession: vi.fn(),
   startAuthFlow: vi.fn().mockResolvedValue({
     flowId: "flow-id",
@@ -57,6 +58,7 @@ vi.mock("./session-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./session-client")>()),
   getSumiSession: authMocks.getSumiSession,
   logoutSumiSession: authMocks.logoutSumiSession,
+  updateSumiProfile: authMocks.updateSumiProfile,
   verifyCommittedSumiSession: authMocks.verifyCommittedSumiSession,
 }));
 
@@ -126,6 +128,10 @@ beforeEach(() => {
     expiresAt: "2026-08-01T01:00:00Z",
   });
   authMocks.logoutSumiSession.mockResolvedValue(undefined);
+  authMocks.updateSumiProfile.mockResolvedValue({
+    id: "user-a",
+    displayName: "After",
+  });
   authMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
   authMocks.beginSameEmailCredentialRecovery.mockResolvedValue(undefined);
   authMocks.completeSameEmailCredentialRecovery.mockResolvedValue(
@@ -146,6 +152,7 @@ function AuthStateProbe() {
     <>
       <div data-testid="session-state">{auth.sessionState}</div>
       <div data-testid="user-id">{auth.user?.id ?? "none"}</div>
+      <div data-testid="display-name">{auth.user?.displayName ?? "none"}</div>
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
       </div>
@@ -182,9 +189,49 @@ function AuthStateProbe() {
       >
         complete email
       </button>
+      <button
+        type="button"
+        onClick={() =>
+          void auth.updateDisplayName("After").catch(() => undefined)
+        }
+      >
+        update display name
+      </button>
     </>
   );
 }
+
+describe("canonical Human profile", () => {
+  it("commits the returned canonical display name into AuthContext immediately", async () => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    });
+    authMocks.updateSumiProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "After",
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("After");
+    });
+    expect(authMocks.updateSumiProfile).toHaveBeenCalledWith("After");
+  });
+});
 
 describe("logout authority transition", () => {
   it("keeps the UI unauthenticated when Firebase cleanup setup throws synchronously", async () => {

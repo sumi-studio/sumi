@@ -62,6 +62,7 @@ import {
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
   type SumiSessionStatus,
+  updateSumiProfile,
   verifyCommittedSumiSession,
 } from "./session-client";
 
@@ -141,6 +142,7 @@ interface AuthContextValue {
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
+  updateDisplayName: (displayName: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<AuthSessionState>;
 }
@@ -724,6 +726,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setOutcomeNotice(null);
   }, []);
 
+  const updateDisplayName = useCallback(
+    async (displayName: string) => {
+      await serializeSessionMutation(async () => {
+        const generation = nextGeneration();
+        const current = serverSession.current;
+        if (!current.authenticated) {
+          throw new AuthAPIError("Authentication is unavailable.", 401);
+        }
+        const updatedUser = await updateSumiProfile(displayName);
+        if (!isCurrentGeneration(generation)) return;
+        if (updatedUser.id !== current.user.id) {
+          throw new AuthAPIError("Profile identity changed.", 409);
+        }
+        const nextSession: SumiSessionStatus = {
+          ...current,
+          user: updatedUser,
+        };
+        serverSession.current = nextSession;
+        setSession(nextSession);
+      });
+    },
+    [isCurrentGeneration, nextGeneration, serializeSessionMutation],
+  );
+
   const logout = useCallback(async () => {
     // AuthGate unmounts ChatScreen as soon as this enters checking, closing
     // the already-upgraded socket before the cookie is cleared server-side.
@@ -771,7 +797,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     return {
       id: session.user.id,
-      displayName: null,
+      displayName: session.user.displayName,
       email: null,
       photoURL: null,
     };
@@ -797,6 +823,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       confirmIntentTransition,
       cancelIntentTransition,
       dismissOutcomeNotice,
+      updateDisplayName,
       logout,
       refreshSession,
     }),
@@ -817,6 +844,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       outcomeNotice,
       user,
+      updateDisplayName,
     ],
   );
 

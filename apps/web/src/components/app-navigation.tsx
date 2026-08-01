@@ -22,9 +22,10 @@ import {
   UserRound,
 } from "lucide-react";
 import type { ComponentType, ReactElement } from "react";
-import { useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
+import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 
@@ -76,8 +77,16 @@ export function AppNavigation() {
 }
 
 export function SettingsPopover() {
-  const { authenticated, user, logout } = useAuth();
+  const { authenticated, user, logout, updateDisplayName } = useAuth();
   const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const [displayName, setDisplayName] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  useEffect(() => {
+    setDisplayName(user?.displayName ?? "");
+  }, [user?.displayName]);
 
   const handleLogout = async () => {
     setLogoutError(null);
@@ -87,6 +96,36 @@ export function SettingsPopover() {
       setLogoutError("ログアウトを完了できませんでした。");
     }
   };
+
+  const handleProfileSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nextDisplayName = displayName.trim();
+    if (
+      !nextDisplayName ||
+      Array.from(nextDisplayName).length > 80 ||
+      nextDisplayName === user?.displayName
+    ) {
+      return;
+    }
+    setProfileError(null);
+    setProfileNotice(null);
+    setSavingProfile(true);
+    try {
+      await updateDisplayName(nextDisplayName);
+      try {
+        await refreshMessagingMemberProfiles();
+      } catch {
+        setProfileNotice("保存済み。トークの表示は再読み込みで反映されます。");
+      }
+    } catch {
+      setProfileError("表示名を更新できませんでした。");
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const displayNameCodePoints = Array.from(displayName.trim()).length;
+  const displayNameTooLong = displayNameCodePoints > 80;
 
   return (
     <Popover>
@@ -115,9 +154,60 @@ export function SettingsPopover() {
             <div className="flex items-center gap-2 px-2.5 py-2 text-sm">
               <UserRound className="size-4 shrink-0" />
               <span className="max-w-44 truncate">
-                {user?.displayName ?? user?.email ?? user?.id ?? "アカウント"}
+                {user?.displayName ?? "アカウント"}
               </span>
             </div>
+            <form
+              onSubmit={(event) => void handleProfileSubmit(event)}
+              className="px-2.5 pb-2"
+            >
+              <label
+                htmlFor="sumi-settings-display-name"
+                className="mb-1 block text-muted-foreground text-xs"
+              >
+                表示名
+              </label>
+              <div className="flex gap-1.5">
+                <input
+                  id="sumi-settings-display-name"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  disabled={user?.displayName === null}
+                  maxLength={160}
+                  aria-invalid={displayNameTooLong || undefined}
+                  autoComplete="name"
+                  className="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={
+                    savingProfile ||
+                    user?.displayName === null ||
+                    !displayName.trim() ||
+                    displayNameTooLong ||
+                    displayName.trim() === user?.displayName
+                  }
+                >
+                  {savingProfile ? "保存中" : "保存"}
+                </Button>
+              </div>
+              {profileError ? (
+                <p role="alert" className="mt-1 text-red-600 text-xs">
+                  {profileError}
+                </p>
+              ) : null}
+              {displayNameTooLong ? (
+                <p role="alert" className="mt-1 text-red-600 text-xs">
+                  表示名は1〜80文字で入力してください。
+                </p>
+              ) : null}
+              {profileNotice ? (
+                <p role="status" className="mt-1 text-muted-foreground text-xs">
+                  {profileNotice}
+                </p>
+              ) : null}
+            </form>
             <ProviderSettings humanId={user?.id ?? ""} />
             <Button
               variant="ghost"
