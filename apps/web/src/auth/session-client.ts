@@ -68,12 +68,12 @@ async function fetchCSRFToken(): Promise<string> {
   return body.csrf_token;
 }
 
-export async function exchangeFirebaseIDToken(idToken: string): Promise<void> {
-  if (!idToken || idToken.length > 12 * 1024) {
-    throw new AuthAPIError("Invalid Firebase ID token.", 0);
-  }
+export async function postAuthJSON(
+  path: `/auth/${string}`,
+  body: Record<string, string>,
+): Promise<unknown> {
   const csrfToken = await fetchCSRFToken();
-  const response = await fetch("/auth/session", {
+  const response = await fetch(path, {
     method: "POST",
     credentials: "include",
     cache: "no-store",
@@ -82,41 +82,36 @@ export async function exchangeFirebaseIDToken(idToken: string): Promise<void> {
       "Content-Type": "application/json",
       "X-CSRF-Token": csrfToken,
     },
-    body: JSON.stringify({ id_token: idToken }),
+    body: JSON.stringify(body),
     signal: authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);
   }
+  return readAuthJSON(response);
 }
 
 /**
- * The exchange response commits HttpOnly authority before the browser can
+ * A terminal auth-flow response commits HttpOnly authority before the browser can
  * confirm its status. Keep both operations in one mutation and compensate
  * with a Sumi logout if any post-commit status read fails.
  */
-export async function establishSumiSession(
-  idToken: string,
-): Promise<Extract<SumiSessionStatus, { authenticated: true }>> {
-  let exchangeCommitted = false;
+export async function verifyCommittedSumiSession(): Promise<
+  Extract<SumiSessionStatus, { authenticated: true }>
+> {
   try {
-    await exchangeFirebaseIDToken(idToken);
-    exchangeCommitted = true;
     const session = await getSumiSession();
     if (!session.authenticated) {
       throw new AuthAPIError("Sumi session was not established.", 401);
     }
     return session;
   } catch (error) {
-    if (exchangeCommitted) {
-      try {
-        await logoutSumiSession();
-      } catch (logoutError) {
-        throw new SumiSessionCompensationFailedError(error, logoutError);
-      }
-      throw new SumiSessionCompensatedError(error);
+    try {
+      await logoutSumiSession();
+    } catch (logoutError) {
+      throw new SumiSessionCompensationFailedError(error, logoutError);
     }
-    throw error;
+    throw new SumiSessionCompensatedError(error);
   }
 }
 
