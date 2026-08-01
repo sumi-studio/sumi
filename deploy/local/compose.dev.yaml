@@ -87,6 +87,7 @@ services:
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-command-log
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-runtime-state
         install -d -m 0750 -o 65532 -g 20000 /run/sumi/local-control
+        install -d -m 0700 -o root -g root /run/sumi/runtime-secrets
     cap_add: [CHOWN, FOWNER]
     volumes:
       - api-command-log:/var/lib/sumi-command-log
@@ -94,6 +95,9 @@ services:
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
+      - type: bind
+        source: /run/sumi/runtime-secrets
+        target: /run/sumi/runtime-secrets
     restart: "no"
 
   api:
@@ -183,12 +187,22 @@ services:
       - /opt/sumi/deploy/agent/supervisor
     environment:
       SUMI_CONTROL_PLANE_NETWORK: sumi-control-plane
+      # Passed only to the supervisor's non-secret activation descriptor.
+      # Empty keeps the agent default; local diagnostics may set a bounded
+      # tracing filter without rebuilding the API.
+      SUMI_LOG: ${SUMI_LOG:-}
+      # Explicitly local-development-only. The supervisor still fails closed
+      # unless the launcher confirms that this host has AppArmor disabled.
+      SUMI_DEV_ALLOW_APPARMOR_UNCONFINED: ${SUMI_DEV_ALLOW_APPARMOR_UNCONFINED:-false}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - provisioner-control:/run/sumi/runtime-provisioner
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
+      - type: bind
+        source: /run/sumi/runtime-secrets
+        target: /run/sumi/runtime-secrets
     depends_on:
       api-state-init:
         condition: service_completed_successfully

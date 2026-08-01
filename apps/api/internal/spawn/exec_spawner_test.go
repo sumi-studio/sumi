@@ -42,7 +42,7 @@ func TestExecSpawnerBuildsAgentEnv(t *testing.T) {
 		AgentID:                   "agent-1",
 		StateDir:                  stateDir,
 		WorkspaceDir:              workspaceDir,
-		WrappingKey:               "wrapping-key",
+		WrappingKey:               WrappingKeyMaterial{ID: "test-wrapping/v1", Bytes: "wrapping-key"},
 		Bearer:                    "bearer-1",
 		Nonce:                     "nonce-1",
 		BearerExpiresAtUnix:       time.Now().Add(time.Hour).Unix(),
@@ -122,7 +122,7 @@ func TestBuildAgentEnvIncludesRequiredValues(t *testing.T) {
 		AgentID:                   "agent-1",
 		StateDir:                  "/state/agent-1",
 		WorkspaceDir:              "/workspace/agent-1",
-		WrappingKey:               "wrapping-key",
+		WrappingKey:               WrappingKeyMaterial{ID: "test-wrapping/v1", Bytes: "wrapping-key"},
 		Bearer:                    "bearer-1",
 		Nonce:                     "nonce-1",
 		BearerExpiresAtUnix:       1900000000,
@@ -142,6 +142,9 @@ func TestBuildAgentEnvIncludesRequiredValues(t *testing.T) {
 	byKey := map[string]string{}
 	for _, e := range env {
 		if i := strings.Index(e, "="); i >= 0 {
+			if _, duplicate := byKey[e[:i]]; duplicate {
+				t.Fatalf("duplicate environment key %s", e[:i])
+			}
 			byKey[e[:i]] = e[i+1:]
 		}
 	}
@@ -158,7 +161,7 @@ func TestBuildAgentEnvIncludesRequiredValues(t *testing.T) {
 		"SUMI_LOCAL_CONTROL_URL":                    "http://127.0.0.1:8081",
 		"SUMI_LOCAL_CONTROL_BEARER":                 "bearer-1",
 		"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX": "1900000000",
-		"SUMI_AGENT_WRAPPING_KEY_ID":                "local-ephemeral/v1",
+		"SUMI_AGENT_WRAPPING_KEY_ID":                "test-wrapping/v1",
 		"SUMI_AGENT_WRAPPING_KEY":                   "wrapping-key",
 		"SUMI_EXECUTOR_SOCKET":                      "/tmp/executor.sock",
 		"SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY":      "true",
@@ -196,7 +199,7 @@ func TestBuildAgentEnvAllowsSharedEnvToOverrideLoopback(t *testing.T) {
 		AgentID:         "agent-1",
 		StateDir:        "/state/agent-1",
 		WorkspaceDir:    "/workspace/agent-1",
-		WrappingKey:     "k",
+		WrappingKey:     WrappingKeyMaterial{ID: "test-wrapping/v1", Bytes: "k"},
 		Bearer:          "b",
 		Nonce:           "n",
 		GatewayURL:      "ws://127.0.0.1:8080/agent/ws",

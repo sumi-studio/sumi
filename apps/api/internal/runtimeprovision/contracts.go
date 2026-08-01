@@ -19,6 +19,8 @@ const (
 )
 
 var canonicalPAID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var approvalSecretDigestKey = regexp.MustCompile(`^[0-9A-Fa-f]{64}$`)
+var agentWrappingKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Phase is the host-observed lifecycle of one process generation.
 type Phase string
@@ -136,6 +138,30 @@ func ValidatePersonalityAgentID(value string) error {
 	return nil
 }
 
+func ValidateApprovalSecretDigestKey(value string) error {
+	if !approvalSecretDigestKey.MatchString(value) {
+		return errors.New("approval_secret_digest_key must be exactly 64 hexadecimal characters")
+	}
+	return nil
+}
+
+func ValidateAgentWrappingKey(value string) error {
+	if !agentWrappingKey.MatchString(value) {
+		return errors.New("agent_wrapping_key must be exactly 64 lowercase hexadecimal characters")
+	}
+	return nil
+}
+
+func ValidateAgentWrappingKeyID(value string) error {
+	if value == "" || len(value) > 255 || strings.TrimSpace(value) != value ||
+		strings.IndexFunc(value, func(character rune) bool {
+			return character < 0x20 || character == 0x7f
+		}) >= 0 {
+		return errors.New("agent_wrapping_key_id must be 1-255 trimmed characters without control bytes")
+	}
+	return nil
+}
+
 func validateVersion(version int) error {
 	if version != ProtocolVersion {
 		return fmt.Errorf("unsupported protocol version %d", version)
@@ -198,6 +224,15 @@ func (config ActivationConfig) Validate() error {
 		if strings.ContainsAny(value, "\x00\r\n") {
 			return fmt.Errorf("%s must not contain NUL or a line ending", name)
 		}
+	}
+	if err := ValidateApprovalSecretDigestKey(config.ApprovalSecretDigestKey); err != nil {
+		return err
+	}
+	if err := ValidateAgentWrappingKey(config.AgentWrappingKey); err != nil {
+		return err
+	}
+	if err := ValidateAgentWrappingKeyID(config.AgentWrappingKeyID); err != nil {
+		return err
 	}
 	if config.LocalControlBearerExpiresAtUnix <= 0 {
 		return errors.New("local_control_bearer_expires_at_unix must be positive")

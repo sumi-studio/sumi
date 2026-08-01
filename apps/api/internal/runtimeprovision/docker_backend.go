@@ -32,18 +32,51 @@ type commandRunner interface {
 
 type execCommandRunner struct{}
 
+type supervisorCommandError struct {
+	cause      error
+	diagnostic string
+}
+
+func (err *supervisorCommandError) Error() string { return err.cause.Error() }
+func (err *supervisorCommandError) Unwrap() error { return err.cause }
+
 func (execCommandRunner) Run(ctx context.Context, path string, args, environment []string) ([]byte, error) {
 	command := exec.CommandContext(ctx, path, args...)
 	command.Env = environment
 	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	command.Stdout = &stdout
-	command.Stderr = io.Discard
+	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
-		// Supervisor stderr is intentionally not reflected into the daemon or
-		// caller because activation configuration contains credentials.
-		return nil, err
+		return nil, &supervisorCommandError{
+			cause:      err,
+			diagnostic: sanitizeSupervisorError(stderr.String(), environment),
+		}
 	}
 	return stdout.Bytes(), nil
+}
+
+func sanitizeSupervisorError(message string, environment []string) string {
+	for _, item := range environment {
+		name, value, ok := strings.Cut(item, "=")
+		if !ok || value == "" {
+			continue
+		}
+		switch name {
+		case "SUMI_LOCAL_CONTROL_BEARER", "SUMI_AGENT_WRAPPING_KEY",
+			"SUMI_APPROVAL_SECRET_DIGEST_KEY", "SUMI_PROVIDER_API_KEY",
+			"SUMI_EXPECTED_RPC_NONCE":
+			message = strings.ReplaceAll(message, value, "<redacted:"+name+">")
+		}
+	}
+	message = strings.TrimSpace(message)
+	if len(message) > 4096 {
+		message = message[len(message)-4096:]
+	}
+	if message == "" {
+		return "no safe supervisor diagnostic"
+	}
+	return message
 }
 
 type DockerBackendConfig struct {
@@ -182,6 +215,10 @@ func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentI
 	defer cancel()
 	output, err := backend.runner.Run(operationContext, backend.supervisor, []string{action}, environment)
 	if err != nil {
+		var commandError *supervisorCommandError
+		if errors.As(err, &commandError) {
+			return nil, fmt.Errorf("docker supervisor %s failed: %s", action, commandError.diagnostic)
+		}
 		return nil, fmt.Errorf("docker supervisor %s failed", action)
 	}
 	return output, nil

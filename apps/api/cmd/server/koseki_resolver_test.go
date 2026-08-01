@@ -29,8 +29,8 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	resolver := newKosekiIdentityBindingResolver(koseki.New(pool), "local", "firebase")
-	store := koseki.New(pool)
+	resolver := newKosekiIdentityBindingResolver(koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1"), "local", "firebase")
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	// First account: auto-registration mints a Human + Secretary.
 	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa"})
@@ -47,8 +47,12 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 		t.Fatal("HumanId and PersonalityAgentID must differ")
 	}
 	// Per-agent wrapping key is generated at registration.
-	if _, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID); err != nil {
+	firstKey, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID)
+	if err != nil {
 		t.Fatalf("wrapping key for first agent: %v", err)
+	}
+	if firstKey.ID != "test-wrapping/v1" || len(firstKey.Bytes) != 64 {
+		t.Fatalf("wrapping key pair mismatch: id=%q bytes=%d", firstKey.ID, len(firstKey.Bytes))
 	}
 
 	// Known credential resolves to the same HumanId and agent (no re-registration).
@@ -68,8 +72,12 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if second.UserID == first.UserID || second.PersonalityAgentID == first.PersonalityAgentID {
 		t.Fatal("second account must get a distinct HumanId and PersonalityAgentID")
 	}
-	if _, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID); err != nil {
+	secondKey, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID)
+	if err != nil {
 		t.Fatalf("wrapping key for second agent: %v", err)
+	}
+	if secondKey.ID != "test-wrapping/v1" || len(secondKey.Bytes) != 64 {
+		t.Fatalf("second wrapping key pair mismatch: id=%q bytes=%d", secondKey.ID, len(secondKey.Bytes))
 	}
 
 	// Each Human has exactly one Secretary that round-trips through the store.
@@ -92,7 +100,7 @@ func TestKosekiDirectChatAuthorizerEnforcesEmployer(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	authorizer := newKosekiDirectChatAuthorizer(store)
 
 	// Two Humans, each with their own Secretary.

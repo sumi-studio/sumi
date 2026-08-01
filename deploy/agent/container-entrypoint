@@ -30,8 +30,8 @@ require_env() {
   [[ -n "${!name:-}" ]] || fail "missing required ${name}"
 }
 
-# Compose environment-backed secrets are mounted with an exact runtime owner
-# and mode. Secret values are one non-empty byte string with no line ending:
+# Root-managed per-generation secret files are mounted with an exact runtime
+# owner and mode. Secret values are one non-empty byte string with no line ending:
 # accepting line-oriented input would make trailing-newline normalization
 # dependent on how the host supplied the value.
 load_runtime_secret() {
@@ -191,9 +191,10 @@ case "${role}" in
     chown root:root /run/sumi/executor /run/sumi/broker
     chmod 0700 /run/sumi/executor /run/sumi/broker
     rm -f /run/sumi/executor/executor.sock /run/sumi/broker/broker.sock
-    install -d -m 0710 -o "${EXECUTOR_UID}" -g "${EXECUTOR_IPC_GID}" /run/sumi/executor
+    install -d -m 0750 -o "${EXECUTOR_UID}" -g "${EXECUTOR_IPC_GID}" /run/sumi/executor
     install -d -m 0710 -o "${BROKER_UID}" -g "${BROKER_IPC_GID}" /run/sumi/broker
-    chmod 02710 /run/sumi/executor /run/sumi/broker
+    chmod 02750 /run/sumi/executor
+    chmod 02710 /run/sumi/broker
     ;;
 
   runtime)
@@ -241,6 +242,7 @@ case "${role}" in
       "SUMI_STATE_DIR=/var/lib/sumi"
       "SUMI_WORKSPACE=${SUMI_WORKSPACE}"
       "SUMI_EXECUTOR_SOCKET=/run/sumi/executor/executor.sock"
+      "SUMI_EXECUTOR_SERVER_UID=${SUMI_EXECUTOR_SERVER_UID}"
       "SUMI_GATEWAY_URL=${SUMI_GATEWAY_URL}"
       "SUMI_LOCAL_CONTROL_UNIX_SOCKET=${SUMI_LOCAL_CONTROL_UNIX_SOCKET}"
       "SUMI_LOCAL_CONTROL_SERVER_UID=${SUMI_LOCAL_CONTROL_SERVER_UID}"

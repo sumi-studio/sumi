@@ -123,3 +123,42 @@ func TestKosekiSchemaConstraints(t *testing.T) {
 		t.Fatalf("expected exactly 1 active employment after transfer, got %d", activeCount)
 	}
 }
+
+func TestAgentWrappingKeyIdentityMigrationRequiresExplicitResolution(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	const humanID = "0198f0f4-9b72-7000-8000-000000000011"
+	const agentID = "0198f0f4-9b72-7000-8000-000000000012"
+	const key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", agentID, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)",
+		agentID, key); err != nil {
+		t.Fatalf("unresolved pre-migration row was not representable: %v", err)
+	}
+	var unresolved bool
+	if err := pool.QueryRow(ctx,
+		"SELECT wrapping_key_id IS NULL FROM agent_secrets WHERE personality_agent_id=$1",
+		agentID).Scan(&unresolved); err != nil || !unresolved {
+		t.Fatalf("historical key identity was guessed: unresolved=%v err=%v", unresolved, err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE agent_secrets SET wrapping_key_id=$2 WHERE personality_agent_id=$1",
+		agentID, " proven-id"); err == nil {
+		t.Fatal("invalid wrapping key ID passed the schema constraint")
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE agent_secrets SET wrapping_key_id=$2 WHERE personality_agent_id=$1",
+		agentID, "test-wrapping/v1"); err != nil {
+		t.Fatalf("explicit proven wrapping key ID was rejected: %v", err)
+	}
+}

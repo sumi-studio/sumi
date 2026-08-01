@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 )
 
 const (
@@ -202,13 +203,18 @@ func browserAuthServerFromEnvWithDB(
 
 	firebaseTenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_TENANT_ID"))
 	var bindings agentevents.IdentityBindingResolver
+	var registrationStore *koseki.Store
 	if kosekiMode {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
 		if tenantID == "" {
 			return nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
 		}
-		store := koseki.New(pool)
-		bindings = newKosekiIdentityBindingResolver(store, tenantID, "firebase")
+		wrappingKeyID := strings.TrimSpace(os.Getenv("SUMI_AGENT_WRAPPING_KEY_ID"))
+		if err := runtimeprovision.ValidateAgentWrappingKeyID(wrappingKeyID); err != nil {
+			return nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
+		}
+		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID)
+		bindings = newKosekiIdentityBindingResolver(registrationStore, tenantID, "firebase")
 	} else {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
 		userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
@@ -276,7 +282,7 @@ func browserAuthServerFromEnvWithDB(
 	server.SessionTTL = ttl
 	if kosekiMode {
 		server.Flows = newKosekiAuthFlowController(
-			koseki.New(pool),
+			registrationStore,
 			strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID")),
 			&firebaseAdminProviderLifecycle{client: providerClient},
 		)

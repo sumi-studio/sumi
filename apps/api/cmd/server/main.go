@@ -348,7 +348,7 @@ func newApplicationFromEnv() (*application, error) {
 	if database != nil {
 		resolver = koseki.New(database.Pool)
 	}
-	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes)
+	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime)
 	if err != nil {
 		if localRuntimes != nil {
 			_ = localRuntimes.Close(context.Background())
@@ -1945,6 +1945,7 @@ func spawnManagerFromEnv(
 	resolver spawn.AgentResolver,
 	control *agentevents.LocalControlServer,
 	listeners *agentevents.LocalControlListenerRegistry,
+	readiness runtimeReadinessController,
 ) (*spawn.Manager, error) {
 	socketPath := strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET"))
 	if socketPath == "" {
@@ -1996,13 +1997,12 @@ func spawnManagerFromEnv(
 	if os.Geteuid() == 0 {
 		return nil, errors.New("API runtime provisioning control plane must run as a non-root UID")
 	}
-	wrappingKeyID, err := require("SUMI_AGENT_WRAPPING_KEY_ID")
-	if err != nil {
-		return nil, err
-	}
 	approvalKey, err := require("SUMI_APPROVAL_SECRET_DIGEST_KEY")
 	if err != nil {
 		return nil, err
+	}
+	if err := runtimeprovision.ValidateApprovalSecretDigestKey(approvalKey); err != nil {
+		return nil, fmt.Errorf("SUMI_APPROVAL_SECRET_DIGEST_KEY: %w", err)
 	}
 	providerKey, err := require("SUMI_PROVIDER_API_KEY")
 	if err != nil {
@@ -2019,13 +2019,13 @@ func spawnManagerFromEnv(
 		Provisioner:    client,
 		Authorizations: control,
 		Listeners:      listeners,
+		Readiness:      readiness,
 		TenantID:       tenantID,
 		Audience:       audience,
 		Delivery:       delivery,
 		Activation: runtimeprovision.ActivationConfig{
 			LocalControlServerUID:        uint32(os.Geteuid()),
 			LocalControlSocketGID:        uint32(gid),
-			AgentWrappingKeyID:           wrappingKeyID,
 			ApprovalSecretDigestKey:      approvalKey,
 			ProviderAPIKey:               providerKey,
 			ModelPreset:                  strings.TrimSpace(os.Getenv("SUMI_MODEL_PRESET")),

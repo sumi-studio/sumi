@@ -33,7 +33,7 @@ type AgentRuntimeConfig struct {
 	AgentID                   string
 	StateDir                  string
 	WorkspaceDir              string
-	WrappingKey               string
+	WrappingKey               WrappingKeyMaterial
 	Bearer                    string
 	Nonce                     string
 	BearerExpiresAtUnix       int64
@@ -44,6 +44,13 @@ type AgentRuntimeConfig struct {
 	GatewayURL                string
 	ExecutorSocket            string
 	LocalControlURL           string
+}
+
+// WrappingKeyMaterial is one indivisible per-agent key identity. The ID and
+// bytes move together from 戸籍 storage through runtime activation.
+type WrappingKeyMaterial struct {
+	ID    string
+	Bytes string
 }
 
 // Process represents a running agent process.
@@ -62,7 +69,7 @@ type ProcessSpawner interface {
 // AgentResolver looks up the per-agent material the manager needs: the wrapping
 // key and warmth setting from the 戸籍.
 type AgentResolver interface {
-	AgentWrappingKey(ctx context.Context, agentID string) (string, error)
+	AgentWrappingKey(ctx context.Context, agentID string) (WrappingKeyMaterial, error)
 	AgentWarmth(ctx context.Context, agentID string) (string, error)
 }
 
@@ -266,53 +273,15 @@ func (m *Manager) Running(agentID string) bool {
 
 // Stop terminates a running agent.
 func (m *Manager) Stop(agentID string) error {
-	for {
-		m.mu.Lock()
-		if stop := m.stopping[agentID]; stop != nil {
-			m.mu.Unlock()
-			<-stop.done
-			return stop.err
-		}
-		if start := m.starting[agentID]; start != nil {
-			m.mu.Unlock()
-			<-start.done
-			continue
-		}
-		rt, ok := m.running[agentID]
-		if !ok {
-			m.mu.Unlock()
-			return nil
-		}
-		m.mu.Unlock()
-		return m.stopRuntime(agentID, rt)
-	}
-}
-
-func (m *Manager) stopRuntime(agentID string, runtime *agentRuntime) error {
 	m.mu.Lock()
-	if current := m.running[agentID]; current != runtime {
+	rt, ok := m.running[agentID]
+	if !ok {
 		m.mu.Unlock()
 		return nil
 	}
-	if stop := m.stopping[agentID]; stop != nil {
-		m.mu.Unlock()
-		<-stop.done
-		return stop.err
-	}
-	stop := &agentStop{done: make(chan struct{})}
-	m.stopping[agentID] = stop
+	delete(m.running, agentID)
 	m.mu.Unlock()
-
-	err := runtime.process.Stop()
-	m.mu.Lock()
-	stop.err = err
-	if m.running[agentID] == runtime {
-		delete(m.running, agentID)
-	}
-	delete(m.stopping, agentID)
-	close(stop.done)
-	m.mu.Unlock()
-	return err
+	return rt.process.Stop()
 }
 
 // StopIdleCold stops any running cold-mode agent that has been idle longer than

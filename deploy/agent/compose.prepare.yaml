@@ -15,7 +15,7 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
-      - apparmor:docker-default
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
     environment:
       SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
       SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
@@ -44,7 +44,7 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
-      - apparmor:docker-default
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
     depends_on:
       allocator:
         condition: service_completed_successfully

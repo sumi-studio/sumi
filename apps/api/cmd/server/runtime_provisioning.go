@@ -16,6 +16,7 @@ import (
 
 const defaultProvisionedLifecycleTimeout = 20 * time.Minute
 const defaultProvisionedTeardownTimeout = 90 * time.Second
+const defaultProvisionedStartupReadyTimeout = 30 * time.Second
 
 type runtimeProvisioner interface {
 	Prepare(context.Context, runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error)
@@ -35,17 +36,23 @@ type localRuntimeListenerController interface {
 	CloseLocalRuntime(context.Context, string) error
 }
 
+type runtimeReadinessController interface {
+	IsPersonalityAgentReady(context.Context, string) (bool, error)
+}
+
 type provisionedRuntimeSpawnerConfig struct {
-	Provisioner      runtimeProvisioner
-	Authorizations   localRuntimeAuthorizationController
-	Listeners        localRuntimeListenerController
-	TenantID         string
-	Audience         string
-	Delivery         agentevents.LocalDeliveryAuthorization
-	BearerTTL        time.Duration
-	LifecycleTimeout time.Duration
-	TeardownTimeout  time.Duration
-	Activation       runtimeprovision.ActivationConfig
+	Provisioner         runtimeProvisioner
+	Authorizations      localRuntimeAuthorizationController
+	Listeners           localRuntimeListenerController
+	Readiness           runtimeReadinessController
+	TenantID            string
+	Audience            string
+	Delivery            agentevents.LocalDeliveryAuthorization
+	BearerTTL           time.Duration
+	LifecycleTimeout    time.Duration
+	TeardownTimeout     time.Duration
+	StartupReadyTimeout time.Duration
+	Activation          runtimeprovision.ActivationConfig
 }
 
 // provisionedRuntimeSpawner is the only production lazy-spawn implementation.
@@ -56,8 +63,8 @@ type provisionedRuntimeSpawner struct {
 }
 
 func newProvisionedRuntimeSpawner(config provisionedRuntimeSpawnerConfig) (*provisionedRuntimeSpawner, error) {
-	if config.Provisioner == nil || config.Authorizations == nil || config.Listeners == nil {
-		return nil, errors.New("provisioned runtime spawner requires provisioner, authorization, and listener controllers")
+	if config.Provisioner == nil || config.Authorizations == nil || config.Listeners == nil || config.Readiness == nil {
+		return nil, errors.New("provisioned runtime spawner requires provisioner, authorization, listener, and readiness controllers")
 	}
 	if config.TenantID == "" || config.Audience == "" {
 		return nil, errors.New("provisioned runtime spawner requires tenant and audience")
@@ -75,6 +82,9 @@ func newProvisionedRuntimeSpawner(config provisionedRuntimeSpawnerConfig) (*prov
 	if config.TeardownTimeout <= 0 {
 		config.TeardownTimeout = defaultProvisionedTeardownTimeout
 	}
+	if config.StartupReadyTimeout <= 0 {
+		config.StartupReadyTimeout = defaultProvisionedStartupReadyTimeout
+	}
 	return &provisionedRuntimeSpawner{config: config}, nil
 }
 
@@ -83,6 +93,12 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	config spawn.AgentRuntimeConfig,
 ) (spawn.Process, error) {
 	if err := runtimeprovision.ValidatePersonalityAgentID(config.AgentID); err != nil {
+		return nil, err
+	}
+	if err := runtimeprovision.ValidateAgentWrappingKey(config.WrappingKey.Bytes); err != nil {
+		return nil, err
+	}
+	if err := runtimeprovision.ValidateAgentWrappingKeyID(config.WrappingKey.ID); err != nil {
 		return nil, err
 	}
 	if err := s.reconcilePreviousRuntime(ctx, config.AgentID); err != nil {
@@ -120,6 +136,22 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		}
 		return errors.Join(cause, fenceErr, listenerErr, abortErr)
 	}
+	retireActive := func(cause error) error {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), s.config.TeardownTimeout)
+		defer cancel()
+		fenceErr := s.config.Authorizations.FenceLocalRuntimeAuthorization(
+			cleanupCtx,
+			epoch.PersonalityAgentID,
+			epoch.Generation,
+			epoch.RPCBootNonce,
+		)
+		_, stopErr := s.config.Provisioner.Stop(cleanupCtx, runtimeprovision.StopRequest{
+			Version:       runtimeprovision.ProtocolVersion,
+			PreparedEpoch: epoch,
+		})
+		listenerErr := s.config.Listeners.CloseLocalRuntime(cleanupCtx, epoch.PersonalityAgentID)
+		return errors.Join(cause, fenceErr, listenerErr, stopErr)
+	}
 
 	bearer, err := randomProvisioningSecret()
 	if err != nil {
@@ -145,7 +177,8 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	activation.GatewayURL = config.GatewayURL
 	activation.LocalControlBearer = bearer
 	activation.LocalControlBearerExpiresAtUnix = time.Now().Add(s.config.BearerTTL).Unix()
-	activation.AgentWrappingKey = config.WrappingKey
+	activation.AgentWrappingKey = config.WrappingKey.Bytes
+	activation.AgentWrappingKeyID = config.WrappingKey.ID
 	inspection, err := s.config.Provisioner.Activate(ctx, runtimeprovision.ActivateRequest{
 		Version:       runtimeprovision.ProtocolVersion,
 		PreparedEpoch: epoch,
@@ -158,6 +191,9 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		inspection.Epoch == nil || *inspection.Epoch != epoch {
 		return nil, cleanup(errors.New("provisioner activation did not confirm the exact prepared epoch"))
 	}
+	if err := s.awaitRuntimeReady(ctx, epoch); err != nil {
+		return nil, retireActive(fmt.Errorf("runtime failed startup readiness: %w", err))
+	}
 
 	return &provisionedProcess{
 		provisioner:     s.config.Provisioner,
@@ -168,6 +204,41 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		teardownTimeout: s.config.TeardownTimeout,
 		done:            make(chan struct{}),
 	}, nil
+}
+
+func (s *provisionedRuntimeSpawner) awaitRuntimeReady(
+	ctx context.Context,
+	epoch runtimeprovision.PreparedEpoch,
+) error {
+	readyCtx, cancel := context.WithTimeout(ctx, s.config.StartupReadyTimeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ready, err := s.config.Readiness.IsPersonalityAgentReady(readyCtx, epoch.PersonalityAgentID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		inspection, err := s.config.Provisioner.Reconcile(readyCtx, runtimeprovision.ReconcileRequest{
+			Version:            runtimeprovision.ProtocolVersion,
+			PersonalityAgentID: epoch.PersonalityAgentID,
+		})
+		if err != nil {
+			return fmt.Errorf("inspect active runtime before Ready: %w", err)
+		}
+		if inspection.Phase != runtimeprovision.PhaseActive ||
+			inspection.Epoch == nil || *inspection.Epoch != epoch {
+			return errors.New("runtime left its active epoch before Ready")
+		}
+		select {
+		case <-readyCtx.Done():
+			return readyCtx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context, personalityAgentID string) error {

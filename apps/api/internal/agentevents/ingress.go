@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -172,11 +173,13 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.Spawner != nil {
 		if err := h.Spawner.EnsureRunning(r.Context(), claims.PersonalityAgentID); err != nil {
+			log.Printf("direct command lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
 			writeUnavailable(w, idempotencyKey)
 			return
 		}
 		if h.Readiness != nil {
 			if err := h.awaitSpawnReady(r.Context(), claims.PersonalityAgentID); err != nil {
+				log.Printf("direct command runtime readiness failed for PAID %s: %v", claims.PersonalityAgentID, err)
 				writeUnavailable(w, idempotencyKey)
 				return
 			}

@@ -84,8 +84,8 @@ func buildAgentEnv(config AgentRuntimeConfig, shared map[string]string) []string
 		"SUMI_LOCAL_CONTROL_URL=" + config.LocalControlURL,
 		"SUMI_LOCAL_CONTROL_BEARER=" + config.Bearer,
 		fmt.Sprintf("SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX=%d", config.BearerExpiresAtUnix),
-		"SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1",
-		"SUMI_AGENT_WRAPPING_KEY=" + config.WrappingKey,
+		"SUMI_AGENT_WRAPPING_KEY=" + config.WrappingKey.Bytes,
+		"SUMI_AGENT_WRAPPING_KEY_ID=" + config.WrappingKey.ID,
 		"SUMI_LOG=sumi_agent=info",
 	}
 	if _, ok := shared["SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY"]; !ok && isInsecureLoopbackGateway(config.GatewayURL) {

@@ -20,9 +20,9 @@ func testActivationConfig() ActivationConfig {
 		LocalControlBearerExpiresAtUnix: 2_000_000_000,
 		LocalControlServerUID:           65532,
 		LocalControlSocketGID:           20000,
-		AgentWrappingKey:                "wrapping-key",
+		AgentWrappingKey:                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		AgentWrappingKeyID:              "wrapping/v1",
-		ApprovalSecretDigestKey:         "approval-key",
+		ApprovalSecretDigestKey:         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
 		ProviderAPIKey:                  "provider-key",
 	}
 }

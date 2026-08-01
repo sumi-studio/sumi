@@ -102,7 +102,7 @@ func TestFullStackProvisionedRolesRetainCanonicalSandboxHardening(t *testing.T) 
 	anchor := agent[anchorStart:servicesStart]
 	for _, required := range []string{
 		"read_only: true", "cap_drop: [ALL]", "no-new-privileges:true",
-		"seccomp:./seccomp/sidecar.json", "apparmor:docker-default",
+		"seccomp:./seccomp/sidecar.json", "apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}",
 	} {
 		if !strings.Contains(anchor, required) {
 			t.Fatalf("canonical long-lived sandbox omits %q", required)
@@ -118,8 +118,9 @@ func TestFullStackProvisionedRolesRetainCanonicalSandboxHardening(t *testing.T) 
 	}
 	executor := agent[executorStart:brokerStart]
 	for _, required := range []string{
-		`user: "10002:10002"`, "network_mode: none", "executor-ipc:/run/sumi/executor",
-		"workspace:/workspace:ro",
+		`user: "10002:10002"`, "network_mode: none", "source: executor-ipc",
+		"target: /run/sumi/executor", "source: workspace", "target: /workspace",
+		"read_only: true", "nocopy: true",
 	} {
 		if !strings.Contains(executor, required) {
 			t.Fatalf("provisioned executor omits isolation contract %q", required)

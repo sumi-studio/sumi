@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,15 @@ var provisionedTestPAIDs = []string{
 	"0198f0f4-9b72-7000-8000-000000000003",
 }
 
+const (
+	provisionedTestWrappingKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	provisionedTestApprovalKey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+)
+
+var provisionedTestWrappingMaterial = spawn.WrappingKeyMaterial{
+	ID: "wrapping/v1", Bytes: provisionedTestWrappingKey,
+}
+
 type provisioningRecorder struct {
 	mu    sync.Mutex
 	calls []string
@@ -34,14 +44,16 @@ func (r *provisioningRecorder) add(call string) {
 }
 
 type fakeRuntimeProvisioner struct {
-	recorder       *provisioningRecorder
-	mu             sync.Mutex
-	nextGeneration map[string]uint64
-	epochs         map[string]runtimeprovision.PreparedEpoch
-	aborts         map[string]int
-	stops          map[string]int
-	activationErr  error
-	mismatchActive bool
+	recorder        *provisioningRecorder
+	mu              sync.Mutex
+	nextGeneration  map[string]uint64
+	epochs          map[string]runtimeprovision.PreparedEpoch
+	aborts          map[string]int
+	stops           map[string]int
+	activations     map[string]runtimeprovision.ActivationConfig
+	activationErr   error
+	mismatchActive  bool
+	dropBeforeReady bool
 }
 
 func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvisioner {
@@ -51,6 +63,7 @@ func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvi
 		epochs:         make(map[string]runtimeprovision.PreparedEpoch),
 		aborts:         make(map[string]int),
 		stops:          make(map[string]int),
+		activations:    make(map[string]runtimeprovision.ActivationConfig),
 	}
 }
 
@@ -72,6 +85,9 @@ func (p *fakeRuntimeProvisioner) Prepare(_ context.Context, request runtimeprovi
 
 func (p *fakeRuntimeProvisioner) Activate(_ context.Context, request runtimeprovision.ActivateRequest) (runtimeprovision.Inspection, error) {
 	p.recorder.add("activate:" + request.PersonalityAgentID)
+	p.mu.Lock()
+	p.activations[request.PersonalityAgentID] = request.Activation
+	p.mu.Unlock()
 	if p.activationErr != nil {
 		return runtimeprovision.Inspection{}, p.activationErr
 	}
@@ -120,6 +136,10 @@ func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimepro
 	if !exists {
 		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
 	}
+	if p.dropBeforeReady {
+		delete(p.epochs, request.PersonalityAgentID)
+		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
+	}
 	return runtimeprovision.Inspection{
 		PersonalityAgentID: request.PersonalityAgentID,
 		Phase:              runtimeprovision.PhaseActive,
@@ -160,6 +180,24 @@ type fakeListenerController struct {
 	ensureErr error
 }
 
+type fakeRuntimeReadiness struct {
+	mu    sync.Mutex
+	ready bool
+	err   error
+}
+
+func (r *fakeRuntimeReadiness) IsPersonalityAgentReady(_ context.Context, _ string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ready, r.err
+}
+
+func (r *fakeRuntimeReadiness) setReady(ready bool) {
+	r.mu.Lock()
+	r.ready = ready
+	r.mu.Unlock()
+}
+
 func (l *fakeListenerController) EnsureLocalRuntime(paid string) error {
 	l.recorder.add("listen:" + paid)
 	if l.ensureErr != nil {
@@ -189,6 +227,7 @@ func newProvisioningTestSpawner(t *testing.T) (*provisionedRuntimeSpawner, *fake
 		Provisioner:      provisioner,
 		Authorizations:   authorizations,
 		Listeners:        listeners,
+		Readiness:        &fakeRuntimeReadiness{ready: true},
 		TenantID:         "tenant-context",
 		Audience:         agentevents.DefaultAgentAudience(),
 		Delivery:         agentevents.LocalDeliveryRaw,
@@ -197,8 +236,8 @@ func newProvisioningTestSpawner(t *testing.T) (*provisionedRuntimeSpawner, *fake
 		Activation: runtimeprovision.ActivationConfig{
 			LocalControlServerUID:   65532,
 			LocalControlSocketGID:   20000,
-			AgentWrappingKeyID:      "wrapping/v1",
-			ApprovalSecretDigestKey: "approval-key",
+			AgentWrappingKeyID:      "template-must-be-overridden",
+			ApprovalSecretDigestKey: provisionedTestApprovalKey,
 			ProviderAPIKey:          "provider-key",
 		},
 	})
@@ -214,7 +253,7 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 	for _, paid := range provisionedTestPAIDs {
 		process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
 			AgentID:     paid,
-			WrappingKey: "wrapping-" + paid,
+			WrappingKey: provisionedTestWrappingMaterial,
 			GatewayURL:  "ws://gateway.invalid/agent/ws",
 		})
 		if err != nil {
@@ -230,6 +269,11 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 		}
 		if !listeners.active[paid] {
 			t.Fatalf("listener not active for %s", paid)
+		}
+		activation := provisioner.activations[paid]
+		if activation.AgentWrappingKeyID != provisionedTestWrappingMaterial.ID ||
+			activation.AgentWrappingKey != provisionedTestWrappingMaterial.Bytes {
+			t.Fatalf("activation split the stored wrapping key pair for %s", paid)
 		}
 	}
 	for _, paid := range provisionedTestPAIDs {
@@ -252,7 +296,7 @@ func TestProvisionedRuntimeSpawnerThreePAIDsAreExactAndIsolatedAcrossRestart(t *
 		}
 	}
 	restarted, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: first, WrappingKey: "wrapping-" + first, GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: first, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +315,7 @@ func TestProvisionedRuntimeSpawnerFailureFencesAndAbortsWithoutActivation(t *tes
 	listeners.ensureErr = errors.New("listener failed")
 	paid := provisionedTestPAIDs[0]
 	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err == nil {
 		t.Fatal("expected listener failure")
@@ -289,7 +333,7 @@ func TestProvisionedRuntimeSpawnerAmbiguousActivationFailureRetiresExactEpoch(t 
 	provisioner.activationErr = errors.New("activation response lost after commit")
 	paid := provisionedTestPAIDs[0]
 	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err == nil {
 		t.Fatal("expected ambiguous activation failure")
@@ -308,7 +352,7 @@ func TestProvisionedRuntimeSpawnerRejectsWrongActiveEpochBeforeReplacement(t *te
 	paid := provisionedTestPAIDs[0]
 	provisioner.mismatchActive = true
 	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err == nil {
 		t.Fatal("expected wrong active epoch rejection")
@@ -318,7 +362,7 @@ func TestProvisionedRuntimeSpawnerRejectsWrongActiveEpochBeforeReplacement(t *te
 	}
 	provisioner.mismatchActive = false
 	replacement, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +383,7 @@ func TestProvisionedProcessStaleStopCannotCloseReplacementListener(t *testing.T)
 	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
 	paid := provisionedTestPAIDs[0]
 	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -373,7 +417,7 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
 	paid := provisionedTestPAIDs[0]
 	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -384,15 +428,16 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	freshListeners := &fakeListenerController{recorder: recorder, active: make(map[string]bool)}
 	restarted, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
 		Provisioner: provisioner, Authorizations: freshAuthorizations, Listeners: freshListeners,
-		TenantID: "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
+		Readiness: &fakeRuntimeReadiness{ready: true},
+		TenantID:  "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 		BearerTTL: time.Hour, LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: "approval-key", ProviderAPIKey: "provider-key"},
+		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := restarted.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +471,7 @@ func TestProvisionedRuntimeSpawnerFreshProcessReconcilesThreePAIDs(t *testing.T)
 	first, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
 	for _, paid := range provisionedTestPAIDs {
 		if _, err := first.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-			AgentID: paid, WrappingKey: "wrapping-" + paid, GatewayURL: "ws://gateway.invalid/agent/ws",
+			AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -435,16 +480,17 @@ func TestProvisionedRuntimeSpawnerFreshProcessReconcilesThreePAIDs(t *testing.T)
 	freshListeners := &fakeListenerController{recorder: recorder, active: make(map[string]bool)}
 	restarted, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
 		Provisioner: provisioner, Authorizations: freshAuthorizations, Listeners: freshListeners,
-		TenantID: "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
+		Readiness: &fakeRuntimeReadiness{ready: true},
+		TenantID:  "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 		LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: "approval-key", ProviderAPIKey: "provider-key"},
+		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, paid := range provisionedTestPAIDs {
 		if _, err := restarted.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-			AgentID: paid, WrappingKey: "wrapping-" + paid, GatewayURL: "ws://gateway.invalid/agent/ws",
+			AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -501,9 +547,10 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 	newSpawner := func(control *agentevents.LocalControlServer, registry *agentevents.LocalControlListenerRegistry) *provisionedRuntimeSpawner {
 		spawner, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
 			Provisioner: provisioner, Authorizations: control, Listeners: registry,
-			TenantID: "tenant", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
+			Readiness: &fakeRuntimeReadiness{ready: true},
+			TenantID:  "tenant", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
 			LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-			Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: uint32(os.Geteuid() + 1), LocalControlSocketGID: uint32(os.Getegid() + 1), AgentWrappingKeyID: "key", ApprovalSecretDigestKey: "approval", ProviderAPIKey: "provider"},
+			Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: uint32(os.Geteuid() + 1), LocalControlSocketGID: uint32(os.Getegid() + 1), AgentWrappingKeyID: "key", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider"},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -513,7 +560,7 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 	paid := provisionedTestPAIDs[0]
 	firstStore, firstControl, firstRegistry := newProcessSide()
 	if _, err := newSpawner(firstControl, firstRegistry).Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +575,7 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 	defer secondStore.Close()
 	defer secondRegistry.Close(context.Background())
 	if _, err := newSpawner(secondControl, secondRegistry).Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: "wrapping", GatewayURL: "ws://gateway.invalid/agent/ws",
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -541,6 +588,67 @@ func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListen
 	}
 	if info, err := os.Stat(filepath.Clean(socketPath)); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("fresh registry did not bind replacement socket: info=%v err=%v", info, err)
+	}
+}
+
+func TestProvisionedRuntimeSpawnerDoesNotReturnBeforeAuthoritativeReady(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	readiness := &fakeRuntimeReadiness{}
+	spawner.config.Readiness = readiness
+	spawner.config.StartupReadyTimeout = time.Second
+	paid := provisionedTestPAIDs[0]
+	done := make(chan error, 1)
+	go func() {
+		_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+			AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+			GatewayURL: "ws://gateway.invalid/agent/ws",
+		})
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		provisioner.mu.Lock()
+		_, activated := provisioner.activations[paid]
+		provisioner.mu.Unlock()
+		if activated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("runtime never reached activation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("spawn returned before Ready: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	readiness.setReady(true)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("spawn did not return after Ready")
+	}
+}
+
+func TestProvisionedRuntimeSpawnerSurfacesPreReadyRuntimeExit(t *testing.T) {
+	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
+	spawner.config.Readiness = &fakeRuntimeReadiness{}
+	spawner.config.StartupReadyTimeout = time.Second
+	provisioner.dropBeforeReady = true
+	paid := provisionedTestPAIDs[0]
+	_, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial,
+		GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "left its active epoch before Ready") {
+		t.Fatalf("pre-Ready runtime exit was not surfaced: %v", err)
+	}
+	if authorizations.fences[paid] != 1 || listeners.active[paid] {
+		t.Fatalf("pre-Ready failure retained authority: fences=%d listener=%v", authorizations.fences[paid], listeners.active[paid])
 	}
 }
 

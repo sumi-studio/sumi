@@ -18,6 +18,9 @@ type fakeProcess struct {
 }
 
 func (p *fakeProcess) Wait() error {
+	if p.done == nil {
+		return p.waitErr
+	}
 	<-p.done
 	return p.waitErr
 }
@@ -25,7 +28,9 @@ func (p *fakeProcess) Stop() error {
 	p.mu.Lock()
 	p.stopped = true
 	p.mu.Unlock()
-	p.once.Do(func() { close(p.done) })
+	if p.done != nil {
+		p.once.Do(func() { close(p.done) })
+	}
 	return p.stopErr
 }
 
@@ -220,11 +225,11 @@ type fakeResolver struct {
 	keyErr error
 }
 
-func (r fakeResolver) AgentWrappingKey(_ context.Context, agentID string) (string, error) {
+func (r fakeResolver) AgentWrappingKey(_ context.Context, agentID string) (WrappingKeyMaterial, error) {
 	if r.keyErr != nil {
-		return "", r.keyErr
+		return WrappingKeyMaterial{}, r.keyErr
 	}
-	return r.keys[agentID], nil
+	return WrappingKeyMaterial{ID: "test/" + agentID, Bytes: r.keys[agentID]}, nil
 }
 
 func (r fakeResolver) AgentWarmth(_ context.Context, agentID string) (string, error) {
@@ -265,8 +270,8 @@ func TestEnsureRunningSpawnsPerAgent(t *testing.T) {
 	}
 	// Per-agent wrapping key and derived bearer are passed to the spawner.
 	c1 := spawner.config("a1")
-	if c1.WrappingKey != "k1" {
-		t.Fatalf("a1 wrapping key: got %q want k1", c1.WrappingKey)
+	if c1.WrappingKey.Bytes != "k1" || c1.WrappingKey.ID != "test/a1" {
+		t.Fatalf("a1 wrapping key: got %#v", c1.WrappingKey)
 	}
 	if c1.Bearer != "bearer/a1" {
 		t.Fatalf("a1 derived bearer: got %q want bearer/a1", c1.Bearer)

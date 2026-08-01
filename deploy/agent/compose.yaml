@@ -8,7 +8,7 @@ x-long-lived-hardening: &long-lived-hardening
   security_opt:
     - no-new-privileges:true
     - seccomp:./seccomp/sidecar.json
-    - apparmor:docker-default
+    - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=32m
   stdin_open: false
@@ -36,7 +36,7 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
-      - apparmor:docker-default
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
     environment:
       SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
       SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
@@ -71,7 +71,7 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
-      - apparmor:docker-default
+      - apparmor:${SUMI_DOCKER_APPARMOR_PROFILE:-docker-default}
     volumes:
       - state:/var/lib/sumi
       - workspace:/workspace
@@ -100,6 +100,7 @@ services:
       # This is the executor's logical workspace address. Runtime uses it only
       # for lexical policy/action projection and receives no workspace volume.
       SUMI_WORKSPACE: /workspace
+      SUMI_EXECUTOR_SERVER_UID: "10002"
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_SERVER_UID: ${SUMI_LOCAL_CONTROL_SERVER_UID:?SUMI_LOCAL_CONTROL_SERVER_UID is required}
       SUMI_LOCAL_CONTROL_SOCKET_GID: ${SUMI_LOCAL_CONTROL_SOCKET_GID:?SUMI_LOCAL_CONTROL_SOCKET_GID is required}
@@ -121,36 +122,66 @@ services:
       # authenticated executor Health exchange after bootstrap.
       executor:
         condition: service_started
-    secrets:
-      - source: sumi_local_control_bearer
-        target: sumi_local_control_bearer
-        uid: "10001"
-        gid: "10001"
-        mode: 0o400
-      - source: sumi_agent_wrapping_key
-        target: sumi_agent_wrapping_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0o400
-      - source: sumi_approval_secret_digest_key
-        target: sumi_approval_secret_digest_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0o400
-      - source: sumi_provider_api_key
-        target: sumi_provider_api_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0o400
     volumes:
-      - state:/var/lib/sumi
-      - runtime-identity:/run/sumi/identity:ro
-      - executor-ipc:/run/sumi/executor:ro
+      - type: volume
+        source: state
+        target: /var/lib/sumi
+        volume:
+          nocopy: true
+      - type: volume
+        source: runtime-identity
+        target: /run/sumi/identity
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: executor-ipc
+        target: /run/sumi/executor
+        read_only: true
+        volume:
+          nocopy: true
+      # Preserve the PAID directory's trusted 0750 ownership while the nested
+      # exact socket-file bind below pins the validated socket inode.
+      - type: bind
+        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}
+        target: /run/sumi/local-control
+        read_only: true
+        bind:
+          create_host_path: false
       # Bind the checked pre-existing socket itself, not its mutable host
       # directory. Runtime receives connect-only access; no TCP route.
       - type: bind
         source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock
         target: /run/sumi/local-control/control.sock
+        read_only: true
+        bind:
+          create_host_path: false
+      # Compose environment-backed secrets are copied into a container after
+      # create and are incompatible with a read-only rootfs. The root-owned
+      # supervisor instead materializes exact per-generation files below a
+      # host-visible private directory, validates their metadata, and removes
+      # them with the epoch. Values never enter Config.Env.
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_local_control_bearer
+        target: /run/secrets/sumi_local_control_bearer
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_agent_wrapping_key
+        target: /run/secrets/sumi_agent_wrapping_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_approval_secret_digest_key
+        target: /run/secrets/sumi_approval_secret_digest_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_provider_api_key
+        target: /run/secrets/sumi_provider_api_key
         read_only: true
         bind:
           create_host_path: false
@@ -169,9 +200,23 @@ services:
       prepare:
         condition: service_completed_successfully
     volumes:
-      - workspace:/workspace:ro
-      - executor-identity:/run/sumi/identity:ro
-      - executor-ipc:/run/sumi/executor
+      - type: volume
+        source: workspace
+        target: /workspace
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: executor-identity
+        target: /run/sumi/identity
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: executor-ipc
+        target: /run/sumi/executor
+        volume:
+          nocopy: true
 
   broker:
     <<: *long-lived-hardening
@@ -187,9 +232,22 @@ services:
       prepare:
         condition: service_completed_successfully
     volumes:
-      - artifacts:/var/lib/sumi-artifacts
-      - broker-identity:/run/sumi/identity:ro
-      - broker-ipc:/run/sumi/broker
+      - type: volume
+        source: artifacts
+        target: /var/lib/sumi-artifacts
+        volume:
+          nocopy: true
+      - type: volume
+        source: broker-identity
+        target: /run/sumi/identity
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: broker-ipc
+        target: /run/sumi/broker
+        volume:
+          nocopy: true
 
 volumes:
   allocator-root: {}
@@ -207,13 +265,3 @@ networks:
   control-plane:
     external: true
     name: ${SUMI_CONTROL_PLANE_NETWORK:-sumi-control-plane}
-
-secrets:
-  sumi_local_control_bearer:
-    environment: SUMI_LOCAL_CONTROL_BEARER
-  sumi_agent_wrapping_key:
-    environment: SUMI_AGENT_WRAPPING_KEY
-  sumi_approval_secret_digest_key:
-    environment: SUMI_APPROVAL_SECRET_DIGEST_KEY
-  sumi_provider_api_key:
-    environment: SUMI_PROVIDER_API_KEY

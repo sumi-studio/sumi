@@ -19,7 +19,7 @@ func TestBuildLocalControlAuthorizersFromKoseki(t *testing.T) {
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	// Register two agents via auto-registration.
 	first, err := store.AutoRegister(ctx, "firebase", "uid-dyn-1")
@@ -82,7 +82,7 @@ func TestBuildLocalControlAuthorizersWithoutEnvAgent(t *testing.T) {
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	if _, err := store.AutoRegister(ctx, "firebase", "uid-noenv-1"); err != nil {
 		t.Fatalf("auto-register: %v", err)
 	}

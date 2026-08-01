@@ -8,9 +8,12 @@ readonly DEFAULT_RUNTIME_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.runtime"
 readonly BASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
 readonly REAL_FIREBASE_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.real-firebase.yaml"
 readonly REAL_FIREBASE_ADC_VOLUME=sumi-dev_firebase-adc-runtime
+readonly CONTROL_PLANE_NETWORK=sumi-control-plane
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
 RUNTIME_ENV_FILE="${SUMI_LOCAL_RUNTIME_ENV_FILE:-${DEFAULT_RUNTIME_ENV_FILE}}"
+COMPOSE_PROJECT="${SUMI_LOCAL_COMPOSE_PROJECT:-sumi-dev}"
+COMPOSE_OVERRIDE_FILE="${SUMI_LOCAL_COMPOSE_OVERRIDE_FILE:-}"
 RUNTIME_ENV_FD=
 ACTION=
 FIREBASE_MODE=emulator
@@ -41,6 +44,21 @@ ensure_control_plane_network() {
     fail "cannot inspect ${CONTROL_PLANE_NETWORK}"
   [[ "${metadata}" == "${CONTROL_PLANE_NETWORK}:bridge:true" ]] ||
     fail "${CONTROL_PLANE_NETWORK} must be an internal bridge network"
+}
+
+configure_local_apparmor_fallback() {
+  local enabled=
+  if [[ -r /sys/module/apparmor/parameters/enabled ]]; then
+    enabled="$(< /sys/module/apparmor/parameters/enabled)"
+  fi
+  if [[ "${enabled}" == "Y" ]]; then
+    export SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=false
+    return
+  fi
+  export SUMI_DEV_ALLOW_APPARMOR_UNCONFINED=true
+  printf '%s\n' \
+    'WARNING: AppArmor is unavailable; using the explicit local-dev unconfined fallback.' \
+    'This is not AppArmor or microVM isolation.' >&2
 }
 
 random_token() {
@@ -246,6 +264,8 @@ real-Firebase Compose overlay and securely stages SUMI_FIREBASE_ADC_FILE for the
 non-root API container. config validates quietly and never renders secrets.
 
 Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
+Set SUMI_LOCAL_COMPOSE_PROJECT to target an explicitly named local stack and
+SUMI_LOCAL_COMPOSE_OVERRIDE_FILE to add one exact Compose override file.
 EOF
 }
 
@@ -281,6 +301,14 @@ case "${FIREBASE_MODE}" in
   *) fail "--firebase must be emulator or real" ;;
 esac
 readonly ACTION FIREBASE_MODE
+
+[[ "${COMPOSE_PROJECT}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+  fail "SUMI_LOCAL_COMPOSE_PROJECT must be a canonical Compose project name"
+if [[ -n "${COMPOSE_OVERRIDE_FILE}" ]]; then
+  [[ -f "${COMPOSE_OVERRIDE_FILE}" && ! -L "${COMPOSE_OVERRIDE_FILE}" ]] ||
+    fail "SUMI_LOCAL_COMPOSE_OVERRIDE_FILE must be a regular non-symlink"
+  COMPOSE_FILES+=(-f "${COMPOSE_OVERRIDE_FILE}")
+fi
 
 # Optional Firebase values are inherited from the user env file. Generated
 # runtime secrets live in a separate ignored 0600 file so durable state remains
@@ -383,10 +411,12 @@ fi
 
 case "${ACTION}" in
   up)
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" up --build "${COMPOSE_ARGUMENTS[@]}"
+    configure_local_apparmor_fallback
+    ensure_control_plane_network
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" up --build "${COMPOSE_ARGUMENTS[@]}"
     ;;
   down)
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" down "${COMPOSE_ARGUMENTS[@]}"
     if [[ "${FIREBASE_MODE}" == "real" ]]; then
       # Unlike durable database/runtime state, the staged ADC must not survive
       # an ordinary stack shutdown. Ignore only the already-absent case.
@@ -398,6 +428,6 @@ case "${ACTION}" in
     ;;
   config)
     ((${#COMPOSE_ARGUMENTS[@]} == 0)) || fail "config accepts no additional Compose arguments"
-    docker compose -p sumi-dev "${COMPOSE_FILES[@]}" config --quiet
+    docker compose -p "${COMPOSE_PROJECT}" "${COMPOSE_FILES[@]}" config --quiet
     ;;
 esac
