@@ -4424,6 +4424,50 @@ fi
     }
 
     #[tokio::test]
+    async fn opencode_console_upstream_400_survives_transport_and_is_provider_scoped() {
+        const BODY: &str = concat!(
+            "{\"error\":{",
+            "\"message\":\"Error from provider (Console Go): Upstream request failed\",",
+            "\"type\":\"invalid_request_error\",",
+            "\"param\":null,",
+            "\"code\":\"invalid_request_error\"}}"
+        );
+
+        for (preset, expected_retryable) in [("opencode-go", true), ("kimi-k3", false)] {
+            let (base_url, server) = serve_fixture(StatusCode::BAD_REQUEST, BODY).await;
+            let mut spec = ModelSpec::preset(preset).expect("preset");
+            spec.base_url = base_url;
+            let mut stream = stream_with_api_key(
+                spec,
+                empty_context(),
+                RequestOptions::default(),
+                CancellationToken::new(),
+                Some("test-key".to_owned()),
+            );
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event);
+            }
+            server.abort();
+
+            assert_eq!(event_types(&events), ["start", "error"]);
+            let message = reconstruct_terminal(&events);
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert_eq!(message.provider_code.as_deref(), Some("http_400"));
+            let expected_error = format!("400: {BODY}");
+            assert_eq!(
+                message.error_message.as_deref(),
+                Some(expected_error.as_str())
+            );
+            assert_eq!(
+                retry::is_retryable(&message),
+                expected_retryable,
+                "{preset}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn http_status_survives_error_body_reset_for_overflow_and_nonretryable_4xx() {
         for (status, expected_code) in [
             (StatusCode::PAYLOAD_TOO_LARGE, "http_413"),
