@@ -1,4 +1,8 @@
-import { AuthAPIError, postAuthJSON } from "./session-client";
+import {
+  AuthAPIError,
+  logoutSumiSession,
+  postAuthJSON,
+} from "./session-client";
 
 export type AuthIntent = "sign_in" | "sign_up";
 export type AuthFlowProvider = "email_link" | "google.com" | "github.com";
@@ -30,6 +34,20 @@ export interface StartAuthFlowRequest {
   email?: string;
   continuation: string;
   nonce: string;
+}
+
+export class AuthFlowRecoveryFailedError extends AggregateError {
+  constructor(
+    mutationError: unknown,
+    recoveryError: unknown,
+    logoutError: unknown,
+  ) {
+    super(
+      [mutationError, recoveryError, logoutError],
+      "Authentication flow response was ambiguous and recovery logout failed.",
+    );
+    this.name = "AuthFlowRecoveryFailedError";
+  }
 }
 
 export function createAuthFlowNonce(): string {
@@ -73,13 +91,24 @@ export async function resolveAuthFlow({
   if (!idToken || idToken.length > 12 * 1024) {
     throw new AuthAPIError("Invalid Firebase ID token.", 0);
   }
-  const result = parseAuthFlowResult(
-    await postAuthJSON("/auth/flows/resolve", {
-      flow_id: flowId,
+  let result: AuthFlowResult;
+  try {
+    result = parseAuthFlowResult(
+      await postAuthJSON("/auth/flows/resolve", {
+        flow_id: flowId,
+        nonce,
+        id_token: idToken,
+      }),
+    );
+  } catch (error) {
+    if (!isAmbiguousMutationError(error)) throw error;
+    result = await recoverAmbiguousFlowMutation({
+      flowId,
       nonce,
-      id_token: idToken,
-    }),
-  );
+      mutationError: error,
+      accept: (recovered) => recovered.outcome !== "proof_required",
+    });
+  }
   if (result.outcome === "proof_required") {
     throw new AuthAPIError("Invalid authentication flow response.", 0);
   }
@@ -97,17 +126,77 @@ export async function confirmAuthFlow({
 }): Promise<
   Extract<AuthFlowResult, { outcome: "signed_in" | "account_created" }>
 > {
-  const result = parseAuthFlowResult(
-    await postAuthJSON("/auth/flows/confirm", {
-      flow_id: flowId,
+  let result: AuthFlowResult;
+  try {
+    result = parseAuthFlowResult(
+      await postAuthJSON("/auth/flows/confirm", {
+        flow_id: flowId,
+        nonce,
+        action,
+      }),
+    );
+  } catch (error) {
+    if (!isAmbiguousMutationError(error)) throw error;
+    result = await recoverAmbiguousFlowMutation({
+      flowId,
       nonce,
-      action,
-    }),
-  );
+      mutationError: error,
+      accept: (recovered) =>
+        recovered.outcome === "signed_in" ||
+        recovered.outcome === "account_created",
+    });
+  }
   if (result.outcome !== "signed_in" && result.outcome !== "account_created") {
     throw new AuthAPIError("Invalid authentication flow response.", 0);
   }
   return result;
+}
+
+async function recoverAmbiguousFlowMutation({
+  flowId,
+  nonce,
+  mutationError,
+  accept,
+}: {
+  flowId: string;
+  nonce: string;
+  mutationError: unknown;
+  accept: (result: AuthFlowResult) => boolean;
+}): Promise<AuthFlowResult> {
+  let recoveryError: unknown = new Error(
+    "Authentication flow status was not terminal.",
+  );
+  try {
+    const recovered = parseAuthFlowResult(
+      await postAuthJSON("/auth/flows/status", {
+        flow_id: flowId,
+        nonce,
+      }),
+    );
+    if (accept(recovered)) return recovered;
+  } catch (error) {
+    recoveryError = error;
+  }
+  try {
+    await logoutSumiSession();
+  } catch (logoutError) {
+    throw new AuthFlowRecoveryFailedError(
+      mutationError,
+      recoveryError,
+      logoutError,
+    );
+  }
+  throw mutationError;
+}
+
+function isAmbiguousMutationError(error: unknown): boolean {
+  if (!(error instanceof AuthAPIError)) return true;
+  return (
+    error.status === 0 ||
+    error.status === 408 ||
+    error.status === 429 ||
+    error.status >= 500
+  );
 }
 
 function parseAuthFlowResult(value: unknown): AuthFlowResult {

@@ -27,10 +27,21 @@ import { AuthAPIError } from "./session-client";
 export interface EmailLinkFlowCompletion {
   flow: PendingEmailAuthFlow;
   result: Exclude<AuthFlowResult, { outcome: "proof_required" }>;
+  firebaseUser: {
+    uid: string;
+    displayName: string | null;
+    email: string | null;
+  };
 }
 
 export function hasEmailLinkCallback(): boolean {
   return emailFlowStateFromLocation() !== null;
+}
+
+export function rejectEmailLinkAuth(): void {
+  const state = emailFlowStateFromLocation();
+  if (state) clearPendingEmailFlow(state);
+  clearEmailFlowLocation();
 }
 
 export async function beginEmailLinkAuth(
@@ -110,5 +121,13 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
   });
   clearPendingEmailFlow(state);
   clearEmailFlowLocation();
-  return { flow: pending, result };
+  return {
+    flow: pending,
+    result,
+    firebaseUser: {
+      uid: user.uid,
+      displayName: user.displayName,
+      email: user.email,
+    },
+  };
 }

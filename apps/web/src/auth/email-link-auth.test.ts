@@ -4,7 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beginEmailLinkAuth, completeEmailLinkAuth } from "./email-link-auth";
 
 const emailMocks = vi.hoisted(() => ({
-  auth: { currentUser: null as null | { uid: string } },
+  auth: {
+    currentUser: null as null | {
+      uid: string;
+      displayName: string | null;
+      email: string | null;
+    },
+  },
   getFirebaseAuth: vi.fn(),
   getIdToken: vi.fn(),
   isSignInWithEmailLink: vi.fn(),
@@ -77,7 +83,11 @@ describe("Firebase email-link Koseki flow", () => {
     );
     emailMocks.isSignInWithEmailLink.mockReturnValue(true);
     emailMocks.signInWithEmailLink.mockResolvedValue({
-      user: { uid: "firebase-user" },
+      user: {
+        uid: "firebase-user",
+        displayName: "Human",
+        email: "human@example.com",
+      },
     });
     emailMocks.getIdToken.mockResolvedValue("id-token");
     emailMocks.resolveAuthFlow.mockResolvedValue({
@@ -94,6 +104,11 @@ describe("Firebase email-link Koseki flow", () => {
     expect(completion.result).toMatchObject({
       outcome: "confirmation_required",
       nextAction: "create_account",
+    });
+    expect(completion.firebaseUser).toEqual({
+      uid: "firebase-user",
+      displayName: "Human",
+      email: "human@example.com",
     });
     expect(emailMocks.resolveAuthFlow).toHaveBeenCalledWith({
       flowId: "flow-email",

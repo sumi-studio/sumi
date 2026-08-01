@@ -6,7 +6,6 @@ import { FcGoogle } from "react-icons/fc";
 import { type SignInProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
 import type { AuthIntent } from "./auth-flow-client";
-import { hasEmailLinkCallback } from "./email-link-auth";
 
 const providers: Array<{ id: SignInProvider; label: string }> = [
   { id: "google", label: "Googleで続ける" },
@@ -15,12 +14,17 @@ const providers: Array<{ id: SignInProvider; label: string }> = [
 
 export function LoginScreen() {
   const {
+    authenticated,
     cancelIntentTransition,
     completeEmailLink,
     confirmation,
     configured,
     confirmIntentTransition,
+    emailLinkCallbackPending,
+    logout,
+    rejectEmailLink,
     sendEmailLink,
+    sessionState,
     signIn,
   } = useAuth();
   const [intent, setIntent] = useState<AuthIntent>("sign_in");
@@ -36,7 +40,8 @@ export function LoginScreen() {
     if (
       emailCallbackStarted.current ||
       !configured ||
-      !hasEmailLinkCallback()
+      !emailLinkCallbackPending ||
+      sessionState !== "unauthenticated"
     ) {
       return;
     }
@@ -48,7 +53,7 @@ export function LoginScreen() {
         setError(getAuthErrorMessage(nextError));
       })
       .finally(() => setBusy(null));
-  }, [completeEmailLink, configured]);
+  }, [completeEmailLink, configured, emailLinkCallbackPending, sessionState]);
 
   const handleSignIn = async (provider: SignInProvider) => {
     if (busy || !configured) {
@@ -81,6 +86,20 @@ export function LoginScreen() {
     }
   };
 
+  const handleEmailLinkAccountSwitch = async () => {
+    if (busy) return;
+    setBusy("email");
+    setError(null);
+    try {
+      await logout();
+      await completeEmailLink();
+    } catch (nextError) {
+      setError(getAuthErrorMessage(nextError));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <main className="fixed inset-0 z-50 flex min-h-dvh flex-col overflow-y-auto bg-neutral-50 text-foreground dark:bg-background">
       <header className="flex h-12 shrink-0 items-center px-5">
@@ -100,16 +119,75 @@ export function LoginScreen() {
                 id="login-title"
                 className="font-semibold text-2xl tracking-[-0.025em]"
               >
-                {confirmation
-                  ? "続行方法の確認"
-                  : intent === "sign_in"
-                    ? "アカウントにログイン"
-                    : "アカウントを新規登録"}
+                {emailLinkCallbackPending
+                  ? authenticated
+                    ? "アカウントを切り替えますか？"
+                    : "メールリンクを確認しています"
+                  : confirmation
+                    ? "続行方法の確認"
+                    : intent === "sign_in"
+                      ? "アカウントにログイン"
+                      : "アカウントを新規登録"}
               </h1>
             </div>
 
-            {confirmation ? (
+            {emailLinkCallbackPending ? (
+              authenticated ? (
+                <div className="space-y-4">
+                  <p className="text-muted-foreground text-sm leading-6">
+                    現在のSumiセッションを終了し、メールリンクのアカウントへ切り替えます。自動では切り替わりません。
+                  </p>
+                  <Button
+                    type="button"
+                    onClick={() => void handleEmailLinkAccountSwitch()}
+                    disabled={busy !== null}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    {busy === "email" && (
+                      <LoaderCircle className="size-5 animate-spin" />
+                    )}
+                    現在のセッションを終了して切り替える
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={rejectEmailLink}
+                    disabled={busy !== null}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    現在のアカウントを使い続ける
+                  </Button>
+                </div>
+              ) : (
+                <div className="space-y-4 text-center">
+                  {sessionState === "unavailable" ? (
+                    <p className="text-muted-foreground text-sm leading-6">
+                      現在のSumiセッションを確認できないため、メールリンクを処理できません。
+                    </p>
+                  ) : (
+                    <>
+                      <LoaderCircle className="mx-auto size-6 animate-spin" />
+                      <p className="text-muted-foreground text-sm leading-6">
+                        Firebaseのメールリンクを確認しています…
+                      </p>
+                    </>
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={rejectEmailLink}
+                    disabled={busy !== null}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    メールリンクをキャンセル
+                  </Button>
+                </div>
+              )
+            ) : confirmation ? (
               <div className="space-y-4">
+                <p className="rounded-lg bg-muted px-3 py-2.5 text-sm">
+                  対象アカウント: {confirmationAccountLabel(confirmation)}
+                </p>
                 <p className="text-muted-foreground text-sm leading-6">
                   {confirmation.action === "create_account"
                     ? "ログインを選択しましたが、この認証情報に対応するSumiアカウントはまだありません。新規登録して続けますか？"
@@ -259,4 +337,14 @@ export function LoginScreen() {
       </div>
     </main>
   );
+}
+
+function confirmationAccountLabel({
+  account,
+  firebaseUID,
+}: {
+  account: { displayName: string | null; email: string | null };
+  firebaseUID: string;
+}): string {
+  return account.email ?? account.displayName ?? `Firebase ${firebaseUID}`;
 }

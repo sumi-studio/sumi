@@ -13,12 +13,21 @@ export interface PendingAuthConfirmation {
   provider: AuthFlowProvider;
   expiresAt: string;
   action: AuthConfirmationAction;
+  firebaseUID: string;
+  account: {
+    displayName: string | null;
+    email: string | null;
+  };
 }
 
 export function savePendingConfirmation(
   confirmation: PendingAuthConfirmation,
 ): void {
-  sessionStorage.setItem(confirmationKey, JSON.stringify(confirmation));
+  try {
+    sessionStorage.setItem(confirmationKey, JSON.stringify(confirmation));
+  } catch {
+    // The in-memory confirmation remains authoritative for this page lifetime.
+  }
 }
 
 export function loadPendingConfirmation(): PendingAuthConfirmation | null {
@@ -64,6 +73,21 @@ function isPendingConfirmation(
     value.expiresAt.length > 0 &&
     value.expiresAt.length <= 64 &&
     "action" in value &&
-    (value.action === "create_account" || value.action === "sign_in")
+    (value.action === "create_account" || value.action === "sign_in") &&
+    "firebaseUID" in value &&
+    typeof value.firebaseUID === "string" &&
+    value.firebaseUID.length > 0 &&
+    value.firebaseUID.length <= 128 &&
+    "account" in value &&
+    typeof value.account === "object" &&
+    value.account !== null &&
+    "displayName" in value.account &&
+    (value.account.displayName === null ||
+      (typeof value.account.displayName === "string" &&
+        value.account.displayName.length <= 256)) &&
+    "email" in value.account &&
+    (value.account.email === null ||
+      (typeof value.account.email === "string" &&
+        value.account.email.length <= 320))
   );
 }

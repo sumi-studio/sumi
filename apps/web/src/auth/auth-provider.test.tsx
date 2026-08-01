@@ -34,7 +34,13 @@ const authMocks = vi.hoisted(() => ({
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
   beginEmailLinkAuth: vi.fn(),
   completeEmailLinkAuth: vi.fn(),
+  hasEmailLinkCallback: vi.fn(() => false),
+  rejectEmailLinkAuth: vi.fn(),
   getFirebaseAuth: vi.fn(),
+  onAuthStateChanged: vi.fn(
+    (_auth: unknown, _observer: (user: { uid: string } | null) => void) =>
+      vi.fn(),
+  ),
   signOut: vi.fn(),
   signInWithPopup: vi.fn(),
   getIdToken: vi.fn(),
@@ -59,6 +65,8 @@ vi.mock("./auth-flow-client", () => ({
 vi.mock("./email-link-auth", () => ({
   beginEmailLinkAuth: authMocks.beginEmailLinkAuth,
   completeEmailLinkAuth: authMocks.completeEmailLinkAuth,
+  hasEmailLinkCallback: authMocks.hasEmailLinkCallback,
+  rejectEmailLinkAuth: authMocks.rejectEmailLinkAuth,
 }));
 
 vi.mock("./firebase", () => ({
@@ -76,6 +84,7 @@ vi.mock("firebase/auth", () => ({
     setCustomParameters() {}
   },
   getIdToken: authMocks.getIdToken,
+  onAuthStateChanged: authMocks.onAuthStateChanged,
   signInWithPopup: authMocks.signInWithPopup,
   signOut: authMocks.signOut,
 }));
@@ -98,7 +107,18 @@ beforeEach(() => {
     continuation: "/",
     expiresAt: "2026-08-01T01:00:00Z",
   });
+  authMocks.confirmAuthFlow.mockResolvedValue({
+    flowId: "flow-id",
+    outcome: "account_created",
+    continuation: "/",
+    expiresAt: "2026-08-01T01:00:00Z",
+  });
+  authMocks.logoutSumiSession.mockResolvedValue(undefined);
   authMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
+  authMocks.hasEmailLinkCallback.mockReturnValue(false);
+  authMocks.onAuthStateChanged.mockImplementation((_auth, _observer) =>
+    vi.fn(),
+  );
 });
 
 function AuthStateProbe() {
@@ -299,13 +319,78 @@ describe("logout authority transition", () => {
     );
   });
 
-  it("does not mint a session for an intent mismatch until explicit confirmation", async () => {
+  it("opens the Firebase popup synchronously before the flow start settles", async () => {
+    let resolveStart!: (value: {
+      flowId: string;
+      outcome: "proof_required";
+      expiresAt: string;
+    }) => void;
+    const start = new Promise<{
+      flowId: string;
+      outcome: "proof_required";
+      expiresAt: string;
+    }>((resolve) => {
+      resolveStart = resolve;
+    });
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.startAuthFlow.mockReturnValue(start);
     authMocks.signInWithPopup.mockResolvedValue({
-      user: { uid: "firebase-new" },
+      user: {
+        uid: "firebase-b",
+        displayName: null,
+        email: "b@example.com",
+      },
     });
-    authMocks.getIdToken.mockResolvedValue("id-token-new");
+    authMocks.getIdToken.mockResolvedValue("id-token-b");
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b" },
+    });
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+
+    expect(authMocks.signInWithPopup).toHaveBeenCalledTimes(1);
+    expect(authMocks.startAuthFlow).toHaveBeenCalledTimes(1);
+    resolveStart({
+      flowId: "flow-id",
+      outcome: "proof_required",
+      expiresAt: "2026-08-01T01:00:00Z",
+    });
+    await waitFor(() => {
+      expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
+    });
+  });
+
+  it("does not mint a session for an intent mismatch until explicit confirmation", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    const firebaseUser = {
+      uid: "firebase-new",
+      displayName: "New Human",
+      email: "new@example.com",
+    };
+    const firebaseAuth = {
+      currentUser: firebaseUser,
+      authStateReady: vi.fn().mockResolvedValue(undefined),
+    };
+    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
+    authMocks.signInWithPopup.mockResolvedValue({
+      user: firebaseUser,
+    });
+    authMocks.getIdToken
+      .mockResolvedValueOnce("id-token-new")
+      .mockResolvedValueOnce("id-token-fresh");
     authMocks.resolveAuthFlow.mockResolvedValue({
       flowId: "flow-id",
       outcome: "confirmation_required",
@@ -355,6 +440,119 @@ describe("logout authority transition", () => {
       nonce: "n".repeat(43),
       action: "create_account",
     });
+    expect(authMocks.getIdToken).toHaveBeenLastCalledWith(firebaseUser, true);
+    expect(authMocks.resolveAuthFlow).toHaveBeenLastCalledWith({
+      flowId: "flow-id",
+      nonce: "n".repeat(43),
+      idToken: "id-token-fresh",
+    });
+  });
+
+  it("invalidates pending confirmation when Firebase auth state changes", async () => {
+    let authObserver: ((user: { uid: string } | null) => void) | undefined;
+    authMocks.onAuthStateChanged.mockImplementation((_auth, observer) => {
+      authObserver = observer;
+      return vi.fn();
+    });
+    const firebaseUser = {
+      uid: "firebase-new",
+      displayName: null,
+      email: "new@example.com",
+    };
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({ currentUser: firebaseUser });
+    authMocks.signInWithPopup.mockResolvedValue({ user: firebaseUser });
+    authMocks.getIdToken.mockResolvedValue("id-token-new");
+    authMocks.resolveAuthFlow.mockResolvedValue({
+      flowId: "flow-id",
+      outcome: "confirmation_required",
+      nextAction: "create_account",
+      continuation: "/",
+      expiresAt: "2026-08-01T01:00:00Z",
+    });
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("confirmation")).toHaveTextContent(
+        "create_account",
+      );
+    });
+
+    authObserver?.({ uid: "different-firebase-user" });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("confirmation")).toHaveTextContent("none");
+    });
+    expect(authMocks.confirmAuthFlow).not.toHaveBeenCalled();
+  });
+
+  it("logs out a Sumi session committed while the Firebase account changes", async () => {
+    const firebaseUser = {
+      uid: "firebase-new",
+      displayName: null,
+      email: "new@example.com",
+    };
+    const firebaseAuth = {
+      currentUser: firebaseUser as { uid: string } | null,
+      authStateReady: vi.fn().mockResolvedValue(undefined),
+    };
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
+    authMocks.signInWithPopup.mockResolvedValue({ user: firebaseUser });
+    authMocks.getIdToken.mockResolvedValue("id-token-new");
+    authMocks.resolveAuthFlow.mockResolvedValue({
+      flowId: "flow-id",
+      outcome: "confirmation_required",
+      nextAction: "create_account",
+      continuation: "/",
+      expiresAt: "2026-08-01T01:00:00Z",
+    });
+    authMocks.confirmAuthFlow.mockImplementation(async () => {
+      firebaseAuth.currentUser = { uid: "different-firebase-user" };
+      return {
+        flowId: "flow-id",
+        outcome: "account_created",
+        continuation: "/",
+        expiresAt: "2026-08-01T01:00:00Z",
+      };
+    });
+    authMocks.logoutSumiSession.mockResolvedValue(undefined);
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("confirmation")).toHaveTextContent(
+        "create_account",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "confirm transition" }));
+
+    await waitFor(() => {
+      expect(authMocks.logoutSumiSession).toHaveBeenCalledTimes(1);
+    });
+    expect(authMocks.verifyCommittedSumiSession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("confirmation")).toHaveTextContent("none");
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "unauthenticated",
+    );
   });
 
   it("clears old client authority after a committed exchange is compensated", async () => {
