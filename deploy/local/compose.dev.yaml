@@ -238,9 +238,11 @@ services:
       # The launcher validates this as required in emulator mode. Keep Compose
       # interpolation non-strict so the real-Firebase overlay can reset it.
       VITE_FIREBASE_AUTH_EMULATOR_URL: ${VITE_FIREBASE_AUTH_EMULATOR_URL:-}
-      # Vite proxies browser /auth and /direct-chat requests over this private
-      # loopback path. The browser itself stays same-origin on port 5173.
-      SUMI_DEV_API_ORIGIN: http://127.0.0.1:8080
+      # Vite runs in the host namespace.  It must bind and proxy to the same
+      # selected local/Tailnet address as the API: loopback cannot reach an API
+      # which Docker has published only on a selected Tailnet address.
+      SUMI_DEV_HOST: ${SUMI_DEV_BIND_HOST:-127.0.0.1}
+      SUMI_DEV_API_ORIGIN: http://${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080
     # Ports are published through the api service because this container shares
     # the api network namespace.
     depends_on:
