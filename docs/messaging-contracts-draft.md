@@ -178,7 +178,7 @@ agentにとってより適した方法があるときだけそちらで代替す
 一致していることが目的である。
 
 > **実装状態（2026-08-01 更新）**: ADR 0011 Decision 1・2 に加え、messaging
-> service側（`apps/api/internal/messaging`、migration 0005・0006）が実装済み:
+> service側（`apps/api/internal/messaging`、migration 0008・0009）が実装済み:
 > workspace/place/message/read markerの永続化とplace単位seq、`/messaging` REST
 > （bootstrap・履歴・送信・既読・DM作成）、`/messaging/ws`（cursor catch-up・
 > hub配送）、AttentionCandidateのper-agent inbox（message commitと同一

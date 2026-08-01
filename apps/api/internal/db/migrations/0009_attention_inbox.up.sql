@@ -1,4 +1,4 @@
--- 0006_attention_inbox: the per-agent AttentionCandidate inbox
+-- 0009_attention_inbox: the per-agent AttentionCandidate inbox
 -- (docs/messaging-boundary-contract.md 凍結v1, ADR 0011 §8-§11).
 --
 -- The shared control plane is the canonical holder of candidates: only the
