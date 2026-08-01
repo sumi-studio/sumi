@@ -156,6 +156,63 @@ describe("same-email Firebase credential recovery", () => {
     });
   });
 
+  it("does not return direct terminal success after Firebase changes users", async () => {
+    const user = { uid: "firebase-existing" };
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+    });
+    recoveryMocks.linkWithCredential.mockResolvedValue({ user });
+    recoveryMocks.completeProviderOperation.mockImplementationOnce(async () => {
+      recoveryMocks.auth.currentUser = { uid: "different-firebase-user" };
+      return {
+        operationId: "provider-operation",
+        outcome: "provider_linked",
+        noticeRequired: true,
+      };
+    });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: user as never,
+      }),
+    ).rejects.toThrow("account changed after provider recovery");
+
+    expect(recoveryMocks.statusProviderOperation).not.toHaveBeenCalled();
+    expect(recoveryMocks.failProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("does not return recovered terminal status after Firebase changes users", async () => {
+    const user = { uid: "firebase-existing" };
+    recoveryMocks.credentialFromJSON.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+    });
+    recoveryMocks.linkWithCredential.mockResolvedValue({ user });
+    recoveryMocks.completeProviderOperation.mockRejectedValueOnce(
+      new Error("completion response was lost"),
+    );
+    recoveryMocks.statusProviderOperation.mockImplementationOnce(async () => {
+      recoveryMocks.auth.currentUser = { uid: "different-firebase-user" };
+      return {
+        operationId: "provider-operation",
+        outcome: "provider_already_linked",
+        noticeRequired: true,
+      };
+    });
+
+    await expect(
+      completeSameEmailCredentialRecovery({
+        recovery: recovery("github.com"),
+        user: user as never,
+      }),
+    ).rejects.toThrow("account changed after provider recovery");
+
+    expect(recoveryMocks.statusProviderOperation).toHaveBeenCalledOnce();
+    expect(recoveryMocks.failProviderOperation).not.toHaveBeenCalled();
+  });
+
   it("terminalizes a credential already linked to another Firebase user", async () => {
     const user = { uid: "firebase-existing" };
     recoveryMocks.credentialFromJSON.mockReturnValue({

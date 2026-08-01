@@ -63,15 +63,16 @@ export async function completeSameEmailCredentialRecovery({
     throw new AuthAPIError("Provider credential recovery expired.", 0);
   }
   const credential = deserializeCredential(recovery);
+  const capturedFirebaseUID = user.uid;
   const nonce = createAuthFlowNonce();
-  if (!isCurrentFirebaseUser(user.uid)) {
+  if (!isCurrentFirebaseUser(capturedFirebaseUID)) {
     throw new AuthAPIError(
       "Firebase account changed before provider recovery.",
       0,
     );
   }
   const emailProofToken = await getIdToken(user, true);
-  if (!isCurrentFirebaseUser(user.uid)) {
+  if (!isCurrentFirebaseUser(capturedFirebaseUID)) {
     throw new AuthAPIError(
       "Firebase account changed before provider recovery.",
       0,
@@ -94,7 +95,7 @@ export async function completeSameEmailCredentialRecovery({
     throw new AuthAPIError("Provider recovery could not be started.", 0);
   }
 
-  if (!isCurrentFirebaseUser(user.uid)) {
+  if (!isCurrentFirebaseUser(capturedFirebaseUID)) {
     await failChangedUserRecovery(started.operationId, nonce, "before");
   }
 
@@ -106,27 +107,25 @@ export async function completeSameEmailCredentialRecovery({
     await failStartedRecovery(started.operationId, nonce, error);
     throw error;
   }
-  if (linkedUser.uid !== user.uid || !isCurrentFirebaseUser(user.uid)) {
+  if (
+    linkedUser.uid !== capturedFirebaseUID ||
+    !isCurrentFirebaseUser(capturedFirebaseUID)
+  ) {
     await failChangedUserRecovery(started.operationId, nonce, "during");
   }
 
   await waitUntil(started.completionTokenNotBefore);
   const completionToken = await getIdToken(linkedUser, true);
-  if (!isCurrentFirebaseUser(user.uid)) {
+  if (!isCurrentFirebaseUser(capturedFirebaseUID)) {
     await failChangedUserRecovery(started.operationId, nonce, "during");
   }
+  let completed: Awaited<ReturnType<typeof completeProviderOperation>>;
   try {
-    const completed = await completeProviderOperation({
+    completed = await completeProviderOperation({
       operationId: started.operationId,
       nonce,
       idToken: completionToken,
     });
-    if (
-      completed.outcome === "provider_linked" ||
-      completed.outcome === "provider_already_linked"
-    ) {
-      return completed.outcome;
-    }
   } catch (error) {
     const recovered = await statusProviderOperation({
       operationId: started.operationId,
@@ -136,9 +135,17 @@ export async function completeSameEmailCredentialRecovery({
       recovered?.outcome === "provider_linked" ||
       recovered?.outcome === "provider_already_linked"
     ) {
+      assertTerminalFirebaseUser(capturedFirebaseUID);
       return recovered.outcome;
     }
     throw error;
+  }
+  if (
+    completed.outcome === "provider_linked" ||
+    completed.outcome === "provider_already_linked"
+  ) {
+    assertTerminalFirebaseUser(capturedFirebaseUID);
+    return completed.outcome;
   }
   throw new AuthAPIError("Provider recovery did not complete.", 0);
 }
@@ -243,6 +250,15 @@ function isCurrentFirebaseUser(uid: string): boolean {
     return getFirebaseAuth().currentUser?.uid === uid;
   } catch {
     return false;
+  }
+}
+
+function assertTerminalFirebaseUser(uid: string): void {
+  if (!isCurrentFirebaseUser(uid)) {
+    throw new AuthAPIError(
+      "Firebase account changed after provider recovery completed.",
+      0,
+    );
   }
 }
 
