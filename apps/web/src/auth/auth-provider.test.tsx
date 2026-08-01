@@ -267,6 +267,43 @@ describe("canonical Human profile", () => {
     expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
   });
 
+  it("does not publish a reconciled profile through a different authority binding", async () => {
+    authMocks.getSumiSession
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingA,
+        user: { id: "user-a", displayName: "Before" },
+      })
+      .mockResolvedValueOnce({
+        authenticated: true,
+        authorityBindingId: authorityBindingB,
+        user: { id: "user-a", displayName: "After" },
+      });
+    authMocks.updateSumiProfile.mockRejectedValue(
+      new TypeError("disconnected"),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    });
+    authMocks.bindDirectChatAuthority.mockClear();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "update display name" }),
+    );
+
+    await waitFor(() => {
+      expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByTestId("display-name")).toHaveTextContent("Before");
+    expect(authMocks.bindDirectChatAuthority).not.toHaveBeenCalled();
+  });
+
   it("does not let a queued profile update invalidate a later logout", async () => {
     let resolveFirstUpdate!: (value: {
       id: string;

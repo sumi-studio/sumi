@@ -765,7 +765,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (!isCurrentGeneration(generation)) return;
           if (
             !reconciled.authenticated ||
-            reconciled.user.id !== current.user.id
+            reconciled.user.id !== current.user.id ||
+            reconciled.authorityBindingId !== current.authorityBindingId
           ) {
             throw new SumiProfileUpdateIndeterminateError(error);
           }
