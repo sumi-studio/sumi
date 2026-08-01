@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
+readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.dev.yaml"
+
+ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+
+log() {
+  printf '[sumi-compose-stack] %s\n' "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+random_token() {
+  openssl rand -hex 32
+}
+
+require_value() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "${name} is required"
+}
+
+load_env_file() {
+  local file="$1"
+  if [[ -f "${file}" ]]; then
+    while IFS='=' read -r key value; do
+      [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+      [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      if ! [[ -v "${key}" ]]; then
+        export "${key}=${value}"
+      fi
+    done < "${file}"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev/compose-stack up|down|config
+
+Starts or stops the full local Sumi stack in Docker Compose:
+Postgres + Go API + Vite web + containerized agent (runtime/executor/broker).
+
+Set SUMI_LOCAL_ENV_FILE to override deploy/local/.env.local.
+EOF
+}
+
+# Optional Firebase values are inherited from the env file; the agent secrets
+# are generated on the fly and exported for this command only.
+load_env_file "${ENV_FILE}"
+
+# Use a stable dev PAID. The API and the agent container share it. The API
+# grants the legacy env-agent authorization so the container can connect.
+export SUMI_PERSONALITY_AGENT_ID="0198f0f4-9b72-7000-8000-00000000000d"
+export SUMI_RPC_NONCE="dev-compose-0001"
+
+# Provide compose-scoped defaults if not already set by the env file.
+export SUMI_DB_URL="${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}"
+export SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}"
+export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}"
+
+# Runtime secrets. These are also read by the agent container through compose
+# secrets and by the API to authorize the container.
+export SUMI_LOCAL_CONTROL_BEARER="${SUMI_LOCAL_CONTROL_BEARER:-$(random_token)}"
+export SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY:-$(random_token)}"
+export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
+# The container entrypoint rejects an empty provider key. A placeholder lets
+# the runtime start; real calls need a key in .env.local or the environment.
+export SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY:-dummy}"
+
+if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
+  log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"
+fi
+
+if (($# == 0)); then
+  usage
+  exit 1
+fi
+
+case "$1" in
+  up)
+    shift
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" up --build "$@"
+    ;;
+  down)
+    shift
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" down "$@"
+    ;;
+  config)
+    docker compose -p sumi-dev -f "${COMPOSE_FILE}" config
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    fail "unknown command: $1"
+    ;;
+esac
