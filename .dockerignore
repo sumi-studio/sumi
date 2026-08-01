@@ -2,6 +2,7 @@
 node_modules
 apps/*/node_modules
 packages/*/node_modules
+**/node_modules
 .pnpm-store
 .pnpm-debug.log
 
@@ -19,8 +20,11 @@ packages/*/node_modules
 # Temporary and artifact directories
 target
 apps/agent/target
+**/target
 dist
+**/dist
 build
+**/.venv
 *.log
 
 # Generated local Go binary (the API image builds its own binary).
