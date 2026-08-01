@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -25,6 +26,104 @@ import (
 type dispositionBeforeAppendReturn struct {
 	gateway *DurableGateway
 	claims  TokenClaims
+}
+
+type countingDirectChatSpawner struct {
+	mu             sync.Mutex
+	ensureTargets  []string
+	ensureContexts []context.Context
+	touchTargets   []string
+}
+
+func (s *countingDirectChatSpawner) EnsureRunning(ctx context.Context, agentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureTargets = append(s.ensureTargets, agentID)
+	s.ensureContexts = append(s.ensureContexts, ctx)
+	return nil
+}
+
+func (s *countingDirectChatSpawner) Touch(agentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.touchTargets = append(s.touchTargets, agentID)
+}
+
+func (s *countingDirectChatSpawner) snapshot() (
+	ensureTargets []string,
+	ensureContexts []context.Context,
+	touchTargets []string,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ensureTargets...),
+		append([]context.Context(nil), s.ensureContexts...),
+		append([]string(nil), s.touchTargets...)
+}
+
+type blockingAdmissionSessionAuthorizer struct {
+	claims           UserSessionClaims
+	authorizeStarted chan struct{}
+	release          chan struct{}
+	mu               sync.Mutex
+	revoked          bool
+}
+
+func (s *blockingAdmissionSessionAuthorizer) VerifySession(
+	context.Context,
+	string,
+) (UserSessionClaims, error) {
+	return s.claims, nil
+}
+
+func (s *blockingAdmissionSessionAuthorizer) AuthorizeSession(
+	ctx context.Context,
+	_ UserSessionClaims,
+	operation func() error,
+) error {
+	close(s.authorizeStarted)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	revoked := s.revoked
+	s.mu.Unlock()
+	if revoked {
+		return errors.New("browser session revoked during admission")
+	}
+	return operation()
+}
+
+func (s *blockingAdmissionSessionAuthorizer) revoke() {
+	s.mu.Lock()
+	s.revoked = true
+	s.mu.Unlock()
+}
+
+type mutableDirectChatAuthorizer struct {
+	mu      sync.Mutex
+	allowed bool
+}
+
+func (a *mutableDirectChatAuthorizer) AuthorizeDirectChat(
+	context.Context,
+	string,
+	string,
+) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.allowed {
+		return errors.New("human is not the current Employer")
+	}
+	return nil
+}
+
+func (a *mutableDirectChatAuthorizer) setAllowed(allowed bool) {
+	a.mu.Lock()
+	a.allowed = allowed
+	a.mu.Unlock()
 }
 
 func (a dispositionBeforeAppendReturn) Append(
@@ -482,7 +581,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 			}
 
 			server := &BrowserServer{Events: gateway}
-			err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, write)
+			err := server.browserEventPump(ctx, personalityAgentID, 0, true, volatile, nil, write)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("browser event pump returned %v, want context cancellation", err)
 			}
@@ -630,6 +729,315 @@ func TestBrowserWebSocketRejectsMissingExpiredAndMalformedPersonalityAgentSessio
 	if err == nil || response == nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected duplicate cookie rejection, response=%v err=%v", response, err)
 	}
+}
+
+func TestBrowserWebSocketRejectsOriginAndAuthorityBeforeRuntimeActivity(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawner := &countingDirectChatSpawner{}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	server.Spawner = spawner
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+	}
+	validSession, err := sessions.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedSession, err := sessions.IssueSession(context.Background(), claims, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.RevokeSession(context.Background(), revokedSession); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+	for _, test := range []struct {
+		name       string
+		origin     string
+		session    string
+		wantStatus int
+	}{
+		{
+			name:       "disallowed origin with valid session",
+			origin:     "https://evil.example",
+			session:    validSession,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "invalid session",
+			origin:     browserAuthTestOrigin,
+			session:    "not-a-session",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "revoked session",
+			origin:     browserAuthTestOrigin,
+			session:    revokedSession,
+			wantStatus: http.StatusUnauthorized,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{
+				"Origin": {test.origin},
+				"Cookie": {BrowserSessionCookie + "=" + test.session},
+			}
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, header)
+			if conn != nil {
+				conn.Close()
+			}
+			if response != nil && response.Body != nil {
+				defer response.Body.Close()
+			}
+			if dialErr == nil || response == nil || response.StatusCode != test.wantStatus {
+				t.Fatalf(
+					"runtime-activity fence response=%v err=%v, want status %d",
+					response,
+					dialErr,
+					test.wantStatus,
+				)
+			}
+			ensures, _, touches := spawner.snapshot()
+			if len(ensures) != 0 || len(touches) != 0 {
+				t.Fatalf("rejected browser caused runtime activity: ensures=%v touches=%v", ensures, touches)
+			}
+		})
+	}
+
+	authorizer := &mutableDirectChatAuthorizer{}
+	server.Authorizer = authorizer
+	header := http.Header{
+		"Origin": {browserAuthTestOrigin},
+		"Cookie": {BrowserSessionCookie + "=" + validSession},
+	}
+	conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, header)
+	if conn != nil {
+		conn.Close()
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if dialErr == nil || response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-Employer response=%v err=%v, want 403", response, dialErr)
+	}
+	ensures, _, touches := spawner.snapshot()
+	if len(ensures) != 0 || len(touches) != 0 {
+		t.Fatalf("unauthorized browser caused runtime activity: ensures=%v touches=%v", ensures, touches)
+	}
+}
+
+func TestBrowserWebSocketRevocationWinsAdmissionBeforeSpawn(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	sessions := &blockingAdmissionSessionAuthorizer{
+		claims: UserSessionClaims{
+			TenantID:           "tenant-1",
+			UserID:             "user-1",
+			PersonalityAgentID: personalityAgentID,
+			sessionID:          base64.RawURLEncoding.EncodeToString(make([]byte, browserSessionIDBytes)),
+			expiresAt:          time.Now().Add(time.Hour),
+		},
+		authorizeStarted: make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	spawner := &countingDirectChatSpawner{}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	server.Spawner = spawner
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	type dialResult struct {
+		conn     *websocket.Conn
+		response *http.Response
+		err      error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		wsURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/direct-chat/ws"
+		header := http.Header{
+			"Origin": {browserAuthTestOrigin},
+			"Cookie": {BrowserSessionCookie + "=verified-before-race"},
+		}
+		conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+		result <- dialResult{conn: conn, response: response, err: err}
+	}()
+
+	select {
+	case <-sessions.authorizeStarted:
+	case <-time.After(time.Second):
+		close(sessions.release)
+		t.Fatal("browser admission did not enter the final session lease")
+	}
+	sessions.revoke()
+	close(sessions.release)
+
+	var got dialResult
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("revoked browser admission did not return")
+	}
+	if got.conn != nil {
+		got.conn.Close()
+	}
+	if got.response != nil && got.response.Body != nil {
+		defer got.response.Body.Close()
+	}
+	if got.err == nil || got.response == nil || got.response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revocation race response=%v err=%v, want 401", got.response, got.err)
+	}
+	ensures, _, touches := spawner.snapshot()
+	if len(ensures) != 0 || len(touches) != 0 {
+		t.Fatalf("revoked admission caused runtime activity: ensures=%v touches=%v", ensures, touches)
+	}
+	if stats := server.ConnectionStats(); stats != (BrowserConnectionStats{}) {
+		t.Fatalf("revoked admission registered a connection: %+v", stats)
+	}
+}
+
+func TestBrowserWebSocketSpawnContextOutlivesSocket(t *testing.T) {
+	spawner := &countingDirectChatSpawner{}
+	_, server, conn := openLiveAuthorizedBrowser(
+		t,
+		nil,
+		spawner,
+		time.Hour,
+		false,
+	)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForBrowserConnectionStats(
+		t,
+		server,
+		BrowserConnectionStats{Active: 0, Accepted: 1},
+	)
+	ensures, ensureContexts, touches := spawner.snapshot()
+	if len(ensures) != 1 || ensures[0] != "018f47a2-9b3c-7def-8abc-0123456789ab" {
+		t.Fatalf("spawn targets = %v", ensures)
+	}
+	if len(ensureContexts) != 1 || ensureContexts[0].Err() != nil || ensureContexts[0].Done() != nil {
+		t.Fatalf("spawn context remained browser-owned: contexts=%v", ensureContexts)
+	}
+	if len(touches) != 0 {
+		t.Fatalf("closing an idle socket touched the runtime: %v", touches)
+	}
+}
+
+func TestBrowserWebSocketRevalidatesCurrentEmployerOnLiveBoundaries(t *testing.T) {
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+
+	t.Run("command admission", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{allowed: true}
+		spawner := &countingDirectChatSpawner{}
+		gateway, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			spawner,
+			time.Hour,
+			true,
+		)
+		authorizer.setAllowed(false)
+		if err := conn.WriteJSON(browserCommandFrame{
+			Type:           "command",
+			IdempotencyKey: "former-employer",
+			Command:        json.RawMessage(`{"type":"user_message","text":"denied","attachments":[]}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
+			t.Fatalf("former Employer command reached durable log: hasCommands=%v err=%v", hasCommands, err)
+		}
+		_, _, touches := spawner.snapshot()
+		if len(touches) != 0 {
+			t.Fatalf("former Employer command touched runtime: %v", touches)
+		}
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
+
+	t.Run("private event", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{allowed: true}
+		spawner := &countingDirectChatSpawner{}
+		gateway, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			spawner,
+			time.Hour,
+			false,
+		)
+		authorizer.setAllowed(false)
+		seq := uint64(1)
+		if err := gateway.Receive(context.Background(), TokenClaims{
+			TenantID:           "tenant-1",
+			PersonalityAgentID: personalityAgentID,
+			Generation:         1,
+		}, Envelope{
+			Seq:                &seq,
+			PersonalityAgentID: personalityAgentID,
+			Event:              json.RawMessage(`{"type":"agent_start"}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		_, _, touches := spawner.snapshot()
+		if len(touches) != 0 {
+			t.Fatalf("denied private event touched runtime: %v", touches)
+		}
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
+
+	t.Run("readiness status", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{allowed: true}
+		gateway, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			nil,
+			time.Hour,
+			false,
+		)
+		authorizer.setAllowed(false)
+		receipt := "ready-after-employment-change"
+		if err := gateway.PublishRuntimeState(personalityAgentID, 1, &receipt); err != nil {
+			t.Fatal(err)
+		}
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
+
+	t.Run("idle socket", func(t *testing.T) {
+		authorizer := &mutableDirectChatAuthorizer{allowed: true}
+		_, server, conn := openLiveAuthorizedBrowser(
+			t,
+			authorizer,
+			nil,
+			10*time.Millisecond,
+			false,
+		)
+		authorizer.setAllowed(false)
+		assertBrowserConnectionClosedBeforeFrame(t, conn)
+		waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
+	})
 }
 
 func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
@@ -995,6 +1403,61 @@ func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T
 	if hasCommands, err := gateway.commands.HasCommands(context.Background(), personalityAgentID); err != nil || hasCommands {
 		t.Fatalf("expiry crossing replay appended command: hasCommands=%v err=%v", hasCommands, err)
 	}
+}
+
+func openLiveAuthorizedBrowser(
+	t *testing.T,
+	authorizer DirectChatAuthorizer,
+	spawner DirectChatSpawner,
+	authorizationPollInterval time.Duration,
+	ready bool,
+) (*DurableGateway, *BrowserServer, *websocket.Conn) {
+	t.Helper()
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	gateway := openRuntimeGateway(t)
+	var receipt *string
+	if ready {
+		value := "ready"
+		receipt = &value
+	}
+	if err := gateway.PublishRuntimeState(personalityAgentID, 1, receipt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := NewHMACUserSessionVerifier(
+		testSecret,
+		"",
+		newTestBrowserSessionRevocationStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewBrowserServer(sessions, gateway, gateway)
+	server.AllowedOrigins = []string{browserAuthTestOrigin}
+	server.Authorizer = authorizer
+	server.Spawner = spawner
+	server.AuthorizationPollInterval = authorizationPollInterval
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
+	session := signBrowserSession(t, testSecret, userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	})
+	conn := dialBrowserWS(t, httpServer, session, personalityAgentID)
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.WriteJSON(browserHello{Type: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	status := "unavailable"
+	if ready {
+		status = "ready"
+	}
+	assertDirectChatStatus(t, conn, status)
+	return gateway, server, conn
 }
 
 func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
