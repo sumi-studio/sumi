@@ -204,7 +204,10 @@ type unreadSummaryWire struct {
 // point distinguishes them.
 func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (ParticipantRef, agentevents.UserSessionClaims, bool) {
 	var none agentevents.UserSessionClaims
-	if !agentevents.BrowserOriginAllowed(r, s.AllowedOrigins) && !sameOriginFetchWithoutOrigin(r) {
+	// Origin is a CSRF boundary for unsafe REST methods. Browsers may omit it
+	// from same-origin GET fetches; those reads remain protected by the browser
+	// session cookie and same-origin response policy.
+	if r.Method != http.MethodGet && !agentevents.BrowserOriginAllowed(r, s.AllowedOrigins) {
 		writeError(w, http.StatusForbidden, "origin_not_allowed")
 		return ParticipantRef{}, none, false
 	}
@@ -228,14 +231,6 @@ func (s *Server) viewer(w http.ResponseWriter, r *http.Request) (ParticipantRef,
 		return ParticipantRef{}, none, false
 	}
 	return viewer, claims, true
-}
-
-// Browsers do not consistently attach Origin to same-origin GET fetches. The
-// Fetch Metadata header is browser-controlled and preserves the CSRF boundary
-// for those reads while duplicate, empty, and cross-site Origin values remain
-// rejected by the exact-origin path above.
-func sameOriginFetchWithoutOrigin(r *http.Request) bool {
-	return len(r.Header.Values("Origin")) == 0 && r.Header.Get("Sec-Fetch-Site") == "same-origin"
 }
 
 // mutate runs op under the session's durable admission lease so a completed

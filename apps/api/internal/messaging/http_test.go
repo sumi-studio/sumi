@@ -80,7 +80,7 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 	defer cancel()
 	w, ts := newTestServer(t, ctx)
 
-	// No Origin header: rejected before anything else.
+	// Browser GET fetches may omit Origin and remain valid with a session.
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/messaging/bootstrap", nil)
 	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
 	resp, err := http.DefaultClient.Do(req)
@@ -88,21 +88,20 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 		t.Fatalf("request: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("missing origin: status %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET without origin: status %d, want 200", resp.StatusCode)
 	}
 
-	// Browsers may omit Origin on same-origin GET fetches; Fetch Metadata is
-	// the browser-controlled proof in that case.
-	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/messaging/bootstrap", nil)
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	// Unsafe methods still fail closed before request-body or resource checks.
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/messaging/places/"+DefaultGeneralChannelID+"/messages", strings.NewReader(`{}`))
+	req.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("same-origin request: %v", err)
+		t.Fatalf("unsafe request: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("same-origin fetch without session: status %d, want 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unsafe request without origin: status %d, want 403", resp.StatusCode)
 	}
 
 	// No cookie.
