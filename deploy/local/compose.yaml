@@ -1,0 +1,30 @@
+# Local development Postgres for the Sumi 戸籍 (identity registry) control
+# plane (ADR 0009 §7). The real-stack launcher (scripts/dev/real-stack) starts
+# this service before the API; `docker compose -f deploy/local/compose.yaml up
+# -d postgres` also works standalone. WSL dev hosts are the target.
+#
+# The API and web frontends are still orchestrated natively by the real-stack
+# launcher; this Compose file owns only the shared control-plane database.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sumi
+      POSTGRES_PASSWORD: sumi-dev
+      POSTGRES_DB: sumi
+    ports:
+      # Bind only to loopback so the dev database is never exposed off-host.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - sumi-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumi -d sumi"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: "no"
+
+volumes:
+  sumi-postgres: {}
