@@ -87,12 +87,14 @@ type ProviderOperationStatusResult struct {
 }
 
 var (
-	ErrBrowserAuthFlowInvalid  = errors.New("invalid authentication flow")
-	ErrBrowserAuthFlowExpired  = errors.New("authentication flow expired")
-	ErrBrowserAuthFlowConsumed = errors.New("authentication flow consumed")
-	ErrBrowserAuthFlowProof    = errors.New("authentication proof mismatch")
-	ErrBrowserAuthRecentReauth = errors.New("recent reauthentication required")
-	ErrBrowserAuthLastMethod   = errors.New("last login method")
+	ErrBrowserAuthFlowInvalid         = errors.New("invalid authentication flow")
+	ErrBrowserAuthFlowExpired         = errors.New("authentication flow expired")
+	ErrBrowserAuthFlowConsumed        = errors.New("authentication flow consumed")
+	ErrBrowserAuthFlowProof           = errors.New("authentication proof mismatch")
+	ErrBrowserAuthRecentReauth        = errors.New("recent reauthentication required")
+	ErrBrowserAuthLastMethod          = errors.New("last login method")
+	ErrBrowserAuthProviderPending     = errors.New("provider operation pending")
+	ErrBrowserAuthProviderUnavailable = errors.New("provider operation unavailable")
 )
 
 // BrowserAuthFlowController owns persisted intent/proof transitions. It never
@@ -346,6 +348,10 @@ func writeFlowError(w http.ResponseWriter, err error) {
 		status, code = http.StatusForbidden, "recent_reauth_required"
 	case errors.Is(err, ErrBrowserAuthLastMethod):
 		status, code = http.StatusConflict, "last_login_method"
+	case errors.Is(err, ErrBrowserAuthProviderPending):
+		status, code = http.StatusConflict, "provider_operation_pending"
+	case errors.Is(err, ErrBrowserAuthProviderUnavailable):
+		status, code = http.StatusServiceUnavailable, "provider_unavailable"
 	}
 	writeBrowserAuthJSON(w, status, map[string]string{"error": code})
 }

@@ -3,8 +3,156 @@ package koseki
 import (
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestProviderUnlinkFenceSerializesFirebaseUIDAndReleasesOnTerminalState(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	owner, err := store.AutoRegister(ctx, "firebase", "provider-fence-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type beginResult struct {
+		operation ProviderOperation
+		nonce     string
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan beginResult, 2)
+	var wg sync.WaitGroup
+	requests := []struct {
+		provider string
+		nonce    string
+	}{
+		{provider: "google.com", nonce: testNonce(t)},
+		{provider: "github.com", nonce: testNonce(t)},
+	}
+	for _, request := range requests {
+		request := request
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			operation, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", request.provider, "unlink", "account_settings", request.nonce)
+			results <- beginResult{operation: operation, nonce: request.nonce, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var winner beginResult
+	succeeded, fenced := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil:
+			succeeded++
+			winner = result
+		case errors.Is(result.err, ErrProviderOperationPending):
+			fenced++
+		default:
+			t.Fatalf("concurrent begin: %v", result.err)
+		}
+	}
+	if succeeded != 1 || fenced != 1 {
+		t.Fatalf("succeeded=%d fenced=%d", succeeded, fenced)
+	}
+
+	repeated, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", winner.operation.Provider, "unlink", "account_settings", winner.nonce)
+	if err != nil || repeated.OperationID != winner.operation.OperationID {
+		t.Fatalf("same-nonce recovery: %+v %v", repeated, err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", "github.com", "link", "account_settings", testNonce(t)); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("link crossed pending unlink fence: %v", err)
+	}
+	if _, err := store.FailProviderOperation(ctx, winner.operation.OperationID, winner.nonce, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	linkNonce := testNonce(t)
+	link, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", "google.com", "link", "account_settings", linkNonce)
+	if err != nil {
+		t.Fatalf("released unlink fence for link: %v", err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", "github.com", "unlink", "account_settings", testNonce(t)); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("unlink crossed pending link fence: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-interval '1 second' WHERE operation_id=$1", link.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, "provider-fence-owner", "github.com", "unlink", "account_settings", testNonce(t)); err != nil {
+		t.Fatalf("expired link intent retained unlink fence: %v", err)
+	}
+}
+
+func TestCompletedEmailLinkProofRequiresSameHumanAndFirebaseUID(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	owner, err := store.AutoRegister(ctx, "firebase", "email-proof-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.AutoRegister(ctx, "firebase", "email-proof-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProof := func(humanID, firebaseUID string, want bool) {
+		t.Helper()
+		got, err := store.HasCompletedEmailLinkProof(ctx, humanID, firebaseUID)
+		if err != nil || got != want {
+			t.Fatalf("proof human=%s uid=%s: got=%v want=%v err=%v", humanID, firebaseUID, got, want, err)
+		}
+	}
+	assertProof(owner.HumanID, "email-proof-owner", false)
+
+	providerNonce := testNonce(t)
+	providerFlow, err := store.StartAuthFlow(ctx, StartAuthFlowRequest{
+		Intent: IntentSignIn, Channel: ChannelProvider, ExpectedProvider: "github.com",
+		Continuation: "/direct-chat", Nonce: providerNonce, TTL: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveAuthProof(ctx, providerFlow.FlowID, providerNonce, VerifiedIdentity{
+		FirebaseUID: "email-proof-owner", SignInProvider: "github.com", ProviderSubject: "email-proof-github",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertProof(owner.HumanID, "email-proof-owner", false)
+
+	emailNonce := testNonce(t)
+	emailFlow := startEmailFlow(t, ctx, store, IntentSignIn, "proof@example.com", emailNonce)
+	if _, err := store.ResolveAuthProof(ctx, emailFlow.FlowID, emailNonce, emailProof("email-proof-owner", "proof@example.com")); err != nil {
+		t.Fatal(err)
+	}
+	assertProof(owner.HumanID, "email-proof-owner", true)
+	assertProof(owner.HumanID, "email-proof-other", false)
+	assertProof(other.HumanID, "email-proof-owner", false)
+}
+
+func TestExpiredProviderUnlinkCanStillTerminalizeItsDurableFence(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	owner, err := store.AutoRegister(ctx, "firebase", "expired-unlink-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := testNonce(t)
+	operation, err := store.BeginProviderOperation(ctx, owner.HumanID, "expired-unlink-owner", "github.com", "unlink", "account_settings", nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-interval '1 second' WHERE operation_id=$1", operation.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailProviderOperation(ctx, operation.OperationID, nonce, "last_login_method"); err != nil {
+		t.Fatalf("terminalize expired unlink: %v", err)
+	}
+	status, err := store.ProviderOperationStatus(ctx, owner.HumanID, operation.OperationID, nonce)
+	if err != nil || status.Status != "failed" || status.TerminalOutcome != "last_login_method" {
+		t.Fatalf("expired unlink status: %+v %v", status, err)
+	}
+}
 
 func TestProviderOperationStatusRecoversPendingAndTerminalStates(t *testing.T) {
 	store, ctx := authFlowStore(t)

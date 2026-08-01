@@ -356,3 +356,21 @@ func TestProviderOperationStatusRouteExistsOnlyInFlowMode(t *testing.T) {
 		t.Fatalf("status route missing in flow mode: %d", flowRecorder.Code)
 	}
 }
+
+func TestProviderOperationSagaErrorsExposeRetryableSemanticCodes(t *testing.T) {
+	tests := []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{err: ErrBrowserAuthProviderPending, wantStatus: http.StatusConflict, wantCode: "provider_operation_pending"},
+		{err: ErrBrowserAuthProviderUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "provider_unavailable"},
+	}
+	for _, test := range tests {
+		recorder := httptest.NewRecorder()
+		writeFlowError(recorder, test.err)
+		if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), `"error":"`+test.wantCode+`"`) {
+			t.Fatalf("error %v: status=%d body=%s", test.err, recorder.Code, recorder.Body.String())
+		}
+	}
+}

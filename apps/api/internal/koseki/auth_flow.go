@@ -35,14 +35,15 @@ const (
 )
 
 var (
-	ErrInvalidAuthFlow    = errors.New("invalid authentication flow")
-	ErrAuthFlowExpired    = errors.New("authentication flow expired")
-	ErrAuthFlowConsumed   = errors.New("authentication flow already consumed")
-	ErrAuthProofMismatch  = errors.New("verified identity does not match authentication flow")
-	ErrConfirmation       = errors.New("invalid authentication confirmation")
-	ErrCredentialInactive = errors.New("credential login method is inactive")
-	ErrLastLoginMethod    = errors.New("last usable login method cannot be removed")
-	ErrRecentReauth       = errors.New("recent reauthentication through another method is required")
+	ErrInvalidAuthFlow          = errors.New("invalid authentication flow")
+	ErrAuthFlowExpired          = errors.New("authentication flow expired")
+	ErrAuthFlowConsumed         = errors.New("authentication flow already consumed")
+	ErrAuthProofMismatch        = errors.New("verified identity does not match authentication flow")
+	ErrConfirmation             = errors.New("invalid authentication confirmation")
+	ErrCredentialInactive       = errors.New("credential login method is inactive")
+	ErrLastLoginMethod          = errors.New("last usable login method cannot be removed")
+	ErrRecentReauth             = errors.New("recent reauthentication through another method is required")
+	ErrProviderOperationPending = errors.New("another provider operation is pending")
 )
 
 type StartAuthFlowRequest struct {

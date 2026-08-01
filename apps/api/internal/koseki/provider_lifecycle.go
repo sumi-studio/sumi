@@ -58,6 +58,9 @@ func (s *Store) BeginProviderOperation(ctx context.Context, humanID, firebaseUID
 		&result.OperationID, &result.HumanID, &result.FirebaseUID, &result.Provider,
 		&result.Operation, &result.Status, &result.DecisionPath, &result.CreatedAt, &result.ExpiresAt)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return ProviderOperation{}, ErrProviderOperationPending
+		}
 		return ProviderOperation{}, fmt.Errorf("begin provider operation: %w", err)
 	}
 	if result.HumanID != humanID || result.FirebaseUID != firebaseUID || result.Provider != provider ||
@@ -77,6 +80,14 @@ func validDecisionPath(path string) bool {
 }
 
 func scanProviderOperation(ctx context.Context, tx pgx.Tx, operationID, nonce string) (ProviderOperation, error) {
+	return scanProviderOperationState(ctx, tx, operationID, nonce, false)
+}
+
+func scanProviderOperationForReconciliation(ctx context.Context, tx pgx.Tx, operationID, nonce string) (ProviderOperation, error) {
+	return scanProviderOperationState(ctx, tx, operationID, nonce, true)
+}
+
+func scanProviderOperationState(ctx context.Context, tx pgx.Tx, operationID, nonce string, allowExpired bool) (ProviderOperation, error) {
 	nonceHash, err := validateNonce(nonce)
 	if err != nil {
 		return ProviderOperation{}, err
@@ -97,10 +108,29 @@ func scanProviderOperation(ctx context.Context, tx pgx.Tx, operationID, nonce st
 	if operation.Status != "pending" {
 		return ProviderOperation{}, ErrAuthFlowConsumed
 	}
-	if !time.Now().UTC().Before(operation.ExpiresAt) {
+	if !allowExpired && !time.Now().UTC().Before(operation.ExpiresAt) {
 		return ProviderOperation{}, ErrAuthFlowExpired
 	}
 	return operation, nil
+}
+
+// HasCompletedEmailLinkProof returns only durable proof that this Human used a
+// completed Sumi email-link flow for the same Firebase UID. Firebase profile
+// email is deliberately not evidence of a usable login method.
+func (s *Store) HasCompletedEmailLinkProof(ctx context.Context, humanID, firebaseUID string) (bool, error) {
+	if humanID == "" || firebaseUID == "" {
+		return false, ErrInvalidAuthFlow
+	}
+	var proved bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM auth_flows
+		WHERE human_id=$1 AND firebase_uid=$2 AND channel='email_link'
+			AND status='completed'
+	)`, humanID, firebaseUID).Scan(&proved)
+	if err != nil {
+		return false, fmt.Errorf("read completed email-link proof: %w", err)
+	}
+	return proved, nil
 }
 
 func (s *Store) PendingProviderOperation(ctx context.Context, operationID, nonce string) (ProviderOperation, error) {
@@ -173,7 +203,10 @@ func (s *Store) ProviderOperationStatus(ctx context.Context, humanID, operationI
 		if eventCount != 0 || operation.TerminalOutcome != "" || operation.CompletedAt != nil {
 			return ProviderOperation{}, ErrInvalidAuthFlow
 		}
-		if !time.Now().UTC().Before(operation.ExpiresAt) {
+		// Link operations are browser intents and expire. Backend-owned unlink
+		// operations are durable sagas: while remote state is indeterminate their
+		// pending row remains the per-UID fence and must stay recoverable by nonce.
+		if operation.Operation != "unlink" && !time.Now().UTC().Before(operation.ExpiresAt) {
 			return ProviderOperation{}, ErrAuthFlowExpired
 		}
 	case "completed", "failed":
@@ -257,30 +290,22 @@ func (s *Store) CompleteProviderLink(ctx context.Context, operationID, nonce, fi
 	return event, nil
 }
 
-// CompleteProviderUnlink is called only after the Firebase provider has been
-// removed and the resulting refreshed token has been verified by the server.
-// The historical binding is disabled, never deleted.
+// CompleteProviderUnlink is called only after the backend-owned Firebase Admin
+// mutation has been postchecked. It may reconcile an expired pending row after
+// a remote-success/local-commit-loss boundary. The historical binding is
+// disabled, never deleted.
 func (s *Store) CompleteProviderUnlink(ctx context.Context, operationID, nonce, firebaseUID, providerSubject string) (SecurityEvent, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return SecurityEvent{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	operation, err := scanProviderOperation(ctx, tx, operationID, nonce)
+	operation, err := scanProviderOperationForReconciliation(ctx, tx, operationID, nonce)
 	if err != nil {
 		return SecurityEvent{}, err
 	}
 	if operation.Operation != "unlink" || operation.FirebaseUID != firebaseUID || providerSubject == "" {
 		return SecurityEvent{}, ErrAuthProofMismatch
-	}
-	var activeCount int
-	if err := tx.QueryRow(ctx, "SELECT count(*) FROM credentials WHERE human_id=$1 AND active", operation.HumanID).Scan(&activeCount); err != nil {
-		return SecurityEvent{}, err
-	}
-	// The immutable Firebase UID anchor counts as one method; unlink may only
-	// disable a provider method while at least one other active method remains.
-	if activeCount <= 1 {
-		return SecurityEvent{}, ErrLastLoginMethod
 	}
 	command, err := tx.Exec(ctx, `UPDATE credentials SET active=false, unlinked_at=now()
 		WHERE provider=$1 AND external_subject=$2 AND human_id=$3 AND active`,
@@ -310,9 +335,15 @@ func (s *Store) FailProviderOperation(ctx context.Context, operationID, nonce, t
 		return SecurityEvent{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	operation, err := scanProviderOperation(ctx, tx, operationID, nonce)
+	operation, err := scanProviderOperationForReconciliation(ctx, tx, operationID, nonce)
 	if err != nil {
 		return SecurityEvent{}, err
+	}
+	// Browser-owned link intents expire. Backend-owned unlinks remain durable
+	// until their remote state is known, so a same-nonce retry must also be able
+	// to terminalize an expired saga whose provider is still present.
+	if operation.Operation != "unlink" && !time.Now().UTC().Before(operation.ExpiresAt) {
+		return SecurityEvent{}, ErrAuthFlowExpired
 	}
 	eventType := "provider_" + operation.Operation + "_failed"
 	event, err := finishProviderOperation(ctx, tx, operation, eventType, terminalOutcome)
