@@ -1,11 +1,5 @@
-# sumi-studio
 
-Sumi は、1 人のユーザーと永続的な人格を持つエージェントが、同じチャットと
-作業空間で協働するためのアプリケーションです。React のブラウザ UI、Go の
-認証・リアルタイム API、Rust の PersonalityAgent runtime で構成されます。
-
-## Sumi
-
+# Sumi
 A shared workspace where people and their AI secretaries work together.
 
 ### Description
