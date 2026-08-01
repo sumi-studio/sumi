@@ -93,7 +93,8 @@ for (const legacyRoute of [
 
 const directChatPost = openApi.paths?.["/direct-chat/commands"]?.post;
 const idempotencyParameter = directChatPost?.parameters?.find(
-  (parameter) => parameter.in === "header" && parameter.name === "Idempotency-Key",
+  (parameter) =>
+    parameter.in === "header" && parameter.name === "Idempotency-Key",
 );
 if (
   !idempotencyParameter?.required ||
@@ -108,7 +109,8 @@ if (
   failed = true;
 }
 
-const directChatRequest = openApi.components?.schemas?.DirectChatUserMessageCommand;
+const directChatRequest =
+  openApi.components?.schemas?.DirectChatUserMessageCommand;
 if (
   directChatRequest?.type !== "object" ||
   directChatRequest?.additionalProperties !== false ||
@@ -116,7 +118,9 @@ if (
   directChatRequest?.properties?.text?.type !== "string" ||
   directChatRequest?.properties?.attachments?.maxItems !== 0
 ) {
-  console.error("Direct-chat HTTP admission must preserve the strict structured user-message command body.");
+  console.error(
+    "Direct-chat HTTP admission must preserve the strict structured user-message command body.",
+  );
   failed = true;
 }
 
@@ -205,16 +209,22 @@ const httpRejectionCases = [
 ];
 
 for (const { name, definition, valid, invalid } of httpRejectionCases) {
-  const validate = schemaOnlyAjv.compile(openApi.components.schemas[definition]);
+  const validate = schemaOnlyAjv.compile(
+    openApi.components.schemas[definition],
+  );
   for (const value of valid) {
     if (!validate(value)) {
-      console.error(`${name} rejected valid response: ${describeErrors(validate.errors)}`);
+      console.error(
+        `${name} rejected valid response: ${describeErrors(validate.errors)}`,
+      );
       failed = true;
     }
   }
   for (const value of invalid) {
     if (validate(value)) {
-      console.error(`${name} accepted invalid response: ${JSON.stringify(value)}`);
+      console.error(
+        `${name} accepted invalid response: ${JSON.stringify(value)}`,
+      );
       failed = true;
     }
   }
