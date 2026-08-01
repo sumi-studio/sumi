@@ -92,6 +92,19 @@ func TestMessagingRoutesFailClosedOnOriginAndSession(t *testing.T) {
 		t.Fatalf("missing origin: status %d, want 403", resp.StatusCode)
 	}
 
+	// Browsers may omit Origin on same-origin GET fetches; Fetch Metadata is
+	// the browser-controlled proof in that case.
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/messaging/bootstrap", nil)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("same-origin request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("same-origin fetch without session: status %d, want 401", resp.StatusCode)
+	}
+
 	// No cookie.
 	resp, _ = call(t, ts, http.MethodGet, "/messaging/bootstrap", "", nil)
 	if resp.StatusCode != http.StatusUnauthorized {
