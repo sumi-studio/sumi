@@ -12,6 +12,33 @@
 name: sumi-dev
 
 services:
+  firebase-auth:
+    build:
+      context: ../firebase
+    environment:
+      FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}
+      FIREBASE_AUTH_EXPORT_DIR: /var/lib/firebase/auth
+    ports:
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:9099:9099"
+    volumes:
+      - firebase-auth-data:/var/lib/firebase
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const net=require('node:net');
+          const socket=net.connect(9099,'127.0.0.1',()=>{socket.end();process.exit(0)});
+          socket.on('error',()=>process.exit(1));
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    restart: unless-stopped
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -101,6 +128,18 @@ services:
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi-command-log
       SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
       SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
+      SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?SUMI_BROWSER_SESSION_SECRET is required}
+      SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web:direct-chat}
+      SUMI_BROWSER_WS_ALLOWED_ORIGINS: ${SUMI_BROWSER_WS_ALLOWED_ORIGINS:?SUMI_BROWSER_WS_ALLOWED_ORIGINS is required}
+      SUMI_AUTH_FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:?SUMI_AUTH_FIREBASE_PROJECT_ID is required}
+      SUMI_AUTH_FIREBASE_TENANT_ID: ${SUMI_AUTH_FIREBASE_TENANT_ID:-}
+      SUMI_AUTH_TENANT_ID: ${SUMI_AUTH_TENANT_ID:-sumi-dev}
+      SUMI_AUTH_ALLOW_INSECURE_COOKIES: ${SUMI_AUTH_ALLOW_INSECURE_COOKIES:-true}
+      SUMI_AUTH_SESSION_TTL: ${SUMI_AUTH_SESSION_TTL:-1h}
+      # API-side traffic stays inside the Compose network. Browsers use the
+      # exact published host address configured on the web service below.
+      FIREBASE_AUTH_EMULATOR_HOST: firebase-auth:9099
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       SUMI_LOCAL_CONTROL_ENABLED: "1"
       SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
       SUMI_LOCAL_CONTROL_SOCKET_GID: "10001"
@@ -110,12 +149,11 @@ services:
       SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}
       SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
       SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
-      SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST: ${SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST:-}
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080:8080"
       # The web dev server shares this network namespace, so its port is also
       # exposed through the API service's port mappings.
-      - "127.0.0.1:5173:5173"
+      - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:5173:5173"
     volumes:
       - api-command-log:/var/lib/sumi-command-log
       - api-runtime-state:/var/lib/sumi-runtime-state
@@ -128,6 +166,8 @@ services:
         condition: service_completed_successfully
       api-state-init:
         condition: service_completed_successfully
+      firebase-auth:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
       postgres:
@@ -150,10 +190,15 @@ services:
     environment:
       VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
       VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
-      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-sumi-studio}
+      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+      VITE_FIREBASE_STORAGE_BUCKET: ${VITE_FIREBASE_STORAGE_BUCKET:-}
+      VITE_FIREBASE_MESSAGING_SENDER_ID: ${VITE_FIREBASE_MESSAGING_SENDER_ID:-}
       VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
-      VITE_FIREBASE_AUTH_EMULATOR_URL: ${VITE_FIREBASE_AUTH_EMULATOR_URL:-}
-      VITE_SUMI_API_ORIGIN: http://127.0.0.1:8080
+      VITE_FIREBASE_MEASUREMENT_ID: ${VITE_FIREBASE_MEASUREMENT_ID:-}
+      VITE_FIREBASE_AUTH_EMULATOR_URL: ${VITE_FIREBASE_AUTH_EMULATOR_URL:?VITE_FIREBASE_AUTH_EMULATOR_URL is required}
+      # Vite proxies browser /auth and /direct-chat requests over this private
+      # loopback path. The browser itself stays same-origin on port 5173.
+      SUMI_DEV_API_ORIGIN: http://127.0.0.1:8080
     # Ports are published through the api service because this container shares
     # the api network namespace.
     depends_on:
@@ -310,6 +355,7 @@ services:
         condition: service_completed_successfully
 
 volumes:
+  firebase-auth-data: {}
   sumi-postgres: {}
   api-command-log: {}
   api-runtime-state: {}
