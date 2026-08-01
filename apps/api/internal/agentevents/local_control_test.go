@@ -408,7 +408,7 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	store, gateway := openLocalControlTestGateway(t, runtimeDir)
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	newAuthorization := localControlAuthorization(localControlNextBearer, localControlTestPAID, 8, "boot-b")
-	_, server := newLocalControlHTTPServer(t, gateway, oldAuthorization, newAuthorization)
+	control, server := newLocalControlHTTPServer(t, gateway, oldAuthorization)
 
 	oldStartup := startupPublication("old-startup", localControlTestPAID, 7, "boot-a")
 	response, _ := postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, oldStartup)
@@ -424,6 +424,9 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	response, _ = postLocalControl(t, server.URL, LocalCredentialIssuePath, localControlTestBearer, oldCredential)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("old credential: got %d", response.StatusCode)
+	}
+	if err := control.InstallLocalRuntimeAuthorization(context.Background(), newAuthorization); err != nil {
+		t.Fatalf("install rollover authorization: %v", err)
 	}
 
 	newStartup := startupPublication("new-startup", localControlTestPAID, 8, "boot-b")
@@ -446,16 +449,16 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	}
 
 	response, _ = postLocalControl(t, server.URL, LocalCredentialIssuePath, localControlTestBearer, oldCredential)
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("old idempotent credential escaped stale-epoch fence: got %d", response.StatusCode)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old idempotent credential escaped authorization fence: got %d", response.StatusCode)
 	}
 	response, _ = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, oldReady)
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("old idempotent Ready escaped stale-epoch fence: got %d", response.StatusCode)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old idempotent Ready escaped authorization fence: got %d", response.StatusCode)
 	}
 	lateOldReady := readyPublication("late-old-ready", localControlTestPAID, 7, "boot-a", 3, "receipt-old")
 	response, _ = postLocalControl(t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer, lateOldReady)
-	if response.StatusCode != http.StatusConflict {
+	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("late old Ready was accepted: got %d", response.StatusCode)
 	}
 
@@ -476,7 +479,7 @@ func TestLocalControlRolloverAtomicallyFencesOldEpochAndSurvivesRestart(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, restartedServer := newLocalControlHTTPServer(t, restartedGateway, oldAuthorization, newAuthorization)
+	_, restartedServer := newLocalControlHTTPServer(t, restartedGateway, newAuthorization)
 	response, body = postLocalControl(
 		t,
 		restartedServer.URL,
@@ -556,23 +559,36 @@ func TestLocalControlDurableHistoryTamperingFailsClosed(t *testing.T) {
 	_, gateway := openLocalControlTestGateway(t, t.TempDir())
 	oldAuthorization := localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a")
 	newAuthorization := localControlAuthorization(localControlNextBearer, localControlTestPAID, 8, "boot-b")
-	_, server := newLocalControlHTTPServer(t, gateway, oldAuthorization, newAuthorization)
+	control, server := newLocalControlHTTPServer(t, gateway, oldAuthorization)
 
-	for _, step := range []struct {
+	steps := []struct {
 		bearer      string
 		path        string
 		publication any
 	}{
 		{localControlTestBearer, LocalRuntimeStatePublishPath, startupPublication("old-startup", localControlTestPAID, 7, "boot-a")},
 		{localControlTestBearer, LocalRuntimeStatePublishPath, readyPublication("old-ready", localControlTestPAID, 7, "boot-a", 1, "receipt-old")},
-		{localControlNextBearer, LocalRuntimeStatePublishPath, startupPublication("new-startup", localControlTestPAID, 8, "boot-b")},
-	} {
+	}
+	for _, step := range steps {
 		response, body := postLocalControl(t, server.URL, step.path, step.bearer, step.publication)
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("seed durable history: status=%d body=%s", response.StatusCode, body)
 		}
 	}
+	if err := control.InstallLocalRuntimeAuthorization(context.Background(), newAuthorization); err != nil {
+		t.Fatalf("install rollover authorization: %v", err)
+	}
 	response, body := postLocalControl(
+		t,
+		server.URL,
+		LocalRuntimeStatePublishPath,
+		localControlNextBearer,
+		startupPublication("new-startup", localControlTestPAID, 8, "boot-b"),
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("seed rollover history: status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = postLocalControl(
 		t,
 		server.URL,
 		LocalCredentialIssuePath,
