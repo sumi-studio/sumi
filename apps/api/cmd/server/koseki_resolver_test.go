@@ -33,7 +33,9 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	// First account: auto-registration mints a Human + Secretary.
-	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa"})
+	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{
+		UID: "firebase-uid-aaa", DisplayName: "  First\nHuman  ",
+	})
 	if err != nil {
 		t.Fatalf("resolve first identity: %v", err)
 	}
@@ -46,6 +48,9 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if first.UserID == first.PersonalityAgentID {
 		t.Fatal("HumanId and PersonalityAgentID must differ")
 	}
+	if got, err := store.HumanDisplayName(ctx, first.UserID); err != nil || got != "First Human" {
+		t.Fatalf("verified initial display name = %q, %v", got, err)
+	}
 	// Per-agent wrapping key is generated at registration.
 	firstKey, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID)
 	if err != nil {
@@ -56,12 +61,15 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	}
 
 	// Known credential resolves to the same HumanId and agent (no re-registration).
-	firstAgain, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa"})
+	firstAgain, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa", DisplayName: "Later Provider Name"})
 	if err != nil {
 		t.Fatalf("resolve known identity: %v", err)
 	}
 	if firstAgain.UserID != first.UserID || firstAgain.PersonalityAgentID != first.PersonalityAgentID {
 		t.Fatalf("known credential resolved differently: first=%+v again=%+v", first, firstAgain)
+	}
+	if got, _ := store.HumanDisplayName(ctx, first.UserID); got != "First Human" {
+		t.Fatalf("later provider name overwrote initial label: %q", got)
 	}
 
 	// Second account: a distinct Human + Secretary, auto-registered.

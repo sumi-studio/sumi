@@ -99,6 +99,75 @@ func TestNewUUIDv7FormatAndUniqueness(t *testing.T) {
 	}
 }
 
+func TestHumanDisplayNameValidationAndExplicitOverride(t *testing.T) {
+	if got, err := normalizeHumanDisplayName("  薄明色\nの忘れ路  "); err != nil || got != "薄明色 の忘れ路" {
+		t.Fatalf("normalized name = %q, %v", got, err)
+	}
+	if got, err := normalizeHumanDisplayName("家族\u200d👩"); err != nil || got != "家族\u200d👩" {
+		t.Fatalf("ZWJ name = %q, %v", got, err)
+	}
+	for _, invalid := range []string{"", "\u200d", "\ufe0f", "\u0301", "safe\u202edanger", strings.Repeat("名", MaxHumanDisplayNameRunes+1)} {
+		if _, err := normalizeHumanDisplayName(invalid); !errors.Is(err, ErrInvalidDisplayName) {
+			t.Fatalf("invalid name accepted: %q, %v", invalid, err)
+		}
+		if got := initialHumanDisplayName(invalid); got != "" {
+			t.Fatalf("invalid provider name persisted: %q => %q", invalid, got)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool := connectTestPool(t, ctx)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	registration, err := store.AutoRegister(ctx, "firebase", "display-name-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedHumanDisplayName(ctx, registration.HumanID, "  Initial Human  "); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.HumanDisplayName(ctx, registration.HumanID); got != "Sumi" {
+		t.Fatalf("new account without provider name was later synced: %q", got)
+	}
+	literal, err := store.AutoRegisterWithDisplayName(ctx, "firebase", "literal-sumi-owner", "Sumi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedHumanDisplayName(ctx, literal.HumanID, "Must Not Replace Literal Sumi"); err != nil {
+		t.Fatal(err)
+	}
+	var literalInitialized bool
+	if err := pool.QueryRow(ctx, "SELECT display_name_initialized FROM humans WHERE human_id=$1", literal.HumanID).Scan(&literalInitialized); err != nil || !literalInitialized {
+		t.Fatalf("literal Sumi initialization=%v err=%v", literalInitialized, err)
+	}
+
+	historical, err := store.AutoRegister(ctx, "firebase", "historical-display-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE humans SET display_name_initialized=false WHERE human_id=$1", historical.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "  Initial Human  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "Later Provider Name"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.HumanDisplayName(ctx, historical.HumanID); err != nil || got != "Initial Human" {
+		t.Fatalf("initial-only seed = %q, %v", got, err)
+	}
+	if got, err := store.UpdateHumanDisplayName(ctx, historical.HumanID, "Sumi"); err != nil || got != "Sumi" {
+		t.Fatalf("explicit literal sentinel = %q, %v", got, err)
+	}
+	if err := store.SeedHumanDisplayName(ctx, historical.HumanID, "Must Not Win"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.HumanDisplayName(ctx, historical.HumanID); got != "Sumi" {
+		t.Fatalf("provider overwrote explicit name: %q", got)
+	}
+}
+
 func connectTestPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
 	pool := testdb.Create(t)

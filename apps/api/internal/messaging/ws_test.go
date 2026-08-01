@@ -232,7 +232,7 @@ func TestWSSendReceiptAndFanOut(t *testing.T) {
 
 	if err := sender.WriteJSON(map[string]any{
 		"type": "send", "place_id": ch.PlaceID,
-		"content": "@Kuro WSからこんにちは", "client_nonce": "ws-nonce-1",
+		"content": "@Kuro（Yohaku） WSからこんにちは", "client_nonce": "ws-nonce-1",
 	}); err != nil {
 		t.Fatalf("write send: %v", err)
 	}
@@ -258,14 +258,14 @@ func TestWSSendReceiptAndFanOut(t *testing.T) {
 		t.Fatalf("event = %v", event)
 	}
 	msg := event["message"].(map[string]any)
-	if msg["content"] != "@Kuro WSからこんにちは" || len(msg["mentions"].([]any)) != 1 {
+	if msg["content"] != "@Kuro（Yohaku） WSからこんにちは" || len(msg["mentions"].([]any)) != 1 {
 		t.Fatalf("message = %v", msg)
 	}
 
 	// A retry gets the original receipt and no second fan-out.
 	if err := sender.WriteJSON(map[string]any{
 		"type": "send", "place_id": ch.PlaceID,
-		"content": "@Kuro WSからこんにちは", "client_nonce": "ws-nonce-1",
+		"content": "@Kuro（Yohaku） WSからこんにちは", "client_nonce": "ws-nonce-1",
 	}); err != nil {
 		t.Fatalf("write retry: %v", err)
 	}

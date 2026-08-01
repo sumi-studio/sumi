@@ -135,11 +135,11 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	if self["kind"] != "human" || self["human_id"] != w.humanA.ID {
 		t.Fatalf("self = %v", self)
 	}
-	if n := len(body["workspaces"].([]any)); n != 1 {
-		t.Fatalf("workspaces = %d, want 1", n)
+	if n := len(body["workspaces"].([]any)); n != 2 {
+		t.Fatalf("workspaces = %d, want default plus explicit workspace", n)
 	}
-	if n := len(body["channels"].([]any)); n != 1 {
-		t.Fatalf("channels = %d, want 1", n)
+	if n := len(body["channels"].([]any)); n != 2 {
+		t.Fatalf("channels = %d, want default plus explicit channel", n)
 	}
 	dms := body["dms"].([]any)
 	if len(dms) != 1 || len(dms[0].(map[string]any)["participants"].([]any)) != 2 {
@@ -151,7 +151,7 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	for _, m := range members {
 		names[m.(map[string]any)["display_name"].(string)] = true
 	}
-	if !names["Yohaku"] || !names["Haru"] || !names["Kuro"] {
+	if !names["Yohaku"] || !names["Haru"] || !names["Kuro（Yohaku）"] {
 		t.Fatalf("members missing display names: %v", members)
 	}
 	// The channel has one unread mention for the viewer.
@@ -178,7 +178,7 @@ func TestSendIsIdempotentAcrossRetriesOverHTTP(t *testing.T) {
 	_, ch := w.workspaceWithChannel(t, ctx)
 
 	path := "/messaging/places/" + ch.PlaceID + "/messages"
-	send := map[string]any{"content": "@Kuro 様子どう？", "client_nonce": "nonce-1", "urgency": "urgent"}
+	send := map[string]any{"content": "@Kuro（Yohaku） 様子どう？", "client_nonce": "nonce-1", "urgency": "urgent"}
 	resp, body := call(t, ts, http.MethodPost, path, w.humanA.ID, send)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("send: status %d body %v", resp.StatusCode, body)

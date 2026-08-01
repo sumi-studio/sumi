@@ -289,7 +289,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			}
 			memberSet[key] = memberWire{
 				Participant: participantToWire(p.Participant),
-				DisplayName: p.DisplayName,
+				DisplayName: p.ProjectedDisplayName(),
 			}
 			memberOrder = append(memberOrder, key)
 		}
@@ -481,7 +481,7 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.DisplayName}
+		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`

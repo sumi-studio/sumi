@@ -160,9 +160,21 @@ type Place struct {
 // MemberProfile is a participant with their scope-resolved display name.
 // IDs are never used as display names (ADR 0008 §1).
 type MemberProfile struct {
-	Participant ParticipantRef
-	DisplayName string
-	Role        string // workspace role; empty for dm/group_dm members
+	Participant             ParticipantRef
+	DisplayName             string
+	SecretaryForDisplayName string
+	Role                    string // workspace role; empty for dm/group_dm members
+}
+
+// ProjectedDisplayName is the temporary v1 wire compromise for multiple
+// Secretaries canonically named Sumi. The composite is presentation only: the
+// agent registry continues to store "Sumi", while its stable Human relation
+// supplies the qualifier.
+func (m MemberProfile) ProjectedDisplayName() string {
+	if m.Participant.Kind == KindPersonalityAgent && m.SecretaryForDisplayName != "" {
+		return m.DisplayName + "（" + m.SecretaryForDisplayName + "）"
+	}
+	return m.DisplayName
 }
 
 // CreateWorkspace mints a workspace and enrolls the creator as owner.
@@ -556,10 +568,13 @@ func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]Me
 	}
 	rows, err := q.Query(ctx,
 		`SELECT pm.member_kind, pm.member_id, '' AS role,
-		        COALESCE(h.display_name, a.display_name, '') AS display_name
+		        COALESCE(h.display_name, a.display_name, '') AS display_name,
+		        CASE WHEN pm.member_kind='personality_agent'
+		             THEN COALESCE(owner.display_name, '') ELSE '' END
 		 FROM place_members pm
 		 LEFT JOIN humans h ON pm.member_kind = 'human' AND h.human_id = pm.member_id
 		 LEFT JOIN agents a ON pm.member_kind = 'personality_agent' AND a.personality_agent_id = pm.member_id
+		 LEFT JOIN humans owner ON owner.human_id = a.human_id
 		 WHERE pm.place_id = $1 AND pm.left_at IS NULL
 		 ORDER BY pm.place_member_id`, place.PlaceID)
 	if err != nil {
@@ -571,10 +586,13 @@ func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]Me
 func (s *Store) workspaceMemberProfiles(ctx context.Context, q querier, workspaceID string) ([]MemberProfile, error) {
 	rows, err := q.Query(ctx,
 		`SELECT wm.member_kind, wm.member_id, wm.role,
-		        COALESCE(h.display_name, a.display_name, '') AS display_name
+		        COALESCE(h.display_name, a.display_name, '') AS display_name,
+		        CASE WHEN wm.member_kind='personality_agent'
+		             THEN COALESCE(owner.display_name, '') ELSE '' END
 		 FROM workspace_members wm
 		 LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
 		 LEFT JOIN agents a ON wm.member_kind = 'personality_agent' AND a.personality_agent_id = wm.member_id
+		 LEFT JOIN humans owner ON owner.human_id = a.human_id
 		 WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
 		 ORDER BY wm.workspace_member_id`, workspaceID)
 	if err != nil {
@@ -589,7 +607,7 @@ func scanMemberProfiles(rows pgx.Rows) ([]MemberProfile, error) {
 	for rows.Next() {
 		var m MemberProfile
 		var kind string
-		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName); err != nil {
+		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName, &m.SecretaryForDisplayName); err != nil {
 			return nil, fmt.Errorf("scan member: %w", err)
 		}
 		m.Participant.Kind = ParticipantKind(kind)

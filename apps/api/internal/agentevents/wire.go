@@ -836,6 +836,15 @@ func unmarshalStrict(data []byte, v any) error {
 	return nil
 }
 
+// DecodeStrictJSON applies the shared browser/API JSON boundary: duplicate
+// object keys, unknown fields, and trailing values are all rejected.
+func DecodeStrictJSON(data []byte, value any) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return err
+	}
+	return unmarshalStrict(data, value)
+}
+
 // checkDuplicateKeys walks the JSON value and returns an error if any object
 // contains duplicate keys. It does not validate values.
 func checkDuplicateKeys(data []byte) error {

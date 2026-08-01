@@ -345,6 +345,12 @@ type Registration struct {
 // use ResolveCredential + AgentForHuman instead; AutoRegister does not check for
 // an existing binding (the unique constraint would reject a duplicate).
 func (s *Store) AutoRegister(ctx context.Context, provider, externalSubject string) (Registration, error) {
+	return s.AutoRegisterWithDisplayName(ctx, provider, externalSubject, "")
+}
+
+// AutoRegisterWithDisplayName is AutoRegister with optional server-verified
+// provider profile metadata used only as the Human's initial label.
+func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, externalSubject, rawDisplayName string) (Registration, error) {
 	wrappingKeyID, err := validateWrappingKeyID(s.wrappingKeyID)
 	if err != nil {
 		return Registration{}, fmt.Errorf("configured wrapping key ID: %w", err)
@@ -360,8 +366,9 @@ func (s *Store) AutoRegister(ctx context.Context, provider, externalSubject stri
 		return Registration{}, fmt.Errorf("begin auto-register: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx,
-		"INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+	displayName := initialHumanDisplayName(rawDisplayName)
+	if _, err := tx.Exec(ctx, `INSERT INTO humans (human_id, display_name)
+		VALUES ($1, COALESCE(NULLIF($2, ''), 'Sumi'))`, humanID, displayName); err != nil {
 		return Registration{}, fmt.Errorf("insert human: %w", err)
 	}
 	if _, err := tx.Exec(ctx,

@@ -61,6 +61,15 @@ type fakeBindingResolver struct {
 	calls  int
 }
 
+type fakeHumanProfileReader struct {
+	name string
+	err  error
+}
+
+func (f fakeHumanProfileReader) HumanDisplayName(context.Context, string) (string, error) {
+	return f.name, f.err
+}
+
 type fakeBrowserConnectionCloser struct {
 	sessionIDs []string
 }
@@ -139,6 +148,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
+	server.Profiles = fakeHumanProfileReader{name: "Canonical Human"}
 	csrf, csrfCookie := obtainCSRF(t, server)
 
 	req := httptest.NewRequest(
@@ -192,7 +202,8 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 		Authenticated      bool   `json:"authenticated"`
 		AuthorityBindingID string `json:"authority_binding_id"`
 		User               struct {
-			ID string `json:"id"`
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
 		} `json:"user"`
 	}
 	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &status); err != nil {
@@ -200,6 +211,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	}
 	if !status.Authenticated ||
 		status.User.ID != "user-1" ||
+		status.User.DisplayName != "Canonical Human" ||
 		status.AuthorityBindingID != claims.authorityBindingID ||
 		!validBrowserAuthorityBindingID(status.AuthorityBindingID) {
 		t.Fatalf("unexpected session status: %+v", status)

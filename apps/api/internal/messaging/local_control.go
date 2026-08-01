@@ -106,7 +106,7 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	}
 	members := make([]memberWire, len(profiles))
 	for i, profile := range profiles {
-		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.DisplayName}
+		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place       placeWire     `json:"place"`
