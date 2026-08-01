@@ -7,6 +7,7 @@
   - [ADR 0010](0010-attention-triggers-and-warmth.md)
 - Related:
   - [ADR 0009](0009-human-koseki-and-multi-user-auth.md)
+  - [メッセージング接続契約（凍結 v1）](../messaging-boundary-contract.md)
   - [メッセージング契約ドラフト](../messaging-contracts-draft.md)
   - [#87](https://github.com/sumi-studio/sumi/issues/87)
 

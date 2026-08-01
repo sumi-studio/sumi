@@ -169,7 +169,8 @@
 ## agent側の契約（AX）
 
 > 正本は [ADR 0011](adr/0011-messaging-surface-and-agent-participation.md)。
-> 本節はその要約であり、齟齬があれば ADR に従う。
+> 本節はその要約であり、齟齬があれば ADR に従う。境界に流れるものの確定形は
+> [メッセージング接続契約（凍結 v1）](messaging-boundary-contract.md)。
 
 人間UIと**同じ能力（agency）を持てる**ことが要件。ただし揃えるのは能力であって
 身体動作や内部transportの操作数ではない（ADR 0011 §5）。できるだけ同じ形にし、
