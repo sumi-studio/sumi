@@ -1,0 +1,279 @@
+# Local full-stack compose: Postgres + Go API + Vite web + containerized agent
+# (runtime/executor/broker) in one command.
+#
+# Usage:
+#   scripts/dev/compose-stack up
+#   scripts/dev/compose-stack down
+#
+# The web and agent runtime share the API's network namespace so they can reach
+# the loopback public and local-control endpoints. The executor and broker are
+# network_mode=none sidecars and communicate over private IPC volumes.
+
+name: sumi-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sumi
+      POSTGRES_PASSWORD: sumi-dev
+      POSTGRES_DB: sumi
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - sumi-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumi -d sumi"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: "no"
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/api/Dockerfile
+    command: ["/usr/local/bin/sumi-migrate"]
+    environment:
+      SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Prepare the local-control socket parent with the exact ownership and mode
+  # the API and runtime expect (uid 65532, gid 10001, mode 0o750).
+  local-control-init:
+    build:
+      context: ../..
+      dockerfile: deploy/api/Dockerfile
+    user: "0:0"
+    command: ["/busybox/sh", "-c", "install -d -m 0750 -o 65532 -g 10001 /run/sumi/local-control"]
+    cap_add: [CHOWN, FOWNER]
+    volumes:
+      - local-control:/run/sumi/local-control
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/api/Dockerfile
+    user: "65532:10001"
+    group_add:
+      - "10001"
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    environment:
+      SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
+      SUMI_PUBLIC_LISTEN: 127.0.0.1:8080
+      SUMI_LOCAL_CONTROL_ENABLED: "1"
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
+      SUMI_LOCAL_CONTROL_SOCKET_GID: "10001"
+      SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
+      SUMI_LOCAL_CONTROL_BEARER: ${SUMI_LOCAL_CONTROL_BEARER:?SUMI_LOCAL_CONTROL_BEARER is required}
+      SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}
+      SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      SUMI_AUTH_FIREBASE_PROJECT_ID: ${SUMI_AUTH_FIREBASE_PROJECT_ID:-}
+      SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST: ${SUMI_AUTH_FIREBASE_AUTH_EMULATOR_HOST:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - local-control:/run/sumi/local-control
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      local-control-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/busybox/wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    restart: "no"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/web/Dockerfile
+    # Share the API's network namespace so the web dev server can use the
+    # loopback public server (127.0.0.1:8080) without exposing the API off-host.
+    network_mode: service:api
+    environment:
+      VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+      VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+      VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+      VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
+      VITE_FIREBASE_AUTH_EMULATOR_URL: ${VITE_FIREBASE_AUTH_EMULATOR_URL:-}
+      VITE_SUMI_API_ORIGIN: http://127.0.0.1:8080
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+
+  # The allocator is the only service that can mutate the generation ledger.
+  # It distributes role-minimal identity.env files atomically and exits.
+  agent-allocator:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [allocator]
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    environment:
+      SUMI_PERSONALITY_AGENT_ID: ${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required}
+      SUMI_ALLOCATOR_TRUST_ROOT: /var/lib/sumi-allocator-root
+      SUMI_ALLOCATOR_STATE_DIR: /var/lib/sumi-allocator-root/state
+      SUMI_IDENTITY_OUTPUT_ROOT: /var/lib/sumi-allocator-root/identity-output
+      SUMI_RUNTIME_IDENTITY_GID: "10001"
+      SUMI_EXECUTOR_IDENTITY_GID: "10002"
+      SUMI_BROKER_IDENTITY_GID: "10003"
+    volumes:
+      - agent-allocator-state:/var/lib/sumi-allocator-root/state
+      - agent-runtime-identity:/var/lib/sumi-allocator-root/identity-output/runtime
+      - agent-executor-identity:/var/lib/sumi-allocator-root/identity-output/executor
+      - agent-broker-identity:/var/lib/sumi-allocator-root/identity-output/broker
+
+  agent-prepare:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [prepare]
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, FSETID]
+    volumes:
+      - agent-state:/var/lib/sumi
+      - agent-workspace:/workspace
+      - agent-artifacts:/var/lib/sumi-artifacts
+      - agent-executor-ipc:/run/sumi/executor
+      - agent-broker-ipc:/run/sumi/broker
+    depends_on:
+      agent-allocator:
+        condition: service_completed_successfully
+
+  agent-runtime:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10001:10001"
+    group_add:
+      - "10020"
+    command: [runtime]
+    # Share the API's network namespace so the loopback gateway and the
+    # local-control Unix socket in the shared volume are reachable.
+    network_mode: service:api
+    environment:
+      SUMI_WORKSPACE: /workspace
+      SUMI_EXECUTOR_SOCKET: /run/sumi/executor/executor.sock
+      SUMI_GATEWAY_URL: ws://127.0.0.1:8080/agent/ws
+      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: "true"
+      SUMI_LOCAL_CONTROL_UNIX_SOCKET: /run/sumi/local-control/control.sock
+      SUMI_LOCAL_CONTROL_SERVER_UID: "65532"
+      SUMI_LOCAL_CONTROL_SOCKET_GID: "10001"
+      SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: ${SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX:-4102444800}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      SUMI_LOG: ${SUMI_LOG:-sumi_agent=info}
+    secrets:
+      - source: sumi_local_control_bearer
+        target: sumi_local_control_bearer
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_agent_wrapping_key
+        target: sumi_agent_wrapping_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_approval_secret_digest_key
+        target: sumi_approval_secret_digest_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+      - source: sumi_provider_api_key
+        target: sumi_provider_api_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0o400
+    volumes:
+      - local-control:/run/sumi/local-control:ro
+      - agent-state:/var/lib/sumi
+      - agent-runtime-identity:/run/sumi/identity:ro
+      - agent-executor-ipc:/run/sumi/executor:ro
+    depends_on:
+      agent-allocator:
+        condition: service_completed_successfully
+      agent-prepare:
+        condition: service_completed_successfully
+      agent-executor:
+        condition: service_started
+      api:
+        condition: service_healthy
+
+  agent-executor:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10002:10002"
+    command: [executor]
+    network_mode: none
+    cap_drop: [ALL]
+    volumes:
+      - agent-workspace:/workspace:ro
+      - agent-executor-identity:/run/sumi/identity:ro
+      - agent-executor-ipc:/run/sumi/executor
+    depends_on:
+      agent-allocator:
+        condition: service_completed_successfully
+      agent-prepare:
+        condition: service_completed_successfully
+
+  agent-broker:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10003:10003"
+    command: [broker]
+    network_mode: none
+    cap_drop: [ALL]
+    volumes:
+      - agent-artifacts:/var/lib/sumi-artifacts
+      - agent-broker-identity:/run/sumi/identity:ro
+      - agent-broker-ipc:/run/sumi/broker
+    depends_on:
+      agent-allocator:
+        condition: service_completed_successfully
+      agent-prepare:
+        condition: service_completed_successfully
+
+volumes:
+  sumi-postgres: {}
+  local-control: {}
+  agent-allocator-state: {}
+  agent-state: {}
+  agent-workspace: {}
+  agent-artifacts: {}
+  agent-runtime-identity: {}
+  agent-executor-identity: {}
+  agent-broker-identity: {}
+  agent-executor-ipc: {}
+  agent-broker-ipc: {}
+
+secrets:
+  sumi_local_control_bearer:
+    environment: SUMI_LOCAL_CONTROL_BEARER
+  sumi_agent_wrapping_key:
+    environment: SUMI_AGENT_WRAPPING_KEY
+  sumi_approval_secret_digest_key:
+    environment: SUMI_APPROVAL_SECRET_DIGEST_KEY
+  sumi_provider_api_key:
+    environment: SUMI_PROVIDER_API_KEY
