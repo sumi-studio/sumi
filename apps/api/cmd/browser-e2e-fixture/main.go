@@ -62,7 +62,7 @@ func main() {
 	// Use the same production router as cmd/server so the E2E journey exercises
 	// production wiring. We do not expose the agent WebSocket boundary in this
 	// fixture; nil TokenVerifier makes it fail-closed.
-	mux, browser, _, err := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"})
+	mux, browser, _, err := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

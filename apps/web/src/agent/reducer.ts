@@ -258,6 +258,17 @@ function applyMessage(
             timestamp: message.timestamp,
           });
   }
+  if (complete && message.stop_reason === "error") {
+    const detail = message.error_message?.trim() || "Provider request failed";
+    const providerCode = message.provider_code?.trim();
+    conversation = upsertEntry(conversation, {
+      kind: "error",
+      id: `message-error:${messageId}`,
+      runId,
+      message: providerCode ? `${detail} (${providerCode})` : detail,
+      retryable: false,
+    });
+  }
 
   for (const content of message.content) {
     if (content.type === "tool_call") {

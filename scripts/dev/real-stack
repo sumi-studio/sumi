@@ -258,10 +258,8 @@ validate_configuration() {
     fail "SUMI_AUTH_PERSONALITY_AGENT_ID must equal SUMI_PERSONALITY_AGENT_ID"
 
   for name in \
-    SUMI_AUTH_FIREBASE_UID \
     SUMI_AUTH_FIREBASE_PROJECT_ID \
     SUMI_AUTH_TENANT_ID \
-    SUMI_AUTH_USER_ID \
     SUMI_MODEL_PRESET \
     SUMI_MODEL_API_KEY_ENV
   do
@@ -269,10 +267,18 @@ validate_configuration() {
   done
   valid_binding_id "${SUMI_AUTH_TENANT_ID}" ||
     fail "SUMI_AUTH_TENANT_ID is not a valid Sumi binding ID"
-  valid_binding_id "${SUMI_AUTH_USER_ID}" ||
-    fail "SUMI_AUTH_USER_ID is not a valid Sumi binding ID"
-  ((${#SUMI_AUTH_FIREBASE_UID} <= 128)) ||
-    fail "SUMI_AUTH_FIREBASE_UID exceeds 128 bytes"
+  # SUMI_AUTH_FIREBASE_UID and SUMI_AUTH_USER_ID were the single-user binding
+  # contract (ADR 0009 §8). They are now optional: the 戸籍-backed resolver
+  # auto-registers any verified Firebase identity. When set, they are still
+  # validated for the legacy static-binding fallback.
+  if [[ -n "${SUMI_AUTH_USER_ID:-}" ]]; then
+    valid_binding_id "${SUMI_AUTH_USER_ID}" ||
+      fail "SUMI_AUTH_USER_ID is not a valid Sumi binding ID"
+  fi
+  if [[ -n "${SUMI_AUTH_FIREBASE_UID:-}" ]]; then
+    ((${#SUMI_AUTH_FIREBASE_UID} <= 128)) ||
+      fail "SUMI_AUTH_FIREBASE_UID exceeds 128 bytes"
+  fi
   if [[ -n "${SUMI_AUTH_FIREBASE_TENANT_ID:-}" ]]; then
     ((${#SUMI_AUTH_FIREBASE_TENANT_ID} <= 128)) ||
       fail "SUMI_AUTH_FIREBASE_TENANT_ID exceeds 128 bytes"

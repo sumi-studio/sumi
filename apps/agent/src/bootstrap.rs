@@ -66,6 +66,7 @@ struct BootstrapContext {
     authority: RuntimeEpochAuthority,
     state_dir: PathBuf,
     executor_socket: PathBuf,
+    executor_server_uid: u32,
     gateway_url: String,
     allow_insecure_loopback_gateway: bool,
     local_control_endpoint: LocalControlEndpoint,
@@ -105,6 +106,12 @@ impl BootstrapContext {
 
         let state_dir = required_absolute_path(&mut get, "SUMI_STATE_DIR")?;
         let executor_socket = required_absolute_path(&mut get, "SUMI_EXECUTOR_SOCKET")?;
+        let executor_server_uid = required_value(&mut get, "SUMI_EXECUTOR_SERVER_UID")?
+            .parse::<u32>()
+            .context("SUMI_EXECUTOR_SERVER_UID must be a decimal UID")?;
+        if executor_server_uid == 0 {
+            bail!("SUMI_EXECUTOR_SERVER_UID must identify a non-root listener");
+        }
         let gateway_url = required_value(&mut get, "SUMI_GATEWAY_URL")?;
         let local_control_endpoint = local_control_endpoint_from_env(&mut get)?;
         let local_control_bearer = required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER")?;
@@ -132,6 +139,7 @@ impl BootstrapContext {
             authority: allocation.into_authority(),
             state_dir,
             executor_socket,
+            executor_server_uid,
             gateway_url,
             allow_insecure_loopback_gateway,
             local_control_endpoint,
@@ -760,9 +768,13 @@ fn unexpected_session_result(report: SessionTerminationReport) -> Result<()> {
 }
 
 /// Validate a UDS parent with the same trust properties as executor-owned IPC:
-/// normalized absolute path, no symlinked directory component, current-uid
-/// ownership, owner write/execute, and no group/other write access.
-fn validate_trusted_ipc_socket_parent(path: &Path, label: &'static str) -> Result<()> {
+/// normalized absolute path, no symlinked directory component, exact listener
+/// UID ownership, owner write/execute, and no group/other write access.
+fn validate_trusted_ipc_socket_parent(
+    path: &Path,
+    label: &'static str,
+    expected_listener_uid: u32,
+) -> Result<()> {
     use std::path::Component;
 
     let parent = path
@@ -801,7 +813,7 @@ fn validate_trusted_ipc_socket_parent(path: &Path, label: &'static str) -> Resul
     let pathname = std::fs::symlink_metadata(parent)
         .with_context(|| format!("restat trusted {label} socket parent {}", parent.display()))?;
     if !descriptor.file_type().is_dir()
-        || descriptor.uid() != unsafe { libc::geteuid() }
+        || descriptor.uid() != expected_listener_uid
         || descriptor.nlink() == 0
         || descriptor.mode() & 0o300 != 0o300
         || descriptor.mode() & 0o022 != 0
@@ -938,7 +950,11 @@ async fn run_after_not_ready(
     let mut signal = install_shutdown_signal().context("install shutdown signal handlers")?;
     let shutdown = CancellationToken::new();
     let preparation = async {
-        validate_trusted_ipc_socket_parent(&context.executor_socket, "executor")?;
+        validate_trusted_ipc_socket_parent(
+            &context.executor_socket,
+            "executor",
+            context.executor_server_uid,
+        )?;
         let config = Config::load().await.context("load production config")?;
         if config.personality_agent_id != *context.authority.personality_agent_id() {
             bail!("config PAID does not match the supervisor runtime allocation");
@@ -1032,7 +1048,10 @@ async fn run_after_not_ready(
                 mode = "production-like-local-loopback",
                 "plaintext WebSocket gateway mode is explicitly enabled"
             );
-            WebSocketConnector::new_loopback_insecure(&context.gateway_url, command_digest_factory)?
+            WebSocketConnector::new_local_control_plane_insecure(
+                &context.gateway_url,
+                command_digest_factory,
+            )?
         } else {
             let connector = WebSocketConnector::new(&context.gateway_url, command_digest_factory);
             connector.validate_configuration()?;
@@ -2064,6 +2083,7 @@ mod tests {
                 "SUMI_EXECUTOR_SOCKET".to_owned(),
                 "/tmp/sumi-executor.sock".into(),
             ),
+            ("SUMI_EXECUTOR_SERVER_UID".to_owned(), "10002".into()),
             (
                 "SUMI_GATEWAY_URL".to_owned(),
                 "wss://gateway.example.test/agent".into(),
@@ -2628,13 +2648,14 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("restrict isolated socket parent");
         let socket = root.join("executor.sock");
-        validate_trusted_ipc_socket_parent(&socket, "executor")
+        let listener_uid = unsafe { libc::geteuid() };
+        validate_trusted_ipc_socket_parent(&socket, "executor", listener_uid)
             .expect("uid-owned non-peer-writable parent");
 
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770))
             .expect("make fixture peer-writable");
         assert!(
-            validate_trusted_ipc_socket_parent(&socket, "executor")
+            validate_trusted_ipc_socket_parent(&socket, "executor", listener_uid)
                 .unwrap_err()
                 .to_string()
                 .contains("non-peer-writable")

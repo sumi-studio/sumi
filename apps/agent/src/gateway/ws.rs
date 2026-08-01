@@ -71,6 +71,22 @@ impl WebSocketConnector {
         })
     }
 
+    /// Create the explicit local Compose connector. In addition to literal
+    /// loopback, this accepts only the fixed internal bridge alias used by the
+    /// provisioned runtime descriptor.
+    pub fn new_local_control_plane_insecure(
+        url: impl Into<String>,
+        digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    ) -> Result<Self> {
+        let url = url.into();
+        validate_local_control_plane_insecure_url(&url)?;
+        Ok(Self {
+            url,
+            digest_factory,
+            allow_insecure: true,
+        })
+    }
+
     /// Compatibility helper for unit fixtures. Production-like local callers
     /// use the fallible constructor above and must handle invalid URLs.
     #[cfg(test)]
@@ -162,7 +178,7 @@ fn validate_connector_url(value: &str, allow_insecure: bool) -> Result<()> {
     let url = reqwest::Url::parse(value).context("invalid websocket URL")?;
     match scheme.to_ascii_lowercase().as_str() {
         "wss" => {}
-        "ws" if allow_insecure => validate_loopback_insecure_url(value)?,
+        "ws" if allow_insecure => validate_local_control_plane_insecure_url(value)?,
         "ws" => bail!("refusing to send bearer credential over insecure ws://"),
         scheme => bail!("unsupported websocket scheme: {scheme}"),
     }
@@ -189,6 +205,26 @@ fn validate_loopback_insecure_url(value: &str) -> Result<()> {
         bail!("local WebSocket URL must not contain credentials or a fragment");
     }
     Ok(())
+}
+
+fn validate_local_control_plane_insecure_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("invalid local WebSocket URL")?;
+    if url.host_str() == Some("sumi-agent-gateway") {
+        if url.scheme() != "ws"
+            || url.port_or_known_default() != Some(8080)
+            || url.path() != "/agent/ws"
+            || url.query().is_some()
+        {
+            bail!(
+                "local control-plane WebSocket URL must be ws://sumi-agent-gateway:8080/agent/ws"
+            );
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            bail!("local WebSocket URL must not contain credentials or a fragment");
+        }
+        return Ok(());
+    }
+    validate_loopback_insecure_url(value)
 }
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
@@ -475,6 +511,30 @@ mod tests {
                 WebSocketConnector::new_loopback_insecure(url, Arc::new(TestDigestFactory))
                     .is_err(),
                 "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_control_plane_mode_accepts_only_the_fixed_internal_alias() {
+        assert!(
+            WebSocketConnector::new_local_control_plane_insecure(
+                "ws://sumi-agent-gateway:8080/agent/ws",
+                Arc::new(TestDigestFactory),
+            )
+            .is_ok()
+        );
+        for url in [
+            "ws://sumi-agent-gateway:8081/agent/ws",
+            "ws://other-service:8080/agent/ws",
+            "ws://sumi-agent-gateway:8080/other",
+        ] {
+            assert!(
+                WebSocketConnector::new_local_control_plane_insecure(
+                    url,
+                    Arc::new(TestDigestFactory),
+                )
+                .is_err()
             );
         }
     }

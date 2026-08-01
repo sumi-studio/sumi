@@ -22,7 +22,7 @@ func authFlowStore(t *testing.T) (*Store, context.Context) {
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return New(pool), ctx
+	return NewWithWrappingKeyID(pool, "test-wrapping/v1"), ctx
 }
 
 func testNonce(t *testing.T) string {

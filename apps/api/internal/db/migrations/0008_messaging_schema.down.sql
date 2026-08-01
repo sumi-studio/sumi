@@ -1,3 +1,4 @@
+-- 0008_messaging_schema rollback.
 DROP TABLE read_markers;
 DROP TABLE message_mentions;
 DROP TABLE messages;

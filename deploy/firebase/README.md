@@ -9,8 +9,13 @@ Start it for the Tailnet development host:
 ```sh
 FIREBASE_AUTH_EMULATOR_BIND_HOST=100.116.25.99 \
   FIREBASE_PROJECT_ID=sumi-studio \
-  docker compose -f deploy/firebase/compose.yaml up -d --build
+  docker compose -f deploy/firebase/compose.yaml up -d
 ```
+
+Compose pulls `ghcr.io/sumi-studio/sumi-firebase:latest` on every start. Set
+`SUMI_FIREBASE_IMAGE_TAG` to a Jenkins-published short commit SHA to pin a
+specific image. Authenticate with `docker login ghcr.io` first when the package
+is private.
 
 The bind host is deliberately an exact IP address. It defaults to `127.0.0.1`
 for local-only use; use the WSL host's Tailnet IP for team access. It is the

@@ -2,12 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AuthAPIError,
   authRequestTimeoutMilliseconds,
-  establishSumiSession,
-  exchangeFirebaseIDToken,
   getSumiSession,
   logoutSumiSession,
+  postAuthJSON,
   SumiSessionCompensatedError,
   SumiSessionCompensationFailedError,
+  verifyCommittedSumiSession,
 } from "./session-client";
 
 const authorityBindingA = "A".repeat(43);
@@ -18,7 +18,7 @@ afterEach(() => {
 });
 
 describe("Sumi browser session client", () => {
-  it("exchanges a Firebase ID token only after obtaining CSRF", async () => {
+  it("posts auth JSON only after obtaining CSRF", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -27,10 +27,14 @@ describe("Sumi browser session client", () => {
           headers: { "Content-Type": "application/json" },
         }),
       )
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ outcome: "proof_required" }), {
+          status: 201,
+        }),
+      );
     vi.stubGlobal("fetch", fetchMock);
 
-    await exchangeFirebaseIDToken("firebase-id-token");
+    await postAuthJSON("/auth/flows", { intent: "sign_in" });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0]).toEqual([
@@ -38,12 +42,12 @@ describe("Sumi browser session client", () => {
       expect.objectContaining({ credentials: "include", cache: "no-store" }),
     ]);
     expect(fetchMock.mock.calls[1]).toEqual([
-      "/auth/session",
+      "/auth/flows",
       expect.objectContaining({
         method: "POST",
         credentials: "include",
         cache: "no-store",
-        body: JSON.stringify({ id_token: "firebase-id-token" }),
+        body: JSON.stringify({ intent: "sign_in" }),
         headers: expect.objectContaining({
           "Content-Type": "application/json",
           "X-CSRF-Token": "c".repeat(43),
@@ -100,15 +104,9 @@ describe("Sumi browser session client", () => {
     await expect(getSumiSession()).rejects.toBeInstanceOf(AuthAPIError);
   });
 
-  it("compensates a committed exchange before surfacing status failure", async () => {
+  it("compensates a committed terminal flow before surfacing status failure", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ csrf_token: "e".repeat(43) }), {
-          status: 200,
-        }),
-      )
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ error: "status unavailable" }), {
           status: 503,
@@ -122,7 +120,7 @@ describe("Sumi browser session client", () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const failure = await establishSumiSession("firebase-id-token").catch(
+    const failure = await verifyCommittedSumiSession().catch(
       (error: unknown) => error,
     );
     expect(failure).toBeInstanceOf(SumiSessionCompensatedError);
@@ -130,10 +128,8 @@ describe("Sumi browser session client", () => {
       status: 503,
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/auth/csrf",
-      "/auth/session",
       "/auth/session",
       "/auth/csrf",
       "/auth/logout",
@@ -143,12 +139,6 @@ describe("Sumi browser session client", () => {
   it("surfaces an explicit fail-closed error when compensation cannot complete", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ csrf_token: "g".repeat(43) }), {
-          status: 200,
-        }),
-      )
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(new Response("invalid status", { status: 200 }))
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ csrf_token: "h".repeat(43) }), {
@@ -162,12 +152,10 @@ describe("Sumi browser session client", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(
-      establishSumiSession("firebase-id-token"),
-    ).rejects.toBeInstanceOf(SumiSessionCompensationFailedError);
+    await expect(verifyCommittedSumiSession()).rejects.toBeInstanceOf(
+      SumiSessionCompensationFailedError,
+    );
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/auth/csrf",
-      "/auth/session",
       "/auth/session",
       "/auth/csrf",
       "/auth/logout",
@@ -217,7 +205,7 @@ describe("Sumi browser session client", () => {
           status: 200,
         }),
       )
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ authenticated: false }), { status: 200 }),
       )
@@ -229,7 +217,7 @@ describe("Sumi browser session client", () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await exchangeFirebaseIDToken("firebase-id-token");
+    await postAuthJSON("/auth/flows", { intent: "sign_in" });
     await getSumiSession();
     await logoutSumiSession();
 

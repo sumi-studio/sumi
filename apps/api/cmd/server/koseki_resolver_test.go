@@ -29,8 +29,8 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	resolver := newKosekiIdentityBindingResolver(koseki.New(pool), "local", "firebase")
-	store := koseki.New(pool)
+	resolver := newKosekiIdentityBindingResolver(koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1"), "local", "firebase")
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	// First account: auto-registration mints a Human + Secretary.
 	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa"})
@@ -47,8 +47,12 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 		t.Fatal("HumanId and PersonalityAgentID must differ")
 	}
 	// Per-agent wrapping key is generated at registration.
-	if _, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID); err != nil {
+	firstKey, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID)
+	if err != nil {
 		t.Fatalf("wrapping key for first agent: %v", err)
+	}
+	if firstKey.ID != "test-wrapping/v1" || len(firstKey.Bytes) != 64 {
+		t.Fatalf("wrapping key pair mismatch: id=%q bytes=%d", firstKey.ID, len(firstKey.Bytes))
 	}
 
 	// Known credential resolves to the same HumanId and agent (no re-registration).
@@ -68,8 +72,12 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	if second.HumanID == first.HumanID || second.PersonalityAgentID == first.PersonalityAgentID {
 		t.Fatal("second account must get a distinct HumanId and PersonalityAgentID")
 	}
-	if _, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID); err != nil {
+	secondKey, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID)
+	if err != nil {
 		t.Fatalf("wrapping key for second agent: %v", err)
+	}
+	if secondKey.ID != "test-wrapping/v1" || len(secondKey.Bytes) != 64 {
+		t.Fatalf("second wrapping key pair mismatch: id=%q bytes=%d", secondKey.ID, len(secondKey.Bytes))
 	}
 
 	// Each Human has exactly one Secretary that round-trips through the store.
@@ -85,5 +93,49 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	// store (the resolver auto-registers instead, so this checks the lookup path).
 	if _, err := store.ResolveCredential(ctx, "firebase", "never-bound"); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expected ErrNoRows for unbound credential, got %v", err)
+	}
+}
+
+func TestKosekiDirectChatAuthorizerEnforcesEmployer(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	authorizer := newKosekiDirectChatAuthorizer(store)
+
+	// Two Humans, each with their own Secretary.
+	first, err := store.AutoRegister(ctx, "firebase", "uid-employer-1")
+	if err != nil {
+		t.Fatalf("auto-register first: %v", err)
+	}
+	second, err := store.AutoRegister(ctx, "firebase", "uid-employer-2")
+	if err != nil {
+		t.Fatalf("auto-register second: %v", err)
+	}
+
+	// Each Human is the Employer of their own Secretary: direct chat allowed.
+	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, func() error { return nil }); err != nil {
+		t.Fatalf("owner should be authorized for own secretary: %v", err)
+	}
+	// A Human is NOT the Employer of another Human's Secretary: rejected.
+	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, func() error { return nil }); err == nil {
+		t.Fatal("non-employer human must not direct-chat with another's secretary")
+	}
+
+	// 異動: transfer the first agent's employment to the second Human. The first
+	// Human is no longer the Employer and loses direct-chat access.
+	if err := store.TransferEmployment(
+		ctx,
+		first.AgentID,
+		koseki.EmployerHuman,
+		second.HumanID,
+	); err != nil {
+		t.Fatalf("transfer employment: %v", err)
+	}
+	if err := authorizer.AuthorizeDirectChat(ctx, first.HumanID, first.AgentID, func() error { return nil }); err == nil {
+		t.Fatal("former employer must lose direct-chat access after 異動")
+	}
+	if err := authorizer.AuthorizeDirectChat(ctx, second.HumanID, first.AgentID, func() error { return nil }); err != nil {
+		t.Fatalf("new employer should be authorized after 異動: %v", err)
 	}
 }

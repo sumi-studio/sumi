@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,75 @@ import (
 )
 
 var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var wrappingKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func TestWrappingKeyGenerationAndStorageBoundaryRequireCanonicalHex(t *testing.T) {
+	first, err := generateWrappingKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := generateWrappingKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrappingKeyRe.MatchString(first) || !wrappingKeyRe.MatchString(second) {
+		t.Fatal("generated wrapping key is not canonical 64-character lowercase hex")
+	}
+	if first == second {
+		t.Fatal("two generated wrapping keys were equal")
+	}
+	if got, err := validateStoredWrappingKey(first); err != nil || got != first {
+		t.Fatalf("canonical stored wrapping key rejected: %v", err)
+	}
+	for _, invalid := range []string{
+		"short",
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"___________________________________________",
+	} {
+		if _, err := validateStoredWrappingKey(invalid); err == nil {
+			t.Fatal("noncanonical stored wrapping key accepted")
+		}
+	}
+}
+
+func TestWrappingKeyIdentityValidation(t *testing.T) {
+	for _, valid := range []string{"test-wrapping/v1", "kms:key:2026-08"} {
+		if got, err := validateWrappingKeyID(valid); err != nil || got != valid {
+			t.Fatalf("valid wrapping key ID rejected: %q %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{"", " padded", "padded ", "line\nbreak", strings.Repeat("x", 256)} {
+		if _, err := validateWrappingKeyID(invalid); err == nil {
+			t.Fatalf("invalid wrapping key ID accepted: %q", invalid)
+		}
+	}
+}
+
+func TestAgentWrappingKeyFailsClosedWhenHistoricalIDIsUnresolved(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool := connectTestPool(t, ctx)
+	store := NewWithWrappingKeyID(pool, "configured-must-not-fallback/v1")
+	const humanID = "0198f0f4-9b72-7000-8000-000000000021"
+	const agentID = "0198f0f4-9b72-7000-8000-000000000022"
+	const key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := pool.Exec(ctx, "INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)",
+		agentID, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key) VALUES ($1, $2)",
+		agentID, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AgentWrappingKey(ctx, agentID); err == nil {
+		t.Fatal("unresolved historical key ID fell back to the configured global ID")
+	}
+}
 
 func TestNewUUIDv7FormatAndUniqueness(t *testing.T) {
 	seen := make(map[string]bool, 1000)
@@ -42,7 +112,7 @@ func TestMintHumanIsUUIDv7AndGloballyUnique(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := New(pool)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	first, err := store.MintHuman(ctx)
 	if err != nil {
@@ -70,7 +140,7 @@ func TestMintSecretaryRecordsAgentAndInitialEmployment(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := New(pool)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	humanID, err := store.MintHuman(ctx)
 	if err != nil {
@@ -103,11 +173,92 @@ func TestMintSecretaryRecordsAgentAndInitialEmployment(t *testing.T) {
 	}
 }
 
+func TestEmployerAuthorityLeaseSerializesTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool := connectTestPool(t, ctx)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	first, err := store.AutoRegister(ctx, "firebase", "authority-lease-first")
+	if err != nil {
+		t.Fatalf("auto-register first Human: %v", err)
+	}
+	second, err := store.AutoRegister(ctx, "firebase", "authority-lease-second")
+	if err != nil {
+		t.Fatalf("auto-register second Human: %v", err)
+	}
+
+	operationStarted := make(chan struct{})
+	releaseOperation := make(chan struct{})
+	authorized := make(chan error, 1)
+	go func() {
+		authorized <- store.AuthorizeCurrentHumanEmployer(
+			ctx,
+			first.HumanID,
+			first.AgentID,
+			func() error {
+				close(operationStarted)
+				select {
+				case <-releaseOperation:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		)
+	}()
+	select {
+	case <-operationStarted:
+	case <-ctx.Done():
+		t.Fatalf("Employer-authorized operation did not start: %v", ctx.Err())
+	}
+
+	blockedCtx, blockedCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	err = store.TransferEmployment(
+		blockedCtx,
+		first.AgentID,
+		EmployerHuman,
+		second.HumanID,
+	)
+	blockedCancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		close(releaseOperation)
+		t.Fatalf("transfer crossed active Employer authority lease: %v", err)
+	}
+	close(releaseOperation)
+	if err := <-authorized; err != nil {
+		t.Fatalf("Employer-authorized operation: %v", err)
+	}
+	if err := store.TransferEmployment(
+		ctx,
+		first.AgentID,
+		EmployerHuman,
+		second.HumanID,
+	); err != nil {
+		t.Fatalf("transfer after authority release: %v", err)
+	}
+	if err := store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		first.HumanID,
+		first.AgentID,
+		func() error { return nil },
+	); !errors.Is(err, ErrNotCurrentEmployer) {
+		t.Fatalf("former Employer authority after transfer: %v", err)
+	}
+	if err := store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		second.HumanID,
+		first.AgentID,
+		func() error { return nil },
+	); err != nil {
+		t.Fatalf("successor Employer authority after transfer: %v", err)
+	}
+}
+
 func TestCredentialBindingRejectsRebindAndDoubleBind(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := New(pool)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	human1, err := store.MintHuman(ctx)
 	if err != nil {
@@ -151,7 +302,7 @@ func TestResearchConsentRegisterLookupAndRevoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := New(pool)
+	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
 
 	humanID, err := store.MintHuman(ctx)
 	if err != nil {

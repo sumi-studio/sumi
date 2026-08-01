@@ -52,7 +52,7 @@ type Store struct {
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to
-// a database with migrations applied (0002 for the 戸籍, 0005 for messaging).
+// a database with migrations applied (0002 for the 戸籍, 0008 for messaging).
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }

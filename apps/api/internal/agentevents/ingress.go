@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -61,10 +62,18 @@ type CommandAppender interface {
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
 type UserCommandIngress struct {
-	Appender       CommandAppender
-	Sessions       UserSessionAuthorizer
-	MaxBytes       int64
-	AllowedOrigins []string
+	Appender  CommandAppender
+	Sessions  UserSessionAuthorizer
+	Spawner   DirectChatSpawner
+	Readiness interface {
+		IsPersonalityAgentReady(context.Context, string) (bool, error)
+	}
+	SpawnReadyTimeout time.Duration
+	MaxBytes          int64
+	AllowedOrigins    []string
+	// Authorizer optionally gates direct chat on Employer-ship (私信 Surface,
+	// ADR 0009 §5). A nil Authorizer permits any verified session.
+	Authorizer DirectChatAuthorizer
 }
 
 var errCommandAppenderRequired = errors.New("CommandAppender is required")
@@ -79,7 +88,32 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 	if appender == nil {
 		return nil, errCommandAppenderRequired
 	}
-	return &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}, nil
+	ingress := &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}
+	if readiness, ok := appender.(interface {
+		IsPersonalityAgentReady(context.Context, string) (bool, error)
+	}); ok {
+		ingress.Readiness = readiness
+	}
+	return ingress, nil
+}
+
+func (h *UserCommandIngress) authorizeDirectChat(
+	ctx context.Context,
+	claims UserSessionClaims,
+	operation func() error,
+) error {
+	if operation == nil {
+		return errors.New("direct-chat authorization operation is required")
+	}
+	if h.Authorizer == nil {
+		return operation()
+	}
+	return h.Authorizer.AuthorizeDirectChat(
+		ctx,
+		claims.HumanID,
+		claims.PersonalityAgentID,
+		operation,
+	)
 }
 
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +142,10 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
+	if err := h.authorizeDirectChat(r.Context(), claims, func() error { return nil }); err != nil {
+		http.Error(w, "not authorized for this agent", http.StatusForbidden)
+		return
+	}
 
 	raw, err := readLimitedBody(r.Body, h.MaxBytes)
 	if err != nil {
@@ -133,35 +171,47 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRejection(w, RejectOversized)
 		return
 	}
+	if h.Spawner != nil {
+		if err := h.Spawner.EnsureRunning(r.Context(), claims.PersonalityAgentID); err != nil {
+			log.Printf("direct command lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
+			writeUnavailable(w, idempotencyKey)
+			return
+		}
+		if h.Readiness != nil {
+			if err := h.awaitSpawnReady(r.Context(), claims.PersonalityAgentID); err != nil {
+				log.Printf("direct command runtime readiness failed for PAID %s: %v", claims.PersonalityAgentID, err)
+				writeUnavailable(w, idempotencyKey)
+				return
+			}
+		}
+	}
 
 	var env CommandEnvelope
-	operationCalled := false
+	sessionLeaseEntered := false
+	appendCalled := false
 	operationContext, cancelOperation := browserSessionOperationContext(r.Context(), claims)
 	defer cancelOperation()
 	err = h.Sessions.AuthorizeSession(r.Context(), claims, func() error {
-		operationCalled = true
-		var appendErr error
-		env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
-		return appendErr
+		sessionLeaseEntered = true
+		return h.authorizeDirectChat(r.Context(), claims, func() error {
+			appendCalled = true
+			var appendErr error
+			env, appendErr = h.Appender.Append(operationContext, directChatProvenance(claims), idempotencyKey, raw)
+			return appendErr
+		})
 	})
 	if err != nil {
-		if !operationCalled ||
+		if !sessionLeaseEntered ||
 			(errors.Is(err, context.DeadlineExceeded) && !time.Now().Before(claims.expiresAt)) {
 			http.Error(w, "invalid session", http.StatusUnauthorized)
 			return
 		}
+		if !appendCalled {
+			http.Error(w, "not authorized for this agent", http.StatusForbidden)
+			return
+		}
 		if errors.Is(err, errBrowserRuntimeUnavailable) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(struct {
-				Error          string       `json:"error"`
-				IdempotencyKey string       `json:"idempotency_key"`
-				RejectReason   RejectReason `json:"reject_reason"`
-			}{
-				Error:          "unavailable",
-				IdempotencyKey: idempotencyKey,
-				RejectReason:   RejectUnavailable,
-			})
+			writeUnavailable(w, idempotencyKey)
 			return
 		}
 		// Idempotency conflicts are exposed as 409 so callers cannot
@@ -192,6 +242,45 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idempotencyKey,
 		CommandID:      env.CommandID,
 		Seq:            env.Seq,
+	})
+}
+
+func (h *UserCommandIngress) awaitSpawnReady(ctx context.Context, personalityAgentID string) error {
+	timeout := h.SpawnReadyTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ready, err := h.Readiness.IsPersonalityAgentReady(readyCtx, personalityAgentID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-readyCtx.Done():
+			return readyCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func writeUnavailable(w http.ResponseWriter, idempotencyKey string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(struct {
+		Error          string       `json:"error"`
+		IdempotencyKey string       `json:"idempotency_key"`
+		RejectReason   RejectReason `json:"reject_reason"`
+	}{
+		Error:          "unavailable",
+		IdempotencyKey: idempotencyKey,
+		RejectReason:   RejectUnavailable,
 	})
 }
 

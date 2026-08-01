@@ -64,3 +64,32 @@ func (r *kosekiIdentityBindingResolver) claims(humanID, agentID string) agenteve
 		PersonalityAgentID: agentID,
 	}
 }
+
+// kosekiDirectChatAuthorizer enforces the 私信 Surface contract (ADR 0009 §5):
+// raw direct chat is restricted to the agent's current Employer. A Human who is
+// not the active Employer (e.g. after 異動 to a Workspace) cannot direct-chat
+// with the agent.
+type kosekiDirectChatAuthorizer struct {
+	store *koseki.Store
+}
+
+func newKosekiDirectChatAuthorizer(store *koseki.Store) *kosekiDirectChatAuthorizer {
+	return &kosekiDirectChatAuthorizer{store: store}
+}
+
+func (a *kosekiDirectChatAuthorizer) AuthorizeDirectChat(
+	ctx context.Context,
+	humanID,
+	personalityAgentID string,
+	operation func() error,
+) error {
+	if err := a.store.AuthorizeCurrentHumanEmployer(
+		ctx,
+		humanID,
+		personalityAgentID,
+		operation,
+	); err != nil {
+		return fmt.Errorf("authorize current Employer operation: %w", err)
+	}
+	return nil
+}
