@@ -1,6 +1,7 @@
 import { secureRandomUUID } from "../lib/random-uuid";
 import type {
   ChannelSummary,
+  ConnectionState,
   DmSummary,
   MemberProfile,
   Message,
@@ -8,9 +9,11 @@ import type {
   ParticipantRef,
   ParticipantStatus,
   Place,
+  PlaceKey,
   ReadMarker,
   ReplyLaterMarker,
   SendMessageInput,
+  SendReceipt,
   ServerEvent,
   StatusKind,
   WorkspaceSummary,
@@ -33,8 +36,14 @@ import {
 
 const SELF: ParticipantRef = { kind: "human", humanId: "h-yohaku" };
 const HARU: ParticipantRef = { kind: "human", humanId: "h-haru" };
-const SUMI: ParticipantRef = { kind: "agent", personalityAgentId: "a-sumi" };
-const KURO: ParticipantRef = { kind: "agent", personalityAgentId: "a-kuro" };
+const SUMI: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a-sumi",
+};
+const KURO: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a-kuro",
+};
 
 const WORKSPACES: WorkspaceSummary[] = [
   { workspaceId: "ws-sumi", name: "Sumi Studio" },
@@ -349,24 +358,41 @@ export class MockMessagingServer implements MessagingBackend {
     return slice.slice(Math.max(0, slice.length - limit));
   }
 
-  sendMessage(input: SendMessageInput): void {
-    window.setTimeout(() => {
-      const message = this.appendMessage({
-        place: input.place,
-        author: SELF,
-        content: input.content,
-        mentions: input.mentions,
-        urgency: input.urgency,
-        replyTo: input.replyTo,
-        clientNonce: input.clientNonce,
+  sendMessage(input: SendMessageInput): Promise<SendReceipt> {
+    // idempotency: 同じclientNonceの再送はcommit済みmessageのreceiptを返すだけ。
+    const existing = (this.history.get(placeKey(input.place)) ?? []).find(
+      (entry) => entry.clientNonce === input.clientNonce,
+    );
+    if (existing) {
+      return Promise.resolve({
+        messageId: existing.messageId,
+        seq: existing.seq,
       });
-      // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
-      this.emit({ type: "message_created", message: { ...message } });
-      this.scheduleAgentResponses(message);
-    }, SEND_LATENCY_MS);
+    }
+    return new Promise((resolve) => {
+      window.setTimeout(() => {
+        const message = this.appendMessage({
+          place: input.place,
+          author: SELF,
+          content: input.content,
+          mentions: input.mentions,
+          urgency: input.urgency,
+          replyTo: input.replyTo,
+          clientNonce: input.clientNonce,
+        });
+        // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
+        this.emit({ type: "message_created", message: { ...message } });
+        this.scheduleAgentResponses(message);
+        resolve({ messageId: message.messageId, seq: message.seq });
+      }, SEND_LATENCY_MS);
+    });
   }
 
-  editMessage(place: Place, messageId: string, content: string): void {
+  async editMessage(
+    place: Place,
+    messageId: string,
+    content: string,
+  ): Promise<void> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
     if (!message || message.deleted) return;
@@ -375,10 +401,11 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "message_edited", message: { ...message } });
   }
 
-  deleteMessage(place: Place, messageId: string): void {
+  async deleteMessage(place: Place, messageId: string): Promise<void> {
     const messages = this.history.get(placeKey(place)) ?? [];
     const message = messages.find((entry) => entry.messageId === messageId);
     if (!message || message.deleted) return;
+    // tombstone化: contentは残さず、消えた事実とseqだけが残る。
     message.deleted = true;
     message.content = "";
     this.emit({
@@ -389,13 +416,13 @@ export class MockMessagingServer implements MessagingBackend {
     });
   }
 
-  markRead(place: Place, lastReadSeq: number): void {
+  async markRead(place: Place, lastReadSeq: number): Promise<void> {
     const key = placeKey(place);
     const current = this.readMarkers.get(key) ?? 0;
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
-  setStatus(status: StatusKind, note: string): void {
+  async setStatus(status: StatusKind, note: string): Promise<void> {
     const next: ParticipantStatus = {
       participant: SELF,
       status,
@@ -406,7 +433,11 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "status_updated", status: next });
   }
 
-  createReplyLater(place: Place, messageId: string, remindAt: number): void {
+  async createReplyLater(
+    place: Place,
+    messageId: string,
+    remindAt: number,
+  ): Promise<void> {
     const marker: ReplyLaterMarker = {
       markerId: secureRandomUUID(),
       participant: SELF,
@@ -420,7 +451,7 @@ export class MockMessagingServer implements MessagingBackend {
     this.emit({ type: "reply_later_created", marker });
   }
 
-  resolveReplyLater(markerId: string): void {
+  async resolveReplyLater(markerId: string): Promise<void> {
     const marker = this.replyLaterMarkers.get(markerId);
     if (!marker || marker.resolved) return;
     marker.resolved = true;
@@ -431,11 +462,21 @@ export class MockMessagingServer implements MessagingBackend {
     // 自分のtypingは他参加者向け。モックでは表示相手がいないため何もしない。
   }
 
-  subscribe(listener: (event: ServerEvent) => void): () => void {
+  subscribe(
+    listener: (event: ServerEvent) => void,
+    _options?: { sinceByPlace?: Record<PlaceKey, number> },
+  ): () => void {
+    // モックは常時ライブ接続のためcursor catch-upは不要。実装はWS再接続時に
+    // sinceByPlaceの次seqからdurable eventをreplayする。
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  subscribeConnection(listener: (state: ConnectionState) => void): () => void {
+    listener("connected");
+    return () => {};
   }
 
   private emit(event: ServerEvent): void {

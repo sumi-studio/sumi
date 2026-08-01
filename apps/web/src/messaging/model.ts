@@ -9,15 +9,16 @@
 
 export type ParticipantRef =
   | { kind: "human"; humanId: string }
-  | { kind: "agent"; personalityAgentId: string };
+  // "agent"ではなく"personality_agent": worker/subagent/appとの混同を防ぐ（Codex合意）。
+  | { kind: "personality_agent"; personalityAgentId: string };
 
-/** Stable map key for a participant: `human:<id>` / `agent:<id>`. */
+/** Stable map key for a participant: `human:<id>` / `personality_agent:<id>`. */
 export type ParticipantKey = string;
 
 export function participantKey(ref: ParticipantRef): ParticipantKey {
   return ref.kind === "human"
     ? `human:${ref.humanId}`
-    : `agent:${ref.personalityAgentId}`;
+    : `personality_agent:${ref.personalityAgentId}`;
 }
 
 export function sameParticipant(a: ParticipantRef, b: ParticipantRef): boolean {
@@ -55,10 +56,13 @@ export function parsePlaceKey(key: PlaceKey): Place | null {
  */
 export type Urgency = "urgent" | "normal" | "fyi";
 
+/** seqはJSONで安全に運べる整数に収める（wire契約はJsonSafeInteger）。 */
+export const MAX_SEQ = Number.MAX_SAFE_INTEGER;
+
 export interface Message {
   messageId: string;
   place: Place;
-  /** Place単位の単調増加seq。未読・replay・permalinkの基準。 */
+  /** Place単位の単調増加seq。未読・replay・permalinkの基準。上限はMAX_SEQ。 */
   seq: number;
   author: ParticipantRef;
   content: string;
@@ -68,8 +72,9 @@ export interface Message {
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
+  /** 削除済みはtombstone: contentは空になり、消えた事実とseqだけが残る。 */
   deleted: boolean;
-  /** この端末が送ったメッセージの楽観的描画との照合用。 */
+  /** 送信者自身の楽観的描画とACK/echoを照合するidempotency key。 */
   clientNonce?: string;
 }
 
@@ -146,13 +151,23 @@ export interface SendMessageInput {
   mentions: ParticipantRef[];
   urgency: Urgency;
   replyTo: string | null;
+  /** 必須のidempotency key。再送しても二重投稿にならない。 */
   clientNonce: string;
 }
 
+/** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
+export interface SendReceipt {
+  messageId: string;
+  seq: number;
+}
+
+export type ConnectionState = "connected" | "reconnecting" | "disconnected";
+
 /**
- * メッセージングbackendの境界。モックと実API（WS+REST）が同じ形を実装する。
+ * メッセージングbackendの境界。モックと実API（REST: /messaging/…、
+ * WS: /messaging/ws 1本で全place multiplex）が同じ形を実装する。
  * ここに載る操作はすべて「人間もagentも使える道具」で、agent側は同じ契約を
- * tool経由で使う（AX）。
+ * tool経由で使う（AX）。UIだけにある操作を作らない。
  */
 export interface MessagingBackend {
   bootstrap(): Promise<{
@@ -169,13 +184,26 @@ export interface MessagingBackend {
     place: Place,
     options?: { beforeSeq?: number; limit?: number },
   ): Promise<Message[]>;
-  sendMessage(input: SendMessageInput): void;
-  editMessage(place: Place, messageId: string, content: string): void;
-  deleteMessage(place: Place, messageId: string): void;
-  markRead(place: Place, lastReadSeq: number): void;
-  setStatus(status: StatusKind, note: string): void;
-  createReplyLater(place: Place, messageId: string, remindAt: number): void;
-  resolveReplyLater(markerId: string): void;
+  sendMessage(input: SendMessageInput): Promise<SendReceipt>;
+  editMessage(place: Place, messageId: string, content: string): Promise<void>;
+  deleteMessage(place: Place, messageId: string): Promise<void>;
+  markRead(place: Place, lastReadSeq: number): Promise<void>;
+  setStatus(status: StatusKind, note: string): Promise<void>;
+  createReplyLater(
+    place: Place,
+    messageId: string,
+    remindAt: number,
+  ): Promise<void>;
+  resolveReplyLater(markerId: string): Promise<void>;
+  /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
-  subscribe(listener: (event: ServerEvent) => void): () => void;
+  /**
+   * durable eventの購読。再接続時はplaceごとの消費済みseqをcursorとして渡し、
+   * その次からcatch-upする（volatile eventはreplayしない）。
+   */
+  subscribe(
+    listener: (event: ServerEvent) => void,
+    options?: { sinceByPlace?: Record<PlaceKey, number> },
+  ): () => void;
+  subscribeConnection(listener: (state: ConnectionState) => void): () => void;
 }

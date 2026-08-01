@@ -39,7 +39,7 @@
 
 ```json
 { "kind": "human", "human_id": "<UUIDv7>" }
-{ "kind": "agent", "personality_agent_id": "<UUIDv7>" }
+{ "kind": "personality_agent", "personality_agent_id": "<UUIDv7>" }
 ```
 
 - author、membership、mention、read marker、通知設定ownerのすべてでこの型を使う。
@@ -122,8 +122,8 @@
 - REST: place一覧、履歴取得（seqベースのpagination）、read marker更新、
   connection申請/承認、通知設定CRUD、channel作成。
 - 送信とlive配信は既存方針どおりWS経由（TTFT < 500ms、[screen-composition.md](screen-composition.md) の設計制約）。
-  既存の `GET /direct-chat/ws` とは**別の関心**なので、messaging用のevent streamを追加する。
-  1本のWSにmultiplexするか別接続かはCodexと要相談（下記Q5）。
+  messagingは別endpoint（REST: `/messaging/…`、WS: `/messaging/ws` 1本で全Workspace/placeをmultiplex）。
+  `/direct-chat/ws` とは混ぜない（privacy・認可・replay・backpressureの境界が違う）。
 - WS event（durable、place-seq付き）: `message_created`, `message_edited`,
   `message_deleted`, `read_marker_updated`, `membership_changed`,
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
@@ -187,21 +187,62 @@
    correlationのprovenanceとともに本人の人生ログへ入る（正本はWorkspace API側、
    agent DBはlocal copy/projection — ADR 0008 §8）。
 
-## Codexへ確認したいこと
+## 合意事項（Codex返信 2026-08-01）
 
-1. **Workspace membershipとの接続**: channelは#130/#131のorg/membership実体の直下でよいか。
-   channel閲覧権限を初期は「Workspaceメンバー全員」に単純化してよいか。
-2. **Connection（つながり）の置き場所**: 戸籍レベルのglobal関係として台帳側に置くべきか、
-   messaging domainの所属か。「到達性」を判定する正本はどこか。
-3. **未読ストアと通知設定評価の所有**: agent覚醒のトリガ評価（mention/keyword判定）は
-   control plane側で行う想定でよいか。`messaging_call` commandの形はagent-events.yamlの
-   command系列にどう合流させるか。
-4. **DMのプライバシー契約**: 「管理者も覗けない」（ADR 0009 §6）はDM本文にも適用するか。
-   適用する場合、研究協力consentの単位（参加者全員の同意が要るか）。
-5. **WS構成**: messaging eventsは既存direct-chat WSへのmultiplexか、別エンドポイントか。
-   session cookie（`sumi:web:direct-chat` audience）のaudience設計への影響。
-6. **agent側tool群**: 上記の知覚・操作toolはWorkspace API経由（agentがAPIクライアントになる）で
-   よいか、それともruntimeへの専用RPCを増やすか。
+1. **アプリレール**: 静的定義で進めてよいが、UI直書きは `AppDescriptor` のlocal
+   providerという位置づけにする。将来同じdescriptor列をserverから受け取り、
+   rendererは `builtin / sdui / mcp_app` に分かれる。MCP AppのHTML/JSは
+   sandboxed iframe内のみで扱い、親originで直接実行しない。
+2. **認証**: ログインは一つの `sumi_session` を全アプリで共有。audienceは
+   surface-neutralな `sumi:web` へbackend側で一方向移行。messagingは別endpoint、
+   別ログインsessionは作らない。必要になればgeneric sessionからendpoint固有の
+   短命ticketを発行する。
+3. **membership**: channelはWorkspace直下。v0はactiveなWorkspaceメンバー全員が
+   閲覧・投稿可。HumanMembershipとPersonalityAgentMembershipを同型に扱う。
+   Employmentとmembershipは別物（Workspace雇用⇒全閲覧可、Secretary⇒Humanと同権限、
+   とはしない）。Workspaceとorgは同一概念にしない。
+4. **Connection**: 戸籍そのもの（immutableなidentity台帳）には入れない。
+   shared control plane上の独立Connection domainが正本。DM到達性は
+   authorization serviceが「activeな共有Workspace membership / accepted Connection /
+   block（最優先）」で判定し、messaging domainは到達性ルールを複製しない。
+5. **未読・通知・覚醒**: ReadMarker / NotificationSettingはhuman/agent同型で、
+   正本はshared messaging/notification service。agent-private DBは本人が経験した
+   もののprojectionであり正本にしない。流れは
+   message commit → mention解決 → transactional outboxでattention candidate →
+   notification/attention側が本人の設定とEmployer予算（別軸）を評価 →
+   agentへ `messaging_call`、人間へ通知intent。
+   agent-events.yamlはsurface-neutralなenvelopeへ一般化し、
+   `MessagingProvenanceV1`（message/place/workspace参照、認証済みtrigger snapshot、
+   actor、trigger reason、urgency、unread seq range、correlation/causation）を追加する。
+   全未読をLLM contextや人生ログへ自動注入しない。呼びかけと本人が実際に読んだ
+   内容だけが「経験」になる。urgentは相手の設定・予算を突破する権限ではない。
+6. **ReplyLater**: 相手に見えるdurableな `ReplyLaterMarker` と、本人だけの
+   private reminder scheduleに二分する。agentのリマインドは覚醒トリガ
+   「予定された出来事」で同じagent sessionへ、Humanはnotification adapterへ。
+   `remind_at` は本人が時刻まで約束した場合を除き相手へ公開しない。
+   markerを置くのは本人の意思であり、platformがagentの約束を代行しない
+   （モックの模擬agent挙動はprototype fixture限定）。
+7. **DM privacy**: ADR 0009 §6をDMにも適用。Workspace/admin権限だけでは本文を
+   読めない。admin閲覧endpointを作らない。log/trace/telemetryへ本文を流さない。
+   これはauthorization契約であり現時点のE2EE実装を意味しない。研究協力による
+   本文取得を導入する場合はplace全参加者の明示的opt-inが必要で、agent本人の同意を
+   Employerの同意で置換しない。参加者変更・同意撤回時は以降の取得を停止する。
+8. **通知配送**: shared notification delivery service/control planeの管轄。
+   messagingはtyped notification intentの発行まで。device token、permission、
+   quiet hours、retry、dedupeは所有しない。HumanのWeb Pushとagentのattention
+   triggerは同じintentから分かれる別adapter。
+
+### 契約修正（v0.1 — 本ドラフトと apps/web/src/messaging/model.ts へ反映済み）
+
+- `ParticipantRef.kind`: `"agent"` → `"personality_agent"`（worker/subagent/appとの混同防止）
+- mutationは `Promise<receipt>`。`clientNonce`（idempotency key）必須、ACKで
+  server採番の `message_id` / `seq` を返す
+- `subscribe` はcursor catch-up（placeごとの消費済みseq）・reconnect・
+  connection stateを持つ
+- `seq` はJsonSafeInteger上限を契約化
+- 削除済みMessageはtombstone（contentを残さない）
+- direct chatはSecretary DMへ統合・転記しない。別surfaceのまま
+- UIだけにある操作を作らない。同じ能力をagent用tool/APIにも公開する
 
 ## Non-goals（v0）
 

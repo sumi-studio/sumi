@@ -126,6 +126,7 @@ export interface MessageItemProps {
   message: Message;
   grouped: boolean;
   pending: boolean;
+  failed: boolean;
   selfKey: ParticipantKey;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   findMessage: (messageId: string) => Message | undefined;
@@ -135,12 +136,14 @@ export interface MessageItemProps {
   onEdit: (message: Message) => void;
   onDelete: (message: Message) => void;
   onJumpTo: (messageId: string) => void;
+  onRetry: (message: Message) => void;
 }
 
 export const MessageItem = memo(function MessageItem({
   message,
   grouped,
   pending,
+  failed,
   selfKey,
   membersByKey,
   findMessage,
@@ -150,6 +153,7 @@ export const MessageItem = memo(function MessageItem({
   onEdit,
   onDelete,
   onJumpTo,
+  onRetry,
 }: MessageItemProps) {
   const authorKey = participantKey(message.author);
   const author = membersByKey[authorKey];
@@ -168,7 +172,7 @@ export const MessageItem = memo(function MessageItem({
     <div
       className={`group relative px-4 sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
         mentionsSelf ? "bg-amber-500/6" : "hover:bg-accent/40"
-      } ${pending ? "opacity-55" : ""}`}
+      } ${pending && !failed ? "opacity-55" : ""}`}
     >
       {replyTarget && replyAuthor ? (
         <button
@@ -226,6 +230,18 @@ export const MessageItem = memo(function MessageItem({
               </span>
             ) : null}
           </div>
+          {failed ? (
+            <div className="mt-0.5 flex items-center gap-2 text-[11px] text-rose-500">
+              送信できませんでした
+              <button
+                type="button"
+                onClick={() => onRetry(message)}
+                className="rounded border border-rose-500/40 px-1.5 py-px font-medium hover:bg-rose-500/10"
+              >
+                再送
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
       {pending ? null : (

@@ -10,7 +10,10 @@ import {
 } from "./timeline";
 
 const SELF: ParticipantRef = { kind: "human", humanId: "h-self" };
-const OTHER: ParticipantRef = { kind: "agent", personalityAgentId: "a-other" };
+const OTHER: ParticipantRef = {
+  kind: "personality_agent",
+  personalityAgentId: "a-other",
+};
 
 const BASE_AT = new Date("2026-08-01T10:00:00").getTime();
 

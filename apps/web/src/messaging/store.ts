@@ -3,6 +3,7 @@ import { secureRandomUUID } from "../lib/random-uuid";
 import { MockMessagingServer } from "./mock-server";
 import type {
   ChannelSummary,
+  ConnectionState,
   DmSummary,
   MemberProfile,
   Message,
@@ -49,11 +50,13 @@ interface MessagingState {
   activePlaceKey: PlaceKey | null;
   editingMessageId: string | null;
   replyTargetId: string | null;
+  connection: ConnectionState;
 
   init(): void;
   selectPlace(key: PlaceKey): void;
   setDraft(key: PlaceKey, draft: string): void;
   send(content: string, urgency: Urgency): void;
+  retrySend(clientNonce: string): void;
   startEdit(messageId: string): void;
   cancelEdit(): void;
   submitEdit(content: string): void;
@@ -190,6 +193,34 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }));
   };
 
+  // 送信・再送の共通経路。ACK(receipt)はecho eventで照合されるため、
+  // ここでは失敗時にpendingへfailedを立てて再送UIへ委ねるだけで良い。
+  const dispatchSend = (key: PlaceKey, pending: PendingMessage) => {
+    const place = parsePlaceKey(key);
+    if (!place) return;
+    backend
+      .sendMessage({
+        place,
+        content: pending.content,
+        mentions: pending.mentions,
+        urgency: pending.urgency,
+        replyTo: pending.replyTo,
+        clientNonce: pending.clientNonce,
+      })
+      .catch(() => {
+        set((state) => ({
+          pendingByPlace: {
+            ...state.pendingByPlace,
+            [key]: (state.pendingByPlace[key] ?? []).map((entry) =>
+              entry.clientNonce === pending.clientNonce
+                ? { ...entry, failed: true }
+                : entry,
+            ),
+          },
+        }));
+      });
+  };
+
   return {
     ready: false,
     self: null,
@@ -209,11 +240,13 @@ export const useMessaging = create<MessagingState>((set, get) => {
     activePlaceKey: null,
     editingMessageId: null,
     replyTargetId: null,
+    connection: "connected",
 
     init() {
       if (initialized) return;
       initialized = true;
       backend.subscribe(applyEvent);
+      backend.subscribeConnection((state) => set({ connection: state }));
       void backend.bootstrap().then((snapshot) => {
         const membersByKey: Record<ParticipantKey, MemberProfile> = {};
         for (const member of snapshot.members) {
@@ -295,14 +328,27 @@ export const useMessaging = create<MessagingState>((set, get) => {
         draftByPlace: { ...current.draftByPlace, [key]: "" },
         replyTargetId: null,
       }));
-      backend.sendMessage({
-        place,
-        content: pending.content,
-        mentions: pending.mentions,
-        urgency: pending.urgency,
-        replyTo: pending.replyTo,
-        clientNonce: pending.clientNonce,
-      });
+      dispatchSend(key, pending);
+    },
+
+    retrySend(clientNonce) {
+      const key = get().activePlaceKey;
+      if (!key) return;
+      const pending = (get().pendingByPlace[key] ?? []).find(
+        (entry) => entry.clientNonce === clientNonce,
+      );
+      if (!pending) return;
+      set((current) => ({
+        pendingByPlace: {
+          ...current.pendingByPlace,
+          [key]: (current.pendingByPlace[key] ?? []).map((entry) =>
+            entry.clientNonce === clientNonce
+              ? { ...entry, failed: false }
+              : entry,
+          ),
+        },
+      }));
+      dispatchSend(key, pending);
     },
 
     startEdit(messageId) {
@@ -320,7 +366,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const messageId = state.editingMessageId;
       const trimmed = content.trim();
       if (!key || !place || !messageId) return;
-      if (trimmed) backend.editMessage(place, messageId, trimmed);
+      if (trimmed) void backend.editMessage(place, messageId, trimmed);
       set({ editingMessageId: null });
     },
 
@@ -330,7 +376,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         ? parsePlaceKey(state.activePlaceKey)
         : null;
       if (!place) return;
-      backend.deleteMessage(place, messageId);
+      void backend.deleteMessage(place, messageId);
     },
 
     setReplyTarget(messageId) {
@@ -346,15 +392,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((entry) => ({
         lastReadByPlace: { ...entry.lastReadByPlace, [key]: seq },
       }));
-      backend.markRead(place, seq);
+      void backend.markRead(place, seq);
     },
 
     setStatus(status, note) {
-      backend.setStatus(status, note);
+      void backend.setStatus(status, note);
     },
 
     createReplyLater(message) {
-      backend.createReplyLater(
+      void backend.createReplyLater(
         message.place,
         message.messageId,
         Date.now() + DEFAULT_REPLY_LATER_REMIND_MS,
@@ -362,7 +408,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      backend.resolveReplyLater(markerId);
+      void backend.resolveReplyLater(markerId);
     },
 
     sendTyping() {

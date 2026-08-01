@@ -60,6 +60,7 @@ export function MessageList({
   const startEdit = useMessaging((state) => state.startEdit);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
+  const retrySend = useMessaging((state) => state.retrySend);
 
   const virtualizerRef = useRef<ConversationVirtualizerHandle>(null);
   const [atEnd, setAtEnd] = useState(true);
@@ -219,6 +220,10 @@ export function MessageList({
             message={row.message}
             grouped={row.grouped}
             pending={row.pending}
+            failed={row.failed}
+            onRetry={(message) => {
+              if (message.clientNonce) retrySend(message.clientNonce);
+            }}
             selfKey={selfKey}
             membersByKey={membersByKey}
             findMessage={(id) => messagesById.get(id)}
@@ -239,6 +244,7 @@ export function MessageList({
       messagesById,
       setReplyTarget,
       createReplyLater,
+      retrySend,
       copyLink,
       startEdit,
       confirmDelete,

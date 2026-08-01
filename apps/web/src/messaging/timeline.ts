@@ -16,6 +16,8 @@ export interface PendingMessage {
   urgency: Urgency;
   replyTo: string | null;
   createdAt: number;
+  /** 送信失敗。UIは再送を促し、再送は同じclientNonceで冪等に行う。 */
+  failed?: boolean;
 }
 
 export type TimelineRow =
@@ -27,6 +29,7 @@ export type TimelineRow =
       message: Message;
       grouped: boolean;
       pending: boolean;
+      failed: boolean;
     };
 
 /**
@@ -133,7 +136,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
   let previous: Message | null = null;
   let previousBroken = true;
 
-  const pushMessage = (message: Message, pending: boolean) => {
+  const pushMessage = (message: Message, pending: boolean, failed = false) => {
     if (message.deleted) return;
     if (previous && !sameDay(previous.createdAt, message.createdAt)) {
       rows.push({
@@ -172,6 +175,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
       message,
       grouped,
       pending,
+      failed,
     });
     previous = message;
     previousBroken = false;
@@ -198,6 +202,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         clientNonce: entry.clientNonce,
       },
       true,
+      entry.failed ?? false,
     );
   }
   return rows;
