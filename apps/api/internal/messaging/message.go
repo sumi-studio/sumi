@@ -180,11 +180,6 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
-	// The inbox is its own transactional outbox: a committed message and its
-	// attention candidates are inseparable.
-	if err := s.issueCandidates(ctx, tx, place, msg); err != nil {
-		return Message{}, false, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit append: %w", err)
 	}
@@ -425,11 +420,6 @@ func (s *Store) ReadThrough(ctx context.Context, placeID string, p ParticipantRe
 		placeID, p.Kind, p.ID, seq)
 	if err != nil {
 		return fmt.Errorf("advance read marker: %w", err)
-	}
-	// Reading past a candidate resolves it: already-read messages never wake
-	// anyone again (凍結契約 v1 lifecycle).
-	if p.Kind == KindPersonalityAgent {
-		return s.supersedeCandidates(ctx, p.ID, placeID, seq)
 	}
 	return nil
 }
