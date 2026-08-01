@@ -107,7 +107,7 @@ function SettingsPopover() {
                 {user?.displayName ?? user?.email ?? user?.id ?? "アカウント"}
               </span>
             </div>
-            <ProviderSettings />
+            <ProviderSettings humanId={user?.id ?? ""} />
             <Button
               variant="ghost"
               onClick={() => void handleLogout()}

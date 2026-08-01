@@ -21,14 +21,29 @@ import {
   reload,
   type User,
 } from "firebase/auth";
-import { Check, Link2, Unlink } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Check,
+  CircleAlert,
+  Link2,
+  LoaderCircle,
+  RotateCcw,
+  Unlink,
+} from "lucide-react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createAuthFlowNonce } from "./auth-flow-client";
 import { getFirebaseAuth } from "./firebase";
 import {
   completeProviderOperation,
   failProviderOperation,
   type ManagedProvider,
+  type ProviderOperation,
   type ProviderOperationResult,
   startProviderOperation,
   statusProviderOperation,
@@ -40,167 +55,339 @@ const PROVIDERS: Array<{ id: ManagedProvider; label: string }> = [
   { id: "github.com", label: "GitHub" },
 ];
 const PROVIDER_NOTICE_KEY = "sumi.auth.provider-notice.v1";
+const PROVIDER_PENDING_KEY = "sumi.auth.provider-pending.v1";
+const RECOVERY_ATTEMPTS = 3;
 
-interface ProviderNotice {
+interface ProviderScope {
+  firebaseUid: string;
+  humanId: string;
+}
+
+interface ProviderNotice extends ProviderScope {
+  version: 1;
   provider: ManagedProvider;
   operation: "linked" | "unlinked";
 }
 
-export function ProviderSettings() {
+type PendingPhase =
+  | "starting"
+  | "link_ready"
+  | "link_mutated"
+  | "unlink_starting";
+
+interface PendingProviderOperation extends ProviderScope {
+  version: 1;
+  provider: ManagedProvider;
+  operation: ProviderOperation;
+  nonce: string;
+  phase: PendingPhase;
+  operationId?: string;
+  completionTokenNotBefore?: string;
+}
+
+export function ProviderSettings({ humanId }: { humanId: string }) {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [providerRevision, setProviderRevision] = useState(0);
   const [busyProvider, setBusyProvider] = useState<ManagedProvider | null>(
     null,
   );
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [unlinkTarget, setUnlinkTarget] = useState<ManagedProvider | null>(
     null,
   );
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<ProviderNotice | null>(() =>
-    loadProviderNotice(),
-  );
+  const [notice, setNotice] = useState<ProviderNotice | null>(null);
+  const [pendingOperation, setPendingOperation] =
+    useState<PendingProviderOperation | null>(null);
 
   useEffect(() => {
     try {
       const auth = getFirebaseAuth();
-      setFirebaseUser(auth.currentUser);
-      return onAuthStateChanged(auth, setFirebaseUser);
+      const observe = (nextUser: User | null) => {
+        setFirebaseUser(nextUser);
+        if (!nextUser) {
+          clearProviderSessionState();
+          setNotice(null);
+          setPendingOperation(null);
+        }
+      };
+      observe(auth.currentUser);
+      return onAuthStateChanged(auth, observe);
     } catch {
+      clearProviderSessionState();
       setFirebaseUser(null);
     }
   }, []);
 
-  const linkedProviders = useMemo(
-    () =>
-      new Set(
-        firebaseUser?.providerData.map(({ providerId }) => providerId) ?? [],
-      ),
-    [firebaseUser],
-  );
+  useEffect(() => {
+    if (!firebaseUser || !humanId) {
+      setNotice(null);
+      setPendingOperation(null);
+      return;
+    }
+    const scope = { firebaseUid: firebaseUser.uid, humanId };
+    setNotice(loadScopedNotice(scope));
+    setPendingOperation(loadScopedPendingOperation(scope));
+  }, [firebaseUser, humanId]);
+
+  const linkedProviders = useMemo(() => {
+    // Firebase reload mutates the existing User object, so this revision is
+    // the explicit signal to read providerData again.
+    void providerRevision;
+    return new Set(
+      firebaseUser?.providerData.map(({ providerId }) => providerId) ?? [],
+    );
+  }, [firebaseUser, providerRevision]);
   const usableMethodCount = linkedProviders.size;
+
+  const scope = useMemo<ProviderScope | null>(
+    () =>
+      firebaseUser && humanId
+        ? { firebaseUid: firebaseUser.uid, humanId }
+        : null,
+    [firebaseUser, humanId],
+  );
+  const activeScopeRef = useRef<ProviderScope | null>(scope);
+  activeScopeRef.current = scope;
+  const scopedNotice =
+    notice && scope && sameScope(notice, scope) ? notice : null;
+  const scopedPendingOperation =
+    pendingOperation && scope && sameScope(pendingOperation, scope)
+      ? pendingOperation
+      : null;
 
   const refreshUser = useCallback(async (user: User) => {
     await reload(user);
     setFirebaseUser(getFirebaseAuth().currentUser);
+    setProviderRevision((revision) => revision + 1);
   }, []);
 
-  const publishNotice = useCallback((nextNotice: ProviderNotice) => {
-    sessionStorage.setItem(PROVIDER_NOTICE_KEY, JSON.stringify(nextNotice));
-    setNotice(nextNotice);
+  const persistPending = useCallback((next: PendingProviderOperation) => {
+    if (!activeScopeRef.current || !sameScope(next, activeScopeRef.current)) {
+      throw new ProviderAccountChangedError();
+    }
+    sessionStorage.setItem(PROVIDER_PENDING_KEY, JSON.stringify(next));
+    setPendingOperation(next);
   }, []);
+
+  const clearPending = useCallback((expected: ProviderScope) => {
+    if (
+      !activeScopeRef.current ||
+      !sameScope(expected, activeScopeRef.current)
+    ) {
+      return;
+    }
+    const stored = readSessionJSON(PROVIDER_PENDING_KEY);
+    if (hasScope(stored) && !sameScope(stored, expected)) return;
+    sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+    setPendingOperation((current) =>
+      current && sameScope(current, expected) ? null : current,
+    );
+  }, []);
+
+  const publishNotice = useCallback(
+    (provider: ManagedProvider, operation: "linked" | "unlinked") => {
+      if (!scope) return;
+      if (
+        !activeScopeRef.current ||
+        !sameScope(scope, activeScopeRef.current)
+      ) {
+        return;
+      }
+      const nextNotice: ProviderNotice = {
+        version: 1,
+        ...scope,
+        provider,
+        operation,
+      };
+      sessionStorage.setItem(PROVIDER_NOTICE_KEY, JSON.stringify(nextNotice));
+      setNotice(nextNotice);
+    },
+    [scope],
+  );
+
+  const operationFor = useCallback(
+    (provider: ManagedProvider, operation: ProviderOperation) => {
+      if (!scope) throw new Error("ログイン情報を確認できませんでした。");
+      if (scopedPendingOperation) {
+        if (
+          scopedPendingOperation.provider !== provider ||
+          scopedPendingOperation.operation !== operation
+        ) {
+          throw new ProviderOperationStillPendingError(
+            "別のログイン方法の変更が保留中です。先にその変更を再開してください。",
+          );
+        }
+        return scopedPendingOperation;
+      }
+      const next: PendingProviderOperation = {
+        version: 1,
+        ...scope,
+        provider,
+        operation,
+        nonce: createAuthFlowNonce(),
+        phase: operation === "link" ? "starting" : "unlink_starting",
+      };
+      persistPending(next);
+      return next;
+    },
+    [persistPending, scope, scopedPendingOperation],
+  );
 
   const linkProvider = useCallback(
     async (provider: ManagedProvider) => {
       if (!firebaseUser || busyProvider) return;
       setBusyProvider(provider);
+      setBusyLabel(`${providerLabel(provider)}の変更を確認中`);
       setError(null);
-      const nonce = createAuthFlowNonce();
-      let operationId: string | null = null;
+      let operation: PendingProviderOperation | null = null;
       let firebaseLinked = false;
-      const startPromise = getIdToken(firebaseUser, true).then((idToken) =>
-        startProviderOperation({
-          provider,
-          operation: "link",
-          nonce,
-          idToken,
-        }),
-      );
-      // Open the popup in the original click task. Awaiting the ID token or
-      // server operation first lets browsers classify it as unsolicited.
-      const popupPromise = linkWithPopup(
-        firebaseUser,
-        createFirebaseProvider(provider),
-      ).then(
-        (linked) => ({ linked, error: null }),
-        (popupError: unknown) => ({ linked: null, error: popupError }),
-      );
       try {
-        const started = await startPromise;
-        operationId = started.operationId;
-        if (
-          started.outcome !== "client_operation_required" ||
-          started.clientOperation !== "firebase_link_with_credential" ||
-          !started.completionTokenNotBefore
-        ) {
-          throw new Error("Invalid provider link response.");
+        operation = operationFor(provider, "link");
+        const started = await startWithSameNonce(
+          operation,
+          await getIdToken(firebaseUser, true),
+          persistPending,
+        );
+        if (isSuccessfulLink(started)) {
+          await finishSuccessfulOperation(
+            started,
+            operation,
+            firebaseUser,
+            refreshUser,
+            clearPending,
+            publishNotice,
+          );
+          return;
         }
-        const popupResult = await popupPromise;
-        if (popupResult.error) throw popupResult.error;
-        const linked = popupResult.linked;
-        if (!linked) throw new Error("Provider popup returned no account.");
-        firebaseLinked = true;
-        await waitUntil(started.completionTokenNotBefore);
-        let completed: ProviderOperationResult;
-        try {
-          completed = await completeProviderOperation({
-            operationId: started.operationId,
-            nonce,
-            idToken: await getIdToken(linked.user, true),
-          });
-        } catch (completionError) {
-          completed = await statusProviderOperation({
-            operationId: started.operationId,
-            nonce,
-          }).catch(() => {
-            throw completionError;
-          });
+        assertLinkReady(started);
+        operation = {
+          ...operation,
+          operationId: started.operationId,
+          completionTokenNotBefore: started.completionTokenNotBefore,
+          phase: linkedProviders.has(provider) ? "link_mutated" : "link_ready",
+        };
+        persistPending(operation);
+
+        let linkedUser = firebaseUser;
+        if (!linkedProviders.has(provider)) {
+          setBusyLabel(`${providerLabel(provider)}で認証中`);
+          const linked = await linkWithPopup(
+            firebaseUser,
+            createFirebaseProvider(provider),
+          );
+          linkedUser = linked.user;
+          firebaseLinked = true;
+          setProviderRevision((revision) => revision + 1);
+          operation = { ...operation, phase: "link_mutated" };
+          persistPending(operation);
+        } else {
+          firebaseLinked = true;
         }
-        if (
-          completed.outcome !== "provider_linked" &&
-          completed.outcome !== "provider_already_linked"
-        ) {
-          throw new Error("Invalid provider link completion.");
-        }
-        await refreshUser(linked.user);
-        if (completed.noticeRequired) {
-          publishNotice({ provider, operation: "linked" });
-        }
+
+        setBusyLabel(`${providerLabel(provider)}の追加を確定中`);
+        const completed = await reconcileLinkCompletion(operation, linkedUser);
+        await finishSuccessfulOperation(
+          completed,
+          operation,
+          linkedUser,
+          refreshUser,
+          clearPending,
+          publishNotice,
+        );
       } catch (nextError) {
-        if (!operationId) {
-          const started = await startPromise.catch(() => null);
-          operationId = started?.operationId ?? null;
+        if (
+          operation?.operationId &&
+          operation.phase === "link_ready" &&
+          !firebaseLinked &&
+          isFirebasePopupFailure(nextError)
+        ) {
+          const settled = await settleKnownLinkFailure(
+            operation,
+            providerFailureOutcome(nextError),
+          );
+          if (settled) clearPending(operation);
+        } else if (isDefinitiveStartFailure(nextError, operation)) {
+          if (operation) clearPending(operation);
+        } else if (nextError instanceof TerminalProviderOperationError) {
+          if (operation) clearPending(operation);
         }
-        if (operationId && !firebaseLinked) {
-          await failProviderOperation({
-            operationId,
-            nonce,
-            outcome: providerFailureOutcome(nextError),
-          }).catch(() => undefined);
+        if (
+          !operation ||
+          (activeScopeRef.current &&
+            sameScope(operation, activeScopeRef.current))
+        ) {
+          setError(providerSettingsError(nextError));
         }
-        setError(providerSettingsError(nextError));
       } finally {
         setBusyProvider(null);
+        setBusyLabel(null);
       }
     },
-    [busyProvider, firebaseUser, publishNotice, refreshUser],
+    [
+      busyProvider,
+      clearPending,
+      firebaseUser,
+      linkedProviders,
+      operationFor,
+      persistPending,
+      publishNotice,
+      refreshUser,
+    ],
   );
 
   const unlinkProvider = useCallback(
     async (provider: ManagedProvider) => {
       if (!firebaseUser || busyProvider) return;
       setBusyProvider(provider);
+      setBusyLabel(`${providerLabel(provider)}の解除を再認証中`);
       setError(null);
+      let operation: PendingProviderOperation | null = null;
       try {
-        const result = await startProviderOperation({
-          provider,
-          operation: "unlink",
-          nonce: createAuthFlowNonce(),
-          idToken: await reauthenticateForUnlink(firebaseUser, provider),
-        });
+        operation = operationFor(provider, "unlink");
+        const idToken = await reauthenticateForUnlink(firebaseUser, provider);
+        setBusyLabel(`${providerLabel(provider)}の解除を確定中`);
+        const result = await startWithSameNonce(
+          operation,
+          idToken,
+          persistPending,
+        );
         if (result.outcome !== "provider_unlinked") {
-          throw new Error("Invalid provider unlink response.");
+          throw resultStateError(result);
         }
+        await confirmTerminalStatus(result, operation);
         await refreshUser(firebaseUser);
-        if (result.noticeRequired) {
-          publishNotice({ provider, operation: "unlinked" });
-        }
+        clearPending(operation);
+        if (result.noticeRequired) publishNotice(provider, "unlinked");
         setUnlinkTarget(null);
       } catch (nextError) {
-        setError(providerSettingsError(nextError));
+        if (
+          isDefinitiveStartFailure(nextError, operation) ||
+          nextError instanceof TerminalProviderOperationError
+        ) {
+          if (operation) clearPending(operation);
+        }
+        if (
+          !operation ||
+          (activeScopeRef.current &&
+            sameScope(operation, activeScopeRef.current))
+        ) {
+          setError(providerSettingsError(nextError));
+        }
       } finally {
         setBusyProvider(null);
+        setBusyLabel(null);
       }
     },
-    [busyProvider, firebaseUser, publishNotice, refreshUser],
+    [
+      busyProvider,
+      clearPending,
+      firebaseUser,
+      operationFor,
+      persistPending,
+      publishNotice,
+      refreshUser,
+    ],
   );
 
   const dismissNotice = () => {
@@ -209,68 +396,147 @@ export function ProviderSettings() {
   };
 
   return (
-    <div className="border-border border-t px-2.5 py-2">
-      <p className="mb-1.5 font-medium text-xs">ログイン方法</p>
-      {notice && (
+    <section
+      className="border-border border-t px-3 py-2"
+      aria-label="ログイン方法"
+    >
+      <div className="flex min-h-11 items-center justify-between gap-3">
+        <div>
+          <h3 className="font-semibold text-[13px] tracking-tight">
+            ログイン方法
+          </h3>
+          <p className="text-muted-foreground text-[11px] leading-4">
+            アカウントへの入口を管理
+          </p>
+        </div>
+        {busyLabel && (
+          <div
+            role="status"
+            className="flex items-center gap-1.5 text-muted-foreground text-[11px]"
+          >
+            <LoaderCircle
+              className="size-3.5 animate-spin"
+              aria-hidden="true"
+            />
+            <span>{busyLabel}</span>
+          </div>
+        )}
+      </div>
+
+      {scopedNotice && (
         <div
           role="status"
-          className="mb-2 flex max-w-60 items-start gap-2 rounded-lg bg-emerald-50 px-2 py-1.5 text-emerald-800 text-xs"
+          className="flex min-h-11 items-center gap-2 border-border border-t text-emerald-700 text-xs dark:text-emerald-400"
         >
-          <Check className="mt-0.5 size-3.5 shrink-0" />
+          <Check className="size-3.5 shrink-0" aria-hidden="true" />
           <span className="flex-1">
-            {providerLabel(notice.provider)}を
-            {notice.operation === "linked"
-              ? "追加しました。"
-              : "解除しました。"}
+            {providerLabel(scopedNotice.provider)}を
+            {scopedNotice.operation === "linked"
+              ? "追加しました"
+              : "解除しました"}
           </span>
           <button
             type="button"
             onClick={dismissNotice}
+            className="grid size-11 place-items-center text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
             aria-label="通知を閉じる"
           >
             ×
           </button>
         </div>
       )}
+
+      {scopedPendingOperation && !busyProvider && (
+        <div
+          role="status"
+          className="flex min-h-11 items-center gap-2 border-border border-t text-amber-700 text-xs dark:text-amber-400"
+        >
+          <RotateCcw className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="flex-1">
+            {providerLabel(scopedPendingOperation.provider)}の
+            {scopedPendingOperation.operation === "link" ? "追加" : "解除"}
+            を再開できます
+          </span>
+        </div>
+      )}
+
       {!firebaseUser ? (
-        <p className="max-w-60 text-muted-foreground text-xs leading-5">
-          ログイン方法を管理するには、いったんログアウトして再ログインしてください。
+        <p className="border-border border-t py-3 text-muted-foreground text-xs leading-5">
+          ログイン方法を管理するには、ログアウトして再ログインしてください。
         </p>
       ) : (
-        <div className="space-y-1">
+        <div className="border-border border-t">
           {linkedProviders.has("password") && (
             <ProviderRow label="メールリンク" linked />
           )}
           {PROVIDERS.map(({ id, label }) => {
             const linked = linkedProviders.has(id);
             const lastMethod = linked && usableMethodCount <= 1;
+            const pending = scopedPendingOperation?.provider === id;
+            const blockedByOtherPending = Boolean(
+              scopedPendingOperation && !pending,
+            );
+            const resumeLink =
+              pending && scopedPendingOperation.operation === "link";
+            const resumeUnlink =
+              pending && scopedPendingOperation.operation === "unlink";
             return (
               <ProviderRow
                 key={id}
                 label={label}
                 linked={linked}
                 action={
-                  linked ? (
+                  resumeLink ? (
                     <Button
-                      size="xs"
-                      variant="destructive"
-                      disabled={busyProvider !== null || lastMethod}
-                      onClick={() => setUnlinkTarget(id)}
-                      aria-label={`${label}を解除`}
+                      size="sm"
+                      variant="ghost"
+                      className="h-11 min-w-11 px-2"
+                      disabled={busyProvider !== null}
+                      onClick={() => void linkProvider(id)}
+                      aria-label={`${label}の追加を再開`}
                     >
-                      <Unlink />
-                      解除
+                      <RotateCcw className="size-3.5" />
+                      再開
+                    </Button>
+                  ) : linked ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-11 min-w-11 px-2 text-destructive hover:text-destructive"
+                      disabled={
+                        busyProvider !== null ||
+                        lastMethod ||
+                        blockedByOtherPending
+                      }
+                      onClick={() => setUnlinkTarget(id)}
+                      aria-label={`${label}の解除を${resumeUnlink ? "再開" : "開始"}`}
+                    >
+                      {resumeUnlink ? (
+                        <RotateCcw className="size-3.5" />
+                      ) : (
+                        <Unlink className="size-3.5" />
+                      )}
+                      {resumeUnlink ? "再開" : "解除"}
                     </Button>
                   ) : (
                     <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={busyProvider !== null}
+                      size="sm"
+                      variant="ghost"
+                      className="h-11 min-w-11 px-2"
+                      disabled={busyProvider !== null || blockedByOtherPending}
                       onClick={() => void linkProvider(id)}
-                      aria-label={`${label}を追加`}
+                      aria-label={`${label}を${pending ? "再開" : "追加"}`}
                     >
-                      <Link2 />
-                      {busyProvider === id ? "処理中" : "追加"}
+                      {pending ? (
+                        <RotateCcw className="size-3.5" />
+                      ) : (
+                        <Link2 className="size-3.5" />
+                      )}
+                      {busyProvider === id
+                        ? "処理中"
+                        : pending
+                          ? "再開"
+                          : "追加"}
                     </Button>
                   )
                 }
@@ -278,20 +544,26 @@ export function ProviderSettings() {
             );
           })}
           {usableMethodCount <= 1 && (
-            <p className="max-w-60 text-muted-foreground text-xs leading-5">
+            <p className="border-border border-t py-2 text-muted-foreground text-[11px] leading-4">
               最後のログイン方法は解除できません。先に別の方法を追加してください。
             </p>
           )}
         </div>
       )}
+
       {error && (
-        <p
+        <div
           role="alert"
-          className="mt-2 max-w-60 text-red-600 text-xs leading-5"
+          className="flex gap-2 border-border border-t py-2.5 text-destructive text-xs leading-5"
         >
-          {error}
-        </p>
+          <CircleAlert
+            className="mt-0.5 size-3.5 shrink-0"
+            aria-hidden="true"
+          />
+          <span>{error}</span>
+        </div>
       )}
+
       <AlertDialog
         open={unlinkTarget !== null}
         onOpenChange={(open) => !open && setUnlinkTarget(null)}
@@ -299,19 +571,23 @@ export function ProviderSettings() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {unlinkTarget ? providerLabel(unlinkTarget) : "プロバイダー"}
+              {unlinkTarget ? providerLabel(unlinkTarget) : "ログイン方法"}
               を解除しますか？
             </AlertDialogTitle>
             <AlertDialogDescription>
-              解除すると、この方法ではログインできなくなります。別のリンク済み方法で再認証してから解除します。最後のログイン方法は解除できません。
+              解除後は、この方法でログインできません。別のリンク済み方法で再認証してから解除します。最後のログイン方法は解除できません。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={busyProvider !== null}>
-              キャンセル
+            <AlertDialogCancel
+              className="min-h-11"
+              disabled={busyProvider !== null}
+            >
+              解除しない
             </AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
+              className="min-h-11"
               disabled={!unlinkTarget || busyProvider !== null}
               onClick={() => unlinkTarget && void unlinkProvider(unlinkTarget)}
             >
@@ -320,7 +596,7 @@ export function ProviderSettings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </section>
   );
 }
 
@@ -331,16 +607,222 @@ function ProviderRow({
 }: {
   label: string;
   linked: boolean;
-  action?: React.ReactNode;
+  action?: ReactNode;
 }) {
   return (
-    <div className="flex min-h-8 items-center gap-2 text-xs">
-      <span className="flex-1">{label}</span>
-      <span className="text-muted-foreground">
+    <div className="flex min-h-11 items-center gap-2 border-border border-b text-xs last:border-b-0">
+      <span className="flex-1 font-medium text-[13px] tracking-tight">
+        {label}
+      </span>
+      <span className="text-muted-foreground text-[11px]">
         {linked ? "リンク済み" : "未追加"}
       </span>
       {action}
     </div>
+  );
+}
+
+async function startWithSameNonce(
+  operation: PendingProviderOperation,
+  idToken: string,
+  persist: (operation: PendingProviderOperation) => void,
+): Promise<ProviderOperationResult> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
+    try {
+      const result = await startProviderOperation({
+        provider: operation.provider,
+        operation: operation.operation,
+        nonce: operation.nonce,
+        idToken,
+      });
+      persist({
+        ...operation,
+        operationId: result.operationId,
+        ...(result.completionTokenNotBefore
+          ? { completionTokenNotBefore: result.completionTokenNotBefore }
+          : {}),
+      });
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (
+        !isRetryableProviderError(error) ||
+        attempt === RECOVERY_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      await recoveryPause(attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function reconcileLinkCompletion(
+  operation: PendingProviderOperation,
+  user: User,
+): Promise<ProviderOperationResult> {
+  if (!operation.operationId || !operation.completionTokenNotBefore) {
+    throw new Error("追加処理の状態を確認できませんでした。");
+  }
+  await waitUntil(operation.completionTokenNotBefore);
+  const idToken = await getIdToken(user, true);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
+    const before = await readOperationStatus(operation).catch((error) => {
+      lastError = error;
+      return null;
+    });
+    if (before) {
+      const terminal = terminalLinkResult(before);
+      if (terminal) return terminal;
+    }
+    try {
+      const completed = await completeProviderOperation({
+        operationId: operation.operationId,
+        nonce: operation.nonce,
+        idToken,
+      });
+      const terminal = terminalLinkResult(completed);
+      if (terminal) return terminal;
+    } catch (error) {
+      lastError = error;
+    }
+    const after = await readOperationStatus(operation).catch((error) => {
+      lastError = error;
+      return null;
+    });
+    if (after) {
+      const terminal = terminalLinkResult(after);
+      if (terminal) return terminal;
+    }
+    if (attempt < RECOVERY_ATTEMPTS - 1) await recoveryPause(attempt);
+  }
+  throw new ProviderOperationStillPendingError(
+    "追加結果をまだ確認できません。接続を確認して「再開」を押してください。",
+    lastError,
+  );
+}
+
+async function settleKnownLinkFailure(
+  operation: PendingProviderOperation,
+  outcome: "credential_in_use" | "firebase_operation_failed" | "cancelled",
+): Promise<boolean> {
+  if (!operation.operationId) return false;
+  for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
+    try {
+      await failProviderOperation({
+        operationId: operation.operationId,
+        nonce: operation.nonce,
+        outcome,
+      });
+      return true;
+    } catch {
+      const status = await readOperationStatus(operation).catch(() => null);
+      if (status?.status === "failed") return true;
+      if (attempt < RECOVERY_ATTEMPTS - 1) await recoveryPause(attempt);
+    }
+  }
+  return false;
+}
+
+async function confirmTerminalStatus(
+  result: ProviderOperationResult,
+  operation: PendingProviderOperation,
+): Promise<void> {
+  const withId = { ...operation, operationId: result.operationId };
+  for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
+    try {
+      const status = await readOperationStatus(withId);
+      if (status.outcome === result.outcome) return;
+      if (status.status === "failed") throw terminalResultError(status);
+    } catch (error) {
+      if (!isRetryableProviderError(error)) throw error;
+    }
+    if (attempt < RECOVERY_ATTEMPTS - 1) await recoveryPause(attempt);
+  }
+  // The mutation response itself is terminal. A status outage must not turn a
+  // confirmed backend-owned unlink back into a client-owned pending action.
+}
+
+async function readOperationStatus(
+  operation: PendingProviderOperation,
+): Promise<ProviderOperationResult> {
+  if (!operation.operationId) {
+    throw new Error("変更処理の識別子がありません。");
+  }
+  return statusProviderOperation({
+    operationId: operation.operationId,
+    nonce: operation.nonce,
+  });
+}
+
+function terminalLinkResult(
+  result: ProviderOperationResult,
+): ProviderOperationResult | null {
+  if (isSuccessfulLink(result)) return result;
+  if (result.status === "failed" || isTerminalFailureOutcome(result.outcome)) {
+    throw terminalResultError(result);
+  }
+  return null;
+}
+
+async function finishSuccessfulOperation(
+  result: ProviderOperationResult,
+  operation: PendingProviderOperation,
+  user: User,
+  refresh: (user: User) => Promise<void>,
+  clear: (expected: ProviderScope) => void,
+  publish: (
+    provider: ManagedProvider,
+    operation: "linked" | "unlinked",
+  ) => void,
+): Promise<void> {
+  await refresh(user);
+  clear(operation);
+  if (result.noticeRequired) publish(operation.provider, "linked");
+}
+
+function assertLinkReady(result: ProviderOperationResult): void {
+  if (
+    result.outcome !== "client_operation_required" ||
+    result.clientOperation !== "firebase_link_with_credential" ||
+    !result.completionTokenNotBefore
+  ) {
+    throw resultStateError(result);
+  }
+}
+
+function isSuccessfulLink(result: ProviderOperationResult): boolean {
+  return (
+    result.outcome === "provider_linked" ||
+    result.outcome === "provider_already_linked"
+  );
+}
+
+function isTerminalFailureOutcome(
+  outcome: ProviderOperationResult["outcome"],
+): boolean {
+  return (
+    outcome === "credential_in_use" ||
+    outcome === "firebase_operation_failed" ||
+    outcome === "cancelled" ||
+    outcome === "last_login_method"
+  );
+}
+
+function terminalResultError(
+  result: ProviderOperationResult,
+): TerminalProviderOperationError {
+  return new TerminalProviderOperationError(result.outcome);
+}
+
+function resultStateError(result: ProviderOperationResult): Error {
+  if (isTerminalFailureOutcome(result.outcome) || result.status === "failed") {
+    return terminalResultError(result);
+  }
+  return new ProviderOperationStillPendingError(
+    "変更結果をまだ確認できません。接続を確認して「再開」を押してください。",
   );
 }
 
@@ -365,13 +847,12 @@ async function reauthenticateForUnlink(
       ? firebaseClaims.sign_in_provider
       : "";
   const authTime = token.claims.auth_time;
-  const recentlyAuthenticated =
-    typeof authTime === "number" &&
-    Date.now() / 1000 - authTime >= -60 &&
-    Date.now() / 1000 - authTime <= 240;
+  const age = typeof authTime === "number" ? Date.now() / 1000 - authTime : NaN;
   if (
     signInProvider === "password" &&
-    recentlyAuthenticated &&
+    Number.isFinite(age) &&
+    age >= -60 &&
+    age <= 240 &&
     user.providerData.some(({ providerId }) => providerId === "password")
   ) {
     return token.token;
@@ -390,8 +871,12 @@ function createFirebaseProvider(provider: ManagedProvider) {
 
 async function waitUntil(timestamp: string): Promise<void> {
   const delay = Date.parse(timestamp) - Date.now() + 50;
-  if (delay > 10_000) throw new Error("Provider completion window is invalid.");
+  if (delay > 10_000) throw new Error("追加処理の開始時刻が不正です。");
   if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function recoveryPause(attempt: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
 }
 
 function providerFailureOutcome(error: unknown) {
@@ -404,7 +889,46 @@ function providerFailureOutcome(error: unknown) {
   return "firebase_operation_failed" as const;
 }
 
+function isFirebasePopupFailure(error: unknown): boolean {
+  return error instanceof FirebaseError || error instanceof Error;
+}
+
+function isRetryableProviderError(error: unknown): boolean {
+  if (
+    error instanceof TerminalProviderOperationError ||
+    error instanceof ProviderAccountChangedError
+  ) {
+    return false;
+  }
+  if (!(error instanceof AuthAPIError)) return true;
+  return error.status >= 500 || error.message === "provider_unavailable";
+}
+
+function isDefinitiveStartFailure(
+  error: unknown,
+  operation: PendingProviderOperation | null,
+): boolean {
+  return (
+    Boolean(operation && !operation.operationId) &&
+    error instanceof AuthAPIError &&
+    !isRetryableProviderError(error)
+  );
+}
+
 function providerSettingsError(error: unknown): string {
+  if (error instanceof ProviderOperationStillPendingError) return error.message;
+  if (error instanceof TerminalProviderOperationError) {
+    switch (error.outcome) {
+      case "credential_in_use":
+        return "このログイン方法は別のアカウントで使用されています。";
+      case "last_login_method":
+        return "最後のログイン方法は解除できません。先に別の方法を追加してください。";
+      case "cancelled":
+        return "認証をキャンセルしました。";
+      default:
+        return "ログイン方法を変更できませんでした。接続を確認して再試行してください。";
+    }
+  }
   if (error instanceof AuthAPIError) {
     switch (error.message) {
       case "recent_reauth_required":
@@ -412,16 +936,16 @@ function providerSettingsError(error: unknown): string {
       case "last_login_method":
         return "最後のログイン方法は解除できません。先に別の方法を追加してください。";
       case "provider_operation_pending":
-        return "別のログイン方法の変更が処理中です。少し待ってからお試しください。";
+        return "別のログイン方法の変更が処理中です。保留中の変更を再開してください。";
       case "provider_unavailable":
-        return "ログイン方法を変更できませんでした。時間をおいて再試行してください。";
+        return "結果をまだ確認できません。接続を確認して再試行してください。";
       case "proof_mismatch":
         return "再認証を確認できませんでした。もう一度お試しください。";
     }
   }
   if (error instanceof FirebaseError) {
     if (error.code === "auth/popup-closed-by-user") {
-      return "再認証がキャンセルされました。";
+      return "認証をキャンセルしました。";
     }
     if (error.code === "auth/credential-already-in-use") {
       return "このログイン方法は別のアカウントで使用されています。";
@@ -439,24 +963,124 @@ function providerLabel(provider: ManagedProvider): string {
   return provider === "github.com" ? "GitHub" : "Google";
 }
 
-function loadProviderNotice(): ProviderNotice | null {
-  try {
-    const value: unknown = JSON.parse(
-      sessionStorage.getItem(PROVIDER_NOTICE_KEY) ?? "null",
-    );
-    if (
-      isObject(value) &&
-      (value.provider === "google.com" || value.provider === "github.com") &&
-      (value.operation === "linked" || value.operation === "unlinked")
-    ) {
-      return { provider: value.provider, operation: value.operation };
-    }
-  } catch {
-    // Ignore malformed session-local presentation state.
+function loadScopedNotice(scope: ProviderScope): ProviderNotice | null {
+  const value = readSessionJSON(PROVIDER_NOTICE_KEY);
+  if (!isProviderNotice(value) || !sameScope(value, scope)) {
+    if (value !== null) sessionStorage.removeItem(PROVIDER_NOTICE_KEY);
+    return null;
   }
-  return null;
+  return value;
+}
+
+function loadScopedPendingOperation(
+  scope: ProviderScope,
+): PendingProviderOperation | null {
+  const value = readSessionJSON(PROVIDER_PENDING_KEY);
+  if (!isPendingProviderOperation(value) || !sameScope(value, scope)) {
+    if (value !== null) sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+    return null;
+  }
+  return value;
+}
+
+function clearProviderSessionState(): void {
+  sessionStorage.removeItem(PROVIDER_NOTICE_KEY);
+  sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+}
+
+function readSessionJSON(key: string): unknown {
+  try {
+    return JSON.parse(sessionStorage.getItem(key) ?? "null") as unknown;
+  } catch {
+    sessionStorage.removeItem(key);
+    return null;
+  }
+}
+
+function isProviderNotice(value: unknown): value is ProviderNotice {
+  return (
+    hasScope(value) &&
+    value.version === 1 &&
+    isManagedProvider(value.provider) &&
+    (value.operation === "linked" || value.operation === "unlinked")
+  );
+}
+
+function isPendingProviderOperation(
+  value: unknown,
+): value is PendingProviderOperation {
+  return (
+    hasScope(value) &&
+    value.version === 1 &&
+    isManagedProvider(value.provider) &&
+    (value.operation === "link" || value.operation === "unlink") &&
+    typeof value.nonce === "string" &&
+    value.nonce.length >= 32 &&
+    value.nonce.length <= 128 &&
+    (value.phase === "starting" ||
+      value.phase === "link_ready" ||
+      value.phase === "link_mutated" ||
+      value.phase === "unlink_starting") &&
+    (value.operationId === undefined ||
+      (typeof value.operationId === "string" &&
+        value.operationId.length <= 128)) &&
+    (value.completionTokenNotBefore === undefined ||
+      (typeof value.completionTokenNotBefore === "string" &&
+        Number.isFinite(Date.parse(value.completionTokenNotBefore))))
+  );
+}
+
+function hasScope(
+  value: unknown,
+): value is Record<string, unknown> & ProviderScope {
+  return (
+    isObject(value) &&
+    typeof value.firebaseUid === "string" &&
+    value.firebaseUid.length > 0 &&
+    value.firebaseUid.length <= 128 &&
+    typeof value.humanId === "string" &&
+    value.humanId.length > 0 &&
+    value.humanId.length <= 256
+  );
+}
+
+function sameScope(value: ProviderScope, scope: ProviderScope): boolean {
+  return (
+    value.firebaseUid === scope.firebaseUid && value.humanId === scope.humanId
+  );
+}
+
+function isManagedProvider(value: unknown): value is ManagedProvider {
+  return value === "google.com" || value === "github.com";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+class TerminalProviderOperationError extends Error {
+  readonly outcome: ProviderOperationResult["outcome"];
+
+  constructor(outcome: ProviderOperationResult["outcome"]) {
+    super(outcome);
+    this.name = "TerminalProviderOperationError";
+    this.outcome = outcome;
+  }
+}
+
+class ProviderOperationStillPendingError extends Error {
+  readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "ProviderOperationStillPendingError";
+    this.cause = cause;
+  }
+}
+
+class ProviderAccountChangedError extends Error {
+  constructor() {
+    super("Account changed during provider operation.");
+    this.name = "ProviderAccountChangedError";
+  }
 }

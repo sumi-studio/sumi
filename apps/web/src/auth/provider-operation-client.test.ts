@@ -87,6 +87,9 @@ describe("provider operation client", () => {
       })
       .mockResolvedValueOnce({
         operation_id: "operation-1",
+        provider: "google.com",
+        operation: "link",
+        status: "completed",
         outcome: "provider_linked",
         notice_required: true,
       });
@@ -98,7 +101,12 @@ describe("provider operation client", () => {
     });
     await expect(
       statusProviderOperation({ operationId: "operation-1", nonce: "nonce" }),
-    ).resolves.toMatchObject({ outcome: "provider_linked" });
+    ).resolves.toMatchObject({
+      provider: "google.com",
+      operation: "link",
+      status: "completed",
+      outcome: "provider_linked",
+    });
     expect(clientMocks.postAuthJSON.mock.calls).toEqual([
       [
         "/auth/providers/operations/fail",

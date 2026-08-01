@@ -12,7 +12,12 @@ export interface ProviderOperationResult {
     | "provider_unlinked"
     | "credential_in_use"
     | "firebase_operation_failed"
-    | "cancelled";
+    | "cancelled"
+    | "last_login_method"
+    | "provider_operation_pending";
+  provider?: ManagedProvider;
+  operation?: ProviderOperation;
+  status?: "pending" | "completed" | "failed";
   clientOperation?: "firebase_link_with_credential";
   completionTokenNotBefore?: string;
   expiresAt?: string;
@@ -96,6 +101,9 @@ function parseProviderOperationResult(value: unknown): ProviderOperationResult {
   if (!isObject(value)) throw new Error("Invalid provider operation response.");
   const operationId = value.operation_id;
   const outcome = value.outcome;
+  const provider = value.provider;
+  const operation = value.operation;
+  const status = value.status;
   const clientOperation = value.client_operation;
   const completionTokenNotBefore = value.completion_token_not_before;
   const expiresAt = value.expires_at;
@@ -105,6 +113,16 @@ function parseProviderOperationResult(value: unknown): ProviderOperationResult {
     operationId.length === 0 ||
     operationId.length > 128 ||
     !isProviderOutcome(outcome) ||
+    (provider !== undefined &&
+      provider !== "google.com" &&
+      provider !== "github.com") ||
+    (operation !== undefined &&
+      operation !== "link" &&
+      operation !== "unlink") ||
+    (status !== undefined &&
+      status !== "pending" &&
+      status !== "completed" &&
+      status !== "failed") ||
     (clientOperation !== undefined &&
       clientOperation !== "firebase_link_with_credential") ||
     (completionTokenNotBefore !== undefined &&
@@ -117,6 +135,9 @@ function parseProviderOperationResult(value: unknown): ProviderOperationResult {
   return {
     operationId,
     outcome,
+    ...(provider ? { provider } : {}),
+    ...(operation ? { operation } : {}),
+    ...(status ? { status } : {}),
     ...(clientOperation ? { clientOperation } : {}),
     ...(completionTokenNotBefore ? { completionTokenNotBefore } : {}),
     ...(expiresAt ? { expiresAt } : {}),
@@ -134,7 +155,9 @@ function isProviderOutcome(
     value === "provider_unlinked" ||
     value === "credential_in_use" ||
     value === "firebase_operation_failed" ||
-    value === "cancelled"
+    value === "cancelled" ||
+    value === "last_login_method" ||
+    value === "provider_operation_pending"
   );
 }
 
