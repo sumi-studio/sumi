@@ -176,7 +176,10 @@ export function ConversationVirtualizer<
       scrollToMessage,
       getScrollOffset: () => viewportRef.current?.scrollTop ?? null,
       scrollToOffset: (offset: number) => {
-        programmaticScrollRef.current.cancelled = false;
+        // Scroll restoration lands mid-history; the follow backstop must
+        // not pull the view back to the end afterwards. It re-arms by
+        // itself when the restored position is the end.
+        followRef.current = false;
         viewportRef.current?.scrollTo({ top: offset, behavior: "auto" });
       },
       getScrollElement: () => viewportRef.current,
