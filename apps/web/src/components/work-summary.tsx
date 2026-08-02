@@ -40,7 +40,10 @@ const TOOL_ICONS = {
 } as const;
 
 export function WorkSummary({ run, onOpenChange }: WorkSummaryProps) {
-  const [open, setOpen] = useState(false);
+  // Open while the agent is working, closed once it finishes — unless the
+  // user has toggled the section, in which case their choice wins.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? run.status === "running";
   const trace = getInspectableTrace(run.trace);
 
   if (trace.length === 0) {
@@ -52,7 +55,7 @@ export function WorkSummary({ run, onOpenChange }: WorkSummaryProps) {
       <Collapsible
         open={open}
         onOpenChange={(nextOpen) => {
-          setOpen(nextOpen);
+          setUserOpen(nextOpen);
           onOpenChange?.(nextOpen);
         }}
         className="text-sm"

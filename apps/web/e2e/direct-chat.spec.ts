@@ -91,7 +91,8 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     await expect(
       page.getByText("streamed assistant", { exact: true }),
     ).toBeVisible();
-    await page.getByText("作業中", { exact: true }).click();
+    // While the run is active the work section is expanded by default.
+    await expect(page.getByText("作業中", { exact: true })).toBeVisible();
     await expect(
       page.getByText("read_fileを完了", { exact: true }),
     ).toBeVisible();
