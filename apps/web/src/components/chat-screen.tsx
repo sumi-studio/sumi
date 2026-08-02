@@ -34,12 +34,16 @@ export function ChatScreen() {
 }
 
 const WAITING_ROW_ID = "__sumi_waiting_for_first_token__";
-const BOTTOM_SPACER_ROW_ID = "__sumi_conversation_bottom_spacer__";
+/**
+ * Breathing room below the last row. Kept as virtualizer padding instead of
+ * a trailing spacer row: a constant trailing key would hide appends from the
+ * virtualizer's end-follow detection, leaving the view behind new messages.
+ */
+const CONVERSATION_BOTTOM_PADDING = 24;
 
 type ConversationRow =
   | ChatItem
-  | { id: typeof WAITING_ROW_ID; kind: "waiting" }
-  | { id: typeof BOTTOM_SPACER_ROW_ID; kind: "spacer" };
+  | { id: typeof WAITING_ROW_ID; kind: "waiting" };
 
 function ChatScreenContent() {
   const {
@@ -99,7 +103,6 @@ function ChatScreenContent() {
     if (waitingForFirstToken) {
       nextRows.push({ id: WAITING_ROW_ID, kind: "waiting" });
     }
-    nextRows.push({ id: BOTTOM_SPACER_ROW_ID, kind: "spacer" });
     return nextRows;
   }, [items, waitingForFirstToken]);
   const onVisibleRowsChange = useCallback(
@@ -166,6 +169,7 @@ function ChatScreenContent() {
             ref={conversationRef}
             items={rows}
             busy={running}
+            paddingEnd={CONVERSATION_BOTTOM_PADDING}
             ariaLabel="Sumiとの会話"
             className="scroll-fade-b scrollbar-ui scrollbar-gutter-stable size-full min-h-0 min-w-0 overscroll-contain contain-content"
             onAtEndChange={setAtEnd}
@@ -188,8 +192,6 @@ function ChatScreenContent() {
                   </div>
                 );
               }
-              if (row.kind === "spacer") return <div className="h-6" />;
-
               return (
                 <div className="mx-auto w-full max-w-2xl px-4 sm:px-6">
                   <Suspense fallback={null}>
@@ -334,7 +336,7 @@ function ChatScreenContent() {
 }
 
 function transcriptText(row: ConversationRow): string | null {
-  if (row.kind === "waiting" || row.kind === "spacer") return null;
+  if (row.kind === "waiting") return null;
   switch (row.kind) {
     case "user":
       return `あなた: ${row.text}`;

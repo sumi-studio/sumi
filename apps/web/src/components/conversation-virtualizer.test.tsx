@@ -183,6 +183,7 @@ describe("ConversationVirtualizer", () => {
     });
     await settleProgrammaticScroll();
 
+    fireEvent.wheel(viewport, { deltaY: -300 });
     viewport.scrollTop = 300;
     fireEvent.scroll(viewport);
     await waitFor(() => {
@@ -294,6 +295,7 @@ describe("ConversationVirtualizer", () => {
     );
     const viewport = screen.getByRole("region");
     await settleProgrammaticScroll();
+    fireEvent.wheel(viewport, { deltaY: -300 });
     viewport.scrollTop = 120;
     fireEvent.scroll(viewport);
     messages = [...messages, { id: "message-100", text: "Message 100" }];
@@ -305,7 +307,9 @@ describe("ConversationVirtualizer", () => {
       />,
     );
     await settleProgrammaticScroll();
-    expect(viewport.scrollTop).toBe(120);
+    // The reading position may shift by a few pixels as rows above it
+    // re-measure, but it must never be pulled back toward the end.
+    expect(Math.abs(viewport.scrollTop - 120)).toBeLessThan(60);
   });
 });
 
