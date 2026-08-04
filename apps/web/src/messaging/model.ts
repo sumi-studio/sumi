@@ -147,6 +147,36 @@ export interface ReadMarker {
   lastReadSeq: number;
 }
 
+/**
+ * 通知の強さ。受信側が place ごとに決める。
+ * mute は「件数は数えるが呼ばない」— 未読が消えるわけではない。
+ */
+export type NotificationLevel = "all" | "mentions" | "mute";
+
+/**
+ * なぜ今呼ばれたのか。サーバーが送信時に評価して、呼んだ相手のwireにだけ載せる。
+ * 優先度は dm > mention > keyword > all で、mute はすべてを抑制する。
+ */
+export type NotifyReason = "dm" | "mention" | "keyword" | "all";
+
+/**
+ * 本人が所有し、本人だけが変更する通知設定（human/agent同型）。
+ * agentにとっては覚醒トリガの発火条件でもあるので、UI専用の概念にしない。
+ */
+export interface NotificationSetting {
+  owner: ParticipantRef;
+  defaults: { level: NotificationLevel };
+  perPlace: { place: Place; level: NotificationLevel }[];
+  keywords: string[];
+}
+
+/** 設定の更新入力。ownerは認証済みsessionが決めるので載せない。 */
+export interface NotificationSettingInput {
+  defaults: { level: NotificationLevel };
+  perPlace: { place: Place; level: NotificationLevel }[];
+  keywords: string[];
+}
+
 /** 履歴をまだ取得していないplaceにも表示できる、認証済みparticipant向け集計。 */
 export interface UnreadSummary {
   place: Place;
@@ -156,7 +186,15 @@ export interface UnreadSummary {
 }
 
 export type ServerEvent =
-  | { type: "message_created"; message: Message }
+  /**
+   * notifyは受信者ごとに異なる。nullは欠損ではなく「あなたを呼んではいない」
+   * というサーバーの答えで、mute/mentionsの判定はここで既に済んでいる。
+   */
+  | {
+      type: "message_created";
+      message: Message;
+      notify: { reason: NotifyReason } | null;
+    }
   | { type: "message_edited"; message: Message }
   | { type: "message_deleted"; message: Message }
   | { type: "typing"; place: Place; participant: ParticipantRef }
@@ -186,6 +224,7 @@ export interface MessagingCapabilities {
   status: boolean;
   replyLater: boolean;
   reactions: boolean;
+  notifications: boolean;
 }
 
 /**
@@ -206,6 +245,8 @@ export interface MessagingBackend {
     readMarkers: ReadMarker[];
     unreadSummaries: UnreadSummary[];
     replyLaterMarkers: ReplyLaterMarker[];
+    /** 自分の通知設定。muteしたplaceを最初の描画から薄くするために要る。 */
+    notificationSetting: NotificationSetting;
     /** 自分がEmployerである人格agent。直通（生の直接回線）の対象。 */
     employedAgents: ParticipantRef[];
   }>;
@@ -225,6 +266,8 @@ export interface MessagingBackend {
   ): Promise<void>;
   resolveReplyLater(markerId: string): Promise<void>;
   toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
+  setNotificationSetting(input: NotificationSettingInput): Promise<void>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

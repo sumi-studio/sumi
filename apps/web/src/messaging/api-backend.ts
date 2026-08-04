@@ -4,6 +4,10 @@ import type {
   MemberProfile,
   Message,
   MessagingBackend,
+  NotificationLevel,
+  NotificationSetting,
+  NotificationSettingInput,
+  NotifyReason,
   ParticipantRef,
   ParticipantStatus,
   Place,
@@ -39,6 +43,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     status: true,
     replyLater: true,
     reactions: true,
+    notifications: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -131,6 +136,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       readMarkers,
       unreadSummaries,
       replyLaterMarkers,
+      notificationSetting: parseNotificationSetting(body.notification_setting),
       employedAgents: [],
     };
   }
@@ -233,6 +239,21 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  /** PUTは全置換。クライアントは常に現在値を持っているので差分は要らない。 */
+  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+    await this.request("/messaging/notification-settings", {
+      method: "PUT",
+      body: {
+        defaults: { level: input.defaults.level },
+        per_place: input.perPlace.map((entry) => ({
+          place: placeToWire(entry.place),
+          level: entry.level,
+        })),
+        keywords: input.keywords,
+      },
+    });
+  }
+
   sendTyping(place: Place): void {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     this.socket.send(
@@ -329,8 +350,12 @@ export class ApiMessagingBackend implements MessagingBackend {
     const wire = asRecord(frame.event);
     const eventType = asString(wire.type);
     let parsed: ServerEvent;
-    if (
-      eventType === "message_created" ||
+    if (eventType === "message_created") {
+      const message = parseMessage(wire.message);
+      this.cursors.set(placeID(message.place), message.seq);
+      // notifyが無いことは欠損ではなく「呼んでいない」という答え。
+      parsed = { type: eventType, message, notify: parseNotify(wire.notify) };
+    } else if (
       eventType === "message_edited" ||
       eventType === "message_deleted"
     ) {
@@ -411,6 +436,51 @@ export class ApiMessagingBackend implements MessagingBackend {
 
 function placeID(place: Place): string {
   return place.kind === "channel" ? place.channelId : place.dmId;
+}
+
+function placeToWire(place: Place): Record<string, string> {
+  return place.kind === "channel"
+    ? { kind: place.kind, channel_id: place.channelId }
+    : { kind: place.kind, dm_id: place.dmId };
+}
+
+function parseNotify(value: unknown): { reason: NotifyReason } | null {
+  if (value == null) return null;
+  const wire = asRecord(value);
+  const reason = asString(wire.reason);
+  if (
+    reason === "dm" ||
+    reason === "mention" ||
+    reason === "keyword" ||
+    reason === "all"
+  ) {
+    return { reason };
+  }
+  // 未知のreasonはfail-closedに無視する（呼ばれなかったのと同じ扱い）。
+  return null;
+}
+
+function asNotificationLevel(value: unknown): NotificationLevel {
+  if (value === "all" || value === "mentions" || value === "mute") return value;
+  throw new Error("invalid notification level");
+}
+
+function parseNotificationSetting(value: unknown): NotificationSetting {
+  const wire = asRecord(value);
+  return {
+    owner: parseParticipant(wire.owner),
+    defaults: {
+      level: asNotificationLevel(asRecord(wire.defaults).level),
+    },
+    perPlace: asArray(wire.per_place).map((entry) => {
+      const item = asRecord(entry);
+      return {
+        place: parsePlace(item.place),
+        level: asNotificationLevel(item.level),
+      };
+    }),
+    keywords: asArray(wire.keywords).map(asString),
+  };
 }
 
 function parseParticipant(value: unknown): ParticipantRef {

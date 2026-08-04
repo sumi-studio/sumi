@@ -46,6 +46,12 @@ const bootstrap = {
     replyLaterWire("marker-1", "human-2"),
     replyLaterWire("marker-2", "human-1", "2026-08-01T11:00:00Z"),
   ],
+  notification_setting: {
+    owner: { kind: "human", human_id: "human-1" },
+    defaults: { level: "mentions" },
+    per_place: [{ place: channelWire(), level: "mute" }],
+    keywords: ["デプロイ"],
+  },
 };
 
 afterEach(() => {
@@ -352,6 +358,89 @@ describe("ApiMessagingBackend", () => {
         },
       },
       { type: "reply_later_resolved", markerId: "marker-4" },
+    ]);
+  });
+
+  it("carries the receiver's notification setting and the per-recipient notify", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (
+          path === "/messaging/notification-settings" &&
+          init?.method === "PUT"
+        ) {
+          return json({
+            owner: { kind: "human", human_id: "human-1" },
+            defaults: { level: "all" },
+            per_place: [{ place: channelWire(), level: "mentions" }],
+            keywords: ["リリース"],
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    expect(backend.capabilities.notifications).toBe(true);
+
+    const snapshot = await backend.bootstrap();
+    expect(snapshot.notificationSetting).toEqual({
+      owner: { kind: "human", humanId: "human-1" },
+      defaults: { level: "mentions" },
+      perPlace: [{ place: channel, level: "mute" }],
+      keywords: ["デプロイ"],
+    });
+
+    await backend.setNotificationSetting({
+      defaults: { level: "all" },
+      perPlace: [{ place: channel, level: "mentions" }],
+      keywords: ["リリース"],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/notification-settings",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          defaults: { level: "all" },
+          per_place: [
+            {
+              place: { kind: "channel", channel_id: "channel-1" },
+              level: "mentions",
+            },
+          ],
+          keywords: ["リリース"],
+        }),
+      }),
+    );
+
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    // 呼ばれた人のwireにだけ notify が載る。
+    socket?.message({
+      type: "event",
+      event: {
+        type: "message_created",
+        place_id: "channel-1",
+        message: messageWire(6, "@yohaku 例の件"),
+        notify: { reason: "mention" },
+      },
+    });
+    // 呼ばれていない人には無い。欠損ではなく「呼んでいない」という答え。
+    socket?.message({
+      type: "event",
+      event: {
+        type: "message_created",
+        place_id: "channel-1",
+        message: messageWire(7, "ふつうの発言"),
+      },
+    });
+    expect(events).toMatchObject([
+      { type: "message_created", notify: { reason: "mention" } },
+      { type: "message_created", notify: null },
     ]);
   });
 });

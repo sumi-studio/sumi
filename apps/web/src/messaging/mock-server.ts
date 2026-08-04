@@ -7,6 +7,9 @@ import type {
   MemberProfile,
   Message,
   MessagingBackend,
+  NotificationSetting,
+  NotificationSettingInput,
+  NotifyReason,
   ParticipantRef,
   ParticipantStatus,
   Place,
@@ -331,12 +334,20 @@ export class MockMessagingServer implements MessagingBackend {
     status: true,
     replyLater: true,
     reactions: true,
+    notifications: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
+  private notificationSetting: NotificationSetting = {
+    owner: SELF,
+    defaults: { level: "all" },
+    perPlace: [],
+    keywords: [],
+  };
   /** 同じagentへの呼びかけは直列に処理される（人格は複製しない）。 */
   private readonly agentNextFreeAt = new Map<string, number>();
 
@@ -390,8 +401,40 @@ export class MockMessagingServer implements MessagingBackend {
       readMarkers,
       unreadSummaries,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
+      notificationSetting: this.notificationSetting,
       employedAgents: [SUMI],
     };
+  }
+
+  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+    this.notificationSetting = { owner: SELF, ...input };
+  }
+
+  /**
+   * 受信者（このモックでは常にSELF）を呼ぶかどうか。優先度は
+   * dm > mention > keyword > all、muteはすべてを抑制する——実サーバーと同じ規則。
+   */
+  private notifyFor(message: Message): { reason: NotifyReason } | null {
+    if (sameParticipant(message.author, SELF)) return null;
+    const key = placeKey(message.place);
+    const override = this.notificationSetting.perPlace.find(
+      (entry) => placeKey(entry.place) === key,
+    );
+    const level = override?.level ?? this.notificationSetting.defaults.level;
+    if (level === "mute") return null;
+    if (message.place.kind !== "channel") return { reason: "dm" };
+    if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
+      return { reason: "mention" };
+    }
+    const content = message.content.toLowerCase();
+    if (
+      this.notificationSetting.keywords.some(
+        (keyword) => keyword && content.includes(keyword.toLowerCase()),
+      )
+    ) {
+      return { reason: "keyword" };
+    }
+    return level === "all" ? { reason: "all" } : null;
   }
 
   async fetchMessages(
@@ -429,7 +472,11 @@ export class MockMessagingServer implements MessagingBackend {
           clientNonce: input.clientNonce,
         });
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
-        this.emit({ type: "message_created", message: { ...message } });
+        this.emit({
+          type: "message_created",
+          message: { ...message },
+          notify: this.notifyFor(message),
+        });
         this.scheduleAgentResponses(message);
         resolve({ messageId: message.messageId, seq: message.seq });
       }, SEND_LATENCY_MS);
@@ -705,7 +752,11 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: "normal",
       replyTo: trigger.messageId,
     });
-    this.emit({ type: "message_created", message: { ...message } });
+    this.emit({
+      type: "message_created",
+      message: { ...message },
+      notify: this.notifyFor(message),
+    });
   }
 
   private scheduleTypingUntil(
