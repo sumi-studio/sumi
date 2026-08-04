@@ -1,7 +1,11 @@
 import {
+  AtSign,
+  ChartBarBig,
   CornerUpLeft,
   Loader2,
+  MessagesSquare,
   Paperclip,
+  SendHorizontal,
   TriangleAlert,
   X,
 } from "lucide-react";
@@ -17,6 +21,8 @@ import {
 } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
+import type { ComposerPlusMenuItem } from "./composer-plus-menu";
+import { ComposerPlusMenu } from "./composer-plus-menu";
 import { formatFileSize } from "./message-attachments";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -131,22 +137,53 @@ export function Composer() {
       .slice(0, 6);
   }, [mention, membersByKey, selfKey]);
 
+  // 入力値の置き場所（draft）だけを面倒みる。
+  // メンション候補の開閉は呼び出し側の事情で変わるのでここには含めない。
+  const writeValue = useCallback(
+    (next: string) => {
+      if (!activePlaceKey) return;
+      setDraft(activePlaceKey, next);
+      const now = Date.now();
+      if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
+        lastTypingAt.current = now;
+        sendTyping();
+      }
+    },
+    [activePlaceKey, setDraft, sendTyping],
+  );
+
   const updateValue = useCallback(
     (next: string) => {
-      if (activePlaceKey) {
-        setDraft(activePlaceKey, next);
-        const now = Date.now();
-        if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
-          lastTypingAt.current = now;
-          sendTyping();
-        }
-      }
+      writeValue(next);
       const caret = textareaRef.current?.selectionStart ?? next.length;
       setMention(findMentionQuery(next, caret));
       setMentionIndex(0);
     },
-    [activePlaceKey, setDraft, sendTyping],
+    [writeValue],
   );
+
+  /**
+   * カーソル位置に @ を差し込み、キーボードで打ったのと同じ候補パネルを開く。
+   * 直前が文字ならスペースを補う（findMentionQueryが語頭の @ しか拾わないため）。
+   * DOMのcaretはまだ更新前なので、候補の範囲は挿入後の位置から直接組み立てる。
+   */
+  const insertMentionTrigger = useCallback(() => {
+    const textarea = textareaRef.current;
+    const caret = textarea?.selectionStart ?? value.length;
+    const before = value.slice(0, caret);
+    const inserted = before === "" || /\s$/.test(before) ? "@" : " @";
+    const next = before + inserted + value.slice(caret);
+    const nextCaret = caret + inserted.length;
+    writeValue(next);
+    setMention({ query: "", start: nextCaret - 1, end: nextCaret });
+    setMentionIndex(0);
+    window.requestAnimationFrame(() => {
+      const current = textareaRef.current;
+      if (!current) return;
+      current.focus();
+      current.setSelectionRange(nextCaret, nextCaret);
+    });
+  }, [value, writeValue]);
 
   const applyMention = useCallback(
     (member: MemberProfile) => {
@@ -238,6 +275,46 @@ export function Composer() {
     setUrgency("normal");
     setMention(null);
   }, [value, send, urgency, uploading, readyAttachments]);
+
+  // 送信できるかどうかの判定は送信ボタンの活殺とEnter送信で同じものを使う。
+  const canSend =
+    !uploading && (value.trim().length > 0 || readyAttachments.length > 0);
+
+  // ＋メニューの品書き。まだ中身のない導線も準備中として席だけ用意しておく
+  // （並行して作られている機能が届いたら、この配列に繋ぎ込むだけで済む）。
+  const plusItems = useMemo<ComposerPlusMenuItem[]>(
+    () => [
+      {
+        id: "attach",
+        label: "ファイルを添付",
+        hint: "画像・書類",
+        icon: Paperclip,
+        onSelect: () => fileInputRef.current?.click(),
+      },
+      {
+        id: "mention",
+        label: "メンション",
+        hint: "@ で相手を呼ぶ",
+        icon: AtSign,
+        onSelect: insertMentionTrigger,
+      },
+      {
+        id: "thread",
+        label: "スレッドを作成",
+        hint: "準備中",
+        icon: MessagesSquare,
+        disabled: true,
+      },
+      {
+        id: "poll",
+        label: "投票を作成",
+        hint: "準備中",
+        icon: ChartBarBig,
+        disabled: true,
+      },
+    ],
+    [insertMentionTrigger],
+  );
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -340,8 +417,11 @@ export function Composer() {
                   name={member.displayName}
                   size={20}
                 />
-                <span className="font-medium">{member.displayName}</span>
-                <span className="truncate text-muted-foreground text-xs">
+                <span className="shrink-0 font-medium">
+                  {member.displayName}
+                </span>
+                {/* 説明は右端に寄せて、名前だけを目で追えるようにする。 */}
+                <span className="ml-auto truncate text-muted-foreground text-xs">
                   {member.tagline}
                 </span>
               </button>
@@ -455,15 +535,7 @@ export function Composer() {
               event.target.value = "";
             }}
           />
-          <button
-            type="button"
-            title="ファイルを添付"
-            aria-label="ファイルを添付"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            <Paperclip className="size-3.5" />
-          </button>
+          <ComposerPlusMenu items={plusItems} finalFocusRef={textareaRef} />
           <div className="flex items-center rounded-md bg-muted/60 p-0.5">
             {URGENCIES.map((entry) => (
               <button
@@ -483,9 +555,22 @@ export function Composer() {
               </button>
             ))}
           </div>
-          <span className="ml-auto text-[11px] text-muted-foreground/60">
-            {uploading ? "アップロード中…" : "Enterで送信・Shift+Enterで改行"}
-          </span>
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            <span className="hidden truncate text-[11px] text-muted-foreground/60 sm:inline">
+              {uploading ? "アップロード中…" : "Enterで送信・Shift+Enterで改行"}
+            </span>
+            {/* キーボードを使わずに送れる口。Enter送信と同じsubmitを呼ぶ。 */}
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!canSend}
+              title="送信（Enter）"
+              aria-label="送信"
+              className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-opacity enabled:hover:opacity-90 disabled:bg-muted disabled:text-muted-foreground/60"
+            >
+              <SendHorizontal className="size-3.5" />
+            </button>
+          </div>
         </div>
       </div>
     </div>
