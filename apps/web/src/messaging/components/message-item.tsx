@@ -25,6 +25,7 @@ import {
 import { memo, type ReactNode, useMemo } from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
+import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { ParticipantAvatar } from "./participant-avatar";
 
@@ -255,13 +256,17 @@ export const MessageItem = memo(function MessageItem({
                 <UrgencyChip urgency={message.urgency} />
               </span>
             ) : null}
-            <MessageContent
-              content={message.content}
-              members={membersByKey}
-              selfKey={selfKey}
-              trailer={editedTrailer}
-            />
+            {/* 添付だけのメッセージは本文を持たない。空のMarkdownを描かない。 */}
+            {message.content ? (
+              <MessageContent
+                content={message.content}
+                members={membersByKey}
+                selfKey={selfKey}
+                trailer={editedTrailer}
+              />
+            ) : null}
           </div>
+          <MessageAttachments attachments={message.attachments} />
           {allowReactions ? (
             <ReactionChips
               message={message}

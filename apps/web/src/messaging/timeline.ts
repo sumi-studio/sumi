@@ -1,4 +1,4 @@
-import type { Message, ParticipantKey, Urgency } from "./model";
+import type { Attachment, Message, ParticipantKey, Urgency } from "./model";
 import { participantKey } from "./model";
 
 /**
@@ -13,6 +13,8 @@ export interface PendingMessage {
   clientNonce: string;
   content: string;
   mentions: Message["mentions"];
+  /** アップロード済みで、この送信に載せる添付。 */
+  attachments: Attachment[];
   urgency: Urgency;
   replyTo: string | null;
   createdAt: number;
@@ -209,6 +211,7 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
         mentions: entry.mentions,
         urgency: entry.urgency,
         reactions: [],
+        attachments: entry.attachments,
         replyTo: entry.replyTo,
         createdAt: entry.createdAt,
         editedAt: null,

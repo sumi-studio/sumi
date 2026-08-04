@@ -72,6 +72,7 @@ describe("ApiMessagingBackend", () => {
         urgency: "normal",
         replyTo: null,
         clientNonce: "nonce-1",
+        attachments: [],
       }),
     ).resolves.toEqual({ messageId: "message-2", seq: 2 });
     await backend.markRead(channel, 2);
@@ -84,6 +85,107 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ seq: 2 }),
       }),
     );
+  });
+
+  it("uploads an attachment as multipart and sends its id with the message", async () => {
+    const requests: { path: string; init?: RequestInit }[] = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        requests.push({ path, init });
+        if (path === "/messaging/attachments") {
+          return json(
+            {
+              attachment_id: "attachment-1",
+              filename: "shot.png",
+              mime: "image/png",
+              size: 2048,
+            },
+            201,
+          );
+        }
+        if (path.endsWith("/messages") && init?.method === "POST") {
+          return json({ message_id: "message-2", seq: 2 }, 201);
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    const file = new File([new Uint8Array([1, 2, 3])], "shot.png", {
+      type: "image/png",
+    });
+    const attachment = await backend.uploadAttachment(file);
+    expect(attachment).toEqual({
+      attachmentId: "attachment-1",
+      filename: "shot.png",
+      mime: "image/png",
+      size: 2048,
+      // 取得先は境界がこの形に決める。可視性はサーバーが検査する。
+      url: "/messaging/attachments/attachment-1",
+    });
+    const upload = requests[0];
+    expect(upload.init?.method).toBe("POST");
+    expect(upload.init?.credentials).toBe("include");
+    // boundary付きContent-Typeはブラウザに決めさせる。
+    expect(upload.init?.headers).not.toHaveProperty("Content-Type");
+    const form = upload.init?.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect((form.get("file") as File).name).toBe("shot.png");
+
+    await backend.sendMessage({
+      place: channel,
+      content: "見て",
+      urgency: "normal",
+      replyTo: null,
+      clientNonce: "nonce-1",
+      attachments: [attachment.attachmentId],
+    });
+    expect(JSON.parse(String(requests[1].init?.body))).toEqual({
+      content: "見て",
+      urgency: "normal",
+      reply_to: "",
+      client_nonce: "nonce-1",
+      attachments: ["attachment-1"],
+    });
+  });
+
+  it("projects the attachments a message carries", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === "/messaging/bootstrap") return json(bootstrap);
+        return json({
+          messages: [
+            {
+              ...messageWire(1, "見て"),
+              attachments: [
+                {
+                  attachment_id: "attachment-1",
+                  filename: "shot.png",
+                  mime: "image/png",
+                  size: 2048,
+                },
+              ],
+            },
+          ],
+        });
+      }),
+    );
+    const backend = new ApiMessagingBackend();
+
+    const [message] = await backend.fetchMessages(channel, { limit: 50 });
+
+    expect(message.attachments).toEqual([
+      {
+        attachmentId: "attachment-1",
+        filename: "shot.png",
+        mime: "image/png",
+        size: 2048,
+        url: "/messaging/attachments/attachment-1",
+      },
+    ]);
   });
 
   it("opens one messaging socket, sends cursors, and projects message_created", async () => {
@@ -169,6 +271,7 @@ function messageWire(seq: number, content: string) {
     author: { kind: "human", human_id: "human-1" },
     content,
     mentions: [],
+    attachments: [],
     urgency: "normal",
     reply_to: null,
     client_nonce: `nonce-${seq}`,

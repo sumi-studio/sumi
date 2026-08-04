@@ -1,14 +1,39 @@
-import { CornerUpLeft, Pencil, X } from "lucide-react";
+import {
+  CornerUpLeft,
+  Loader2,
+  Paperclip,
+  Pencil,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { secureRandomUUID } from "../../lib/random-uuid";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
-import type { MemberProfile, Message, Urgency } from "../model";
-import { participantKey } from "../model";
+import type { Attachment, MemberProfile, Message, Urgency } from "../model";
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  participantKey,
+} from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
+import { formatFileSize } from "./message-attachments";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
+
+/**
+ * 送信待ちの添付。アップロードは送信より前に済ませ、送信時にはidを渡すだけ。
+ * 送る前ならいつでも取り消せる。
+ */
+interface DraftAttachment {
+  localId: string;
+  filename: string;
+  size: number;
+  status: "uploading" | "ready" | "failed";
+  attachment?: Attachment;
+}
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
 const NO_MESSAGES: Message[] = [];
@@ -56,6 +81,7 @@ export function Composer() {
   const startEdit = useMessaging((state) => state.startEdit);
   const replyTargetId = useMessaging((state) => state.replyTargetId);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
+  const uploadAttachment = useMessaging((state) => state.uploadAttachment);
 
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -63,7 +89,10 @@ export function Composer() {
   const [editValue, setEditValue] = useState("");
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  const [dragging, setDragging] = useState(false);
   const lastTypingAt = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const editingMessage = editingMessageId
     ? messages.find((entry) => entry.messageId === editingMessageId)
@@ -146,16 +175,89 @@ export function Composer() {
     [mention, value, updateValue],
   );
 
+  // 添付は送信前にアップロードし、送信時にはidを渡すだけにする。
+  // 大きすぎるファイルはサーバーへ運ばずここで落とす（上限は契約と同値）。
+  const addFiles = useCallback(
+    (files: FileList | File[] | null | undefined) => {
+      if (editing) return;
+      const chosen = Array.from(files ?? []);
+      if (chosen.length === 0) return;
+      const room = Math.max(
+        0,
+        MAX_ATTACHMENTS_PER_MESSAGE - attachments.length,
+      );
+      const accepted = chosen.slice(0, room);
+      const drafts: DraftAttachment[] = accepted.map((file) => ({
+        localId: secureRandomUUID(),
+        filename: file.name || "file",
+        size: file.size,
+        status: file.size > MAX_ATTACHMENT_BYTES ? "failed" : "uploading",
+      }));
+      if (drafts.length === 0) return;
+      setAttachments((current) => [...current, ...drafts]);
+      drafts.forEach((draft, index) => {
+        if (draft.status !== "uploading") return;
+        uploadAttachment(accepted[index])
+          .then((attachment) => {
+            setAttachments((current) =>
+              current.map((entry) =>
+                entry.localId === draft.localId
+                  ? { ...entry, status: "ready" as const, attachment }
+                  : entry,
+              ),
+            );
+          })
+          .catch(() => {
+            setAttachments((current) =>
+              current.map((entry) =>
+                entry.localId === draft.localId
+                  ? { ...entry, status: "failed" as const }
+                  : entry,
+              ),
+            );
+          });
+      });
+    },
+    [attachments.length, editing, uploadAttachment],
+  );
+
+  const removeAttachment = useCallback((localId: string) => {
+    setAttachments((current) =>
+      current.filter((entry) => entry.localId !== localId),
+    );
+  }, []);
+
+  const uploading = attachments.some((entry) => entry.status === "uploading");
+  const readyAttachments = useMemo(
+    () =>
+      attachments.flatMap((entry) =>
+        entry.attachment ? [entry.attachment] : [],
+      ),
+    [attachments],
+  );
+
   const submit = useCallback(() => {
     if (editing) {
       submitEdit(editValue);
       return;
     }
-    if (!value.trim()) return;
-    send(value, urgency);
+    // アップロード中に送ると添付を取りこぼす。終わるまで送信しない。
+    if (uploading) return;
+    if (!value.trim() && readyAttachments.length === 0) return;
+    send(value, urgency, readyAttachments);
+    setAttachments([]);
     setUrgency("normal");
     setMention(null);
-  }, [editing, editValue, submitEdit, value, send, urgency]);
+  }, [
+    editing,
+    editValue,
+    submitEdit,
+    value,
+    send,
+    urgency,
+    uploading,
+    readyAttachments,
+  ]);
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -302,12 +404,76 @@ export function Composer() {
           </button>
         </div>
       ) : null}
-      <div className="rounded-xl border border-border bg-background shadow-xs transition-colors focus-within:border-ring/60">
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: ドロップ先は入力欄そのもの。キーボードからはクリップから添付する */}
+      <div
+        className={`rounded-xl border bg-background shadow-xs transition-colors focus-within:border-ring/60 ${
+          dragging ? "border-ring border-dashed bg-accent/40" : "border-border"
+        }`}
+        onDragOver={(event) => {
+          if (editing) return;
+          event.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={(event) => {
+          if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+          setDragging(false);
+        }}
+        onDrop={(event) => {
+          if (editing) return;
+          event.preventDefault();
+          setDragging(false);
+          addFiles(event.dataTransfer.files);
+        }}
+      >
+        {attachments.length > 0 ? (
+          <div className="flex flex-wrap gap-1.5 px-2.5 pt-2.5">
+            {attachments.map((entry) => (
+              <span
+                key={entry.localId}
+                className={`flex max-w-56 items-center gap-1.5 rounded-md border px-2 py-1 text-[12px] ${
+                  entry.status === "failed"
+                    ? "border-rose-500/40 bg-rose-500/8 text-rose-600 dark:text-rose-400"
+                    : "border-border bg-muted/40"
+                }`}
+              >
+                {entry.status === "uploading" ? (
+                  <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
+                ) : entry.status === "failed" ? (
+                  <TriangleAlert className="size-3 shrink-0" />
+                ) : (
+                  <Paperclip className="size-3 shrink-0 text-muted-foreground" />
+                )}
+                <span className="truncate">{entry.filename}</span>
+                <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
+                  {entry.status === "failed"
+                    ? entry.size > MAX_ATTACHMENT_BYTES
+                      ? "大きすぎます"
+                      : "失敗"
+                    : formatFileSize(entry.size)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeAttachment(entry.localId)}
+                  className="shrink-0 rounded p-0.5 hover:bg-accent"
+                  aria-label={`${entry.filename} の添付を取り消す`}
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <textarea
           ref={textareaRef}
           value={value}
           onChange={(event) => updateValue(event.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            // クリップボードの画像・ファイルはそのまま添付にする。
+            if (editing || event.clipboardData.files.length === 0) return;
+            event.preventDefault();
+            addFiles(event.clipboardData.files);
+          }}
           onClick={(event) => {
             const caret = event.currentTarget.selectionStart ?? 0;
             setMention(findMentionQuery(value, caret));
@@ -318,6 +484,28 @@ export function Composer() {
           className="block w-full resize-none bg-transparent px-3.5 pt-3 pb-1.5 text-[13.5px] leading-6 outline-none placeholder:text-muted-foreground/70"
         />
         <div className="flex items-center gap-1 px-2.5 pb-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              addFiles(event.target.files);
+              // 同じファイルを続けて選べるように選択状態を捨てる。
+              event.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            title="ファイルを添付"
+            aria-label="ファイルを添付"
+            onClick={() => fileInputRef.current?.click()}
+            className={`flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground ${
+              editing ? "invisible" : ""
+            }`}
+          >
+            <Paperclip className="size-3.5" />
+          </button>
           {/* 編集中は緊急度セレクタを不可視にするだけで場所は保つ
               （編集開始でツールバー行の高さが変わり入力欄が跳ねないように）。 */}
           <div
@@ -344,7 +532,7 @@ export function Composer() {
             ))}
           </div>
           <span className="ml-auto text-[11px] text-muted-foreground/60">
-            Enterで送信・Shift+Enterで改行
+            {uploading ? "アップロード中…" : "Enterで送信・Shift+Enterで改行"}
           </span>
         </div>
       </div>

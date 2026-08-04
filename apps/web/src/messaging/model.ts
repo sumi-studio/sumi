@@ -65,6 +65,41 @@ export interface ReactionSummary {
   participants: ParticipantRef[];
 }
 
+/**
+ * メッセージが運ぶ添付ファイル。実体はwireに載らず、urlから取得する。
+ * urlはbackend境界が決める（実APIは同一originの `/messaging/attachments/<id>`、
+ * モックはローカルのobject URL）。
+ */
+export interface Attachment {
+  attachmentId: string;
+  filename: string;
+  mime: string;
+  /** バイト数。 */
+  size: number;
+  url: string;
+}
+
+/**
+ * インラインプレビューして良い画像MIME。サーバーが `inline` で配信するものと
+ * 同じ集合に保つ（それ以外はdownloadとして配信されるためimgでは表示できない）。
+ */
+const INLINE_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
+export function isImageAttachment(attachment: Attachment): boolean {
+  return INLINE_IMAGE_MIMES.has(attachment.mime.toLowerCase());
+}
+
+/** 添付できる1ファイルの上限（20MiB）。サーバーのMaxAttachmentBytesと同値。 */
+export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+/** 1メッセージに添付できる件数の上限。サーバーの上限と同値。 */
+export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -76,6 +111,8 @@ export interface Message {
   mentions: ParticipantRef[];
   urgency: Urgency;
   reactions: ReactionSummary[];
+  /** 送信時に紐付いた添付。tombstoneは何も運ばない。 */
+  attachments: Attachment[];
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -168,6 +205,8 @@ export interface SendMessageInput {
   replyTo: string | null;
   /** 必須のidempotency key。再送しても二重投稿にならない。 */
   clientNonce: string;
+  /** 先にアップロード済みの添付id。自分がアップロードしたものだけ紐付く。 */
+  attachments: string[];
 }
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
@@ -210,6 +249,11 @@ export interface MessagingBackend {
     options?: { beforeSeq?: number; limit?: number },
   ): Promise<Message[]>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
+  /**
+   * 送信前にファイルを預ける。返ったAttachmentのidをsendMessageへ渡すまで
+   * どのメッセージにも属さず、アップロードした本人にしか見えない。
+   */
+  uploadAttachment(file: File): Promise<Attachment>;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;

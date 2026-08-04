@@ -1,4 +1,5 @@
 import type {
+  Attachment,
   ConnectionState,
   DmSummary,
   MemberProfile,
@@ -16,6 +17,8 @@ import type {
 import { MAX_SEQ, parsePlaceKey } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** アップロードは最大20MiBを運ぶため、通常のRESTより長い猶予を与える。 */
+const UPLOAD_TIMEOUT_MS = 120_000;
 
 export class MessagingAPIError extends Error {
   readonly code: string;
@@ -152,11 +155,40 @@ export class ApiMessagingBackend implements MessagingBackend {
             urgency: input.urgency,
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
+            attachments: input.attachments,
           },
         },
       ),
     );
     return { messageId: asString(body.message_id), seq: asSeq(body.seq) };
+  }
+
+  /**
+   * multipartで1ファイルを預ける。Content-Typeはboundary付きでブラウザに
+   * 決めさせる（手で設定するとboundaryが失われる）。
+   */
+  async uploadAttachment(file: File): Promise<Attachment> {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const response = await fetch("/messaging/attachments", {
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      body: form,
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      let code = "attachment_upload_failed";
+      try {
+        const failure = asRecord(await response.json());
+        if (typeof failure.error === "string") code = failure.error;
+      } catch {
+        // Status remains the authoritative non-sensitive signal.
+      }
+      throw new MessagingAPIError(code, response.status);
+    }
+    return parseAttachment(await response.json());
   }
 
   async editMessage(
@@ -395,6 +427,22 @@ function parsePlace(value: unknown): Place {
   throw new Error("invalid place");
 }
 
+/**
+ * 添付のwire → domain。urlはこの境界で組み立てる（同一originのセッション付き
+ * GET。可視性はサーバーがmessageのplaceに対して検査する）。
+ */
+function parseAttachment(value: unknown): Attachment {
+  const wire = asRecord(value);
+  const attachmentId = asString(wire.attachment_id);
+  return {
+    attachmentId,
+    filename: asString(wire.filename),
+    mime: asString(wire.mime),
+    size: asSeq(wire.size),
+    url: `/messaging/attachments/${encodeURIComponent(attachmentId)}`,
+  };
+}
+
 function parseMessage(value: unknown): Message {
   const wire = asRecord(value);
   return {
@@ -406,6 +454,7 @@ function parseMessage(value: unknown): Message {
     mentions: asArray(wire.mentions).map(parseParticipant),
     urgency: asUrgency(wire.urgency),
     reactions: [],
+    attachments: asArray(wire.attachments ?? []).map(parseAttachment),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,

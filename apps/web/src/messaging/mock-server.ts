@@ -1,6 +1,7 @@
 import { secureRandomUUID } from "../lib/random-uuid";
 import { hasDisplayMention } from "./mention";
 import type {
+  Attachment,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -138,6 +139,7 @@ function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
     mentions: spec.mentions ?? [],
     urgency: spec.urgency ?? "normal",
     reactions: spec.reactions ?? [],
+    attachments: [],
     replyTo: null,
     createdAt: now - spec.minutesAgo * 60_000,
     editedAt: null,
@@ -339,6 +341,8 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
   /** 同じagentへの呼びかけは直列に処理される（人格は複製しない）。 */
   private readonly agentNextFreeAt = new Map<string, number>();
+  /** 送信前の預かり中の添付。送信で1度だけメッセージへ移る。 */
+  private readonly uploads = new Map<string, Attachment>();
 
   constructor() {
     this.readMarkers = initialReadMarkers(this.history);
@@ -427,6 +431,13 @@ export class MockMessagingServer implements MessagingBackend {
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
+          // 自分がアップロードした未紐付けの添付だけがメッセージに載る。
+          attachments: input.attachments.flatMap((attachmentId) => {
+            const pending = this.uploads.get(attachmentId);
+            if (!pending) return [];
+            this.uploads.delete(attachmentId);
+            return [pending];
+          }),
         });
         // 送信者自身にもmessage_createdをechoし、楽観的描画を確定へ置換する。
         this.emit({ type: "message_created", message: { ...message } });
@@ -434,6 +445,22 @@ export class MockMessagingServer implements MessagingBackend {
         resolve({ messageId: message.messageId, seq: message.seq });
       }, SEND_LATENCY_MS);
     });
+  }
+
+  /**
+   * モックはブラウザ内で完結するため、実体はobject URLで参照する。
+   * 実APIではセッション付きの `/messaging/attachments/<id>` になる。
+   */
+  async uploadAttachment(file: File): Promise<Attachment> {
+    const attachment: Attachment = {
+      attachmentId: secureRandomUUID(),
+      filename: file.name,
+      mime: file.type || "application/octet-stream",
+      size: file.size,
+      url: URL.createObjectURL(file),
+    };
+    this.uploads.set(attachment.attachmentId, attachment);
+    return attachment;
   }
 
   async editMessage(
@@ -587,6 +614,7 @@ export class MockMessagingServer implements MessagingBackend {
     urgency: Message["urgency"];
     replyTo: string | null;
     clientNonce?: string;
+    attachments?: Attachment[];
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -600,6 +628,7 @@ export class MockMessagingServer implements MessagingBackend {
       mentions: input.mentions,
       urgency: input.urgency,
       reactions: [],
+      attachments: input.attachments ?? [],
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
