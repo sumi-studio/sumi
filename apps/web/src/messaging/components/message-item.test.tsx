@@ -8,7 +8,12 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  lockedMessageId,
+  lockMessageActions,
+  resetMessageActionLock,
+} from "../message-action-lock";
 import type {
   MemberProfile,
   Message,
@@ -16,6 +21,7 @@ import type {
   ParticipantRef,
 } from "../model";
 import { participantKey } from "../model";
+import { noteEmojiUsed, resetRecentEmojis } from "../recent-emoji";
 import { MessageItem } from "./message-item";
 
 vi.mock("@tanstack/react-router", () => ({
@@ -93,6 +99,11 @@ function renderItem(
     />,
   );
 }
+
+beforeEach(() => {
+  resetRecentEmojis();
+  resetMessageActionLock();
+});
 
 afterEach(() => {
   cleanup();
@@ -240,5 +251,98 @@ describe("インライン編集", () => {
     fireEvent.click(screen.getByText("保存"));
     expect(onSubmitEdit).not.toHaveBeenCalled();
     expect(onCancelEdit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("リアクションの選択", () => {
+  it("直近使用の3つがピッカー無しでチップに並ぶ", () => {
+    noteEmojiUsed("🔥");
+    noteEmojiUsed("🚀");
+    const onToggleReaction = vi.fn();
+    renderItem(makeMessage(), { onToggleReaction });
+    // 直近が先頭。足りない分は既定で埋める。
+    expect(screen.getByLabelText("進める でリアクション")).toBeVisible();
+    expect(screen.getByLabelText("熱い でリアクション")).toBeVisible();
+    fireEvent.click(screen.getByLabelText("進める でリアクション"));
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "🚀",
+    );
+  });
+
+  it("使った絵文字が直近の先頭へ来る", () => {
+    const { unmount } = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("完了 でリアクション"));
+    unmount();
+    cleanup();
+    renderItem(makeMessage());
+    const quick = screen
+      .getAllByRole("button")
+      .filter((node) =>
+        node.getAttribute("aria-label")?.endsWith("でリアクション"),
+      );
+    expect(quick[0]).toHaveAccessibleName("完了 でリアクション");
+  });
+
+  it("ピッカーは検索・カテゴリ・最近から選べる", async () => {
+    noteEmojiUsed("🐛");
+    const onToggleReaction = vi.fn();
+    renderItem(makeMessage(), { onToggleReaction });
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    const search = await screen.findByLabelText("絵文字を検索");
+    expect(screen.getByText("最近使った絵文字")).toBeVisible();
+    expect(screen.getByTitle("顔・気持ち")).toBeVisible();
+    fireEvent.change(search, { target: { value: "祝" } });
+    const found = await screen.findByTitle("祝う");
+    fireEvent.click(found);
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "🎉",
+    );
+  });
+
+  it("見つからない検索語では素直に見つからないと言う", async () => {
+    renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    const search = await screen.findByLabelText("絵文字を検索");
+    fireEvent.change(search, { target: { value: "zzzznotfound" } });
+    expect(await screen.findByText("見つかりませんでした")).toBeVisible();
+  });
+});
+
+describe("操作対象の固定", () => {
+  it("ピッカーを開いている間、その行が対象を握り続ける", async () => {
+    const { container } = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    await waitFor(() =>
+      expect(
+        container.querySelector("[data-message-id='m1'][data-holds-actions]"),
+      ).not.toBeNull(),
+    );
+  });
+
+  it("他の行がパネルを開いている間は自分のチップを出さない", async () => {
+    // 別のメッセージが対象を握っている状態を作る。
+    const first = renderItem(makeMessage({ messageId: "m1" }));
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    first.unmount();
+    // アンマウントで手放されるので、握ったままの状態を直接作って確認する。
+    lockMessageActions("other");
+    const { container } = renderItem(makeMessage({ messageId: "m1" }));
+    expect(screen.queryByLabelText("返信")).toBeNull();
+    expect(
+      container.querySelector("[data-message-id='m1']")?.className,
+    ).not.toContain("hover:bg-accent");
+  });
+
+  it("行が消えるときは対象の固定を手放す", async () => {
+    const view = renderItem(makeMessage());
+    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    await screen.findByLabelText("絵文字を検索");
+    expect(lockedMessageId()).toBe("m1");
+    view.unmount();
+    expect(lockedMessageId()).toBeNull();
   });
 });

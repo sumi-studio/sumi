@@ -33,8 +33,20 @@ import {
   useRef,
   useState,
 } from "react";
+import { emojiName } from "../emoji-data";
+import {
+  lockMessageActions,
+  releaseMessageActions,
+  useLockedMessageId,
+} from "../message-action-lock";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
+import {
+  noteEmojiUsed,
+  topRecentEmojis,
+  useRecentEmojis,
+} from "../recent-emoji";
+import { EmojiPicker } from "./emoji-picker";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { MessageEditor } from "./message-editor";
@@ -53,8 +65,6 @@ const FULL_FORMAT = new Intl.DateTimeFormat("ja-JP", {
   hour: "2-digit",
   minute: "2-digit",
 });
-
-const REACTION_PALETTE = ["👍", "✅", "👀", "🙏", "🎉", "😄", "❤️", "🤔"];
 
 const REPLY_LATER_OPTIONS: { label: string; delayMs: number }[] = [
   { label: "30分後", delayMs: 30 * 60_000 },
@@ -136,7 +146,11 @@ function ReactionChips({
             key={reaction.emoji}
             type="button"
             title={names}
-            onClick={() => onToggleReaction(message, reaction.emoji)}
+            onClick={() => {
+              // 付けるときだけ「使った」に数える（外すのは使用ではない）。
+              if (!mine) noteEmojiUsed(reaction.emoji);
+              onToggleReaction(message, reaction.emoji);
+            }}
             className={`flex items-center gap-1 rounded-full border px-1.5 py-px text-[12px] transition-colors ${
               mine
                 ? "border-primary/40 bg-primary/10"
@@ -247,10 +261,43 @@ export const MessageItem = memo(function MessageItem({
     });
   }, [message, onCopyLink]);
 
+  // パネル（絵文字ピッカー・後で返信）の開閉はここ1か所に集約する。
+  // 開いている間はこのメッセージが操作の対象を握り、他の行のホバーで
+  // チップが移動しない。Popoverプリミティブを差し替えるときも、
+  // 触るのはこのopenPanelの受け渡しだけで済む。
+  const [openPanel, setOpenPanel] = useState<null | "reaction" | "replyLater">(
+    null,
+  );
+  const lockedId = useLockedMessageId();
+  const holdsTarget = lockedId === message.messageId;
+  // 他のメッセージがパネルを開いている間は、この行のホバー表示を出さない。
+  const suppressed = lockedId !== null && !holdsTarget;
+  const messageId = message.messageId;
+  useEffect(() => {
+    if (openPanel) lockMessageActions(messageId);
+    else releaseMessageActions(messageId);
+  }, [openPanel, messageId]);
+  // 行が消える（仮想リストのアンマウント・place切替）ときも必ず手放す。
+  useEffect(() => () => releaseMessageActions(messageId), [messageId]);
+
+  const recent = useRecentEmojis();
+  const quickEmojis = useMemo(() => topRecentEmojis(recent), [recent]);
+  const chooseEmoji = useCallback(
+    (emoji: string) => {
+      noteEmojiUsed(emoji);
+      onToggleReaction(message, emoji);
+      setOpenPanel(null);
+    },
+    [message, onToggleReaction],
+  );
+
   return (
     <div
       data-message-id={message.messageId}
-      className={`group relative px-4 transition-colors hover:bg-accent sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+      data-holds-actions={holdsTarget ? "" : undefined}
+      className={`group relative px-4 transition-colors sm:px-6 ${grouped ? "py-0.5" : "mt-2.5 py-0.5"} ${
+        suppressed ? "" : "hover:bg-accent"
+      } ${holdsTarget ? "bg-accent" : ""} ${
         mentionsSelf ? "bg-amber-500/6" : ""
       } ${pending && !failed ? "opacity-55" : ""}`}
     >
@@ -258,7 +305,13 @@ export const MessageItem = memo(function MessageItem({
           本文側にも「今どの行に触れているか」を出す。 */}
       <span
         aria-hidden
-        className="pointer-events-none absolute inset-y-0 left-0 w-0.5 bg-transparent transition-colors group-focus-within:bg-primary/50 group-hover:bg-primary/50"
+        className={`pointer-events-none absolute inset-y-0 left-0 w-0.5 transition-colors ${
+          holdsTarget
+            ? "bg-primary/50"
+            : suppressed
+              ? "bg-transparent"
+              : "bg-transparent group-focus-within:bg-primary/50 group-hover:bg-primary/50"
+        }`}
       />
       {replyTarget && replyAuthor ? (
         <button
@@ -382,45 +435,59 @@ export const MessageItem = memo(function MessageItem({
       </div>
       {/* 操作チップは対象行の内側（右上）に置く。行の外へはみ出すと
           どのメッセージに効くのかが読み取れなくなる。 */}
-      {pending || editing ? null : (
-        <div className="pointer-events-none absolute top-0.5 right-3 flex items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+      {pending || editing || suppressed ? null : (
+        <div
+          className={`absolute top-0.5 right-3 flex items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 shadow-sm transition-opacity ${
+            holdsTarget
+              ? "pointer-events-auto opacity-100"
+              : "pointer-events-none opacity-0 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+          }`}
+        >
           {allowReactions ? (
-            <Popover>
-              <PopoverTrigger
-                render={
-                  <button
-                    type="button"
-                    title="リアクション"
-                    aria-label="リアクション"
-                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  />
-                }
+            <>
+              {/* 直近に使った3つはピッカーを開かずに1クリックで置ける。 */}
+              {quickEmojis.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  title={`${emojiName(emoji)} でリアクション`}
+                  aria-label={`${emojiName(emoji)} でリアクション`}
+                  onClick={() => chooseEmoji(emoji)}
+                  className="flex size-7 items-center justify-center rounded-md text-[15px] transition-colors hover:bg-accent"
+                >
+                  {emoji}
+                </button>
+              ))}
+              <Popover
+                open={openPanel === "reaction"}
+                onOpenChange={(next) => setOpenPanel(next ? "reaction" : null)}
               >
-                <SmilePlus className="size-3.5" />
-              </PopoverTrigger>
-              <PopoverContent
-                ref={passthroughRef}
-                side="top"
-                className="flex gap-0.5 p-1"
-              >
-                {REACTION_PALETTE.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    onClick={() => onToggleReaction(message, emoji)}
-                    className="flex size-8 items-center justify-center rounded-md text-[16px] transition-colors hover:bg-accent"
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </PopoverContent>
-            </Popover>
+                <PopoverTrigger
+                  render={
+                    <button
+                      type="button"
+                      title="絵文字を追加"
+                      aria-label="絵文字を追加"
+                      className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    />
+                  }
+                >
+                  <SmilePlus className="size-3.5" />
+                </PopoverTrigger>
+                <PopoverContent ref={passthroughRef} side="top" className="p-1.5">
+                  <EmojiPicker onSelect={chooseEmoji} />
+                </PopoverContent>
+              </Popover>
+            </>
           ) : null}
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
           {own || !allowReplyLater ? null : (
-            <Popover>
+            <Popover
+              open={openPanel === "replyLater"}
+              onOpenChange={(next) => setOpenPanel(next ? "replyLater" : null)}
+            >
               <PopoverTrigger
                 render={
                   <button
@@ -445,7 +512,10 @@ export const MessageItem = memo(function MessageItem({
                   <button
                     key={option.label}
                     type="button"
-                    onClick={() => onReplyLater(message, option.delayMs)}
+                    onClick={() => {
+                      onReplyLater(message, option.delayMs);
+                      setOpenPanel(null);
+                    }}
                     className="w-full rounded-md px-2 py-1 text-left text-[12.5px] transition-colors hover:bg-accent"
                   >
                     {option.label}
