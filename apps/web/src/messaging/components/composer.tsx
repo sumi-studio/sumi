@@ -314,27 +314,31 @@ export function Composer() {
           className="block w-full resize-none bg-transparent px-3.5 pt-3 pb-1.5 text-[13.5px] leading-6 outline-none placeholder:text-muted-foreground/70"
         />
         <div className="flex items-center gap-1 px-2.5 pb-2">
-          {editing ? null : (
-            <div className="flex items-center rounded-md bg-muted/60 p-0.5">
-              {URGENCIES.map((entry) => (
-                <button
-                  key={entry.value}
-                  type="button"
-                  title={entry.hint}
-                  onClick={() => setUrgency(entry.value)}
-                  className={`rounded px-2 py-0.5 font-medium text-[11px] transition-colors ${
-                    urgency === entry.value
-                      ? entry.value === "urgent"
-                        ? "bg-background text-rose-500 shadow-xs"
-                        : "bg-background text-foreground shadow-xs"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {entry.label}
-                </button>
-              ))}
-            </div>
-          )}
+          {/* 編集中は緊急度セレクタを不可視にするだけで場所は保つ
+              （編集開始でツールバー行の高さが変わり入力欄が跳ねないように）。 */}
+          <div
+            className={`flex items-center rounded-md bg-muted/60 p-0.5 ${
+              editing ? "invisible" : ""
+            }`}
+          >
+            {URGENCIES.map((entry) => (
+              <button
+                key={entry.value}
+                type="button"
+                title={entry.hint}
+                onClick={() => setUrgency(entry.value)}
+                className={`rounded px-2 py-0.5 font-medium text-[11px] transition-colors ${
+                  urgency === entry.value
+                    ? entry.value === "urgent"
+                      ? "bg-background text-rose-500 shadow-xs"
+                      : "bg-background text-foreground shadow-xs"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
           <span className="ml-auto text-[11px] text-muted-foreground/60">
             Enterで送信・Shift+Enterで改行
           </span>

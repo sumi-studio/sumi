@@ -331,7 +331,9 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     <div className="flex h-dvh bg-background text-foreground">
       <AppRail activeAppId="home" />
       <Sidebar />
-      <main className="flex min-w-0 flex-1 flex-col">
+      {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
+          開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
+      <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
           {display?.kind === "channel" ? (
             <Hash className="size-4 shrink-0 text-muted-foreground" />
@@ -362,11 +364,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           </span>
         </header>
         <ConnectionBanner />
-        <MessageList handleRef={listRef} />
-        <TypingIndicator />
-        <Composer />
-      </main>
-      {membersOpen ? <MemberList /> : null}
+        <div className="flex min-h-0 flex-1">
+          <main className="flex min-w-0 flex-1 flex-col">
+            <MessageList handleRef={listRef} />
+            <TypingIndicator />
+            <Composer />
+          </main>
+          {membersOpen ? <MemberList /> : null}
+        </div>
+      </div>
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
     </div>
   );
