@@ -36,8 +36,9 @@ use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
 use crate::apiclient::messaging::{
-    MessagingApi, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, WriteMessagingMessageRequest,
+    CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
+    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
+    SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -510,6 +511,30 @@ impl MessagingApi for LocalControlHttpClient {
             MAX_MESSAGING_RESPONSE_BYTES,
         )
         .await
+    }
+
+    async fn set_status(
+        &self,
+        request: SetMessagingStatusRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:status", &request)
+            .await
+    }
+
+    async fn reply_later(
+        &self,
+        request: CreateMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later", &request)
+            .await
+    }
+
+    async fn resolve_reply_later(
+        &self,
+        request: ResolveMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later-resolve", &request)
+            .await
     }
 
     async fn read_through(
