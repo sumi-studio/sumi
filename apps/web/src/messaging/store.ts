@@ -8,6 +8,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   MessagingCapabilities,
   ParticipantKey,
@@ -70,6 +71,8 @@ interface MessagingState {
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannelTopic(channelId: string, topic: string): Promise<void>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
+  /** 可視なplace全体の本文検索。結果はUI局所状態で持ち、storeには残さない。 */
+  searchMessages(query: string): Promise<MessageSearchResult[]>;
   setDraft(key: PlaceKey, draft: string): void;
   send(content: string, urgency: Urgency): void;
   retrySend(clientNonce: string): void;
@@ -558,6 +561,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       return messages.some((message) => message.seq === seq);
+    },
+
+    searchMessages(query) {
+      return backend.searchMessages(query, { limit: 20 });
     },
 
     setDraft(key, draft) {

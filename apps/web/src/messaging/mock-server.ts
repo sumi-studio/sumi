@@ -6,6 +6,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   ParticipantRef,
   ParticipantStatus,
@@ -403,6 +404,39 @@ export class MockMessagingServer implements MessagingBackend {
     const limit = options?.limit ?? 50;
     const slice = messages.filter((message) => message.seq < beforeSeq);
     return slice.slice(Math.max(0, slice.length - limit));
+  }
+
+  async searchMessages(
+    query: string,
+    options?: { place?: Place; limit?: number },
+  ): Promise<MessageSearchResult[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const scope = options?.place
+      ? [placeKey(options.place)]
+      : [...this.history.keys()];
+    const results: MessageSearchResult[] = [];
+    for (const key of scope) {
+      const place = parsePlaceKey(key);
+      if (!place) continue;
+      for (const message of this.history.get(key) ?? []) {
+        if (message.deleted) continue;
+        if (!message.content.toLowerCase().includes(q)) continue;
+        results.push({
+          messageId: message.messageId,
+          place,
+          seq: message.seq,
+          author: message.author,
+          snippet:
+            message.content.length > 120
+              ? `${message.content.slice(0, 120)}…`
+              : message.content,
+          createdAt: message.createdAt,
+        });
+      }
+    }
+    results.sort((a, b) => b.createdAt - a.createdAt);
+    return results.slice(0, options?.limit ?? 20);
   }
 
   async createChannel(

@@ -8,6 +8,7 @@ import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
+import { MessageSearch } from "./message-search";
 import { Sidebar } from "./sidebar";
 
 interface PendingJump {
@@ -379,8 +380,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     (jump: PendingJump) => {
       placeNavigate(jump.placeKey);
       setPendingJump(jump);
+      // seq付きジャンプ（検索結果など）は対象が履歴の彼方にあり得るため、
+      // permalinkと同じ経路で該当seq周辺を読み込んでおく。
+      if (jump.seq !== undefined) {
+        void loadPlaceAround(jump.placeKey, jump.seq);
+      }
     },
-    [placeNavigate],
+    [placeNavigate, loadPlaceAround],
   );
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
@@ -440,6 +446,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            <MessageSearch onJump={requestJump} />
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             <button
               type="button"

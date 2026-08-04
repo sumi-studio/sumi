@@ -86,6 +86,55 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("searches messages over REST and scopes by place", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.startsWith("/messaging/search?")) {
+        return json({
+          results: [
+            {
+              message_id: "message-7",
+              place: channelWire(),
+              seq: 7,
+              author: { kind: "human", human_id: "human-2" },
+              snippet: "…明日の予定はこちら…",
+              created_at: "2026-08-01T10:00:00Z",
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    const results = await backend.searchMessages("予定", {
+      place: channel,
+      limit: 10,
+    });
+    expect(results).toEqual([
+      {
+        messageId: "message-7",
+        place: channel,
+        seq: 7,
+        author: { kind: "human", humanId: "human-2" },
+        snippet: "…明日の予定はこちら…",
+        createdAt: Date.parse("2026-08-01T10:00:00Z"),
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/messaging/search?q=${encodeURIComponent("予定")}&place_id=channel-1&limit=10`,
+      expect.objectContaining({ method: "GET", credentials: "include" }),
+    );
+
+    // 未指定オプションはクエリに載らない。
+    await backend.searchMessages("予定");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `/messaging/search?q=${encodeURIComponent("予定")}`,
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
   it("opens one messaging socket, sends cursors, and projects message_created", async () => {
     vi.stubGlobal(
       "fetch",
