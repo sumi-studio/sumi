@@ -446,6 +446,115 @@ describe("ApiMessagingBackend", () => {
       cursors: { "channel-1": 4, "channel-2": 0, "dm-9": 0 },
     });
   });
+
+  it("declares and projects self-declared attention state", async () => {
+    const presenceBootstrap = {
+      ...bootstrap,
+      statuses: [
+        {
+          participant: { kind: "human", human_id: "human-2" },
+          status: "busy",
+          note: "取り込み中",
+          expires_at: null,
+        },
+      ],
+      reply_later_markers: [
+        replyLaterWire("marker-1", "human-2"),
+        replyLaterWire("marker-2", "human-1", "2026-08-01T11:00:00Z"),
+      ],
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(presenceBootstrap);
+        if (path === "/messaging/status" && init?.method === "PUT") {
+          return json({
+            participant: { kind: "human", human_id: "human-1" },
+            status: "busy",
+            note: "取り込み中",
+            expires_at: null,
+          });
+        }
+        if (path.endsWith("/reply-later") && init?.method === "POST") {
+          return json(
+            {
+              marker: replyLaterWire(
+                "marker-3",
+                "human-1",
+                "2026-08-01T11:00:00Z",
+              ),
+              created: true,
+            },
+            201,
+          );
+        }
+        if (path.endsWith("/resolve") && init?.method === "POST") {
+          return json({ marker: replyLaterWire("marker-3", "human-1") });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+
+    const snapshot = await backend.bootstrap();
+    expect(snapshot.statuses).toEqual([
+      {
+        participant: { kind: "human", humanId: "human-2" },
+        status: "busy",
+        note: "取り込み中",
+        expiresAt: null,
+      },
+    ]);
+    expect(snapshot.replyLaterMarkers.map((marker) => marker.remindAt)).toEqual([
+      null,
+      Date.parse("2026-08-01T11:00:00Z"),
+    ]);
+
+    await backend.setStatus("busy", "取り込み中");
+    const remindAt = Date.parse("2026-08-01T11:00:00Z");
+    await backend.createReplyLater(channel, "message-1", remindAt);
+    await backend.resolveReplyLater("marker-3");
+
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    socket?.message({
+      type: "event",
+      event: {
+        type: "status_updated",
+        status: {
+          participant: { kind: "human", human_id: "human-2" },
+          status: "away",
+          note: "",
+          expires_at: "2026-08-01T12:00:00Z",
+        },
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reply_later_created",
+        place_id: "channel-1",
+        marker: replyLaterWire("marker-4", "human-2"),
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "reply_later_resolved",
+        place_id: "channel-1",
+        marker_id: "marker-4",
+      },
+    });
+    expect(events).toMatchObject([
+      { type: "status_updated", status: { status: "away" } },
+      { type: "reply_later_created", marker: { markerId: "marker-4" } },
+      { type: "reply_later_resolved", markerId: "marker-4" },
+    ]);
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -495,6 +604,18 @@ function channelSummaryWire(topic: string) {
     name: "dev",
     topic,
     visibility: "public",
+  };
+}
+
+function replyLaterWire(markerId: string, humanId: string, remindAt?: string) {
+  return {
+    marker_id: markerId,
+    participant: { kind: "human", human_id: humanId },
+    place: channelWire(),
+    message_id: "message-1",
+    note: "後で返信します",
+    ...(remindAt === undefined ? {} : { remind_at: remindAt }),
+    resolved: false,
   };
 }
 
