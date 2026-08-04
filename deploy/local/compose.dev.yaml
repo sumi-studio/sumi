@@ -83,12 +83,14 @@ services:
       - |
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-command-log
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-runtime-state
+        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-messaging-attachments
         install -d -m 0750 -o 65532 -g 20000 /run/sumi/local-control
         install -d -m 0700 -o root -g root /run/sumi/runtime-secrets
     cap_add: [CHOWN, FOWNER]
     volumes:
       - api-command-log:/var/lib/sumi-command-log
       - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-messaging-attachments:/var/lib/sumi-messaging-attachments
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
@@ -108,6 +110,7 @@ services:
       SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi-command-log
       SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
+      SUMI_MESSAGING_ATTACHMENT_ROOT: /var/lib/sumi-messaging-attachments
       SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?SUMI_BROWSER_SESSION_SECRET is required}
       SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}
@@ -138,6 +141,7 @@ services:
     volumes:
       - api-command-log:/var/lib/sumi-command-log
       - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-messaging-attachments:/var/lib/sumi-messaging-attachments
       - type: bind
         source: /run/sumi/local-control
         target: /run/sumi/local-control
@@ -260,6 +264,7 @@ volumes:
   sumi-postgres: {}
   api-command-log: {}
   api-runtime-state: {}
+  api-messaging-attachments: {}
   provisioner-control: {}
 
 networks:

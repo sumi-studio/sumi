@@ -35,6 +35,7 @@ type Message struct {
 	Content     string
 	Urgency     string
 	Mentions    []ParticipantRef
+	Attachments []Attachment
 	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
@@ -44,14 +45,17 @@ type Message struct {
 
 // AppendInput is a send request. Mentions are deliberately absent: the server
 // resolves them from content and active membership at admission time and never
-// accepts them as a client assertion.
+// accepts them as a client assertion. AttachmentIDs, by contrast, are a client
+// assertion the store verifies: only the author's own still-unbound uploads can
+// be bound to the message.
 type AppendInput struct {
-	PlaceID     string
-	Author      ParticipantRef
-	Content     string
-	Urgency     string // empty means normal
-	ReplyTo     string // optional message_id in the same place
-	ClientNonce string
+	PlaceID       string
+	Author        ParticipantRef
+	Content       string
+	Urgency       string // empty means normal
+	ReplyTo       string // optional message_id in the same place
+	ClientNonce   string
+	AttachmentIDs []string
 }
 
 // AppendMessage commits a message to a place, allocating the next place seq in
@@ -70,11 +74,16 @@ func (s *Store) AppendMessage(ctx context.Context, in AppendInput) (Message, boo
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	if in.Content == "" {
+	// A message may be attachments only: sending an image without a caption is
+	// an ordinary thing to do. Empty and attachment-less stays refused.
+	if in.Content == "" && len(in.AttachmentIDs) == 0 {
 		return Message{}, false, fmt.Errorf("content must not be empty")
 	}
 	if len(in.Content) > MaxContentBytes {
 		return Message{}, false, fmt.Errorf("content exceeds %d bytes", MaxContentBytes)
+	}
+	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
+		return Message{}, false, ErrTooManyAttachments
 	}
 	if in.ClientNonce == "" || len(in.ClientNonce) > 128 {
 		return Message{}, false, fmt.Errorf("client nonce must be 1..128 bytes")
@@ -180,6 +189,11 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
+	attachments, err := bindAttachments(ctx, tx, msg.MessageID, in.Author, in.AttachmentIDs)
+	if err != nil {
+		return Message{}, false, err
+	}
+	msg.Attachments = attachments
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit append: %w", err)
 	}
@@ -230,6 +244,9 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if err := s.attachMentions(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -256,6 +273,9 @@ func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer Partic
 		return nil, err
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -326,7 +346,13 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	msg.Content = content
 	msg.Mentions = mentions
 	msg.EditedAt = &editedAt
-	return msg, nil
+	// An edit rewrites text only; the attachments the message was sent with
+	// stay part of it, so the returned message (and its echo) keeps them.
+	edited := []Message{msg}
+	if err := s.attachAttachments(ctx, edited); err != nil {
+		return Message{}, err
+	}
+	return edited[0], nil
 }
 
 // DeleteMessage tombstones a message: content is removed, the fact and the seq
@@ -389,6 +415,10 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 	}
 	msg.Content = ""
 	msg.Mentions = nil
+	// A tombstone carries nothing: the attachment rows stay as the record of
+	// what was sent, but they are no longer delivered or served (see
+	// AttachmentForViewer).
+	msg.Attachments = nil
 	msg.Deleted = true
 	return msg, nil
 }
@@ -519,6 +549,9 @@ func (s *Store) messageByNonce(ctx context.Context, q querier, in AppendInput) (
 		return Message{}, false, nil
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachAttachments(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
 	return messages[0], true, nil

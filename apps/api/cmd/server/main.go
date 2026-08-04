@@ -348,6 +348,18 @@ func newApplicationFromEnv() (*application, error) {
 		messagingServer = messaging.NewServer(messagingStore, messagingSessions)
 		messagingServer.AllowedOrigins = browserOrigins
 		messagingServer.Hub = messagingHub
+		// Attachment bytes live on local disk. Without a configured root the
+		// attachment routes stay mounted and fail closed (503) rather than
+		// accepting uploads nothing can serve.
+		if root := strings.TrimSpace(os.Getenv("SUMI_MESSAGING_ATTACHMENT_ROOT")); root != "" {
+			blobs, err := messaging.NewDiskAttachments(root)
+			if err != nil {
+				closeOnError()
+				return nil, fmt.Errorf("messaging attachments: %w", err)
+			}
+			messagingServer.Attachments = blobs
+			log.Printf("messaging attachments ready (root=%s)", root)
+		}
 		messagingServer.RegisterRoutes(mux)
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins

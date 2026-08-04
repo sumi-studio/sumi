@@ -1,12 +1,20 @@
 package messaging
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
@@ -26,6 +34,10 @@ type Server struct {
 	Store          *Store
 	Sessions       agentevents.UserSessionAuthorizer
 	AllowedOrigins []string
+	// Attachments stores uploaded bytes. Nil disables the attachment routes
+	// (503): the deployment has no configured storage root, and failing closed
+	// is better than accepting uploads nothing can serve.
+	Attachments AttachmentBlobs
 	// Hub, when set, receives durable events from REST mutations so live
 	// WebSocket subscribers see messages regardless of which transport
 	// committed them. Nil is fine: durable truth lives in the store.
@@ -49,6 +61,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
+	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
+	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -114,6 +128,32 @@ func placeToWire(p Place) placeWire {
 	return placeWire{Kind: p.Kind, DMID: p.PlaceID}
 }
 
+// attachmentWire is the file a message carries. The bytes are fetched from
+// GET /messaging/attachments/{attachment_id}; the wire never inlines them.
+type attachmentWire struct {
+	AttachmentID string `json:"attachment_id"`
+	Filename     string `json:"filename"`
+	MIME         string `json:"mime"`
+	Size         int64  `json:"size"`
+}
+
+func attachmentToWire(a Attachment) attachmentWire {
+	return attachmentWire{
+		AttachmentID: a.AttachmentID,
+		Filename:     a.Filename,
+		MIME:         a.MIME,
+		Size:         a.SizeBytes,
+	}
+}
+
+func attachmentsToWire(attachments []Attachment) []attachmentWire {
+	out := make([]attachmentWire, len(attachments))
+	for i, a := range attachments {
+		out[i] = attachmentToWire(a)
+	}
+	return out
+}
+
 type messageWire struct {
 	MessageID   string            `json:"message_id"`
 	Place       placeWire         `json:"place"`
@@ -121,6 +161,7 @@ type messageWire struct {
 	Author      participantWire   `json:"author"`
 	Content     string            `json:"content"`
 	Mentions    []participantWire `json:"mentions"`
+	Attachments []attachmentWire  `json:"attachments"`
 	Urgency     string            `json:"urgency"`
 	ReplyTo     *string           `json:"reply_to"`
 	ClientNonce string            `json:"client_nonce"`
@@ -137,6 +178,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Author:      participantToWire(m.Author),
 		Content:     m.Content,
 		Mentions:    participantsToWire(m.Mentions),
+		Attachments: attachmentsToWire(m.Attachments),
 		Urgency:     m.Urgency,
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
@@ -539,10 +581,11 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 	}
 	placeID := r.PathValue("place_id")
 	var req struct {
-		Content     string `json:"content"`
-		Urgency     string `json:"urgency"`
-		ReplyTo     string `json:"reply_to"`
-		ClientNonce string `json:"client_nonce"`
+		Content     string   `json:"content"`
+		Urgency     string   `json:"urgency"`
+		ReplyTo     string   `json:"reply_to"`
+		ClientNonce string   `json:"client_nonce"`
+		Attachments []string `json:"attachments"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -553,8 +596,13 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
-	if req.Content == "" || len(req.Content) > MaxContentBytes {
+	// Attachments-only messages are legitimate; empty and attachment-less is not.
+	if (req.Content == "" && len(req.Attachments) == 0) || len(req.Content) > MaxContentBytes {
 		writeError(w, http.StatusBadRequest, "invalid_content")
+		return
+	}
+	if len(req.Attachments) > MaxAttachmentsPerMessage {
+		writeError(w, http.StatusBadRequest, "too_many_attachments")
 		return
 	}
 	if req.ClientNonce == "" || len(req.ClientNonce) > 128 {
@@ -575,6 +623,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		msg, created, opErr = s.Store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
+			AttachmentIDs: req.Attachments,
 		})
 		return opErr
 	})
@@ -695,6 +744,225 @@ func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// --- attachments ---
+
+// maxAttachmentEnvelopeBytes is the multipart framing headroom allowed on top
+// of the file itself (part headers, boundaries, other fields).
+const maxAttachmentEnvelopeBytes = 64 * 1024
+
+// inlineImageMIMEs are the only types served with `Content-Disposition:
+// inline`. Everything else — including image/svg+xml, which is a scriptable
+// document — is delivered as a download.
+var inlineImageMIMEs = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// serveUploadAttachment accepts one multipart file and returns its identity.
+// The upload is not yet part of any message: it is bound when the uploader
+// sends a message listing it.
+func (s *Server) serveUploadAttachment(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, MaxAttachmentBytes+maxAttachmentEnvelopeBytes)
+	parts, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+		return
+	}
+	var (
+		att   Attachment
+		found bool
+	)
+	done, err := s.mutate(w, r, claims, func() error {
+		for {
+			part, err := parts.NextPart()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return errInvalidMultipart
+			}
+			if part.FormName() != "file" || part.FileName() == "" {
+				part.Close()
+				continue
+			}
+			att, err = s.storeUpload(r.Context(), viewer, part)
+			part.Close()
+			if err != nil {
+				return err
+			}
+			found = true
+			return nil
+		}
+	})
+	if !done {
+		return
+	}
+	switch {
+	case errors.Is(err, errInvalidMultipart):
+		writeError(w, http.StatusBadRequest, "invalid_multipart")
+		return
+	case errors.Is(err, ErrAttachmentTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	case err != nil:
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusBadRequest, "missing_file")
+		return
+	}
+	writeJSON(w, http.StatusCreated, attachmentToWire(att))
+}
+
+var errInvalidMultipart = errors.New("invalid multipart body")
+
+// storeUpload writes the part's bytes and records the metadata. The blob is
+// written first under a freshly minted id, so a metadata row never points at
+// missing bytes; a failed insert removes the orphan it just wrote.
+func (s *Server) storeUpload(ctx context.Context, uploader ParticipantRef, part *multipart.Part) (Attachment, error) {
+	head := make([]byte, 512)
+	read, err := io.ReadFull(part, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return Attachment{}, ErrAttachmentTooLarge
+		}
+		return Attachment{}, errInvalidMultipart
+	}
+	head = head[:read]
+	attachmentID := NewAttachmentID()
+	size, err := s.Attachments.Put(attachmentID, io.MultiReader(bytes.NewReader(head), part))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return Attachment{}, ErrAttachmentTooLarge
+		}
+		_ = s.Attachments.Remove(attachmentID)
+		return Attachment{}, err
+	}
+	att, err := s.Store.CreateAttachment(ctx, attachmentID, uploader,
+		sanitizeAttachmentFilename(part.FileName()),
+		resolveAttachmentMIME(part.Header.Get("Content-Type"), head), size)
+	if err != nil {
+		_ = s.Attachments.Remove(attachmentID)
+		return Attachment{}, err
+	}
+	return att, nil
+}
+
+// serveAttachment delivers the bytes to a viewer the store says may read them.
+// Every response is nosniff and sandboxed; only known-safe image types render
+// inline, so an uploaded document can never execute in the app's origin.
+func (s *Server) serveAttachment(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	if s.Attachments == nil {
+		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return
+	}
+	att, err := s.Store.AttachmentForViewer(r.Context(), r.PathValue("attachment_id"), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	blob, err := s.Attachments.Open(att.AttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	defer blob.Close()
+	inline := inlineImageMIMEs[att.MIME]
+	disposition := "attachment"
+	contentType := "application/octet-stream"
+	if inline {
+		disposition = "inline"
+		contentType = att.MIME
+	}
+	header := w.Header()
+	header.Set("Content-Type", contentType)
+	header.Set("Content-Disposition",
+		mime.FormatMediaType(disposition, map[string]string{"filename": att.Filename}))
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	header.Set("Cross-Origin-Resource-Policy", "same-origin")
+	header.Set("Referrer-Policy", "no-referrer")
+	// Private: the response is authorized per viewer and must never be reused
+	// from a shared cache.
+	header.Set("Cache-Control", "private, no-store")
+	http.ServeContent(w, r, "", att.CreatedAt, blob)
+}
+
+// sanitizeAttachmentFilename keeps a display name only: no directories, no
+// control characters, bounded length. It is never used as a storage path.
+func sanitizeAttachmentFilename(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = path.Base(strings.TrimSpace(name))
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || name == "/" {
+		return "file"
+	}
+	for len(name) > MaxAttachmentFilenameBytes {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	if name == "" {
+		return "file"
+	}
+	return name
+}
+
+// resolveAttachmentMIME decides the stored type from the bytes first and the
+// client's claim second. Bytes that sniff as a supported image are that image;
+// a claimed image whose bytes disagree is demoted to an opaque download, so a
+// document can never be delivered under an inline image type.
+func resolveAttachmentMIME(declared string, head []byte) string {
+	sniffed := normalizeMediaType(http.DetectContentType(head))
+	if inlineImageMIMEs[sniffed] {
+		return sniffed
+	}
+	claimed := normalizeMediaType(declared)
+	if claimed == "" || inlineImageMIMEs[claimed] || strings.HasPrefix(claimed, "image/") {
+		return "application/octet-stream"
+	}
+	return claimed
+}
+
+func normalizeMediaType(value string) string {
+	parsed, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	parsed = strings.ToLower(parsed)
+	if len(parsed) > 255 {
+		return ""
+	}
+	return parsed
+}
+
 // --- plumbing ---
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, into any) bool {
@@ -737,6 +1005,14 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
 		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound):
 		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, ErrAttachmentNotFound):
+		writeError(w, http.StatusNotFound, "attachment_not_found")
+	case errors.Is(err, ErrAttachmentTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+	case errors.Is(err, ErrTooManyAttachments):
+		writeError(w, http.StatusBadRequest, "too_many_attachments")
+	case errors.Is(err, ErrAttachmentEmpty):
+		writeError(w, http.StatusBadRequest, "empty_attachment")
 	case errors.Is(err, ErrNotAMember):
 		writeError(w, http.StatusForbidden, "not_a_member")
 	case errors.Is(err, ErrNotAuthor):
