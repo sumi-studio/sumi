@@ -4,7 +4,11 @@ import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { notificationLevelFor, useMessaging } from "../store";
+import { useOverlayPanel } from "./overlay";
 import { ParticipantAvatar, STATUS_LABEL } from "./participant-avatar";
+
+/** サイドバーのplace一覧。ここが自前のスクロール領域。 */
+const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
@@ -62,35 +66,23 @@ function PlaceNotificationMenu({
   const setPlaceNotificationLevel = useMessaging(
     (state) => state.setPlaceNotificationLevel,
   );
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) {
-        onOpenChange(false);
-      }
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onOpenChange(false);
-    };
-    window.addEventListener("mousedown", closeOnOutsideClick);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("mousedown", closeOnOutsideClick);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open, onOpenChange]);
+  // パネルはサイドバーのスクロール領域の内側にあるので、ホイールの転送はいらない。
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange,
+    scrollPassthrough: () => null,
+  });
 
   return (
-    <div ref={containerRef} className="relative">
+    <div className="relative">
       <button
         type="button"
         aria-label="通知設定"
-        aria-expanded={open}
+        aria-haspopup="menu"
+        {...overlay.triggerProps}
         onClick={(event) => {
           event.stopPropagation();
-          onOpenChange(!open);
+          overlay.toggle();
         }}
         className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
           open ? "opacity-100" : "opacity-0 group-hover:opacity-100"
@@ -99,7 +91,10 @@ function PlaceNotificationMenu({
         <MoreVertical className="size-3.5" />
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md">
+        <div
+          {...overlay.panelProps}
+          className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
+        >
           <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
             通知
           </p>
@@ -485,6 +480,13 @@ export function Sidebar() {
   const canSetStatus = useMessaging((state) => state.capabilities.status);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
+  // ステータスメニューはplace一覧の上に浮くので、ホイールは一覧へ渡す。
+  const statusOverlay = useOverlayPanel<HTMLButtonElement>({
+    open: statusMenuOpen,
+    onOpenChange: setStatusMenuOpen,
+    scrollPassthrough: () =>
+      document.querySelector<HTMLElement>(SIDEBAR_PLACES),
+  });
 
   const selfProfile = self ? membersByKey[selfKey] : undefined;
   const selfStatus = statusByKey[selfKey];
@@ -496,7 +498,10 @@ export function Sidebar() {
           {workspaces[0]?.name ?? "Sumi"}
         </span>
       </div>
-      <nav className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2">
+      <nav
+        data-slot="sidebar-places"
+        className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2"
+      >
         <div className="pt-2">
           <SectionHeader
             label="チャンネル"
@@ -560,7 +565,12 @@ export function Sidebar() {
       </nav>
       <div className="relative shrink-0 border-border/70 border-t p-2">
         {statusMenuOpen && canSetStatus ? (
-          <div className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md">
+          <div
+            {...statusOverlay.panelProps}
+            role="dialog"
+            aria-label="ステータス"
+            className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
+          >
             {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
               <button
                 key={kind}
@@ -593,8 +603,10 @@ export function Sidebar() {
         <button
           type="button"
           disabled={!canSetStatus}
+          aria-haspopup="menu"
+          {...statusOverlay.triggerProps}
           onClick={() => {
-            if (canSetStatus) setStatusMenuOpen((open) => !open);
+            if (canSetStatus) statusOverlay.toggle();
           }}
           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
         >

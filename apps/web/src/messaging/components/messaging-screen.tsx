@@ -31,6 +31,7 @@ import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
+import { useOverlayPanel, useWheelPassthrough } from "./overlay";
 import { NOTIFICATION_LEVEL_LABEL, Sidebar } from "./sidebar";
 
 interface PendingJump {
@@ -227,6 +228,10 @@ function NotificationSettingsMenu() {
   );
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange: setOpen,
+  });
 
   const addKeyword = () => {
     const value = draft.trim();
@@ -243,8 +248,8 @@ function NotificationSettingsMenu() {
       <button
         type="button"
         title="通知設定"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        aria-haspopup="dialog"
+        {...overlay.triggerProps}
         className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
           open ? "bg-accent text-foreground" : "text-muted-foreground"
         }`}
@@ -252,7 +257,12 @@ function NotificationSettingsMenu() {
         <Bell className="size-4" />
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-2 shadow-md">
+        <div
+          {...overlay.panelProps}
+          role="dialog"
+          aria-label="通知設定"
+          className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-2 shadow-md"
+        >
           <p className="pb-1 font-medium text-[11px] text-muted-foreground">
             既定の通知
           </p>
@@ -333,6 +343,10 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange: setOpen,
+  });
 
   // リマインドの予定が入っているのは本人のmarkerだけ。相手の「後で返信します」は
   // messageの側に見えていればよく、こちらのknock対象にはならない。
@@ -360,8 +374,9 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
     <div className="relative">
       <button
         type="button"
-        onClick={() => setOpen((value) => !value)}
         title="後で返信"
+        aria-haspopup="dialog"
+        {...overlay.triggerProps}
         className={`relative flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
           open ? "bg-accent text-foreground" : "text-muted-foreground"
         }`}
@@ -378,7 +393,12 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
         ) : null}
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md">
+        <div
+          {...overlay.panelProps}
+          role="dialog"
+          aria-label="後で返信"
+          className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md"
+        >
           <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
             後で返信 — 忘れないように knock します
           </p>
@@ -445,6 +465,8 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [now, setNow] = useState(() => Date.now());
   const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
+  // 一覧の上に浮いているので、この上でのホイールも一覧へ渡す。
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -463,7 +485,10 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   if (!marker) return null;
 
   return (
-    <div className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg">
+    <div
+      ref={passthroughRef}
+      className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg"
+    >
       <p className="flex items-center gap-1.5 font-medium text-[13px]">
         <Clock className="size-3.5 text-rose-500" />
         後で返信の時間です

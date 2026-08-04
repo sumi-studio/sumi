@@ -121,6 +121,35 @@ describe("ConversationVirtualizer", () => {
     ).toBe(true);
   });
 
+  it("pins the footer overlay inside the scroll viewport so the wheel keeps reaching it", () => {
+    render(
+      <ConversationVirtualizer
+        items={makeMessages(20)}
+        estimateSize={() => 64}
+        ariaLabel="Test conversation"
+        renderItem={(message) => <p>{message.text}</p>}
+        footerOverlay={
+          <button type="button" className="absolute right-4 bottom-3">
+            jump to latest
+          </button>
+        }
+      />,
+    );
+
+    const viewport = document.querySelector(
+      '[data-slot="conversation-viewport"]',
+    );
+    const jump = screen.getByRole("button", { name: "jump to latest" });
+    // A control floating outside the scroll container swallows wheel events:
+    // the browser scrolls the nearest scrollable ancestor of whatever sits
+    // under the pointer, and none of its ancestors would scroll.
+    expect(viewport?.contains(jump)).toBe(true);
+    const footer = jump.closest(
+      '[data-slot="conversation-viewport-footer"]',
+    ) as HTMLElement | null;
+    expect(footer?.style.position).toBe("sticky");
+  });
+
   it("scrolls to a stable message id and reports the visible ids", async () => {
     const messages = makeMessages(500);
     const handle = createRef<ConversationVirtualizerHandle>();
