@@ -1,12 +1,14 @@
 package messaging
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
@@ -50,6 +52,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
+	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
+	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -208,6 +213,99 @@ type readMarkerWire struct {
 	LastReadSeq int64     `json:"last_read_seq"`
 }
 
+// statusWire matches the web model's ParticipantStatus.
+type statusWire struct {
+	Participant participantWire `json:"participant"`
+	Status      string          `json:"status"`
+	Note        string          `json:"note"`
+	ExpiresAt   *time.Time      `json:"expires_at"`
+}
+
+func statusToWire(status ParticipantStatus) statusWire {
+	return statusWire{
+		Participant: participantToWire(status.Participant),
+		Status:      status.Status,
+		Note:        status.Note,
+		ExpiresAt:   status.ExpiresAt,
+	}
+}
+
+// replyLaterWire matches the web model's ReplyLaterMarker. RemindAt rides only
+// on the owner's copy (合意事項 6: remind_at は本人が時刻まで約束した場合を
+// 除き相手へ公開しない — v1 has no such promise field, so it is never shared);
+// everyone else sees the fact and the note.
+type replyLaterWire struct {
+	MarkerID    string          `json:"marker_id"`
+	Participant participantWire `json:"participant"`
+	Place       placeWire       `json:"place"`
+	MessageID   string          `json:"message_id"`
+	Note        string          `json:"note"`
+	RemindAt    *time.Time      `json:"remind_at,omitempty"`
+	Resolved    bool            `json:"resolved"`
+}
+
+// replyLaterToWire projects a marker for one viewer, deciding whether the
+// private remind_at may appear. Every path that serializes a marker goes
+// through here, so the secrecy rule cannot be skipped by a new endpoint.
+func replyLaterToWire(marker ReplyLaterMarker, viewer ParticipantRef) replyLaterWire {
+	wire := replyLaterWire{
+		MarkerID:    marker.MarkerID,
+		Participant: participantToWire(marker.Participant),
+		Place:       placeToWire(Place{PlaceID: marker.PlaceID, Kind: marker.PlaceKind}),
+		MessageID:   marker.MessageID,
+		Note:        marker.Note,
+		Resolved:    marker.Resolved,
+	}
+	if marker.Participant == viewer {
+		remindAt := marker.RemindAt
+		wire.RemindAt = &remindAt
+	}
+	return wire
+}
+
+// publishReplyLaterCreated fans one durable creation out as two per-audience
+// payloads: the owner's copy carries remind_at, everyone else's does not.
+func (s *Server) publishReplyLaterCreated(ctx context.Context, marker ReplyLaterMarker) {
+	if s.Hub == nil {
+		return
+	}
+	owner := marker.Participant
+	ownerWire := replyLaterToWire(marker, owner)
+	s.Hub.Publish(ctx, Event{
+		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
+		Marker: &ownerWire, OnlyFor: &owner,
+	})
+	publicWire := replyLaterToWire(marker, ParticipantRef{})
+	s.Hub.Publish(ctx, Event{
+		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
+		Marker: &publicWire, ExceptFor: &owner,
+	})
+}
+
+// publishReplyLaterResolved announces a kept promise. Only the identifier
+// travels: everyone who saw the marker appear can retire it, and nothing
+// private needs re-stating to do so.
+func (s *Server) publishReplyLaterResolved(ctx context.Context, marker ReplyLaterMarker) {
+	if s.Hub == nil {
+		return
+	}
+	s.Hub.Publish(ctx, Event{
+		Type: EventReplyLaterResolved, PlaceID: marker.PlaceID, MarkerID: marker.MarkerID,
+	})
+}
+
+// publishStatus fans a self-declared status out to everyone who may see the
+// participant. It is volatile like typing: the current value is in bootstrap,
+// so a missed frame costs nothing.
+func (s *Server) publishStatus(ctx context.Context, status ParticipantStatus) {
+	if s.Hub == nil {
+		return
+	}
+	subject := status.Participant
+	wire := statusToWire(status)
+	s.Hub.Publish(ctx, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
+}
+
 type unreadSummaryWire struct {
 	Place        placeWire `json:"place"`
 	LatestSeq    int64     `json:"latest_seq"`
@@ -358,22 +456,51 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	for i, key := range memberOrder {
 		members[i] = memberSet[key]
 	}
+
+	// Self-declared attention state: the current status of everyone visible
+	// (expired ones are already filtered out) and the open reply-later
+	// promises of every visible place. Statuses change over the volatile
+	// status_updated event, which never replays — bootstrap is where a fresh
+	// client learns the current value.
+	statuses, err := s.Store.StatusesVisibleTo(ctx, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	statusWires := make([]statusWire, len(statuses))
+	for i, status := range statuses {
+		statusWires[i] = statusToWire(status)
+	}
+	markers, err := s.Store.ReplyLaterMarkersFor(ctx, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	markerWires := make([]replyLaterWire, len(markers))
+	for i, marker := range markers {
+		markerWires[i] = replyLaterToWire(marker, viewer)
+	}
+
 	writeJSON(w, http.StatusOK, struct {
-		Self            participantWire     `json:"self"`
-		Workspaces      []workspaceWire     `json:"workspaces"`
-		Channels        []channelWire       `json:"channels"`
-		DMs             []dmWire            `json:"dms"`
-		Members         []memberWire        `json:"members"`
-		ReadMarkers     []readMarkerWire    `json:"read_markers"`
-		UnreadSummaries []unreadSummaryWire `json:"unread_summaries"`
+		Self              participantWire     `json:"self"`
+		Workspaces        []workspaceWire     `json:"workspaces"`
+		Channels          []channelWire       `json:"channels"`
+		DMs               []dmWire            `json:"dms"`
+		Members           []memberWire        `json:"members"`
+		Statuses          []statusWire        `json:"statuses"`
+		ReadMarkers       []readMarkerWire    `json:"read_markers"`
+		UnreadSummaries   []unreadSummaryWire `json:"unread_summaries"`
+		ReplyLaterMarkers []replyLaterWire    `json:"reply_later_markers"`
 	}{
-		Self:            participantToWire(viewer),
-		Workspaces:      workspaceWires,
-		Channels:        channels,
-		DMs:             dms,
-		Members:         members,
-		ReadMarkers:     readMarkers,
-		UnreadSummaries: unread,
+		Self:              participantToWire(viewer),
+		Workspaces:        workspaceWires,
+		Channels:          channels,
+		DMs:               dms,
+		Members:           members,
+		Statuses:          statusWires,
+		ReadMarkers:       readMarkers,
+		UnreadSummaries:   unread,
+		ReplyLaterMarkers: markerWires,
 	})
 }
 
@@ -739,6 +866,133 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	}{Message: wire, Reacted: reacted})
 }
 
+// serveSetStatus replaces the viewer's own status. There is no route for
+// setting anyone else's: the participant is the authenticated session, never a
+// request field (自己申告のattention — the platform does not observe or
+// announce attention on a person's behalf).
+func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+		Note   string `json:"note"`
+		// Absent or null holds the status until it is replaced.
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	switch req.Status {
+	case StatusAvailable, StatusBusy, StatusAway:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_status")
+		return
+	}
+	if utf8.RuneCountInString(req.Note) > MaxStatusNoteChars {
+		writeError(w, http.StatusBadRequest, "invalid_note")
+		return
+	}
+	var status ParticipantStatus
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		status, opErr = s.Store.SetStatus(r.Context(), viewer, req.Status, req.Note, req.ExpiresAt)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishStatus(r.Context(), status)
+	writeJSON(w, http.StatusOK, statusToWire(status))
+}
+
+// serveCreateReplyLater places the viewer's own「後で返信します」marker on a
+// message they can see. Repeating the tap returns the existing open marker.
+func (s *Server) serveCreateReplyLater(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	placeID := r.PathValue("place_id")
+	var req struct {
+		Note string `json:"note"`
+		// The owner's own reminder time. It is stored, echoed back to the
+		// owner, and withheld from every other participant's wire.
+		RemindAt *time.Time `json:"remind_at"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.RemindAt == nil || req.RemindAt.IsZero() {
+		writeError(w, http.StatusBadRequest, "invalid_remind_at")
+		return
+	}
+	if utf8.RuneCountInString(req.Note) > MaxReplyLaterNoteChars {
+		writeError(w, http.StatusBadRequest, "invalid_note")
+		return
+	}
+	var (
+		marker  ReplyLaterMarker
+		created bool
+	)
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		marker, created, opErr = s.Store.CreateReplyLater(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Note, *req.RemindAt)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if created {
+		s.publishReplyLaterCreated(r.Context(), marker)
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Marker  replyLaterWire `json:"marker"`
+		Created bool           `json:"created"`
+	}{Marker: replyLaterToWire(marker, viewer), Created: created})
+}
+
+// serveResolveReplyLater marks the viewer's own promise as kept. Someone
+// else's marker is reported as missing rather than forbidden, so the route
+// never confirms marker identifiers across the ownership boundary.
+func (s *Server) serveResolveReplyLater(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var marker ReplyLaterMarker
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		marker, opErr = s.Store.ResolveReplyLater(r.Context(), r.PathValue("marker_id"), viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishReplyLaterResolved(r.Context(), marker)
+	writeJSON(w, http.StatusOK, struct {
+		Marker replyLaterWire `json:"marker"`
+	}{Marker: replyLaterToWire(marker, viewer)})
+}
+
 func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {
 	viewer, claims, ok := s.viewer(w, r)
 	if !ok {
@@ -803,7 +1057,8 @@ func writeError(w http.ResponseWriter, status int, code string) {
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
-		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound):
+		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound),
+		errors.Is(err, ErrMarkerNotFound):
 		writeError(w, http.StatusNotFound, "not_found")
 	case errors.Is(err, ErrNotAMember):
 		writeError(w, http.StatusForbidden, "not_a_member")

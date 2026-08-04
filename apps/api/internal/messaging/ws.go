@@ -430,7 +430,8 @@ func (s *WSServer) writeControlError(conn *websocket.Conn, code, clientNonce str
 func storeErrorCode(err error) string {
 	switch {
 	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
-		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound):
+		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound),
+		errors.Is(err, ErrMarkerNotFound):
 		return "not_found"
 	case errors.Is(err, ErrNotAMember):
 		return "not_a_member"
