@@ -26,17 +26,23 @@ messaging service と agent runtime は別々に実装される。境界が動�
 
 ## 境界を越えるもの（4つ）
 
-### 1. InboundProvenanceV1 — 実装済み
+### 1. InboundProvenanceV1 — 契約は凍結、実装は revert 済み（#172 で再導入）
 
 `contracts/agent-events.yaml` の `InboundProvenanceV1`。surface 一般
 （direct chat / messaging）、actor は human | personality_agent、human は
 canonical `HumanId`（UUIDv7）。messaging は place と配送された一件の
 メッセージを必ず伴う。
 
-Rust `apps/agent/src/runtime/contracts.rs`、Go
-`apps/api/internal/agentevents/wire.go`、生成 TS 型が同じ形を共有し、
-`contracts/agent-events-fixtures.json` の `messaging_mention_command` で
-三者が同じバイト列を往復することを検証している。
+> **実装状態（2026-08-04 時点）**: 実装（`739a8c9`）と AttentionCandidate
+> inbox（`9119138`、migration renumber `17ae35c` を含む）は一度書かれたが、
+> 既存個体の人生ログ移行を伴わない v1 の再定義だったため、main へ届く前に
+> 同ブランチ上で revert された（`8ca10cb` / `e5a572b` / `fdfe974`）。
+> 現 main の `contracts/agent-events.yaml` は `surface: direct_chat` 固定の
+> ままで、fixtures に `messaging_mention_command` は存在せず、migration
+> `0009` は欠番として残っている。versioned な provenance 移行（#172）を
+> 経てから再導入し、その後 #173 が候補配送を実装する。**凍結された契約の
+> 形そのものは本書のとおりで、変わっていない。** revert されたコードは
+> git 履歴に残っており、再導入時のサルベージ元にできる。
 
 ### 2. AttentionCandidate — 本書で凍結
 
@@ -123,6 +129,11 @@ urgency は意味を持つが、送信側の権限にはならない。
 
 注意の経路が実装されるまで、messaging surface 由来の inbound は agent の
 受信口で `not_allowed` として拒否される（`apps/agent/src/gateway/stdio.rs`）。
+
+> **実装状態（2026-08-04 時点）**: この門のコードも上記 revert で main には
+> 存在しない。現状は wire に messaging surface を表現する形が無いため、
+> inbound は構造的に閉じている（門より強い fail-closed）。本節は #172 で
+> provenance が再導入された時点の契約として読む。
 
 **門が拒否するのは「agent turn への直接投入」だけである。** message は場の
 durable event として残り、AttentionCandidate が未実装なだけである。messaging
