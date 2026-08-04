@@ -598,6 +598,7 @@ class StubBackend implements MessagingBackend {
     status: false,
     replyLater: false,
     reactions: true,
+    notifications: false,
   } as const;
   history: Message[] = [];
   readonly fetches: { beforeSeq?: number; limit?: number }[] = [];
@@ -655,6 +656,12 @@ class StubBackend implements MessagingBackend {
       readMarkers: [],
       unreadSummaries: [],
       replyLaterMarkers: [],
+      notificationSetting: {
+        owner: self,
+        defaults: { level: "all" },
+        perPlace: [],
+        keywords: [],
+      },
       employedAgents: [],
     };
   }
@@ -704,6 +711,11 @@ class StubBackend implements MessagingBackend {
     ): Promise<ReactionMutationResult> =>
       await (this.toggleResults.shift() ?? { messageId, reactions: [] }),
   );
+  async setNotificationSetting(): ReturnType<
+    MessagingBackend["setNotificationSetting"]
+  > {
+    throw new Error("unused");
+  }
   sendTyping = vi.fn();
 
   subscribe(listener: (event: ServerEvent) => void): () => void {

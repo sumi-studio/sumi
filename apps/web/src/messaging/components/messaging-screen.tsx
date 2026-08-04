@@ -1,15 +1,36 @@
-import { Clock, Hash, Pencil, Users } from "lucide-react";
+import {
+  Bell,
+  Clock,
+  Hash,
+  Pencil,
+  Users,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
-import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
+import {
+  type NotificationLevel,
+  type PlaceKey,
+  participantKey,
+  type ReplyLaterMarker,
+} from "../model";
+import {
+  dismissPermissionPrompt,
+  isPermissionPromptDismissed,
+  type NotificationPermissionState,
+  notificationPermission,
+  requestNotificationPermission,
+} from "../notifications";
 import { usePlaceNavigate } from "../place-route";
-import { useMessaging } from "../store";
+import { setNotificationNavigator, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
-import { Sidebar } from "./sidebar";
+import { NOTIFICATION_LEVEL_LABEL, Sidebar } from "./sidebar";
 
 interface PendingJump {
   placeKey: PlaceKey;
@@ -141,6 +162,165 @@ function TypingIndicator() {
         <span className="text-[11px] text-muted-foreground">
           <span className="font-medium">{names}</span> が入力中…
         </span>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 通知許可を求める導線。ブラウザのダイアログは一度断られると出し直せないので、
+ * 押されるまで待つ控えめなバナーにしておく。閉じたら二度と出さない。
+ */
+function NotificationPermissionBanner() {
+  const enabled = useMessaging((state) => state.capabilities.notifications);
+  const [permission, setPermission] = useState<NotificationPermissionState>(
+    () => notificationPermission(),
+  );
+  const [dismissed, setDismissed] = useState(() =>
+    isPermissionPromptDismissed(),
+  );
+
+  if (!enabled || dismissed || permission !== "default") return null;
+
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-accent/40 px-4 py-1.5 sm:px-5">
+      <Bell className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
+        呼ばれたときだけ通知します。ブラウザの通知を許可しますか？
+      </span>
+      <button
+        type="button"
+        onClick={() => {
+          void requestNotificationPermission().then(setPermission);
+        }}
+        className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
+      >
+        許可する
+      </button>
+      <button
+        type="button"
+        aria-label="通知の案内を閉じる"
+        onClick={() => {
+          dismissPermissionPrompt();
+          setDismissed(true);
+        }}
+        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+/** 既定のレベル・keyword・音。placeごとの上書きはサイドバー側にある。 */
+function NotificationSettingsMenu() {
+  const defaultLevel = useMessaging((state) => state.notificationDefaultLevel);
+  const keywords = useMessaging((state) => state.notificationKeywords);
+  const soundEnabled = useMessaging((state) => state.notificationSoundEnabled);
+  const setDefaultLevel = useMessaging(
+    (state) => state.setNotificationDefaultLevel,
+  );
+  const setKeywords = useMessaging((state) => state.setNotificationKeywords);
+  const setSoundEnabled = useMessaging(
+    (state) => state.setNotificationSoundEnabled,
+  );
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  const addKeyword = () => {
+    const value = draft.trim();
+    if (!value || keywords.includes(value)) {
+      setDraft("");
+      return;
+    }
+    setKeywords([...keywords, value]);
+    setDraft("");
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        title="通知設定"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+          open ? "bg-accent text-foreground" : "text-muted-foreground"
+        }`}
+      >
+        <Bell className="size-4" />
+      </button>
+      {open ? (
+        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-2 shadow-md">
+          <p className="pb-1 font-medium text-[11px] text-muted-foreground">
+            既定の通知
+          </p>
+          {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
+            (level) => (
+              <button
+                key={level}
+                type="button"
+                onClick={() => setDefaultLevel(level)}
+                className={`block w-full rounded-md px-2 py-1 text-left text-[13px] hover:bg-accent ${
+                  defaultLevel === level ? "bg-accent/60 font-medium" : ""
+                }`}
+              >
+                {NOTIFICATION_LEVEL_LABEL[level]}
+              </button>
+            ),
+          )}
+          <p className="pt-3 pb-1 font-medium text-[11px] text-muted-foreground">
+            キーワード — 名前以外で呼ばれたい言葉
+          </p>
+          <div className="flex flex-wrap gap-1 pb-1">
+            {keywords.map((keyword) => (
+              <span
+                key={keyword}
+                className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[12px]"
+              >
+                {keyword}
+                <button
+                  type="button"
+                  aria-label={`${keyword} を外す`}
+                  onClick={() =>
+                    setKeywords(keywords.filter((entry) => entry !== keyword))
+                  }
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            ))}
+          </div>
+          <input
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              addKeyword();
+            }}
+            onBlur={addKeyword}
+            placeholder="追加して Enter"
+            aria-label="通知キーワードを追加"
+            className="w-full rounded-md border border-border bg-transparent px-2 py-1 text-[12.5px] outline-none focus:border-muted-foreground/60"
+          />
+          <button
+            type="button"
+            onClick={() => setSoundEnabled(!soundEnabled)}
+            className="mt-3 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent"
+          >
+            {soundEnabled ? (
+              <Volume2 className="size-3.5" />
+            ) : (
+              <VolumeX className="size-3.5 text-muted-foreground" />
+            )}
+            通知音 {soundEnabled ? "オン" : "オフ"}
+            <span className="ml-auto text-[11px] text-muted-foreground">
+              この端末だけ
+            </span>
+          </button>
+        </div>
       ) : null}
     </div>
   );
@@ -344,6 +524,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   );
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const canNotify = useMessaging((state) => state.capabilities.notifications);
+  const notificationLevelByPlace = useMessaging(
+    (state) => state.notificationLevelByPlace,
+  );
+  const notificationDefaultLevel = useMessaging(
+    (state) => state.notificationDefaultLevel,
+  );
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
@@ -362,16 +549,31 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }, [ready, placeKey, activePlaceKey, selectPlace, channels, dms]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
+  // muteしたplaceはここから外す——サイドバーには件数が残るが、タブの数字は
+  // 「呼ばれている数」であって「溜まっている数」ではない。
   useEffect(() => {
     let unread = 0;
     for (const [key, count] of Object.entries(unreadCountByPlace)) {
+      const level = notificationLevelByPlace[key] ?? notificationDefaultLevel;
+      if (level === "mute") continue;
       unread +=
         key.startsWith("dm:") || key.startsWith("group_dm:")
           ? count
           : (mentionCountByPlace[key] ?? 0);
     }
     document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
-  }, [unreadCountByPlace, mentionCountByPlace]);
+  }, [
+    unreadCountByPlace,
+    mentionCountByPlace,
+    notificationLevelByPlace,
+    notificationDefaultLevel,
+  ]);
+
+  // デスクトップ通知のクリック先。URLが現在地の正本なのでrouterに任せる。
+  useEffect(() => {
+    setNotificationNavigator(placeNavigate);
+    return () => setNotificationNavigator(null);
+  }, [placeNavigate]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {
@@ -432,6 +634,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       {/* ヘッダーはコンテンツ列の全幅に固定し、メンバーパネルはその下で開閉する。
           開閉でヘッダー内のボタンが動かないための構造（ポインタの下でUIを動かさない）。 */}
       <div className="flex min-w-0 flex-1 flex-col">
+        <NotificationPermissionBanner />
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
           {display?.kind === "channel" ? (
             <Hash className="size-4 shrink-0 text-muted-foreground" />
@@ -453,6 +656,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             <button
               type="button"

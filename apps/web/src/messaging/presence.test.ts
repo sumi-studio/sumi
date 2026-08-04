@@ -74,6 +74,7 @@ class FakePresenceBackend implements MessagingBackend {
     status: true,
     replyLater: true,
     reactions: true,
+    notifications: false,
   } as const;
   presence: {
     statuses: ParticipantStatus[];
@@ -111,6 +112,12 @@ class FakePresenceBackend implements MessagingBackend {
       readMarkers: [],
       unreadSummaries: [],
       replyLaterMarkers: this.presence.replyLaterMarkers,
+      notificationSetting: {
+        owner: SELF,
+        defaults: { level: "all" },
+        perPlace: [],
+        keywords: [],
+      },
       employedAgents: [],
     };
   }
@@ -158,6 +165,11 @@ class FakePresenceBackend implements MessagingBackend {
     return { ...this.nextMarker, resolved: true };
   }
   async toggleReaction(): Promise<ReactionMutationResult> {
+    throw new Error("unused");
+  }
+  async setNotificationSetting(): ReturnType<
+    MessagingBackend["setNotificationSetting"]
+  > {
     throw new Error("unused");
   }
   sendTyping(): void {}

@@ -68,6 +68,12 @@ function snapshot(options: {
       mentionCount: options.unread[key].mention,
     })),
     replyLaterMarkers: [],
+    notificationSetting: {
+      owner: SELF,
+      defaults: { level: "all" },
+      perPlace: [],
+      keywords: [],
+    },
     employedAgents: [],
   };
 }
@@ -78,6 +84,7 @@ class FakeBackend implements MessagingBackend {
     status: false,
     replyLater: false,
     reactions: false,
+    notifications: false,
   } as const;
   next: BootstrapSnapshot;
   bootstrapCalls = 0;
@@ -129,6 +136,11 @@ class FakeBackend implements MessagingBackend {
   }
   async toggleReaction() {
     return { messageId: "unused", reactions: [] };
+  }
+  async setNotificationSetting(): ReturnType<
+    MessagingBackend["setNotificationSetting"]
+  > {
+    throw new Error("unused");
   }
   sendTyping() {}
 
