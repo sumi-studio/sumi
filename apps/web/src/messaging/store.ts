@@ -65,6 +65,10 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
+  createChannel(name: string, topic: string): Promise<PlaceKey>;
+  /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
+  startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
+  updateChannelTopic(channelId: string, topic: string): Promise<void>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   setDraft(key: PlaceKey, draft: string): void;
   send(content: string, urgency: Urgency): void;
@@ -275,6 +279,34 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      return;
+    }
+    if (event.type === "place_created") {
+      const { channel, dm } = event;
+      set((state) => {
+        if (channel) {
+          return state.channels.some(
+            (entry) => entry.channelId === channel.channelId,
+          )
+            ? {}
+            : { channels: [...state.channels, channel] };
+        }
+        if (dm) {
+          return state.dms.some((entry) => entry.dmId === dm.dmId)
+            ? {}
+            : { dms: [...state.dms, dm] };
+        }
+        return {};
+      });
+      return;
+    }
+    if (event.type === "place_updated") {
+      const { channel } = event;
+      set((state) => ({
+        channels: state.channels.map((entry) =>
+          entry.channelId === channel.channelId ? channel : entry,
+        ),
+      }));
     }
   };
 
@@ -467,6 +499,42 @@ export const useMessaging = create<MessagingState>((set, get) => {
         },
       }));
       void loadPlace(place);
+    },
+
+    async createChannel(name, topic) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      const channel = await backend.createChannel(workspaceId, name, topic);
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
+    },
+
+    async startDM(participants) {
+      const [first] = participants;
+      if (!first) throw new Error("participants are required");
+      const dm =
+        participants.length === 1
+          ? await backend.ensureDM(first)
+          : await backend.createGroupDM(participants);
+      set((state) =>
+        state.dms.some((entry) => entry.dmId === dm.dmId)
+          ? {}
+          : { dms: [...state.dms, dm] },
+      );
+      return placeKey({ kind: dm.kind, dmId: dm.dmId });
+    },
+
+    async updateChannelTopic(channelId, topic) {
+      const channel = await backend.updateChannelTopic(channelId, topic);
+      set((state) => ({
+        channels: state.channels.map((entry) =>
+          entry.channelId === channel.channelId ? channel : entry,
+        ),
+      }));
     },
 
     async loadPlaceAround(key, seq) {
