@@ -90,8 +90,13 @@ const INLINE_IMAGE_MIMES = new Set([
   "image/webp",
 ]);
 
+/** MIME単体の判定。送信前の下書き（まだAttachmentでない）でも使う。 */
+export function isImageMime(mime: string): boolean {
+  return INLINE_IMAGE_MIMES.has(mime.toLowerCase());
+}
+
 export function isImageAttachment(attachment: Attachment): boolean {
-  return INLINE_IMAGE_MIMES.has(attachment.mime.toLowerCase());
+  return isImageMime(attachment.mime);
 }
 
 /** 添付できる1ファイルの上限（20MiB）。サーバーのMaxAttachmentBytesと同値。 */

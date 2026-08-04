@@ -2,45 +2,29 @@ import {
   AtSign,
   ChartBarBig,
   CornerUpLeft,
-  Loader2,
   MessagesSquare,
   Paperclip,
   SendHorizontal,
-  TriangleAlert,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
-import { secureRandomUUID } from "../../lib/random-uuid";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
-import type { Attachment, MemberProfile, Message, Urgency } from "../model";
-import {
-  MAX_ATTACHMENT_BYTES,
-  MAX_ATTACHMENTS_PER_MESSAGE,
-  participantKey,
-} from "../model";
+import type { MemberProfile, Message, Urgency } from "../model";
+import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
+import {
+  ComposerAttachments,
+  useDraftAttachments,
+} from "./composer-attachments";
 import type { ComposerPlusMenuItem } from "./composer-plus-menu";
 import { ComposerPlusMenu } from "./composer-plus-menu";
-import { formatFileSize } from "./message-attachments";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
-
-/**
- * 送信待ちの添付。アップロードは送信より前に済ませ、送信時にはidを渡すだけ。
- * 送る前ならいつでも取り消せる。
- */
-interface DraftAttachment {
-  localId: string;
-  filename: string;
-  size: number;
-  status: "uploading" | "ready" | "failed";
-  attachment?: Attachment;
-}
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
 const NO_MESSAGES: Message[] = [];
@@ -95,7 +79,7 @@ export function Composer() {
   const [urgency, setUrgency] = useState<Urgency>("normal");
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
-  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  const drafts = useDraftAttachments(uploadAttachment);
   const [dragging, setDragging] = useState(false);
   const lastTypingAt = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -205,76 +189,28 @@ export function Composer() {
   );
 
   // 添付は送信前にアップロードし、送信時にはidを渡すだけにする。
-  // 大きすぎるファイルはサーバーへ運ばずここで落とす（上限は契約と同値）。
+  // 受け皿と表示はcomposer-attachmentsが持つ。
+  const addDraftFiles = drafts.addFiles;
   const addFiles = useCallback(
     (files: FileList | File[] | null | undefined) => {
-      const chosen = Array.from(files ?? []);
-      if (chosen.length === 0) return;
-      const room = Math.max(
-        0,
-        MAX_ATTACHMENTS_PER_MESSAGE - attachments.length,
-      );
-      const accepted = chosen.slice(0, room);
-      const drafts: DraftAttachment[] = accepted.map((file) => ({
-        localId: secureRandomUUID(),
-        filename: file.name || "file",
-        size: file.size,
-        status: file.size > MAX_ATTACHMENT_BYTES ? "failed" : "uploading",
-      }));
-      if (drafts.length === 0) return;
-      setAttachments((current) => [...current, ...drafts]);
-      drafts.forEach((draft, index) => {
-        if (draft.status !== "uploading") return;
-        uploadAttachment(accepted[index])
-          .then((attachment) => {
-            setAttachments((current) =>
-              current.map((entry) =>
-                entry.localId === draft.localId
-                  ? { ...entry, status: "ready" as const, attachment }
-                  : entry,
-              ),
-            );
-          })
-          .catch(() => {
-            setAttachments((current) =>
-              current.map((entry) =>
-                entry.localId === draft.localId
-                  ? { ...entry, status: "failed" as const }
-                  : entry,
-              ),
-            );
-          });
-      });
+      addDraftFiles(files);
     },
-    [attachments.length, uploadAttachment],
+    [addDraftFiles],
   );
-
-  const removeAttachment = useCallback((localId: string) => {
-    setAttachments((current) =>
-      current.filter((entry) => entry.localId !== localId),
-    );
-  }, []);
 
   // メンション候補は一覧の上に浮くので、この上でのホイールも一覧へ渡す。
   const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
-  const uploading = attachments.some((entry) => entry.status === "uploading");
-  const readyAttachments = useMemo(
-    () =>
-      attachments.flatMap((entry) =>
-        entry.attachment ? [entry.attachment] : [],
-      ),
-    [attachments],
-  );
+  const { uploading, ready: readyAttachments, clear: clearDrafts } = drafts;
 
   const submit = useCallback(() => {
     // アップロード中に送ると添付を取りこぼす。終わるまで送信しない。
     if (uploading) return;
     if (!value.trim() && readyAttachments.length === 0) return;
     send(value, urgency, readyAttachments);
-    setAttachments([]);
+    clearDrafts();
     setUrgency("normal");
     setMention(null);
-  }, [value, send, urgency, uploading, readyAttachments]);
+  }, [value, send, urgency, uploading, readyAttachments, clearDrafts]);
 
   // 送信できるかどうかの判定は送信ボタンの活殺とEnter送信で同じものを使う。
   const canSend =
@@ -465,44 +401,7 @@ export function Composer() {
           addFiles(event.dataTransfer.files);
         }}
       >
-        {attachments.length > 0 ? (
-          <div className="flex flex-wrap gap-1.5 px-2.5 pt-2.5">
-            {attachments.map((entry) => (
-              <span
-                key={entry.localId}
-                className={`flex max-w-56 items-center gap-1.5 rounded-md border px-2 py-1 text-[12px] ${
-                  entry.status === "failed"
-                    ? "border-rose-500/40 bg-rose-500/8 text-rose-600 dark:text-rose-400"
-                    : "border-border bg-muted/40"
-                }`}
-              >
-                {entry.status === "uploading" ? (
-                  <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
-                ) : entry.status === "failed" ? (
-                  <TriangleAlert className="size-3 shrink-0" />
-                ) : (
-                  <Paperclip className="size-3 shrink-0 text-muted-foreground" />
-                )}
-                <span className="truncate">{entry.filename}</span>
-                <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
-                  {entry.status === "failed"
-                    ? entry.size > MAX_ATTACHMENT_BYTES
-                      ? "大きすぎます"
-                      : "失敗"
-                    : formatFileSize(entry.size)}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => removeAttachment(entry.localId)}
-                  className="shrink-0 rounded p-0.5 hover:bg-accent"
-                  aria-label={`${entry.filename} の添付を取り消す`}
-                >
-                  <X className="size-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-        ) : null}
+        <ComposerAttachments items={drafts.items} onRemove={drafts.remove} />
         <textarea
           ref={textareaRef}
           value={value}
