@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { isImeComposing } from "../../lib/ime";
 import type {
   ChannelSummary,
   DmSummary,
@@ -180,7 +181,7 @@ export function MessageSearch({
             if (query.trim()) setOpen(true);
           }}
           onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return;
+            if (isImeComposing(event)) return;
             if (event.key === "Enter") {
               event.preventDefault();
               if (timerRef.current) window.clearTimeout(timerRef.current);
@@ -194,7 +195,8 @@ export function MessageSearch({
               close();
             }
           }}
-          className="h-7 w-36 rounded-md border border-border bg-background pr-2 pl-7 text-[12px] outline-none transition-[width] duration-150 focus:w-64 focus-visible:border-ring/60 sm:w-44"
+          // フォーカスで幅を変えない。右隣のアイコンが動くと押し損ねる。
+          className="h-7 w-36 rounded-md border border-border bg-background pr-2 pl-7 text-[12px] outline-none focus-visible:border-ring/60 sm:w-44"
         />
       </div>
       {showPanel ? (

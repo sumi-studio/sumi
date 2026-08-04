@@ -7,6 +7,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import { secureRandomUUID } from "../../lib/random-uuid";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { Attachment, MemberProfile, Message, Urgency } from "../model";
@@ -264,7 +265,7 @@ export function Composer() {
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (event.nativeEvent.isComposing) return;
+      if (isImeComposing(event)) return;
       if (mention && candidates.length > 0) {
         if (event.key === "ArrowDown") {
           event.preventDefault();

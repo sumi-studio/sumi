@@ -26,6 +26,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
 import { SumiProfileUpdateIndeterminateError } from "../auth/session-client";
+import { isImeComposing } from "../lib/ime";
 import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { LOCAL_APP_DESCRIPTORS } from "../shell/app-descriptors";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
@@ -164,6 +165,12 @@ export function SettingsPopover() {
             </div>
             <form
               onSubmit={(event) => void handleProfileSubmit(event)}
+              onKeyDown={(event) => {
+                // IME変換確定のEnterで保存しない。
+                if (event.key === "Enter" && isImeComposing(event)) {
+                  event.preventDefault();
+                }
+              }}
               className="px-2.5 pb-2"
             >
               <label

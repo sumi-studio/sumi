@@ -1,5 +1,6 @@
 import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -95,35 +96,54 @@ function PlaceNotificationMenu({
           {...overlay.panelProps}
           className="absolute top-full right-0 z-30 mt-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
         >
-          <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
+          <p
+            id={`place-notification-${key}`}
+            className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground"
+          >
             通知
           </p>
-          {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
-            (candidate) => (
-              <button
-                key={candidate}
-                type="button"
-                onClick={() => {
-                  setPlaceNotificationLevel(key, candidate);
-                  onOpenChange(false);
-                }}
-                className={`block w-full rounded-md px-2 py-1.5 text-left hover:bg-accent ${
-                  level === candidate ? "bg-accent/60" : ""
-                }`}
-              >
-                <span
-                  className={`block text-[13px] ${
-                    level === candidate ? "font-medium" : ""
+          <div role="radiogroup" aria-labelledby={`place-notification-${key}`}>
+            {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
+              (candidate) => (
+                <label
+                  key={candidate}
+                  className={`flex w-full cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
+                    level === candidate ? "bg-accent/60" : ""
                   }`}
                 >
-                  {NOTIFICATION_LEVEL_LABEL[candidate]}
-                </span>
-                <span className="block text-[11px] text-muted-foreground">
-                  {NOTIFICATION_LEVEL_HINT[candidate]}
-                </span>
-              </button>
-            ),
-          )}
+                  <input
+                    type="radio"
+                    name={`place-notification-choice-${key}`}
+                    checked={level === candidate}
+                    onChange={() => {
+                      setPlaceNotificationLevel(key, candidate);
+                      onOpenChange(false);
+                    }}
+                    className="sr-only"
+                  />
+                  {/* 選択中は色だけでなく形（✓）でも示す。 */}
+                  <Check
+                    aria-hidden
+                    className={`mt-0.5 size-3.5 shrink-0 transition-opacity ${
+                      level === candidate ? "opacity-100" : "opacity-0"
+                    }`}
+                  />
+                  <span className="min-w-0">
+                    <span
+                      className={`block text-[13px] ${
+                        level === candidate ? "font-medium" : ""
+                      }`}
+                    >
+                      {NOTIFICATION_LEVEL_LABEL[candidate]}
+                    </span>
+                    <span className="block text-[11px] text-muted-foreground">
+                      {NOTIFICATION_LEVEL_HINT[candidate]}
+                    </span>
+                  </span>
+                </label>
+              ),
+            )}
+          </div>
         </div>
       ) : null}
     </div>
@@ -269,7 +289,16 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <DialogShell title="チャンネルを作成" onClose={onClose}>
-      <form onSubmit={submit} className="mt-3 space-y-3">
+      <form
+        onSubmit={submit}
+        onKeyDown={(event) => {
+          // IME変換確定のEnterでフォームを飛ばさない。
+          if (event.key === "Enter" && isImeComposing(event)) {
+            event.preventDefault();
+          }
+        }}
+        className="mt-3 space-y-3"
+      >
         <label className="block">
           <span className="mb-1 block text-[11px] text-muted-foreground">
             名前
@@ -572,17 +601,22 @@ export function Sidebar() {
             className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
           >
             {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
-              <button
+              <label
                 key={kind}
-                type="button"
-                onClick={() => {
-                  setStatus(kind, kind === "busy" ? "取り込み中" : "");
-                  setStatusMenuOpen(false);
-                }}
-                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent ${
+                className={`flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
                   selfStatus?.status === kind ? "font-medium" : ""
                 }`}
               >
+                <input
+                  type="radio"
+                  name="self-status-choice"
+                  checked={selfStatus?.status === kind}
+                  onChange={() => {
+                    setStatus(kind, kind === "busy" ? "取り込み中" : "");
+                    setStatusMenuOpen(false);
+                  }}
+                  className="sr-only"
+                />
                 <span
                   className={`size-2 rounded-full ${
                     kind === "available"
@@ -593,7 +627,13 @@ export function Sidebar() {
                   }`}
                 />
                 {STATUS_LABEL[kind]}
-              </button>
+                <Check
+                  aria-hidden
+                  className={`ml-auto size-3.5 shrink-0 ${
+                    selfStatus?.status === kind ? "opacity-100" : "opacity-0"
+                  }`}
+                />
+              </label>
             ))}
             <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
               ステータスは自己申告。誰かが勝手に晒すことはありません
