@@ -45,6 +45,7 @@ var (
 	ErrNotReachable        = errors.New("participants share no active workspace membership")
 	ErrMessageNotFound     = errors.New("message not found")
 	ErrNotAuthor           = errors.New("only the author may do this")
+	ErrNotAChannel         = errors.New("place is not a channel")
 	ErrForbidden           = errors.New("participant lacks the required role")
 	ErrMessageDeleted      = errors.New("message is deleted")
 	ErrIdempotencyConflict = errors.New("idempotency key was already used for another reaction mutation")
@@ -282,31 +283,52 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	}, nil
 }
 
-// EnsureDM returns the one dm place between two participants, creating it on
-// first use. Reachability (契約ドラフト: 到達できれば誰とでも会話できる) v0
-// requires an active shared workspace membership; the accepted-Connection
-// basis lands with the Connection domain (Codex合意 4) and widens this check
-// without changing callers.
-func (s *Store) EnsureDM(ctx context.Context, a, b ParticipantRef) (Place, error) {
-	for _, p := range []ParticipantRef{a, b} {
-		if err := p.Validate(); err != nil {
-			return Place{}, err
-		}
-	}
-	if a.Key() == b.Key() {
-		return Place{}, fmt.Errorf("a dm needs two distinct participants")
-	}
-	reachable, err := s.shareActiveWorkspace(ctx, a, b)
+// UpdateChannelTopic sets a channel's topic. v0 permission mirrors
+// CreateChannel: any active workspace member may edit the topic (契約ドラフト:
+// 権限は最小構成). Visibility is checked first so a place the actor cannot see
+// stays unrevealed.
+func (s *Store) UpdateChannelTopic(ctx context.Context, placeID, topic string, actor ParticipantRef) (Place, error) {
+	place, err := s.PlaceFor(ctx, placeID, actor)
 	if err != nil {
 		return Place{}, err
 	}
+	if place.Kind != PlaceChannel {
+		return Place{}, ErrNotAChannel
+	}
+	if _, err := s.pool.Exec(ctx,
+		"UPDATE places SET topic = $1 WHERE place_id = $2", topic, placeID); err != nil {
+		return Place{}, fmt.Errorf("update channel topic: %w", err)
+	}
+	place.Topic = topic
+	return place, nil
+}
+
+// EnsureDM returns the one dm place between two participants, creating it on
+// first use; created reports whether this call minted the place. Reachability
+// (契約ドラフト: 到達できれば誰とでも会話できる) v0 requires an active shared
+// workspace membership; the accepted-Connection basis lands with the
+// Connection domain (Codex合意 4) and widens this check without changing
+// callers.
+func (s *Store) EnsureDM(ctx context.Context, a, b ParticipantRef) (place Place, created bool, err error) {
+	for _, p := range []ParticipantRef{a, b} {
+		if err := p.Validate(); err != nil {
+			return Place{}, false, err
+		}
+	}
+	if a.Key() == b.Key() {
+		return Place{}, false, fmt.Errorf("a dm needs two distinct participants")
+	}
+	reachable, err := s.shareActiveWorkspace(ctx, a, b)
+	if err != nil {
+		return Place{}, false, err
+	}
 	if !reachable {
-		return Place{}, ErrNotReachable
+		return Place{}, false, ErrNotReachable
 	}
 	dmKey := dmPairKey(a, b)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Place{}, fmt.Errorf("begin ensure dm: %w", err)
+		return Place{}, false, fmt.Errorf("begin ensure dm: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	placeID := newUUIDv7()
@@ -323,29 +345,29 @@ func (s *Store) EnsureDM(ctx context.Context, a, b ParticipantRef) (Place, error
 			"SELECT place_id, last_seq FROM places WHERE dm_key = $1",
 			dmKey).Scan(&existing.PlaceID, &existing.LastSeq)
 		if err != nil {
-			return Place{}, fmt.Errorf("load existing dm: %w", err)
+			return Place{}, false, fmt.Errorf("load existing dm: %w", err)
 		}
 		existing.Kind = PlaceDM
 		existing.Visibility = "public"
 		if err := tx.Commit(ctx); err != nil {
-			return Place{}, fmt.Errorf("commit ensure dm: %w", err)
+			return Place{}, false, fmt.Errorf("commit ensure dm: %w", err)
 		}
-		return existing, nil
+		return existing, false, nil
 	}
 	if err != nil {
-		return Place{}, fmt.Errorf("insert dm place: %w", err)
+		return Place{}, false, fmt.Errorf("insert dm place: %w", err)
 	}
 	for _, p := range []ParticipantRef{a, b} {
 		if _, err := tx.Exec(ctx,
 			"INSERT INTO place_members (place_id, member_kind, member_id) VALUES ($1, $2, $3)",
 			placeID, p.Kind, p.ID); err != nil {
-			return Place{}, fmt.Errorf("insert dm member: %w", err)
+			return Place{}, false, fmt.Errorf("insert dm member: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Place{}, fmt.Errorf("commit ensure dm: %w", err)
+		return Place{}, false, fmt.Errorf("commit ensure dm: %w", err)
 	}
-	return Place{PlaceID: placeID, Kind: PlaceDM, Visibility: "public"}, nil
+	return Place{PlaceID: placeID, Kind: PlaceDM, Visibility: "public"}, true, nil
 }
 
 // CreateGroupDM creates a group dm with the creator and at least two others.
