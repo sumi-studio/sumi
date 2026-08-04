@@ -50,6 +50,9 @@ type Server struct {
 	// failing closed (503): a subscription nothing can send to is worse than
 	// an honest "この deployment に push はまだ無い".
 	Push *PushDispatcher
+	// Calls, when set, is the RTC surface (ADR 0012). Nil means the deployment
+	// configured no media transport, and the call routes are not mounted.
+	Calls *CallService
 }
 
 // NewServer returns a messaging REST server backed by the store.

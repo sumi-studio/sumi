@@ -7,6 +7,10 @@
  * sum typeであり、consumerは未知のkindをfail-closedに無視できる必要がある。
  */
 
+// 通話（ADR 0012）はメッセージングの上に乗る別の層なので、型は call/ に置き、
+// ここではServerEventの一分岐として参照するだけにする（型のみのimport）。
+import type { CallState } from "./call/model";
+
 export type ParticipantRef =
   | { kind: "human"; humanId: string }
   // "agent"ではなく"personality_agent": worker/subagent/appとの混同を防ぐ（Codex合意）。
@@ -305,7 +309,12 @@ export type ServerEvent =
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
   | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
   /** channelのmutable属性（v0: topic）の変更。 */
-  | { type: "place_updated"; channel: ChannelSummary };
+  | { type: "place_updated"; channel: ChannelSummary }
+  /**
+   * placeの通話に今いる人（ADR 0012）。typingやstatusと同じくvolatileで
+   * replayされない。再接続時の現在値は GET /messaging/calls から読む。
+   */
+  | { type: "call_state"; call: CallState };
 
 export interface SendMessageInput {
   place: Place;

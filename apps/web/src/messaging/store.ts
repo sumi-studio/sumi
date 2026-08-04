@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
@@ -440,6 +441,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+      return;
+    }
+    // 通話の在室（ADR 0012）はメッセージングのstateではなくcall storeが持つ。
+    if (event.type === "call_state") {
+      useCall.getState().applyCallState(event.call);
     }
   };
 
@@ -652,6 +658,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           });
           backend.subscribe(applyEvent, { sinceByPlace });
           backend.subscribeConnection((state) => set({ connection: state }));
+          // 通話はreplayされないので、今開いている通話は明示的に読み直す。
+          void useCall.getState().hydrate();
         })
         .catch(() => {
           initialized = false;
@@ -1011,6 +1019,8 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  // 人が入れ替わるなら通話も終わる。前の人の部屋に残らない。
+  useCall.getState().reset();
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;

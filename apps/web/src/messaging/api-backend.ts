@@ -1,3 +1,4 @@
+import { parseCallState } from "./call/call-api";
 import type {
   Attachment,
   AttachmentDraftPatch,
@@ -514,6 +515,9 @@ export class ApiMessagingBackend implements MessagingBackend {
         type: "place_updated",
         channel: this.registerChannel(wire.channel),
       };
+    } else if (eventType === "call_state") {
+      // 通話の在室（ADR 0012）。volatileなのでcursorは動かさない。
+      parsed = { type: "call_state", call: parseCallState(wire.call) };
     } else {
       return;
     }

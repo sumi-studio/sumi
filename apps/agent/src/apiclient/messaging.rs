@@ -183,6 +183,17 @@ pub(crate) struct PollMessagingAttentionRequest {
     pub limit: Option<u16>,
 }
 
+/// Reading who is currently in a call (ADR 0012).  No place means every place
+/// the agent can see; naming one narrows the answer to it.  There is
+/// deliberately no request for *joining* a call — the ADR records that as an
+/// open design question rather than a missing endpoint.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetMessagingCallStateRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn overview(&self) -> Result<Value>;
@@ -223,4 +234,6 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     ) -> Result<Value>;
 
     async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<Value>;
+
+    async fn call_state(&self, request: GetMessagingCallStateRequest<'_>) -> Result<Value>;
 }

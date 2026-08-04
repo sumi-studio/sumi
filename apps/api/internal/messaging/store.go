@@ -510,6 +510,15 @@ func (s *Store) PlaceFor(ctx context.Context, placeID string, viewer Participant
 	return place, nil
 }
 
+// PlaceByID loads a place without a viewer. It exists for server-to-server
+// paths that must name a place before any recipient is known — the LiveKit
+// call webhook, which learns only a room name and needs the place shape to
+// publish. It performs no visibility check, so it must never answer a request
+// that carries a participant: the Hub still decides who is told (call.go).
+func (s *Store) PlaceByID(ctx context.Context, placeID string) (Place, error) {
+	return s.loadPlace(ctx, s.pool, placeID)
+}
+
 // ActiveMembers returns the active members of a place with display names
 // resolved from the 戸籍 (workspace nicknames land later). The viewer must be
 // able to see the place.

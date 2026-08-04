@@ -37,11 +37,11 @@ use super::supervisor::{
 };
 use crate::apiclient::messaging::{
     CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-    DuplicateMessagingChannelRequest, MessagingApi, MessagingNotificationSettingsRequest,
-    OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
-    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
-    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
-    WriteMessagingMessageRequest,
+    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, MessagingApi,
+    MessagingNotificationSettingsRequest, OpenMessagingPlaceRequest,
+    PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+    ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
+    StartMessagingDMRequest, UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -601,6 +601,14 @@ impl MessagingApi for LocalControlHttpClient {
 
     async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:attention", &request)
+            .await
+    }
+
+    async fn call_state(
+        &self,
+        request: GetMessagingCallStateRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:call-state", &request)
             .await
     }
 }
