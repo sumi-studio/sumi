@@ -35,6 +35,7 @@ type Message struct {
 	Content     string
 	Urgency     string
 	Mentions    []ParticipantRef
+	Reactions   []ReactionSummary
 	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
@@ -230,6 +231,9 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if err := s.attachMentions(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -256,6 +260,9 @@ func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer Partic
 		return nil, err
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -326,7 +333,13 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	msg.Content = content
 	msg.Mentions = mentions
 	msg.EditedAt = &editedAt
-	return msg, nil
+	// The edited event carries the whole message; live consumers replace their
+	// copy with it, so reactions must ride along or the edit would erase them.
+	messages := []Message{msg}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return Message{}, err
+	}
+	return messages[0], nil
 }
 
 // DeleteMessage tombstones a message: content is removed, the fact and the seq
@@ -384,11 +397,18 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 		"DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
 		return Message{}, fmt.Errorf("clear mentions: %w", err)
 	}
+	// A tombstone keeps only the fact and the seq; reactions to the vanished
+	// content vanish with it.
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_reactions WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear reactions: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit delete: %w", err)
 	}
 	msg.Content = ""
 	msg.Mentions = nil
+	msg.Reactions = nil
 	msg.Deleted = true
 	return msg, nil
 }
@@ -519,6 +539,9 @@ func (s *Store) messageByNonce(ctx context.Context, q querier, in AppendInput) (
 		return Message{}, false, nil
 	}
 	if err := s.attachMentions(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
 	return messages[0], true, nil

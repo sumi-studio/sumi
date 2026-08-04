@@ -18,10 +18,11 @@ type Event struct {
 
 // Durable event types. The wire names match the web model's ServerEvent.
 const (
-	EventMessageCreated = "message_created"
-	EventMessageEdited  = "message_edited"
-	EventMessageDeleted = "message_deleted"
-	EventTyping         = "typing"
+	EventMessageCreated  = "message_created"
+	EventMessageEdited   = "message_edited"
+	EventMessageDeleted  = "message_deleted"
+	EventReactionUpdated = "reaction_updated"
+	EventTyping          = "typing"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a

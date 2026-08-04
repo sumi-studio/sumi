@@ -48,6 +48,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 }
 
@@ -122,11 +123,29 @@ type messageWire struct {
 	Content     string            `json:"content"`
 	Mentions    []participantWire `json:"mentions"`
 	Urgency     string            `json:"urgency"`
+	Reactions   []reactionWire    `json:"reactions"`
 	ReplyTo     *string           `json:"reply_to"`
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`
 	EditedAt    *time.Time        `json:"edited_at"`
 	Deleted     bool              `json:"deleted"`
+}
+
+// reactionWire matches the web model's ReactionSummary.
+type reactionWire struct {
+	Emoji        string            `json:"emoji"`
+	Participants []participantWire `json:"participants"`
+}
+
+func reactionsToWire(summaries []ReactionSummary) []reactionWire {
+	out := make([]reactionWire, len(summaries))
+	for i, summary := range summaries {
+		out[i] = reactionWire{
+			Emoji:        summary.Emoji,
+			Participants: participantsToWire(summary.Participants),
+		}
+	}
+	return out
 }
 
 func messageToWire(place Place, m Message) messageWire {
@@ -138,6 +157,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Content:     m.Content,
 		Mentions:    participantsToWire(m.Mentions),
 		Urgency:     m.Urgency,
+		Reactions:   reactionsToWire(m.Reactions),
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
@@ -669,6 +689,54 @@ func (s *Server) serveDelete(w http.ResponseWriter, r *http.Request) {
 	wire := messageToWire(place, msg)
 	s.Hub.Publish(r.Context(), Event{Type: EventMessageDeleted, PlaceID: placeID, Message: &wire})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// serveToggleReaction toggles the viewer's emoji on a message. The same store
+// toggle backs the agent tool path (AX: UIだけにある操作を作らない).
+func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	placeID := r.PathValue("place_id")
+	var req struct {
+		Emoji string `json:"emoji"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if validateReactionEmoji(req.Emoji) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_emoji")
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var (
+		msg     Message
+		reacted bool
+	)
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		msg, reacted, opErr = s.Store.ToggleReaction(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Message: &wire})
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+		Reacted bool        `json:"reacted"`
+	}{Message: wire, Reacted: reacted})
 }
 
 func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {
