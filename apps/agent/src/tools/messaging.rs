@@ -15,9 +15,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
-        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
+        CreateMessagingReplyLaterRequest, MessagingApi, MessagingParticipant,
+        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+        WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -30,6 +31,10 @@ const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
 const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_MARKER_ID_BYTES: usize = 256;
+const MAX_PARTICIPANT_ID_BYTES: usize = 256;
+// A group dm the agent opens in one gesture. Far beyond any real conversation,
+// tight enough that a malformed argument cannot fan out.
+const MAX_DM_PARTICIPANTS: usize = 32;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
@@ -91,6 +96,13 @@ enum MessagingAction {
     /// Mark one's own earlier promise as kept.  Like the human's reply-later
     /// list this is reachable from anywhere, not only from the place.
     ResolveReplyLater { marker_id: String },
+    /// Open a direct conversation with one person (a dm) or several (a group
+    /// dm), exactly like the human sidebar's「ダイレクトメッセージを開始」.
+    /// The new place becomes the one in view, as it does for a human who is
+    /// taken into the conversation they just opened.
+    StartDm {
+        participants: Vec<MessagingParticipant>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -174,15 +186,16 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id. Write, react and reply_later act on the place most recently opened in ",
-            "this tool view; status and resolve_reply_later need no open place."
+            "marker_id; start_dm requires participants. Write, react and reply_later act on the ",
+            "place most recently opened in this tool view; status, resolve_reply_later and ",
+            "start_dm need no open place."
         ),
         "properties": {
             "action": {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later"
+                    "status", "reply_later", "resolve_reply_later", "start_dm"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -190,7 +203,9 @@ fn messaging_parameters_schema() -> Value {
                     "the currently open place; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept."
+                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "start_dm opens a direct conversation with one person, or a group ",
+                    "conversation with several, and puts it in view."
                 )
             },
             "place_id": {
@@ -284,6 +299,36 @@ fn messaging_parameters_schema() -> Value {
                     "Required for resolve_reply_later and omitted for other actions. The ",
                     "marker_id returned when you made the promise."
                 )
+            },
+            "participants": {
+                "type": "array",
+                "maxItems": 32,
+                "description": concat!(
+                    "Required for start_dm and omitted for other actions. The people to open the ",
+                    "conversation with, each copied from the participant object overview showed ",
+                    "for that member. Do not list yourself. One entry opens the single direct ",
+                    "conversation with that person; several open a group conversation."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["human", "personality_agent"],
+                            "description": "Which kind of participant this is."
+                        },
+                        "human_id": {
+                            "type": "string",
+                            "description": "Required when kind is human, omitted otherwise."
+                        },
+                        "personality_agent_id": {
+                            "type": "string",
+                            "description": "Required when kind is personality_agent, omitted otherwise."
+                        }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }
             }
         },
         "required": ["action"],
@@ -300,7 +345,8 @@ impl Tool for MessagingTool {
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status. ",
+                "message visible in it. Declare your own availability with status, or ",
+                "open a new direct or group conversation with start_dm. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare."
             )
@@ -477,6 +523,28 @@ impl Tool for MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::StartDm { participants } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.start_dm(StartMessagingDMRequest {
+                        participants: &participants,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // A human who starts a conversation lands in it. Focus the new
+                // place so writing needs no second gesture; nothing has been
+                // seen there yet, so the screen starts empty.
+                if let Some(dm_id) = response
+                    .get("dm")
+                    .and_then(|dm| dm.get("dm_id"))
+                    .and_then(Value::as_str)
+                {
+                    state.focused_place_id = Some(dm_id.to_owned());
+                    state.pending_read_through = None;
+                    state.visible_messages.clear();
+                }
+                response
+            }
         };
 
         let rendered = serde_json::to_string_pretty(&response)
@@ -552,7 +620,35 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         MessagingAction::ResolveReplyLater { marker_id } => {
             validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
         }
+        MessagingAction::StartDm { participants } => validate_dm_participants(participants),
     }
+}
+
+/// The people a conversation is opened with. Each is named in the shape
+/// overview already showed, and each names exactly one identity: a kind
+/// without its matching id (or with the other kind's id) is not a person.
+fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(), ToolError> {
+    if participants.is_empty() || participants.len() > MAX_DM_PARTICIPANTS {
+        return Err(ToolError::InvalidArguments);
+    }
+    let mut seen = Vec::with_capacity(participants.len());
+    for participant in participants {
+        let id = match (
+            participant.kind.as_str(),
+            participant.human_id.as_deref(),
+            participant.personality_agent_id.as_deref(),
+        ) {
+            ("human", Some(id), None) | ("personality_agent", None, Some(id)) => id,
+            _ => return Err(ToolError::InvalidArguments),
+        };
+        validate_bounded_nonempty(id, MAX_PARTICIPANT_ID_BYTES)?;
+        let key = format!("{}:{id}", participant.kind);
+        if seen.contains(&key) {
+            return Err(ToolError::InvalidArguments);
+        }
+        seen.push(key);
+    }
+    Ok(())
 }
 
 /// Exactly one selector: the gesture lands on one visible message. React and
@@ -698,6 +794,7 @@ mod tests {
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
+        started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -805,6 +902,23 @@ mod tests {
             Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
         }
 
+        async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("start_dm".to_owned());
+            self.started_dms
+                .lock()
+                .await
+                .push(request.participants.to_vec());
+            let group = request.participants.len() > 1;
+            Ok(json!({
+                "dm": {
+                    "dm_id": if group { "gdm-1" } else { "dm-1" },
+                    "kind": if group { "group_dm" } else { "dm" },
+                    "participants": []
+                },
+                "created": true
+            }))
+        }
+
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
             if self.failures.lock().await.pop_front() == Some("read") {
                 return Err(anyhow!("read failed"));
@@ -893,7 +1007,8 @@ mod tests {
                 "react",
                 "status",
                 "reply_later",
-                "resolve_reply_later"
+                "resolve_reply_later",
+                "start_dm"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -912,6 +1027,11 @@ mod tests {
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
+        assert_eq!(schema["properties"]["participants"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["participants"]["items"]["properties"]["kind"]["enum"],
+            json!(["human", "personality_agent"])
+        );
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -921,7 +1041,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            15
+            16
         );
     }
 
@@ -1324,6 +1444,78 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.resolutions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_dm_opens_the_conversation_and_puts_it_in_view() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // One person: the single direct conversation, and the agent lands in
+        // it — writing needs no separate open, exactly as a human is taken
+        // into the conversation they just started.
+        execute(
+            &tool,
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "human", "human_id": "h-haru"}]}),
+            "dm",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "はじめまして"}),
+            "w1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "dm-1");
+
+        // Several people: a group conversation, which becomes the place in view.
+        execute(
+            &tool,
+            json!({"action": "start_dm", "participants": [
+                {"kind": "human", "human_id": "h-haru"},
+                {"kind": "personality_agent", "personality_agent_id": "a-kuro"}
+            ]}),
+            "gdm",
+        )
+        .await
+        .unwrap();
+        execute(&tool, json!({"action": "write", "content": "3人で"}), "w2")
+            .await
+            .unwrap();
+        assert_eq!(api.writes.lock().await[1].0, "gdm-1");
+        assert_eq!(api.started_dms.lock().await.len(), 2);
+
+        // Nothing has been seen in a place just opened, so there is nothing to
+        // react to there yet.
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+
+        // A participant must name exactly one identity, and nobody twice.
+        for arguments in [
+            json!({"action": "start_dm", "participants": []}),
+            json!({"action": "start_dm", "participants": [{"kind": "human"}]}),
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "human", "personality_agent_id": "a-kuro"}]}),
+            json!({"action": "start_dm", "participants": [
+                {"kind": "human", "human_id": "h-haru"},
+                {"kind": "human", "human_id": "h-haru"}
+            ]}),
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "app", "human_id": "h-haru"}]}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.started_dms.lock().await.len(), 2);
     }
 
     #[tokio::test]

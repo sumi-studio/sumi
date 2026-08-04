@@ -38,7 +38,7 @@ use super::supervisor::{
 use crate::apiclient::messaging::{
     CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
     ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
-    SetMessagingStatusRequest, WriteMessagingMessageRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -542,6 +542,11 @@ impl MessagingApi for LocalControlHttpClient {
         request: ReadMessagingThroughRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:read-through", &request)
+            .await
+    }
+
+    async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:start-dm", &request)
             .await
     }
 }

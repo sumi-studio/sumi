@@ -17,6 +17,11 @@ const (
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
+	// LocalStartDMPath opens the same conversation the human sidebar's
+	// 「ダイレクトメッセージを開始」opens: one participant reuses (or mints) the
+	// single dm, several mint a group dm. Both go through the identical store
+	// calls REST uses, so neither side can reach a place the other cannot.
+	LocalStartDMPath = "/local-control/v1/messaging:start-dm"
 	// LocalNotificationSettingsPath is both the read and the write of the
 	// agent's own notification setting. The agent owns the identical resource a
 	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
@@ -47,6 +52,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalStartDMPath, s.localStartDM},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 	}
 	for _, route := range routes {
@@ -415,6 +421,67 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localStartDM opens a direct conversation for the agent through the same
+// store calls POST /messaging/dms and POST /messaging/group-dms use. One other
+// participant means the single dm with them (existing or freshly minted);
+// several mean a group dm. The agent is always one of the participants and is
+// never named in the body — the credential decides who is acting.
+func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		Participants []participantWire `json:"participants"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if len(request.Participants) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	others := make([]ParticipantRef, 0, len(request.Participants))
+	for _, wire := range request.Participants {
+		ref, err := wire.ref()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		others = append(others, ref)
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var (
+		place   Place
+		created = true
+		err     error
+	)
+	if len(others) == 1 {
+		place, created, err = s.Store.EnsureDM(r.Context(), viewer, others[0])
+	} else {
+		place, err = s.Store.CreateGroupDM(r.Context(), viewer, others)
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := dmWire{
+		DMID: place.PlaceID, Kind: place.Kind,
+		Participants: append([]participantWire{participantToWire(viewer)}, request.Participants...),
+	}
+	if created && s.Hub != nil {
+		s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		DM      dmWire `json:"dm"`
+		Created bool   `json:"created"`
+	}{wire, created})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

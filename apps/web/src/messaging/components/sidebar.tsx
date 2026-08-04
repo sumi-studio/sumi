@@ -1,4 +1,12 @@
-import { BellOff, Check, Hash, MoreVertical, Plus, X } from "lucide-react";
+import {
+  BellOff,
+  Check,
+  Hash,
+  MoreVertical,
+  Plus,
+  Search,
+  X,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel, PlaceKey, StatusKind } from "../model";
@@ -352,6 +360,14 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** 検索の一致判定。表示名と肩書きの両方を、大小・全角半角を問わず見る。 */
+function matchesQuery(haystack: string, needle: string): boolean {
+  return haystack
+    .normalize("NFKC")
+    .toLowerCase()
+    .includes(needle.normalize("NFKC").toLowerCase());
+}
+
 function StartDMDialog({ onClose }: { onClose: () => void }) {
   const membersByKey = useMessaging((state) => state.membersByKey);
   const statusByKey = useMessaging((state) => state.statusByKey);
@@ -359,8 +375,14 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   const startDM = useMessaging((state) => state.startDM);
   const placeNavigate = usePlaceNavigate();
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
+  const queryRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    queryRef.current?.focus();
+  }, []);
 
   const candidates = useMemo(
     () =>
@@ -372,6 +394,18 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   const chosen = candidates.filter(
     (member) => selected[participantKey(member.participant)],
   );
+  // 絞り込みは表示だけを狭める。選んだ相手は検索語から外れても消えない——
+  // 一覧から見えなくなった選択は、黙って人を落とすのと同じことになる。
+  const visible = useMemo(() => {
+    const trimmed = query.trim();
+    if (!trimmed) return candidates;
+    return candidates.filter(
+      (member) =>
+        selected[participantKey(member.participant)] ||
+        matchesQuery(member.displayName, trimmed) ||
+        matchesQuery(member.tagline, trimmed),
+    );
+  }, [candidates, query, selected]);
 
   const submit = async () => {
     if (busy || chosen.length === 0) return;
@@ -392,13 +426,30 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
       <p className="mt-1 text-[11px] text-muted-foreground/80">
         1人ならDM、複数人ならグループDMになります
       </p>
+      <div className="relative mt-2">
+        <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground/60" />
+        <input
+          ref={queryRef}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          disabled={busy}
+          maxLength={80}
+          placeholder="名前で絞り込む"
+          aria-label="宛先を検索"
+          className={`${INPUT_CLASS} pl-7`}
+        />
+      </div>
       <div className="scrollbar-ui mt-2 max-h-64 overflow-y-auto rounded-md border border-border/70 p-1">
         {candidates.length === 0 ? (
           <p className="px-2 py-3 text-[12px] text-muted-foreground/70">
             話せる相手がいません
           </p>
+        ) : visible.length === 0 ? (
+          <p className="px-2 py-3 text-[12px] text-muted-foreground/70">
+            「{query.trim()}」に合う相手はいません
+          </p>
         ) : (
-          candidates.map((member) => {
+          visible.map((member) => {
             const key = participantKey(member.participant);
             const checked = selected[key] ?? false;
             return (
@@ -441,16 +492,23 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
           })
         )}
       </div>
+      {chosen.length > 0 ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          {chosen.map((member) => member.displayName).join("、")} を選択中
+        </p>
+      ) : null}
       {failed ? (
         <p className="mt-2 text-[11px] text-rose-500">
           会話を開始できませんでした
         </p>
       ) : null}
-      <div className="mt-3 flex justify-end gap-1.5">
+      {/* 主操作の文言は選択人数で伸び縮みするので、キャンセルは左端に固定して
+          ポインタの下から逃げないようにする（両端揃え）。 */}
+      <div className="mt-3 flex items-center justify-between gap-2">
         <button
           type="button"
           onClick={onClose}
-          className="rounded-md px-2.5 py-1.5 text-[12.5px] text-muted-foreground hover:bg-accent"
+          className="rounded-md px-2.5 py-1.5 text-[12.5px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           キャンセル
         </button>
