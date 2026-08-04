@@ -6,6 +6,7 @@ import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
+import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
 import { Sidebar } from "./sidebar";
@@ -360,6 +361,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </button>
           </span>
         </header>
+        <ConnectionBanner />
         <MessageList handleRef={listRef} />
         <TypingIndicator />
         <Composer />
