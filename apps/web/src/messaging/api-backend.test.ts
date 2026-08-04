@@ -377,7 +377,7 @@ describe("ApiMessagingBackend", () => {
     ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
 
     await expect(
-      backend.updateChannelTopic("channel-2", "新しいトピック"),
+      backend.updateChannel("channel-2", { topic: "新しいトピック" }),
     ).resolves.toMatchObject({ topic: "新しいトピック" });
   });
 

@@ -100,6 +100,40 @@ pub(crate) struct StartMessagingDMRequest<'a> {
     pub participants: &'a [MessagingParticipant],
 }
 
+/// Opening a channel in the workspace.  An absent workspace means "the one I
+/// am in", which is the only case the MVP has.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingChannelRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<&'a str>,
+}
+
+/// Editing a channel's mutable identity.  An absent field is left alone, so
+/// renaming never silently clears the topic.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<&'a str>,
+}
+
+/// Copying a channel's shape into a new, empty one.  An absent name takes the
+/// server's derived default, the same one the human menu gets.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DuplicateMessagingChannelRequest<'a> {
+    pub place_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn overview(&self) -> Result<Value>;
@@ -122,4 +156,13 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value>;
 
     async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<Value>;
+
+    async fn create_channel(&self, request: CreateMessagingChannelRequest<'_>) -> Result<Value>;
+
+    async fn update_channel(&self, request: UpdateMessagingChannelRequest<'_>) -> Result<Value>;
+
+    async fn duplicate_channel(
+        &self,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<Value>;
 }

@@ -136,3 +136,58 @@ func TestLocalStartDMOpensTheSamePlacesAsTheHumanUI(t *testing.T) {
 		}
 	}
 }
+
+// The agent's channel lifecycle is the human context menu's, through the same
+// Store calls: create, rename/retopic, duplicate.
+func TestLocalChannelLifecycleMatchesTheHumanMenu(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	world := newWorld(t, ctx)
+	server := NewServer(world.store, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: world.agent.ID}
+
+	post := func(path, body string, handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization)) (int, channelWire) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)).WithContext(ctx)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler(response, request, authorization)
+		var decoded struct {
+			Channel channelWire `json:"channel"`
+		}
+		if response.Code < 300 {
+			if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+				t.Fatalf("decode %s: %v (%s)", path, err, response.Body.String())
+			}
+		}
+		return response.Code, decoded.Channel
+	}
+
+	// workspace_id may be omitted: the agent is in exactly one workspace.
+	code, created := post(LocalCreateChannelPath, `{"name":"設計","topic":"図面の相談"}`, server.localCreateChannel)
+	if code != http.StatusCreated || created.Name != "設計" || created.WorkspaceID != DefaultWorkspaceID {
+		t.Fatalf("create-channel = %d %#v", code, created)
+	}
+
+	code, renamed := post(LocalUpdateChannelPath,
+		`{"place_id":"`+created.ChannelID+`","name":"設計と素材"}`, server.localUpdateChannel)
+	if code != http.StatusOK || renamed.Name != "設計と素材" || renamed.Topic != "図面の相談" {
+		t.Fatalf("update-channel = %d %#v, want the topic left alone", code, renamed)
+	}
+
+	code, copied := post(LocalDuplicateChannelPath,
+		`{"place_id":"`+created.ChannelID+`"}`, server.localDuplicateChannel)
+	if code != http.StatusCreated || copied.Name != "設計と素材 のコピー" ||
+		copied.ChannelID == created.ChannelID {
+		t.Fatalf("duplicate-channel = %d %#v", code, copied)
+	}
+
+	// An edit that names nothing is refused rather than silently succeeding.
+	if code, _ := post(LocalUpdateChannelPath,
+		`{"place_id":"`+created.ChannelID+`"}`, server.localUpdateChannel); code != http.StatusBadRequest {
+		t.Fatalf("empty update status = %d, want 400", code)
+	}
+	if code, _ := post(LocalCreateChannelPath, `{"name":""}`, server.localCreateChannel); code != http.StatusBadRequest {
+		t.Fatalf("empty name status = %d, want 400", code)
+	}
+}

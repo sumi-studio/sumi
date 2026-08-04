@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -46,6 +47,7 @@ var (
 	ErrMessageNotFound     = errors.New("message not found")
 	ErrNotAuthor           = errors.New("only the author may do this")
 	ErrNotAChannel         = errors.New("place is not a channel")
+	ErrInvalidChannelName  = errors.New("channel name must be 1..200 characters")
 	ErrForbidden           = errors.New("participant lacks the required role")
 	ErrMessageDeleted      = errors.New("message is deleted")
 	ErrSeqBeyondLatest     = errors.New("seq is beyond the place's latest seq")
@@ -261,6 +263,9 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	if err := creator.Validate(); err != nil {
 		return Place{}, err
 	}
+	if !validChannelName(name) {
+		return Place{}, ErrInvalidChannelName
+	}
 	active, _, err := s.workspaceMembership(ctx, s.pool, workspaceID, creator)
 	if err != nil {
 		return Place{}, err
@@ -282,11 +287,15 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	}, nil
 }
 
-// UpdateChannelTopic sets a channel's topic. v0 permission mirrors
-// CreateChannel: any active workspace member may edit the topic (契約ドラフト:
-// 権限は最小構成). Visibility is checked first so a place the actor cannot see
-// stays unrevealed.
-func (s *Store) UpdateChannelTopic(ctx context.Context, placeID, topic string, actor ParticipantRef) (Place, error) {
+// MaxChannelNameChars matches the schema CHECK on places.name.
+const MaxChannelNameChars = 200
+
+// UpdateChannel edits a channel's mutable identity: its name, its topic, or
+// both. A nil field is left alone, so naming one thing never silently discards
+// the other. v0 permission mirrors CreateChannel: any active workspace member
+// may edit (契約ドラフト: 権限は最小構成). Visibility is checked first so a
+// place the actor cannot see stays unrevealed.
+func (s *Store) UpdateChannel(ctx context.Context, placeID string, name, topic *string, actor ParticipantRef) (Place, error) {
 	place, err := s.PlaceFor(ctx, placeID, actor)
 	if err != nil {
 		return Place{}, err
@@ -294,12 +303,66 @@ func (s *Store) UpdateChannelTopic(ctx context.Context, placeID, topic string, a
 	if place.Kind != PlaceChannel {
 		return Place{}, ErrNotAChannel
 	}
-	if _, err := s.pool.Exec(ctx,
-		"UPDATE places SET topic = $1 WHERE place_id = $2", topic, placeID); err != nil {
-		return Place{}, fmt.Errorf("update channel topic: %w", err)
+	if name != nil && !validChannelName(*name) {
+		return Place{}, ErrInvalidChannelName
 	}
-	place.Topic = topic
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE places
+		 SET name = COALESCE($1, name), topic = COALESCE($2, topic)
+		 WHERE place_id = $3`, name, topic, placeID); err != nil {
+		return Place{}, fmt.Errorf("update channel: %w", err)
+	}
+	if name != nil {
+		place.Name = *name
+	}
+	if topic != nil {
+		place.Topic = *topic
+	}
 	return place, nil
+}
+
+// UpdateChannelTopic sets a channel's topic and leaves its name alone.
+func (s *Store) UpdateChannelTopic(ctx context.Context, placeID, topic string, actor ParticipantRef) (Place, error) {
+	return s.UpdateChannel(ctx, placeID, nil, &topic, actor)
+}
+
+// DuplicateChannel creates a new channel beside an existing one, carrying its
+// topic over. An empty name derives one from the source ("dev" → "dev のコピー")
+// so both the human menu and the agent tool land on the same default instead of
+// each inventing their own. The copy is a new, empty place: messages, read
+// markers and per-place notification settings belong to the original.
+func (s *Store) DuplicateChannel(ctx context.Context, placeID, name string, actor ParticipantRef) (Place, error) {
+	source, err := s.PlaceFor(ctx, placeID, actor)
+	if err != nil {
+		return Place{}, err
+	}
+	if source.Kind != PlaceChannel {
+		return Place{}, ErrNotAChannel
+	}
+	if name == "" {
+		name = duplicateChannelName(source.Name)
+	}
+	if !validChannelName(name) {
+		return Place{}, ErrInvalidChannelName
+	}
+	return s.CreateChannel(ctx, source.WorkspaceID, name, source.Topic, actor)
+}
+
+// duplicateChannelName names the copy, keeping the result inside the schema's
+// 200-character bound by trimming the source rather than failing.
+func duplicateChannelName(source string) string {
+	const suffix = " のコピー"
+	room := MaxChannelNameChars - utf8.RuneCountInString(suffix)
+	runes := []rune(source)
+	if len(runes) > room {
+		runes = runes[:room]
+	}
+	return string(runes) + suffix
+}
+
+func validChannelName(name string) bool {
+	length := utf8.RuneCountInString(name)
+	return length >= 1 && length <= MaxChannelNameChars
 }
 
 // EnsureDM returns the one dm place between two participants, creating it on

@@ -36,9 +36,11 @@ use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+    DuplicateMessagingChannelRequest, MessagingApi, OpenMessagingPlaceRequest,
     ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
-    SetMessagingStatusRequest, StartMessagingDMRequest, WriteMessagingMessageRequest,
+    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+    WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -547,6 +549,30 @@ impl MessagingApi for LocalControlHttpClient {
 
     async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:start-dm", &request)
+            .await
+    }
+
+    async fn create_channel(
+        &self,
+        request: CreateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:create-channel", &request)
+            .await
+    }
+
+    async fn update_channel(
+        &self,
+        request: UpdateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:update-channel", &request)
+            .await
+    }
+
+    async fn duplicate_channel(
+        &self,
+        request: DuplicateMessagingChannelRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:duplicate-channel", &request)
             .await
     }
 }

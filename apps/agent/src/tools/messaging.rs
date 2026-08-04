@@ -15,10 +15,11 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, MessagingApi, MessagingParticipant,
+        CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+        DuplicateMessagingChannelRequest, MessagingApi, MessagingParticipant,
         OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
         ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
-        WriteMessagingMessageRequest,
+        UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -32,6 +33,11 @@ const MAX_REPLY_ID_BYTES: usize = 256;
 const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_MARKER_ID_BYTES: usize = 256;
 const MAX_PARTICIPANT_ID_BYTES: usize = 256;
+const MAX_WORKSPACE_ID_BYTES: usize = 256;
+// The server bounds a channel name at 200 characters and a topic at 1000
+// bytes; four bytes per character covers any UTF-8 within the name bound.
+const MAX_CHANNEL_NAME_BYTES: usize = 800;
+const MAX_TOPIC_BYTES: usize = 1000;
 // A group dm the agent opens in one gesture. Far beyond any real conversation,
 // tight enough that a malformed argument cannot fan out.
 const MAX_DM_PARTICIPANTS: usize = 32;
@@ -102,6 +108,30 @@ enum MessagingAction {
     /// taken into the conversation they just opened.
     StartDm {
         participants: Vec<MessagingParticipant>,
+    },
+    /// Open a channel in the workspace, as the sidebar's「チャンネルを作成」
+    /// does.  The new channel becomes the place in view.
+    CreateChannel {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// Rename a channel, retopic it, or both.  An omitted field is left alone.
+    UpdateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    /// Copy a channel's name and topic into a new, empty channel.  The copy
+    /// carries no messages: it is a fresh place shaped like the original.
+    DuplicateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
     },
 }
 
@@ -186,16 +216,19 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id; start_dm requires participants. Write, react and reply_later act on the ",
-            "place most recently opened in this tool view; status, resolve_reply_later and ",
-            "start_dm need no open place."
+            "marker_id; start_dm requires participants; create_channel requires name and may ",
+            "include topic or workspace_id; update_channel requires place_id plus name, topic or ",
+            "both; duplicate_channel requires place_id and may include name. Write, react and ",
+            "reply_later act on the place most recently opened in this tool view; every other ",
+            "action needs no open place."
         ),
         "properties": {
             "action": {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later", "start_dm"
+                    "status", "reply_later", "resolve_reply_later", "start_dm",
+                    "create_channel", "update_channel", "duplicate_channel"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -205,12 +238,39 @@ fn messaging_parameters_schema() -> Value {
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
                     "start_dm opens a direct conversation with one person, or a group ",
-                    "conversation with several, and puts it in view."
+                    "conversation with several, and puts it in view; create_channel opens a new ",
+                    "channel and puts it in view; update_channel renames or retopics a channel; ",
+                    "duplicate_channel copies a channel's name and topic into a new empty one."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open and omitted for other actions. The place to open."
+                "description": concat!(
+                    "Required for open, update_channel and duplicate_channel; omitted for other ",
+                    "actions. The place to open, edit or copy."
+                )
+            },
+            "name": {
+                "type": "string",
+                "description": concat!(
+                    "Required for create_channel; optional for update_channel and ",
+                    "duplicate_channel; omitted for other actions. The channel's name. For ",
+                    "duplicate_channel, omitting it takes the derived default name for a copy."
+                )
+            },
+            "topic": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for create_channel and update_channel, omitted for other actions. ",
+                    "The one line describing what the channel is for."
+                )
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for create_channel and omitted for other actions. Which workspace ",
+                    "to open the channel in; when omitted, the workspace you are in is used."
+                )
             },
             "before_seq": {
                 "type": "integer",
@@ -545,6 +605,48 @@ impl Tool for MessagingTool {
                 }
                 response
             }
+            MessagingAction::CreateChannel {
+                name,
+                topic,
+                workspace_id,
+            } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_channel(CreateMessagingChannelRequest {
+                        workspace_id: workspace_id.as_deref(),
+                        name: &name,
+                        topic: topic.as_deref(),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                focus_created_channel(&mut state, &response);
+                response
+            }
+            MessagingAction::UpdateChannel {
+                place_id,
+                name,
+                topic,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.update_channel(UpdateMessagingChannelRequest {
+                    place_id: &place_id,
+                    name: name.as_deref(),
+                    topic: topic.as_deref(),
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::DuplicateChannel { place_id, name } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.duplicate_channel(DuplicateMessagingChannelRequest {
+                        place_id: &place_id,
+                        name: name.as_deref(),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                focus_created_channel(&mut state, &response);
+                response
+            }
         };
 
         let rendered = serde_json::to_string_pretty(&response)
@@ -555,6 +657,22 @@ impl Tool for MessagingTool {
             is_error: false,
         })
     }
+}
+
+/// A channel that was just created becomes the place in view, the way a human
+/// lands in the channel they made. Nothing has been seen there, so the screen
+/// starts empty (ADR 0011 §3: 見えていないものは操作できない).
+fn focus_created_channel(state: &mut MessagingViewState, response: &Value) {
+    let Some(channel_id) = response
+        .get("channel")
+        .and_then(|channel| channel.get("channel_id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    state.focused_place_id = Some(channel_id.to_owned());
+    state.pending_read_through = None;
+    state.visible_messages.clear();
 }
 
 fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
@@ -621,6 +739,47 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
         }
         MessagingAction::StartDm { participants } => validate_dm_participants(participants),
+        MessagingAction::CreateChannel {
+            name,
+            topic,
+            workspace_id,
+        } => {
+            validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES)?;
+            validate_optional_note(topic, MAX_TOPIC_BYTES)?;
+            if workspace_id.as_deref().is_some_and(|workspace| {
+                validate_bounded_nonempty(workspace, MAX_WORKSPACE_ID_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        MessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            // Naming nothing is not an edit; it would be a silent no-op that
+            // reads to the model as a successful rename.
+            if name.is_none() && topic.is_none() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_note(topic, MAX_TOPIC_BYTES)
+        }
+        MessagingAction::DuplicateChannel { place_id, name } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            if name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -795,6 +954,7 @@ mod tests {
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
+        channels: AsyncMutex<Vec<(String, String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -900,6 +1060,58 @@ mod tests {
                 .await
                 .push(request.marker_id.to_owned());
             Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
+        }
+
+        async fn create_channel(
+            &self,
+            request: CreateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_channel:{}", request.name));
+            self.channels.lock().await.push((
+                "create".to_owned(),
+                request.name.to_owned(),
+                request.topic.map(str::to_owned),
+            ));
+            Ok(
+                json!({"channel": {"channel_id": "ch-new", "name": request.name,
+                                  "topic": request.topic.unwrap_or("")}}),
+            )
+        }
+
+        async fn update_channel(
+            &self,
+            request: UpdateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("update_channel:{}", request.place_id));
+            self.channels.lock().await.push((
+                format!("update:{}", request.place_id),
+                request.name.unwrap_or("").to_owned(),
+                request.topic.map(str::to_owned),
+            ));
+            Ok(json!({"channel": {"channel_id": request.place_id,
+                                  "name": request.name.unwrap_or("general")}}))
+        }
+
+        async fn duplicate_channel(
+            &self,
+            request: DuplicateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("duplicate_channel:{}", request.place_id));
+            self.channels.lock().await.push((
+                format!("duplicate:{}", request.place_id),
+                request.name.unwrap_or("").to_owned(),
+                None,
+            ));
+            Ok(json!({"channel": {"channel_id": "ch-copy", "name": "general のコピー"}}))
         }
 
         async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<Value> {
@@ -1008,7 +1220,10 @@ mod tests {
                 "status",
                 "reply_later",
                 "resolve_reply_later",
-                "start_dm"
+                "start_dm",
+                "create_channel",
+                "update_channel",
+                "duplicate_channel"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -1028,6 +1243,9 @@ mod tests {
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
         assert_eq!(schema["properties"]["participants"]["type"], "array");
+        for field in ["name", "topic", "workspace_id"] {
+            assert_eq!(schema["properties"][field]["type"], "string");
+        }
         assert_eq!(
             schema["properties"]["participants"]["items"]["properties"]["kind"]["enum"],
             json!(["human", "personality_agent"])
@@ -1041,7 +1259,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            16
+            19
         );
     }
 
@@ -1516,6 +1734,67 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.started_dms.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_matches_the_human_context_menu() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // Creating a channel lands the agent in it, as a human is taken into
+        // the channel they just made.
+        execute(
+            &tool,
+            json!({"action": "create_channel", "name": "設計", "topic": "図面の相談"}),
+            "create",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "ここで話します"}),
+            "w",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "ch-new");
+
+        execute(
+            &tool,
+            json!({"action": "update_channel", "place_id": "ch-new", "topic": "図面と素材"}),
+            "update",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "duplicate_channel", "place_id": "ch-new"}),
+            "duplicate",
+        )
+        .await
+        .unwrap();
+        let channels = api.channels.lock().await.clone();
+        assert_eq!(channels[0].0, "create");
+        assert_eq!(channels[0].1, "設計");
+        assert_eq!(channels[1].0, "update:ch-new");
+        assert_eq!(channels[1].2, Some("図面と素材".to_owned()));
+        assert_eq!(channels[2].0, "duplicate:ch-new");
+        // The copy's name is the server's to derive; the tool does not invent
+        // its own so the two sides cannot disagree about what a copy is called.
+        assert_eq!(channels[2].1, "");
+
+        for arguments in [
+            json!({"action": "create_channel"}),
+            json!({"action": "create_channel", "name": ""}),
+            // An edit that names nothing is a silent no-op that reads as success.
+            json!({"action": "update_channel", "place_id": "ch-new"}),
+            json!({"action": "update_channel", "place_id": "ch-new", "name": ""}),
+            json!({"action": "duplicate_channel"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.channels.lock().await.len(), 3);
     }
 
     #[tokio::test]

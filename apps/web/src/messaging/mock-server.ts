@@ -531,15 +531,30 @@ export class MockMessagingServer implements MessagingBackend {
     return dm;
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
     const channel = CHANNELS.find((entry) => entry.channelId === channelId);
     if (!channel) throw new Error("unknown channel");
-    channel.topic = topic;
+    if (input.name !== undefined) channel.name = input.name;
+    if (input.topic !== undefined) channel.topic = input.topic;
     this.emit({ type: "place_updated", channel });
     return channel;
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const source = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!source) throw new Error("unknown channel");
+    // 名前の既定は実サーバーと同じ導出（「〜 のコピー」）。中身は運ばない。
+    return this.createChannel(
+      source.workspaceId,
+      name?.trim() || `${source.name} のコピー`,
+      source.topic,
+    );
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {

@@ -326,7 +326,20 @@ export interface MessagingBackend {
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
   createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
-  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
+  /**
+   * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
+   * そのまま残る——名前を変えただけでトピックが消えては困る。
+   */
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<ChannelSummary>;
+  /**
+   * 同じ形（名前・トピック）の空のchannelを新しく作る。中身は複製しない:
+   * メッセージ・既読・通知設定は元のchannelのもの。nameを省くとサーバーが
+   * 既定の名前（「〜 のコピー」）を決める。
+   */
+  duplicateChannel(channelId: string, name?: string): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /**
    * 送信前にファイルを預ける。返ったAttachmentのidをsendMessageへ渡すまで

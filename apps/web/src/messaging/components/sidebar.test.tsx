@@ -50,16 +50,20 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
-  it("placeごとの通知レベルは選択中が✓で分かり、選ぶと閉じる", () => {
+  it("placeごとの通知レベルはコンテキストメニューの通知設定から選べ、選択中が分かる", () => {
     render(<Sidebar />);
 
-    fireEvent.click(screen.getByRole("button", { name: "通知設定" }));
-    expect(screen.getByRole("radio", { name: /すべて通知/ })).toBeChecked();
+    // 行のメニュー → 通知設定サブメニュー（UI-CHN-01でここに一本化された）。
+    fireEvent.click(screen.getByRole("button", { name: "この場所のメニュー" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /通知設定/ }));
+    expect(
+      screen.getByRole("menuitemradio", { name: /すべて通知/ }),
+    ).toHaveAttribute("aria-checked", "true");
 
-    fireEvent.click(screen.getByRole("radio", { name: /ミュート/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /ミュート/ }));
 
     expect(
-      screen.queryByRole("radio", { name: /ミュート/ }),
+      screen.queryByRole("menuitemradio", { name: /ミュート/ }),
     ).not.toBeInTheDocument();
     expect(useMessaging.getState().notificationLevelByPlace["channel:c1"]).toBe(
       "mute",

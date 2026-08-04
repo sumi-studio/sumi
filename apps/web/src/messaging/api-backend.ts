@@ -184,13 +184,31 @@ export class ApiMessagingBackend implements MessagingBackend {
     return this.registerDm(body);
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
+    // 省いた項目はbodyに載せない。nullを送ると「消して」の意味になる。
     const body = await this.request(
       `/messaging/places/${encodeURIComponent(channelId)}`,
-      { method: "PATCH", body: { topic } },
+      {
+        method: "PATCH",
+        body: {
+          ...(input.name === undefined ? {} : { name: input.name }),
+          ...(input.topic === undefined ? {} : { topic: input.topic }),
+        },
+      },
+    );
+    return this.registerChannel(body);
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(channelId)}/duplicate`,
+      { method: "POST", body: { name: name ?? "" } },
     );
     return this.registerChannel(body);
   }
