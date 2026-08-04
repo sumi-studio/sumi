@@ -62,6 +62,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
+	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
+	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
 }
@@ -305,7 +307,7 @@ func (s *Server) publishReplyLaterCreated(ctx context.Context, marker ReplyLater
 	publicWire := replyLaterToWire(marker, ParticipantRef{})
 	s.Hub.Publish(ctx, Event{
 		Type: EventReplyLaterCreated, PlaceID: marker.PlaceID,
-		Marker: &publicWire, ExceptFor: &owner,
+		Marker: &publicWire, ExceptFor: []ParticipantRef{owner},
 	})
 }
 
@@ -318,6 +320,86 @@ func (s *Server) publishReplyLaterResolved(ctx context.Context, marker ReplyLate
 	}
 	s.Hub.Publish(ctx, Event{
 		Type: EventReplyLaterResolved, PlaceID: marker.PlaceID, MarkerID: marker.MarkerID,
+	})
+}
+
+// notifyWire is the per-recipient「これで呼びました」marker on message_created.
+// Only the reason travels: the recipient already has the message, and the
+// server owes them an explanation, not a second copy of the content.
+type notifyWire struct {
+	Reason string `json:"reason"`
+}
+
+// notificationLevelWire matches the contract's `defaults` object, which is an
+// object rather than a bare string so later preferences (quiet hours 等) can
+// join it without breaking the shape.
+type notificationLevelWire struct {
+	Level string `json:"level"`
+}
+
+type notificationPlaceWire struct {
+	Place placeWire `json:"place"`
+	Level string    `json:"level"`
+}
+
+// notificationSettingWire matches the frozen NotificationSetting shape from
+// docs/messaging-contracts-draft.md.
+type notificationSettingWire struct {
+	Owner    participantWire         `json:"owner"`
+	Defaults notificationLevelWire   `json:"defaults"`
+	PerPlace []notificationPlaceWire `json:"per_place"`
+	Keywords []string                `json:"keywords"`
+}
+
+func notificationSettingToWire(setting NotificationSetting) notificationSettingWire {
+	perPlace := make([]notificationPlaceWire, len(setting.PerPlace))
+	for i, entry := range setting.PerPlace {
+		perPlace[i] = notificationPlaceWire{
+			Place: placeToWire(Place{PlaceID: entry.PlaceID, Kind: entry.PlaceKind}),
+			Level: entry.Level,
+		}
+	}
+	keywords := setting.Keywords
+	if keywords == nil {
+		keywords = []string{}
+	}
+	return notificationSettingWire{
+		Owner:    participantToWire(setting.Owner),
+		Defaults: notificationLevelWire{Level: setting.Default()},
+		PerPlace: perPlace,
+		Keywords: keywords,
+	}
+}
+
+// publishMessageCreated fans one committed message out as per-recipient
+// payloads: the people the server decided to interrupt get the message with
+// `notify`, everyone else gets the same message without it. The evaluation
+// happens here — one place, shared by REST, WS, and the agent's control socket
+// — so no transport can deliver a message that skipped the receiver's own
+// rules. Notification is best-effort on top of durable truth: an evaluation
+// failure still delivers the message, silently.
+func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Place, msg Message) {
+	if hub == nil {
+		return
+	}
+	wire := messageToWire(place, msg)
+	decisions, err := store.NotificationDecisionsFor(ctx, place, msg)
+	if err != nil {
+		decisions = nil
+	}
+	notified := make([]ParticipantRef, 0, len(decisions))
+	for _, decision := range decisions {
+		recipient := decision.Participant
+		notify := notifyWire{Reason: decision.Reason}
+		hub.Publish(ctx, Event{
+			Type: EventMessageCreated, PlaceID: place.PlaceID,
+			Message: &wire, Notify: &notify, OnlyFor: &recipient,
+		})
+		notified = append(notified, recipient)
+	}
+	hub.Publish(ctx, Event{
+		Type: EventMessageCreated, PlaceID: place.PlaceID,
+		Message: &wire, ExceptFor: notified,
 	})
 }
 
@@ -507,27 +589,36 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	for i, marker := range markers {
 		markerWires[i] = replyLaterToWire(marker, viewer)
 	}
+	// The viewer's own notification setting: the sidebar dims muted places from
+	// the first paint, without a second round trip that could disagree.
+	setting, err := s.Store.NotificationSettingFor(ctx, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, struct {
-		Self              participantWire     `json:"self"`
-		Workspaces        []workspaceWire     `json:"workspaces"`
-		Channels          []channelWire       `json:"channels"`
-		DMs               []dmWire            `json:"dms"`
-		Members           []memberWire        `json:"members"`
-		Statuses          []statusWire        `json:"statuses"`
-		ReadMarkers       []readMarkerWire    `json:"read_markers"`
-		UnreadSummaries   []unreadSummaryWire `json:"unread_summaries"`
-		ReplyLaterMarkers []replyLaterWire    `json:"reply_later_markers"`
+		Self                participantWire         `json:"self"`
+		Workspaces          []workspaceWire         `json:"workspaces"`
+		Channels            []channelWire           `json:"channels"`
+		DMs                 []dmWire                `json:"dms"`
+		Members             []memberWire            `json:"members"`
+		Statuses            []statusWire            `json:"statuses"`
+		ReadMarkers         []readMarkerWire        `json:"read_markers"`
+		UnreadSummaries     []unreadSummaryWire     `json:"unread_summaries"`
+		ReplyLaterMarkers   []replyLaterWire        `json:"reply_later_markers"`
+		NotificationSetting notificationSettingWire `json:"notification_setting"`
 	}{
-		Self:              participantToWire(viewer),
-		Workspaces:        workspaceWires,
-		Channels:          channels,
-		DMs:               dms,
-		Members:           members,
-		Statuses:          statusWires,
-		ReadMarkers:       readMarkers,
-		UnreadSummaries:   unread,
-		ReplyLaterMarkers: markerWires,
+		Self:                participantToWire(viewer),
+		Workspaces:          workspaceWires,
+		Channels:            channels,
+		DMs:                 dms,
+		Members:             members,
+		Statuses:            statusWires,
+		ReadMarkers:         readMarkers,
+		UnreadSummaries:     unread,
+		ReplyLaterMarkers:   markerWires,
+		NotificationSetting: notificationSettingToWire(setting),
 	})
 }
 
@@ -814,8 +905,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	if created {
-		wire := messageToWire(place, msg)
-		s.Hub.Publish(r.Context(), Event{Type: EventMessageCreated, PlaceID: placeID, Message: &wire})
+		publishMessageCreated(r.Context(), s.Store, s.Hub, place, msg)
 	}
 	writeJSON(w, status, struct {
 		MessageID string      `json:"message_id"`
@@ -990,6 +1080,79 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusToWire(status))
 }
 
+// serveNotificationSetting returns the viewer's own notification preference.
+// There is no route for reading anyone else's: what interrupts a person is
+// theirs to know (契約ドラフト: owner が本人、変更も本人のみ).
+func (s *Server) serveNotificationSetting(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	setting, err := s.Store.NotificationSettingFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, notificationSettingToWire(setting))
+}
+
+// serveSetNotificationSetting replaces the viewer's whole setting. PUT is a
+// replacement on purpose: the client always holds the full current setting
+// (bootstrap gives it), so a partial merge would only add a way for two tabs to
+// disagree about what was removed.
+func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Defaults notificationLevelWire `json:"defaults"`
+		PerPlace []struct {
+			Place placeWire `json:"place"`
+			Level string    `json:"level"`
+		} `json:"per_place"`
+		Keywords []string `json:"keywords"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Defaults.Level != "" && ValidateNotifyLevel(req.Defaults.Level) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_level")
+		return
+	}
+	perPlace := make([]PlaceNotifyLevel, 0, len(req.PerPlace))
+	for _, entry := range req.PerPlace {
+		if ValidateNotifyLevel(entry.Level) != nil {
+			writeError(w, http.StatusBadRequest, "invalid_level")
+			return
+		}
+		placeID := entry.Place.ChannelID
+		if placeID == "" {
+			placeID = entry.Place.DMID
+		}
+		if placeID == "" {
+			writeError(w, http.StatusBadRequest, "invalid_place")
+			return
+		}
+		perPlace = append(perPlace, PlaceNotifyLevel{PlaceID: placeID, Level: entry.Level})
+	}
+	var setting NotificationSetting
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		setting, opErr = s.Store.SetNotificationSetting(
+			r.Context(), viewer, req.Defaults.Level, perPlace, req.Keywords)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, notificationSettingToWire(setting))
+}
+
 // serveCreateReplyLater places the viewer's own「後で返信します」marker on a
 // message they can see. Repeating the tap returns the existing open marker.
 func (s *Server) serveCreateReplyLater(w http.ResponseWriter, r *http.Request) {
@@ -1155,6 +1318,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrNotAChannel):
 		writeError(w, http.StatusBadRequest, "not_a_channel")
+	case errors.Is(err, ErrInvalidNotificationSetting):
+		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

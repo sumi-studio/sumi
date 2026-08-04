@@ -1,0 +1,43 @@
+-- 0015_notification_settings: 受信側が自分の通知条件を持つ
+-- (docs/messaging-contracts-draft.md「ReadMarker と NotificationSetting —
+-- HumanもAgentも同じ形」)。owner が本人、human/agent は同型の resource であり、
+-- 変更できるのは本人だけ。人間はUI、agentはtool — 同じ契約の別transport。
+--
+-- 通知の「発火するか」は送信時にサーバー側で評価する。受信者ごとの判定を
+-- クライアントに委ねると、mute した place の本文が結局その端末まで届いてから
+-- 捨てられることになり、受信側制御と呼べない。
+
+-- 1. notification_settings — 一人ぶんの既定と keyword。行が無いことは
+--    「まだ何も言っていない」であって未設定エラーではないので、読み出し側は
+--    defaults_level の DEFAULT と同じ既定値へ落とす。
+CREATE TABLE notification_settings (
+    member_kind    text        NOT NULL
+        CHECK (member_kind IN ('human', 'personality_agent')),
+    member_id      uuidv7      NOT NULL,
+    defaults_level text        NOT NULL DEFAULT 'all'
+        CHECK (defaults_level IN ('all', 'mentions', 'mute')),
+    -- 自分の名前以外で呼ばれたい言葉。空配列は「keyword を使わない」。
+    keywords       text[]      NOT NULL DEFAULT '{}'
+        CHECK (cardinality(keywords) <= 32),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (member_kind, member_id)
+);
+
+-- 2. notification_setting_places — place 単位の上書き。既定と同じ値でも
+--    「その place について明示的にそう決めた」という別の事実なので、行を
+--    残すか消すかは本人の操作がそのまま反映される。
+CREATE TABLE notification_setting_places (
+    member_kind text        NOT NULL
+        CHECK (member_kind IN ('human', 'personality_agent')),
+    member_id   uuidv7      NOT NULL,
+    place_id    uuidv7      NOT NULL REFERENCES places(place_id) ON DELETE CASCADE,
+    level       text        NOT NULL CHECK (level IN ('all', 'mentions', 'mute')),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (member_kind, member_id, place_id),
+    FOREIGN KEY (member_kind, member_id)
+        REFERENCES notification_settings (member_kind, member_id) ON DELETE CASCADE
+);
+
+-- 送信ごとに「この place を mute している人は誰か」を引く経路。
+CREATE INDEX notification_setting_places_by_place
+    ON notification_setting_places (place_id);
