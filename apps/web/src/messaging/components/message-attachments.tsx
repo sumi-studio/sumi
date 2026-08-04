@@ -1,11 +1,14 @@
 import { Paperclip } from "lucide-react";
+import { useState } from "react";
 import type { Attachment } from "../model";
 import { isImageAttachment } from "../model";
+import { ImageViewer } from "./image-viewer";
 
 /**
  * 添付の表示。画像はその場で見えることに意味があるのでインラインに置き、
  * それ以外は「何が届いたか」が分かるファイルカードにする。
- * 原寸で見たいときは新規タブへ（サーバーは画像だけをinlineで配信する）。
+ * 画像を大きく見たいときはアプリ内のビューアーを開く（会話から離れない）。
+ * 画像以外は新規タブへ（サーバーはそれをdownloadとして配信する）。
  */
 
 export function formatFileSize(bytes: number): string {
@@ -23,28 +26,37 @@ export function formatFileSize(bytes: number): string {
 
 export function MessageAttachments({
   attachments,
+  authorName,
+  createdAt,
 }: {
   attachments: Attachment[];
+  /** ビューアーの左上に出す投稿者名と時刻。無ければ出さない。 */
+  authorName?: string;
+  createdAt?: number;
 }) {
+  const [viewing, setViewing] = useState<string | null>(null);
   if (attachments.length === 0) return null;
+  const viewed = attachments.find(
+    (attachment) => attachment.attachmentId === viewing,
+  );
   return (
     <div className="mt-1 flex flex-wrap items-start gap-2">
       {attachments.map((attachment) =>
         isImageAttachment(attachment) ? (
-          <a
+          <button
             key={attachment.attachmentId}
-            href={attachment.url}
-            target="_blank"
-            rel="noreferrer"
+            type="button"
+            onClick={() => setViewing(attachment.attachmentId)}
             title={`${attachment.filename}・${formatFileSize(attachment.size)}`}
-            className="block overflow-hidden rounded-lg border border-border"
+            aria-label={`${attachment.filename} を開く`}
+            className="block cursor-zoom-in overflow-hidden rounded-lg border border-border transition-colors hover:border-ring/60"
           >
             <img
               src={attachment.url}
               alt={attachment.filename}
               className="max-h-80 max-w-full object-contain"
             />
-          </a>
+          </button>
         ) : (
           <a
             key={attachment.attachmentId}
@@ -64,6 +76,14 @@ export function MessageAttachments({
           </a>
         ),
       )}
+      {viewed ? (
+        <ImageViewer
+          attachment={viewed}
+          authorName={authorName}
+          createdAt={createdAt}
+          onClose={() => setViewing(null)}
+        />
+      ) : null}
     </div>
   );
 }

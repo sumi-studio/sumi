@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Attachment } from "../model";
 import { formatFileSize, MessageAttachments } from "./message-attachments";
@@ -20,14 +20,32 @@ function attachment(overrides: Partial<Attachment> = {}): Attachment {
 afterEach(cleanup);
 
 describe("MessageAttachments", () => {
-  it("画像はインラインプレビューにし、クリックで原寸を開く", () => {
-    render(<MessageAttachments attachments={[attachment()]} />);
+  it("画像はインラインプレビューにし、クリックでアプリ内ビューアーを開く", () => {
+    render(
+      <MessageAttachments
+        attachments={[attachment()]}
+        authorName="そら"
+        createdAt={Date.UTC(2026, 0, 2, 3, 4)}
+      />,
+    );
 
     const image = screen.getByAltText("shot.png");
     expect(image).toHaveAttribute("src", "/messaging/attachments/attachment-1");
-    const link = image.closest("a");
-    expect(link).toHaveAttribute("href", "/messaging/attachments/attachment-1");
-    expect(link).toHaveAttribute("target", "_blank");
+    // 新規タブへ飛ばさない: 画像はリンクではなくビューアーを開くボタン。
+    expect(image.closest("a")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "shot.png を開く" }));
+
+    const viewer = screen.getByRole("dialog", {
+      name: "shot.png の画像ビューアー",
+    });
+    expect(viewer).toBeInTheDocument();
+    expect(screen.getByText("そら")).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "shot.png の画像ビューアー" }),
+    ).toBeNull();
   });
 
   it("画像以外はファイル名とサイズのカードにする", () => {
