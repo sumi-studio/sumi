@@ -172,13 +172,19 @@ type Place struct {
 	Voice bool
 }
 
-// MemberProfile is a participant with their scope-resolved display name.
+// MemberProfile is a participant with their scope-resolved display name and
+// the presentation profile they chose for themselves (participant_profiles).
 // IDs are never used as display names (ADR 0008 §1).
 type MemberProfile struct {
 	Participant             ParticipantRef
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
+	// Tagline は本人が名乗る職務の説明。空でよい。
+	Tagline string
+	// 画像は message_attachments の添付id。空は「未設定」。
+	AvatarAttachmentID string
+	BannerAttachmentID string
 }
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
@@ -688,11 +694,15 @@ func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]Me
 		`SELECT pm.member_kind, pm.member_id, '' AS role,
 		        COALESCE(h.display_name, a.display_name, '') AS display_name,
 		        CASE WHEN pm.member_kind='personality_agent'
-		             THEN COALESCE(owner.display_name, '') ELSE '' END
+		             THEN COALESCE(owner.display_name, '') ELSE '' END,
+		        COALESCE(pp.tagline, ''),
+		        pp.avatar_attachment_id, pp.banner_attachment_id
 		 FROM place_members pm
 		 LEFT JOIN humans h ON pm.member_kind = 'human' AND h.human_id = pm.member_id
 		 LEFT JOIN agents a ON pm.member_kind = 'personality_agent' AND a.personality_agent_id = pm.member_id
 		 LEFT JOIN humans owner ON owner.human_id = a.human_id
+		 LEFT JOIN participant_profiles pp ON pp.member_kind = pm.member_kind
+		                                 AND pp.member_id = pm.member_id
 		 WHERE pm.place_id = $1 AND pm.left_at IS NULL
 		 ORDER BY pm.place_member_id`, place.PlaceID)
 	if err != nil {
@@ -706,11 +716,15 @@ func (s *Store) workspaceMemberProfiles(ctx context.Context, q querier, workspac
 		`SELECT wm.member_kind, wm.member_id, wm.role,
 		        COALESCE(h.display_name, a.display_name, '') AS display_name,
 		        CASE WHEN wm.member_kind='personality_agent'
-		             THEN COALESCE(owner.display_name, '') ELSE '' END
+		             THEN COALESCE(owner.display_name, '') ELSE '' END,
+		        COALESCE(pp.tagline, ''),
+		        pp.avatar_attachment_id, pp.banner_attachment_id
 		 FROM workspace_members wm
 		 LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
 		 LEFT JOIN agents a ON wm.member_kind = 'personality_agent' AND a.personality_agent_id = wm.member_id
 		 LEFT JOIN humans owner ON owner.human_id = a.human_id
+		 LEFT JOIN participant_profiles pp ON pp.member_kind = wm.member_kind
+		                                 AND pp.member_id = wm.member_id
 		 WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
 		 ORDER BY wm.workspace_member_id`, workspaceID)
 	if err != nil {
@@ -725,10 +739,18 @@ func scanMemberProfiles(rows pgx.Rows) ([]MemberProfile, error) {
 	for rows.Next() {
 		var m MemberProfile
 		var kind string
-		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName, &m.SecretaryForDisplayName); err != nil {
+		var avatar, banner *string
+		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName,
+			&m.SecretaryForDisplayName, &m.Tagline, &avatar, &banner); err != nil {
 			return nil, fmt.Errorf("scan member: %w", err)
 		}
 		m.Participant.Kind = ParticipantKind(kind)
+		if avatar != nil {
+			m.AvatarAttachmentID = *avatar
+		}
+		if banner != nil {
+			m.BannerAttachmentID = *banner
+		}
 		members = append(members, m)
 	}
 	if err := rows.Err(); err != nil {

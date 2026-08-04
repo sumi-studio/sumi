@@ -83,6 +83,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
+	mux.HandleFunc("GET /messaging/profile", s.serveProfile)
+	mux.HandleFunc("PUT /messaging/profile", s.serveSetProfile)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
@@ -412,9 +414,25 @@ type dmWire struct {
 	Participants []participantWire `json:"participants"`
 }
 
+// memberWire is one participant as the UI and the agent tool both see them:
+// the 戸籍 name plus whatever the participant said about themselves. Humans and
+// PersonalityAgents use the identical shape — there is no bot field.
 type memberWire struct {
-	Participant participantWire `json:"participant"`
-	DisplayName string          `json:"display_name"`
+	Participant        participantWire `json:"participant"`
+	DisplayName        string          `json:"display_name"`
+	Tagline            string          `json:"tagline"`
+	AvatarAttachmentID string          `json:"avatar_attachment_id,omitempty"`
+	BannerAttachmentID string          `json:"banner_attachment_id,omitempty"`
+}
+
+func memberToWire(p MemberProfile) memberWire {
+	return memberWire{
+		Participant:        participantToWire(p.Participant),
+		DisplayName:        p.ProjectedDisplayName(),
+		Tagline:            p.Tagline,
+		AvatarAttachmentID: p.AvatarAttachmentID,
+		BannerAttachmentID: p.BannerAttachmentID,
+	}
 }
 
 type readMarkerWire struct {
@@ -745,10 +763,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberWire{
-				Participant: participantToWire(p.Participant),
-				DisplayName: p.ProjectedDisplayName(),
-			}
+			memberSet[key] = memberToWire(p)
 			memberOrder = append(memberOrder, key)
 		}
 	}
@@ -1143,7 +1158,7 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+		members[i] = memberToWire(p)
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`
@@ -1524,6 +1539,72 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.publishStatus(r.Context(), status)
 	writeJSON(w, http.StatusOK, statusToWire(status))
+}
+
+// serveProfile returns the viewer's own profile. Everyone else's profile
+// arrives with the member list, so there is no route for reading one by id.
+func (s *Server) serveProfile(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	profile, err := s.Store.MemberProfileFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberToWire(profile))
+}
+
+// serveSetProfile replaces the viewer's own profile. PUT is a replacement for
+// the same reason the notification setting is: the client already holds the
+// current value (bootstrap gives it), so a partial merge would only add a way
+// for two tabs to disagree about what was cleared.
+//
+// There is no route for editing anyone else's profile — 名乗りは本人のもの。
+func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		DisplayName string `json:"display_name"`
+		Tagline     string `json:"tagline"`
+		// 空文字は「画像を外す」。省略も同じ意味になる（PUTは全置換）。
+		AvatarAttachmentID string `json:"avatar_attachment_id"`
+		BannerAttachmentID string `json:"banner_attachment_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var profile MemberProfile
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		profile, opErr = s.Store.SetProfile(r.Context(), viewer,
+			req.DisplayName, req.Tagline, req.AvatarAttachmentID, req.BannerAttachmentID)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishProfile(r.Context(), profile)
+	writeJSON(w, http.StatusOK, memberToWire(profile))
+}
+
+// publishProfile tells everyone who can see this participant that the way they
+// present themselves changed. Like status it is participant-scoped and never
+// replayed: bootstrap carries the current value.
+func (s *Server) publishProfile(ctx context.Context, profile MemberProfile) {
+	if s.Hub == nil {
+		return
+	}
+	subject := profile.Participant
+	wire := memberToWire(profile)
+	s.Hub.Publish(ctx, Event{Type: EventProfileUpdated, Subject: &subject, Member: &wire})
 }
 
 // serveNotificationSetting returns the viewer's own notification preference.
@@ -2072,6 +2153,12 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "poll_closed")
 	case errors.Is(err, ErrPollSingleChoice):
 		writeError(w, http.StatusBadRequest, "poll_single_choice")
+	case errors.Is(err, ErrInvalidDisplayName):
+		writeError(w, http.StatusBadRequest, "invalid_display_name")
+	case errors.Is(err, ErrInvalidTagline):
+		writeError(w, http.StatusBadRequest, "invalid_tagline")
+	case errors.Is(err, ErrInvalidProfileImage):
+		writeError(w, http.StatusBadRequest, "invalid_profile_image")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

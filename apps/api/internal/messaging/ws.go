@@ -448,6 +448,12 @@ func storeErrorCode(err error) string {
 		return "invalid_notification_setting"
 	case errors.Is(err, ErrNotAChannel):
 		return "not_a_channel"
+	case errors.Is(err, ErrInvalidDisplayName):
+		return "invalid_display_name"
+	case errors.Is(err, ErrInvalidTagline):
+		return "invalid_tagline"
+	case errors.Is(err, ErrInvalidProfileImage):
+		return "invalid_profile_image"
 	default:
 		return "internal"
 	}

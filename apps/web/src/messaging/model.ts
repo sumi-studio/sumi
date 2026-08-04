@@ -266,6 +266,27 @@ export interface MemberProfile {
   participant: ParticipantRef;
   displayName: string;
   tagline: string;
+  /** プロフィール画像の添付id。未設定は「画像なし」。 */
+  avatarAttachmentId?: string;
+  bannerAttachmentId?: string;
+  /**
+   * 表示用URL。attachmentと同じくbackend境界が決める
+   * （実APIは同一originの `/messaging/attachments/<id>`、モックはobject URL）。
+   */
+  avatarUrl?: string;
+  bannerUrl?: string;
+}
+
+/**
+ * 個人設定からの名乗りの更新。ownerは認証済みsessionが決めるので載せない。
+ * 全置換: クライアントは常に現在値を持っているので差分は要らない。
+ */
+export interface ProfileInput {
+  displayName: string;
+  tagline: string;
+  /** 空文字は「画像を外す」。 */
+  avatarAttachmentId: string;
+  bannerAttachmentId: string;
 }
 
 export type StatusKind = "available" | "busy" | "away";
@@ -397,6 +418,8 @@ export type ServerEvent =
    * 名乗ることはしない。
    */
   | { type: "status_cleared"; participant: ParticipantRef }
+  /** 本人が名乗りを変えた。member-list・プロフィール・発言者名に即時に効く。 */
+  | { type: "profile_updated"; member: MemberProfile }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   | { type: "reaction_updated"; message: Message }
@@ -546,6 +569,11 @@ export interface MessagingBackend {
     note: string,
     expiresAt: number | null,
   ): Promise<void>;
+  /**
+   * 自分の名乗りを丸ごと置き換える。人間はこれを個人設定画面から、agentは
+   * 同じ契約をtool経由で使う（AX: UIだけにある操作を作らない）。
+   */
+  updateProfile(input: ProfileInput): Promise<MemberProfile>;
   createReplyLater(
     place: Place,
     messageId: string,

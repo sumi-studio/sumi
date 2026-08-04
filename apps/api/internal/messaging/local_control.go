@@ -11,11 +11,15 @@ import (
 )
 
 const (
-	LocalOverviewPath          = "/local-control/v1/messaging:overview"
-	LocalOpenPath              = "/local-control/v1/messaging:open"
-	LocalWritePath             = "/local-control/v1/messaging:write"
-	LocalReactPath             = "/local-control/v1/messaging:react"
-	LocalStatusPath            = "/local-control/v1/messaging:status"
+	LocalOverviewPath = "/local-control/v1/messaging:overview"
+	LocalOpenPath     = "/local-control/v1/messaging:open"
+	LocalWritePath    = "/local-control/v1/messaging:write"
+	LocalReactPath    = "/local-control/v1/messaging:react"
+	LocalStatusPath   = "/local-control/v1/messaging:status"
+	// LocalProfilePath は agent が自分の名乗り（表示名・tagline）を読み書きする口。
+	// 人間が個人設定画面から行うのと同じ Store 経路を通る（AX: UIだけにある操作を
+	// 作らない）。
+	LocalProfilePath           = "/local-control/v1/messaging:profile"
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
@@ -72,6 +76,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
+		{"POST " + LocalProfilePath, s.localProfile},
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
@@ -176,7 +181,7 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	}
 	members := make([]memberWire, len(profiles))
 	for i, profile := range profiles {
-		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
+		members[i] = memberToWire(profile)
 	}
 	// A thread is read as belonging to its parent: the agent should see the
 	// same relation a human sees in the thread header, not a stray place.
@@ -400,6 +405,60 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	writeJSON(w, http.StatusOK, struct {
 		Status statusWire `json:"status"`
 	}{statusToWire(status)})
+}
+
+// localProfile reads or updates the agent's own名乗り through the identical
+// store path the human settings screen uses. A request with no field set is a
+// read; any field present is a change to that field only, because an agent
+// naming one thing about itself ("taglineを『開発』にして") should not silently
+// discard the rest of its profile the way a full PUT would.
+//
+// 画像はこの口には無い: agent はまだファイルをアップロードする道具を持って
+// いないので、口だけ先に開けても使えない。道具が生えた時に追加する。
+func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		DisplayName *string `json:"display_name,omitempty"`
+		Tagline     *string `json:"tagline,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	current, err := s.Store.MemberProfileFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if request.DisplayName == nil && request.Tagline == nil {
+		writeJSON(w, http.StatusOK, struct {
+			Profile memberWire `json:"profile"`
+		}{memberToWire(current)})
+		return
+	}
+	// The stored canonical name, not the composed "Sumi（たっけ）" projection:
+	// re-submitting the projection would smuggle the qualifier into the registry.
+	displayName := current.DisplayName
+	if request.DisplayName != nil {
+		displayName = *request.DisplayName
+	}
+	tagline := current.Tagline
+	if request.Tagline != nil {
+		tagline = *request.Tagline
+	}
+	stored, err := s.Store.SetProfile(r.Context(), viewer, displayName, tagline,
+		current.AvatarAttachmentID, current.BannerAttachmentID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishProfile(r.Context(), stored)
+	writeJSON(w, http.StatusOK, struct {
+		Profile memberWire `json:"profile"`
+	}{memberToWire(stored)})
 }
 
 // localReplyLater places the agent's own「後で返信します」marker. The tool

@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ConnectionState,
+  MemberProfile,
   Message,
   MessagingBackend,
   NotificationSettingInput,
@@ -120,6 +121,9 @@ class StubBackend implements MessagingBackend {
   async deleteMessage(): Promise<void> {}
   async markRead(): Promise<void> {}
   async setStatus(): Promise<void> {}
+  async updateProfile(): Promise<MemberProfile> {
+    return { participant: SELF, displayName: "yohaku", tagline: "" };
+  }
   async createReplyLater(): Promise<void> {}
   async resolveReplyLater(): Promise<void> {}
   async toggleReaction(): Promise<void> {}

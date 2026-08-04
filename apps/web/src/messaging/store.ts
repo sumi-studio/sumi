@@ -21,6 +21,7 @@ import type {
   Place,
   PlaceKey,
   PollInput,
+  ProfileInput,
   ReplyLaterMarker,
   ServerEvent,
   StatusKind,
@@ -145,6 +146,11 @@ interface MessagingState {
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
   setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
+  /**
+   * 自分の名乗りの更新。失敗はUIが伝えるべきことなので握り潰さず投げ返す
+   * （設定が効いたふりをして黙って効いていないのが一番困る）。
+   */
+  updateProfile(input: ProfileInput): Promise<void>;
   setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
   setNotificationDefaultLevel(level: NotificationLevel): void;
   setNotificationKeywords(keywords: string[]): void;
@@ -432,6 +438,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
             ...(state.typingByPlace[key] ?? {}),
             [typerKey]: Date.now() + TYPING_TTL_MS,
           },
+        },
+      }));
+      return;
+    }
+    if (event.type === "profile_updated") {
+      set((state) => ({
+        membersByKey: {
+          ...state.membersByKey,
+          [participantKey(event.member.participant)]: event.member,
         },
       }));
       return;
@@ -1003,6 +1018,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     setStatus(status, note, expiresAt = null) {
       void backend.setStatus(status, note, expiresAt).catch(() => undefined);
+    },
+
+    async updateProfile(input) {
+      const member = await backend.updateProfile(input);
+      set((state) => ({
+        membersByKey: {
+          ...state.membersByKey,
+          [participantKey(member.participant)]: member,
+        },
+      }));
     },
 
     setPlaceNotificationLevel(key, level) {

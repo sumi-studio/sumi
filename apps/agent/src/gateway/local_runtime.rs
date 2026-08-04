@@ -41,8 +41,8 @@ use crate::apiclient::messaging::{
     ListMessagingThreadsRequest, MessagingApi, MessagingNotificationSettingsRequest,
     OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
-    SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
-    VoteMessagingPollRequest, WriteMessagingMessageRequest,
+    SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+    UpdateMessagingChannelRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -522,6 +522,11 @@ impl MessagingApi for LocalControlHttpClient {
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:status", &request)
+            .await
+    }
+
+    async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:profile", &request)
             .await
     }
 

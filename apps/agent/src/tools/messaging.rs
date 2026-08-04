@@ -21,9 +21,9 @@ use crate::{
         ListMessagingThreadsRequest, MessagingApi, MessagingNotificationPlace,
         MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingPlaceRequest,
         PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
-        StartMessagingDMRequest, UpdateMessagingChannelRequest, VoteMessagingPollRequest,
-        WriteMessagingMessageRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingProfileRequest,
+        SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+        VoteMessagingPollRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -58,6 +58,10 @@ const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
 // character covers any UTF-8 within those limits.
 const MAX_STATUS_NOTE_BYTES: usize = 800;
+// The server bounds a display name at 80 characters and a tagline at 100;
+// four bytes per character covers any UTF-8 within those limits.
+const MAX_DISPLAY_NAME_BYTES: usize = 320;
+const MAX_TAGLINE_BYTES: usize = 400;
 const MAX_REPLY_LATER_NOTE_BYTES: usize = 2000;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
@@ -111,6 +115,16 @@ enum MessagingAction {
         note: Option<String>,
         #[serde(default)]
         expires_in_minutes: Option<u32>,
+    },
+    /// Read or change one's own名乗り — the display name and the one-line
+    /// description others see next to it.  Like status this is about the
+    /// person, not a place, so no view need be open.  Sending no field reads
+    /// the current profile.
+    Profile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        tagline: Option<String>,
     },
     /// Promise a later reply to a message visible in the open place.
     ReplyLater {
@@ -334,7 +348,9 @@ fn messaging_parameters_schema() -> Value {
             "or limit; write requires content and may include urgency or reply_to; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
-            "status and may include note or expires_in_minutes; resolve_reply_later requires ",
+            "status and may include note or expires_in_minutes; profile may include display_name ",
+            "or tagline and reads the current profile when neither is given; ",
+            "resolve_reply_later requires ",
             "marker_id; start_dm requires participants; create_channel requires name and may ",
             "include topic or workspace_id; update_channel requires place_id plus name, topic or ",
             "both; duplicate_channel requires place_id and may include name; search requires ",
@@ -349,7 +365,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later", "start_dm",
+                    "status", "profile", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
                     "search", "notification_settings", "attention", "get_call_state",
                     "threads", "create_thread", "create_poll", "vote_poll"
@@ -360,7 +376,9 @@ fn messaging_parameters_schema() -> Value {
                     "the currently open place; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "own availability; profile reads or changes your own display name and the ",
+                    "one-line description shown next to it; resolve_reply_later marks one of ",
+                    "your promises as kept; ",
                     "start_dm opens a direct conversation with one person, or a group ",
                     "conversation with several, and puts it in view; create_channel opens a new ",
                     "channel and puts it in view; update_channel renames or retopics a channel; ",
@@ -526,6 +544,21 @@ fn messaging_parameters_schema() -> Value {
                     "about your presence is observed in the first place."
                 )
             },
+            "display_name": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. The name others see ",
+                    "for you. Omit it to leave your current name unchanged."
+                )
+            },
+            "tagline": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. One line about what ",
+                    "you do, shown next to your name. Omit it to leave it unchanged; send an ",
+                    "empty string to remove it."
+                )
+            },
             "note": {
                 "type": "string",
                 "description": concat!(
@@ -658,7 +691,8 @@ impl Tool for MessagingTool {
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
                 "message visible in it. When a tangent deserves its own room, list or ",
-                "open a thread under the place. Declare your own availability with status, or ",
+                "open a thread under the place. Declare your own availability with status, ",
+                "say who you are — your name and what you do — with profile, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Use search to find something said elsewhere, attention to see what ",
                 "arrived while you were not looking, notification_settings to ",
@@ -810,6 +844,17 @@ impl Tool for MessagingTool {
                     status: status_text(status),
                     note: note.as_deref(),
                     expires_in_minutes,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::Profile {
+                display_name,
+                tagline,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.profile(SetMessagingProfileRequest {
+                    display_name: display_name.as_deref(),
+                    tagline: tagline.as_deref(),
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
@@ -1170,6 +1215,25 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         } => {
             validate_optional_note(note, MAX_STATUS_NOTE_BYTES)?;
             validate_relative_minutes(expires_in_minutes)
+        }
+        MessagingAction::Profile {
+            display_name,
+            tagline,
+        } => {
+            // A present-but-blank name would ask the server to erase the one
+            // thing every list needs; omitting the field is how one leaves it
+            // alone. A blank tagline is legitimate — it removes the line.
+            if display_name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_DISPLAY_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            if tagline.as_deref().is_some_and(|tagline| {
+                tagline.len() > MAX_TAGLINE_BYTES || tagline.chars().any(char::is_control)
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
         }
         MessagingAction::ReplyLater {
             message_id,
@@ -1545,6 +1609,7 @@ mod tests {
         writes: AsyncMutex<Vec<(String, String, String)>>,
         reacts: AsyncMutex<Vec<(String, String, String)>>,
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
+        profiles: AsyncMutex<Vec<(Option<String>, Option<String>)>>,
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
@@ -1629,6 +1694,18 @@ mod tests {
                 request.expires_in_minutes,
             ));
             Ok(json!({"status": {"status": request.status, "note": request.note.unwrap_or("")}}))
+        }
+
+        async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("profile".to_owned());
+            self.profiles.lock().await.push((
+                request.display_name.map(str::to_owned),
+                request.tagline.map(str::to_owned),
+            ));
+            Ok(json!({"profile": {
+                "display_name": request.display_name.unwrap_or("Sumi"),
+                "tagline": request.tagline.unwrap_or("")
+            }}))
         }
 
         async fn reply_later(
@@ -1950,6 +2027,7 @@ mod tests {
                 "write",
                 "react",
                 "status",
+                "profile",
                 "reply_later",
                 "resolve_reply_later",
                 "start_dm",
@@ -1989,6 +2067,8 @@ mod tests {
             json!(["available", "busy", "away"])
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
+        assert_eq!(schema["properties"]["display_name"]["type"], "string");
+        assert_eq!(schema["properties"]["tagline"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
         assert_eq!(schema["properties"]["participants"]["type"], "array");
         for field in ["name", "topic", "workspace_id"] {
@@ -2013,7 +2093,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            30
+            32
         );
     }
 
@@ -2084,6 +2164,20 @@ mod tests {
                 note: Some(note),
                 expires_in_minutes: Some(45)
             } if note == "取り込み中"
+        ));
+
+        let profile: MessagingAction = serde_json::from_value(json!({
+            "action": "profile",
+            "display_name": "墨",
+            "tagline": "秘書"
+        }))
+        .unwrap();
+        assert!(matches!(
+            profile,
+            MessagingAction::Profile {
+                display_name: Some(display_name),
+                tagline: Some(tagline)
+            } if display_name == "墨" && tagline == "秘書"
         ));
 
         let reply_later: MessagingAction = serde_json::from_value(json!({
@@ -2436,6 +2530,48 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.statuses.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_is_read_and_changed_field_by_field_without_an_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // 名乗り is about the person, so like status it needs no place in view.
+        execute(&tool, json!({"action": "profile"}), "read")
+            .await
+            .unwrap();
+        assert_eq!(api.profiles.lock().await.as_slice(), &[(None, None)]);
+
+        // Naming one field leaves the other alone: omitted fields stay off the
+        // wire rather than arriving as a null the server must interpret.
+        execute(
+            &tool,
+            json!({"action": "profile", "tagline": "開発"}),
+            "tagline",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.profiles.lock().await[1],
+            (None, Some("開発".to_owned()))
+        );
+
+        // An empty tagline removes the line; an empty name would erase the one
+        // thing every member list needs, so it is refused here.
+        execute(&tool, json!({"action": "profile", "tagline": ""}), "clear")
+            .await
+            .unwrap();
+        assert_eq!(api.profiles.lock().await[2], (None, Some(String::new())));
+
+        for arguments in [
+            json!({"action": "profile", "display_name": ""}),
+            json!({"action": "profile", "display_name": "改\n行"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.profiles.lock().await.len(), 3);
     }
 
     #[tokio::test]

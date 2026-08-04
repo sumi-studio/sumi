@@ -47,6 +47,38 @@ func normalizeHumanDisplayName(raw string) (string, error) {
 	return "", ErrInvalidDisplayName
 }
 
+// NormalizeDisplayName is the registry's rule for a名乗り, exported so other
+// boundaries (messaging の個人設定) apply the identical normalization instead of
+// inventing a second one. Humans and PersonalityAgents share it: a participant
+// is a participant.
+func NormalizeDisplayName(raw string) (string, error) {
+	return normalizeHumanDisplayName(raw)
+}
+
+// ErrAgentNotFound is returned when a PersonalityAgentId names no live agent.
+var ErrAgentNotFound = errors.New("personality agent not found")
+
+// UpdateAgentDisplayName renames a PersonalityAgent. The agents table belongs
+// to the 戸籍, so the write lives here even though the caller is the messaging
+// surface — and the agent renaming itself goes through the same door a Human
+// does (AX: UIだけにある操作を作らない).
+func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, raw string) (string, error) {
+	name, err := normalizeHumanDisplayName(raw)
+	if err != nil {
+		return "", err
+	}
+	var stored string
+	if err := s.pool.QueryRow(ctx,
+		`UPDATE agents SET display_name=$2 WHERE personality_agent_id=$1
+		 RETURNING display_name`, agentID, name).Scan(&stored); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrAgentNotFound
+		}
+		return "", fmt.Errorf("update PersonalityAgent display name: %w", err)
+	}
+	return stored, nil
+}
+
 // initialHumanDisplayName treats a malformed verified provider label as absent
 // so profile metadata can never prevent authentication.
 func initialHumanDisplayName(raw string) string {

@@ -19,6 +19,7 @@ import type {
   Place,
   PlaceKey,
   PollInput,
+  ProfileInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -799,6 +800,39 @@ export class MockMessagingServer implements MessagingBackend {
       },
       Math.max(0, expiresAt - Date.now()),
     );
+  }
+
+  /**
+   * 自分の名乗りの置き換え。実サーバーと同じく、誰のものかは呼び出し側が
+   * 名乗るのではなく認証済みの participant（モックでは常にSELF）が決める。
+   */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    const index = MEMBERS.findIndex((member) =>
+      sameParticipant(member.participant, SELF),
+    );
+    if (index < 0) throw new Error("unknown participant");
+    const current = MEMBERS[index];
+    // 空文字は「外す」。それ以外は預かり中のアップロードのURLを使い、
+    // 既に設定済みのidをそのまま出し直した場合は現在のURLを保つ。
+    const image = (attachmentId: string, url: string | undefined) =>
+      attachmentId
+        ? { attachmentId, url: this.uploads.get(attachmentId)?.url ?? url }
+        : { attachmentId: undefined, url: undefined };
+    const avatar = image(input.avatarAttachmentId, current.avatarUrl);
+    const banner = image(input.bannerAttachmentId, current.bannerUrl);
+    const member: MemberProfile = {
+      participant: SELF,
+      displayName: input.displayName.trim(),
+      tagline: input.tagline,
+      avatarAttachmentId: avatar.attachmentId,
+      bannerAttachmentId: banner.attachmentId,
+      avatarUrl: avatar.url,
+      bannerUrl: banner.url,
+    };
+    if (!member.displayName) throw new Error("invalid display name");
+    MEMBERS[index] = member;
+    this.emit({ type: "profile_updated", member });
+    return member;
   }
 
   async createReplyLater(

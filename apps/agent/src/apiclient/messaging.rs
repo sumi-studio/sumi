@@ -52,6 +52,19 @@ pub(crate) struct SetMessagingStatusRequest<'a> {
     pub expires_in_minutes: Option<u32>,
 }
 
+/// Reading or changing one's own名乗り.  There is no field for whose profile
+/// it is: the transport's credential decides, exactly as the human settings
+/// screen can only edit the signed-in person.  Omitted fields are left alone,
+/// so naming one thing about oneself never discards the rest.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetMessagingProfileRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tagline: Option<&'a str>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateMessagingReplyLaterRequest<'a> {
@@ -253,6 +266,8 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value>;
 
     async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value>;
+
+    async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<Value>;
 
     async fn reply_later(&self, request: CreateMessagingReplyLaterRequest<'_>) -> Result<Value>;
 

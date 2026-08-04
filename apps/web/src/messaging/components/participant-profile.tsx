@@ -63,12 +63,20 @@ function ParticipantProfileCard({
 
   return (
     <div className="flex flex-col gap-2.5 p-1.5">
+      {member.bannerUrl ? (
+        <img
+          src={member.bannerUrl}
+          alt=""
+          className="-mx-1.5 -mt-1.5 h-16 w-[calc(100%+0.75rem)] rounded-t-md object-cover"
+        />
+      ) : null}
       <div className="flex items-start gap-3">
         <ParticipantAvatar
           participantKey={key}
           name={member.displayName}
           size={48}
           status={status?.status}
+          src={member.avatarUrl}
         />
         <div className="min-w-0 flex-1 pt-0.5">
           <p className="truncate font-semibold text-[15px]">

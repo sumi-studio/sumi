@@ -18,6 +18,7 @@ import { usePlaceNavigate } from "../place-route";
 import { notificationLevelFor, useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 import { PlaceContextMenu } from "./place-context-menu";
+import { SettingsOverlay } from "./settings-overlay";
 import { StatusMenu, statusSummary } from "./status-menu";
 
 const INPUT_CLASS =
@@ -544,6 +545,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
                   name={member.displayName}
                   size={22}
                   status={statusByKey[key]?.status}
+                  src={member.avatarUrl}
                 />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[13px]">
@@ -741,6 +743,7 @@ export function Sidebar() {
                   name={membersByKey[firstKey]?.displayName ?? "?"}
                   size={18}
                   status={statusByKey[firstKey]?.status}
+                  src={membersByKey[firstKey]?.avatarUrl}
                 />
               }
               unread={unread}
@@ -775,6 +778,7 @@ export function Sidebar() {
             name={selfProfile?.displayName ?? "?"}
             size={26}
             status={selfStatus?.status}
+            src={selfProfile?.avatarUrl}
           />
           <span className="min-w-0 flex-1">
             <span className="block truncate font-medium text-[13px]">
@@ -798,6 +802,7 @@ export function Sidebar() {
           onClose={() => setEditingChannelId(null)}
         />
       ) : null}
+      <SettingsOverlay />
     </aside>
   );
 }

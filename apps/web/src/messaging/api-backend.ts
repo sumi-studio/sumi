@@ -19,6 +19,7 @@ import type {
   Place,
   PlaceKey,
   PollOption,
+  ProfileInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -86,14 +87,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
       this.registerThread(entry),
     );
-    const members: MemberProfile[] = asArray(body.members).map((entry) => {
-      const value = asRecord(entry);
-      return {
-        participant: parseParticipant(value.participant),
-        displayName: asString(value.display_name),
-        tagline: typeof value.tagline === "string" ? value.tagline : "",
-      };
-    });
+    const members: MemberProfile[] = asArray(body.members).map(parseMember);
     const readMarkers: ReadMarker[] = asArray(body.read_markers).map(
       (entry) => {
         const value = asRecord(entry);
@@ -370,6 +364,21 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
   }
 
+  /** PUTは全置換。誰の名乗りかはsessionが決め、bodyには載せない。 */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    return parseMember(
+      await this.request("/messaging/profile", {
+        method: "PUT",
+        body: {
+          display_name: input.displayName,
+          tagline: input.tagline,
+          avatar_attachment_id: input.avatarAttachmentId,
+          banner_attachment_id: input.bannerAttachmentId,
+        },
+      }),
+    );
+  }
+
   async createReplyLater(
     place: Place,
     messageId: string,
@@ -552,6 +561,9 @@ export class ApiMessagingBackend implements MessagingBackend {
               participant: parseParticipant(status.participant),
             }
           : { type: eventType, status: parseStatus(status) };
+    } else if (eventType === "profile_updated") {
+      // 名乗りもstatusと同じくparticipantスコープ。seqを進めない。
+      parsed = { type: eventType, member: parseMember(wire.member) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -777,6 +789,35 @@ function parseReaction(value: unknown): ReactionSummary {
     emoji: asString(wire.emoji),
     participants: asArray(wire.participants).map(parseParticipant),
   };
+}
+
+/**
+ * メンバーのwire → domain。画像は添付idだけが載るので、URLはこの境界で
+ * 組み立てる（同一originのセッション付きGET。可視性はサーバーが検査する）。
+ */
+function parseMember(value: unknown): MemberProfile {
+  const wire = asRecord(value);
+  const avatarAttachmentId = optionalString(wire.avatar_attachment_id);
+  const bannerAttachmentId = optionalString(wire.banner_attachment_id);
+  return {
+    participant: parseParticipant(wire.participant),
+    displayName: asString(wire.display_name),
+    tagline: optionalString(wire.tagline),
+    avatarAttachmentId,
+    bannerAttachmentId,
+    avatarUrl: attachmentURL(avatarAttachmentId),
+    bannerUrl: attachmentURL(bannerAttachmentId),
+  };
+}
+
+function attachmentURL(attachmentId: string): string | undefined {
+  return attachmentId
+    ? `/messaging/attachments/${encodeURIComponent(attachmentId)}`
+    : undefined;
+}
+
+function optionalString(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function parseStatus(value: unknown): ParticipantStatus {

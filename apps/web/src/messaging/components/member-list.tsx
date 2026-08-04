@@ -43,6 +43,7 @@ export function MemberList() {
                 name={member.displayName}
                 size={28}
                 status={status?.status ?? "available"}
+                src={member.avatarUrl}
               />
               <span className="min-w-0 flex-1">
                 <span className="block truncate font-medium text-[13px]">
