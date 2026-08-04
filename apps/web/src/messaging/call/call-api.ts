@@ -5,7 +5,7 @@
  * 失敗してテキストはそのまま動く。
  */
 
-import type { Place } from "../model";
+import { type Place, placeId } from "../model";
 import type { CallParticipant, CallState, CallTicket } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -28,7 +28,7 @@ export class CallAPIError extends Error {
 }
 
 function placeID(place: Place): string {
-  return place.kind === "channel" ? place.channelId : place.dmId;
+  return placeId(place);
 }
 
 async function request(

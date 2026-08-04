@@ -30,6 +30,11 @@ const (
 	LocalCreateChannelPath    = "/local-control/v1/messaging:create-channel"
 	LocalUpdateChannelPath    = "/local-control/v1/messaging:update-channel"
 	LocalDuplicateChannelPath = "/local-control/v1/messaging:duplicate-channel"
+	// LocalCreateThreadPath opens a side conversation under a channel — the
+	// same capability the human gets from「スレッドを作成」, through the same
+	// store call (AX: UIだけにある操作を作らない).
+	LocalCreateThreadPath = "/local-control/v1/messaging:create-thread"
+	LocalThreadsPath      = "/local-control/v1/messaging:threads"
 	// LocalNotificationSettingsPath is both the read and the write of the
 	// agent's own notification setting. The agent owns the identical resource a
 	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
@@ -70,6 +75,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalCreateChannelPath, s.localCreateChannel},
 		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
 		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
+		{"POST " + LocalCreateThreadPath, s.localCreateThread},
+		{"POST " + LocalThreadsPath, s.localThreads},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 		{"POST " + LocalSearchPath, s.localSearch},
 		{"POST " + LocalAttentionPath, s.localAttention},
@@ -165,13 +172,96 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	for i, profile := range profiles {
 		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
 	}
+	// A thread is read as belonging to its parent: the agent should see the
+	// same relation a human sees in the thread header, not a stray place.
+	var thread *threadWire
+	if place.Kind == PlaceThread {
+		summary, err := s.Store.ThreadFor(r.Context(), place.PlaceID, viewer)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		wire := threadToWire(summary)
+		thread = &wire
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Place       placeWire     `json:"place"`
+		Thread      *threadWire   `json:"thread,omitempty"`
 		LatestSeq   int64         `json:"latest_seq"`
 		LastReadSeq int64         `json:"last_read_seq"`
 		Members     []memberWire  `json:"members"`
 		Messages    []messageWire `json:"messages"`
-	}{placeToWire(place), place.LastSeq, lastRead, members, wires})
+	}{placeToWire(place), thread, place.LastSeq, lastRead, members, wires})
+}
+
+// localThreads lists the side conversations under a channel the agent can see.
+func (s *Server) localThreads(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID string `json:"place_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	threads, err := s.Store.ThreadsIn(r.Context(), request.PlaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Threads []threadWire `json:"threads"`
+	}{threadsToWire(threads)})
+}
+
+// localCreateThread opens a thread through the identical store path the human
+// UI uses. The origin message, when named, must be one the agent can see in
+// the parent — the same rule react and reply-later follow (ADR 0011 §3).
+func (s *Server) localCreateThread(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID string `json:"place_id"`
+		Name    string `json:"name"`
+		// Absent means the thread starts from nothing said yet.
+		ParentMessageID *string `json:"parent_message_id,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || strings.TrimSpace(request.Name) == "" ||
+		utf8.RuneCountInString(request.Name) > MaxThreadNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	origin := ""
+	if request.ParentMessageID != nil {
+		origin = *request.ParentMessageID
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	thread, err := s.Store.CreateThread(r.Context(), request.PlaceID, request.Name, origin, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := threadToWire(thread)
+	if s.Hub != nil {
+		s.Hub.Publish(r.Context(), Event{
+			Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
+		})
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		Thread threadWire `json:"thread"`
+	}{wire})
 }
 
 func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

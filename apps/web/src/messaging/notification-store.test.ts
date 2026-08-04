@@ -29,6 +29,7 @@ class StubBackend implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   readonly settingWrites: NotificationSettingInput[] = [];
   rejectSettingWrites = false;
@@ -49,6 +50,7 @@ class StubBackend implements MessagingBackend {
         },
       ],
       dms: [],
+      threads: [],
       members: [
         { participant: SELF, displayName: "yohaku", tagline: "" },
         { participant: OTHER, displayName: "Kuro", tagline: "" },
@@ -87,6 +89,12 @@ class StubBackend implements MessagingBackend {
     throw new Error("not used");
   }
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
+    throw new Error("not used");
+  }
+  async fetchThreads(): ReturnType<MessagingBackend["fetchThreads"]> {
+    return [];
+  }
+  async createThread(): ReturnType<MessagingBackend["createThread"]> {
     throw new Error("not used");
   }
   async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {

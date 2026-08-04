@@ -24,12 +24,14 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   WorkspaceSummary,
 } from "./model";
 import {
   parsePlaceKey,
   participantKey,
+  placeId,
   placeKey,
   sameParticipant,
 } from "./model";
@@ -342,8 +344,11 @@ export class MockMessagingServer implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
+  /** スレッドはplaceの一種。作成されるまで存在しないのでインスタンス側に持つ。 */
+  private readonly threads = new Map<string, ThreadSummary>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
@@ -407,6 +412,7 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES,
       channels: CHANNELS,
       dms: DMS,
+      threads: [...this.threads.values()],
       members: MEMBERS,
       statuses: [...this.statuses.values()],
       readMarkers,
@@ -433,7 +439,9 @@ export class MockMessagingServer implements MessagingBackend {
     );
     const level = override?.level ?? this.notificationSetting.defaults.level;
     if (level === "mute") return null;
-    if (message.place.kind !== "channel") return { reason: "dm" };
+    if (message.place.kind === "dm" || message.place.kind === "group_dm") {
+      return { reason: "dm" };
+    }
     if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
       return { reason: "mention" };
     }
@@ -537,6 +545,44 @@ export class MockMessagingServer implements MessagingBackend {
     DMS.push(dm);
     this.emit({ type: "place_created", dm });
     return dm;
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const parentKey = placeKey(parent);
+    return [...this.threads.values()].filter(
+      (thread) => placeKey(thread.parentPlace) === parentKey,
+    );
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    if (parent.kind !== "channel") throw new Error("not threadable");
+    const taken = [...this.threads.values()].some(
+      (thread) =>
+        originMessageId !== null && thread.parentMessageId === originMessageId,
+    );
+    if (taken) throw new Error("thread exists");
+    const thread: ThreadSummary = {
+      threadId: `th-${secureRandomUUID().slice(0, 8)}`,
+      parentPlace: parent,
+      parentMessageId: originMessageId,
+      name,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    this.threads.set(thread.threadId, thread);
+    this.readMarkers.set(
+      placeKey({ kind: "thread", threadId: thread.threadId }),
+      0,
+    );
+    this.emit({ type: "place_created", thread });
+    return thread;
   }
 
   async updateChannel(
@@ -862,6 +908,21 @@ export class MockMessagingServer implements MessagingBackend {
     };
     messages.push(message);
     this.history.set(key, messages);
+    // スレッドに書くことが参加すること。一覧の件数・最新行・参加者を更新する。
+    if (input.place.kind === "thread") {
+      const thread = this.threads.get(placeId(input.place));
+      if (thread) {
+        thread.messageCount += 1;
+        thread.lastMessageAt = message.createdAt;
+        thread.lastMessage = message.content;
+        thread.latestSeq = message.seq;
+        if (
+          !thread.participants.some((ref) => sameParticipant(ref, input.author))
+        ) {
+          thread.participants = [...thread.participants, input.author];
+        }
+      }
+    }
     return message;
   }
 

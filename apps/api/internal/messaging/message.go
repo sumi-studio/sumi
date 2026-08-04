@@ -190,6 +190,13 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 	if err := insertMentions(ctx, tx, msg.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
+	// Writing in a thread is how one joins it: from here the thread counts
+	// towards this participant's unread and may call them.
+	if place.Kind == PlaceThread {
+		if err := joinThread(ctx, tx, place.PlaceID, in.Author); err != nil {
+			return Message{}, false, err
+		}
+	}
 	attachments, err := bindAttachments(ctx, tx, msg.MessageID, in.Author, in.AttachmentIDs)
 	if err != nil {
 		return Message{}, false, err

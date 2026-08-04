@@ -238,16 +238,16 @@ func (s *Store) SetNotificationSetting(
 // silencing a place means silence, not "silence unless someone insists". The
 // author is never notified of their own message: writing is not being called.
 func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg Message) ([]NotificationDecision, error) {
-	members, err := s.activeMembers(ctx, s.pool, place)
+	audience, err := s.notificationAudience(ctx, place, msg)
 	if err != nil {
 		return nil, err
 	}
-	candidates := make([]ParticipantRef, 0, len(members))
-	for _, member := range members {
-		if member.Participant == msg.Author {
+	candidates := make([]ParticipantRef, 0, len(audience))
+	for _, member := range audience {
+		if member == msg.Author {
 			continue
 		}
-		candidates = append(candidates, member.Participant)
+		candidates = append(candidates, member)
 	}
 	if len(candidates) == 0 {
 		return nil, nil
@@ -270,7 +270,7 @@ func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg M
 		}
 		reason := ""
 		switch {
-		case place.Kind != PlaceChannel:
+		case place.Kind == PlaceDM || place.Kind == PlaceGroupDM:
 			reason = NotifyReasonDM
 		case mentioned[candidate.Key()]:
 			reason = NotifyReasonMention
@@ -288,6 +288,39 @@ func (s *Store) NotificationDecisionsFor(ctx context.Context, place Place, msg M
 }
 
 // --- internals ---
+
+// notificationAudience is who a message in this place may call. For channels
+// and dms it is the place's active members. For a thread it is the people who
+// joined it plus anyone the message names — a tangent should not ring every
+// member of the parent channel, but being named still reaches you and, by the
+// same act, brings you into the thread's audience from then on.
+func (s *Store) notificationAudience(ctx context.Context, place Place, msg Message) ([]ParticipantRef, error) {
+	if place.Kind != PlaceThread {
+		members, err := s.activeMembers(ctx, s.pool, place)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]ParticipantRef, len(members))
+		for i, member := range members {
+			out[i] = member.Participant
+		}
+		return out, nil
+	}
+	joined, err := s.threadMembers(ctx, s.pool, place.PlaceID)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(joined)+len(msg.Mentions))
+	out := make([]ParticipantRef, 0, len(joined)+len(msg.Mentions))
+	for _, ref := range append(append([]ParticipantRef{}, joined...), msg.Mentions...) {
+		if seen[ref.Key()] {
+			continue
+		}
+		seen[ref.Key()] = true
+		out = append(out, ref)
+	}
+	return out, nil
+}
 
 // resolvedSetting is one candidate's effective level for one place plus their
 // keyword list, already reduced from the two setting tables.

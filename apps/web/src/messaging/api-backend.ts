@@ -24,9 +24,10 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
 } from "./model";
-import { MAX_SEQ, parsePlaceKey } from "./model";
+import { MAX_SEQ, parsePlaceKey, placeId } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 /** アップロードは最大20MiBを運ぶため、通常のRESTより長い猶予を与える。 */
@@ -51,6 +52,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -77,6 +79,9 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
+    );
+    const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
+      this.registerThread(entry),
     );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
@@ -119,6 +124,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       workspaces,
       channels,
       dms,
+      threads,
       members,
       statuses,
       readMarkers,
@@ -185,6 +191,30 @@ export class ApiMessagingBackend implements MessagingBackend {
       body: { participants: participants.map(participantToWire) },
     });
     return this.registerDm(body);
+  }
+
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      ),
+    );
+    return asArray(body.threads).map((entry) => this.registerThread(entry));
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      {
+        method: "POST",
+        body: { name, parent_message_id: originMessageId ?? "" },
+      },
+    );
+    return this.registerThread(body);
   }
 
   async updateChannel(
@@ -504,13 +534,19 @@ export class ApiMessagingBackend implements MessagingBackend {
         participant: parseParticipant(wire.actor),
       };
     } else if (eventType === "place_created") {
-      parsed =
-        wire.channel === undefined || wire.channel === null
-          ? { type: "place_created", dm: this.registerDm(wire.dm) }
-          : {
-              type: "place_created",
-              channel: this.registerChannel(wire.channel),
-            };
+      if (wire.channel != null) {
+        parsed = {
+          type: "place_created",
+          channel: this.registerChannel(wire.channel),
+        };
+      } else if (wire.thread != null) {
+        parsed = {
+          type: "place_created",
+          thread: this.registerThread(wire.thread),
+        };
+      } else {
+        parsed = { type: "place_created", dm: this.registerDm(wire.dm) };
+      }
     } else if (eventType === "place_updated") {
       parsed = {
         type: "place_updated",
@@ -542,6 +578,32 @@ export class ApiMessagingBackend implements MessagingBackend {
       channelId: channel.channelId,
     });
     return channel;
+  }
+
+  /** Parses a thread wire shape and remembers the place for event routing. */
+  private registerThread(value: unknown): ThreadSummary {
+    const wire = asRecord(value);
+    const thread: ThreadSummary = {
+      threadId: asString(wire.thread_id),
+      parentPlace: parsePlace(wire.parent_place),
+      parentMessageId:
+        wire.parent_message_id == null
+          ? null
+          : asString(wire.parent_message_id),
+      name: asString(wire.name),
+      messageCount: asSeq(wire.message_count),
+      lastMessageAt:
+        wire.last_message_at == null ? null : asTimestamp(wire.last_message_at),
+      lastMessage:
+        typeof wire.last_message === "string" ? wire.last_message : "",
+      participants: asArray(wire.participants).map(parseParticipant),
+      latestSeq: asSeq(wire.latest_seq),
+    };
+    this.places.set(thread.threadId, {
+      kind: "thread",
+      threadId: thread.threadId,
+    });
+    return thread;
   }
 
   /** Parses a dm wire shape and remembers the place for event routing. */
@@ -603,13 +665,17 @@ export class ApiMessagingBackend implements MessagingBackend {
 }
 
 function placeID(place: Place): string {
-  return place.kind === "channel" ? place.channelId : place.dmId;
+  return placeId(place);
 }
 
 function placeToWire(place: Place): Record<string, string> {
-  return place.kind === "channel"
-    ? { kind: place.kind, channel_id: place.channelId }
-    : { kind: place.kind, dm_id: place.dmId };
+  if (place.kind === "channel") {
+    return { kind: place.kind, channel_id: place.channelId };
+  }
+  if (place.kind === "thread") {
+    return { kind: place.kind, thread_id: place.threadId };
+  }
+  return { kind: place.kind, dm_id: place.dmId };
 }
 
 function parseNotify(value: unknown): { reason: NotifyReason } | null {
@@ -719,6 +785,9 @@ function parsePlace(value: unknown): Place {
   const kind = asString(wire.kind);
   if (kind === "channel") {
     return { kind, channelId: asString(wire.channel_id) };
+  }
+  if (kind === "thread") {
+    return { kind, threadId: asString(wire.thread_id) };
   }
   if (kind === "dm" || kind === "group_dm") {
     return { kind, dmId: asString(wire.dm_id) };

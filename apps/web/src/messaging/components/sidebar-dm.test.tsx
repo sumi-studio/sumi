@@ -78,6 +78,7 @@ beforeEach(() => {
       replyLater: true,
       reactions: true,
       notifications: true,
+      threads: true,
     },
   });
 });

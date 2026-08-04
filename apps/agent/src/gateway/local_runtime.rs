@@ -36,12 +36,12 @@ use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, MessagingApi,
-    MessagingNotificationSettingsRequest, OpenMessagingPlaceRequest, PollMessagingAttentionRequest,
-    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
-    SearchMessagingRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
-    UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, ListMessagingThreadsRequest,
+    MessagingApi, MessagingNotificationSettingsRequest, OpenMessagingPlaceRequest,
+    PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+    ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
+    StartMessagingDMRequest, UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -609,6 +609,25 @@ impl MessagingApi for LocalControlHttpClient {
         request: GetMessagingCallStateRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:call-state", &request)
+            .await
+    }
+
+    async fn threads(&self, request: ListMessagingThreadsRequest<'_>) -> Result<serde_json::Value> {
+        // A channel's thread list carries one preview line per thread, so it
+        // shares the messaging screen bound rather than the control-plane one.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:threads",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_thread(
+        &self,
+        request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:create-thread", &request)
             .await
     }
 }

@@ -23,6 +23,7 @@ import type {
   ReplyLaterMarker,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   Urgency,
   WorkspaceSummary,
 } from "./model";
@@ -60,6 +61,13 @@ interface MessagingState {
   workspaces: WorkspaceSummary[];
   channels: ChannelSummary[];
   dms: DmSummary[];
+  /**
+   * 見えているスレッド。bootstrapでは自分が参加しているものだけが載り、
+   * 親チャンネルを開くとその配下が全部足される（閲覧は親のメンバー全員できる）。
+   */
+  threadsById: Record<string, ThreadSummary>;
+  /** スレッド一覧を取り終えた親place。開くたびの再取得を避ける。 */
+  threadsLoadedForPlace: Record<PlaceKey, boolean>;
   membersByKey: Record<ParticipantKey, MemberProfile>;
   statusByKey: Record<ParticipantKey, ParticipantStatus>;
   messagesByPlace: Record<PlaceKey, Message[]>;
@@ -101,6 +109,14 @@ interface MessagingState {
   ): Promise<void>;
   /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
   duplicateChannel(channelId: string): Promise<PlaceKey>;
+  /** 親チャンネル配下のスレッド一覧を取り込む。取得済みなら何もしない。 */
+  loadThreads(parentKey: PlaceKey): Promise<void>;
+  /** スレッドを作る。返り値は開く先のPlaceKey。 */
+  createThread(
+    parentKey: PlaceKey,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<PlaceKey>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   /** 可視なplace全体の本文検索。結果はUI局所状態で持ち、storeには残さない。 */
   searchMessages(query: string): Promise<MessageSearchResult[]>;
@@ -258,6 +274,37 @@ export const useMessaging = create<MessagingState>((set, get) => {
     });
   };
 
+  /**
+   * スレッドに新しい発言が着いたときの一覧側の追従。件数と最新行は一覧を
+   * 開き直さなくても正しくあってほしいので、eventから直接更新する。
+   */
+  const noteThreadActivity = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    set((state) => {
+      const thread = state.threadsById[threadId];
+      if (!thread) return {};
+      const known = thread.participants.some(
+        (ref) => participantKey(ref) === participantKey(message.author),
+      );
+      return {
+        threadsById: {
+          ...state.threadsById,
+          [threadId]: {
+            ...thread,
+            messageCount: thread.messageCount + (message.deleted ? 0 : 1),
+            lastMessageAt: message.createdAt,
+            lastMessage: message.content,
+            latestSeq: Math.max(thread.latestSeq, message.seq),
+            participants: known
+              ? thread.participants
+              : [...thread.participants, message.author],
+          },
+        },
+      };
+    });
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
@@ -321,7 +368,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
-      if (event.type === "message_created") presentNotification(event);
+      if (event.type === "message_created") {
+        noteThreadActivity(event.message);
+        presentNotification(event);
+      }
       return;
     }
     if (event.type === "message_deleted") {
@@ -420,8 +470,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "place_created") {
-      const { channel, dm } = event;
+      const { channel, dm, thread } = event;
       set((state) => {
+        if (thread) {
+          return {
+            threadsById: {
+              ...state.threadsById,
+              [thread.threadId]: thread,
+            },
+          };
+        }
         if (channel) {
           return state.channels.some(
             (entry) => entry.channelId === channel.channelId,
@@ -581,6 +639,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},
@@ -635,6 +695,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
             mentionCountByPlace[key] = summary.mentionCount;
             sinceByPlace[key] = summary.latestSeq;
           }
+          const threadsById: Record<string, ThreadSummary> = {};
+          for (const thread of snapshot.threads) {
+            threadsById[thread.threadId] = thread;
+          }
           const notificationLevelByPlace: Record<PlaceKey, NotificationLevel> =
             {};
           for (const entry of snapshot.notificationSetting.perPlace) {
@@ -648,6 +712,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             workspaces: snapshot.workspaces,
             channels: snapshot.channels,
             dms: snapshot.dms,
+            threadsById,
             membersByKey,
             statusByKey,
             lastReadByPlace,
@@ -680,9 +745,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? state.channels.some(
               (channel) => channel.channelId === place.channelId,
             )
-          : state.dms.some(
-              (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
-            );
+          : place.kind === "thread"
+            ? state.threadsById[place.threadId] !== undefined
+            : state.dms.some(
+                (dm) => dm.kind === place.kind && dm.dmId === place.dmId,
+              );
       if (!known) return;
       set((state) => ({
         activePlaceKey: key,
@@ -726,6 +793,34 @@ export const useMessaging = create<MessagingState>((set, get) => {
           : { dms: [...state.dms, dm] },
       );
       return placeKey({ kind: dm.kind, dmId: dm.dmId });
+    },
+
+    async loadThreads(parentKey) {
+      const parent = parsePlaceKey(parentKey);
+      if (parent?.kind !== "channel") return;
+      if (get().threadsLoadedForPlace[parentKey]) return;
+      const threads = await backend.fetchThreads(parent);
+      set((state) => {
+        const threadsById = { ...state.threadsById };
+        for (const thread of threads) threadsById[thread.threadId] = thread;
+        return {
+          threadsById,
+          threadsLoadedForPlace: {
+            ...state.threadsLoadedForPlace,
+            [parentKey]: true,
+          },
+        };
+      });
+    },
+
+    async createThread(parentKey, name, originMessageId) {
+      const parent = parsePlaceKey(parentKey);
+      if (!parent) throw new Error("unknown place");
+      const thread = await backend.createThread(parent, name, originMessageId);
+      set((state) => ({
+        threadsById: { ...state.threadsById, [thread.threadId]: thread },
+      }));
+      return placeKey({ kind: "thread", threadId: thread.threadId });
     },
 
     async updateChannel(channelId, input) {
@@ -1041,6 +1136,8 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
     workspaces: [],
     channels: [],
     dms: [],
+    threadsById: {},
+    threadsLoadedForPlace: {},
     membersByKey: {},
     statusByKey: {},
     messagesByPlace: {},

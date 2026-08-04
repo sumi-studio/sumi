@@ -69,6 +69,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
 	mux.HandleFunc("POST /messaging/places/{place_id}/duplicate", s.serveDuplicatePlace)
+	mux.HandleFunc("GET /messaging/places/{place_id}/threads", s.serveThreads)
+	mux.HandleFunc("POST /messaging/places/{place_id}/threads", s.serveCreateThread)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("GET /messaging/search", s.serveSearch)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
@@ -138,18 +140,81 @@ func participantsToWire(refs []ParticipantRef) []participantWire {
 	return out
 }
 
-// placeWire matches the frozen PlaceRef shape from contracts/agent-events.yaml.
+// placeWire matches the frozen PlaceRef shape from contracts/agent-events.yaml,
+// extended with the thread kind (migration 0018). Consumers that do not know
+// `thread` fail closed on the unknown kind, exactly as they must for any future
+// kind, so the frozen shape is not reinterpreted.
 type placeWire struct {
 	Kind      string `json:"kind"`
 	ChannelID string `json:"channel_id,omitempty"`
 	DMID      string `json:"dm_id,omitempty"`
+	ThreadID  string `json:"thread_id,omitempty"`
 }
 
 func placeToWire(p Place) placeWire {
-	if p.Kind == PlaceChannel {
+	switch p.Kind {
+	case PlaceChannel:
 		return placeWire{Kind: p.Kind, ChannelID: p.PlaceID}
+	case PlaceThread:
+		return placeWire{Kind: p.Kind, ThreadID: p.PlaceID}
+	default:
+		return placeWire{Kind: p.Kind, DMID: p.PlaceID}
 	}
-	return placeWire{Kind: p.Kind, DMID: p.PlaceID}
+}
+
+// placeIDOf reads the identifier out of a client-sent place reference without
+// caring which kind field carried it.
+func (p placeWire) placeID() string {
+	switch {
+	case p.ChannelID != "":
+		return p.ChannelID
+	case p.DMID != "":
+		return p.DMID
+	default:
+		return p.ThreadID
+	}
+}
+
+// threadWire is a thread place plus what a list of threads renders: how much
+// was said, when, and who is in it.
+type threadWire struct {
+	ThreadID        string            `json:"thread_id"`
+	ParentPlace     placeWire         `json:"parent_place"`
+	ParentMessageID *string           `json:"parent_message_id"`
+	WorkspaceID     string            `json:"workspace_id"`
+	Name            string            `json:"name"`
+	MessageCount    int64             `json:"message_count"`
+	LastMessageAt   *time.Time        `json:"last_message_at"`
+	LastMessage     string            `json:"last_message"`
+	Participants    []participantWire `json:"participants"`
+	LatestSeq       int64             `json:"latest_seq"`
+}
+
+func threadToWire(t Thread) threadWire {
+	wire := threadWire{
+		ThreadID:      t.Place.PlaceID,
+		ParentPlace:   placeToWire(Place{PlaceID: t.ParentPlaceID, Kind: PlaceChannel}),
+		WorkspaceID:   t.Place.WorkspaceID,
+		Name:          t.Place.Name,
+		MessageCount:  t.MessageCount,
+		LastMessageAt: t.LastMessageAt,
+		LastMessage:   t.LastMessagePreview,
+		Participants:  participantsToWire(t.Participants),
+		LatestSeq:     t.Place.LastSeq,
+	}
+	if t.ParentMessageID != "" {
+		origin := t.ParentMessageID
+		wire.ParentMessageID = &origin
+	}
+	return wire
+}
+
+func threadsToWire(threads []Thread) []threadWire {
+	out := make([]threadWire, len(threads))
+	for i, thread := range threads {
+		out[i] = threadToWire(thread)
+	}
+	return out
 }
 
 // attachmentWire is the file a message carries. The bytes are fetched from
@@ -653,6 +718,11 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			channels = append(channels, channelToWire(sum.Place))
 			continue
 		}
+		// A thread's identity travels in `threads` (it needs its parent), and
+		// its members are the parent channel's — already added above.
+		if sum.Place.Kind == PlaceThread {
+			continue
+		}
 		profiles, err := s.Store.ActiveMembers(ctx, sum.Place.PlaceID, viewer)
 		if err != nil {
 			writeStoreError(w, err)
@@ -701,12 +771,21 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	// Threads the viewer has joined. They are places like any other, but the
+	// client needs the parent relation to place them under their channel
+	// instead of listing them beside it.
+	threads, err := s.Store.ThreadsFor(ctx, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, struct {
 		Self                participantWire         `json:"self"`
 		Workspaces          []workspaceWire         `json:"workspaces"`
 		Channels            []channelWire           `json:"channels"`
 		DMs                 []dmWire                `json:"dms"`
+		Threads             []threadWire            `json:"threads"`
 		Members             []memberWire            `json:"members"`
 		Statuses            []statusWire            `json:"statuses"`
 		ReadMarkers         []readMarkerWire        `json:"read_markers"`
@@ -718,6 +797,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		Workspaces:          workspaceWires,
 		Channels:            channels,
 		DMs:                 dms,
+		Threads:             threadsToWire(threads),
 		Members:             members,
 		Statuses:            statusWires,
 		ReadMarkers:         readMarkers,
@@ -924,6 +1004,64 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
 	}
 	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	writeJSON(w, http.StatusCreated, wire)
+}
+
+// serveThreads lists the side conversations under a channel. Every member of
+// the parent sees all of them: a thread keeps a tangent out of the main flow,
+// it does not hide it.
+func (s *Server) serveThreads(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	threads, err := s.Store.ThreadsIn(r.Context(), r.PathValue("place_id"), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Threads []threadWire `json:"threads"`
+	}{Threads: threadsToWire(threads)})
+}
+
+// serveCreateThread opens a thread under a channel, optionally anchored to the
+// message it grew out of. The same store call backs the agent tool path.
+func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		// Empty means the thread starts from nothing said yet.
+		ParentMessageID string `json:"parent_message_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" || utf8.RuneCountInString(req.Name) > MaxThreadNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	var thread Thread
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		thread, opErr = s.Store.CreateThread(
+			r.Context(), r.PathValue("place_id"), req.Name, req.ParentMessageID, viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := threadToWire(thread)
+	s.Hub.Publish(r.Context(), Event{
+		Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
+	})
 	writeJSON(w, http.StatusCreated, wire)
 }
 
@@ -1325,10 +1463,7 @@ func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid_level")
 			return
 		}
-		placeID := entry.Place.ChannelID
-		if placeID == "" {
-			placeID = entry.Place.DMID
-		}
+		placeID := entry.Place.placeID()
 		if placeID == "" {
 			writeError(w, http.StatusBadRequest, "invalid_place")
 			return
@@ -1816,6 +1951,10 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidChannelName):
 		writeError(w, http.StatusBadRequest, "invalid_name")
+	case errors.Is(err, ErrNotThreadable):
+		writeError(w, http.StatusBadRequest, "not_threadable")
+	case errors.Is(err, ErrThreadExists):
+		writeError(w, http.StatusConflict, "thread_exists")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

@@ -1,4 +1,13 @@
-import { Bell, Clock, Hash, Users, Volume2, X } from "lucide-react";
+import {
+  Bell,
+  ChevronLeft,
+  Clock,
+  Hash,
+  MessagesSquare,
+  Users,
+  Volume2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
 import { CallBanner } from "../call/call-banner";
@@ -6,7 +15,12 @@ import { CallStage } from "../call/call-stage";
 import { CallStartButtons } from "../call/call-start-buttons";
 import { IncomingCallModal } from "../call/incoming-call";
 import { VoiceChannelPanel } from "../call/voice-channel-panel";
-import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
+import {
+  type PlaceKey,
+  participantKey,
+  placeKey,
+  type ReplyLaterMarker,
+} from "../model";
 import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
@@ -27,6 +41,7 @@ import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
 import { PushSubscriptionBridge } from "./push-bridge";
 import { Sidebar } from "./sidebar";
+import { ThreadPanel } from "./thread-panel";
 
 interface PendingJump {
   placeKey: PlaceKey;
@@ -207,11 +222,7 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
                     onClick={() => {
                       setOpen(false);
                       onJump({
-                        placeKey: `${marker.place.kind}:${
-                          marker.place.kind === "channel"
-                            ? marker.place.channelId
-                            : marker.place.dmId
-                        }`,
+                        placeKey: placeKey(marker.place),
                         messageId: marker.messageId,
                       });
                     }}
@@ -289,11 +300,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
           type="button"
           onClick={() =>
             onJump({
-              placeKey: `${marker.place.kind}:${
-                marker.place.kind === "channel"
-                  ? marker.place.channelId
-                  : marker.place.dmId
-              }`,
+              placeKey: placeKey(marker.place),
               messageId: marker.messageId,
             })
           }
@@ -351,8 +358,10 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const notificationDefaultLevel = useMessaging(
     (state) => state.notificationDefaultLevel,
   );
+  const canThread = useMessaging((state) => state.capabilities.threads);
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
+  const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
 
   useEffect(() => {
@@ -464,6 +473,23 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               <Hash className="size-4 shrink-0 text-muted-foreground" />
             )
           ) : null}
+          {/* スレッドは親チャンネルの脇道。どこから枝分かれしたかを見出しに残し、
+              戻る導線を必ず添える。 */}
+          {display?.kind === "thread" && display.parent ? (
+            <button
+              type="button"
+              title={`#${display.parent.name} へ戻る`}
+              onClick={() => placeNavigate(display.parent?.placeKey ?? "")}
+              className="flex shrink-0 items-center gap-0.5 rounded-md py-0.5 pr-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <ChevronLeft className="size-3.5" />
+              <Hash className="size-3" />
+              <span className="max-w-32 truncate">{display.parent.name}</span>
+            </button>
+          ) : null}
+          {display?.kind === "thread" ? (
+            <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
+          ) : null}
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? ""}
           </span>
@@ -483,6 +509,20 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               <CallStartButtons placeKey={activePlaceKey} />
             ) : null}
             <MessageSearch onJump={requestJump} />
+            {canThread && display?.kind === "channel" ? (
+              <button
+                type="button"
+                title="スレッド"
+                onClick={() => setThreadsOpen((value) => !value)}
+                className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+                  threadsOpen
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground"
+                }`}
+              >
+                <MessagesSquare className="size-4" />
+              </button>
+            ) : null}
             {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
             <button
@@ -516,6 +556,12 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             <TypingIndicator />
             <Composer />
           </main>
+          {threadsOpen && activePlaceKey?.startsWith("channel:") ? (
+            <ThreadPanel
+              parentKey={activePlaceKey}
+              onClose={() => setThreadsOpen(false)}
+            />
+          ) : null}
           {membersOpen ? <MemberList /> : null}
         </div>
       </div>

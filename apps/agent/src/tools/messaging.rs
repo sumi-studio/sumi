@@ -16,7 +16,8 @@ use tokio::sync::Mutex;
 use crate::{
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-        DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, MessagingApi,
+        CreateMessagingThreadRequest, DuplicateMessagingChannelRequest,
+        GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
         MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
         OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
         ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
@@ -43,6 +44,9 @@ const MAX_TOPIC_BYTES: usize = 1000;
 // A group dm the agent opens in one gesture. Far beyond any real conversation,
 // tight enough that a malformed argument cannot fan out.
 const MAX_DM_PARTICIPANTS: usize = 32;
+// The server bounds a thread name at 100 characters; four bytes per character
+// covers any UTF-8 within that limit.
+const MAX_THREAD_NAME_BYTES: usize = 400;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
@@ -194,6 +198,17 @@ enum MessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    /// See the side conversations under the place currently in view.
+    Threads {},
+    /// Open a side conversation under the place currently in view, optionally
+    /// growing it out of a message visible there.
+    CreateThread {
+        name: String,
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+    },
 }
 
 /// The three notification levels, identical to the ones a Human chooses in the
@@ -310,7 +325,8 @@ fn messaging_parameters_schema() -> Value {
                     "overview", "open", "write", "react",
                     "status", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
-                    "search", "notification_settings", "attention", "get_call_state"
+                    "search", "notification_settings", "attention", "get_call_state",
+                    "threads", "create_thread"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -326,7 +342,9 @@ fn messaging_parameters_schema() -> Value {
                     "search finds messages you can already see, anywhere; ",
                     "notification_settings reads or changes what is allowed to interrupt you; ",
                     "attention lists what arrived while you were not looking, and why; ",
-                    "get_call_state reports who is currently in a voice or video call."
+                    "get_call_state reports who is currently in a voice or video call; ",
+                    "threads lists the side conversations under the currently open place; ",
+                    "create_thread opens one and moves this view into it."
                 )
             },
             "place_id": {
@@ -397,17 +415,27 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "message_id. Provide exactly one of message_id or seq; the message must be ",
-                    "visible in the currently open place."
+                    "For react, reply_later and create_thread, omitted for other actions. The ",
+                    "target message by message_id. react and reply_later need exactly one of ",
+                    "message_id or seq; create_thread takes at most one and starts a thread from ",
+                    "nothing said when both are omitted. The message must be visible in the ",
+                    "currently open place."
                 )
             },
             "seq": {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "its seq in the currently open place. Provide exactly one of message_id or seq."
+                    "For react, reply_later and create_thread, omitted for other actions. The ",
+                    "target message by its seq in the currently open place; provide at most one ",
+                    "of message_id or seq."
+                )
+            },
+            "name": {
+                "type": "string",
+                "description": concat!(
+                    "Required for create_thread and omitted for other actions. The heading of ",
+                    "the side conversation, as others will see it in the thread list."
                 )
             },
             "emoji": {
@@ -558,7 +586,8 @@ impl Tool for MessagingTool {
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status, or ",
+                "message visible in it. When a tangent deserves its own room, list or ",
+                "open a thread under the place. Declare your own availability with status, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Use search to find something said elsewhere, attention to see what ",
                 "arrived while you were not looking, notification_settings to ",
@@ -763,6 +792,66 @@ impl Tool for MessagingTool {
                     .and_then(Value::as_str)
                 {
                     state.focused_place_id = Some(dm_id.to_owned());
+                    state.pending_read_through = None;
+                    state.visible_messages.clear();
+                }
+                response
+            }
+            MessagingAction::Threads {} => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before listing threads; the list belongs to the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.threads(ListMessagingThreadsRequest {
+                        place_id: &place_id,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::CreateThread {
+                name,
+                message_id,
+                seq,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before creating a thread; the thread hangs under the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                // An origin, when named, must be on this screen — the same rule
+                // react and reply_later follow (ADR 0011 §3).
+                let origin = if message_id.is_some() || seq.is_some() {
+                    Some(visible_target(
+                        &state,
+                        &message_id,
+                        seq,
+                        "start a thread from it",
+                    )?)
+                } else {
+                    None
+                };
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_thread(CreateMessagingThreadRequest {
+                        place_id: &place_id,
+                        name: &name,
+                        parent_message_id: origin.as_ref().map(|target| target.message_id.as_str()),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // Creating a thread takes you into it, exactly as the human UI
+                // navigates to the new place. The screen starts empty.
+                if let Some(thread_id) = response
+                    .get("thread")
+                    .and_then(|thread| thread.get("thread_id"))
+                    .and_then(Value::as_str)
+                {
+                    state.focused_place_id = Some(thread_id.to_owned());
                     state.pending_read_through = None;
                     state.visible_messages.clear();
                 }
@@ -1078,6 +1167,30 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Threads {} => Ok(()),
+        MessagingAction::CreateThread {
+            name,
+            message_id,
+            seq,
+        } => {
+            validate_bounded_nonempty(name, MAX_THREAD_NAME_BYTES)?;
+            // Unlike react, an origin is optional here: a thread may start
+            // from a message or from nothing said yet. Naming both selectors
+            // is still ambiguous.
+            if message_id.is_some() && seq.is_some() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if seq == &Some(0) {
+                return Err(ToolError::InvalidArguments);
+            }
+            if message_id
+                .as_deref()
+                .is_some_and(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1271,6 +1384,7 @@ mod tests {
         searches: AsyncMutex<Vec<(String, Option<String>, Option<u16>)>>,
         notifications: AsyncMutex<Vec<(Option<String>, usize, Vec<String>)>>,
         attentions: AsyncMutex<Vec<(Option<u64>, Option<u16>)>>,
+        threads: AsyncMutex<Vec<(String, String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -1452,6 +1566,36 @@ mod tests {
             }))
         }
 
+        async fn threads(&self, request: ListMessagingThreadsRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("threads:{}", request.place_id));
+            Ok(json!({"threads": []}))
+        }
+
+        async fn create_thread(&self, request: CreateMessagingThreadRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_thread:{}", request.place_id));
+            self.threads.lock().await.push((
+                request.place_id.to_owned(),
+                request.name.to_owned(),
+                request.parent_message_id.map(str::to_owned),
+            ));
+            Ok(json!({
+                "thread": {
+                    "thread_id": "th-1",
+                    "name": request.name,
+                    "parent_place": {"kind": "channel", "channel_id": request.place_id},
+                    "parent_message_id": request.parent_message_id,
+                    "message_count": 0,
+                    "participants": []
+                }
+            }))
+        }
+
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
             if self.failures.lock().await.pop_front() == Some("read") {
                 return Err(anyhow!("read failed"));
@@ -1618,7 +1762,9 @@ mod tests {
                 "search",
                 "notification_settings",
                 "attention",
-                "get_call_state"
+                "get_call_state",
+                "threads",
+                "create_thread"
             ])
         );
         assert_eq!(
@@ -2310,6 +2456,110 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.channels.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn threads_need_an_open_place_and_creation_moves_the_view_into_it() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // A thread hangs under a place, so both actions need one in view.
+        for arguments in [
+            json!({"action": "threads"}),
+            json!({"action": "create_thread", "name": "認証リダイレクトの件"}),
+        ] {
+            let error = execute(&tool, arguments, "no-place").await.unwrap_err();
+            assert!(matches!(error, ToolError::Protocol(_)));
+        }
+        assert!(api.threads.lock().await.is_empty());
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(&tool, json!({"action": "threads"}), "list")
+            .await
+            .unwrap();
+        execute(
+            &tool,
+            json!({"action": "create_thread", "name": "認証リダイレクトの件", "seq": 7}),
+            "create",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.threads.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "認証リダイレクトの件".to_owned(),
+                Some("m7".to_owned())
+            )]
+        );
+
+        // Creating moved the view into the new thread: the next write lands
+        // there, and the parent's screen is no longer what can be acted on.
+        execute(
+            &tool,
+            json!({"action": "write", "content": "続きはこちらで"}),
+            "write",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "th-1");
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn create_thread_rejects_missing_names_and_unseen_or_ambiguous_origins() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        for arguments in [
+            json!({"action": "create_thread"}),
+            json!({"action": "create_thread", "name": ""}),
+            json!({"action": "create_thread", "name": "x", "message_id": "m7", "seq": 7}),
+            json!({"action": "create_thread", "name": "x", "seq": 0}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        // A message off the screen cannot become an origin (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "create_thread", "name": "x", "message_id": "m404"}),
+            "missing",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert!(api.threads.lock().await.is_empty());
+
+        // Without an origin the thread simply starts from nothing said yet.
+        execute(
+            &tool,
+            json!({"action": "create_thread", "name": "来週の段取り"}),
+            "scratch",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.threads.lock().await[0].2, None);
     }
 
     #[tokio::test]
