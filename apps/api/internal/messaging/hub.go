@@ -7,29 +7,46 @@ import (
 )
 
 // Event is one durable or volatile messaging event fanned out to live
-// subscribers. Durable message and reaction events carry their partial
-// projections; place events carry a place summary but are not replayed because
-// reconnecting clients re-read the durable places table via bootstrap. Typing
-// events carry only the actor and are never replayed.
+// subscribers. Message events carry the whole message (with its place seq);
+// reaction_updated carries only the partial reaction payload so it can never
+// roll back a concurrent edit. Place events carry a place summary but are not
+// replayed because reconnecting clients re-read the durable places table via
+// bootstrap. Volatile events (typing, status_updated) are never replayed.
+// Place events scope delivery by PlaceID; participant-scoped events
+// (status_updated) leave PlaceID empty and set Subject instead.
 type Event struct {
 	Type     string              `json:"type"`
-	PlaceID  string              `json:"place_id"`
+	PlaceID  string              `json:"place_id,omitempty"`
 	Message  *messageWire        `json:"message,omitempty"`
 	Reaction *reactionUpdateWire `json:"reaction,omitempty"`
 	Actor    *participantWire    `json:"actor,omitempty"`
 	Channel  *channelWire        `json:"channel,omitempty"`
 	DM       *dmWire             `json:"dm,omitempty"`
+	Status   *statusWire         `json:"status,omitempty"`
+	Marker   *replyLaterWire     `json:"marker,omitempty"`
+	MarkerID string              `json:"marker_id,omitempty"`
+
+	// Delivery controls; never serialized. Subject scopes a place-less event to
+	// subscribers who can see that participant. OnlyFor/ExceptFor split one
+	// logical event into per-audience payloads (remind_at は本人以外の wire に
+	// 載せない — the owner's copy and everyone else's copy differ).
+	Subject   *ParticipantRef `json:"-"`
+	OnlyFor   *ParticipantRef `json:"-"`
+	ExceptFor *ParticipantRef `json:"-"`
 }
 
 // Durable event types. The wire names match the web model's ServerEvent.
 const (
-	EventMessageCreated  = "message_created"
-	EventMessageEdited   = "message_edited"
-	EventMessageDeleted  = "message_deleted"
-	EventReactionUpdated = "reaction_updated"
-	EventTyping          = "typing"
-	EventPlaceCreated    = "place_created"
-	EventPlaceUpdated    = "place_updated"
+	EventMessageCreated     = "message_created"
+	EventMessageEdited      = "message_edited"
+	EventMessageDeleted     = "message_deleted"
+	EventReactionUpdated    = "reaction_updated"
+	EventTyping             = "typing"
+	EventStatusUpdated      = "status_updated"
+	EventReplyLaterCreated  = "reply_later_created"
+	EventReplyLaterResolved = "reply_later_resolved"
+	EventPlaceCreated       = "place_created"
+	EventPlaceUpdated       = "place_updated"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a
@@ -104,8 +121,9 @@ func (h *Hub) unsubscribe(sub *subscriber) {
 	h.mu.Unlock()
 }
 
-// Publish delivers the event to every subscriber who can see its place.
-// Slow subscribers are dropped rather than blocking the publisher.
+// Publish delivers the event to every subscriber in its audience who can see
+// its scope (place, or subject participant for place-less events). Slow
+// subscribers are dropped rather than blocking the publisher.
 func (h *Hub) Publish(ctx context.Context, event Event) {
 	if h == nil {
 		return
@@ -126,13 +144,13 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 
 	var drop []*subscriber
 	for _, sub := range subs {
-		ok, known := sub.visibility(event.PlaceID)
-		if !known {
-			_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
-			ok = err == nil
-			sub.markVisible(event.PlaceID, ok)
+		if event.OnlyFor != nil && sub.viewer != *event.OnlyFor {
+			continue
 		}
-		if !ok {
+		if event.ExceptFor != nil && sub.viewer == *event.ExceptFor {
+			continue
+		}
+		if !h.visibleTo(ctx, sub, event) {
 			continue
 		}
 		select {
@@ -145,4 +163,32 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 	for _, sub := range drop {
 		h.unsubscribe(sub)
 	}
+}
+
+// visibleTo answers "may this subscriber be told about this event now",
+// caching verdicts per scope key. Place events use place visibility;
+// participant-scoped events use ParticipantVisible under a prefixed key so the
+// two namespaces cannot collide. An event with neither scope is delivered to
+// no one (fail-closed).
+func (h *Hub) visibleTo(ctx context.Context, sub *subscriber, event Event) bool {
+	scope := event.PlaceID
+	if scope == "" {
+		if event.Subject == nil {
+			return false
+		}
+		scope = "participant|" + event.Subject.Key()
+	}
+	ok, known := sub.visibility(scope)
+	if known {
+		return ok
+	}
+	if event.PlaceID != "" {
+		_, err := h.store.PlaceFor(ctx, event.PlaceID, sub.viewer)
+		ok = err == nil
+	} else {
+		visible, err := h.store.ParticipantVisible(ctx, sub.viewer, *event.Subject)
+		ok = err == nil && visible
+	}
+	sub.markVisible(scope, ok)
+	return ok
 }
