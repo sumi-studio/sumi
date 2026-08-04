@@ -79,6 +79,14 @@
   "author": ParticipantRef,
   "content": "markdown",
   "mentions": [ParticipantRef, ...],
+  "attachments": [
+    {
+      "attachment_id": "<UUIDv7>",
+      "filename": "shot.png",
+      "mime": "image/png",
+      "size": 20480
+    }
+  ],
   "urgency": "urgent | normal | fyi",
   "reply_to": "<message_id> | null",
   "created_at": "...",
@@ -94,6 +102,16 @@
 - すべてのメッセージはplace + seqでpermalinkを持ち、引用共有とジャンプに使う。
   引用は「該当メッセージへ飛べる状態での共有」を人間もagentも同じ形で行う道具。
 
+- `attachments` は画像・ファイルの添付。実体はwireに載らず、メタデータだけが載る。
+  送信の前に `POST /messaging/attachments`（multipart、1ファイル20MiBまで）で預け、
+  送信入力の `attachments: ["<attachment_id>", ...]` で紐付ける。**紐付けられるのは
+  自分がアップロードした、まだどのメッセージにも属していないものだけ**（authorと同じく
+  client assertionを信用しない）。実体は `GET /messaging/attachments/{attachment_id}` で
+  取得し、可視性は紐付いたmessageのplaceに対して評価する（未紐付けはアップローダー本人のみ、
+  tombstone化したmessageの添付は誰にも配信しない）。配信は画像MIMEのみ `inline`、
+  それ以外は `Content-Disposition: attachment`。全応答が `X-Content-Type-Options: nosniff`
+  で、宣言MIMEと中身が食い違う画像は不透明なdownloadへ落とす。添付だけで本文の無い
+  メッセージは正当（画像だけを送るのは普通のこと）。
 - `mentions` は入力テキストの `@表示名` をadmission時にmembership lookupで**解決済みParticipantRef**として束縛する。
   raw文字列の一致を認可やmention判定に使わない（ADR 0008: scope-local addressは交換可能な参照）。
 - authorはサーバー側が認証済みactorから構成する。client-assertedのauthor名を信用しない（ADR 0008 §6）。
