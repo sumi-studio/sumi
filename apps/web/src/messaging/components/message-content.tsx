@@ -1,3 +1,4 @@
+import "katex/dist/katex.min.css";
 import { Check, Copy } from "lucide-react";
 import {
   Children,
@@ -8,10 +9,12 @@ import {
   useState,
 } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { displayMentionPattern } from "../mention";
 import type { MemberProfile, ParticipantKey } from "../model";
 import { participantKey } from "../model";
@@ -30,6 +33,9 @@ import { participantKey } from "../model";
  * mention装飾はremarkプラグインとしてAST上のtextノードを分割する。
  * code / inlineCode は値がtextノードにならないため、コードの内側は
  * Discordと同様に装飾されない。link内も装飾しない（URLを壊さない）。
+ *
+ * 数式はremark-math + rehype-katex（KaTeX）。CSSはCDNではなくローカル
+ * import（バンドル同梱）。単一$の誤爆と$$の扱いはremarkMathGuardで補正する。
  */
 
 const MENTION_SELF_CLASS =
@@ -45,6 +51,11 @@ interface MdNode {
   data?: {
     hName?: string;
     hProperties?: Record<string, unknown>;
+    hChildren?: HastNode[];
+  };
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
   };
 }
 
@@ -120,6 +131,149 @@ function remarkMentions(targets: MentionTarget[]) {
   };
 }
 
+/**
+ * remark-mathの単一$を素直に使うと「ランチは $5 と $10」のような通貨表記が
+ * 数式になってしまう（$5 と $ が数式として閉じる）。単一$の数式は残したまま、
+ * pandoc相当の規則で誤爆だけを元のテキストへ戻す。
+ *
+ * 戻す条件（単一$のときだけ判定する）:
+ * - 中身が空、または前後が空白（開き$の直後・閉じ$の直前が空白）
+ * - 閉じ$の直後が数字（"$5 と $10" の 10 のような続き）
+ */
+function isCurrencyLikeMath(raw: string, source: string, end: number): boolean {
+  const inner = raw.slice(1, -1);
+  if (inner.trim() === "") return true;
+  if (/^\s|\s$/.test(inner)) return true;
+  return /\d/.test(source.charAt(end));
+}
+
+/** 先頭に連続する $ の数。$$…$$ の判別に使う。 */
+function dollarRun(raw: string): number {
+  let count = 0;
+  while (count < raw.length && raw[count] === "$") count += 1;
+  return count;
+}
+
+function rawSource(source: string, node: MdNode): string | null {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  if (typeof start !== "number" || typeof end !== "number") return null;
+  const raw = source.slice(start, end);
+  return raw.startsWith("$") && raw.endsWith("$") ? raw : null;
+}
+
+/** remark-mathのブロック数式（$$を独立行で囲む形）と同じmdastノードを作る。 */
+function displayMathNode(value: string): MdNode {
+  return {
+    type: "math",
+    value,
+    data: {
+      hName: "pre",
+      hChildren: [
+        {
+          type: "element",
+          tagName: "code",
+          properties: { className: ["language-math", "math-display"] },
+          children: [{ type: "text", value }],
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * 段落の中で「その行がまるごと $$…$$」になっているインライン数式を
+ * ブロック数式へ昇格させる。remark-mathは1行に閉じた $$…$$ をインライン
+ * 扱いにするが、チャットでは $$ は別行組みの意図で書かれるため。
+ * remark-breaksにより行の区切りはbreakノードとして残っている。
+ */
+function splitDisplayMathLines(
+  paragraph: MdNode,
+  source: string,
+): MdNode[] | null {
+  const children = paragraph.children ?? [];
+  const out: MdNode[] = [];
+  let line: MdNode[] = [];
+  let promoted = false;
+  const flush = () => {
+    while (line.length > 0 && line[0].type === "break") line.shift();
+    while (line.length > 0 && line[line.length - 1].type === "break")
+      line.pop();
+    if (line.length > 0) out.push({ type: "paragraph", children: line });
+    line = [];
+  };
+  for (const [index, child] of children.entries()) {
+    const previous = children[index - 1];
+    const next = children[index + 1];
+    const alone =
+      (previous === undefined || previous.type === "break") &&
+      (next === undefined || next.type === "break");
+    const raw = child.type === "inlineMath" ? rawSource(source, child) : null;
+    if (alone && raw !== null && dollarRun(raw) >= 2) {
+      flush();
+      out.push(displayMathNode(child.value ?? ""));
+      promoted = true;
+      continue;
+    }
+    line.push(child);
+  }
+  flush();
+  return promoted ? out : null;
+}
+
+/** remark-mathの結果を補正する。誤爆の巻き戻し → $$行のブロック昇格の順。 */
+function remarkMathGuard() {
+  return (tree: MdNode, file: { value?: unknown }) => {
+    const source = typeof file.value === "string" ? file.value : "";
+    if (source === "") return;
+
+    const demote = (node: MdNode) => {
+      if (!node.children) return;
+      const next: MdNode[] = [];
+      let changed = false;
+      for (const child of node.children) {
+        if (child.type === "inlineMath") {
+          const raw = rawSource(source, child);
+          const end = child.position?.end?.offset ?? 0;
+          if (
+            raw !== null &&
+            dollarRun(raw) === 1 &&
+            isCurrencyLikeMath(raw, source, end)
+          ) {
+            next.push({ type: "text", value: raw });
+            changed = true;
+            continue;
+          }
+        }
+        demote(child);
+        next.push(child);
+      }
+      if (changed) node.children = next;
+    };
+    demote(tree);
+
+    const promote = (node: MdNode) => {
+      if (!node.children) return;
+      const next: MdNode[] = [];
+      let changed = false;
+      for (const child of node.children) {
+        if (child.type === "paragraph") {
+          const split = splitDisplayMathLines(child, source);
+          if (split) {
+            next.push(...split);
+            changed = true;
+            continue;
+          }
+        }
+        promote(child);
+        next.push(child);
+      }
+      if (changed) node.children = next;
+    };
+    promote(tree);
+  };
+}
+
 /** hastノードの最小型（rehypeプラグイン用）。 */
 interface HastNode {
   type: string;
@@ -127,6 +281,47 @@ interface HastNode {
   properties?: Record<string, unknown>;
   value?: string;
   children?: HastNode[];
+}
+
+function hastClassNames(node: HastNode): string[] {
+  const value = node.properties?.className;
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") return value.split(/\s+/);
+  return [];
+}
+
+/**
+ * KaTeXのブロック数式は既定で上下1emの余白を取り、長い式は横にはみ出す。
+ * チャットの行間に合わせて余白を詰め、横スクロール可能な器で包む。
+ * rehype-katexが元の要素ごと差し替えるため、この整形はKaTeXの後に行う。
+ */
+function rehypeKatexLayout() {
+  return (tree: HastNode) => {
+    const walk = (node: HastNode) => {
+      const children = node.children;
+      if (!children) return;
+      for (const [index, child] of children.entries()) {
+        if (
+          child.type === "element" &&
+          hastClassNames(child).includes("katex-display")
+        ) {
+          child.properties = {
+            ...child.properties,
+            className: [...hastClassNames(child), "my-0!"],
+          };
+          children[index] = {
+            type: "element",
+            tagName: "div",
+            properties: { className: "my-1 max-w-full overflow-x-auto" },
+            children: [child],
+          };
+          continue;
+        }
+        walk(child);
+      }
+    };
+    walk(tree);
+  };
 }
 
 export interface ContentTrailer {
@@ -299,6 +494,21 @@ const markdownComponents: Components = {
   ),
 };
 
+/**
+ * strict:"ignore" は日本語混じりの数式（$長さ = 3$ 等）で出る警告を止めるため。
+ * 失敗した式は例外を投げず、赤字＋title付きで元のソースを見せる（KaTeX既定）。
+ */
+const KATEX_OPTIONS = {
+  strict: "ignore" as const,
+  errorColor: "var(--destructive)",
+  trust: false,
+};
+
+/** オプション付きKaTeX。既存のrehypeTrailerと同じくattacherの形で渡す。 */
+function rehypeKatexWithOptions() {
+  return rehypeKatex(KATEX_OPTIONS);
+}
+
 export interface MessageContentProps {
   content: string;
   members: Record<ParticipantKey, MemberProfile>;
@@ -323,12 +533,19 @@ export const MessageContent = memo(function MessageContent({
       remarkCjkFriendly,
       remarkCjkFriendlyGfmStrikethrough,
       remarkBreaks,
+      remarkMath,
+      // 誤爆の巻き戻しはmention装飾より前。戻したテキストの@名前も装飾したい。
+      remarkMathGuard,
       remarkMentions(targets),
     ];
   }, [members, selfKey]);
 
   const rehypePlugins = useMemo(
-    () => (trailer ? [rehypeTrailer(trailer)] : []),
+    () => [
+      rehypeKatexWithOptions,
+      rehypeKatexLayout,
+      ...(trailer ? [rehypeTrailer(trailer)] : []),
+    ],
     [trailer],
   );
 
