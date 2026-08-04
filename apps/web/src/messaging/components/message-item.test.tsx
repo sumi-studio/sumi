@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   MemberProfile,
@@ -75,11 +81,14 @@ function renderItem(
       onReply={noop}
       onReplyLater={noop}
       onToggleReaction={noop}
-      onCopyLink={noop}
+      onCopyLink={() => Promise.resolve(true)}
       onEdit={noop}
       onDelete={noop}
       onJumpTo={noop}
       onRetry={noop}
+      editing={false}
+      onSubmitEdit={noop}
+      onCancelEdit={noop}
       {...props}
     />,
   );
@@ -138,5 +147,98 @@ describe("MessageItem の行の見せ方", () => {
     expect(screen.getByTitle("余白 の返信元へ移動")).toHaveTextContent(
       "添付ファイル",
     );
+  });
+});
+
+describe("リンクのコピー", () => {
+  it("成功したらチェック表示へ一時的に変わる", async () => {
+    const onCopyLink = vi.fn().mockResolvedValue(true);
+    renderItem(makeMessage(), { onCopyLink });
+    fireEvent.click(screen.getByLabelText("リンクをコピー"));
+    expect(onCopyLink).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.getByLabelText("リンクをコピーしました")).toBeVisible(),
+    );
+  });
+
+  it("失敗したら成功と偽らず、失敗として示す", async () => {
+    const onCopyLink = vi.fn().mockResolvedValue(false);
+    renderItem(makeMessage(), { onCopyLink });
+    fireEvent.click(screen.getByLabelText("リンクをコピー"));
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("リンクをコピーできませんでした"),
+      ).toBeVisible(),
+    );
+    expect(screen.queryByLabelText("リンクをコピーしました")).toBeNull();
+  });
+});
+
+describe("インライン編集", () => {
+  it("編集中は本文の位置に入力欄とヒントが出て、操作チップは引っ込む", () => {
+    renderItem(makeMessage({ content: "編集前" }), { editing: true });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    expect(textarea).toHaveValue("編集前");
+    expect(screen.getByText("Escでキャンセル・Enterで保存")).toBeVisible();
+    expect(screen.queryByLabelText("返信")).toBeNull();
+  });
+
+  it("Enterで保存し、Escで取り消す", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: "編集後" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmitEdit).toHaveBeenCalledWith("編集後");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("IME変換中のEnter・Escは編集の操作として奪わない", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage(), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(textarea, { key: "Escape", isComposing: true });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    expect(onCancelEdit).not.toHaveBeenCalled();
+  });
+
+  it("Shift+Enterと未閉鎖のコードフェンス内では保存しない", () => {
+    const onSubmitEdit = vi.fn();
+    renderItem(makeMessage({ content: "```ts" }), {
+      editing: true,
+      onSubmitEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+  });
+
+  it("空にして保存しようとしたら削除ではなく取消として扱う", () => {
+    const onSubmitEdit = vi.fn();
+    const onCancelEdit = vi.fn();
+    renderItem(makeMessage({ content: "編集前" }), {
+      editing: true,
+      onSubmitEdit,
+      onCancelEdit,
+    });
+    const textarea = screen.getByLabelText("メッセージを編集");
+    fireEvent.change(textarea, { target: { value: "   " } });
+    fireEvent.click(screen.getByText("保存"));
+    expect(onSubmitEdit).not.toHaveBeenCalled();
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
   });
 });

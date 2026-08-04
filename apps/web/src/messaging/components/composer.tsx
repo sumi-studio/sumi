@@ -2,7 +2,6 @@ import {
   CornerUpLeft,
   Loader2,
   Paperclip,
-  Pencil,
   TriangleAlert,
   X,
 } from "lucide-react";
@@ -77,9 +76,9 @@ export function Composer() {
       ? (state.messagesByPlace[state.activePlaceKey] ?? NO_MESSAGES)
       : NO_MESSAGES,
   );
+  // 編集はメッセージ本体の位置で行う（message-item のインライン編集）。
+  // composerは編集を預からず、↑キーの入り口だけを持つ。
   const editingMessageId = useMessaging((state) => state.editingMessageId);
-  const cancelEdit = useMessaging((state) => state.cancelEdit);
-  const submitEdit = useMessaging((state) => state.submitEdit);
   const startEdit = useMessaging((state) => state.startEdit);
   const replyTargetId = useMessaging((state) => state.replyTargetId);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
@@ -88,7 +87,6 @@ export function Composer() {
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [urgency, setUrgency] = useState<Urgency>("normal");
-  const [editValue, setEditValue] = useState("");
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
@@ -96,9 +94,6 @@ export function Composer() {
   const lastTypingAt = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const editingMessage = editingMessageId
-    ? messages.find((entry) => entry.messageId === editingMessageId)
-    : undefined;
   const replyTarget = replyTargetId
     ? messages.find((entry) => entry.messageId === replyTargetId)
     : undefined;
@@ -106,17 +101,14 @@ export function Composer() {
     ? membersByKey[participantKey(replyTarget.author)]
     : undefined;
 
-  const editing = editingMessage !== undefined;
-  const value = editing ? editValue : draft;
+  const value = draft;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始をフォーカスのトリガーにする
   useEffect(() => {
-    if (editingMessage) setEditValue(editingMessage.content);
-  }, [editingMessage]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 編集開始・place切替・返信開始をフォーカスのトリガーにする
-  useEffect(() => {
+    // インライン編集中はキャレットが編集欄にある。奪い返さない。
+    if (editingMessageId) return;
     textareaRef.current?.focus();
-  }, [activePlaceKey, editingMessageId, replyTargetId]);
+  }, [activePlaceKey, replyTargetId]);
 
   // autogrow: 内容に合わせて高さを伸ばし、上限でスクロールへ切り替える。
   // biome-ignore lint/correctness/useExhaustiveDependencies: 入力値の変化を高さ再計算のトリガーにする
@@ -141,9 +133,7 @@ export function Composer() {
 
   const updateValue = useCallback(
     (next: string) => {
-      if (editing) {
-        setEditValue(next);
-      } else if (activePlaceKey) {
+      if (activePlaceKey) {
         setDraft(activePlaceKey, next);
         const now = Date.now();
         if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
@@ -155,7 +145,7 @@ export function Composer() {
       setMention(findMentionQuery(next, caret));
       setMentionIndex(0);
     },
-    [editing, activePlaceKey, setDraft, sendTyping],
+    [activePlaceKey, setDraft, sendTyping],
   );
 
   const applyMention = useCallback(
@@ -181,7 +171,6 @@ export function Composer() {
   // 大きすぎるファイルはサーバーへ運ばずここで落とす（上限は契約と同値）。
   const addFiles = useCallback(
     (files: FileList | File[] | null | undefined) => {
-      if (editing) return;
       const chosen = Array.from(files ?? []);
       if (chosen.length === 0) return;
       const room = Math.max(
@@ -220,7 +209,7 @@ export function Composer() {
           });
       });
     },
-    [attachments.length, editing, uploadAttachment],
+    [attachments.length, uploadAttachment],
   );
 
   const removeAttachment = useCallback((localId: string) => {
@@ -241,10 +230,6 @@ export function Composer() {
   );
 
   const submit = useCallback(() => {
-    if (editing) {
-      submitEdit(editValue);
-      return;
-    }
     // アップロード中に送ると添付を取りこぼす。終わるまで送信しない。
     if (uploading) return;
     if (!value.trim() && readyAttachments.length === 0) return;
@@ -252,16 +237,7 @@ export function Composer() {
     setAttachments([]);
     setUrgency("normal");
     setMention(null);
-  }, [
-    editing,
-    editValue,
-    submitEdit,
-    value,
-    send,
-    urgency,
-    uploading,
-    readyAttachments,
-  ]);
+  }, [value, send, urgency, uploading, readyAttachments]);
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -291,10 +267,7 @@ export function Composer() {
         }
       }
       if (event.key === "Escape") {
-        if (editing) {
-          event.preventDefault();
-          cancelEdit();
-        } else if (replyTargetId) {
+        if (replyTargetId) {
           event.preventDefault();
           setReplyTarget(null);
         }
@@ -308,8 +281,8 @@ export function Composer() {
         submit();
         return;
       }
-      // 空欄で↑ = 自分の直前のメッセージを編集（Discordと同じ手癖）。
-      if (event.key === "ArrowUp" && !editing && value === "") {
+      // 空欄で↑ = 自分の直前のメッセージをその場で編集し始める。
+      if (event.key === "ArrowUp" && !editingMessageId && value === "") {
         const own = [...messages]
           .reverse()
           .find((entry) => participantKey(entry.author) === selfKey);
@@ -324,8 +297,7 @@ export function Composer() {
       candidates,
       mentionIndex,
       applyMention,
-      editing,
-      cancelEdit,
+      editingMessageId,
       replyTargetId,
       setReplyTarget,
       submit,
@@ -377,24 +349,7 @@ export function Composer() {
           })}
         </div>
       ) : null}
-      {editing ? (
-        <div className="mb-1 flex items-center gap-2 text-muted-foreground text-xs">
-          <Pencil className="size-3" />
-          メッセージを編集中
-          <span className="text-muted-foreground/70">
-            Enterで保存・Escでキャンセル
-          </span>
-          <button
-            type="button"
-            onClick={cancelEdit}
-            className="ml-auto rounded p-0.5 hover:bg-accent"
-            aria-label="編集をキャンセル"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
-      ) : null}
-      {!editing && replyTarget && replyAuthor ? (
+      {replyTarget && replyAuthor ? (
         <div className="mb-1 flex items-center gap-2 text-muted-foreground text-xs">
           <CornerUpLeft className="size-3" />
           <span className="font-medium text-foreground">
@@ -417,7 +372,6 @@ export function Composer() {
           dragging ? "border-ring border-dashed bg-accent/40" : "border-border"
         }`}
         onDragOver={(event) => {
-          if (editing) return;
           event.preventDefault();
           setDragging(true);
         }}
@@ -426,7 +380,6 @@ export function Composer() {
           setDragging(false);
         }}
         onDrop={(event) => {
-          if (editing) return;
           event.preventDefault();
           setDragging(false);
           addFiles(event.dataTransfer.files);
@@ -477,7 +430,7 @@ export function Composer() {
           onKeyDown={onKeyDown}
           onPaste={(event) => {
             // クリップボードの画像・ファイルはそのまま添付にする。
-            if (editing || event.clipboardData.files.length === 0) return;
+            if (event.clipboardData.files.length === 0) return;
             event.preventDefault();
             addFiles(event.clipboardData.files);
           }}
@@ -507,19 +460,11 @@ export function Composer() {
             title="ファイルを添付"
             aria-label="ファイルを添付"
             onClick={() => fileInputRef.current?.click()}
-            className={`flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground ${
-              editing ? "invisible" : ""
-            }`}
+            className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Paperclip className="size-3.5" />
           </button>
-          {/* 編集中は緊急度セレクタを不可視にするだけで場所は保つ
-              （編集開始でツールバー行の高さが変わり入力欄が跳ねないように）。 */}
-          <div
-            className={`flex items-center rounded-md bg-muted/60 p-0.5 ${
-              editing ? "invisible" : ""
-            }`}
-          >
+          <div className="flex items-center rounded-md bg-muted/60 p-0.5">
             {URGENCIES.map((entry) => (
               <button
                 key={entry.value}

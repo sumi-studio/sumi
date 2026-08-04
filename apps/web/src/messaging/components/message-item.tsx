@@ -15,18 +15,29 @@ import {
   PopoverTrigger,
 } from "@sumi/ui/components/popover";
 import {
+  Check,
   Clock,
   CornerUpLeft,
   Link as LinkIcon,
   Pencil,
   SmilePlus,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
-import { memo, type ReactNode, useMemo } from "react";
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { MemberProfile, Message, ParticipantKey } from "../model";
 import { participantKey } from "../model";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
+import { MessageEditor } from "./message-editor";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
@@ -158,11 +169,16 @@ export interface MessageItemProps {
   onReply: (message: Message) => void;
   onReplyLater: (message: Message, delayMs: number) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
-  onCopyLink: (message: Message) => void;
+  /** コピーの成否を返す。UIはこの結果でだけ完了表示を出す。 */
+  onCopyLink: (message: Message) => Promise<boolean>;
   onEdit: (message: Message) => void;
   onDelete: (message: Message) => void;
   onJumpTo: (messageId: string) => void;
   onRetry: (message: Message) => void;
+  /** このメッセージをインライン編集中か。 */
+  editing: boolean;
+  onSubmitEdit: (content: string) => void;
+  onCancelEdit: () => void;
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -184,6 +200,9 @@ export const MessageItem = memo(function MessageItem({
   onDelete,
   onJumpTo,
   onRetry,
+  editing,
+  onSubmitEdit,
+  onCancelEdit,
 }: MessageItemProps) {
   // パレット類はportalで一覧の外に出る。その上でのホイールは一覧へ渡す。
   const passthroughRef = useWheelPassthrough<HTMLDivElement>();
@@ -207,6 +226,26 @@ export const MessageItem = memo(function MessageItem({
         : undefined,
     [editedAt],
   );
+
+  // コピーの結果を短く出すための状態。押しただけでは何も言わない。
+  const [copyResult, setCopyResult] = useState<"done" | "failed" | null>(null);
+  const copyTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimer.current) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+  const copyLink = useCallback(() => {
+    void Promise.resolve(onCopyLink(message)).then((ok) => {
+      setCopyResult(ok ? "done" : "failed");
+      if (copyTimer.current) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(
+        () => setCopyResult(null),
+        ok ? 1_000 : 1_800,
+      );
+    });
+  }, [message, onCopyLink]);
 
   return (
     <div
@@ -286,20 +325,31 @@ export const MessageItem = memo(function MessageItem({
             </div>
           )}
           <div className="break-words text-[13.5px] leading-6">
-            {grouped && message.urgency !== "normal" ? (
-              <span className="float-left mt-0.5 mr-1.5">
-                <UrgencyChip urgency={message.urgency} />
-              </span>
-            ) : null}
-            {/* 添付だけのメッセージは本文を持たない。空のMarkdownを描かない。 */}
-            {message.content ? (
-              <MessageContent
-                content={message.content}
-                members={membersByKey}
-                selfKey={selfKey}
-                trailer={editedTrailer}
+            {editing ? (
+              // 編集は本文の位置で起きる。画面下のcomposerへ視線を飛ばさない。
+              <MessageEditor
+                initialValue={message.content}
+                onSubmit={onSubmitEdit}
+                onCancel={onCancelEdit}
               />
-            ) : null}
+            ) : (
+              <>
+                {grouped && message.urgency !== "normal" ? (
+                  <span className="float-left mt-0.5 mr-1.5">
+                    <UrgencyChip urgency={message.urgency} />
+                  </span>
+                ) : null}
+                {/* 添付だけのメッセージは本文を持たない。空のMarkdownを描かない。 */}
+                {message.content ? (
+                  <MessageContent
+                    content={message.content}
+                    members={membersByKey}
+                    selfKey={selfKey}
+                    trailer={editedTrailer}
+                  />
+                ) : null}
+              </>
+            )}
           </div>
           <MessageAttachments attachments={message.attachments} />
           {allowReactions ? (
@@ -332,7 +382,7 @@ export const MessageItem = memo(function MessageItem({
       </div>
       {/* 操作チップは対象行の内側（右上）に置く。行の外へはみ出すと
           どのメッセージに効くのかが読み取れなくなる。 */}
-      {pending ? null : (
+      {pending || editing ? null : (
         <div className="pointer-events-none absolute top-0.5 right-3 flex items-center gap-0.5 rounded-lg border border-border bg-background p-0.5 opacity-0 shadow-sm transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
           {allowReactions ? (
             <Popover>
@@ -405,10 +455,22 @@ export const MessageItem = memo(function MessageItem({
             </Popover>
           )}
           <ToolbarButton
-            label="リンクをコピー"
-            onClick={() => onCopyLink(message)}
+            label={
+              copyResult === "done"
+                ? "リンクをコピーしました"
+                : copyResult === "failed"
+                  ? "リンクをコピーできませんでした"
+                  : "リンクをコピー"
+            }
+            onClick={copyLink}
           >
-            <LinkIcon className="size-3.5" />
+            {copyResult === "done" ? (
+              <Check className="size-3.5 text-emerald-500" />
+            ) : copyResult === "failed" ? (
+              <TriangleAlert className="size-3.5 text-rose-500" />
+            ) : (
+              <LinkIcon className="size-3.5" />
+            )}
           </ToolbarButton>
           {own ? (
             <>
