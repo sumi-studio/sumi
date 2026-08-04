@@ -214,6 +214,19 @@ export interface NotificationSettingInput {
   keywords: string[];
 }
 
+/**
+ * メッセージ検索の1件。permalink識別子（place + seq）と表示に必要な断片だけを
+ * 運ぶ。全文はサーバー側に留まり、ジャンプは既存のplace遷移+seq経路に乗る。
+ */
+export interface MessageSearchResult {
+  messageId: string;
+  place: Place;
+  seq: number;
+  author: ParticipantRef;
+  snippet: string;
+  createdAt: number;
+}
+
 /** 履歴をまだ取得していないplaceにも表示できる、認証済みparticipant向け集計。 */
 export interface UnreadSummary {
   place: Place;
@@ -238,7 +251,11 @@ export type ServerEvent =
   | { type: "status_updated"; status: ParticipantStatus }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
-  | { type: "reaction_updated"; message: Message };
+  | { type: "reaction_updated"; message: Message }
+  /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
+  | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
+  /** channelのmutable属性（v0: topic）の変更。 */
+  | { type: "place_updated"; channel: ChannelSummary };
 
 export interface SendMessageInput {
   place: Place;
@@ -293,6 +310,23 @@ export interface MessagingBackend {
     place: Place,
     options?: { beforeSeq?: number; limit?: number },
   ): Promise<Message[]>;
+  /**
+   * 可視なplace全体（またはplace指定）での本文検索。可視性はサーバーが強制し、
+   * tombstoneは含まれない。
+   */
+  searchMessages(
+    query: string,
+    options?: { place?: Place; limit?: number },
+  ): Promise<MessageSearchResult[]>;
+  createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary>;
+  /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
+  ensureDM(participant: ParticipantRef): Promise<DmSummary>;
+  createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
+  updateChannelTopic(channelId: string, topic: string): Promise<ChannelSummary>;
   sendMessage(input: SendMessageInput): Promise<SendReceipt>;
   /**
    * 送信前にファイルを預ける。返ったAttachmentのidをsendMessageへ渡すまで

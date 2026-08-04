@@ -7,10 +7,12 @@ import (
 )
 
 // Event is one durable or volatile messaging event fanned out to live
-// subscribers. Durable events carry the message (with its place seq); volatile
-// events (typing, status_updated) are never replayed. Place events scope
-// delivery by PlaceID; participant-scoped events (status_updated) leave
-// PlaceID empty and set Subject instead.
+// subscribers. Durable events carry the message (with its place seq) or the
+// place summary; volatile events (typing, status_updated) are never replayed.
+// Place events scope delivery by PlaceID; participant-scoped events
+// (status_updated) leave PlaceID empty and set Subject instead. Place
+// created/updated events are not replayed either — the durable truth is the
+// places table, and a reconnecting client re-reads it via bootstrap.
 type Event struct {
 	Type    string           `json:"type"`
 	PlaceID string           `json:"place_id,omitempty"`
@@ -18,6 +20,8 @@ type Event struct {
 	Actor   *participantWire `json:"actor,omitempty"`
 	Status  *statusWire      `json:"status,omitempty"`
 	Marker  *replyLaterWire  `json:"marker,omitempty"`
+	Channel *channelWire     `json:"channel,omitempty"`
+	DM      *dmWire          `json:"dm,omitempty"`
 	// Notify rides only on the copy addressed to a recipient the server decided
 	// to interrupt. Its absence is the answer "this is not worth calling you
 	// for", which is why it is per-recipient rather than part of the message.
@@ -43,6 +47,8 @@ const (
 	EventStatusUpdated      = "status_updated"
 	EventReplyLaterCreated  = "reply_later_created"
 	EventReplyLaterResolved = "reply_later_resolved"
+	EventPlaceCreated       = "place_created"
+	EventPlaceUpdated       = "place_updated"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a

@@ -446,6 +446,8 @@ func storeErrorCode(err error) string {
 		return "seq_beyond_latest"
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		return "invalid_notification_setting"
+	case errors.Is(err, ErrNotAChannel):
+		return "not_a_channel"
 	default:
 		return "internal"
 	}

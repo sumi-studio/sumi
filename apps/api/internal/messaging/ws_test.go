@@ -311,7 +311,7 @@ func TestWSDeliveryFollowsPlaceVisibility(t *testing.T) {
 	defer cancel()
 	w, ts := newWSWorld(t, ctx)
 	w.workspaceWithChannel(t, ctx)
-	dm, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
@@ -372,6 +372,65 @@ func TestRESTSendReachesWSSubscribers(t *testing.T) {
 	if event["type"] != EventMessageCreated ||
 		event["message"].(map[string]any)["content"] != "RESTから" {
 		t.Fatalf("event = %v", event)
+	}
+}
+
+func TestPlaceLifecycleEventsReachWSSubscribers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newWSWorld(t, ctx)
+	ws, _ := w.workspaceWithChannel(t, ctx)
+
+	observer := dialWS(t, ts, w.humanB.ID, nil)
+
+	// Channel creation reaches every workspace member's live socket.
+	resp, created := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "dev", "topic": "開発の相談"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create channel: status %d body %v", resp.StatusCode, created)
+	}
+	channelID := created["channel_id"].(string)
+	frame := readFrame(t, observer)
+	event := frame["event"].(map[string]any)
+	if event["type"] != EventPlaceCreated || event["place_id"] != channelID ||
+		event["channel"].(map[string]any)["name"] != "dev" {
+		t.Fatalf("place_created frame = %v", frame)
+	}
+
+	// A dm the observer is not part of stays invisible; the group dm that does
+	// include the observer arrives next. Ordering on one socket proves the dm
+	// event was skipped, not merely delayed.
+	resp, _ = call(t, ts, http.MethodPost, "/messaging/dms", w.humanA.ID,
+		map[string]any{"participant": map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID}})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ensure dm: status %d", resp.StatusCode)
+	}
+	resp, groupDM := call(t, ts, http.MethodPost, "/messaging/group-dms", w.humanA.ID,
+		map[string]any{"participants": []any{
+			map[string]any{"kind": "human", "human_id": w.humanB.ID},
+			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
+		}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create group dm: status %d body %v", resp.StatusCode, groupDM)
+	}
+	frame = readFrame(t, observer)
+	event = frame["event"].(map[string]any)
+	if event["type"] != EventPlaceCreated || event["place_id"] != groupDM["dm_id"] ||
+		event["dm"].(map[string]any)["kind"] != PlaceGroupDM {
+		t.Fatalf("group dm frame = %v", frame)
+	}
+
+	// Topic edits fan out as place_updated.
+	resp, _ = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanA.ID,
+		map[string]any{"topic": "レビューはこちら"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch topic: status %d", resp.StatusCode)
+	}
+	frame = readFrame(t, observer)
+	event = frame["event"].(map[string]any)
+	if event["type"] != EventPlaceUpdated || event["place_id"] != channelID ||
+		event["channel"].(map[string]any)["topic"] != "レビューはこちら" {
+		t.Fatalf("place_updated frame = %v", frame)
 	}
 }
 

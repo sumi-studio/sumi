@@ -106,6 +106,55 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("searches messages over REST and scopes by place", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.startsWith("/messaging/search?")) {
+        return json({
+          results: [
+            {
+              message_id: "message-7",
+              place: channelWire(),
+              seq: 7,
+              author: { kind: "human", human_id: "human-2" },
+              snippet: "…明日の予定はこちら…",
+              created_at: "2026-08-01T10:00:00Z",
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    const results = await backend.searchMessages("予定", {
+      place: channel,
+      limit: 10,
+    });
+    expect(results).toEqual([
+      {
+        messageId: "message-7",
+        place: channel,
+        seq: 7,
+        author: { kind: "human", humanId: "human-2" },
+        snippet: "…明日の予定はこちら…",
+        createdAt: Date.parse("2026-08-01T10:00:00Z"),
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/messaging/search?q=${encodeURIComponent("予定")}&place_id=channel-1&limit=10`,
+      expect.objectContaining({ method: "GET", credentials: "include" }),
+    );
+
+    // 未指定オプションはクエリに載らない。
+    await backend.searchMessages("予定");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `/messaging/search?q=${encodeURIComponent("予定")}`,
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
   it("uploads an attachment as multipart and sends its id with the message", async () => {
     const requests: { path: string; init?: RequestInit }[] = [];
     const fetchMock = vi.fn(
@@ -239,6 +288,147 @@ describe("ApiMessagingBackend", () => {
       type: "message_created",
       message: { seq: 5, content: "live", place: channel },
     });
+  });
+
+  it("creates channels, dms, and group dms and edits topics over REST", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          return json(channelSummaryWire("開発の相談"), 201);
+        }
+        if (path === "/messaging/dms" && init?.method === "POST") {
+          return json({
+            dm_id: "dm-1",
+            kind: "dm",
+            participants: [
+              { kind: "human", human_id: "human-1" },
+              { kind: "human", human_id: "human-2" },
+            ],
+          });
+        }
+        if (path === "/messaging/group-dms" && init?.method === "POST") {
+          return json(
+            {
+              dm_id: "group-dm-1",
+              kind: "group_dm",
+              participants: [
+                { kind: "human", human_id: "human-1" },
+                { kind: "human", human_id: "human-2" },
+                { kind: "personality_agent", personality_agent_id: "agent-1" },
+              ],
+            },
+            201,
+          );
+        }
+        if (
+          path === "/messaging/places/channel-2" &&
+          init?.method === "PATCH"
+        ) {
+          return json(channelSummaryWire("新しいトピック"));
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel("workspace-1", "dev", "開発の相談"),
+    ).resolves.toEqual({
+      channelId: "channel-2",
+      workspaceId: "workspace-1",
+      name: "dev",
+      topic: "開発の相談",
+      visibility: "public",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/channels",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          workspace_id: "workspace-1",
+          name: "dev",
+          topic: "開発の相談",
+        }),
+      }),
+    );
+
+    await expect(
+      backend.ensureDM({ kind: "human", humanId: "human-2" }),
+    ).resolves.toMatchObject({ dmId: "dm-1", kind: "dm" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/dms",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          participant: { kind: "human", human_id: "human-2" },
+        }),
+      }),
+    );
+
+    await expect(
+      backend.createGroupDM([
+        { kind: "human", humanId: "human-2" },
+        { kind: "personality_agent", personalityAgentId: "agent-1" },
+      ]),
+    ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
+
+    await expect(
+      backend.updateChannelTopic("channel-2", "新しいトピック"),
+    ).resolves.toMatchObject({ topic: "新しいトピック" });
+  });
+
+  it("projects place_created and place_updated from the socket", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event));
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "channel-2",
+        channel: channelSummaryWire(""),
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_created",
+        place_id: "dm-9",
+        dm: {
+          dm_id: "dm-9",
+          kind: "dm",
+          participants: [
+            { kind: "human", human_id: "human-1" },
+            { kind: "human", human_id: "human-2" },
+          ],
+        },
+      },
+    });
+    socket?.message({
+      type: "event",
+      event: {
+        type: "place_updated",
+        place_id: "channel-2",
+        channel: channelSummaryWire("更新後"),
+      },
+    });
+    expect(events).toMatchObject([
+      { type: "place_created", channel: { channelId: "channel-2" } },
+      { type: "place_created", dm: { dmId: "dm-9", kind: "dm" } },
+      { type: "place_updated", channel: { topic: "更新後" } },
+    ]);
   });
 
   it("toggles reactions over REST and projects reaction_updated", async () => {
@@ -596,6 +786,16 @@ function replyLaterWire(markerId: string, humanId: string, remindAt?: string) {
     note: "後で返信します",
     ...(remindAt === undefined ? {} : { remind_at: remindAt }),
     resolved: false,
+  };
+}
+
+function channelSummaryWire(topic: string) {
+  return {
+    channel_id: "channel-2",
+    workspace_id: "workspace-1",
+    name: "dev",
+    topic,
+    visibility: "public",
   };
 }
 

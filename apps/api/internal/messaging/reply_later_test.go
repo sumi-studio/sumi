@@ -81,7 +81,7 @@ func TestReplyLaterRefusesInvisiblePlacesAndTombstones(t *testing.T) {
 	remindAt := time.Now().Add(time.Hour)
 
 	// A place the actor cannot see is reported as missing, never as forbidden.
-	dm, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}

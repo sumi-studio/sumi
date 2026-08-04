@@ -76,6 +76,26 @@ class StubBackend implements MessagingBackend {
   async fetchMessages(): Promise<Message[]> {
     return [];
   }
+  async searchMessages(): ReturnType<MessagingBackend["searchMessages"]> {
+    return [];
+  }
+  async createChannel(): ReturnType<MessagingBackend["createChannel"]> {
+    throw new Error("not used");
+  }
+  async ensureDM(): ReturnType<MessagingBackend["ensureDM"]> {
+    throw new Error("not used");
+  }
+  async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
+    throw new Error("not used");
+  }
+  async updateChannelTopic(): ReturnType<
+    MessagingBackend["updateChannelTopic"]
+  > {
+    throw new Error("not used");
+  }
+  async uploadAttachment(): ReturnType<MessagingBackend["uploadAttachment"]> {
+    throw new Error("not used");
+  }
   async sendMessage() {
     return { messageId: "m", seq: 1 };
   }
@@ -118,6 +138,7 @@ function incoming(overrides: Partial<Message> = {}): Message {
     mentions: [],
     urgency: "normal",
     reactions: [],
+    attachments: [],
     replyTo: null,
     createdAt: 1,
     editedAt: null,

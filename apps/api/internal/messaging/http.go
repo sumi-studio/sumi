@@ -23,6 +23,9 @@ import (
 // message content plus envelope headroom.
 const maxRequestBytes = MaxContentBytes + 64*1024
 
+// maxTopicBytes bounds a channel topic: one header line, not a document.
+const maxTopicBytes = 1000
+
 // Server is the /messaging REST surface. It authenticates the browser session
 // (exact-origin allowlist + signed HttpOnly cookie, the same policy as the
 // direct-chat routes) and acts as the session's Human participant. Every
@@ -56,7 +59,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/dms", s.serveEnsureDM)
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
+	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
+	mux.HandleFunc("GET /messaging/search", s.serveSearch)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
@@ -214,6 +219,18 @@ func messageToWire(place Place, m Message) messageWire {
 		w.ReplyTo = &m.ReplyTo
 	}
 	return w
+}
+
+// searchResultWire is one search hit: the permalink identity (place + seq)
+// plus what the result list renders. The full content stays server-side; only
+// the snippet crosses the wire.
+type searchResultWire struct {
+	MessageID string          `json:"message_id"`
+	Place     placeWire       `json:"place"`
+	Seq       int64           `json:"seq"`
+	Author    participantWire `json:"author"`
+	Snippet   string          `json:"snippet"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 type workspaceWire struct {
@@ -652,6 +669,10 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
+	if len(req.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_topic")
+		return
+	}
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
@@ -665,7 +686,43 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, channelToWire(place))
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	writeJSON(w, http.StatusCreated, wire)
+}
+
+// serveUpdatePlace edits a channel's mutable fields (v0: topic only).
+func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Topic string `json:"topic"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_topic")
+		return
+	}
+	var place Place
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		place, opErr = s.Store.UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic, viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
+	writeJSON(w, http.StatusOK, wire)
 }
 
 func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
@@ -684,10 +741,13 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_participant")
 		return
 	}
-	var place Place
+	var (
+		place   Place
+		created bool
+	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.EnsureDM(r.Context(), viewer, other)
+		place, created, opErr = s.Store.EnsureDM(r.Context(), viewer, other)
 		return opErr
 	})
 	if !done {
@@ -697,10 +757,14 @@ func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, dmWire{
+	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: []participantWire{participantToWire(viewer), participantToWire(other)},
-	})
+	}
+	if created {
+		s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	writeJSON(w, http.StatusOK, wire)
 }
 
 func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
@@ -736,10 +800,12 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, dmWire{
+	wire := dmWire{
 		DMID: place.PlaceID, Kind: place.Kind,
 		Participants: append([]participantWire{participantToWire(viewer)}, req.Participants...),
-	})
+	}
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	writeJSON(w, http.StatusCreated, wire)
 }
 
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
@@ -808,6 +874,49 @@ func (s *Server) serveHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Messages []messageWire `json:"messages"`
 	}{Messages: wires})
+}
+
+// serveSearch is GET /messaging/search?q=…&place_id=…&limit=…. Visibility is
+// enforced by the store: results only ever come from places the session's
+// Human can see, and a place_id the viewer cannot see is 404, not empty.
+func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" || len(query) > MaxSearchQueryBytes {
+		writeError(w, http.StatusBadRequest, "invalid_query")
+		return
+	}
+	opt := SearchOptions{PlaceID: r.URL.Query().Get("place_id")}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		limit, err := strconv.Atoi(v)
+		if err != nil || limit <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_limit")
+			return
+		}
+		opt.Limit = limit
+	}
+	results, err := s.Store.SearchMessages(r.Context(), viewer, query, opt)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, res := range results {
+		wires[i] = searchResultWire{
+			MessageID: res.Message.MessageID,
+			Place:     placeToWire(res.Place),
+			Seq:       res.Message.Seq,
+			Author:    participantToWire(res.Message.Author),
+			Snippet:   res.Snippet,
+			CreatedAt: res.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{Results: wires})
 }
 
 func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
@@ -1511,6 +1620,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrNotAChannel):
+		writeError(w, http.StatusBadRequest, "not_a_channel")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

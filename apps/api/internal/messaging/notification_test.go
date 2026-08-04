@@ -147,7 +147,7 @@ func TestNotificationDecisionsTreatDMsAsTheirOwnReason(t *testing.T) {
 	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanB); err != nil {
 		t.Fatalf("admit humanB: %v", err)
 	}
-	dm, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestNotificationSettingRoundTripsAndStaysItsOwners(t *testing.T) {
 	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanB); err != nil {
 		t.Fatalf("admit humanB: %v", err)
 	}
-	private, err := w.store.EnsureDM(ctx, w.humanB, w.agent)
+	private, _, err := w.store.EnsureDM(ctx, w.humanB, w.agent)
 	if err != nil {
 		t.Fatalf("ensure private dm: %v", err)
 	}

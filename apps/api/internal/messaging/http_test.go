@@ -122,7 +122,7 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	defer cancel()
 	w, ts := newTestServer(t, ctx)
 	_, ch := w.workspaceWithChannel(t, ctx)
-	if _, err := w.store.EnsureDM(ctx, w.humanA, w.agent); err != nil {
+	if _, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent); err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
 	w.send(t, ctx, ch.PlaceID, w.humanB, "@Yohaku 見て")
@@ -302,5 +302,71 @@ func TestDMEndpointsUseReachability(t *testing.T) {
 		map[string]any{"participant": map[string]any{"kind": "human", "human_id": w.humanA.ID}})
 	if resp.StatusCode != http.StatusForbidden || body["error"] != "not_reachable" {
 		t.Fatalf("unreachable dm: status %d body %v", resp.StatusCode, body)
+	}
+}
+
+func TestChannelTopicPatchOverHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, ts := newTestServer(t, ctx)
+	ws, _ := w.workspaceWithChannel(t, ctx)
+
+	resp, body := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "design", "topic": "デザインの話"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create channel: status %d body %v", resp.StatusCode, body)
+	}
+	channelID := body["channel_id"].(string)
+
+	// Any active workspace member may edit the topic (v0: CreateChannelと同じ基準).
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanB.ID,
+		map[string]any{"topic": "レビュー予約はこちら"})
+	if resp.StatusCode != http.StatusOK || body["topic"] != "レビュー予約はこちら" {
+		t.Fatalf("patch topic: status %d body %v", resp.StatusCode, body)
+	}
+
+	// The change is durable and projected by bootstrap.
+	resp, body = call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanA.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bootstrap: status %d", resp.StatusCode)
+	}
+	found := false
+	for _, entry := range body["channels"].([]any) {
+		channel := entry.(map[string]any)
+		if channel["channel_id"] == channelID {
+			found = true
+			if channel["topic"] != "レビュー予約はこちら" {
+				t.Fatalf("bootstrap topic = %v", channel["topic"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("created channel missing from bootstrap: %v", body["channels"])
+	}
+
+	// A non-member cannot even learn the channel exists.
+	outsider := "018f3f8d-7b2c-7a10-8f9e-00000000ab99"
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, outsider,
+		map[string]any{"topic": "見えないはず"})
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "not_found" {
+		t.Fatalf("outsider patch: status %d body %v", resp.StatusCode, body)
+	}
+
+	// A dm has no topic.
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	if err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+dm.PlaceID, w.humanA.ID,
+		map[string]any{"topic": "トピックなし"})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "not_a_channel" {
+		t.Fatalf("dm patch: status %d body %v", resp.StatusCode, body)
+	}
+
+	// Oversized topics fail closed before touching the store.
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID,
+		w.humanA.ID, map[string]any{"topic": strings.Repeat("あ", 1000)})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_topic" {
+		t.Fatalf("oversized topic: status %d body %v", resp.StatusCode, body)
 	}
 }

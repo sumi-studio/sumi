@@ -7,6 +7,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   NotificationSetting,
   NotificationSettingInput,
@@ -450,6 +451,95 @@ export class MockMessagingServer implements MessagingBackend {
     const limit = options?.limit ?? 50;
     const slice = messages.filter((message) => message.seq < beforeSeq);
     return slice.slice(Math.max(0, slice.length - limit));
+  }
+
+  async searchMessages(
+    query: string,
+    options?: { place?: Place; limit?: number },
+  ): Promise<MessageSearchResult[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const scope = options?.place
+      ? [placeKey(options.place)]
+      : [...this.history.keys()];
+    const results: MessageSearchResult[] = [];
+    for (const key of scope) {
+      const place = parsePlaceKey(key);
+      if (!place) continue;
+      for (const message of this.history.get(key) ?? []) {
+        if (message.deleted) continue;
+        if (!message.content.toLowerCase().includes(q)) continue;
+        results.push({
+          messageId: message.messageId,
+          place,
+          seq: message.seq,
+          author: message.author,
+          snippet:
+            message.content.length > 120
+              ? `${message.content.slice(0, 120)}…`
+              : message.content,
+          createdAt: message.createdAt,
+        });
+      }
+    }
+    results.sort((a, b) => b.createdAt - a.createdAt);
+    return results.slice(0, options?.limit ?? 20);
+  }
+
+  async createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const channel: ChannelSummary = {
+      channelId: `ch-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId,
+      name,
+      topic,
+      visibility: "public",
+    };
+    CHANNELS.push(channel);
+    this.emit({ type: "place_created", channel });
+    return channel;
+  }
+
+  async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
+    const existing = DMS.find(
+      (dm) =>
+        dm.kind === "dm" &&
+        dm.participants.some((ref) => sameParticipant(ref, participant)),
+    );
+    if (existing) return existing;
+    const dm: DmSummary = {
+      dmId: `dm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "dm",
+      participants: [SELF, participant],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+    const dm: DmSummary = {
+      dmId: `gdm-${secureRandomUUID().slice(0, 8)}`,
+      kind: "group_dm",
+      participants: [SELF, ...participants],
+    };
+    DMS.push(dm);
+    this.emit({ type: "place_created", dm });
+    return dm;
+  }
+
+  async updateChannelTopic(
+    channelId: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const channel = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!channel) throw new Error("unknown channel");
+    channel.topic = topic;
+    this.emit({ type: "place_updated", channel });
+    return channel;
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {

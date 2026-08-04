@@ -1,9 +1,11 @@
 import type {
   Attachment,
+  ChannelSummary,
   ConnectionState,
   DmSummary,
   MemberProfile,
   Message,
+  MessageSearchResult,
   MessagingBackend,
   NotificationLevel,
   NotificationSetting,
@@ -68,31 +70,12 @@ export class ApiMessagingBackend implements MessagingBackend {
         name: asString(value.name),
       };
     });
-    const channels = asArray(body.channels).map((entry) => {
-      const value = asRecord(entry);
-      const channel = {
-        channelId: asString(value.channel_id),
-        workspaceId: asString(value.workspace_id),
-        name: asString(value.name),
-        topic: asString(value.topic),
-        visibility: asVisibility(value.visibility),
-      };
-      this.places.set(channel.channelId, {
-        kind: "channel",
-        channelId: channel.channelId,
-      });
-      return channel;
-    });
-    const dms: DmSummary[] = asArray(body.dms).map((entry) => {
-      const value = asRecord(entry);
-      const dm: DmSummary = {
-        dmId: asString(value.dm_id),
-        kind: asDMKind(value.kind),
-        participants: asArray(value.participants).map(parseParticipant),
-      };
-      this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
-      return dm;
-    });
+    const channels = asArray(body.channels).map((entry) =>
+      this.registerChannel(entry),
+    );
+    const dms: DmSummary[] = asArray(body.dms).map((entry) =>
+      this.registerDm(entry),
+    );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
       return {
@@ -160,6 +143,56 @@ export class ApiMessagingBackend implements MessagingBackend {
       ),
     );
     return asArray(body.messages).map(parseMessage);
+  }
+
+  async searchMessages(
+    query: string,
+    options: { place?: Place; limit?: number } = {},
+  ): Promise<MessageSearchResult[]> {
+    const params = new URLSearchParams({ q: query });
+    if (options.place) params.set("place_id", placeID(options.place));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const body = asRecord(await this.request(`/messaging/search?${params}`));
+    return asArray(body.results).map(parseSearchResult);
+  }
+
+  async createChannel(
+    workspaceId: string,
+    name: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request("/messaging/channels", {
+      method: "POST",
+      body: { workspace_id: workspaceId, name, topic },
+    });
+    return this.registerChannel(body);
+  }
+
+  async ensureDM(participant: ParticipantRef): Promise<DmSummary> {
+    const body = await this.request("/messaging/dms", {
+      method: "POST",
+      body: { participant: participantToWire(participant) },
+    });
+    return this.registerDm(body);
+  }
+
+  async createGroupDM(participants: ParticipantRef[]): Promise<DmSummary> {
+    const body = await this.request("/messaging/group-dms", {
+      method: "POST",
+      body: { participants: participants.map(participantToWire) },
+    });
+    return this.registerDm(body);
+  }
+
+  async updateChannelTopic(
+    channelId: string,
+    topic: string,
+  ): Promise<ChannelSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(channelId)}`,
+      { method: "PATCH", body: { topic } },
+    );
+    return this.registerChannel(body);
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -414,10 +447,52 @@ export class ApiMessagingBackend implements MessagingBackend {
         place,
         participant: parseParticipant(wire.actor),
       };
+    } else if (eventType === "place_created") {
+      parsed =
+        wire.channel === undefined || wire.channel === null
+          ? { type: "place_created", dm: this.registerDm(wire.dm) }
+          : {
+              type: "place_created",
+              channel: this.registerChannel(wire.channel),
+            };
+    } else if (eventType === "place_updated") {
+      parsed = {
+        type: "place_updated",
+        channel: this.registerChannel(wire.channel),
+      };
     } else {
       return;
     }
     for (const listener of this.listeners) listener(parsed);
+  }
+
+  /** Parses a channel wire shape and remembers the place for event routing. */
+  private registerChannel(value: unknown): ChannelSummary {
+    const wire = asRecord(value);
+    const channel: ChannelSummary = {
+      channelId: asString(wire.channel_id),
+      workspaceId: asString(wire.workspace_id),
+      name: asString(wire.name),
+      topic: asString(wire.topic),
+      visibility: asVisibility(wire.visibility),
+    };
+    this.places.set(channel.channelId, {
+      kind: "channel",
+      channelId: channel.channelId,
+    });
+    return channel;
+  }
+
+  /** Parses a dm wire shape and remembers the place for event routing. */
+  private registerDm(value: unknown): DmSummary {
+    const wire = asRecord(value);
+    const dm: DmSummary = {
+      dmId: asString(wire.dm_id),
+      kind: asDMKind(wire.kind),
+      participants: asArray(wire.participants).map(parseParticipant),
+    };
+    this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
+    return dm;
   }
 
   private stopSocket(): void {
@@ -515,6 +590,15 @@ function parseNotificationSetting(value: unknown): NotificationSetting {
   };
 }
 
+function participantToWire(ref: ParticipantRef): Record<string, string> {
+  return ref.kind === "human"
+    ? { kind: "human", human_id: ref.humanId }
+    : {
+        kind: "personality_agent",
+        personality_agent_id: ref.personalityAgentId,
+      };
+}
+
 function parseParticipant(value: unknown): ParticipantRef {
   const wire = asRecord(value);
   const kind = asString(wire.kind);
@@ -607,6 +691,18 @@ function parseMessage(value: unknown): Message {
     createdAt: asTimestamp(wire.created_at),
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
     deleted: asBoolean(wire.deleted),
+  };
+}
+
+function parseSearchResult(value: unknown): MessageSearchResult {
+  const wire = asRecord(value);
+  return {
+    messageId: asString(wire.message_id),
+    place: parsePlace(wire.place),
+    seq: asSeq(wire.seq),
+    author: parseParticipant(wire.author),
+    snippet: asString(wire.snippet),
+    createdAt: asTimestamp(wire.created_at),
   };
 }
 
