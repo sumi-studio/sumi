@@ -1,7 +1,7 @@
 import { Clock, Hash, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
-import { type PlaceKey, participantKey } from "../model";
+import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
@@ -64,12 +64,16 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
+  // リマインドの予定が入っているのは本人のmarkerだけ。相手の「後で返信します」は
+  // messageの側に見えていればよく、こちらのknock対象にはならない。
   const markers = useMemo(
     () =>
       Object.values(replyLaterById)
         .filter(
-          (marker) =>
-            !marker.resolved && participantKey(marker.participant) === selfKey,
+          (marker): marker is ReplyLaterMarker & { remindAt: number } =>
+            !marker.resolved &&
+            participantKey(marker.participant) === selfKey &&
+            marker.remindAt !== null,
         )
         .sort((a, b) => a.remindAt - b.remindAt),
     [replyLaterById, selfKey],
@@ -181,6 +185,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
     (marker) =>
       !marker.resolved &&
       participantKey(marker.participant) === selfKey &&
+      marker.remindAt !== null &&
       marker.remindAt <= now &&
       !dismissed[marker.markerId],
   );

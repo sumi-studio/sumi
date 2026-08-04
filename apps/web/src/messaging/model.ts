@@ -134,7 +134,11 @@ export interface ReplyLaterMarker {
   place: Place;
   messageId: string;
   note: string;
-  remindAt: number;
+  /**
+   * 本人だけのリマインド予定。相手のwireには載らないのでnullになる
+   * （合意事項6: durableなmarkerとprivate reminderに二分する）。
+   */
+  remindAt: number | null;
   resolved: boolean;
 }
 
