@@ -1,5 +1,6 @@
 import { CornerUpLeft, Pencil, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { MemberProfile, Message, Urgency } from "../model";
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
@@ -194,6 +195,9 @@ export function Composer() {
         return;
       }
       if (event.key === "Enter" && !event.shiftKey) {
+        // 未閉鎖の```コードブロック内では送信せず、デフォルトの改行に任せる。
+        const caret = event.currentTarget.selectionStart ?? value.length;
+        if (isInsideUnclosedCodeFence(value, caret)) return;
         event.preventDefault();
         submit();
         return;
