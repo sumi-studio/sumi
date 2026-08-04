@@ -45,6 +45,11 @@ type Server struct {
 	// WebSocket subscribers see messages regardless of which transport
 	// committed them. Nil is fine: durable truth lives in the store.
 	Hub *Hub
+	// Push, when set, holds this deployment's VAPID keys and sends Web Push
+	// to a Human's registered browsers. Nil keeps the routes mounted and
+	// failing closed (503): a subscription nothing can send to is worse than
+	// an honest "この deployment に push はまだ無い".
+	Push *PushDispatcher
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -76,6 +81,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
 	mux.HandleFunc("POST /messaging/reply-later/{marker_id}/resolve", s.serveResolveReplyLater)
+	mux.HandleFunc("GET /messaging/push-key", s.servePushKey)
+	mux.HandleFunc("POST /messaging/push-subscriptions", s.serveSavePushSubscription)
+	mux.HandleFunc("DELETE /messaging/push-subscriptions", s.serveDeletePushSubscription)
 }
 
 // --- wire shapes (snake_case, ActorRef/PlaceRef-compatible) ---
@@ -450,6 +458,12 @@ func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Pl
 		Type: EventMessageCreated, PlaceID: place.PlaceID,
 		Message: &wire, ExceptFor: notified,
 	})
+	// 同じひとつの判定から、身体の違う二つの出口へ（凍結契約 v1「Push 通知
+	// レイヤーとの対応」）。人間には閉じたタブの向こうへ Web Push、agent には
+	// runtime が止まっていても残る AttentionCandidate。どちらも WS が届いた
+	// 人を除外したりはしない——「今見ている画面に重ねない」の判断は、その
+	// 画面を持っている側（SW / agent 本人）が行う。
+	store.deliverPush(ctx, place, msg, decisions)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the
@@ -1787,6 +1801,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
 	case errors.Is(err, ErrInvalidNotificationSetting):
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+	case errors.Is(err, ErrInvalidPushSubscription):
+		writeError(w, http.StatusBadRequest, "invalid_push_subscription")
 	case errors.Is(err, ErrNotAChannel):
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidChannelName):

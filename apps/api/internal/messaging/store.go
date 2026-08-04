@@ -59,6 +59,10 @@ var (
 // 人間がUIから行うのと同じ経路・同じ権限モデル).
 type Store struct {
 	pool *pgxpool.Pool
+	// push, when attached (UsePush), carries the notification decision out to
+	// a Human's registered browsers. Nil means「タブを閉じたら届かない」だけで、
+	// 判定も配信も変わらない。
+	push *PushDispatcher
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to

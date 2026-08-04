@@ -369,6 +369,20 @@ func newApplicationFromEnv() (*application, error) {
 			messagingServer.Attachments = blobs
 			log.Printf("messaging attachments ready (root=%s)", root)
 		}
+		// Web Push は「タブを閉じていても呼ばれる」ための出口。VAPID の
+		// subject は push service に対する運用連絡先で、設定が無ければ push
+		// だけを黙って持たない（routes は 503 で正直に断る）。判定も既存の
+		// タブ内通知も、これとは独立に動く。
+		if subject := strings.TrimSpace(os.Getenv("SUMI_MESSAGING_PUSH_SUBJECT")); subject != "" {
+			dispatcher, err := messaging.NewPushDispatcher(context.Background(), messagingStore, subject)
+			if err != nil {
+				closeOnError()
+				return nil, fmt.Errorf("messaging web push: %w", err)
+			}
+			messagingServer.Push = dispatcher
+			messagingStore.UsePush(dispatcher)
+			log.Print("messaging web push ready")
+		}
 		messagingServer.RegisterRoutes(mux)
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins

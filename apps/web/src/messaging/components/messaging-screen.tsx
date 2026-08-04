@@ -10,6 +10,7 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
+import { enablePushSubscription } from "../push";
 import { setNotificationNavigator, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
@@ -19,6 +20,7 @@ import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
+import { PushSubscriptionBridge } from "./push-bridge";
 import { Sidebar } from "./sidebar";
 
 interface PendingJump {
@@ -92,7 +94,12 @@ function NotificationPermissionBanner() {
       <button
         type="button"
         onClick={() => {
-          void requestNotificationPermission().then(setPermission);
+          void requestNotificationPermission().then((next) => {
+            setPermission(next);
+            // 許可されたその場で端末を購読済みにする。ここで待たせると、
+            // 「許可したのに閉じている間は届かない」時間が生まれる。
+            if (next === "granted") void enablePushSubscription();
+          });
         }}
         className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
       >
@@ -469,6 +476,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </button>
           </span>
         </header>
+        <PushSubscriptionBridge />
         <NotificationPermissionBanner />
         <ConnectionBanner />
         <div className="flex min-h-0 flex-1">
