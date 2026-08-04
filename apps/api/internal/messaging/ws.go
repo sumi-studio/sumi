@@ -444,6 +444,8 @@ func storeErrorCode(err error) string {
 		return "message_deleted"
 	case errors.Is(err, ErrSeqBeyondLatest):
 		return "seq_beyond_latest"
+	case errors.Is(err, ErrNotAChannel):
+		return "not_a_channel"
 	default:
 		return "internal"
 	}

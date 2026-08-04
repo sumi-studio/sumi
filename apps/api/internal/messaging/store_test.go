@@ -224,16 +224,22 @@ func TestDMReachabilityAndPairUniqueness(t *testing.T) {
 	w := newWorld(t, ctx)
 	w.workspaceWithChannel(t, ctx)
 
-	dm, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	dm, created, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
 	if err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
-	same, err := w.store.EnsureDM(ctx, w.agent, w.humanA)
+	if !created {
+		t.Fatalf("first ensure must create the dm")
+	}
+	same, createdAgain, err := w.store.EnsureDM(ctx, w.agent, w.humanA)
 	if err != nil {
 		t.Fatalf("ensure dm again: %v", err)
 	}
 	if same.PlaceID != dm.PlaceID {
 		t.Fatalf("a pair must have exactly one dm: %s vs %s", same.PlaceID, dm.PlaceID)
+	}
+	if createdAgain {
+		t.Fatalf("second ensure must reuse the dm, not create one")
 	}
 
 	// No shared workspace, no reachability (v0 basis; Connection domain will
@@ -242,7 +248,7 @@ func TestDMReachabilityAndPairUniqueness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint stranger: %v", err)
 	}
-	if _, err := w.store.EnsureDM(ctx, w.humanA, Human(stranger)); !errors.Is(err, ErrNotReachable) {
+	if _, _, err := w.store.EnsureDM(ctx, w.humanA, Human(stranger)); !errors.Is(err, ErrNotReachable) {
 		t.Fatalf("unreachable dm: got %v, want ErrNotReachable", err)
 	}
 

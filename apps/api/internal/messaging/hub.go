@@ -7,13 +7,17 @@ import (
 )
 
 // Event is one durable or volatile messaging event fanned out to live
-// subscribers. Durable events carry the message (with its place seq); volatile
-// events (typing) carry only the actor and are never replayed.
+// subscribers. Durable events carry the message (with its place seq) or the
+// place summary; volatile events (typing) carry only the actor and are never
+// replayed. Place events are not replayed either — the durable truth is the
+// places table, and a reconnecting client re-reads it via bootstrap.
 type Event struct {
 	Type    string           `json:"type"`
 	PlaceID string           `json:"place_id"`
 	Message *messageWire     `json:"message,omitempty"`
 	Actor   *participantWire `json:"actor,omitempty"`
+	Channel *channelWire     `json:"channel,omitempty"`
+	DM      *dmWire          `json:"dm,omitempty"`
 }
 
 // Durable event types. The wire names match the web model's ServerEvent.
@@ -22,6 +26,8 @@ const (
 	EventMessageEdited  = "message_edited"
 	EventMessageDeleted = "message_deleted"
 	EventTyping         = "typing"
+	EventPlaceCreated   = "place_created"
+	EventPlaceUpdated   = "place_updated"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a
