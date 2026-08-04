@@ -12,21 +12,25 @@ import (
 // delivery by PlaceID; participant-scoped events (status_updated) leave
 // PlaceID empty and set Subject instead.
 type Event struct {
-	Type     string           `json:"type"`
-	PlaceID  string           `json:"place_id,omitempty"`
-	Message  *messageWire     `json:"message,omitempty"`
-	Actor    *participantWire `json:"actor,omitempty"`
-	Status   *statusWire      `json:"status,omitempty"`
-	Marker   *replyLaterWire  `json:"marker,omitempty"`
-	MarkerID string           `json:"marker_id,omitempty"`
+	Type    string           `json:"type"`
+	PlaceID string           `json:"place_id,omitempty"`
+	Message *messageWire     `json:"message,omitempty"`
+	Actor   *participantWire `json:"actor,omitempty"`
+	Status  *statusWire      `json:"status,omitempty"`
+	Marker  *replyLaterWire  `json:"marker,omitempty"`
+	// Notify rides only on the copy addressed to a recipient the server decided
+	// to interrupt. Its absence is the answer "this is not worth calling you
+	// for", which is why it is per-recipient rather than part of the message.
+	Notify   *notifyWire `json:"notify,omitempty"`
+	MarkerID string      `json:"marker_id,omitempty"`
 
 	// Delivery controls; never serialized. Subject scopes a place-less event to
 	// subscribers who can see that participant. OnlyFor/ExceptFor split one
 	// logical event into per-audience payloads (remind_at は本人以外の wire に
-	// 載せない — the owner's copy and everyone else's copy differ).
-	Subject   *ParticipantRef `json:"-"`
-	OnlyFor   *ParticipantRef `json:"-"`
-	ExceptFor *ParticipantRef `json:"-"`
+	// 載せない; notify は呼ばれた人の wire にしか載らない).
+	Subject   *ParticipantRef  `json:"-"`
+	OnlyFor   *ParticipantRef  `json:"-"`
+	ExceptFor []ParticipantRef `json:"-"`
 }
 
 // Durable event types. The wire names match the web model's ServerEvent.
@@ -139,7 +143,7 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 		if event.OnlyFor != nil && sub.viewer != *event.OnlyFor {
 			continue
 		}
-		if event.ExceptFor != nil && sub.viewer == *event.ExceptFor {
+		if excluded(event.ExceptFor, sub.viewer) {
 			continue
 		}
 		if !h.visibleTo(ctx, sub, event) {
@@ -155,6 +159,18 @@ func (h *Hub) Publish(ctx context.Context, event Event) {
 	for _, sub := range drop {
 		h.unsubscribe(sub)
 	}
+}
+
+// excluded reports whether the viewer is in an event's exclusion list. The
+// list is short by construction (one audience split per publish), so a linear
+// scan is the honest shape.
+func excluded(refs []ParticipantRef, viewer ParticipantRef) bool {
+	for _, ref := range refs {
+		if ref == viewer {
+			return true
+		}
+	}
+	return false
 }
 
 // visibleTo answers "may this subscriber be told about this event now",

@@ -116,6 +116,19 @@
 - agentの通知設定は覚醒トリガ（呼びかけ）の発火条件になる。本人が自分で変更できる
   （人間はUI、agentはtool — 同じ契約の別transport）。
 - Employerの予算・許可（ADR 0010 §3-4）はこの設定を上書きする別レイヤーで、選好とは混ぜない。
+- **発火判定はサーバー側**。message commit時に、その場所を見られる参加者ひとりずつに
+  ついてこの設定を評価し、`message_created` の**受信者ごとの** payload へ
+  `notify: { "reason": "dm | mention | keyword | all" } | null` を添える。
+  優先度は `dm > mention > keyword > all`、`mute` はすべてを抑制し、
+  自分の発言では自分を呼ばない。`notify` が無いことは欠損ではなく
+  「あなたを呼んでいない」という答えで、clientはこれを再判定しない
+  （clientに判定させると、muteした場所の本文が結局その端末まで届いてから
+  捨てられることになり、受信側制御にならない）。
+  同じ場所が将来のagent delivery eligibility（`AttentionCandidate` の発行判断）の
+  評価点になる。
+- 通知の**提示**（デスクトップ通知・音・許可）はclient側の関心で、設定の正本には
+  混ぜない。未読件数はmuteしても数え続ける（呼ばないことと、無かったことにするのは
+  別である）。
 
 ## API / event（人間UI側）
 

@@ -285,8 +285,7 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		Created     bool   `json:"created"`
 	}{Type: "receipt", ClientNonce: frame.ClientNonce, MessageID: msg.MessageID, Seq: msg.Seq, Created: created})
 	if created {
-		wire := messageToWire(place, msg)
-		s.Hub.Publish(ctx, Event{Type: EventMessageCreated, PlaceID: frame.PlaceID, Message: &wire})
+		publishMessageCreated(ctx, s.Store, s.Hub, place, msg)
 	}
 }
 
@@ -445,6 +444,8 @@ func storeErrorCode(err error) string {
 		return "message_deleted"
 	case errors.Is(err, ErrSeqBeyondLatest):
 		return "seq_beyond_latest"
+	case errors.Is(err, ErrInvalidNotificationSetting):
+		return "invalid_notification_setting"
 	default:
 		return "internal"
 	}

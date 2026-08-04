@@ -17,6 +17,12 @@ const (
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
+	// LocalNotificationSettingsPath is both the read and the write of the
+	// agent's own notification setting. The agent owns the identical resource a
+	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
+	// agentはtool). The messaging tool that calls it lands with #209; the口 is
+	// here so the capability is not UI-only in the meantime.
+	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
 )
 
 // maxRelativeMinutes bounds every relative duration the agent lane accepts.
@@ -41,6 +47,7 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
@@ -166,9 +173,8 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	if created && s.Hub != nil {
-		wire := messageToWire(place, message)
-		s.Hub.Publish(r.Context(), Event{Type: EventMessageCreated, PlaceID: request.PlaceID, Message: &wire})
+	if created {
+		publishMessageCreated(r.Context(), s.Store, s.Hub, place, message)
 	}
 	status := http.StatusCreated
 	if !created {
@@ -347,6 +353,68 @@ func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusOK, struct {
 		Marker replyLaterWire `json:"marker"`
 	}{replyLaterToWire(marker, viewer)})
+}
+
+// localNotificationSettings reads or updates the agent's own notification
+// setting through the identical store path the human UI uses. A request with
+// no field set is a read; any field present is a change to that field only,
+// because an agent naming one preference ("この place は mute にして") should not
+// silently discard the rest of its setting the way a full PUT would.
+func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		DefaultsLevel *string `json:"defaults_level,omitempty"`
+		PerPlace      *[]struct {
+			PlaceID string `json:"place_id"`
+			Level   string `json:"level"`
+		} `json:"per_place,omitempty"`
+		Keywords *[]string `json:"keywords,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	current, err := s.Store.NotificationSettingFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if request.DefaultsLevel == nil && request.PerPlace == nil && request.Keywords == nil {
+		writeJSON(w, http.StatusOK, struct {
+			Setting notificationSettingWire `json:"setting"`
+		}{notificationSettingToWire(current)})
+		return
+	}
+	defaultLevel := current.Default()
+	if request.DefaultsLevel != nil {
+		defaultLevel = *request.DefaultsLevel
+	}
+	perPlace := current.PerPlace
+	if request.PerPlace != nil {
+		perPlace = make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
+		for _, entry := range *request.PerPlace {
+			if entry.PlaceID == "" {
+				writeError(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			perPlace = append(perPlace, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
+		}
+	}
+	keywords := current.Keywords
+	if request.Keywords != nil {
+		keywords = *request.Keywords
+	}
+	stored, err := s.Store.SetNotificationSetting(r.Context(), viewer, defaultLevel, perPlace, keywords)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Setting notificationSettingWire `json:"setting"`
+	}{notificationSettingToWire(stored)})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
