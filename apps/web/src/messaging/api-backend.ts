@@ -7,6 +7,7 @@ import type {
   ParticipantRef,
   Place,
   PlaceKey,
+  ReactionSummary,
   ReadMarker,
   SendMessageInput,
   SendReceipt,
@@ -34,7 +35,7 @@ export class ApiMessagingBackend implements MessagingBackend {
   readonly capabilities = {
     status: false,
     replyLater: false,
-    reactions: false,
+    reactions: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -193,8 +194,16 @@ export class ApiMessagingBackend implements MessagingBackend {
   resolveReplyLater(): Promise<void> {
     return unsupported();
   }
-  toggleReaction(): Promise<void> {
-    return unsupported();
+
+  async toggleReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+      { method: "POST", body: { emoji } },
+    );
   }
 
   sendTyping(place: Place): void {
@@ -301,6 +310,10 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
+    } else if (eventType === "reaction_updated") {
+      // A reaction can target a message older than the replay cursor, so it
+      // must never move the cursor (backwards or at all).
+      parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "typing") {
       const id = asString(wire.place_id);
       const place = this.places.get(id);
@@ -383,6 +396,14 @@ function parseParticipant(value: unknown): ParticipantRef {
   throw new Error("invalid participant");
 }
 
+function parseReaction(value: unknown): ReactionSummary {
+  const wire = asRecord(value);
+  return {
+    emoji: asString(wire.emoji),
+    participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
 function parsePlace(value: unknown): Place {
   const wire = asRecord(value);
   const kind = asString(wire.kind);
@@ -405,7 +426,7 @@ function parseMessage(value: unknown): Message {
     content: asString(wire.content),
     mentions: asArray(wire.mentions).map(parseParticipant),
     urgency: asUrgency(wire.urgency),
-    reactions: [],
+    reactions: asArray(wire.reactions).map(parseReaction),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,

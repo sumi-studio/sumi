@@ -119,6 +119,90 @@ describe("ApiMessagingBackend", () => {
       message: { seq: 5, content: "live", place: channel },
     });
   });
+
+  it("toggles reactions over REST and projects reaction_updated", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path.endsWith("/reactions") && init?.method === "POST") {
+          return json({
+            message: messageWire(1, "hello", [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ]),
+            reacted: true,
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    expect(backend.capabilities.reactions).toBe(true);
+    await backend.bootstrap();
+
+    await backend.toggleReaction(channel, "message-1", "👍");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/places/channel-1/messages/message-1/reactions",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ emoji: "👍" }),
+      }),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const events: ServerEvent[] = [];
+      backend.subscribe((event) => events.push(event), {
+        sinceByPlace: { "channel:channel-1": 4 },
+      });
+      const socket = FakeWebSocket.instances[0];
+      socket?.open();
+      socket?.message({
+        type: "event",
+        event: {
+          type: "reaction_updated",
+          place_id: "channel-1",
+          message: messageWire(1, "hello", [
+            {
+              emoji: "👍",
+              participants: [{ kind: "human", human_id: "human-1" }],
+            },
+          ]),
+        },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "reaction_updated",
+        message: {
+          seq: 1,
+          reactions: [
+            {
+              emoji: "👍",
+              participants: [{ kind: "human", humanId: "human-1" }],
+            },
+          ],
+        },
+      });
+      // A reaction to an old message must not rewind the replay cursor: the
+      // reconnect hello still asks for everything after seq 4.
+      socket?.close();
+      vi.advanceTimersByTime(300);
+      const reconnected = FakeWebSocket.instances[0];
+      expect(reconnected).not.toBe(socket);
+      reconnected?.open();
+      expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+        type: "hello",
+        cursors: { "channel-1": 4 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 class FakeWebSocket extends EventTarget {
@@ -161,7 +245,11 @@ function channelWire() {
   return { kind: "channel", channel_id: "channel-1" };
 }
 
-function messageWire(seq: number, content: string) {
+function messageWire(
+  seq: number,
+  content: string,
+  reactions: { emoji: string; participants: unknown[] }[] = [],
+) {
   return {
     message_id: `message-${seq}`,
     place: channelWire(),
@@ -170,6 +258,7 @@ function messageWire(seq: number, content: string) {
     content,
     mentions: [],
     urgency: "normal",
+    reactions,
     reply_to: null,
     client_nonce: `nonce-${seq}`,
     created_at: "2026-08-01T10:00:00Z",
