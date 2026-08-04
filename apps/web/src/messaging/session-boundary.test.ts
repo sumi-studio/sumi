@@ -24,6 +24,7 @@ describe("messaging session boundary", () => {
           name: "A",
           topic: "",
           visibility: "private",
+          voice: false,
         },
       ],
       messagesByPlace: {

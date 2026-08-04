@@ -56,6 +56,7 @@ beforeEach(() => {
         name: "dev",
         topic: "開発の相談",
         visibility: "public",
+        voice: false,
       },
     ],
     dms: [],

@@ -162,10 +162,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     workspaceId: string,
     name: string,
     topic: string,
+    voice = false,
   ): Promise<ChannelSummary> {
     const body = await this.request("/messaging/channels", {
       method: "POST",
-      body: { workspace_id: workspaceId, name, topic },
+      body: { workspace_id: workspaceId, name, topic, voice },
     });
     return this.registerChannel(body);
   }
@@ -533,6 +534,8 @@ export class ApiMessagingBackend implements MessagingBackend {
       name: asString(wire.name),
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),
+      // voiceが無いwireは「話す場所ではない」——欠損として扱わない。
+      voice: wire.voice === true,
     };
     this.places.set(channel.channelId, {
       kind: "channel",

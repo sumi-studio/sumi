@@ -12,6 +12,8 @@ import { CallStartButtons } from "./call-start-buttons";
 import { useCall } from "./call-store";
 import { IncomingCallModal } from "./incoming-call";
 import type { CallState } from "./model";
+import { VoiceChannelMembers } from "./voice-channel-members";
+import { VoiceChannelPanel } from "./voice-channel-panel";
 
 const me: ParticipantRef = { kind: "human", humanId: "h1" };
 const haru: ParticipantRef = { kind: "human", humanId: "h2" };
@@ -198,5 +200,58 @@ describe("通話開始ボタン", () => {
     expect(
       screen.getByRole("button", { name: "音声通話を開始" }),
     ).toBeEnabled();
+  });
+});
+
+describe("ボイスチャンネル", () => {
+  it("誰もいなければ入り口だけを出し、テキスト列は畳まない", () => {
+    const join = vi.fn();
+    useCall.setState({ join });
+    render(<VoiceChannelPanel placeKey="channel:v1" />);
+
+    expect(
+      screen.getByText("まだ誰も入っていません。入ると通話が始まります"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "通話に参加" }));
+    expect(join).toHaveBeenCalledWith("channel:v1");
+  });
+
+  it("誰かが入っていれば入り口を畳む（バナー側が受け持つ）", () => {
+    useCall.setState({
+      stateByPlace: {
+        "channel:v1": callWith({ kind: "channel", channelId: "v1" }, [haru]),
+      },
+    });
+    const { container } = render(<VoiceChannelPanel placeKey="channel:v1" />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("サイドバーには通話中の参加者が名前の下にぶら下がる", () => {
+    useCall.setState({
+      stateByPlace: {
+        "channel:v1": callWith({ kind: "channel", channelId: "v1" }, [
+          haru,
+          kuro,
+        ]),
+      },
+    });
+    render(<VoiceChannelMembers placeKey="channel:v1" />);
+
+    // 人間と人格agentが同じ行の文法で並ぶ。
+    expect(screen.getAllByText("はる").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("墨").length).toBeGreaterThan(0);
+  });
+
+  it("誰もいないボイスチャンネルには空の枠を出さない", () => {
+    const { container } = render(<VoiceChannelMembers placeKey="channel:v1" />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("画面共有はサイドバーからも見える", () => {
+    const call = callWith({ kind: "channel", channelId: "v1" }, [haru]);
+    call.participants[0].screenShare = true;
+    useCall.setState({ stateByPlace: { "channel:v1": call } });
+    render(<VoiceChannelMembers placeKey="channel:v1" />);
+    expect(screen.getByLabelText("画面共有中")).toBeInTheDocument();
   });
 });

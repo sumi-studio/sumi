@@ -110,6 +110,8 @@ pub(crate) struct CreateMessagingChannelRequest<'a> {
     pub name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<bool>,
 }
 
 /// Editing a channel's mutable identity.  An absent field is left alone, so

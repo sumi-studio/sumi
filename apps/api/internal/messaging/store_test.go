@@ -70,7 +70,7 @@ func (w world) workspaceWithChannel(t *testing.T, ctx context.Context) (Workspac
 			t.Fatalf("add member %s: %v", m.Key(), err)
 		}
 	}
-	ch, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "general", "日々のこと", w.humanA)
+	ch, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "general", "日々のこと", w.humanA, false)
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestChannelPostingFollowsWorkspaceMembership(t *testing.T) {
 	if _, err := w.store.PlaceFor(ctx, ch.PlaceID, Human(stranger)); !errors.Is(err, ErrPlaceNotFound) {
 		t.Fatalf("stranger view: got %v, want ErrPlaceNotFound", err)
 	}
-	if _, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "secret", "", Human(stranger)); !errors.Is(err, ErrNotAMember) {
+	if _, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "secret", "", Human(stranger), false); !errors.Is(err, ErrNotAMember) {
 		t.Fatalf("stranger create channel: got %v, want ErrNotAMember", err)
 	}
 
@@ -425,7 +425,7 @@ func TestUpdateAndDuplicateChannel(t *testing.T) {
 	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
 		t.Fatalf("admit human: %v", err)
 	}
-	channel, err := w.store.CreateChannel(ctx, DefaultWorkspaceID, "dev", "開発の相談", w.humanA)
+	channel, err := w.store.CreateChannel(ctx, DefaultWorkspaceID, "dev", "開発の相談", w.humanA, false)
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}

@@ -24,6 +24,7 @@ beforeEach(() => {
         name: "dev",
         topic: "",
         visibility: "public",
+        voice: false,
       },
     ],
     dms: [],

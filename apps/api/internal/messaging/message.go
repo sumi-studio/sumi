@@ -502,6 +502,7 @@ func (s *Store) UnreadSummaries(ctx context.Context, viewer ParticipantRef) ([]U
 		    AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
 		 )
 		 SELECT mp.place_id, mp.kind, mp.workspace_id, mp.name, mp.topic, mp.visibility, mp.last_seq,
+		        mp.voice,
 		        COALESCE(rm.last_read_seq, 0),
 		        (SELECT count(*) FROM messages m
 		          WHERE m.place_id = mp.place_id AND m.seq > COALESCE(rm.last_read_seq, 0)
@@ -530,7 +531,7 @@ func (s *Store) UnreadSummaries(ctx context.Context, viewer ParticipantRef) ([]U
 			name        *string
 		)
 		if err := rows.Scan(&sum.Place.PlaceID, &sum.Place.Kind, &workspaceID, &name,
-			&sum.Place.Topic, &sum.Place.Visibility, &sum.Place.LastSeq,
+			&sum.Place.Topic, &sum.Place.Visibility, &sum.Place.LastSeq, &sum.Place.Voice,
 			&sum.LastReadSeq, &sum.UnreadCount, &sum.MentionCount); err != nil {
 			return nil, fmt.Errorf("scan unread summary: %w", err)
 		}

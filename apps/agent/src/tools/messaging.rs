@@ -131,6 +131,9 @@ enum MessagingAction {
         topic: Option<String>,
         #[serde(default)]
         workspace_id: Option<String>,
+        /// A voice channel is a place people are meant to talk in (ADR 0012).
+        #[serde(default)]
+        voice: Option<bool>,
     },
     /// Rename a channel, retopic it, or both.  An omitted field is left alone.
     UpdateChannel {
@@ -355,6 +358,13 @@ fn messaging_parameters_schema() -> Value {
                 "description": concat!(
                     "Optional for create_channel and omitted for other actions. Which workspace ",
                     "to open the channel in; when omitted, the workspace you are in is used."
+                )
+            },
+            "voice": {
+                "type": "boolean",
+                "description": concat!(
+                    "Optional for create_channel and omitted for other actions. True opens a ",
+                    "voice channel — a place people are meant to talk in (ADR 0012)."
                 )
             },
             "before_seq": {
@@ -762,6 +772,7 @@ impl Tool for MessagingTool {
                 name,
                 topic,
                 workspace_id,
+                voice,
             } => {
                 let response = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
@@ -769,6 +780,7 @@ impl Tool for MessagingTool {
                         workspace_id: workspace_id.as_deref(),
                         name: &name,
                         topic: topic.as_deref(),
+                        voice,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
@@ -958,6 +970,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             name,
             topic,
             workspace_id,
+            ..
         } => {
             validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES)?;
             validate_optional_note(topic, MAX_TOPIC_BYTES)?;
@@ -1649,7 +1662,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            24
+            25
         );
     }
 
@@ -1834,7 +1847,10 @@ mod tests {
             .await
             .unwrap();
         assert!(output.details["calls"][0]["active"].as_bool().unwrap());
-        assert_eq!(api.calls.lock().await.as_slice(), ["overview", "call_state:*"]);
+        assert_eq!(
+            api.calls.lock().await.as_slice(),
+            ["overview", "call_state:*"]
+        );
 
         execute(
             &tool,

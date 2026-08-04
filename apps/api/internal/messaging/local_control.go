@@ -518,6 +518,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		WorkspaceID string `json:"workspace_id,omitempty"`
 		Name        string `json:"name"`
 		Topic       string `json:"topic,omitempty"`
+		Voice       bool   `json:"voice,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -537,7 +538,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		writeStoreError(w, err)
 		return
 	}
-	place, err := s.Store.CreateChannel(r.Context(), workspaceID, request.Name, request.Topic, viewer)
+	place, err := s.Store.CreateChannel(r.Context(), workspaceID, request.Name, request.Topic, viewer, request.Voice)
 	if err != nil {
 		writeStoreError(w, err)
 		return

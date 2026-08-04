@@ -156,6 +156,11 @@ export interface ChannelSummary {
   name: string;
   topic: string;
   visibility: "public" | "private";
+  /**
+   * 「話す場所」として作られたchannel（ADR 0012）。別種のplaceではなく
+   * channelの一属性なので、timelineも未読もmentionもそのまま乗る。
+   */
+  voice: boolean;
 }
 
 export interface DmSummary {
@@ -377,10 +382,12 @@ export interface MessagingBackend {
     query: string,
     options?: { place?: Place; limit?: number },
   ): Promise<MessageSearchResult[]>;
+  /** voiceは「話す場所」として作るかどうか。省略はテキストchannel。 */
   createChannel(
     workspaceId: string,
     name: string,
     topic: string,
+    voice?: boolean,
   ): Promise<ChannelSummary>;
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;

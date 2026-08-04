@@ -88,7 +88,11 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
-  createChannel(name: string, topic: string): Promise<PlaceKey>;
+  createChannel(
+    name: string,
+    topic: string,
+    voice?: boolean,
+  ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannel(
@@ -692,10 +696,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void loadPlace(place);
     },
 
-    async createChannel(name, topic) {
+    async createChannel(name, topic, voice = false) {
       const workspaceId = get().workspaces[0]?.workspaceId;
       if (!workspaceId) throw new Error("workspace is not ready");
-      const channel = await backend.createChannel(workspaceId, name, topic);
+      const channel = await backend.createChannel(
+        workspaceId,
+        name,
+        topic,
+        voice,
+      );
       set((state) =>
         state.channels.some((entry) => entry.channelId === channel.channelId)
           ? {}

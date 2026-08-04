@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -241,5 +242,95 @@ func TestCallRoutesFailClosedWithoutLiveKit(t *testing.T) {
 	mux.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unconfigured webhook status = %d", response.Code)
+	}
+}
+
+// TestVoiceChannelIsAChannelThatAlsoCarriesText pins the ADR 0012 decision that
+// a voice channel is an attribute of a channel, not a separate kind: it keeps
+// the timeline, the seq and the unread projection every other channel has.
+func TestVoiceChannelIsAChannelThatAlsoCarriesText(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	ws, err := w.store.CreateWorkspace(ctx, "sumi-dev", w.humanA)
+	if err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if err := w.store.AddWorkspaceMember(ctx, ws.WorkspaceID, w.humanB, RoleMember); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+
+	voice, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "作業通話", "", w.humanA, true)
+	if err != nil {
+		t.Fatalf("create voice channel: %v", err)
+	}
+	if !voice.Voice || voice.Kind != PlaceChannel {
+		t.Fatalf("created place = %+v, want a voice channel", voice)
+	}
+	text, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "general", "", w.humanA, false)
+	if err != nil {
+		t.Fatalf("create text channel: %v", err)
+	}
+	if text.Voice {
+		t.Fatal("a channel created without voice must not be a voice channel")
+	}
+
+	// Reloading must preserve the flag, and the wire must carry it.
+	reloaded, err := w.store.PlaceFor(ctx, voice.PlaceID, w.humanA)
+	if err != nil {
+		t.Fatalf("reload voice channel: %v", err)
+	}
+	if !reloaded.Voice {
+		t.Fatal("voice was not persisted")
+	}
+	if !channelToWire(reloaded).Voice {
+		t.Fatal("voice did not reach the wire")
+	}
+
+	// It is still a place where people write, and the unread projection still
+	// covers it — that is the whole point of not making it a separate kind.
+	w.send(t, ctx, voice.PlaceID, w.humanB, "先に入ってます")
+	summaries, err := w.store.UnreadSummaries(ctx, w.humanA)
+	if err != nil {
+		t.Fatalf("unread summaries: %v", err)
+	}
+	found := false
+	for _, summary := range summaries {
+		if summary.Place.PlaceID != voice.PlaceID {
+			continue
+		}
+		found = true
+		if !summary.Place.Voice {
+			t.Fatal("unread summary lost the voice flag")
+		}
+		if summary.UnreadCount != 1 {
+			t.Fatalf("unread count = %d, want 1", summary.UnreadCount)
+		}
+	}
+	if !found {
+		t.Fatal("the voice channel is missing from the unread summaries")
+	}
+}
+
+// TestVoiceIsRefusedOutsideChannels keeps dm/group_dm from becoming permanent
+// voice rooms: they can hold a call, but they are not a place people join.
+func TestVoiceIsRefusedOutsideChannels(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	ws, err := w.store.CreateWorkspace(ctx, "sumi-dev", w.humanA)
+	if err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if err := w.store.AddWorkspaceMember(ctx, ws.WorkspaceID, w.humanB, RoleMember); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
+	if err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+	if _, err := w.store.pool.Exec(ctx,
+		"UPDATE places SET voice = true WHERE place_id = $1", dm.PlaceID); err == nil {
+		t.Fatal("a dm was allowed to become a voice channel")
 	}
 }
