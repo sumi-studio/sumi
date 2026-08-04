@@ -22,11 +22,9 @@ export function MemberList() {
 
   return (
     <aside className="hidden w-56 shrink-0 flex-col border-border/70 border-l bg-muted/20 lg:flex">
-      <div className="flex h-12 shrink-0 items-center border-border/70 border-b px-4">
-        <span className="font-medium text-[12px] text-muted-foreground">
-          メンバー — {members.length}
-        </span>
-      </div>
+      <p className="shrink-0 px-4 pt-3 pb-1 font-medium text-[12px] text-muted-foreground">
+        メンバー — {members.length}
+      </p>
       <div className="scrollbar-ui min-h-0 flex-1 overflow-y-auto p-2">
         {members.map((member) => {
           const key = participantKey(member.participant);
