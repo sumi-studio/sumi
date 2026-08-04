@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantProfilePopover } from "./participant-profile";
 
 /**
  * メンバーリスト。人間とagentを同じ「参加者」として一つのリストに並べる。
@@ -32,9 +33,12 @@ export function MemberList() {
           const key = participantKey(member.participant);
           const status = statusByKey[key];
           return (
-            <div
+            <ParticipantProfilePopover
               key={key}
-              className="flex items-center gap-2.5 rounded-md px-2 py-1.5"
+              participantKey={key}
+              side="left"
+              align="start"
+              className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/60"
             >
               <ParticipantAvatar
                 participantKey={key}
@@ -55,7 +59,7 @@ export function MemberList() {
                   {status?.note ? status.note : member.tagline}
                 </span>
               </span>
-            </div>
+            </ParticipantProfilePopover>
           );
         })}
       </div>

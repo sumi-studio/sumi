@@ -4,16 +4,10 @@ import type { PlaceKey, StatusKind } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
-import { ParticipantAvatar } from "./participant-avatar";
+import { ParticipantAvatar, STATUS_LABEL } from "./participant-avatar";
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
-
-const STATUS_LABEL: Record<StatusKind, string> = {
-  available: "対応可能",
-  busy: "取り込み中",
-  away: "離席中",
-};
 
 function Badge({ count, urgent }: { count: number; urgent: boolean }) {
   if (count <= 0) return null;
