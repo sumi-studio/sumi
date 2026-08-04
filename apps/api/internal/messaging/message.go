@@ -36,6 +36,7 @@ type Message struct {
 	Urgency     string
 	Mentions    []ParticipantRef
 	Attachments []Attachment
+	Reactions   []ReactionSummary
 	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
@@ -247,6 +248,9 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if err := s.attachAttachments(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := s.attachReactions(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -276,6 +280,9 @@ func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer Partic
 		return nil, err
 	}
 	if err := s.attachAttachments(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -348,8 +355,13 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	msg.EditedAt = &editedAt
 	// An edit rewrites text only; the attachments the message was sent with
 	// stay part of it, so the returned message (and its echo) keeps them.
+	// The edited event carries the whole message; live consumers replace their
+	// copy with it, so reactions must ride along or the edit would erase them.
 	edited := []Message{msg}
 	if err := s.attachAttachments(ctx, edited); err != nil {
+		return Message{}, err
+	}
+	if err := s.attachReactions(ctx, edited); err != nil {
 		return Message{}, err
 	}
 	return edited[0], nil
@@ -410,6 +422,12 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 		"DELETE FROM message_mentions WHERE message_id = $1", messageID); err != nil {
 		return Message{}, fmt.Errorf("clear mentions: %w", err)
 	}
+	// A tombstone keeps only the fact and the seq; reactions to the vanished
+	// content vanish with it.
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_reactions WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear reactions: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit delete: %w", err)
 	}
@@ -419,6 +437,7 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 	// what was sent, but they are no longer delivered or served (see
 	// AttachmentForViewer).
 	msg.Attachments = nil
+	msg.Reactions = nil
 	msg.Deleted = true
 	return msg, nil
 }
@@ -552,6 +571,9 @@ func (s *Store) messageByNonce(ctx context.Context, q querier, in AppendInput) (
 		return Message{}, false, err
 	}
 	if err := s.attachAttachments(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachReactions(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
 	return messages[0], true, nil

@@ -36,8 +36,9 @@ use super::supervisor::{
     CredentialProvider, DeliveryAuthorization, GatewayCredential, HydrationLatch, HydrationReady,
 };
 use crate::apiclient::messaging::{
-    MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
-    WriteMessagingMessageRequest,
+    CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
+    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
+    SetMessagingStatusRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -497,6 +498,42 @@ impl MessagingApi for LocalControlHttpClient {
 
     async fn write(&self, request: WriteMessagingMessageRequest<'_>) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:write", &request)
+            .await
+    }
+
+    async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<serde_json::Value> {
+        // The response echoes the full message (content up to 64 KiB plus its
+        // reaction state), so it shares the messaging screen bound rather than
+        // the tighter control-plane bound.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:react",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn set_status(
+        &self,
+        request: SetMessagingStatusRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:status", &request)
+            .await
+    }
+
+    async fn reply_later(
+        &self,
+        request: CreateMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later", &request)
+            .await
+    }
+
+    async fn resolve_reply_later(
+        &self,
+        request: ResolveMessagingReplyLaterRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:reply-later-resolve", &request)
             .await
     }
 

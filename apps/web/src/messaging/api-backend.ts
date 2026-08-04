@@ -5,13 +5,21 @@ import type {
   MemberProfile,
   Message,
   MessagingBackend,
+  NotificationLevel,
+  NotificationSetting,
+  NotificationSettingInput,
+  NotifyReason,
   ParticipantRef,
+  ParticipantStatus,
   Place,
   PlaceKey,
+  ReactionSummary,
   ReadMarker,
+  ReplyLaterMarker,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
+  StatusKind,
   UnreadSummary,
 } from "./model";
 import { MAX_SEQ, parsePlaceKey } from "./model";
@@ -35,9 +43,10 @@ export class MessagingAPIError extends Error {
 /** Same-origin browser-session client for the shared messaging surface. */
 export class ApiMessagingBackend implements MessagingBackend {
   readonly capabilities = {
-    status: false,
-    replyLater: false,
-    reactions: false,
+    status: true,
+    replyLater: true,
+    reactions: true,
+    notifications: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -112,16 +121,25 @@ export class ApiMessagingBackend implements MessagingBackend {
         };
       },
     );
+    // status_updated は replay されないvolatile eventなので、現在値はここでしか
+    // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
+    const statuses: ParticipantStatus[] = asArray(body.statuses).map(
+      parseStatus,
+    );
+    const replyLaterMarkers: ReplyLaterMarker[] = asArray(
+      body.reply_later_markers,
+    ).map(parseReplyLater);
     return {
       self: parseParticipant(body.self),
       workspaces,
       channels,
       dms,
       members,
-      statuses: [],
+      statuses,
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers: [],
+      replyLaterMarkers,
+      notificationSetting: parseNotificationSetting(body.notification_setting),
       employedAgents: [],
     };
   }
@@ -216,17 +234,56 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
-  setStatus(): Promise<void> {
-    return unsupported();
+  /** 自分のstatusだけを置き換える。参加者はsessionが決め、bodyには載せない。 */
+  async setStatus(status: StatusKind, note: string): Promise<void> {
+    await this.request("/messaging/status", {
+      method: "PUT",
+      body: { status, note },
+    });
   }
-  createReplyLater(): Promise<void> {
-    return unsupported();
+
+  async createReplyLater(
+    place: Place,
+    messageId: string,
+    remindAt: number,
+  ): Promise<void> {
+    await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
+      { method: "POST", body: { remind_at: new Date(remindAt).toISOString() } },
+    );
   }
-  resolveReplyLater(): Promise<void> {
-    return unsupported();
+
+  async resolveReplyLater(markerId: string): Promise<void> {
+    await this.request(
+      `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
+      { method: "POST", body: {} },
+    );
   }
-  toggleReaction(): Promise<void> {
-    return unsupported();
+
+  async toggleReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+      { method: "POST", body: { emoji } },
+    );
+  }
+
+  /** PUTは全置換。クライアントは常に現在値を持っているので差分は要らない。 */
+  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+    await this.request("/messaging/notification-settings", {
+      method: "PUT",
+      body: {
+        defaults: { level: input.defaults.level },
+        per_place: input.perPlace.map((entry) => ({
+          place: placeToWire(entry.place),
+          level: entry.level,
+        })),
+        keywords: input.keywords,
+      },
+    });
   }
 
   sendTyping(place: Place): void {
@@ -325,14 +382,29 @@ export class ApiMessagingBackend implements MessagingBackend {
     const wire = asRecord(frame.event);
     const eventType = asString(wire.type);
     let parsed: ServerEvent;
-    if (
-      eventType === "message_created" ||
+    if (eventType === "message_created") {
+      const message = parseMessage(wire.message);
+      this.cursors.set(placeID(message.place), message.seq);
+      // notifyが無いことは欠損ではなく「呼んでいない」という答え。
+      parsed = { type: eventType, message, notify: parseNotify(wire.notify) };
+    } else if (
       eventType === "message_edited" ||
       eventType === "message_deleted"
     ) {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
+    } else if (eventType === "reaction_updated") {
+      // A reaction can target a message older than the replay cursor, so it
+      // must never move the cursor (backwards or at all).
+      parsed = { type: eventType, message: parseMessage(wire.message) };
+    } else if (eventType === "status_updated") {
+      // 自己申告のattention。placeを持たず、seqも進めない。
+      parsed = { type: eventType, status: parseStatus(wire.status) };
+    } else if (eventType === "reply_later_created") {
+      parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
+    } else if (eventType === "reply_later_resolved") {
+      parsed = { type: eventType, markerId: asString(wire.marker_id) };
     } else if (eventType === "typing") {
       const id = asString(wire.place_id);
       const place = this.places.get(id);
@@ -394,12 +466,53 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 }
 
-function unsupported(): Promise<void> {
-  return Promise.reject(new MessagingAPIError("not_implemented", 501));
-}
-
 function placeID(place: Place): string {
   return place.kind === "channel" ? place.channelId : place.dmId;
+}
+
+function placeToWire(place: Place): Record<string, string> {
+  return place.kind === "channel"
+    ? { kind: place.kind, channel_id: place.channelId }
+    : { kind: place.kind, dm_id: place.dmId };
+}
+
+function parseNotify(value: unknown): { reason: NotifyReason } | null {
+  if (value == null) return null;
+  const wire = asRecord(value);
+  const reason = asString(wire.reason);
+  if (
+    reason === "dm" ||
+    reason === "mention" ||
+    reason === "keyword" ||
+    reason === "all"
+  ) {
+    return { reason };
+  }
+  // 未知のreasonはfail-closedに無視する（呼ばれなかったのと同じ扱い）。
+  return null;
+}
+
+function asNotificationLevel(value: unknown): NotificationLevel {
+  if (value === "all" || value === "mentions" || value === "mute") return value;
+  throw new Error("invalid notification level");
+}
+
+function parseNotificationSetting(value: unknown): NotificationSetting {
+  const wire = asRecord(value);
+  return {
+    owner: parseParticipant(wire.owner),
+    defaults: {
+      level: asNotificationLevel(asRecord(wire.defaults).level),
+    },
+    perPlace: asArray(wire.per_place).map((entry) => {
+      const item = asRecord(entry);
+      return {
+        place: parsePlace(item.place),
+        level: asNotificationLevel(item.level),
+      };
+    }),
+    keywords: asArray(wire.keywords).map(asString),
+  };
 }
 
 function parseParticipant(value: unknown): ParticipantRef {
@@ -413,6 +526,39 @@ function parseParticipant(value: unknown): ParticipantRef {
     };
   }
   throw new Error("invalid participant");
+}
+
+function parseReaction(value: unknown): ReactionSummary {
+  const wire = asRecord(value);
+  return {
+    emoji: asString(wire.emoji),
+    participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
+function parseStatus(value: unknown): ParticipantStatus {
+  const wire = asRecord(value);
+  return {
+    participant: parseParticipant(wire.participant),
+    status: asStatusKind(wire.status),
+    note: asString(wire.note),
+    expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
+  };
+}
+
+function parseReplyLater(value: unknown): ReplyLaterMarker {
+  const wire = asRecord(value);
+  return {
+    markerId: asString(wire.marker_id),
+    participant: parseParticipant(wire.participant),
+    place: parsePlace(wire.place),
+    messageId: asString(wire.message_id),
+    note: asString(wire.note),
+    // remind_atは本人のwireにしか載らない。無いことは欠損ではなく、
+    // 「自分の約束ではない」という正しい答え。
+    remindAt: wire.remind_at == null ? null : asTimestamp(wire.remind_at),
+    resolved: asBoolean(wire.resolved),
+  };
 }
 
 function parsePlace(value: unknown): Place {
@@ -453,7 +599,7 @@ function parseMessage(value: unknown): Message {
     content: asString(wire.content),
     mentions: asArray(wire.mentions).map(parseParticipant),
     urgency: asUrgency(wire.urgency),
-    reactions: [],
+    reactions: asArray(wire.reactions).map(parseReaction),
     attachments: asArray(wire.attachments ?? []).map(parseAttachment),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
@@ -500,6 +646,12 @@ function asTimestamp(value: unknown): number {
 function asVisibility(value: unknown): "public" | "private" {
   if (value === "public" || value === "private") return value;
   throw new Error("invalid channel visibility");
+}
+function asStatusKind(value: unknown): StatusKind {
+  if (value === "available" || value === "busy" || value === "away") {
+    return value;
+  }
+  throw new Error("invalid participant status");
 }
 function asDMKind(value: unknown): "dm" | "group_dm" {
   if (value === "dm" || value === "group_dm") return value;

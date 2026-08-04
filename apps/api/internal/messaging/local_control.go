@@ -2,16 +2,34 @@ package messaging
 
 import (
 	"net/http"
+	"time"
+	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 const (
-	LocalOverviewPath    = "/local-control/v1/messaging:overview"
-	LocalOpenPath        = "/local-control/v1/messaging:open"
-	LocalWritePath       = "/local-control/v1/messaging:write"
-	LocalReadThroughPath = "/local-control/v1/messaging:read-through"
+	LocalOverviewPath          = "/local-control/v1/messaging:overview"
+	LocalOpenPath              = "/local-control/v1/messaging:open"
+	LocalWritePath             = "/local-control/v1/messaging:write"
+	LocalReactPath             = "/local-control/v1/messaging:react"
+	LocalStatusPath            = "/local-control/v1/messaging:status"
+	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
+	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
+	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
+	// LocalNotificationSettingsPath is both the read and the write of the
+	// agent's own notification setting. The agent owns the identical resource a
+	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
+	// agentはtool). The messaging tool that calls it lands with #209; the口 is
+	// here so the capability is not UI-only in the meantime.
+	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
 )
+
+// maxRelativeMinutes bounds every relative duration the agent lane accepts.
+// The agent names durations ("30分後に"), not wall-clock instants, so the
+// server's clock decides the moment and a drifting workspace clock cannot
+// place a promise in the past or the far future.
+const maxRelativeMinutes = uint32(MaxReplyLaterDelay / time.Minute)
 
 // RegisterLocalControlRoutes exposes the same Store capabilities to a
 // PersonalityAgent through its PAID-bound Unix control socket. Identity is
@@ -24,7 +42,12 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOverviewPath, s.localOverview},
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalWritePath, s.localWrite},
+		{"POST " + LocalReactPath, s.localReact},
+		{"POST " + LocalStatusPath, s.localStatus},
+		{"POST " + LocalReplyLaterPath, s.localReplyLater},
+		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
@@ -150,9 +173,8 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	if created && s.Hub != nil {
-		wire := messageToWire(place, message)
-		s.Hub.Publish(r.Context(), Event{Type: EventMessageCreated, PlaceID: request.PlaceID, Message: &wire})
+	if created {
+		publishMessageCreated(r.Context(), s.Store, s.Hub, place, message)
 	}
 	status := http.StatusCreated
 	if !created {
@@ -163,6 +185,236 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		Seq       int64       `json:"seq"`
 		Message   messageWire `json:"message"`
 	}{message.MessageID, message.Seq, messageToWire(place, message)})
+}
+
+// localReact toggles the agent's emoji on a message through the identical
+// store path the human UI uses. The tool layer scopes it to messages visible
+// in the currently open view (ADR 0011 §3: 見えていないものは操作できない);
+// the server enforces the shared permission model.
+func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID   string `json:"place_id"`
+		MessageID string `json:"message_id"`
+		Emoji     string `json:"emoji"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" || validateReactionEmoji(request.Emoji) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, reacted, err := s.Store.ToggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, message)
+	if s.Hub != nil {
+		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Message: &wire})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+		Reacted bool        `json:"reacted"`
+	}{wire, reacted})
+}
+
+// localStatus sets the agent's own status through the identical store path the
+// human status menu uses. Unlike react and reply-later it is not scoped to an
+// open place: a person's attention state is about the person, not a screen.
+func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		Status string `json:"status"`
+		Note   string `json:"note,omitempty"`
+		// 0 (or omitted) means the status holds until it is replaced.
+		ExpiresInMinutes uint32 `json:"expires_in_minutes,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	switch request.Status {
+	case StatusAvailable, StatusBusy, StatusAway:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if utf8.RuneCountInString(request.Note) > MaxStatusNoteChars ||
+		request.ExpiresInMinutes > maxRelativeMinutes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var expiresAt *time.Time
+	if request.ExpiresInMinutes > 0 {
+		moment := time.Now().Add(time.Duration(request.ExpiresInMinutes) * time.Minute)
+		expiresAt = &moment
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	status, err := s.Store.SetStatus(r.Context(), viewer, request.Status, request.Note, expiresAt)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishStatus(r.Context(), status)
+	writeJSON(w, http.StatusOK, struct {
+		Status statusWire `json:"status"`
+	}{statusToWire(status)})
+}
+
+// localReplyLater places the agent's own「後で返信します」marker. The tool
+// layer scopes it to messages visible in the currently open view, the same
+// rule as react (ADR 0011 §3); the server enforces the shared permission
+// model. The marker's own copy carries remind_at because the agent is its
+// owner — other participants' wires never do.
+func (s *Server) localReplyLater(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID   string `json:"place_id"`
+		MessageID string `json:"message_id"`
+		Note      string `json:"note,omitempty"`
+		// Relative so the server's clock, not the workspace's, fixes the moment.
+		RemindInMinutes uint32 `json:"remind_in_minutes,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" ||
+		utf8.RuneCountInString(request.Note) > MaxReplyLaterNoteChars ||
+		request.RemindInMinutes > maxRelativeMinutes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	remindAt := time.Now().Add(DefaultReplyLaterDelay)
+	if request.RemindInMinutes > 0 {
+		remindAt = time.Now().Add(time.Duration(request.RemindInMinutes) * time.Minute)
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	marker, created, err := s.Store.CreateReplyLater(
+		r.Context(), request.PlaceID, request.MessageID, viewer, request.Note, remindAt)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if created {
+		s.publishReplyLaterCreated(r.Context(), marker)
+	}
+	// TODO(#128): the agent's own reminder rides the「予定された出来事」覚醒
+	// トリガ from here once that trigger exists; the marker is already durable.
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		Marker  replyLaterWire `json:"marker"`
+		Created bool           `json:"created"`
+	}{replyLaterToWire(marker, viewer), created})
+}
+
+// localReplyLaterResolve marks the agent's own promise as kept. Someone else's
+// marker is reported as missing, never as forbidden.
+func (s *Server) localReplyLaterResolve(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		MarkerID string `json:"marker_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.MarkerID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	marker, err := s.Store.ResolveReplyLater(r.Context(), request.MarkerID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishReplyLaterResolved(r.Context(), marker)
+	writeJSON(w, http.StatusOK, struct {
+		Marker replyLaterWire `json:"marker"`
+	}{replyLaterToWire(marker, viewer)})
+}
+
+// localNotificationSettings reads or updates the agent's own notification
+// setting through the identical store path the human UI uses. A request with
+// no field set is a read; any field present is a change to that field only,
+// because an agent naming one preference ("この place は mute にして") should not
+// silently discard the rest of its setting the way a full PUT would.
+func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		DefaultsLevel *string `json:"defaults_level,omitempty"`
+		PerPlace      *[]struct {
+			PlaceID string `json:"place_id"`
+			Level   string `json:"level"`
+		} `json:"per_place,omitempty"`
+		Keywords *[]string `json:"keywords,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	current, err := s.Store.NotificationSettingFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if request.DefaultsLevel == nil && request.PerPlace == nil && request.Keywords == nil {
+		writeJSON(w, http.StatusOK, struct {
+			Setting notificationSettingWire `json:"setting"`
+		}{notificationSettingToWire(current)})
+		return
+	}
+	defaultLevel := current.Default()
+	if request.DefaultsLevel != nil {
+		defaultLevel = *request.DefaultsLevel
+	}
+	perPlace := current.PerPlace
+	if request.PerPlace != nil {
+		perPlace = make([]PlaceNotifyLevel, 0, len(*request.PerPlace))
+		for _, entry := range *request.PerPlace {
+			if entry.PlaceID == "" {
+				writeError(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			perPlace = append(perPlace, PlaceNotifyLevel{PlaceID: entry.PlaceID, Level: entry.Level})
+		}
+	}
+	keywords := current.Keywords
+	if request.Keywords != nil {
+		keywords = *request.Keywords
+	}
+	stored, err := s.Store.SetNotificationSetting(r.Context(), viewer, defaultLevel, perPlace, keywords)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Setting notificationSettingWire `json:"setting"`
+	}{notificationSettingToWire(stored)})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

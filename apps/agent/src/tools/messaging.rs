@@ -15,8 +15,9 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        MessagingApi, OpenMessagingPlaceRequest, ReadMessagingThroughRequest,
-        WriteMessagingMessageRequest,
+        CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
+        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -27,6 +28,16 @@ const CLIENT_NONCE_DOMAIN: &[u8] = b"sumi-messaging-tool-v1";
 const MAX_PLACE_ID_BYTES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
+const MAX_MESSAGE_ID_BYTES: usize = 256;
+const MAX_MARKER_ID_BYTES: usize = 256;
+// The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
+const MAX_EMOJI_BYTES: usize = 128;
+// The server bounds these notes at 200 and 500 characters; four bytes per
+// character covers any UTF-8 within those limits.
+const MAX_STATUS_NOTE_BYTES: usize = 800;
+const MAX_REPLY_LATER_NOTE_BYTES: usize = 2000;
+// A week, matching the server's bound on relative durations.
+const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -49,6 +60,37 @@ enum MessagingAction {
         #[serde(default)]
         reply_to: Option<String>,
     },
+    /// Toggle an emoji reaction on a message visible in the open place.
+    React {
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        emoji: String,
+    },
+    /// Declare one's own attention state.  Unlike every other action this one
+    /// is not about a place: it is about the person, so no view need be open.
+    Status {
+        status: MessagingStatus,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        expires_in_minutes: Option<u32>,
+    },
+    /// Promise a later reply to a message visible in the open place.
+    ReplyLater {
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        remind_in_minutes: Option<u32>,
+    },
+    /// Mark one's own earlier promise as kept.  Like the human's reply-later
+    /// list this is reachable from anywhere, not only from the place.
+    ResolveReplyLater { marker_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -60,11 +102,31 @@ enum MessagingUrgency {
     Fyi,
 }
 
+/// The three self-declared states.  There is no "offline" or "active": nothing
+/// here is observed, all of it is said.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessagingStatus {
+    Available,
+    Busy,
+    Away,
+}
+
+/// One message currently on this view's screen. Reactions may only target
+/// these (ADR 0011 §3: 見えていないものは操作できない — like a human, the
+/// agent reacts to what the open place shows, never to an unseen permalink).
+#[derive(Clone)]
+struct VisibleMessage {
+    message_id: String,
+    seq: Option<u64>,
+}
+
 #[derive(Default)]
 struct MessagingViewState {
     initialized: bool,
     focused_place_id: Option<String>,
     pending_read_through: Option<(String, u64)>,
+    visible_messages: Vec<VisibleMessage>,
 }
 
 pub(crate) struct MessagingTool {
@@ -108,17 +170,27 @@ fn messaging_parameters_schema() -> Value {
         "description": concat!(
             "Choose one messaging action and include only the fields used by that action. ",
             "overview needs no other fields; open requires place_id and may include before_seq ",
-            "or limit; write requires content and may include urgency or reply_to. Write acts on ",
-            "the place most recently opened in this tool view."
+            "or limit; write requires content and may include urgency or reply_to; react ",
+            "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
+            "one of message_id or seq and may include note or remind_in_minutes; status requires ",
+            "status and may include note or expires_in_minutes; resolve_reply_later requires ",
+            "marker_id. Write, react and reply_later act on the place most recently opened in ",
+            "this tool view; status and resolve_reply_later need no open place."
         ),
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["overview", "open", "write"],
+                "enum": [
+                    "overview", "open", "write", "react",
+                    "status", "reply_later", "resolve_reply_later"
+                ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
                     "shows one place and focuses it for later writes; write sends a message to ",
-                    "the currently open place."
+                    "the currently open place; react toggles an emoji reaction on a message ",
+                    "visible in the currently open place; reply_later promises a later reply to ",
+                    "such a message so others see it and you are reminded; status declares your ",
+                    "own availability; resolve_reply_later marks one of your promises as kept."
                 )
             },
             "place_id": {
@@ -148,6 +220,70 @@ fn messaging_parameters_schema() -> Value {
             "reply_to": {
                 "type": "string",
                 "description": "Optional for write and omitted for other actions. Message identifier to reply to."
+            },
+            "message_id": {
+                "type": "string",
+                "description": concat!(
+                    "For react and reply_later, omitted for other actions. The target message by ",
+                    "message_id. Provide exactly one of message_id or seq; the message must be ",
+                    "visible in the currently open place."
+                )
+            },
+            "seq": {
+                "type": "integer",
+                "minimum": 1,
+                "description": concat!(
+                    "For react and reply_later, omitted for other actions. The target message by ",
+                    "its seq in the currently open place. Provide exactly one of message_id or seq."
+                )
+            },
+            "emoji": {
+                "type": "string",
+                "description": concat!(
+                    "Required for react and omitted for other actions. Emoji to toggle on the ",
+                    "target message; reacting again with the same emoji removes your reaction."
+                )
+            },
+            "status": {
+                "type": "string",
+                "enum": ["available", "busy", "away"],
+                "description": concat!(
+                    "Required for status and omitted for other actions. Your own availability, ",
+                    "which you declare; nothing about you is published automatically."
+                )
+            },
+            "note": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for status and reply_later, omitted for other actions. A short ",
+                    "line others see alongside the state or the promise."
+                )
+            },
+            "expires_in_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10080,
+                "description": concat!(
+                    "Optional for status and omitted for other actions. Minutes until the status ",
+                    "lapses on its own; when omitted it holds until you replace it."
+                )
+            },
+            "remind_in_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10080,
+                "description": concat!(
+                    "Optional for reply_later and omitted for other actions. Minutes until you ",
+                    "are reminded to answer; when omitted the default delay is used. This time ",
+                    "is yours alone and is not shown to the other participants."
+                )
+            },
+            "marker_id": {
+                "type": "string",
+                "description": concat!(
+                    "Required for resolve_reply_later and omitted for other actions. The ",
+                    "marker_id returned when you made the promise."
+                )
             }
         },
         "required": ["action"],
@@ -163,7 +299,10 @@ impl Tool for MessagingTool {
             description: concat!(
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
-                "that currently open place. Opening never publishes presence."
+                "that currently open place, or react or promise a later reply to a ",
+                "message visible in it. Declare your own availability with status. ",
+                "Opening never publishes presence: what others see about your ",
+                "attention is only what you declare."
             )
             .to_owned(),
             parameters: messaging_parameters_schema(),
@@ -231,6 +370,9 @@ impl Tool for MessagingTool {
                     .and_then(Value::as_u64);
                 state.focused_place_id = Some(place_id.clone());
                 state.pending_read_through = last_visible_seq.map(|seq| (place_id, seq));
+                // The opened screen defines what can be reacted to; a new open
+                // (including paging with before_seq) replaces the screen.
+                state.visible_messages = visible_messages_from(&response);
                 response
             }
             MessagingAction::Write {
@@ -245,7 +387,7 @@ impl Tool for MessagingTool {
                     )
                 })?;
                 let nonce = client_nonce(ctx.flow_id, ctx.call_id);
-                tokio::select! {
+                let response = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
                     result = self.api.write(WriteMessagingMessageRequest {
                         place_id: &place_id,
@@ -255,8 +397,86 @@ impl Tool for MessagingTool {
                         client_nonce: &nonce,
                     }) => result,
                 }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // The freshly sent message appears on the sender's own screen,
+                // exactly like a human seeing their message land — so it is
+                // immediately reactable.
+                if let Some(message_id) = response.get("message_id").and_then(Value::as_str) {
+                    state.visible_messages.push(VisibleMessage {
+                        message_id: message_id.to_owned(),
+                        seq: response.get("seq").and_then(Value::as_u64),
+                    });
+                }
+                response
+            }
+            MessagingAction::React {
+                message_id,
+                seq,
+                emoji,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before reacting; reactions attach to messages visible in the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                let target = visible_target(&state, &message_id, seq, "react")?;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.react(ReactMessagingReactionRequest {
+                        place_id: &place_id,
+                        message_id: &target.message_id,
+                        emoji: &emoji,
+                    }) => result,
+                }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?
             }
+            MessagingAction::Status {
+                status,
+                note,
+                expires_in_minutes,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.set_status(SetMessagingStatusRequest {
+                    status: status_text(status),
+                    note: note.as_deref(),
+                    expires_in_minutes,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::ReplyLater {
+                message_id,
+                seq,
+                note,
+                remind_in_minutes,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before promising a reply; the promise attaches to a message visible in the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                let target = visible_target(&state, &message_id, seq, "promise a reply")?;
+                // The reminder itself arrives through the「予定された出来事」
+                // wake trigger (#128); this call only makes the promise durable.
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.reply_later(CreateMessagingReplyLaterRequest {
+                        place_id: &place_id,
+                        message_id: &target.message_id,
+                        note: note.as_deref(),
+                        remind_in_minutes,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::ResolveReplyLater { marker_id } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.resolve_reply_later(ResolveMessagingReplyLaterRequest {
+                    marker_id: &marker_id,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
         };
 
         let rendered = serde_json::to_string_pretty(&response)
@@ -295,7 +515,126 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::React {
+            message_id,
+            seq,
+            emoji,
+        } => {
+            validate_visible_selector(message_id, seq)?;
+            if emoji.is_empty()
+                || emoji.len() > MAX_EMOJI_BYTES
+                || emoji
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        MessagingAction::Status {
+            note,
+            expires_in_minutes,
+            ..
+        } => {
+            validate_optional_note(note, MAX_STATUS_NOTE_BYTES)?;
+            validate_relative_minutes(expires_in_minutes)
+        }
+        MessagingAction::ReplyLater {
+            message_id,
+            seq,
+            note,
+            remind_in_minutes,
+        } => {
+            validate_visible_selector(message_id, seq)?;
+            validate_optional_note(note, MAX_REPLY_LATER_NOTE_BYTES)?;
+            validate_relative_minutes(remind_in_minutes)
+        }
+        MessagingAction::ResolveReplyLater { marker_id } => {
+            validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
+        }
     }
+}
+
+/// Exactly one selector: the gesture lands on one visible message. React and
+/// reply_later share the rule because they are the same kind of act — a
+/// response to something on screen.
+fn validate_visible_selector(
+    message_id: &Option<String>,
+    seq: &Option<u64>,
+) -> Result<(), ToolError> {
+    if message_id.is_some() == seq.is_some() || seq == &Some(0) {
+        return Err(ToolError::InvalidArguments);
+    }
+    if message_id
+        .as_deref()
+        .is_some_and(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_err())
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+fn validate_optional_note(note: &Option<String>, max_bytes: usize) -> Result<(), ToolError> {
+    if note
+        .as_deref()
+        .is_some_and(|note| note.len() > max_bytes || note.chars().any(char::is_control))
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// Durations the agent names are relative, so the server's clock fixes the
+/// instant. Zero would mean "now", which is a reminder nobody asked for.
+fn validate_relative_minutes(minutes: &Option<u32>) -> Result<(), ToolError> {
+    if minutes.is_some_and(|minutes| minutes == 0 || minutes > MAX_RELATIVE_MINUTES) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// Resolves one selector against the screen this view currently shows. A
+/// message that is not on it cannot be acted on at all (ADR 0011 §3:
+/// 見えていないものは操作できない).
+fn visible_target(
+    state: &MessagingViewState,
+    message_id: &Option<String>,
+    seq: Option<u64>,
+    verb: &str,
+) -> Result<VisibleMessage, ToolError> {
+    state
+        .visible_messages
+        .iter()
+        .find(|message| match (message_id, seq) {
+            (Some(id), _) => &message.message_id == id,
+            (None, Some(seq)) => message.seq == Some(seq),
+            (None, None) => false,
+        })
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::Protocol(format!(
+                "that message is not visible in the currently open place; open the place (paging with before_seq if needed) so the message is on screen, then {verb}"
+            ))
+        })
+}
+
+/// Extracts the reactable screen contents from an open response. Entries
+/// without a message_id (unexpected wire shapes) are skipped fail-closed.
+fn visible_messages_from(response: &Value) -> Vec<VisibleMessage> {
+    response
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| {
+                    let message_id = message.get("message_id")?.as_str()?.to_owned();
+                    let seq = message.get("seq").and_then(Value::as_u64);
+                    Some(VisibleMessage { message_id, seq })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_bounded_nonempty(value: &str, max_bytes: usize) -> Result<(), ToolError> {
@@ -310,6 +649,14 @@ const fn urgency_text(urgency: MessagingUrgency) -> &'static str {
         MessagingUrgency::Urgent => "urgent",
         MessagingUrgency::Normal => "normal",
         MessagingUrgency::Fyi => "fyi",
+    }
+}
+
+const fn status_text(status: MessagingStatus) -> &'static str {
+    match status {
+        MessagingStatus::Available => "available",
+        MessagingStatus::Busy => "busy",
+        MessagingStatus::Away => "away",
     }
 }
 
@@ -347,6 +694,10 @@ mod tests {
         calls: AsyncMutex<Vec<String>>,
         reads: AsyncMutex<Vec<(String, u64)>>,
         writes: AsyncMutex<Vec<(String, String, String)>>,
+        reacts: AsyncMutex<Vec<(String, String, String)>>,
+        statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
+        promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
+        resolutions: AsyncMutex<Vec<String>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -367,7 +718,11 @@ mod tests {
                 "latest_seq": 7,
                 "last_read_seq": 3,
                 "members": [],
-                "messages": [{"seq": 7, "content": "hello"}]
+                "messages": [
+                    {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": []},
+                    {"message_id": "m7", "seq": 7, "content": "hello",
+                     "reactions": [{"emoji": "👍", "participants": []}]}
+                ]
             }))
         }
 
@@ -381,7 +736,73 @@ mod tests {
                 request.content.to_owned(),
                 request.client_nonce.to_owned(),
             ));
-            Ok(json!({"message_id": "m1", "seq": 8}))
+            Ok(json!({"message_id": "m8", "seq": 8}))
+        }
+
+        async fn react(&self, request: ReactMessagingReactionRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("react:{}:{}", request.place_id, request.message_id));
+            self.reacts.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                request.emoji.to_owned(),
+            ));
+            Ok(json!({
+                "message": {"message_id": request.message_id,
+                            "reactions": [{"emoji": request.emoji, "participants": []}]},
+                "reacted": true
+            }))
+        }
+
+        async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("status:{}", request.status));
+            self.statuses.lock().await.push((
+                request.status.to_owned(),
+                request.note.map(str::to_owned),
+                request.expires_in_minutes,
+            ));
+            Ok(json!({"status": {"status": request.status, "note": request.note.unwrap_or("")}}))
+        }
+
+        async fn reply_later(
+            &self,
+            request: CreateMessagingReplyLaterRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("reply_later:{}", request.message_id));
+            self.promises.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                request.note.map(str::to_owned),
+                request.remind_in_minutes,
+            ));
+            Ok(json!({
+                "marker": {"marker_id": "marker-1", "message_id": request.message_id,
+                           "remind_at": "2026-08-04T12:00:00Z", "resolved": false},
+                "created": true
+            }))
+        }
+
+        async fn resolve_reply_later(
+            &self,
+            request: ResolveMessagingReplyLaterRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("resolve:{}", request.marker_id));
+            self.resolutions
+                .lock()
+                .await
+                .push(request.marker_id.to_owned());
+            Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
         }
 
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
@@ -465,7 +886,15 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["action"]["enum"],
-            json!(["overview", "open", "write"])
+            json!([
+                "overview",
+                "open",
+                "write",
+                "react",
+                "status",
+                "reply_later",
+                "resolve_reply_later"
+            ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
@@ -474,12 +903,25 @@ mod tests {
             schema["properties"]["urgency"]["enum"],
             json!(["urgent", "normal", "fyi"])
         );
+        assert_eq!(schema["properties"]["seq"]["minimum"], 1);
+        assert_eq!(schema["properties"]["emoji"]["type"], "string");
+        assert_eq!(schema["properties"]["message_id"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            json!(["available", "busy", "away"])
+        );
+        assert_eq!(schema["properties"]["note"]["type"], "string");
+        assert_eq!(schema["properties"]["marker_id"]["type"], "string");
+        for field in ["expires_in_minutes", "remind_in_minutes"] {
+            assert_eq!(schema["properties"][field]["minimum"], 1);
+            assert_eq!(schema["properties"][field]["maximum"], 10080);
+        }
         assert_eq!(
             schema["properties"]
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            7
+            15
         );
     }
 
@@ -519,6 +961,63 @@ mod tests {
                 urgency: MessagingUrgency::Fyi,
                 reply_to: Some(reply_to)
             } if content == "hello" && reply_to == "message-1"
+        ));
+
+        let react: MessagingAction = serde_json::from_value(json!({
+            "action": "react",
+            "seq": 7,
+            "emoji": "👍"
+        }))
+        .unwrap();
+        assert!(matches!(
+            react,
+            MessagingAction::React {
+                message_id: None,
+                seq: Some(7),
+                emoji
+            } if emoji == "👍"
+        ));
+
+        let status: MessagingAction = serde_json::from_value(json!({
+            "action": "status",
+            "status": "busy",
+            "note": "取り込み中",
+            "expires_in_minutes": 45
+        }))
+        .unwrap();
+        assert!(matches!(
+            status,
+            MessagingAction::Status {
+                status: MessagingStatus::Busy,
+                note: Some(note),
+                expires_in_minutes: Some(45)
+            } if note == "取り込み中"
+        ));
+
+        let reply_later: MessagingAction = serde_json::from_value(json!({
+            "action": "reply_later",
+            "message_id": "message-1",
+            "remind_in_minutes": 30
+        }))
+        .unwrap();
+        assert!(matches!(
+            reply_later,
+            MessagingAction::ReplyLater {
+                message_id: Some(message_id),
+                seq: None,
+                note: None,
+                remind_in_minutes: Some(30)
+            } if message_id == "message-1"
+        ));
+
+        let resolve: MessagingAction = serde_json::from_value(json!({
+            "action": "resolve_reply_later",
+            "marker_id": "marker-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            resolve,
+            MessagingAction::ResolveReplyLater { marker_id } if marker_id == "marker-1"
         ));
     }
 
@@ -595,5 +1094,266 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api.reads.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn react_requires_an_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert!(api.reacts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn react_targets_only_messages_visible_on_the_open_screen() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        // By seq and by message_id, both against the visible screen.
+        execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "r1",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "react", "message_id": "m6", "emoji": "🎉"}),
+            "r2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.reacts.lock().await.as_slice(),
+            &[
+                ("general".to_owned(), "m7".to_owned(), "👍".to_owned()),
+                ("general".to_owned(), "m6".to_owned(), "🎉".to_owned()),
+            ]
+        );
+
+        // A message that is not on the screen cannot be reacted to, whether
+        // addressed by id or by seq (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "react", "message_id": "m404", "emoji": "👍"}),
+            "r3",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 99, "emoji": "👍"}),
+            "r4",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert_eq!(api.reacts.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn react_rejects_ambiguous_or_malformed_selectors() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        for arguments in [
+            json!({"action": "react", "emoji": "👍"}),
+            json!({"action": "react", "message_id": "m7", "seq": 7, "emoji": "👍"}),
+            json!({"action": "react", "seq": 0, "emoji": "👍"}),
+            json!({"action": "react", "seq": 7, "emoji": ""}),
+            json!({"action": "react", "seq": 7, "emoji": "a b"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert!(api.reacts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_is_declared_without_opening_a_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // Attention state is about the person, not about a screen, so unlike
+        // write/react/reply_later it needs no place in view.
+        execute(
+            &tool,
+            json!({"action": "status", "status": "busy", "note": "別の対応中です",
+                   "expires_in_minutes": 45}),
+            "status",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.statuses.lock().await.as_slice(),
+            &[(
+                "busy".to_owned(),
+                Some("別の対応中です".to_owned()),
+                Some(45)
+            )]
+        );
+
+        // Omitted fields stay off the wire so the server applies its own
+        // defaults rather than receiving a null it must interpret.
+        execute(
+            &tool,
+            json!({"action": "status", "status": "available"}),
+            "status-2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.statuses.lock().await[1],
+            ("available".to_owned(), None, None)
+        );
+
+        for arguments in [
+            json!({"action": "status"}),
+            json!({"action": "status", "status": "invisible"}),
+            json!({"action": "status", "status": "busy", "expires_in_minutes": 0}),
+            json!({"action": "status", "status": "busy", "expires_in_minutes": 10081}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.statuses.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reply_later_targets_only_messages_visible_on_the_open_screen() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        let error = execute(
+            &tool,
+            json!({"action": "reply_later", "seq": 7}),
+            "no-place",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "reply_later", "seq": 7, "note": "後で必ず返します",
+                   "remind_in_minutes": 60}),
+            "promise",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.promises.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "m7".to_owned(),
+                Some("後で必ず返します".to_owned()),
+                Some(60)
+            )]
+        );
+
+        // A message the open place does not show cannot be promised a reply,
+        // exactly as it cannot be reacted to.
+        let error = execute(
+            &tool,
+            json!({"action": "reply_later", "message_id": "m404"}),
+            "missing",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+
+        for arguments in [
+            json!({"action": "reply_later"}),
+            json!({"action": "reply_later", "message_id": "m7", "seq": 7}),
+            json!({"action": "reply_later", "seq": 0}),
+            json!({"action": "reply_later", "seq": 7, "remind_in_minutes": 0}),
+            json!({"action": "reply_later", "seq": 7, "remind_in_minutes": 10081}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.promises.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolving_a_promise_needs_only_its_marker() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // Like the human's reply-later list, keeping a promise is reachable
+        // from anywhere — the place it was made in need not be open.
+        execute(
+            &tool,
+            json!({"action": "resolve_reply_later", "marker_id": "marker-1"}),
+            "resolve",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.resolutions.lock().await.as_slice(),
+            &["marker-1".to_owned()]
+        );
+
+        for arguments in [
+            json!({"action": "resolve_reply_later"}),
+            json!({"action": "resolve_reply_later", "marker_id": ""}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.resolutions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn own_written_message_is_immediately_reactable() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "追記"}),
+            "write",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "react", "seq": 8, "emoji": "✅"}),
+            "react",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.reacts.lock().await.as_slice(),
+            &[("general".to_owned(), "m8".to_owned(), "✅".to_owned())]
+        );
     }
 }
