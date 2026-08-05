@@ -422,6 +422,11 @@ func (s *Store) EnsureFoundingAdmin(ctx context.Context, participant Participant
 		`SELECT EXISTS (
 		   SELECT 1 FROM participant_roles pr
 		   JOIN workspace_roles wr ON wr.role_id = pr.role_id
+		   JOIN workspace_members wm
+		     ON wm.workspace_id = wr.workspace_id
+		    AND wm.member_kind = pr.member_kind
+		    AND wm.member_id = pr.member_id
+		    AND wm.left_at IS NULL
 		   WHERE wr.workspace_id = $1
 		     AND COALESCE((wr.permissions ->> 'manage_roles')::boolean, false))`,
 		DefaultWorkspaceID).Scan(&administered); err != nil {

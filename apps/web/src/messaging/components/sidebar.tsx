@@ -62,6 +62,7 @@ function PlaceRow({
   onEditChannel,
   onDuplicateChannel,
   onCreateChannel,
+  canManageChannels,
   onOpen,
 }: {
   placeKey: PlaceKey;
@@ -74,6 +75,7 @@ function PlaceRow({
   onEditChannel: (channelId: string) => void;
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
+  canManageChannels: boolean;
   /** 開くときの追加の作用（ボイスチャンネルはそのまま通話へ入る）。 */
   onOpen?: () => void;
 }) {
@@ -88,7 +90,8 @@ function PlaceRow({
   const muted = level === "mute";
   // channelには編集・複製・作成があるので、通知設定を持たない構成でもメニューは
   // 意味を持つ。DM行は通知設定しか無いので、それが無ければメニュー自体を出さない。
-  const hasMenu = channelId !== null || canConfigureNotifications;
+  const hasMenu =
+    (channelId !== null && canManageChannels) || canConfigureNotifications;
   return (
     <div
       className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors ${
@@ -145,6 +148,7 @@ function PlaceRow({
           }
           open={menuOpen}
           onOpenChange={setMenuOpen}
+          canManageChannels={canManageChannels}
           onEditChannel={onEditChannel}
           onDuplicateChannel={onDuplicateChannel}
           onCreateChannel={onCreateChannel}
@@ -708,6 +712,7 @@ export function Sidebar() {
                 }
                 unread={unread}
                 mentions={mentions}
+                canManageChannels={canManageChannels}
                 onOpen={channel.voice ? () => void joinCall(key) : undefined}
                 {...menuActions}
               />
@@ -752,6 +757,7 @@ export function Sidebar() {
               }
               unread={unread}
               mentions={unread}
+              canManageChannels={canManageChannels}
               {...menuActions}
             />
           );

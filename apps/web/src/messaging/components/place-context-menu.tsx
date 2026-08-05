@@ -36,6 +36,7 @@ export function PlaceContextMenu({
   trigger,
   open,
   onOpenChange,
+  canManageChannels,
   onEditChannel,
   onDuplicateChannel,
   onCreateChannel,
@@ -46,6 +47,7 @@ export function PlaceContextMenu({
   trigger: ReactElement;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  canManageChannels: boolean;
   onEditChannel: (channelId: string) => void;
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
@@ -80,7 +82,7 @@ export function PlaceContextMenu({
         sideOffset={4}
         className="w-52 rounded-lg bg-background p-1"
       >
-        {channelId ? (
+        {channelId && canManageChannels ? (
           <>
             <button
               type="button"

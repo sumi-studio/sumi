@@ -519,3 +519,28 @@ func TestFoundingAdminOnlyFiresWhileNobodyAdministers(t *testing.T) {
 		t.Fatalf("second human permissions = %#v, want none", granted)
 	}
 }
+
+func TestFoundingAdminIgnoresAdminAssignmentsOutsideTheWorkspace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+
+	// A participant_roles row may outlive active membership in the shared
+	// workspace. It must not strand the workspace by counting as its admin.
+	if _, err := w.store.pool.Exec(ctx,
+		`INSERT INTO participant_roles (role_id, member_kind, member_id)
+		 VALUES ($1, $2, $3)`,
+		DefaultAdminRoleID, w.humanB.Kind, w.humanB.ID); err != nil {
+		t.Fatalf("seed non-member Admin assignment: %v", err)
+	}
+	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+		t.Fatalf("admit first active human: %v", err)
+	}
+	granted, err := w.store.PermissionsFor(ctx, DefaultWorkspaceID, w.humanA)
+	if err != nil {
+		t.Fatalf("first active human permissions: %v", err)
+	}
+	if !granted.Can(PermManageChannels) || !granted.Can(PermManageRoles) {
+		t.Fatalf("first active human permissions = %#v, want Admin", granted)
+	}
+}
