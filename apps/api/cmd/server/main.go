@@ -383,18 +383,20 @@ func newApplicationFromEnv() (*application, error) {
 			messagingStore.UsePush(dispatcher)
 			log.Print("messaging web push ready")
 		}
-		// 通話 (ADR 0012)。key/secret が無い deployment では call service を
-		// 作らず、通話の口を生やさない。テキストは通話に依存しない。
+		// 通話 (ADR 0012)。現在値のGETは常設し、SFU未設定でも空の状態を返す。
+		// token/webhookだけが503へ縮退するため、Webは404を障害として扱わずに済む。
 		livekit := messaging.LiveKitConfig{
 			URL:       strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_URL")),
 			APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
 			APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
 		}
+		calls := messaging.NewCallService(messagingServer, livekit)
+		messagingServer.Calls = calls
+		calls.RegisterRoutes(mux)
 		if livekit.APIKey != "" && livekit.APISecret != "" {
-			calls := messaging.NewCallService(messagingServer, livekit)
-			messagingServer.Calls = calls
-			calls.RegisterRoutes(mux)
 			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
+		} else {
+			log.Print("messaging calls unavailable (LiveKit is not configured)")
 		}
 		messagingServer.RegisterRoutes(mux)
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)

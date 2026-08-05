@@ -237,6 +237,10 @@ func TestCallRoutesFailClosedWithoutLiveKit(t *testing.T) {
 	service := &CallService{Server: &Server{}, Registry: NewCallRegistry()}
 	mux := http.NewServeMux()
 	service.RegisterRoutes(mux)
+	_, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, "/messaging/calls", nil))
+	if pattern != "GET /messaging/calls" {
+		t.Fatalf("unconfigured call-state route pattern = %q, want mounted GET route", pattern)
+	}
 	request := httptest.NewRequest(http.MethodPost, "/messaging/livekit/webhook", strings.NewReader("{}"))
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
