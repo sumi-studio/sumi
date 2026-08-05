@@ -15,6 +15,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  ReactionSummary,
   ReplyLaterMarker,
   StatusKind,
   Urgency,
@@ -26,6 +27,18 @@ import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
+/** 再接続時にreactionを読み直すmessage数の上限（serverの1ページ上限と同じ）。 */
+const REACTION_RESYNC_LIMIT = 200;
+
+/** reactionの同一判定用。無変化ならmessageの参照を保って再描画を避ける。 */
+function reactionsFingerprint(reactions: readonly ReactionSummary[]): string {
+  return reactions
+    .map(
+      (entry) =>
+        `${entry.emoji}:${entry.participants.map(participantKey).join(",")}`,
+    )
+    .join("|");
+}
 
 let backend: MessagingBackend = new ApiMessagingBackend();
 
@@ -128,14 +141,76 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 開発時のデバッグ・E2E検証用のstate参照口。
     (globalThis as Record<string, unknown>).__sumiMessaging = () => get();
   }
+  /**
+   * ロード済み範囲のreactionを読み直して収束させる。catch-upはcursorより後の
+   * messageしかreplayしないので、切断中やHub overflowで落ちたreaction eventは
+   * 二度と届かない。再接続のたびに直近のロード済みwindowを読み直す。
+   */
+  const resyncReactions = async (place: Place) => {
+    const key = placeKey(place);
+    const loaded = get().messagesByPlace[key];
+    if (!loaded || loaded.length === 0) return;
+    const fresh = await backend.fetchMessages(place, {
+      beforeSeq: loaded[loaded.length - 1].seq + 1,
+      limit: Math.min(loaded.length, REACTION_RESYNC_LIMIT),
+    });
+    const reactionsById = new Map(
+      fresh.map((message) => [message.messageId, message.reactions]),
+    );
+    set((state) => {
+      const current = state.messagesByPlace[key];
+      if (!current) return {};
+      let changed = false;
+      const next = current.map((message) => {
+        const reactions = reactionsById.get(message.messageId);
+        if (
+          !reactions ||
+          reactionsFingerprint(reactions) ===
+            reactionsFingerprint(message.reactions)
+        ) {
+          return message;
+        }
+        changed = true;
+        return { ...message, reactions };
+      });
+      if (!changed) return {};
+      return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+    });
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
-    if (
-      event.type === "message_created" ||
-      event.type === "message_edited" ||
-      event.type === "reaction_updated"
-    ) {
+    if (event.type === "reaction_updated") {
+      // reactionだけを差し替える。message全体を置き換えると、同時に届いた
+      // 編集をこのeventが巻き戻す。未ロードのmessageは無視でよい（後で読めば
+      // 現在のreactionが付いてくる）。
+      const key = placeKey(event.place);
+      set((state) => {
+        const current = state.messagesByPlace[key];
+        if (!current) return {};
+        let changed = false;
+        const next = current.map((message) => {
+          if (message.messageId !== event.messageId) return message;
+          if (
+            reactionsFingerprint(message.reactions) ===
+            reactionsFingerprint(event.reactions)
+          ) {
+            return message;
+          }
+          changed = true;
+          return { ...message, reactions: event.reactions };
+        });
+        if (!changed) return {};
+        return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+      });
+      return;
+    }
+    if (event.type === "caught_up") {
+      void resyncReactions(event.place).catch(() => undefined);
+      return;
+    }
+    if (event.type === "message_created" || event.type === "message_edited") {
       const key = placeKey(event.message.place);
       set((state) => {
         const existing = (state.messagesByPlace[key] ?? []).find(

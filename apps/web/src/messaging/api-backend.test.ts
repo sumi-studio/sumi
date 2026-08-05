@@ -145,6 +145,11 @@ describe("ApiMessagingBackend", () => {
     expect(backend.capabilities.reactions).toBe(true);
     await backend.bootstrap();
 
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+
     await backend.toggleReaction(channel, "message-1", "👍");
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reactions",
@@ -153,13 +158,25 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ emoji: "👍" }),
       }),
     );
+    // The socket echo can be dropped, so the authoritative POST response is
+    // projected locally rather than discarded.
+    expect(events).toEqual([
+      {
+        type: "reaction_updated",
+        place: channel,
+        messageId: "message-1",
+        reactions: [
+          {
+            emoji: "👍",
+            participants: [{ kind: "human", humanId: "human-1" }],
+          },
+        ],
+      },
+    ]);
+    events.length = 0;
 
     vi.useFakeTimers();
     try {
-      const events: ServerEvent[] = [];
-      backend.subscribe((event) => events.push(event), {
-        sinceByPlace: { "channel:channel-1": 4 },
-      });
       const socket = FakeWebSocket.instances[0];
       socket?.open();
       socket?.message({
@@ -167,19 +184,24 @@ describe("ApiMessagingBackend", () => {
         event: {
           type: "reaction_updated",
           place_id: "channel-1",
-          message: messageWire(1, "hello", [
-            {
-              emoji: "👍",
-              participants: [{ kind: "human", human_id: "human-1" }],
-            },
-          ]),
+          reaction: {
+            message_id: "message-1",
+            reactions: [
+              {
+                emoji: "👍",
+                participants: [{ kind: "human", human_id: "human-1" }],
+              },
+            ],
+          },
         },
       });
-      expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({
-        type: "reaction_updated",
-        message: {
-          seq: 1,
+      // The event is a reaction-only patch: it carries no content, so it can
+      // never roll back an edit that raced it.
+      expect(events).toEqual([
+        {
+          type: "reaction_updated",
+          place: channel,
+          messageId: "message-1",
           reactions: [
             {
               emoji: "👍",
@@ -187,7 +209,26 @@ describe("ApiMessagingBackend", () => {
             },
           ],
         },
+      ]);
+      events.length = 0;
+      // Clearing the last reaction arrives as an empty set, not an omission.
+      socket?.message({
+        type: "event",
+        event: {
+          type: "reaction_updated",
+          place_id: "channel-1",
+          reaction: { message_id: "message-1", reactions: [] },
+        },
       });
+      expect(events).toEqual([
+        {
+          type: "reaction_updated",
+          place: channel,
+          messageId: "message-1",
+          reactions: [],
+        },
+      ]);
+      events.length = 0;
       // A reaction to an old message must not rewind the replay cursor: the
       // reconnect hello still asks for everything after seq 4.
       socket?.close();
@@ -199,6 +240,14 @@ describe("ApiMessagingBackend", () => {
         type: "hello",
         cursors: { "channel-1": 4 },
       });
+      // caught_up is surfaced so the subscriber can re-read its loaded window:
+      // reactions below the cursor are never replayed by catch-up.
+      reconnected?.message({
+        type: "caught_up",
+        place_id: "channel-1",
+        latest_seq: 9,
+      });
+      expect(events).toEqual([{ type: "caught_up", place: channel }]);
     } finally {
       vi.useRealTimers();
     }

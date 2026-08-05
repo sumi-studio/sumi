@@ -551,7 +551,17 @@ export class MockMessagingServer implements MessagingBackend {
     } else {
       summary.participants.push(participant);
     }
-    this.emit({ type: "reaction_updated", message: { ...message } });
+    // reactionだけを配る部分更新。実backendと同じ形にしておかないと、mockでは
+    // 通るのに実接続で編集を巻き戻す、という差が出る。
+    this.emit({
+      type: "reaction_updated",
+      place: message.place,
+      messageId: message.messageId,
+      reactions: message.reactions.map((entry) => ({
+        emoji: entry.emoji,
+        participants: [...entry.participants],
+      })),
+    });
   }
 
   sendTyping(_place: Place): void {

@@ -200,10 +200,21 @@ export class ApiMessagingBackend implements MessagingBackend {
     messageId: string,
     emoji: string,
   ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
-      { method: "POST", body: { emoji } },
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
+        { method: "POST", body: { emoji } },
+      ),
     );
+    // The socket echo is best-effort (disconnect, hub overflow), but the POST
+    // response is authoritative, so project it locally instead of discarding
+    // it. Reaction state is an absolute set, so the duplicate echo is a no-op.
+    this.emit({
+      type: "reaction_updated",
+      place,
+      messageId,
+      reactions: asArray(asRecord(body.message).reactions).map(parseReaction),
+    });
   }
 
   sendTyping(place: Place): void {
@@ -296,7 +307,15 @@ export class ApiMessagingBackend implements MessagingBackend {
       this.emitConnection("connected");
       return;
     }
-    if (type === "caught_up" || type === "receipt") return;
+    if (type === "caught_up") {
+      // Catch-up replays only messages after the cursor, so reactions that
+      // landed on already-read messages while the socket was down are not in
+      // it. Surface the boundary so the subscriber can re-read what it holds.
+      const place = this.places.get(asString(frame.place_id));
+      if (place) this.emit({ type: "caught_up", place });
+      return;
+    }
+    if (type === "receipt") return;
     if (type === "error") throw new Error("messaging socket error");
     if (type !== "event") throw new Error("unknown messaging frame");
     const wire = asRecord(frame.event);
@@ -312,8 +331,18 @@ export class ApiMessagingBackend implements MessagingBackend {
       parsed = { type: eventType, message };
     } else if (eventType === "reaction_updated") {
       // A reaction can target a message older than the replay cursor, so it
-      // must never move the cursor (backwards or at all).
-      parsed = { type: eventType, message: parseMessage(wire.message) };
+      // must never move the cursor (backwards or at all). It is also a partial
+      // update: applying it as a whole message would roll back an edit that
+      // committed while this event was in flight.
+      const place = this.places.get(asString(wire.place_id));
+      if (!place) return;
+      const update = asRecord(wire.reaction);
+      parsed = {
+        type: eventType,
+        place,
+        messageId: asString(update.message_id),
+        reactions: asArray(update.reactions).map(parseReaction),
+      };
     } else if (eventType === "typing") {
       const id = asString(wire.place_id);
       const place = this.places.get(id);
@@ -326,7 +355,11 @@ export class ApiMessagingBackend implements MessagingBackend {
     } else {
       return;
     }
-    for (const listener of this.listeners) listener(parsed);
+    this.emit(parsed);
+  }
+
+  private emit(event: ServerEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 
   private stopSocket(): void {

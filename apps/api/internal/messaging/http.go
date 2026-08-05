@@ -148,6 +148,25 @@ func reactionsToWire(summaries []ReactionSummary) []reactionWire {
 	return out
 }
 
+// reactionUpdateWire is the reaction_updated payload: the message identity plus
+// its complete reaction set. It deliberately omits content, mentions and
+// edited_at. ToggleReaction releases the message row lock at commit, so an edit
+// can commit and publish while this event is still being assembled; a full
+// message here would arrive late with pre-edit content and roll the edit back
+// on every live client. Reactions are an absolute set, so a late reaction
+// payload only costs a redundant repaint.
+type reactionUpdateWire struct {
+	MessageID string         `json:"message_id"`
+	Reactions []reactionWire `json:"reactions"`
+}
+
+func reactionUpdateToWire(m Message) reactionUpdateWire {
+	return reactionUpdateWire{
+		MessageID: m.MessageID,
+		Reactions: reactionsToWire(m.Reactions),
+	}
+}
+
 func messageToWire(place Place, m Message) messageWire {
 	w := messageWire{
 		MessageID:   m.MessageID,
@@ -731,12 +750,12 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	wire := messageToWire(place, msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Message: &wire})
+	update := reactionUpdateToWire(msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update})
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`
 		Reacted bool        `json:"reacted"`
-	}{Message: wire, Reacted: reacted})
+	}{Message: messageToWire(place, msg), Reacted: reacted})
 }
 
 func (s *Server) serveReadThrough(w http.ResponseWriter, r *http.Request) {

@@ -159,7 +159,21 @@ export type ServerEvent =
   | { type: "status_updated"; status: ParticipantStatus }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
-  | { type: "reaction_updated"; message: Message };
+  /**
+   * reactionだけの部分更新。message全体を運ばないのは、同時に走った編集より
+   * 遅れて届いたreaction eventがcontentを巻き戻さないようにするため。
+   */
+  | {
+      type: "reaction_updated";
+      place: Place;
+      messageId: string;
+      reactions: ReactionSummary[];
+    }
+  /**
+   * placeのcatch-up完了。cursorより手前のmessageに付いたreactionはreplayされ
+   * ないので、受け手はロード済み範囲を読み直して収束させる。
+   */
+  | { type: "caught_up"; place: Place };
 
 export interface SendMessageInput {
   place: Place;

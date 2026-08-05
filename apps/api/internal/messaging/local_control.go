@@ -201,7 +201,8 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 	}
 	wire := messageToWire(place, message)
 	if s.Hub != nil {
-		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Message: &wire})
+		update := reactionUpdateToWire(message)
+		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Reaction: &update})
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`

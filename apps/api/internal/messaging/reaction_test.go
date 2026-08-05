@@ -201,7 +201,17 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	if event["type"] != EventReactionUpdated {
 		t.Fatalf("event = %v", event)
 	}
-	eventReactions := event["message"].(map[string]any)["reactions"].([]any)
+	// The event is a partial update: identity plus reactions, never a whole
+	// message. A full message would carry the pre-lock content and roll back a
+	// concurrent edit that committed after this toggle released the row lock.
+	if _, ok := event["message"]; ok {
+		t.Fatalf("reaction event must not carry a message: %v", event)
+	}
+	update := event["reaction"].(map[string]any)
+	if update["message_id"] != msg.MessageID {
+		t.Fatalf("reaction message_id = %v, want %v", update["message_id"], msg.MessageID)
+	}
+	eventReactions := update["reactions"].([]any)
 	participants := eventReactions[0].(map[string]any)["participants"].([]any)
 	if len(participants) != 1 || participants[0].(map[string]any)["human_id"] != w.humanA.ID {
 		t.Fatalf("event participants = %v", participants)
@@ -223,6 +233,18 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	replayedReactions := replayed["reactions"].([]any)
 	if len(replayedReactions) != 1 || replayedReactions[0].(map[string]any)["emoji"] != "👍" {
 		t.Fatalf("replayed reactions = %v", replayedReactions)
+	}
+
+	// Removing the last reaction publishes an empty set rather than omitting
+	// the field, so a client can tell "cleared" from "unchanged".
+	resp, _ = call(t, ts, http.MethodPost, path, w.humanA.ID, map[string]any{"emoji": "👍"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("untoggle: status %d", resp.StatusCode)
+	}
+	frame = readFrame(t, conn)
+	cleared := frame["event"].(map[string]any)["reaction"].(map[string]any)
+	if got, ok := cleared["reactions"].([]any); !ok || len(got) != 0 {
+		t.Fatalf("cleared reactions = %v", cleared["reactions"])
 	}
 }
 

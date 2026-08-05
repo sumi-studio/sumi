@@ -34,6 +34,9 @@ const maxHelloCursors = 1024
 //
 // Durable truth stays in the store; the socket only carries it. A dropped or
 // slow connection loses nothing — reconnect with cursors replays from seq.
+// Reactions are the one mutation seq cannot replay: they change messages at or
+// below the cursor. They ride as event{reaction{message_id, reactions}}, and
+// the client re-reads its loaded window on caught_up to converge.
 type WSServer struct {
 	Store          *Store
 	Sessions       agentevents.UserSessionAuthorizer
