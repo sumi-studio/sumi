@@ -546,6 +546,77 @@ export const useMessaging = create<MessagingState>((set, get) => {
     }
   };
 
+  /**
+   * 再接続時のplace突き合わせ。place lifecycle event（place_created /
+   * place_updated）はcursor replayの対象外で、durableな正本はplacesそのもの。
+   * 切断中に作られたchannel/DMや編集されたtopicはeventとして二度と届かないため、
+   * 再接続のたびにbootstrapを読み直してplace一覧を取り直す。
+   *
+   * 進行中のローカルstate（下書き・選択中のplace・読み込み済みメッセージ・
+   * 送信待ち）は触らない。既知placeの既読と未読はcursor replayとローカルの
+   * 既読進行が正本で、bootstrapのスナップショットで塗り直すと読んだはずの
+   * メッセージが未読へ巻き戻る。未読を採用するのはこのクライアントがまだ
+   * 知らなかったplaceだけにする。
+   */
+  const reconcilePlaces = async () => {
+    const currentBackend = backend;
+    const currentIdentity = getMessagingSessionIdentity();
+    const expectedSelfKey = get().selfKey;
+    const snapshot = await currentBackend.bootstrap();
+    if (
+      backend !== currentBackend ||
+      getMessagingSessionIdentity() !== currentIdentity ||
+      get().selfKey !== expectedSelfKey ||
+      participantKey(snapshot.self) !== expectedSelfKey
+    ) {
+      // セッション境界を越えた応答は別人のsnapshotなので捨てる。
+      return;
+    }
+    const state = get();
+    const known = new Set<PlaceKey>([
+      ...state.channels.map((entry) =>
+        placeKey({ kind: "channel", channelId: entry.channelId }),
+      ),
+      ...state.dms.map((entry) =>
+        placeKey({ kind: entry.kind, dmId: entry.dmId }),
+      ),
+    ]);
+    const membersByKey: Record<ParticipantKey, MemberProfile> = {};
+    for (const member of snapshot.members) {
+      membersByKey[participantKey(member.participant)] = member;
+    }
+    const lastReadByPlace = { ...state.lastReadByPlace };
+    for (const marker of snapshot.readMarkers) {
+      const key = placeKey(marker.place);
+      if (!known.has(key)) lastReadByPlace[key] = marker.lastReadSeq;
+    }
+    const unreadCountByPlace = { ...state.unreadCountByPlace };
+    const mentionCountByPlace = { ...state.mentionCountByPlace };
+    const sinceByPlace: Record<PlaceKey, number> = {};
+    for (const summary of snapshot.unreadSummaries) {
+      const key = placeKey(summary.place);
+      if (known.has(key)) continue;
+      unreadCountByPlace[key] = summary.unreadCount;
+      mentionCountByPlace[key] = summary.mentionCount;
+      sinceByPlace[key] = summary.latestSeq;
+    }
+    set({
+      workspaces: snapshot.workspaces,
+      channels: snapshot.channels,
+      dms: snapshot.dms,
+      membersByKey,
+      lastReadByPlace,
+      unreadCountByPlace,
+      mentionCountByPlace,
+    });
+    if (Object.keys(sinceByPlace).length > 0) {
+      // 新しく見つかったplaceのcursorを登録し、次の切断でもそのplaceの
+      // durable eventがreplayされるようにする。applyEventは同一参照なので
+      // listenerは重複しない。
+      currentBackend.subscribe(applyEvent, { sinceByPlace });
+    }
+  };
+
   const PAGE_SIZE = 50;
 
   const loadPlace = async (place: Place) => {
@@ -704,7 +775,18 @@ export const useMessaging = create<MessagingState>((set, get) => {
             employedAgents: snapshot.employedAgents,
           });
           backend.subscribe(applyEvent, { sinceByPlace });
-          backend.subscribeConnection((state) => set({ connection: state }));
+          // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
+          // 再接続なので、replayされないplace lifecycleを読み直す。
+          let connectedOnce = false;
+          backend.subscribeConnection((connection) => {
+            set({ connection });
+            if (connection !== "connected") return;
+            if (!connectedOnce) {
+              connectedOnce = true;
+              return;
+            }
+            void reconcilePlaces().catch(() => undefined);
+          });
         })
         .catch(() => {
           initialized = false;

@@ -337,6 +337,8 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const mentionCountByPlace = useMessaging(
     (state) => state.mentionCountByPlace,
   );
+  const channels = useMessaging((state) => state.channels);
+  const dms = useMessaging((state) => state.dms);
   const listRef = useRef<MessageListHandle>(null);
   const [membersOpen, setMembersOpen] = useState(true);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
@@ -346,10 +348,13 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   }, [init]);
 
   // URLが現在地の正本。route paramのplaceをstoreへ同期する。
+  // selectPlaceは未知のplaceを黙って捨てるので、place一覧が変わったら
+  // （live event・再接続後の突き合わせ）もう一度同期し直す。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: place一覧の変化を選び直しのトリガーにする
   useEffect(() => {
     if (!ready || !placeKey) return;
     if (placeKey !== activePlaceKey) selectPlace(placeKey);
-  }, [ready, placeKey, activePlaceKey, selectPlace]);
+  }, [ready, placeKey, activePlaceKey, selectPlace, channels, dms]);
 
   // タブタイトルへ未読を集約する。ウィンドウが裏にあっても件数が見える。
   useEffect(() => {
