@@ -332,6 +332,7 @@ export const MessageItem = memo(function MessageItem({
             participantKey={participantKey(replyTarget.author)}
             name={replyAuthor.displayName}
             size={16}
+            src={replyAuthor.avatarUrl}
           />
           <span className="shrink-0 font-medium text-foreground/80">
             {replyAuthor.displayName}

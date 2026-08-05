@@ -45,6 +45,7 @@ const membersByKey: Record<ParticipantKey, MemberProfile> = {
     participant: agent,
     displayName: "墨",
     tagline: "秘書",
+    avatarUrl: "/messaging/attachments/agent-avatar",
   },
 };
 
@@ -142,6 +143,10 @@ describe("MessageItem の行の見せ方", () => {
     const quote = screen.getByTitle("墨 の返信元へ移動");
     expect(quote).toHaveTextContent("墨");
     expect(quote).toHaveTextContent("元のメッセージ");
+    expect(quote.querySelector("img")).toHaveAttribute(
+      "src",
+      "/messaging/attachments/agent-avatar",
+    );
     // カギ線 → ミニアバター → 名前 → 抜粋 の順で一つの階層に並ぶ。
     const connector = quote.querySelector("span[aria-hidden]");
     expect(connector?.className).toContain("border-l-2");
