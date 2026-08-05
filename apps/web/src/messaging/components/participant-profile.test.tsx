@@ -46,6 +46,8 @@ beforeEach(() => {
         status: "busy",
         note: "設計中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     },
     startDM: mocks.startDM,

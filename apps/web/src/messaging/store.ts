@@ -109,7 +109,7 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string): void;
+  setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
   setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
   setNotificationDefaultLevel(level: NotificationLevel): void;
   setNotificationKeywords(keywords: string[]): void;
@@ -373,6 +373,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [participantKey(event.status.participant)]: event.status,
         },
       }));
+      return;
+    }
+    if (event.type === "status_cleared") {
+      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
+      set((state) => {
+        const key = participantKey(event.participant);
+        if (!(key in state.statusByKey)) return {};
+        const statusByKey = { ...state.statusByKey };
+        delete statusByKey[key];
+        return { statusByKey };
+      });
       return;
     }
     if (event.type === "reply_later_created") {
@@ -856,8 +867,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.markRead(place, seq);
     },
 
-    setStatus(status, note) {
-      void backend.setStatus(status, note).catch(() => undefined);
+    setStatus(status, note, expiresAt = null) {
+      void backend.setStatus(status, note, expiresAt).catch(() => undefined);
     },
 
     setPlaceNotificationLevel(key, level) {

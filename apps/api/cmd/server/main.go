@@ -86,6 +86,14 @@ func run(ctx context.Context) (runErr error) {
 		defer cancelReaper()
 		go runIdleReaper(reaperCtx, app.spawnManager)
 	}
+	// Temporary statuses lapse back to what the participant had said before.
+	// Readers resolve that themselves, so this loop only makes the change
+	// visible on screens that are already open.
+	if app.messaging != nil {
+		expiryCtx, cancelExpiry := context.WithCancel(ctx)
+		defer cancelExpiry()
+		go app.messaging.RunStatusExpiry(expiryCtx, messaging.DefaultStatusExpiryInterval)
+	}
 	if app.localMux == nil {
 		return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
 	}
@@ -214,6 +222,7 @@ type application struct {
 	database      *db.Pool
 	spawnManager  *spawn.Manager
 	localRuntimes *agentevents.LocalControlListenerRegistry
+	messaging     *messaging.Server
 	closeOnce     sync.Once
 	closeErr      error
 }
@@ -429,6 +438,7 @@ func newApplicationFromEnv() (*application, error) {
 		database:      database,
 		spawnManager:  spawnManager,
 		localRuntimes: localRuntimes,
+		messaging:     messagingServer,
 	}, nil
 }
 

@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   updateChannel: vi.fn(),
   duplicateChannel: vi.fn(),
   setPlaceNotificationLevel: vi.fn(),
+  setStatus: vi.fn(),
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -68,8 +69,15 @@ beforeEach(() => {
     updateChannel: mocks.updateChannel,
     duplicateChannel: mocks.duplicateChannel,
     setPlaceNotificationLevel: mocks.setPlaceNotificationLevel,
+    setStatus: mocks.setStatus,
     notificationDefaultLevel: "all",
     notificationLevelByPlace: {},
+    capabilities: {
+      status: true,
+      replyLater: true,
+      reactions: true,
+      notifications: true,
+    },
   });
 });
 
@@ -216,6 +224,99 @@ describe("チャンネルのコンテキストメニュー", () => {
     expect(mocks.setPlaceNotificationLevel).toHaveBeenCalledWith(
       "channel:c1",
       "mentions",
+    );
+  });
+});
+
+describe("ステータス", () => {
+  function openStatusMenu() {
+    render(<Sidebar />);
+    fireEvent.click(screen.getByLabelText("アカウントとステータス"));
+    return within(screen.getByRole("menu", { name: "ステータス" }));
+  }
+
+  it("状態を選ぶと期間のサブメニューが横に開く", () => {
+    const menu = openStatusMenu();
+    // 期間は最初から並ばない——状態を選んでから聞かれる。
+    expect(screen.queryByText("15分")).not.toBeInTheDocument();
+    fireEvent.click(menu.getByRole("menuitem", { name: /取り込み中/ }));
+    const submenu = within(
+      screen.getByRole("menu", { name: "取り込み中の期間" }),
+    );
+    for (const label of ["15分", "1時間", "8時間", "24時間", "3日間"]) {
+      expect(
+        submenu.getByRole("menuitem", { name: label }),
+      ).toBeInTheDocument();
+    }
+    expect(
+      submenu.getByRole("menuitem", { name: "解除するまで" }),
+    ).toBeInTheDocument();
+  });
+
+  it("期間を選ぶと期限付きで申告する", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-05T09:00:00Z"));
+    try {
+      const menu = openStatusMenu();
+      fireEvent.change(menu.getByLabelText("ステータスのひとこと"), {
+        target: { value: "会議中" },
+      });
+      fireEvent.click(menu.getByRole("menuitem", { name: /取り込み中/ }));
+      fireEvent.click(
+        within(
+          screen.getByRole("menu", { name: "取り込み中の期間" }),
+        ).getByRole("menuitem", { name: "1時間" }),
+      );
+      expect(mocks.setStatus).toHaveBeenCalledWith(
+        "busy",
+        "会議中",
+        Date.parse("2026-08-05T10:00:00Z"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("解除するまでを選ぶと期限を付けない", () => {
+    const menu = openStatusMenu();
+    fireEvent.click(menu.getByRole("menuitem", { name: /離席中/ }));
+    fireEvent.click(
+      within(screen.getByRole("menu", { name: "離席中の期間" })).getByRole(
+        "menuitem",
+        { name: "解除するまで" },
+      ),
+    );
+    expect(mocks.setStatus).toHaveBeenCalledWith("away", "", null);
+  });
+
+  it("一時ステータスは「◯◯まで」と戻る先を出す", () => {
+    const expiresAt = Date.now() + 60 * 60_000;
+    useMessaging.setState({
+      statusByKey: {
+        [participantKey(self)]: {
+          participant: self,
+          status: "busy",
+          note: "会議中",
+          expiresAt,
+          baseStatus: "away",
+          baseNote: "外出中",
+        },
+      },
+    });
+    render(<Sidebar />);
+    const account = screen.getByLabelText("アカウントとステータス");
+    expect(account).toHaveTextContent("取り込み中 — 会議中");
+    expect(account).toHaveTextContent("まで");
+    fireEvent.click(account);
+    expect(
+      screen.getByText("期限が来たら「離席中」に戻ります"),
+    ).toBeInTheDocument();
+  });
+
+  it("宣言が無いときは未設定と言う（勝手に対応可能にしない）", () => {
+    render(<Sidebar />);
+    expect(screen.getByLabelText("アカウントとステータス")).toHaveTextContent(
+      "ステータス未設定",
     );
   });
 });

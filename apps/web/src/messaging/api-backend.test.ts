@@ -563,6 +563,8 @@ describe("ApiMessagingBackend", () => {
         status: "busy",
         note: "取り込み中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     ]);
     expect(snapshot.replyLaterMarkers.map((m) => m.remindAt)).toEqual([
@@ -570,12 +572,34 @@ describe("ApiMessagingBackend", () => {
       Date.parse("2026-08-01T11:00:00Z"),
     ]);
 
-    await backend.setStatus("busy", "取り込み中");
+    await backend.setStatus("busy", "取り込み中", null);
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/status",
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ status: "busy", note: "取り込み中" }),
+        body: JSON.stringify({
+          status: "busy",
+          note: "取り込み中",
+          expires_at: null,
+        }),
+      }),
+    );
+
+    // 期間付きの一時ステータスは、絶対時刻としてサーバーへ渡す。
+    await backend.setStatus(
+      "busy",
+      "会議中",
+      Date.parse("2026-08-01T12:00:00Z"),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/status",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          status: "busy",
+          note: "会議中",
+          expires_at: "2026-08-01T12:00:00.000Z",
+        }),
       }),
     );
 
@@ -604,9 +628,26 @@ describe("ApiMessagingBackend", () => {
         type: "status_updated",
         status: {
           participant: { kind: "human", human_id: "human-2" },
-          status: "away",
-          note: "",
+          status: "busy",
+          note: "会議中",
           expires_at: "2026-08-01T12:00:00Z",
+          base_status: "away",
+          base_note: "外出中",
+        },
+      },
+    });
+    // 空のstatusは欠損ではなく「宣言が終わった」という答え。
+    socket?.message({
+      type: "event",
+      event: {
+        type: "status_updated",
+        status: {
+          participant: { kind: "human", human_id: "human-2" },
+          status: "",
+          note: "",
+          expires_at: null,
+          base_status: "",
+          base_note: "",
         },
       },
     });
@@ -631,10 +672,16 @@ describe("ApiMessagingBackend", () => {
         type: "status_updated",
         status: {
           participant: { kind: "human", humanId: "human-2" },
-          status: "away",
-          note: "",
+          status: "busy",
+          note: "会議中",
           expiresAt: Date.parse("2026-08-01T12:00:00Z"),
+          baseStatus: "away",
+          baseNote: "外出中",
         },
+      },
+      {
+        type: "status_cleared",
+        participant: { kind: "human", humanId: "human-2" },
       },
       {
         type: "reply_later_created",

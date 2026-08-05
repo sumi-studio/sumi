@@ -363,6 +363,8 @@ export class MockMessagingServer implements MessagingBackend {
       status: "busy",
       note: "デプロイ対応中",
       expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
     });
   }
 
@@ -652,15 +654,58 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
-  async setStatus(status: StatusKind, note: string): Promise<void> {
+  async setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null = null,
+  ): Promise<void> {
+    const key = participantKey(SELF);
+    const current = this.statuses.get(key);
+    // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
+    // 一時の上に一時を重ねても、下にある恒久の宣言は埋もれない。
+    const base =
+      expiresAt === null
+        ? null
+        : current?.expiresAt !== null && current?.expiresAt !== undefined
+          ? current.baseStatus
+            ? { status: current.baseStatus, note: current.baseNote }
+            : null
+          : current
+            ? { status: current.status, note: current.note }
+            : null;
     const next: ParticipantStatus = {
       participant: SELF,
       status,
       note,
-      expiresAt: null,
+      expiresAt,
+      baseStatus: base?.status ?? null,
+      baseNote: base?.note ?? "",
     };
-    this.statuses.set(participantKey(SELF), next);
+    this.statuses.set(key, next);
     this.emit({ type: "status_updated", status: next });
+    if (expiresAt === null) return;
+    window.setTimeout(
+      () => {
+        // 期限が来ても、途中で置き換えられていたら何もしない。
+        if (this.statuses.get(key) !== next) return;
+        if (next.baseStatus === null) {
+          this.statuses.delete(key);
+          this.emit({ type: "status_cleared", participant: SELF });
+          return;
+        }
+        const restored: ParticipantStatus = {
+          participant: SELF,
+          status: next.baseStatus,
+          note: next.baseNote,
+          expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
+        };
+        this.statuses.set(key, restored);
+        this.emit({ type: "status_updated", status: restored });
+      },
+      Math.max(0, expiresAt - Date.now()),
+    );
   }
 
   async createReplyLater(
@@ -868,6 +913,8 @@ export class MockMessagingServer implements MessagingBackend {
           status: "available",
           note: "",
           expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
         };
         this.statuses.set(participantKey(persona.ref), status);
         this.emit({ type: "status_updated", status });

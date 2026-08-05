@@ -9,16 +9,13 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
-import type { PlaceKey, StatusKind } from "../model";
+import type { PlaceKey } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
 import { notificationLevelFor, useMessaging } from "../store";
-import { useOverlayPanel } from "./overlay";
-import { ParticipantAvatar, STATUS_LABEL } from "./participant-avatar";
+import { ParticipantAvatar } from "./participant-avatar";
 import { PlaceContextMenu } from "./place-context-menu";
-
-/** サイドバーのplace一覧。ここが自前のスクロール領域。 */
-const SIDEBAR_PLACES = '[data-slot="sidebar-places"]';
+import { StatusMenu, statusSummary } from "./status-menu";
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring/60 disabled:opacity-50";
@@ -125,6 +122,10 @@ function PlaceRow({
             type="button"
             aria-label="この場所のメニュー"
             aria-expanded={menuOpen}
+            onMouseDown={(event) => {
+              // トリガー上のmousedownを外側クリック判定に拾わせない（閉→即再開を防ぐ）。
+              event.stopPropagation();
+            }}
             onClick={(event) => {
               event.stopPropagation();
               setMenuOpen(!menuOpen);
@@ -593,19 +594,11 @@ export function Sidebar() {
   );
   const selfKey = useMessaging((state) => state.selfKey);
   const self = useMessaging((state) => state.self);
-  const setStatus = useMessaging((state) => state.setStatus);
   const canSetStatus = useMessaging((state) => state.capabilities.status);
   const duplicateChannel = useMessaging((state) => state.duplicateChannel);
   const placeNavigate = usePlaceNavigate();
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
-  // ステータスメニューはplace一覧の上に浮くので、ホイールは一覧へ渡す。
-  const statusOverlay = useOverlayPanel<HTMLButtonElement>({
-    open: statusMenuOpen,
-    onOpenChange: setStatusMenuOpen,
-    scrollPassthrough: () =>
-      document.querySelector<HTMLElement>(SIDEBAR_PLACES),
-  });
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
 
   const menuActions = {
@@ -622,6 +615,14 @@ export function Sidebar() {
 
   const selfProfile = self ? membersByKey[selfKey] : undefined;
   const selfStatus = statusByKey[selfKey];
+
+  // 「◯◯まで」の残りだけのための時計。期限で表示が黙って古くなるのを防ぐ。
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (selfStatus?.expiresAt == null) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [selfStatus?.expiresAt]);
 
   return (
     <aside className="flex w-60 shrink-0 flex-col border-border/70 border-r bg-muted/20">
@@ -700,60 +701,22 @@ export function Sidebar() {
         })}
       </nav>
       <div className="relative shrink-0 border-border/70 border-t p-2">
-        {statusMenuOpen && canSetStatus ? (
-          <div
-            {...statusOverlay.panelProps}
-            role="dialog"
-            aria-label="ステータス"
-            className="absolute bottom-full left-2 z-10 mb-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
-          >
-            {(Object.keys(STATUS_LABEL) as StatusKind[]).map((kind) => (
-              <label
-                key={kind}
-                className={`flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent active:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring/60 ${
-                  selfStatus?.status === kind ? "font-medium" : ""
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="self-status-choice"
-                  checked={selfStatus?.status === kind}
-                  onChange={() => {
-                    setStatus(kind, kind === "busy" ? "取り込み中" : "");
-                    setStatusMenuOpen(false);
-                  }}
-                  className="sr-only"
-                />
-                <span
-                  className={`size-2 rounded-full ${
-                    kind === "available"
-                      ? "bg-emerald-500"
-                      : kind === "busy"
-                        ? "bg-rose-500"
-                        : "bg-amber-400"
-                  }`}
-                />
-                {STATUS_LABEL[kind]}
-                <Check
-                  aria-hidden
-                  className={`ml-auto size-3.5 shrink-0 ${
-                    selfStatus?.status === kind ? "opacity-100" : "opacity-0"
-                  }`}
-                />
-              </label>
-            ))}
-            <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
-              ステータスは自己申告。誰かが勝手に晒すことはありません
-            </p>
-          </div>
+        {canSetStatus ? (
+          <StatusMenu open={statusMenuOpen} onOpenChange={setStatusMenuOpen} />
         ) : null}
         <button
           type="button"
+          aria-label="アカウントとステータス"
+          aria-expanded={statusMenuOpen}
           disabled={!canSetStatus}
           aria-haspopup="menu"
-          {...statusOverlay.triggerProps}
+          onMouseDown={(event) => {
+            // トリガー上のmousedownをStatusMenuの外側クリック判定に拾わせない。
+            // 拾わせると「mousedownで閉じ→clickで再オープン」になり閉じられない。
+            event.stopPropagation();
+          }}
           onClick={() => {
-            if (canSetStatus) statusOverlay.toggle();
+            if (canSetStatus) setStatusMenuOpen((open) => !open);
           }}
           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors enabled:hover:bg-accent/60 disabled:cursor-default"
         >
@@ -761,15 +724,14 @@ export function Sidebar() {
             participantKey={selfKey}
             name={selfProfile?.displayName ?? "?"}
             size={26}
-            status={selfStatus?.status ?? "available"}
+            status={selfStatus?.status}
           />
           <span className="min-w-0 flex-1">
             <span className="block truncate font-medium text-[13px]">
               {selfProfile?.displayName ?? "…"}
             </span>
             <span className="block truncate text-[11px] text-muted-foreground">
-              {selfStatus ? STATUS_LABEL[selfStatus.status] : "対応可能"}
-              {selfStatus?.note ? ` — ${selfStatus.note}` : ""}
+              {statusSummary(selfStatus, now)}
             </span>
           </span>
         </button>

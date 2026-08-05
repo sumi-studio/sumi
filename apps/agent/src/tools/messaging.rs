@@ -81,6 +81,9 @@ enum MessagingAction {
     },
     /// Declare one's own attention state.  Unlike every other action this one
     /// is not about a place: it is about the person, so no view need be open.
+    /// With `expires_in_minutes` the state is temporary and lapses back to
+    /// whatever was declared before it, so「1時間だけ取り込み中」does not have to
+    /// be undone by hand.
     Status {
         status: MessagingStatus,
         #[serde(default)]
@@ -324,7 +327,9 @@ fn messaging_parameters_schema() -> Value {
                 "enum": ["available", "busy", "away"],
                 "description": concat!(
                     "Required for status and omitted for other actions. Your own availability, ",
-                    "which you declare; nothing about you is published automatically."
+                    "which you declare; nothing about you is published automatically. These are ",
+                    "the only three states: there is no offline or invisible, because nothing ",
+                    "about your presence is observed in the first place."
                 )
             },
             "note": {
@@ -340,7 +345,9 @@ fn messaging_parameters_schema() -> Value {
                 "maximum": 10080,
                 "description": concat!(
                     "Optional for status and omitted for other actions. Minutes until the status ",
-                    "lapses on its own; when omitted it holds until you replace it."
+                    "lapses on its own, returning you to whatever you had declared before it — ",
+                    "use it for a state that is only true for a while (\"busy for the next ",
+                    "hour\"). When omitted the status holds until you replace it."
                 )
             },
             "remind_in_minutes": {

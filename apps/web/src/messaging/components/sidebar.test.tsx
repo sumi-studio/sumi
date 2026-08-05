@@ -70,18 +70,27 @@ describe("Sidebar", () => {
     );
   });
 
-  it("ステータスメニューは外側を押したら閉じる", () => {
+  it("ステータスメニューは外側を押したら閉じ、トリガーの押し直しでも閉じる", () => {
     render(<Sidebar />);
 
-    fireEvent.click(screen.getByRole("button", { name: /余白/ }));
+    const trigger = screen.getByLabelText("アカウントとステータス");
+    fireEvent.click(trigger);
     expect(
-      screen.getByRole("radio", { name: "取り込み中" }),
+      screen.getByRole("menu", { name: "ステータス" }),
     ).toBeInTheDocument();
 
-    fireEvent.pointerDown(screen.getByRole("navigation"));
-
+    // 外側のmousedownで閉じる（StatusMenuの外側クリック規律）。
+    fireEvent.mouseDown(screen.getByRole("navigation"));
     expect(
-      screen.queryByRole("radio", { name: "取り込み中" }),
+      screen.queryByRole("menu", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+
+    // トリガーで開き直し、トリガーをもう一度押すと（mousedown→clickの順でも）閉じる。
+    fireEvent.click(trigger);
+    fireEvent.mouseDown(trigger);
+    fireEvent.click(trigger);
+    expect(
+      screen.queryByRole("menu", { name: "ステータス" }),
     ).not.toBeInTheDocument();
   });
 });

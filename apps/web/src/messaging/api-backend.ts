@@ -286,10 +286,19 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 
   /** 自分のstatusだけを置き換える。参加者はsessionが決め、bodyには載せない。 */
-  async setStatus(status: StatusKind, note: string): Promise<void> {
+  async setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null,
+  ): Promise<void> {
     await this.request("/messaging/status", {
       method: "PUT",
-      body: { status, note },
+      body: {
+        status,
+        note,
+        expires_at:
+          expiresAt === null ? null : new Date(expiresAt).toISOString(),
+      },
     });
   }
 
@@ -451,7 +460,16 @@ export class ApiMessagingBackend implements MessagingBackend {
       parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
-      parsed = { type: eventType, status: parseStatus(wire.status) };
+      // 空のstatusは欠損ではなく「宣言が終わった」という答え——期限切れで
+      // 戻る先が無かった場合に届く。
+      const status = asRecord(wire.status);
+      parsed =
+        status.status === ""
+          ? {
+              type: "status_cleared",
+              participant: parseParticipant(status.participant),
+            }
+          : { type: eventType, status: parseStatus(status) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -645,6 +663,14 @@ function parseStatus(value: unknown): ParticipantStatus {
     status: asStatusKind(wire.status),
     note: asString(wire.note),
     expiresAt: wire.expires_at == null ? null : asTimestamp(wire.expires_at),
+    // 期限切れで戻る先。無ければ期限で宣言そのものが終わる。
+    baseStatus:
+      wire.base_status === undefined ||
+      wire.base_status === null ||
+      wire.base_status === ""
+        ? null
+        : asStatusKind(wire.base_status),
+    baseNote: typeof wire.base_note === "string" ? wire.base_note : "",
   };
 }
 

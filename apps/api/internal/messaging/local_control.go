@@ -258,9 +258,7 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	switch request.Status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(request.Status) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
