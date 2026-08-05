@@ -79,7 +79,11 @@ export function Composer() {
   const [urgency, setUrgency] = useState<Urgency>("normal");
   const [mention, setMention] = useState<MentionQuery | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
-  const drafts = useDraftAttachments(uploadAttachment);
+  const updateAttachment = useMessaging((state) => state.updateAttachment);
+  const drafts = useDraftAttachments({
+    upload: uploadAttachment,
+    update: updateAttachment,
+  });
   const [dragging, setDragging] = useState(false);
   const lastTypingAt = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -401,7 +405,15 @@ export function Composer() {
           addFiles(event.dataTransfer.files);
         }}
       >
-        <ComposerAttachments items={drafts.items} onRemove={drafts.remove} />
+        <ComposerAttachments
+          items={drafts.items}
+          onRemove={drafts.remove}
+          onToggleSpoiler={drafts.toggleSpoiler}
+          onEdit={(localId, edit) => {
+            void drafts.applyEdit(localId, edit);
+          }}
+          fileFor={drafts.fileFor}
+        />
         <textarea
           ref={textareaRef}
           value={value}

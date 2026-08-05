@@ -16,6 +16,15 @@ function draft(overrides: Partial<DraftAttachment> = {}): DraftAttachment {
     size: 68 * 1024,
     mime: "image/jpeg",
     status: "ready",
+    attachment: {
+      attachmentId: "attachment-1",
+      filename: "avatar.jpg",
+      mime: "image/jpeg",
+      size: 68 * 1024,
+      url: "/messaging/attachments/attachment-1",
+      spoiler: false,
+      alt: "",
+    },
     ...overrides,
   };
 }
@@ -73,6 +82,66 @@ describe("ComposerAttachments", () => {
 
     fireEvent.click(remove);
     expect(onRemove).toHaveBeenCalledWith("draft-1");
+  });
+
+  it("サムネイルのホバー操作からネタバレを切り替えられる", () => {
+    const onToggleSpoiler = vi.fn();
+    render(
+      <ComposerAttachments
+        items={[draft({ previewUrl: "blob:preview-1" })]}
+        onRemove={() => {}}
+        onToggleSpoiler={onToggleSpoiler}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "avatar.jpg のネタバレをマーク" }),
+    );
+    expect(onToggleSpoiler).toHaveBeenCalledWith("draft-1");
+  });
+
+  it("ネタバレ済みの下書きはぼかして「ネタバレ」と示す", () => {
+    render(
+      <ComposerAttachments
+        items={[
+          draft({
+            previewUrl: "blob:preview-1",
+            attachment: {
+              attachmentId: "attachment-1",
+              filename: "avatar.jpg",
+              mime: "image/jpeg",
+              size: 68 * 1024,
+              url: "/messaging/attachments/attachment-1",
+              spoiler: true,
+              alt: "",
+            },
+          }),
+        ]}
+        onRemove={() => {}}
+        onToggleSpoiler={() => {}}
+      />,
+    );
+
+    expect(screen.getByAltText("avatar.jpg のプレビュー").className).toContain(
+      "blur-md",
+    );
+    expect(screen.getByText("ネタバレ")).toBeInTheDocument();
+  });
+
+  it("編集ボタンから添付ファイルの編集を開く", () => {
+    render(
+      <ComposerAttachments
+        items={[draft()]}
+        onRemove={() => {}}
+        onEdit={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "avatar.jpg を編集" }));
+
+    const modal = screen.getByRole("dialog", { name: "添付ファイルを編集" });
+    expect(modal).toBeInTheDocument();
+    expect(screen.getByLabelText(/スポイラーとしてマーク/)).toBeInTheDocument();
   });
 
   it("大きすぎる添付は失敗として見せる", () => {

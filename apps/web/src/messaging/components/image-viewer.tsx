@@ -263,7 +263,7 @@ export function ImageViewer({
       >
         <img
           src={attachment.url}
-          alt={attachment.filename}
+          alt={attachment.alt || attachment.filename}
           className={
             zoomed
               ? "max-h-screen max-w-screen object-contain"
@@ -278,6 +278,9 @@ export function ImageViewer({
           <p className="text-white/60">
             {formatFileSize(attachment.size)}・{attachment.mime}
           </p>
+          {attachment.alt ? (
+            <p className="mt-1 text-white/70">{attachment.alt}</p>
+          ) : null}
         </div>
       ) : null}
 

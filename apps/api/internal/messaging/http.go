@@ -70,6 +70,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
+	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
@@ -147,6 +148,12 @@ type attachmentWire struct {
 	Filename     string `json:"filename"`
 	MIME         string `json:"mime"`
 	Size         int64  `json:"size"`
+	// Spoiler and Alt are the sender's declarations about the file. They travel
+	// with every delivery — REST, WebSocket and the agent's local control lane —
+	// so a PersonalityAgent reading a timeline knows「これはネタバレ画像だ」
+	// exactly as a human's screen does.
+	Spoiler bool   `json:"spoiler"`
+	Alt     string `json:"alt"`
 }
 
 func attachmentToWire(a Attachment) attachmentWire {
@@ -155,6 +162,8 @@ func attachmentToWire(a Attachment) attachmentWire {
 		Filename:     a.Filename,
 		MIME:         a.MIME,
 		Size:         a.SizeBytes,
+		Spoiler:      a.Spoiler,
+		Alt:          a.Alt,
 	}
 }
 
@@ -1592,6 +1601,72 @@ func (s *Server) serveAttachment(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", att.CreatedAt, blob)
 }
 
+// serveUpdateAttachment edits an upload before it is sent: display name,
+// description, and the spoiler flag. Only the uploader's own still-unbound
+// attachment can be edited — after send, what the recipients saw stands.
+//
+// An absent field is「触らない」, so a caller naming one preference does not
+// silently reset the others (the same shape as the notification settings
+// lane).
+func (s *Server) serveUpdateAttachment(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Filename *string `json:"filename"`
+		Alt      *string `json:"alt"`
+		Spoiler  *bool   `json:"spoiler"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Filename == nil && req.Alt == nil && req.Spoiler == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if req.Filename != nil {
+		name := sanitizeAttachmentFilename(*req.Filename)
+		req.Filename = &name
+	}
+	if req.Alt != nil {
+		alt := sanitizeAttachmentAlt(*req.Alt)
+		if utf8.RuneCountInString(alt) > MaxAttachmentAltRunes {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		req.Alt = &alt
+	}
+	var att Attachment
+	done, err := s.mutate(w, r, claims, func() error {
+		var updateErr error
+		att, updateErr = s.Store.UpdateDraftAttachment(r.Context(),
+			r.PathValue("attachment_id"), viewer,
+			AttachmentDraftPatch{Filename: req.Filename, Alt: req.Alt, Spoiler: req.Spoiler})
+		return updateErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, attachmentToWire(att))
+}
+
+// sanitizeAttachmentAlt keeps a one-paragraph description: no control
+// characters (newlines included), bounded by the caller's check afterwards.
+func sanitizeAttachmentAlt(alt string) string {
+	alt = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, alt)
+	return strings.TrimSpace(alt)
+}
+
 // sanitizeAttachmentFilename keeps a display name only: no directories, no
 // control characters, bounded length. It is never used as a storage path.
 func sanitizeAttachmentFilename(name string) string {
@@ -1696,6 +1771,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "too_many_attachments")
 	case errors.Is(err, ErrAttachmentEmpty):
 		writeError(w, http.StatusBadRequest, "empty_attachment")
+	case errors.Is(err, ErrAttachmentAlreadySent):
+		writeError(w, http.StatusConflict, "attachment_already_sent")
 	case errors.Is(err, ErrNotAMember):
 		writeError(w, http.StatusForbidden, "not_a_member")
 	case errors.Is(err, ErrNotAuthor):

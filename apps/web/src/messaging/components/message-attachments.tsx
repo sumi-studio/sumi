@@ -1,4 +1,4 @@
-import { Paperclip } from "lucide-react";
+import { EyeOff, Paperclip } from "lucide-react";
 import { useState } from "react";
 import type { Attachment } from "../model";
 import { isImageAttachment } from "../model";
@@ -24,6 +24,37 @@ export function formatFileSize(bytes: number): string {
   return `${rounded} ${units[unit]}`;
 }
 
+/**
+ * ネタバレ付きの添付。送り手が「先に中身を見せない」と言ったものは、
+ * 受け手が開ける操作をするまで隠す。概要（alt）はぼかしの上でも読める:
+ * 何かは分かった上で、見るかどうかを受け手が決められるようにする。
+ */
+function SpoilerCover({
+  alt,
+  onReveal,
+}: {
+  alt: string;
+  onReveal: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onReveal}
+      className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-background/40 backdrop-blur-none transition-colors hover:bg-background/25"
+    >
+      <span className="flex items-center gap-1 rounded-full bg-background/90 px-2.5 py-1 font-medium text-[11px] shadow-xs">
+        <EyeOff className="size-3" />
+        ネタバレ
+      </span>
+      {alt ? (
+        <span className="max-w-[80%] truncate text-[11px] text-foreground/70">
+          {alt}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
 export function MessageAttachments({
   attachments,
   authorName,
@@ -35,6 +66,7 @@ export function MessageAttachments({
   createdAt?: number;
 }) {
   const [viewing, setViewing] = useState<string | null>(null);
+  const [revealed, setRevealed] = useState<string[]>([]);
   if (attachments.length === 0) return null;
   const viewed = attachments.find(
     (attachment) => attachment.attachmentId === viewing,
@@ -43,20 +75,41 @@ export function MessageAttachments({
     <div className="mt-1 flex flex-wrap items-start gap-2">
       {attachments.map((attachment) =>
         isImageAttachment(attachment) ? (
-          <button
+          <span
             key={attachment.attachmentId}
-            type="button"
-            onClick={() => setViewing(attachment.attachmentId)}
-            title={`${attachment.filename}・${formatFileSize(attachment.size)}`}
-            aria-label={`${attachment.filename} を開く`}
-            className="block cursor-zoom-in overflow-hidden rounded-lg border border-border transition-colors hover:border-ring/60"
+            className="relative block overflow-hidden rounded-lg border border-border"
           >
-            <img
-              src={attachment.url}
-              alt={attachment.filename}
-              className="max-h-80 max-w-full object-contain"
-            />
-          </button>
+            <button
+              type="button"
+              onClick={() => setViewing(attachment.attachmentId)}
+              title={`${attachment.filename}・${formatFileSize(attachment.size)}`}
+              aria-label={`${attachment.filename} を開く`}
+              className="block cursor-zoom-in transition-colors hover:border-ring/60"
+            >
+              <img
+                src={attachment.url}
+                alt={attachment.alt || attachment.filename}
+                className={`max-h-80 max-w-full object-contain ${
+                  attachment.spoiler &&
+                  !revealed.includes(attachment.attachmentId)
+                    ? "blur-xl"
+                    : ""
+                }`}
+              />
+            </button>
+            {attachment.spoiler &&
+            !revealed.includes(attachment.attachmentId) ? (
+              <SpoilerCover
+                alt={attachment.alt}
+                onReveal={() =>
+                  setRevealed((current) => [
+                    ...current,
+                    attachment.attachmentId,
+                  ])
+                }
+              />
+            ) : null}
+          </span>
         ) : (
           <a
             key={attachment.attachmentId}
@@ -70,6 +123,12 @@ export function MessageAttachments({
             <span className="truncate font-medium text-[12.5px]">
               {attachment.filename}
             </span>
+            {attachment.spoiler ? (
+              <span className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-px text-[10px] text-muted-foreground">
+                <EyeOff className="size-3" />
+                ネタバレ
+              </span>
+            ) : null}
             <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
               {formatFileSize(attachment.size)}
             </span>

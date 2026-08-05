@@ -2,6 +2,7 @@ import { secureRandomUUID } from "../lib/random-uuid";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -612,9 +613,31 @@ export class MockMessagingServer implements MessagingBackend {
       mime: file.type || "application/octet-stream",
       size: file.size,
       url: URL.createObjectURL(file),
+      spoiler: false,
+      alt: "",
     };
     this.uploads.set(attachment.attachmentId, attachment);
     return attachment;
+  }
+
+  /**
+   * 送信前の添付の編集。実APIと同じく、送ってしまった（=uploadsから消えた）
+   * 添付は編集できない。
+   */
+  async updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const pending = this.uploads.get(attachmentId);
+    if (!pending) throw new Error("attachment_not_found");
+    const next: Attachment = {
+      ...pending,
+      filename: patch.filename ?? pending.filename,
+      alt: patch.alt ?? pending.alt,
+      spoiler: patch.spoiler ?? pending.spoiler,
+    };
+    this.uploads.set(attachmentId, next);
+    return next;
   }
 
   async editMessage(

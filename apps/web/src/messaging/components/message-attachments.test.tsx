@@ -13,6 +13,8 @@ function attachment(overrides: Partial<Attachment> = {}): Attachment {
     mime: "image/png",
     size: 2048,
     url: "/messaging/attachments/attachment-1",
+    spoiler: false,
+    alt: "",
     ...overrides,
   };
 }
@@ -80,6 +82,41 @@ describe("MessageAttachments", () => {
 
     expect(screen.queryByRole("img")).toBeNull();
     expect(screen.getByText("logo.svg")).toBeInTheDocument();
+  });
+
+  it("ネタバレ画像はぼかして隠し、クリックで開示する", () => {
+    render(
+      <MessageAttachments
+        attachments={[attachment({ spoiler: true, alt: "結末の一枚" })]}
+      />,
+    );
+
+    const image = screen.getByAltText("結末の一枚");
+    expect(image.className).toContain("blur-xl");
+    // 何かは分かる: 概要はぼかしの上に出す。
+    expect(screen.getByText("ネタバレ")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("ネタバレ"));
+
+    expect(screen.getByAltText("結末の一枚").className).not.toContain("blur");
+    expect(screen.queryByText("ネタバレ")).toBeNull();
+  });
+
+  it("ネタバレ付きの画像以外はピルで示す", () => {
+    render(
+      <MessageAttachments
+        attachments={[
+          attachment({
+            filename: "報告.pdf",
+            mime: "application/pdf",
+            spoiler: true,
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("ネタバレ")).toBeInTheDocument();
+    expect(screen.getByRole("link")).toHaveAttribute("download", "報告.pdf");
   });
 
   it("添付が無ければ何も描かない", () => {

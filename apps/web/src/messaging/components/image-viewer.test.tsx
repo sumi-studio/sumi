@@ -13,6 +13,8 @@ function attachment(overrides: Partial<Attachment> = {}): Attachment {
     mime: "image/png",
     size: 2048,
     url: "/messaging/attachments/attachment-1",
+    spoiler: false,
+    alt: "",
     ...overrides,
   };
 }
