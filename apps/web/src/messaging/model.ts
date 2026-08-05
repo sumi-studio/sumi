@@ -317,8 +317,14 @@ export interface MessagingBackend {
     emoji: string,
     clientNonce: string,
   ): Promise<ReactionMutationResult>;
-  /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
-  setNotificationSetting(input: NotificationSettingInput): Promise<void>;
+  /**
+   * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
+   * 返すのはサーバーが正規化した確定値。手元がそれと食い違ったまま残らないよう、
+   * 呼び出し側はこれを正本として取り込む。
+   */
+  setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

@@ -407,8 +407,11 @@ export class MockMessagingServer implements MessagingBackend {
     };
   }
 
-  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+  async setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting> {
     this.notificationSetting = { owner: SELF, ...input };
+    return this.notificationSetting;
   }
 
   /**

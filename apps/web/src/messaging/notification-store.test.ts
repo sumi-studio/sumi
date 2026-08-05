@@ -5,6 +5,7 @@ import type {
   ConnectionState,
   Message,
   MessagingBackend,
+  NotificationSetting,
   NotificationSettingInput,
   Place,
   PlaceKey,
@@ -32,7 +33,31 @@ class StubBackend implements MessagingBackend {
   } as const;
   readonly settingWrites: NotificationSettingInput[] = [];
   rejectSettingWrites = false;
+  /**
+   * サーバー側の現在値。PUTが「解決した順」に置き換わるので、送信が入れ替わると
+   * ここに古いsnapshotが残る——それが今回の再現したい壊れ方。
+   */
+  serverSetting: NotificationSetting = {
+    owner: SELF,
+    defaults: { level: "mentions" },
+    perPlace: [{ place: CHANNEL, level: "all" }],
+    keywords: ["デプロイ"],
+  };
+  /** 本物のサーバーはkeywordを正規化して返す。手元がそれを取り込むかを見る。 */
+  normalizeKeywords: ((keywords: string[]) => string[]) | null = null;
+  /** trueの間、届いたPUTを解決させずに溜める。遅いbackendの代わり。 */
+  holdWrites = false;
+  private heldWrites: (() => void)[] = [];
   private listener: ((event: ServerEvent) => void) | null = null;
+
+  get inFlight(): number {
+    return this.heldWrites.length;
+  }
+
+  releaseWrites(): void {
+    const held = this.heldWrites.splice(0, this.heldWrites.length);
+    for (const resolve of held) resolve();
+  }
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
     return {
@@ -63,12 +88,7 @@ class StubBackend implements MessagingBackend {
         },
       ],
       replyLaterMarkers: [],
-      notificationSetting: {
-        owner: SELF,
-        defaults: { level: "mentions" },
-        perPlace: [{ place: CHANNEL, level: "all" }],
-        keywords: ["デプロイ"],
-      },
+      notificationSetting: this.serverSetting,
       employedAgents: [],
     };
   }
@@ -111,9 +131,25 @@ class StubBackend implements MessagingBackend {
   async toggleReaction(): ReturnType<MessagingBackend["toggleReaction"]> {
     throw new Error("unused");
   }
-  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
+  async setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting> {
     this.settingWrites.push(input);
-    if (this.rejectSettingWrites) throw new Error("rejected");
+    // 成否はPUTが届いた時点で決まる。溜めている間の切り替えに引きずられない。
+    const rejects = this.rejectSettingWrites;
+    if (this.holdWrites) {
+      await new Promise<void>((resolve) => this.heldWrites.push(resolve));
+    }
+    if (rejects) throw new Error("rejected");
+    this.serverSetting = {
+      owner: SELF,
+      defaults: input.defaults,
+      perPlace: input.perPlace,
+      keywords: this.normalizeKeywords
+        ? this.normalizeKeywords(input.keywords)
+        : input.keywords,
+    };
+    return this.serverSetting;
   }
   sendTyping(): void {}
   subscribe(listener: (event: ServerEvent) => void): () => void {
@@ -216,15 +252,72 @@ describe("notification settings in the store", () => {
     useMessaging.getState().setNotificationDefaultLevel("all");
     useMessaging.getState().setNotificationKeywords(["リリース", "Kuro"]);
 
-    await vi.waitFor(() => expect(backend.settingWrites).toHaveLength(2));
-    expect(backend.settingWrites[1]).toMatchObject({
+    // 全置換なので、続けて変えた分は最新のsnapshot1本にまとめて送れば足りる。
+    await vi.waitFor(() =>
+      expect(backend.serverSetting.keywords).toEqual(["リリース", "Kuro"]),
+    );
+    expect(backend.settingWrites).toHaveLength(1);
+    expect(backend.settingWrites[0]).toMatchObject({
       defaults: { level: "all" },
       keywords: ["リリース", "Kuro"],
     });
+    expect(backend.serverSetting.defaults).toEqual({ level: "all" });
     expect(useMessaging.getState().notificationKeywords).toEqual([
       "リリース",
       "Kuro",
     ]);
+  });
+
+  it("並べて送るので、遅れて届いた古いsnapshotがサーバーを巻き戻さない", async () => {
+    backend.holdWrites = true;
+    useMessaging.getState().setNotificationDefaultLevel("all");
+    await vi.waitFor(() => expect(backend.inFlight).toBe(1));
+
+    // 1本目が飛んでいる最中の変更。列の後ろに並ぶので、まだ送られない。
+    useMessaging.getState().setNotificationKeywords(["リリース"]);
+    expect(backend.settingWrites).toHaveLength(1);
+
+    backend.holdWrites = false;
+    backend.releaseWrites();
+
+    await vi.waitFor(() => expect(backend.settingWrites).toHaveLength(2));
+    // サーバーに最後に残るのは新しい方。手元と食い違わない。
+    expect(backend.serverSetting.keywords).toEqual(["リリース"]);
+    expect(backend.serverSetting.defaults).toEqual({ level: "all" });
+    expect(useMessaging.getState().notificationKeywords).toEqual(["リリース"]);
+    expect(useMessaging.getState().notificationDefaultLevel).toBe("all");
+  });
+
+  it("追い越された書き込みの失敗では、後から成功した設定を巻き戻さない", async () => {
+    backend.holdWrites = true;
+    backend.rejectSettingWrites = true;
+    useMessaging.getState().setNotificationDefaultLevel("all");
+    await vi.waitFor(() => expect(backend.inFlight).toBe(1));
+
+    // 後続は成功する。失敗するのは追い越された古い1本だけ。
+    backend.rejectSettingWrites = false;
+    useMessaging.getState().setNotificationKeywords(["リリース"]);
+    backend.holdWrites = false;
+    backend.releaseWrites();
+
+    await vi.waitFor(() =>
+      expect(backend.serverSetting.keywords).toEqual(["リリース"]),
+    );
+    expect(useMessaging.getState().notificationKeywords).toEqual(["リリース"]);
+    expect(useMessaging.getState().notificationDefaultLevel).toBe("all");
+  });
+
+  it("はサーバーが正規化して返した確定値を手元の正本にする", async () => {
+    backend.normalizeKeywords = (keywords) =>
+      keywords.map((keyword) => keyword.trim()).filter(Boolean);
+
+    useMessaging.getState().setNotificationKeywords(["  リリース  ", "   "]);
+
+    await vi.waitFor(() =>
+      expect(useMessaging.getState().notificationKeywords).toEqual([
+        "リリース",
+      ]),
+    );
   });
 
   it("puts a rejected change back, rather than showing a setting that is not in force", async () => {

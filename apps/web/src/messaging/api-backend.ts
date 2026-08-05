@@ -287,8 +287,10 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 
   /** PUTは全置換。クライアントは常に現在値を持っているので差分は要らない。 */
-  async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
-    await this.request("/messaging/notification-settings", {
+  async setNotificationSetting(
+    input: NotificationSettingInput,
+  ): Promise<NotificationSetting> {
+    const body = await this.request("/messaging/notification-settings", {
       method: "PUT",
       body: {
         defaults: { level: input.defaults.level },
@@ -299,6 +301,7 @@ export class ApiMessagingBackend implements MessagingBackend {
         keywords: input.keywords,
       },
     });
+    return parseNotificationSetting(body);
   }
 
   sendTyping(place: Place): void {
