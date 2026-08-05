@@ -17,6 +17,8 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--interactive-hover);
+  --color-accent-foreground: var(--foreground);
   --color-interactive-active: var(--interactive-active);
   --color-interactive-hover: var(--interactive-hover);
   --color-destructive: var(--destructive);

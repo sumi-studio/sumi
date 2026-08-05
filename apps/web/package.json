@@ -12,7 +12,7 @@
     "test:ui": "vitest run",
     "test:runtime": "tsx --test src/agent/reducer.test.ts src/agent/store.test.ts",
     "test:socket": "tsx --test scripts/direct-chat-socket.test.mjs",
-    "test:config": "tsx --test scripts/vite-config.test.ts scripts/real-agent-provider.test.ts",
+    "test:config": "tsx --test scripts/vite-config.test.ts scripts/real-agent-provider.test.ts scripts/theme-token-contract.test.ts",
     "test:e2e": "playwright test",
     "test:e2e:real-agent": "playwright test e2e/real-agent-chat.spec.ts",
     "preview": "vite preview"
