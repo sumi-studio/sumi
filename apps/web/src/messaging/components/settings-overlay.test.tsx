@@ -19,9 +19,29 @@ const self: MemberProfile = {
 
 const updateProfile = vi.fn();
 const uploadAttachment = vi.fn();
+const refreshRoles = vi.fn();
+const setMemberRoles = vi.fn();
+const createRole = vi.fn();
+
+const adminRole = {
+  roleId: "role-admin",
+  workspaceId: "ws",
+  name: "Admin",
+  color: "#3366ff",
+  position: 100,
+  permissions: {
+    manage_channels: true,
+    manage_roles: true,
+    manage_members: true,
+    mention_all: true,
+  },
+} as const;
 
 beforeEach(() => {
   updateProfile.mockResolvedValue(undefined);
+  refreshRoles.mockResolvedValue(undefined);
+  setMemberRoles.mockResolvedValue(undefined);
+  createRole.mockResolvedValue(undefined);
   uploadAttachment.mockResolvedValue({
     attachmentId: "att-1",
     filename: "face.png",
@@ -36,6 +56,12 @@ beforeEach(() => {
     membersByKey: { [humanKey]: self },
     updateProfile,
     uploadAttachment,
+    refreshRoles,
+    setMemberRoles,
+    createRole,
+    roles: [],
+    roleAssignments: [],
+    permissions: {},
   });
   useSettingsOverlay.setState({ open: true, section: "profile" });
 });
@@ -150,5 +176,60 @@ describe("SettingsOverlay", () => {
     fireEvent.keyDown(window, { key: "Escape" });
 
     expect(useSettingsOverlay.getState().open).toBe(false);
+  });
+
+  it("権限が無ければワークスペース設定の導線を出さない", () => {
+    render(<SettingsOverlay />);
+
+    expect(screen.queryByRole("button", { name: "メンバー" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "ロール" })).toBeNull();
+  });
+
+  it("権限を持つ人にだけワークスペース設定が現れ、個人設定と分かれている", () => {
+    useMessaging.setState({
+      permissions: { manage_members: true, manage_roles: true },
+    });
+    render(<SettingsOverlay />);
+
+    expect(screen.getByText("ユーザー設定")).toBeInTheDocument();
+    expect(screen.getByText("ワークスペース設定")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "メンバー" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "ロール" })).toBeInTheDocument();
+  });
+
+  it("権限を失ったセクションは開いていても中身を描かない", () => {
+    useMessaging.setState({ permissions: {} });
+    useSettingsOverlay.setState({ section: "roles" });
+    render(<SettingsOverlay />);
+
+    // 導線を隠すだけでなく、描画時にも権限を確かめる。
+    expect(screen.queryByRole("button", { name: "ロールを作成" })).toBeNull();
+  });
+
+  it("メンバーのロールをその場で付け外しする", async () => {
+    useMessaging.setState({
+      permissions: { manage_members: true },
+      roles: [adminRole],
+      roleAssignments: [],
+    });
+    useSettingsOverlay.setState({ section: "members" });
+    render(<SettingsOverlay />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Admin/ }));
+
+    await vi.waitFor(() => {
+      expect(setMemberRoles).toHaveBeenCalledWith(human, ["role-admin"]);
+    });
+  });
+
+  it("開いた時点でロールを取り直す", async () => {
+    useMessaging.setState({ permissions: { manage_roles: true } });
+    render(<SettingsOverlay />);
+
+    await vi.waitFor(() => {
+      expect(refreshRoles).toHaveBeenCalled();
+    });
   });
 });

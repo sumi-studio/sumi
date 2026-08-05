@@ -318,7 +318,23 @@ func TestChannelTopicPatchOverHTTP(t *testing.T) {
 	}
 	channelID := body["channel_id"].(string)
 
-	// Any active workspace member may edit the topic (v0: CreateChannelと同じ基準).
+	// Editing a channel is workspace administration: a plain member is refused
+	// (0019: manage_channels と同じ基準を作成・編集の両方に掛ける).
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanB.ID,
+		map[string]any{"topic": "勝手な書き換え"})
+	if resp.StatusCode != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("member patches topic: status %d body %v", resp.StatusCode, body)
+	}
+
+	// With a role carrying manage_channels the same member may edit it.
+	role, err := w.store.CreateRole(ctx, ws.WorkspaceID, w.humanA, "編集者", "",
+		map[string]bool{PermManageChannels: true})
+	if err != nil {
+		t.Fatalf("create editor role: %v", err)
+	}
+	if _, err := w.store.SetParticipantRoles(ctx, ws.WorkspaceID, w.humanA, w.humanB, []string{role.RoleID}); err != nil {
+		t.Fatalf("grant editor role: %v", err)
+	}
 	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanB.ID,
 		map[string]any{"topic": "レビュー予約はこちら"})
 	if resp.StatusCode != http.StatusOK || body["topic"] != "レビュー予約はこちら" {

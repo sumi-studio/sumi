@@ -548,6 +548,110 @@ describe("ApiMessagingBackend", () => {
     );
   });
 
+  it("reads and administers roles over REST and drops unknown permissions", async () => {
+    const rolesPath = "/messaging/workspaces/workspace-1/roles";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === rolesPath && (init?.method ?? "GET") === "GET") {
+          return json({
+            roles: [roleWire()],
+            role_assignments: [
+              {
+                participant: { kind: "human", human_id: "human-1" },
+                role_ids: ["role-1"],
+              },
+            ],
+            // 未知のキーはfail-closedに落とす。真のものだけが残る。
+            permissions: { manage_roles: true, become_owner: true },
+          });
+        }
+        if (path === rolesPath && init?.method === "POST") {
+          return json(roleWire(), 201);
+        }
+        if (path === `${rolesPath}/role-1` && init?.method === "PATCH") {
+          return json(roleWire("設計"));
+        }
+        if (path === `${rolesPath}/role-1` && init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        if (
+          path ===
+            "/messaging/workspaces/workspace-1/members/personality_agent/agent-1/roles" &&
+          init?.method === "PUT"
+        ) {
+          return json({
+            participant: {
+              kind: "personality_agent",
+              personality_agent_id: "agent-1",
+            },
+            role_ids: ["role-1"],
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+
+    await expect(backend.fetchRoles("workspace-1")).resolves.toEqual({
+      roles: [
+        {
+          roleId: "role-1",
+          workspaceId: "workspace-1",
+          name: "開発",
+          color: "#3366ff",
+          position: 0,
+          permissions: { manage_channels: true },
+        },
+      ],
+      roleAssignments: [
+        {
+          participant: { kind: "human", humanId: "human-1" },
+          roleIds: ["role-1"],
+        },
+      ],
+      permissions: { manage_roles: true },
+    });
+
+    const input = {
+      name: "開発",
+      color: "#3366ff",
+      permissions: { manage_channels: true } as const,
+    };
+    await expect(
+      backend.createRole("workspace-1", input),
+    ).resolves.toMatchObject({ roleId: "role-1", name: "開発" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      rolesPath,
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    );
+
+    await expect(
+      backend.updateRole("workspace-1", "role-1", { ...input, name: "設計" }),
+    ).resolves.toMatchObject({ name: "設計" });
+    await expect(
+      backend.deleteRole("workspace-1", "role-1"),
+    ).resolves.toBeUndefined();
+
+    // 人格agentも人と同じkind/idの文法で名指す。bot用の別経路は作らない。
+    await expect(
+      backend.setMemberRoles(
+        "workspace-1",
+        { kind: "personality_agent", personalityAgentId: "agent-1" },
+        ["role-1"],
+      ),
+    ).resolves.toEqual({
+      participant: { kind: "personality_agent", personalityAgentId: "agent-1" },
+      roleIds: ["role-1"],
+    });
+  });
+
   it("projects place_created and place_updated from the socket", async () => {
     vi.stubGlobal(
       "fetch",
@@ -1034,6 +1138,17 @@ function messageWire(
     created_at: "2026-08-01T10:00:00Z",
     edited_at: null,
     deleted: false,
+  };
+}
+
+function roleWire(name = "開発") {
+  return {
+    role_id: "role-1",
+    workspace_id: "workspace-1",
+    name,
+    color: "#3366ff",
+    position: 0,
+    permissions: { manage_channels: true, become_owner: true },
   };
 }
 

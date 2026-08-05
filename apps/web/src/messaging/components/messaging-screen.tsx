@@ -30,7 +30,10 @@ import {
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
 import { enablePushSubscription } from "../push";
-import { setNotificationNavigator, useMessaging } from "../store";
+import {
+  setNotificationNavigator,
+  useMessaging,
+} from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";

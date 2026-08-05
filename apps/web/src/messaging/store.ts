@@ -18,15 +18,20 @@ import type {
   ParticipantKey,
   ParticipantRef,
   ParticipantStatus,
+  Permission,
+  PermissionSet,
   Place,
   PlaceKey,
   PollInput,
   ProfileInput,
   ReplyLaterMarker,
+  RoleAssignment,
+  RoleInput,
   ServerEvent,
   StatusKind,
   ThreadSummary,
   Urgency,
+  WorkspaceRole,
   WorkspaceSummary,
 } from "./model";
 import { parsePlaceKey, participantKey, placeKey } from "./model";
@@ -89,6 +94,10 @@ interface MessagingState {
   /** 音は端末の都合なのでlocalStorageに置く（設定の正本には混ぜない）。 */
   notificationSoundEnabled: boolean;
   employedAgents: ParticipantRef[];
+  /** いま居るワークスペースのロールと、自分の権限（正本はサーバー）。 */
+  roles: WorkspaceRole[];
+  roleAssignments: RoleAssignment[];
+  permissions: PermissionSet;
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
   activePlaceKey: PlaceKey | null;
@@ -151,6 +160,12 @@ interface MessagingState {
    * （設定が効いたふりをして黙って効いていないのが一番困る）。
    */
   updateProfile(input: ProfileInput): Promise<void>;
+  /** ロールを取り直す。ライブ配信しない代わりに、設定画面を開いた時点で読む。 */
+  refreshRoles(): Promise<void>;
+  createRole(input: RoleInput): Promise<void>;
+  updateRole(roleId: string, input: RoleInput): Promise<void>;
+  deleteRole(roleId: string): Promise<void>;
+  setMemberRoles(participant: ParticipantRef, roleIds: string[]): Promise<void>;
   setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
   setNotificationDefaultLevel(level: NotificationLevel): void;
   setNotificationKeywords(keywords: string[]): void;
@@ -682,6 +697,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     notificationKeywords: [],
     notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
+    roles: [],
+    roleAssignments: [],
+    permissions: {},
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
     activePlaceKey: null,
@@ -749,6 +767,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
             notificationLevelByPlace,
             notificationKeywords: snapshot.notificationSetting.keywords,
             employedAgents: snapshot.employedAgents,
+            roles: snapshot.roles,
+            roleAssignments: snapshot.roleAssignments,
+            permissions: snapshot.permissions,
           });
           backend.subscribe(applyEvent, { sinceByPlace });
           backend.subscribeConnection((state) => set({ connection: state }));
@@ -1020,6 +1041,45 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.setStatus(status, note, expiresAt).catch(() => undefined);
     },
 
+    async refreshRoles() {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) return;
+      const snapshot = await backend.fetchRoles(workspaceId);
+      set({
+        roles: snapshot.roles,
+        roleAssignments: snapshot.roleAssignments,
+        permissions: snapshot.permissions,
+      });
+    },
+
+    async createRole(input) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.createRole(workspaceId, input);
+      await get().refreshRoles();
+    },
+
+    async updateRole(roleId, input) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.updateRole(workspaceId, roleId, input);
+      await get().refreshRoles();
+    },
+
+    async deleteRole(roleId) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.deleteRole(workspaceId, roleId);
+      await get().refreshRoles();
+    },
+
+    async setMemberRoles(participant, roleIds) {
+      const workspaceId = get().workspaces[0]?.workspaceId;
+      if (!workspaceId) throw new Error("workspace is not ready");
+      await backend.setMemberRoles(workspaceId, participant, roleIds);
+      await get().refreshRoles();
+    },
+
     async updateProfile(input) {
       const member = await backend.updateProfile(input);
       set((state) => ({
@@ -1128,6 +1188,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 });
 
+/**
+ * 自分の権限セット。並行して作られたUI（チャンネルメニュー等）へ権限ゲートを
+ * 差し込みやすいよう、単純な述語として export する。
+ *
+ * 正本はサーバーで、ここはその写し。UIで隠すのは導線の整理であって、
+ * 強制ではない——実際の拒否はサーバーの 403 が行う。
+ */
+export function usePermissions(): {
+  can: (permission: Permission) => boolean;
+  permissions: PermissionSet;
+} {
+  const permissions = useMessaging((state) => state.permissions);
+  return {
+    permissions,
+    can: (permission: Permission) => permissions[permission] === true,
+  };
+}
+
+/** フック外（イベントハンドラ等）から同じ判定を使うための口。 */
+export function canDo(permission: Permission): boolean {
+  return useMessaging.getState().permissions[permission] === true;
+}
+
 let messagingSessionIdentity: string | null = null;
 
 export function getMessagingSessionIdentity(): string | null {
@@ -1197,6 +1280,9 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
     notificationKeywords: [],
     notificationSoundEnabled: isNotificationSoundEnabled(),
     employedAgents: [],
+    roles: [],
+    roleAssignments: [],
+    permissions: {},
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
     activePlaceKey: null,

@@ -134,7 +134,7 @@ func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participan
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit default workspace admission: %w", err)
 	}
-	return nil
+	return s.EnsureFoundingAdmin(ctx, participant)
 }
 
 func addDefaultMember(ctx context.Context, tx pgx.Tx, participant ParticipantRef) error {
@@ -223,6 +223,24 @@ func (s *Store) CreateWorkspace(ctx context.Context, name string, creator Partic
 		workspaceID, creator.Kind, creator.ID, RoleOwner); err != nil {
 		return Workspace{}, fmt.Errorf("insert workspace owner: %w", err)
 	}
+	// Every workspace is born with the same two roles the shared one has, and
+	// its creator holds Admin. A workspace nobody can administer is not a
+	// state the product should be able to reach.
+	adminRoleID := newUUIDv7()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO workspace_roles (role_id, workspace_id, name, position, permissions)
+		 VALUES ($1, $2, 'Admin', 100, $3), ($4, $2, 'Member', 0, '{}'::jsonb)`,
+		adminRoleID, workspaceID, map[string]bool{
+			PermManageChannels: true, PermManageRoles: true,
+			PermManageMembers: true, PermMentionAll: true,
+		}, newUUIDv7()); err != nil {
+		return Workspace{}, fmt.Errorf("seed workspace roles: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO participant_roles (role_id, member_kind, member_id) VALUES ($1, $2, $3)`,
+		adminRoleID, creator.Kind, creator.ID); err != nil {
+		return Workspace{}, fmt.Errorf("grant workspace admin: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Workspace{}, fmt.Errorf("commit create workspace: %w", err)
 	}
@@ -275,8 +293,9 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, workspaceID string, m
 	return nil
 }
 
-// CreateChannel creates a public channel in the workspace. v0: any active
-// member may create channels (契約ドラフト: 権限は最小構成).
+// CreateChannel creates a public channel in the workspace. Creating a channel
+// is workspace administration, so it requires manage_channels — the same check
+// on the REST lane and the agent lane (AX 同型).
 // voice marks the channel as a place people are meant to talk in (ADR 0012).
 // It changes nothing else: the channel still carries a timeline, unread counts
 // and notification settings, because a voice channel is still a channel.
@@ -293,6 +312,9 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	}
 	if !active {
 		return Place{}, ErrNotAMember
+	}
+	if err := s.RequirePermission(ctx, workspaceID, creator, PermManageChannels); err != nil {
+		return Place{}, err
 	}
 	placeID := newUUIDv7()
 	_, err = s.pool.Exec(ctx,
@@ -313,9 +335,10 @@ const MaxChannelNameChars = 200
 
 // UpdateChannel edits a channel's mutable identity: its name, its topic, or
 // both. A nil field is left alone, so naming one thing never silently discards
-// the other. v0 permission mirrors CreateChannel: any active workspace member
-// may edit (契約ドラフト: 権限は最小構成). Visibility is checked first so a
-// place the actor cannot see stays unrevealed.
+// the other. Editing a channel needs manage_channels, mirroring CreateChannel.
+// Visibility is checked first so a place the actor cannot see stays
+// unrevealed — a member without the permission is refused, a stranger is told
+// nothing.
 func (s *Store) UpdateChannel(ctx context.Context, placeID string, name, topic *string, actor ParticipantRef) (Place, error) {
 	place, err := s.PlaceFor(ctx, placeID, actor)
 	if err != nil {
@@ -326,6 +349,9 @@ func (s *Store) UpdateChannel(ctx context.Context, placeID string, name, topic *
 	}
 	if name != nil && !validChannelName(*name) {
 		return Place{}, ErrInvalidChannelName
+	}
+	if err := s.RequirePermission(ctx, place.WorkspaceID, actor, PermManageChannels); err != nil {
+		return Place{}, err
 	}
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE places

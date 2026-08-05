@@ -65,6 +65,72 @@ pub(crate) struct SetMessagingProfileRequest<'a> {
     pub tagline: Option<&'a str>,
 }
 
+/// Reading who may do what.  Open to any member: knowing whom to ask is not
+/// itself a privilege.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListMessagingRolesRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+}
+
+/// Administering roles.  These exist because the human settings screen has
+/// them: an operation that lives only in the UI would make the agent a lesser
+/// participant.  The boundary is the permission, not the tool — the server
+/// refuses an agent without `manage_roles` exactly as it refuses a Human
+/// without it.  `permissions` names what the role ends up holding; the call is
+/// a replacement, not a patch.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingRoleRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<&'a str>,
+    pub permissions: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateMessagingRoleRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    pub role_id: &'a str,
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<&'a str>,
+    pub permissions: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeleteMessagingRoleRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    pub role_id: &'a str,
+}
+
+/// Replacing the roles one participant holds.  The member is named in the
+/// ParticipantRef grammar, so a PersonalityAgent is addressed exactly like a
+/// Human — there is one member list, not a people list and a bot list.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetMessagingMemberRolesRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<&'a str>,
+    pub member_kind: &'a str,
+    pub member_id: &'a str,
+    pub role_ids: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetMessagingChannelTopicRequest<'a> {
+    pub place_id: &'a str,
+    pub topic: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateMessagingReplyLaterRequest<'a> {
@@ -268,6 +334,21 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn set_status(&self, request: SetMessagingStatusRequest<'_>) -> Result<Value>;
 
     async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<Value>;
+
+    async fn roles(&self, request: ListMessagingRolesRequest<'_>) -> Result<Value>;
+
+    async fn create_role(&self, request: CreateMessagingRoleRequest<'_>) -> Result<Value>;
+
+    async fn update_role(&self, request: UpdateMessagingRoleRequest<'_>) -> Result<Value>;
+
+    async fn delete_role(&self, request: DeleteMessagingRoleRequest<'_>) -> Result<Value>;
+
+    async fn set_member_roles(&self, request: SetMessagingMemberRolesRequest<'_>) -> Result<Value>;
+
+    async fn set_channel_topic(
+        &self,
+        request: SetMessagingChannelTopicRequest<'_>,
+    ) -> Result<Value>;
 
     async fn reply_later(&self, request: CreateMessagingReplyLaterRequest<'_>) -> Result<Value>;
 

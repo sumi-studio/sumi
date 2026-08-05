@@ -1,8 +1,16 @@
 import { Check, Copy, Image as ImageIcon, Settings, X } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { create } from "zustand";
-import { MAX_ATTACHMENT_BYTES, type ParticipantRef } from "../model";
-import { useMessaging } from "../store";
+import {
+  MAX_ATTACHMENT_BYTES,
+  type ParticipantRef,
+  PERMISSIONS,
+  type Permission,
+  type PermissionSet,
+  participantKey,
+  type WorkspaceRole,
+} from "../model";
+import { useMessaging, usePermissions } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 
 /**
@@ -12,7 +20,30 @@ import { ParticipantAvatar } from "./participant-avatar";
  * 一般の利用者に見えるのは前者だけで、後者は権限を持つ人にだけ現れる。
  */
 
-export type SettingsSection = "profile" | "account";
+export type SettingsSection = "profile" | "account" | "members" | "roles";
+
+/** 権限を持つ人にだけ現れるセクションと、それに要る権限。 */
+const WORKSPACE_SECTIONS: {
+  section: SettingsSection;
+  permission: Permission;
+}[] = [
+  { section: "members", permission: "manage_members" },
+  { section: "roles", permission: "manage_roles" },
+];
+
+const PERMISSION_LABEL: Record<Permission, string> = {
+  manage_channels: "チャンネルの管理",
+  manage_roles: "ロールの管理",
+  manage_members: "メンバーの管理",
+  mention_all: "全員への呼びかけ",
+};
+
+const PERMISSION_HINT: Record<Permission, string> = {
+  manage_channels: "作成・編集・複製・削除",
+  manage_roles: "ロールの作成・権限の変更・削除",
+  manage_members: "メンバーへのロール付与と変更",
+  mention_all: "@everyone 相当（今はまだ使いません）",
+};
 
 interface SettingsOverlayState {
   open: boolean;
@@ -35,6 +66,8 @@ export const useSettingsOverlay = create<SettingsOverlayState>((set) => ({
 const SECTION_LABEL: Record<SettingsSection, string> = {
   profile: "プロフィール",
   account: "アカウント",
+  members: "メンバー",
+  roles: "ロール",
 };
 
 const INPUT_CLASS =
@@ -388,12 +421,353 @@ function AccountSection({ self }: { self: ParticipantRef }) {
   );
 }
 
+/** ロールの色の点。色未設定は輪郭だけにする。 */
+function RoleDot({ color }: { color: string }) {
+  return (
+    <span
+      className={`size-2.5 shrink-0 rounded-full ${color ? "" : "border border-muted-foreground/50"}`}
+      style={color ? { backgroundColor: color } : undefined}
+    />
+  );
+}
+
+function PermissionToggles({
+  permissions,
+  disabled,
+  onChange,
+}: {
+  permissions: PermissionSet;
+  disabled: boolean;
+  onChange: (next: PermissionSet) => void;
+}) {
+  return (
+    <div className="space-y-1">
+      {PERMISSIONS.map((permission) => {
+        const checked = permissions[permission] === true;
+        return (
+          <label
+            key={permission}
+            className="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-accent/60"
+          >
+            <input
+              type="checkbox"
+              checked={checked}
+              disabled={disabled}
+              onChange={() =>
+                onChange({ ...permissions, [permission]: !checked })
+              }
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="block text-[13px]">
+                {PERMISSION_LABEL[permission]}
+              </span>
+              <span className="block text-[11px] text-muted-foreground">
+                {PERMISSION_HINT[permission]}
+              </span>
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+/** ロール1件の編集フォーム。新規作成と既存編集で同じ形を使う。 */
+function RoleEditor({
+  role,
+  busy,
+  onSubmit,
+  onCancel,
+}: {
+  role?: WorkspaceRole;
+  busy: boolean;
+  onSubmit: (input: {
+    name: string;
+    color: string;
+    permissions: PermissionSet;
+  }) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(role?.name ?? "");
+  const [color, setColor] = useState(role?.color ?? "");
+  const [permissions, setPermissions] = useState<PermissionSet>(
+    role?.permissions ?? {},
+  );
+
+  return (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!name.trim() || busy) return;
+        onSubmit({ name: name.trim(), color, permissions });
+      }}
+      className="space-y-3 rounded-lg border border-border p-3"
+    >
+      <div className="flex items-end gap-2">
+        <span className="min-w-0 flex-1">
+          <span className="mb-1 block font-medium text-[12px]">名前</span>
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            disabled={busy}
+            maxLength={60}
+            placeholder="例: 開発"
+            aria-label="ロール名"
+            className={INPUT_CLASS}
+          />
+        </span>
+        <span>
+          <span className="mb-1 block font-medium text-[12px]">色</span>
+          <input
+            type="color"
+            value={color || "#888888"}
+            disabled={busy}
+            aria-label="ロールの色"
+            onChange={(event) => setColor(event.target.value)}
+            className="h-8 w-12 rounded-md border border-border bg-background"
+          />
+        </span>
+        <button
+          type="button"
+          disabled={busy || !color}
+          onClick={() => setColor("")}
+          className="rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-accent disabled:opacity-40"
+        >
+          色なし
+        </button>
+      </div>
+      <PermissionToggles
+        permissions={permissions}
+        disabled={busy}
+        onChange={setPermissions}
+      />
+      <div className="flex justify-end gap-1.5">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md px-2.5 py-1.5 text-[12.5px] text-muted-foreground hover:bg-accent"
+        >
+          キャンセル
+        </button>
+        <button
+          type="submit"
+          disabled={busy || !name.trim()}
+          className="rounded-md bg-primary px-2.5 py-1.5 font-medium text-[12.5px] text-primary-foreground hover:opacity-90 disabled:opacity-50"
+        >
+          {role ? "保存" : "作成"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** ロール管理: 作成・名前/色/権限の編集・削除。 */
+function RolesSection() {
+  const roles = useMessaging((state) => state.roles);
+  const createRole = useMessaging((state) => state.createRole);
+  const updateRole = useMessaging((state) => state.updateRole);
+  const deleteRole = useMessaging((state) => state.deleteRole);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState("");
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true);
+    setFailed("");
+    try {
+      await action();
+      setEditing(null);
+      setCreating(false);
+    } catch {
+      setFailed("変更できませんでした。同じ名前のロールがあるかもしれません");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <p className="text-[12px] text-muted-foreground">
+        ロールは権限の束です。人にも人格agentにも同じ形で付きます。
+      </p>
+      {roles.map((role) =>
+        editing === role.roleId ? (
+          <RoleEditor
+            key={role.roleId}
+            role={role}
+            busy={busy}
+            onCancel={() => setEditing(null)}
+            onSubmit={(input) => void run(() => updateRole(role.roleId, input))}
+          />
+        ) : (
+          <div
+            key={role.roleId}
+            className="flex items-center gap-2.5 rounded-lg border border-border/70 px-3 py-2"
+          >
+            <RoleDot color={role.color} />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium text-[13px]">
+                {role.name}
+              </span>
+              <span className="block truncate text-[11px] text-muted-foreground">
+                {PERMISSIONS.filter(
+                  (permission) => role.permissions[permission],
+                )
+                  .map((permission) => PERMISSION_LABEL[permission])
+                  .join("、") || "権限なし"}
+              </span>
+            </span>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setEditing(role.roleId)}
+              className="rounded-md px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+            >
+              編集
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void run(() => deleteRole(role.roleId))}
+              className="rounded-md px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent hover:text-rose-500 disabled:opacity-50"
+            >
+              削除
+            </button>
+          </div>
+        ),
+      )}
+      {creating ? (
+        <RoleEditor
+          busy={busy}
+          onCancel={() => setCreating(false)}
+          onSubmit={(input) => void run(() => createRole(input))}
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => setCreating(true)}
+          className="rounded-md border border-border border-dashed px-3 py-1.5 text-[12.5px] text-muted-foreground hover:bg-accent hover:text-foreground"
+        >
+          ロールを作成
+        </button>
+      )}
+      {failed ? <p className="text-[12px] text-rose-500">{failed}</p> : null}
+    </div>
+  );
+}
+
+/** メンバー一覧: ロールの表示と付与/変更。 */
+function MembersSection() {
+  const membersByKey = useMessaging((state) => state.membersByKey);
+  const roles = useMessaging((state) => state.roles);
+  const roleAssignments = useMessaging((state) => state.roleAssignments);
+  const setMemberRoles = useMessaging((state) => state.setMemberRoles);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [failed, setFailed] = useState("");
+
+  const heldBy = new Map<string, string[]>();
+  for (const assignment of roleAssignments) {
+    heldBy.set(participantKey(assignment.participant), assignment.roleIds);
+  }
+  const members = Object.values(membersByKey).sort((a, b) =>
+    a.displayName.localeCompare(b.displayName, "ja"),
+  );
+
+  const toggle = async (
+    key: string,
+    participant: ParticipantRef,
+    roleId: string,
+  ) => {
+    const held = heldBy.get(key) ?? [];
+    const next = held.includes(roleId)
+      ? held.filter((id) => id !== roleId)
+      : [...held, roleId];
+    setBusyKey(key);
+    setFailed("");
+    try {
+      await setMemberRoles(participant, next);
+    } catch {
+      setFailed("ロールを変更できませんでした");
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[12px] text-muted-foreground">
+        参加者は人も人格agentも同じ一覧に並びます。
+      </p>
+      {members.map((member) => {
+        const key = participantKey(member.participant);
+        const held = heldBy.get(key) ?? [];
+        return (
+          <div
+            key={key}
+            className="flex items-start gap-2.5 rounded-lg border border-border/70 px-3 py-2"
+          >
+            <ParticipantAvatar
+              participantKey={key}
+              name={member.displayName}
+              size={28}
+              src={member.avatarUrl}
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium text-[13px]">
+                {member.displayName}
+              </span>
+              <span className="mt-1 flex flex-wrap gap-1">
+                {roles.map((role) => {
+                  const on = held.includes(role.roleId);
+                  return (
+                    <button
+                      key={role.roleId}
+                      type="button"
+                      disabled={busyKey === key}
+                      onClick={() =>
+                        void toggle(key, member.participant, role.roleId)
+                      }
+                      className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors disabled:opacity-50 ${
+                        on
+                          ? "border-transparent bg-accent font-medium text-foreground"
+                          : "border-border text-muted-foreground hover:bg-accent/60"
+                      }`}
+                    >
+                      <RoleDot color={role.color} />
+                      {role.name}
+                    </button>
+                  );
+                })}
+              </span>
+            </span>
+          </div>
+        );
+      })}
+      {failed ? <p className="text-[12px] text-rose-500">{failed}</p> : null}
+    </div>
+  );
+}
+
 export function SettingsOverlay() {
   const open = useSettingsOverlay((state) => state.open);
   const section = useSettingsOverlay((state) => state.section);
   const close = useSettingsOverlay((state) => state.close);
   const openSettings = useSettingsOverlay((state) => state.openSettings);
   const self = useMessaging((state) => state.self);
+  const refreshRoles = useMessaging((state) => state.refreshRoles);
+  const { can } = usePermissions();
+  const workspaceSections = WORKSPACE_SECTIONS.filter((entry) =>
+    can(entry.permission),
+  );
+
+  // ロールの変更はライブ配信しない（Hub は place / participant スコープしか
+  // 持たない）。代わりに設定を開いた時点で取り直す。
+  useEffect(() => {
+    if (!open) return;
+    void refreshRoles().catch(() => undefined);
+  }, [open, refreshRoles]);
 
   useEffect(() => {
     if (!open) return;
@@ -425,6 +799,21 @@ export function SettingsOverlay() {
             onSelect={openSettings}
           />
         ))}
+        {workspaceSections.length > 0 ? (
+          <>
+            <p className="mt-4 px-2.5 pt-2 pb-1 font-medium text-[11px] text-muted-foreground/80">
+              ワークスペース設定
+            </p>
+            {workspaceSections.map((entry) => (
+              <SectionButton
+                key={entry.section}
+                section={entry.section}
+                active={section === entry.section}
+                onSelect={openSettings}
+              />
+            ))}
+          </>
+        ) : null}
       </nav>
       <div className="scrollbar-ui min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-2xl px-6 py-8">
@@ -444,6 +833,12 @@ export function SettingsOverlay() {
           </div>
           {section === "profile" ? <ProfileSection /> : null}
           {section === "account" ? <AccountSection self={self} /> : null}
+          {/* 権限を失った状態で古いセクションが開いたままにならないよう、
+              描画時にも権限を確かめる（導線を隠すだけにしない）。 */}
+          {section === "members" && can("manage_members") ? (
+            <MembersSection />
+          ) : null}
+          {section === "roles" && can("manage_roles") ? <RolesSection /> : null}
         </div>
       </div>
     </div>

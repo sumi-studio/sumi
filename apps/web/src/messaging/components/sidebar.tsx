@@ -15,7 +15,7 @@ import { VoiceChannelMembers } from "../call/voice-channel-members";
 import type { PlaceKey } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
-import { notificationLevelFor, useMessaging } from "../store";
+import { notificationLevelFor, useMessaging, usePermissions } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 import { PlaceContextMenu } from "./place-context-menu";
 import { SettingsOverlay } from "./settings-overlay";
@@ -595,6 +595,10 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+/**
+ * 見出しと、その場所を増やす導線。onActionが無いときは「＋」を出さない——
+ * 押せば必ず断られるボタンを見せるくらいなら、無い方が正直。
+ */
 function SectionHeader({
   label,
   actionTitle,
@@ -602,21 +606,23 @@ function SectionHeader({
 }: {
   label: string;
   actionTitle: string;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   return (
     <div className="group flex items-center justify-between px-2 pb-1">
       <p className="font-medium text-[11px] text-muted-foreground/80">
         {label}
       </p>
-      <button
-        type="button"
-        title={actionTitle}
-        onClick={onAction}
-        className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
-      >
-        <Plus className="size-3.5" />
-      </button>
+      {onAction ? (
+        <button
+          type="button"
+          title={actionTitle}
+          onClick={onAction}
+          className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Plus className="size-3.5" />
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -638,6 +644,9 @@ export function Sidebar() {
   const placeNavigate = usePlaceNavigate();
   // ボイスチャンネルは開くことと入ることが同じ動作（ADR 0012）。
   const joinCall = useCall((state) => state.join);
+  // チャンネルを増やすのはワークスペースの管理。DMは自分の会話なので誰でも。
+  const { can } = usePermissions();
+  const canManageChannels = can("manage_channels");
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
@@ -680,7 +689,9 @@ export function Sidebar() {
           <SectionHeader
             label="チャンネル"
             actionTitle="チャンネルを作成"
-            onAction={() => setOpenDialog("channel")}
+            onAction={
+              canManageChannels ? () => setOpenDialog("channel") : undefined
+            }
           />
         </div>
         {channels.map((channel) => {
@@ -790,7 +801,7 @@ export function Sidebar() {
           </span>
         </button>
       </div>
-      {openDialog === "channel" ? (
+      {openDialog === "channel" && canManageChannels ? (
         <CreateChannelDialog onClose={() => setOpenDialog(null)} />
       ) : null}
       {openDialog === "dm" ? (

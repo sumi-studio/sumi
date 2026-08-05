@@ -16,6 +16,7 @@ import type {
   NotifyReason,
   ParticipantRef,
   ParticipantStatus,
+  PermissionSet,
   Place,
   PlaceKey,
   PollInput,
@@ -23,12 +24,15 @@ import type {
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
+  RoleAssignment,
+  RoleInput,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
   StatusKind,
   ThreadSummary,
   UnreadSummary,
+  WorkspaceRole,
   WorkspaceSummary,
 } from "./model";
 import {
@@ -116,6 +120,38 @@ const MEMBERS: MemberProfile[] = [
   { participant: SUMI, displayName: "Sumi", tagline: "yohakuの秘書" },
   { participant: KURO, displayName: "Kuro", tagline: "開発" },
 ];
+
+const ROLES: WorkspaceRole[] = [
+  {
+    roleId: "role-admin",
+    workspaceId: "ws-sumi",
+    name: "Admin",
+    color: "#3366ff",
+    position: 100,
+    permissions: {
+      manage_channels: true,
+      manage_roles: true,
+      manage_members: true,
+      mention_all: true,
+    },
+  },
+  {
+    roleId: "role-member",
+    workspaceId: "ws-sumi",
+    name: "Member",
+    color: "",
+    position: 0,
+    permissions: {},
+  },
+];
+
+/** モックの自分は創業メンバー相当。全権限を持つ。 */
+const SELF_PERMISSIONS: PermissionSet = {
+  manage_channels: true,
+  manage_roles: true,
+  manage_members: true,
+  mention_all: true,
+};
 
 interface AgentPersona {
   ref: ParticipantRef;
@@ -379,6 +415,10 @@ export class MockMessagingServer implements MessagingBackend {
     perPlace: [],
     keywords: [],
   };
+  private roles: WorkspaceRole[] = [...ROLES];
+  private roleAssignments: RoleAssignment[] = [
+    { participant: SELF, roleIds: ["role-admin"] },
+  ];
   /** 同じagentへの呼びかけは直列に処理される（人格は複製しない）。 */
   private readonly agentNextFreeAt = new Map<string, number>();
   /** 送信前の預かり中の添付。送信で1度だけメッセージへ移る。 */
@@ -438,8 +478,76 @@ export class MockMessagingServer implements MessagingBackend {
       unreadSummaries,
       replyLaterMarkers: [...this.replyLaterMarkers.values()],
       notificationSetting: this.notificationSetting,
+      roles: this.roles,
+      roleAssignments: this.roleAssignments,
+      permissions: SELF_PERMISSIONS,
       employedAgents: [SUMI],
     };
+  }
+
+  async fetchRoles(): Promise<{
+    roles: WorkspaceRole[];
+    roleAssignments: RoleAssignment[];
+    permissions: PermissionSet;
+  }> {
+    return {
+      roles: this.roles,
+      roleAssignments: this.roleAssignments,
+      permissions: SELF_PERMISSIONS,
+    };
+  }
+
+  async createRole(
+    _workspaceId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    const role: WorkspaceRole = {
+      roleId: `role-${secureRandomUUID().slice(0, 8)}`,
+      workspaceId: WORKSPACES[0].workspaceId,
+      name: input.name,
+      color: input.color,
+      position: 0,
+      permissions: input.permissions,
+    };
+    this.roles = [...this.roles, role];
+    return role;
+  }
+
+  async updateRole(
+    _workspaceId: string,
+    roleId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    const existing = this.roles.find((role) => role.roleId === roleId);
+    if (!existing) throw new Error("unknown role");
+    const role: WorkspaceRole = { ...existing, ...input };
+    this.roles = this.roles.map((entry) =>
+      entry.roleId === roleId ? role : entry,
+    );
+    return role;
+  }
+
+  async deleteRole(_workspaceId: string, roleId: string): Promise<void> {
+    this.roles = this.roles.filter((role) => role.roleId !== roleId);
+    this.roleAssignments = this.roleAssignments
+      .map((entry) => ({
+        ...entry,
+        roleIds: entry.roleIds.filter((id) => id !== roleId),
+      }))
+      .filter((entry) => entry.roleIds.length > 0);
+  }
+
+  async setMemberRoles(
+    _workspaceId: string,
+    participant: ParticipantRef,
+    roleIds: string[],
+  ): Promise<RoleAssignment> {
+    const assignment: RoleAssignment = { participant, roleIds };
+    this.roleAssignments = this.roleAssignments.filter(
+      (entry) => !sameParticipant(entry.participant, participant),
+    );
+    if (roleIds.length > 0) this.roleAssignments.push(assignment);
+    return assignment;
   }
 
   async setNotificationSetting(input: NotificationSettingInput): Promise<void> {

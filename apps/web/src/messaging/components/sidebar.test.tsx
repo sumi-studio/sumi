@@ -3,19 +3,34 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ParticipantRef } from "../model";
+import type { MemberProfile, ParticipantRef } from "../model";
+import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { Sidebar } from "./sidebar";
 
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
+const mocks = vi.hoisted(() => ({ navigate: vi.fn() }));
+
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => mocks.navigate,
+}));
 
 const human: ParticipantRef = { kind: "human", humanId: "h1" };
+const humanKey = participantKey(human);
+const self: MemberProfile = {
+  participant: human,
+  displayName: "余白",
+  tagline: "創業・デザイン",
+};
+
+const refreshRoles = vi.fn();
 
 beforeEach(() => {
+  refreshRoles.mockResolvedValue(undefined);
   useMessaging.setState({
     ready: true,
     self: human,
-    selfKey: "human:h1",
+    selfKey: humanKey,
+    membersByKey: { [humanKey]: self },
     workspaces: [{ workspaceId: "w1", name: "Sumi" }],
     channels: [
       {
@@ -28,9 +43,6 @@ beforeEach(() => {
       },
     ],
     dms: [],
-    membersByKey: {
-      "human:h1": { participant: human, displayName: "余白", tagline: "" },
-    },
     statusByKey: {},
     unreadCountByPlace: {},
     mentionCountByPlace: {},
@@ -44,6 +56,10 @@ beforeEach(() => {
       threads: true,
       polls: true,
     },
+    permissions: {},
+    roles: [],
+    roleAssignments: [],
+    refreshRoles,
   });
 });
 
@@ -95,5 +111,26 @@ describe("Sidebar", () => {
     expect(
       screen.queryByRole("menu", { name: "ステータス" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("manage_channelsが無ければチャンネルを増やす導線を出さない", () => {
+    render(<Sidebar />);
+
+    // 押せば必ず断られるボタンは出さない。DMは自分の会話なので残る。
+    expect(
+      screen.queryByRole("button", { name: "チャンネルを作成" }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "ダイレクトメッセージを開始" }),
+    ).toBeInTheDocument();
+  });
+
+  it("manage_channelsを持つ人にはチャンネル作成が現れる", () => {
+    useMessaging.setState({ permissions: { manage_channels: true } });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "チャンネルを作成" }));
+
+    expect(screen.getByPlaceholderText("例: dev")).toBeInTheDocument();
   });
 });
