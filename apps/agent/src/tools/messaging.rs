@@ -16,10 +16,11 @@ use tokio::sync::Mutex;
 use crate::{
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-        DuplicateMessagingChannelRequest, MessagingApi, MessagingParticipant,
-        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
-        UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
+        DuplicateMessagingChannelRequest, MessagingApi, MessagingNotificationPlace,
+        MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingPlaceRequest,
+        PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
+        StartMessagingDMRequest, UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -49,6 +50,15 @@ const MAX_STATUS_NOTE_BYTES: usize = 800;
 const MAX_REPLY_LATER_NOTE_BYTES: usize = 2000;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
+// The server bounds a search phrase at 200 bytes and one poll at 50 candidates.
+const MAX_SEARCH_QUERY_BYTES: usize = 200;
+const MAX_SEARCH_LIMIT: u16 = 50;
+const MAX_ATTENTION_LIMIT: u16 = 50;
+// A keyword list is a handful of words one wants to be called for, not a
+// search index: the server bounds it at 32 words of 64 characters each.
+const MAX_NOTIFICATION_KEYWORDS: usize = 32;
+const MAX_NOTIFICATION_KEYWORD_BYTES: usize = 64 * 4;
+const MAX_NOTIFICATION_PLACES: usize = 200;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -136,6 +146,59 @@ enum MessagingAction {
         #[serde(default)]
         name: Option<String>,
     },
+    /// Find messages one can already see.  Like status this is not about a
+    /// place: remembering something said elsewhere should not require having
+    /// guessed the place first.
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    /// Read or change one's own notification setting — the identical resource
+    /// a Human owns and changes from the UI.  With no field set this reads;
+    /// any field present changes only that field, because naming one
+    /// preference must not silently discard the rest.
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+    /// Take in one's own AttentionCandidates: what arrived while one was not
+    /// looking, and why.  `consume_through` acknowledges everything up to that
+    /// candidate_seq before the rest is listed.
+    ///
+    /// This is a provisional wiring ahead of the wake-trigger design (ADR 0010
+    /// / issue #173).  There, a candidate's arrival wakes the person; here the
+    /// already-awake person comes to look.  What is durable either way is that
+    /// nothing said while the runtime was stopped is lost.
+    Attention {
+        #[serde(default)]
+        consume_through: Option<u64>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+}
+
+/// The three notification levels, identical to the ones a Human chooses in the
+/// UI (契約ドラフト: HumanもAgentも同じ形).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessagingNotifyLevel {
+    All,
+    Mentions,
+    Mute,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagingNotifyPlace {
+    place_id: String,
+    level: MessagingNotifyLevel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -221,7 +284,10 @@ fn messaging_parameters_schema() -> Value {
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
             "marker_id; start_dm requires participants; create_channel requires name and may ",
             "include topic or workspace_id; update_channel requires place_id plus name, topic or ",
-            "both; duplicate_channel requires place_id and may include name. Write, react and ",
+            "both; duplicate_channel requires place_id and may include name; search requires ",
+            "query and may include place_id or limit; notification_settings takes any of ",
+            "defaults_level, per_place or keywords and reads the current setting when given ",
+            "none of them; attention may include consume_through or limit. Write, react and ",
             "reply_later act on the place most recently opened in this tool view; every other ",
             "action needs no open place."
         ),
@@ -231,7 +297,8 @@ fn messaging_parameters_schema() -> Value {
                 "enum": [
                     "overview", "open", "write", "react",
                     "status", "reply_later", "resolve_reply_later", "start_dm",
-                    "create_channel", "update_channel", "duplicate_channel"
+                    "create_channel", "update_channel", "duplicate_channel",
+                    "search", "notification_settings", "attention"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -243,14 +310,18 @@ fn messaging_parameters_schema() -> Value {
                     "start_dm opens a direct conversation with one person, or a group ",
                     "conversation with several, and puts it in view; create_channel opens a new ",
                     "channel and puts it in view; update_channel renames or retopics a channel; ",
-                    "duplicate_channel copies a channel's name and topic into a new empty one."
+                    "duplicate_channel copies a channel's name and topic into a new empty one; ",
+                    "search finds messages you can already see, anywhere; ",
+                    "notification_settings reads or changes what is allowed to interrupt you; ",
+                    "attention lists what arrived while you were not looking, and why."
                 )
             },
             "place_id": {
                 "type": "string",
                 "description": concat!(
-                    "Required for open, update_channel and duplicate_channel; omitted for other ",
-                    "actions. The place to open, edit or copy."
+                    "Required for open, update_channel and duplicate_channel; optional for ",
+                    "search; omitted for other actions. The place to open, edit or copy, or the ",
+                    "one place a search is restricted to."
                 )
             },
             "name": {
@@ -284,7 +355,10 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Optional for open and omitted for other actions. Maximum number of messages to return."
+                "description": concat!(
+                    "Optional for open, search and attention, omitted for other actions. ",
+                    "Maximum number of messages, search hits or candidates to return."
+                )
             },
             "content": {
                 "type": "string",
@@ -396,6 +470,57 @@ fn messaging_parameters_schema() -> Value {
                     "required": ["kind"],
                     "additionalProperties": false
                 }
+            },
+            "query": {
+                "type": "string",
+                "description": concat!(
+                    "Required for search and omitted for other actions. Words to look for. ",
+                    "Matching is case-insensitive substring, so a partial word finds it; the ",
+                    "results only ever come from places you can already see."
+                )
+            },
+            "defaults_level": {
+                "type": "string",
+                "enum": ["all", "mentions", "mute"],
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. What may ",
+                    "interrupt you in a place you have not singled out: all messages, only when ",
+                    "you are called, or nothing."
+                )
+            },
+            "per_place": {
+                "type": "array",
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. Overrides ",
+                    "for individual places. Sending this replaces the whole list of overrides."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "place_id": {"type": "string"},
+                        "level": {"type": "string", "enum": ["all", "mentions", "mute"]}
+                    },
+                    "required": ["place_id", "level"],
+                    "additionalProperties": false
+                }
+            },
+            "keywords": {
+                "type": "array",
+                "description": concat!(
+                    "Optional for notification_settings and omitted for other actions. Words ",
+                    "other than your name that should reach you. Sending this replaces the whole ",
+                    "list; an empty array means you use no keywords."
+                ),
+                "items": {"type": "string"}
+            },
+            "consume_through": {
+                "type": "integer",
+                "minimum": 1,
+                "description": concat!(
+                    "Optional for attention and omitted for other actions. The candidate_seq you ",
+                    "have taken in; everything up to and including it stops being offered. ",
+                    "Acknowledging is idempotent and never moves the cursor backwards."
+                )
             }
         },
         "required": ["action"],
@@ -414,6 +539,9 @@ impl Tool for MessagingTool {
                 "that currently open place, or react or promise a later reply to a ",
                 "message visible in it. Declare your own availability with status, or ",
                 "open a new direct or group conversation with start_dm. ",
+                "Use search to find something said elsewhere, attention to see what ",
+                "arrived while you were not looking, and notification_settings to ",
+                "decide what is allowed to interrupt you. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare. ",
                 "A message may carry attachments; each one reports filename, mime, ",
@@ -660,6 +788,61 @@ impl Tool for MessagingTool {
                 focus_created_channel(&mut state, &response);
                 response
             }
+            // Search results are not a screen.  They stay out of
+            // visible_messages, so a hit cannot be reacted to from the result
+            // list — one opens the place first, exactly as a human does
+            // (ADR 0011 §3: 見えていないものは操作できない).
+            MessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.search(SearchMessagingRequest {
+                    query: &query,
+                    place_id: place_id.as_deref(),
+                    limit,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let places = per_place.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| MessagingNotificationPlace {
+                            place_id: entry.place_id.as_str(),
+                            level: notify_level_text(entry.level),
+                        })
+                        .collect()
+                });
+                let words = keywords
+                    .as_ref()
+                    .map(|words| words.iter().map(String::as_str).collect());
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.notification_settings(MessagingNotificationSettingsRequest {
+                        defaults_level: defaults_level.map(notify_level_text),
+                        per_place: places,
+                        keywords: words,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::Attention {
+                consume_through,
+                limit,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.attention(PollMessagingAttentionRequest {
+                    consume_through,
+                    limit,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
         };
 
         let rendered = serde_json::to_string_pretty(&response)
@@ -793,6 +976,67 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => {
+            // A blank query is not a search. Asking for everything is not a
+            // question, and the server would refuse it anyway.
+            if query.trim().is_empty() || query.len() > MAX_SEARCH_QUERY_BYTES {
+                return Err(ToolError::InvalidArguments);
+            }
+            if place_id
+                .as_deref()
+                .is_some_and(|place| validate_bounded_nonempty(place, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_limit(limit, MAX_SEARCH_LIMIT)
+        }
+        MessagingAction::NotificationSettings {
+            per_place,
+            keywords,
+            ..
+        } => {
+            if per_place
+                .as_ref()
+                .is_some_and(|entries| entries.len() > MAX_NOTIFICATION_PLACES)
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if let Some(entries) = per_place {
+                for entry in entries {
+                    validate_bounded_nonempty(&entry.place_id, MAX_PLACE_ID_BYTES)?;
+                }
+            }
+            if let Some(words) = keywords {
+                if words.len() > MAX_NOTIFICATION_KEYWORDS {
+                    return Err(ToolError::InvalidArguments);
+                }
+                for word in words {
+                    // 空文字は「呼ばれたい言葉」ではない。サーバー側でも落ちる。
+                    if word.trim().is_empty()
+                        || word.len() > MAX_NOTIFICATION_KEYWORD_BYTES
+                        || word.chars().any(char::is_control)
+                    {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            Ok(())
+        }
+        MessagingAction::Attention {
+            consume_through,
+            limit,
+        } => {
+            // Zero would mean "acknowledge nothing", which is what omitting the
+            // field already says; a caller writing it means something else.
+            if consume_through == &Some(0) {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_limit(limit, MAX_ATTENTION_LIMIT)
+        }
     }
 }
 
@@ -819,6 +1063,13 @@ fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(),
             return Err(ToolError::InvalidArguments);
         }
         seen.push(key);
+    }
+    Ok(())
+}
+
+fn validate_limit(limit: &Option<u16>, max: u16) -> Result<(), ToolError> {
+    if limit.is_some_and(|limit| limit == 0 || limit > max) {
+        return Err(ToolError::InvalidArguments);
     }
     Ok(())
 }
@@ -920,6 +1171,14 @@ const fn urgency_text(urgency: MessagingUrgency) -> &'static str {
     }
 }
 
+const fn notify_level_text(level: MessagingNotifyLevel) -> &'static str {
+    match level {
+        MessagingNotifyLevel::All => "all",
+        MessagingNotifyLevel::Mentions => "mentions",
+        MessagingNotifyLevel::Mute => "mute",
+    }
+}
+
 const fn status_text(status: MessagingStatus) -> &'static str {
     match status {
         MessagingStatus::Available => "available",
@@ -968,6 +1227,9 @@ mod tests {
         resolutions: AsyncMutex<Vec<String>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         channels: AsyncMutex<Vec<(String, String, Option<String>)>>,
+        searches: AsyncMutex<Vec<(String, Option<String>, Option<u16>)>>,
+        notifications: AsyncMutex<Vec<(Option<String>, usize, Vec<String>)>>,
+        attentions: AsyncMutex<Vec<(Option<u64>, Option<u16>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -1163,6 +1425,61 @@ mod tests {
                 .push((request.place_id.to_owned(), request.seq));
             Ok(json!({"last_read_seq": request.seq}))
         }
+
+        async fn search(&self, request: SearchMessagingRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("search:{}", request.query));
+            self.searches.lock().await.push((
+                request.query.to_owned(),
+                request.place_id.map(str::to_owned),
+                request.limit,
+            ));
+            Ok(json!({"results": [
+                {"message_id": "m6", "place": {"kind": "channel", "channel_id": "general"},
+                 "seq": 6, "snippet": request.query}
+            ]}))
+        }
+
+        async fn notification_settings(
+            &self,
+            request: MessagingNotificationSettingsRequest<'_>,
+        ) -> Result<Value> {
+            self.calls.lock().await.push("notification".to_owned());
+            self.notifications.lock().await.push((
+                request.defaults_level.map(str::to_owned),
+                request
+                    .per_place
+                    .as_ref()
+                    .map(|entries| entries.len())
+                    .unwrap_or_default(),
+                request
+                    .keywords
+                    .as_ref()
+                    .map(|words| words.iter().map(|word| (*word).to_owned()).collect())
+                    .unwrap_or_default(),
+            ));
+            Ok(json!({"setting": {"defaults": {"level": request.defaults_level.unwrap_or("all")}}}))
+        }
+
+        async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<Value> {
+            self.calls.lock().await.push("attention".to_owned());
+            self.attentions
+                .lock()
+                .await
+                .push((request.consume_through, request.limit));
+            Ok(json!({
+                "candidates": [
+                    {"candidate_id": "c1", "candidate_seq": 1,
+                     "place": {"kind": "channel", "channel_id": "general"},
+                     "message_seq": 7, "reason": "mention",
+                     "arrival_time": "2026-08-04T12:00:00Z"}
+                ],
+                "consumed": request.consume_through.unwrap_or_default(),
+                "latest_seq": 1
+            }))
+        }
     }
 
     async fn execute(
@@ -1241,9 +1558,20 @@ mod tests {
                 "start_dm",
                 "create_channel",
                 "update_channel",
-                "duplicate_channel"
+                "duplicate_channel",
+                "search",
+                "notification_settings",
+                "attention"
             ])
         );
+        assert_eq!(
+            schema["properties"]["defaults_level"]["enum"],
+            json!(["all", "mentions", "mute"])
+        );
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["properties"]["consume_through"]["minimum"], 1);
+        assert_eq!(schema["properties"]["per_place"]["type"], "array");
+        assert_eq!(schema["properties"]["keywords"]["items"]["type"], "string");
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
         assert_eq!(schema["properties"]["limit"]["maximum"], 50);
@@ -1277,7 +1605,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            19
+            24
         );
     }
 
@@ -1374,6 +1702,66 @@ mod tests {
         assert!(matches!(
             resolve,
             MessagingAction::ResolveReplyLater { marker_id } if marker_id == "marker-1"
+        ));
+
+        let search: MessagingAction = serde_json::from_value(json!({
+            "action": "search",
+            "query": "デプロイ",
+            "place_id": "general",
+            "limit": 10
+        }))
+        .unwrap();
+        assert!(matches!(
+            search,
+            MessagingAction::Search {
+                query,
+                place_id: Some(place_id),
+                limit: Some(10)
+            } if query == "デプロイ" && place_id == "general"
+        ));
+
+        // 何も名指さない呼びも通る。それが「読み」である。
+        let read: MessagingAction =
+            serde_json::from_value(json!({"action": "notification_settings"})).unwrap();
+        assert!(matches!(
+            read,
+            MessagingAction::NotificationSettings {
+                defaults_level: None,
+                per_place: None,
+                keywords: None
+            }
+        ));
+
+        let settings: MessagingAction = serde_json::from_value(json!({
+            "action": "notification_settings",
+            "defaults_level": "mute",
+            "per_place": [{"place_id": "general", "level": "all"}],
+            "keywords": ["障害"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            settings,
+            MessagingAction::NotificationSettings {
+                defaults_level: Some(MessagingNotifyLevel::Mute),
+                per_place: Some(places),
+                keywords: Some(keywords)
+            } if places.len() == 1
+                && places[0].place_id == "general"
+                && matches!(places[0].level, MessagingNotifyLevel::All)
+                && keywords == vec!["障害".to_owned()]
+        ));
+
+        let attention: MessagingAction = serde_json::from_value(json!({
+            "action": "attention",
+            "consume_through": 12
+        }))
+        .unwrap();
+        assert!(matches!(
+            attention,
+            MessagingAction::Attention {
+                consume_through: Some(12),
+                limit: None
+            }
         ));
     }
 
@@ -1883,5 +2271,123 @@ mod tests {
         };
         assert!(text.contains("\"spoiler\": true"), "rendered: {text}");
         assert!(text.contains("結末の一枚"), "rendered: {text}");
+    }
+
+    #[tokio::test]
+    async fn search_needs_no_open_place_and_never_becomes_a_screen() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "search", "query": "デプロイ", "limit": 5}),
+            "search",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.searches.lock().await.as_slice(),
+            &[("デプロイ".to_owned(), None, Some(5))]
+        );
+        // A hit is not something on screen: reacting to it must still require
+        // opening the place first (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 6, "emoji": "👍"}),
+            "react-after-search",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn blank_search_query_is_refused_before_it_reaches_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let error = execute(&tool, json!({"action": "search", "query": "   "}), "blank")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments), "{error:?}");
+        assert!(api.searches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_settings_reads_when_nothing_is_named() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(&tool, json!({"action": "notification_settings"}), "read")
+            .await
+            .unwrap();
+        // 何も名指さない呼びは読み。既存の設定を空で上書きしない。
+        assert_eq!(
+            api.notifications.lock().await.as_slice(),
+            &[(None, 0, Vec::<String>::new())]
+        );
+
+        execute(
+            &tool,
+            json!({
+                "action": "notification_settings",
+                "defaults_level": "mentions",
+                "keywords": ["デプロイ", "障害"]
+            }),
+            "write",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.notifications.lock().await.last().unwrap(),
+            &(
+                Some("mentions".to_owned()),
+                0,
+                vec!["デプロイ".to_owned(), "障害".to_owned()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_settings_rejects_an_unknown_level() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let error = execute(
+            &tool,
+            json!({"action": "notification_settings", "defaults_level": "silent"}),
+            "unknown-level",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments), "{error:?}");
+        assert!(api.notifications.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attention_acknowledges_then_lists_what_remains() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        let output = execute(
+            &tool,
+            json!({"action": "attention", "consume_through": 3, "limit": 10}),
+            "attention",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.attentions.lock().await.as_slice(),
+            &[(Some(3), Some(10))]
+        );
+        // 候補は message ref。本文は運ばれず、続きは place を開いて読む。
+        let candidate = &output.details["candidates"][0];
+        assert_eq!(candidate["reason"], "mention");
+        assert!(candidate.get("content").is_none());
+
+        // 0 は「何も ack しない」で、それは省略が既に言っていること。
+        let error = execute(
+            &tool,
+            json!({"action": "attention", "consume_through": 0}),
+            "zero-ack",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments), "{error:?}");
     }
 }

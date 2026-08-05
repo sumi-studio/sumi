@@ -464,6 +464,7 @@ func publishMessageCreated(ctx context.Context, store *Store, hub *Hub, place Pl
 	// 人を除外したりはしない——「今見ている画面に重ねない」の判断は、その
 	// 画面を持っている側（SW / agent 本人）が行う。
 	store.deliverPush(ctx, place, msg, decisions)
+	store.recordAttentionCandidates(ctx, place, msg, decisions)
 }
 
 // publishStatus fans a self-declared status out to everyone who may see the
