@@ -149,6 +149,35 @@ describe("MessageContent sanitization", () => {
     expect(container.querySelector("script")).toBeNull();
   });
 
+  it("never fetches a markdown image: renders a link instead of <img>", () => {
+    const { container } = renderContent(
+      "![pixel](https://attacker.example/pixel.png)",
+    );
+    expect(container.querySelector("img")).toBeNull();
+    const link = container.querySelector("[data-image-link]");
+    expect(link).toHaveAttribute("href", "https://attacker.example/pixel.png");
+    expect(link).toHaveAttribute("rel", "noreferrer noopener");
+    expect(link).toHaveTextContent("pixel");
+  });
+
+  it("never fetches a reference-style markdown image either", () => {
+    const { container } = renderContent(
+      "![pixel][p]\n\n[p]: https://attacker.example/ref.png",
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("[data-image-link]")).toHaveAttribute(
+      "href",
+      "https://attacker.example/ref.png",
+    );
+  });
+
+  it("does not build an image link from an unsafe URL scheme", () => {
+    const { container } = renderContent("![x](javascript:alert(1))");
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("[data-image-link]")).toBeNull();
+    expect(container.innerHTML).not.toContain("javascript:");
+  });
+
   it("does not execute javascript: URLs are left as plain text, not mangled HTML", () => {
     const { container } = renderContent("<a href='javascript:alert(1)'>x</a>");
     const anchor = container.querySelector("a");

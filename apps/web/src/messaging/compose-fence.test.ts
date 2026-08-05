@@ -35,4 +35,56 @@ describe("isInsideUnclosedCodeFence", () => {
     const value = "~~~\ncode";
     expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
   });
+
+  it("is false once a tilde fence is closed by a tilde fence", () => {
+    const value = "~~~\ncode\n~~~";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
+});
+
+describe("isInsideUnclosedCodeFence closing fence rules", () => {
+  it("does not let a tilde line close a backtick fence", () => {
+    const value = "```\ncode\n~~~";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("does not let a backtick line close a tilde fence", () => {
+    const value = "~~~\ncode\n```";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("does not let a shorter fence close a longer opener", () => {
+    const value = "````\ncode\n```";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("lets a longer fence close a shorter opener", () => {
+    const value = "```\ncode\n````";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
+
+  it("does not treat a fence with an info string as closing", () => {
+    const value = "```\ncode\n```ts";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("allows trailing whitespace on the closing fence", () => {
+    const value = "```ts\ncode\n```   ";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
+
+  it("allows up to three spaces of indent on the closing fence", () => {
+    const value = "```ts\ncode\n   ```";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
+
+  it("reopens after a closed fence", () => {
+    const value = "```\na\n```\ntext\n```";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(true);
+  });
+
+  it("ignores a backtick opener whose info string contains a backtick", () => {
+    const value = "```a`b\ncode";
+    expect(isInsideUnclosedCodeFence(value, value.length)).toBe(false);
+  });
 });

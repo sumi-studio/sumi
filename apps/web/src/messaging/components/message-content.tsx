@@ -1,4 +1,4 @@
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Image as ImageIcon } from "lucide-react";
 import {
   Children,
   isValidElement,
@@ -25,7 +25,8 @@ import { participantKey } from "../model";
  *
  * 安全性: rehype-rawを入れないため本文由来の生HTMLは描画されない
  * （react-markdownのデフォルトで生HTMLはテキスト扱い）。リンクは
- * rel="noreferrer noopener" target="_blank"。
+ * rel="noreferrer noopener" target="_blank"。![alt](url)は<img>にせず
+ * リンクとして描く（自動取得しない。後述のImageLink参照）。
  *
  * mention装飾はremarkプラグインとしてAST上のtextノードを分割する。
  * code / inlineCode は値がtextノードにならないため、コードの内側は
@@ -227,11 +228,57 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
+const LINK_CLASS =
+  "break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary";
+
+/**
+ * ![alt](url) を <img> にせず、開くかどうかを読み手が決めるリンクにする。
+ *
+ * <img>で描くと、メッセージを表示しただけで作者の指定したURLへ閲覧者の
+ * ブラウザからGETが飛び、IPと閲覧時刻が作者へ渡る。承認済みの
+ * proxy／attachment経路（#201）ができるまでは自動取得しない。
+ * hrefはreact-markdownのurlTransformを通っており、javascript:などは空になる。
+ */
+function ImageLink({
+  src,
+  alt,
+  title,
+}: {
+  src?: string | Blob;
+  alt?: string;
+  title?: string;
+}) {
+  const href = typeof src === "string" && src !== "" ? src : undefined;
+  const label = alt?.trim() || href || "画像";
+  if (!href) {
+    return (
+      <span className="inline-flex items-baseline gap-1 text-muted-foreground">
+        <ImageIcon className="size-3 self-center" aria-hidden="true" />
+        {label}
+      </span>
+    );
+  }
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer noopener"
+      title={title ?? href}
+      data-image-link=""
+      className={`inline-flex items-baseline gap-1 ${LINK_CLASS}`}
+    >
+      <ImageIcon className="size-3 self-center" aria-hidden="true" />
+      {label}
+    </a>
+  );
+}
+
 /**
  * チャット向けの控えめな組版。見出しはDiscord同様に本文よりわずかに
  * 大きい程度へ抑える。段落間は狭く、リストはインデントのみ。
  */
 const markdownComponents: Components = {
+  img: ({ src, alt, title }) => <ImageLink src={src} alt={alt} title={title} />,
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   code: ({ children }) => (
     <code className="rounded bg-muted px-1 py-px font-mono text-[12.5px]">
@@ -243,7 +290,7 @@ const markdownComponents: Components = {
       href={href}
       target="_blank"
       rel="noreferrer noopener"
-      className="break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
+      className={LINK_CLASS}
     >
       {children}
     </a>
