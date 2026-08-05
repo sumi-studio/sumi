@@ -1,5 +1,11 @@
 import { Check, X } from "lucide-react";
+import { useEffect } from "react";
 import type { AuthOutcomeNotice as AuthOutcomeNoticeState } from "./auth-outcome-notice-state";
+
+// Outcome notices are useful confirmation, not persistent status. Keep them
+// long enough to read the transition copy while avoiding a notification that
+// blocks the workspace until it is manually closed.
+export const authOutcomeNoticeAutoDismissMilliseconds = 5_000;
 
 export function AuthOutcomeNotice({
   notice,
@@ -8,6 +14,17 @@ export function AuthOutcomeNotice({
   notice: AuthOutcomeNoticeState;
   onDismiss: () => void;
 }) {
+  const noticeReceiptId = notice.receiptId;
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      // Keep the timer scoped to this terminal receipt. A new notice should
+      // get a fresh reading window even when the component remains mounted.
+      onDismiss();
+    }, authOutcomeNoticeAutoDismissMilliseconds);
+    return () => window.clearTimeout(timeoutId);
+  }, [noticeReceiptId, onDismiss]);
+
   return (
     <div
       role="status"
