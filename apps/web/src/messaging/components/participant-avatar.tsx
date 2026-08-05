@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { StatusKind } from "../model";
 
 /**
@@ -41,6 +42,8 @@ export function ParticipantAvatar({
   src?: string;
 }) {
   const hue = hueFor(participantKey);
+  const [failedSrc, setFailedSrc] = useState<string>();
+  const showImage = Boolean(src && src !== failedSrc);
   return (
     <span
       className="relative inline-flex shrink-0 select-none items-center justify-center rounded-full font-medium"
@@ -53,10 +56,15 @@ export function ParticipantAvatar({
       }}
       aria-hidden
     >
-      {src ? (
+      {showImage ? (
         // ステータスの点は円の外側に環を持つので、切り抜きは画像だけに掛ける。
         <span className="absolute inset-0 overflow-hidden rounded-full">
-          <img src={src} alt="" className="size-full object-cover" />
+          <img
+            src={src}
+            alt=""
+            className="size-full object-cover"
+            onError={() => setFailedSrc(src)}
+          />
         </span>
       ) : (
         name.slice(0, 1).toUpperCase()

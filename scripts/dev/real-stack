@@ -512,7 +512,8 @@ trap cleanup EXIT INT TERM
 
 readonly COMMAND_LOG_DIR="${RUNTIME_ROOT}/command-log"
 readonly GATEWAY_STATE_DIR="${RUNTIME_ROOT}/gateway-state"
-readonly MESSAGING_ATTACHMENT_DIR="${RUNTIME_ROOT}/messaging-attachments"
+readonly PERSISTENT_STATE_ROOT="${SUMI_REAL_STACK_STATE_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/real-stack}"
+readonly MESSAGING_ATTACHMENT_DIR="${PERSISTENT_STATE_ROOT}/messaging-attachments"
 readonly AGENT_STATE_DIR="${RUNTIME_ROOT}/agent-state"
 readonly WORKSPACE_DIR="${RUNTIME_ROOT}/workspace"
 readonly IPC_DIR="${RUNTIME_ROOT}/ipc"
@@ -521,12 +522,15 @@ readonly BIN_DIR="${RUNTIME_ROOT}/bin"
 mkdir -m 0700 \
   "${COMMAND_LOG_DIR}" \
   "${GATEWAY_STATE_DIR}" \
-  "${MESSAGING_ATTACHMENT_DIR}" \
   "${AGENT_STATE_DIR}" \
   "${WORKSPACE_DIR}" \
   "${IPC_DIR}" \
   "${LOG_DIR}" \
   "${BIN_DIR}"
+mkdir -p -m 0700 "${MESSAGING_ATTACHMENT_DIR}"
+[[ -d "${MESSAGING_ATTACHMENT_DIR}" && ! -L "${MESSAGING_ATTACHMENT_DIR}" ]] ||
+  fail "persistent messaging attachment root must be a directory, not a symlink"
+chmod 0700 "${MESSAGING_ATTACHMENT_DIR}"
 
 readonly API_BINARY="${BIN_DIR}/sumi-api"
 readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"
@@ -711,7 +715,7 @@ wait_for_http "${WEB_ORIGIN}/" "${VITE_PID}" "Vite"
 assert_exact_tcp_listener "${PUBLIC_HOST}:${WEB_PORT}" "${WEB_PORT}" "Vite"
 
 log "Sumi is Ready: ${WEB_ORIGIN}"
-log "Press Ctrl-C to stop; disposable state and non-production secrets will be removed."
+log "Press Ctrl-C to stop; ephemeral state is removed while uploaded attachments persist."
 while true; do
   for pid in "${CHILD_PIDS[@]}"; do
     process_is_running "${pid}" || fail "a required Sumi process exited"

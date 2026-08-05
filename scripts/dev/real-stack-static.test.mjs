@@ -237,3 +237,15 @@ test("the allocator exception is bounded to one locked disposable generation", a
   assert.match(launcher, /fail "a required Sumi process exited"/);
   assert.doesNotMatch(launcher, /--supervisor-allocate/);
 });
+
+test("attachment bytes persist alongside the persistent local database", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  assert.match(
+    launcher,
+    /SUMI_REAL_STACK_STATE_ROOT:-\$\{XDG_STATE_HOME:-\$\{HOME\}\/\.local\/state\}\/sumi\/real-stack/,
+  );
+  assert.doesNotMatch(
+    launcher,
+    /MESSAGING_ATTACHMENT_DIR="\$\{RUNTIME_ROOT\}\/messaging-attachments"/,
+  );
+});
