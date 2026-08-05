@@ -22,6 +22,7 @@ import type { ComposerPlusMenuItem } from "./composer-plus-menu";
 import { ComposerPlusMenu } from "./composer-plus-menu";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
+import { PollCreateDialog } from "./poll-create-dialog";
 
 const MAX_HEIGHT_PX = 220;
 const TYPING_THROTTLE_MS = 2_000;
@@ -73,6 +74,7 @@ export function Composer() {
   const replyTargetId = useMessaging((state) => state.replyTargetId);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
   const uploadAttachment = useMessaging((state) => state.uploadAttachment);
+  const canPoll = useMessaging((state) => state.capabilities.polls);
 
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -85,6 +87,7 @@ export function Composer() {
     update: updateAttachment,
   });
   const [dragging, setDragging] = useState(false);
+  const [pollOpen, setPollOpen] = useState(false);
   const lastTypingAt = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -248,12 +251,13 @@ export function Composer() {
       {
         id: "poll",
         label: "投票を作成",
-        hint: "準備中",
+        hint: canPoll ? "みんなに聞く" : "準備中",
         icon: ChartBarBig,
-        disabled: true,
+        disabled: !canPoll,
+        onSelect: () => setPollOpen(true),
       },
     ],
-    [insertMentionTrigger],
+    [insertMentionTrigger, canPoll],
   );
 
   const onKeyDown = useCallback(
@@ -484,6 +488,9 @@ export function Composer() {
           </div>
         </div>
       </div>
+      {pollOpen ? (
+        <PollCreateDialog onClose={() => setPollOpen(false)} />
+      ) : null}
     </div>
   );
 }

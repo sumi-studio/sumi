@@ -30,6 +30,7 @@ class StubBackend implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   readonly settingWrites: NotificationSettingInput[] = [];
   rejectSettingWrites = false;
@@ -95,6 +96,9 @@ class StubBackend implements MessagingBackend {
     return [];
   }
   async createThread(): ReturnType<MessagingBackend["createThread"]> {
+    throw new Error("not used");
+  }
+  async votePoll(): ReturnType<MessagingBackend["votePoll"]> {
     throw new Error("not used");
   }
   async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {

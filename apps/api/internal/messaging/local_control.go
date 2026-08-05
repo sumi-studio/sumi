@@ -35,6 +35,10 @@ const (
 	// store call (AX: UIだけにある操作を作らない).
 	LocalCreateThreadPath = "/local-control/v1/messaging:create-thread"
 	LocalThreadsPath      = "/local-control/v1/messaging:threads"
+	// LocalCreatePollPath and LocalVotePollPath give the agent the same two
+	// acts a human has: asking a question of the room, and answering one.
+	LocalCreatePollPath = "/local-control/v1/messaging:create-poll"
+	LocalVotePollPath   = "/local-control/v1/messaging:vote-poll"
 	// LocalNotificationSettingsPath is both the read and the write of the
 	// agent's own notification setting. The agent owns the identical resource a
 	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
@@ -77,6 +81,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalCreateThreadPath, s.localCreateThread},
 		{"POST " + LocalThreadsPath, s.localThreads},
+		{"POST " + LocalCreatePollPath, s.localCreatePoll},
+		{"POST " + LocalVotePollPath, s.localVotePoll},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 		{"POST " + LocalSearchPath, s.localSearch},
 		{"POST " + LocalAttentionPath, s.localAttention},
@@ -857,6 +863,110 @@ func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authoriz
 	}{wires, consumed, latestSeq})
 }
 
+// localCreatePoll asks a question in the open place. It goes through the
+// ordinary send, so the poll and the message that carries it commit together
+// and the same message_created event reaches every transport.
+func (s *Server) localCreatePoll(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID     string   `json:"place_id"`
+		Question    string   `json:"question"`
+		Options     []string `json:"options"`
+		AllowMulti  bool     `json:"allow_multi,omitempty"`
+		Content     string   `json:"content,omitempty"`
+		ClientNonce string   `json:"client_nonce"`
+		// Relative so the server's clock, not the workspace's, fixes the
+		// deadline — the same rule status and reply-later follow.
+		ClosesInMinutes uint32 `json:"closes_in_minutes,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.ClosesInMinutes > maxRelativeMinutes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	poll := &PollInput{
+		Question:   request.Question,
+		AllowMulti: request.AllowMulti,
+		Options:    request.Options,
+	}
+	if request.ClosesInMinutes > 0 {
+		moment := time.Now().Add(time.Duration(request.ClosesInMinutes) * time.Minute)
+		poll.ClosesAt = &moment
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, created, err := s.Store.AppendMessage(r.Context(), AppendInput{
+		PlaceID: request.PlaceID, Author: viewer, Content: request.Content,
+		ClientNonce: request.ClientNonce, Poll: poll,
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if created {
+		publishMessageCreated(r.Context(), s.Store, s.Hub, place, message)
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		MessageID string      `json:"message_id"`
+		Seq       int64       `json:"seq"`
+		Message   messageWire `json:"message"`
+	}{message.MessageID, message.Seq, messageToWire(place, message)})
+}
+
+// localVotePoll restates the agent's whole choice on a poll visible in the
+// open place. An empty option list withdraws the vote.
+func (s *Server) localVotePoll(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID   string   `json:"place_id"`
+		MessageID string   `json:"message_id"`
+		OptionIDs []string `json:"option_ids"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), request.PlaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, err := s.Store.VotePoll(
+		r.Context(), request.PlaceID, request.MessageID, viewer, request.OptionIDs)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, message)
+	if s.Hub != nil {
+		s.Hub.Publish(r.Context(), Event{
+			Type: EventPollUpdated, PlaceID: request.PlaceID, Message: &wire,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{wire})
+}
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
 	var request struct {
 		PlaceID string `json:"place_id"`

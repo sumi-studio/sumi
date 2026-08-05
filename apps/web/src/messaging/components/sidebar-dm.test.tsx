@@ -79,6 +79,7 @@ beforeEach(() => {
       reactions: true,
       notifications: true,
       threads: true,
+      polls: true,
     },
   });
 });

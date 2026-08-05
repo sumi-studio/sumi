@@ -7,6 +7,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
   MessageSearchResult,
   MessagingBackend,
   NotificationLevel,
@@ -17,6 +18,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  PollOption,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -53,6 +55,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -258,6 +261,21 @@ export class ApiMessagingBackend implements MessagingBackend {
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
             attachments: input.attachments,
+            // 問いを立てない送信にpollは載せない。ほとんどのメッセージが
+            // 運ぶ必要のないnullを、毎回wireに置かないため。
+            ...(input.poll
+              ? {
+                  poll: {
+                    question: input.poll.question,
+                    allow_multi: input.poll.allowMulti,
+                    closes_at:
+                      input.poll.closesAt === null
+                        ? null
+                        : new Date(input.poll.closesAt).toISOString(),
+                    options: input.poll.options,
+                  },
+                }
+              : {}),
           },
         },
       ),
@@ -378,6 +396,17 @@ export class ApiMessagingBackend implements MessagingBackend {
     await this.request(
       `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
       { method: "POST", body: { emoji } },
+    );
+  }
+
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<void> {
+    await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/poll/vote`,
+      { method: "POST", body: { option_ids: optionIds } },
     );
   }
 
@@ -504,9 +533,12 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
-    } else if (eventType === "reaction_updated") {
-      // A reaction can target a message older than the replay cursor, so it
-      // must never move the cursor (backwards or at all).
+    } else if (
+      eventType === "reaction_updated" ||
+      eventType === "poll_updated"
+    ) {
+      // A reaction or a vote can target a message older than the replay
+      // cursor, so it must never move the cursor (backwards or at all).
       parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
@@ -813,6 +845,26 @@ function parseAttachment(value: unknown): Attachment {
   };
 }
 
+function parsePollOption(value: unknown): PollOption {
+  const wire = asRecord(value);
+  return {
+    optionId: asString(wire.option_id),
+    text: asString(wire.text),
+    voters: asArray(wire.voters).map(parseParticipant),
+  };
+}
+
+function parsePoll(value: unknown): MessagePoll | null {
+  if (value == null) return null;
+  const wire = asRecord(value);
+  return {
+    question: asString(wire.question),
+    allowMulti: asBoolean(wire.allow_multi),
+    closesAt: wire.closes_at == null ? null : asTimestamp(wire.closes_at),
+    options: asArray(wire.options).map(parsePollOption),
+  };
+}
+
 function parseMessage(value: unknown): Message {
   const wire = asRecord(value);
   return {
@@ -825,6 +877,7 @@ function parseMessage(value: unknown): Message {
     urgency: asUrgency(wire.urgency),
     reactions: asArray(wire.reactions).map(parseReaction),
     attachments: asArray(wire.attachments ?? []).map(parseAttachment),
+    poll: parsePoll(wire.poll ?? null),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,

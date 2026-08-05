@@ -139,6 +139,53 @@ export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 /** 1メッセージに添付できる件数の上限。サーバーの上限と同値。 */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
+/**
+ * 投票の選択肢。誰が入れたかはreactionと同じく見える（v0に匿名投票はない）。
+ * 票数はvotersの数から導く——別に数を持つと二つの真実ができる。
+ */
+export interface PollOption {
+  optionId: string;
+  text: string;
+  voters: ParticipantRef[];
+}
+
+/**
+ * メッセージが運ぶ問い。投票は別の入れ物ではなくメッセージの付属物で、
+ * 発言と一緒にcommitされ、発言が消えれば票ごと消える。
+ */
+export interface MessagePoll {
+  question: string;
+  /** 複数選択可。falseなら「同一投票に1票」をサーバーが強制する。 */
+  allowMulti: boolean;
+  /** 締切。nullは締切なし。過ぎたら結果だけが見える。 */
+  closesAt: number | null;
+  options: PollOption[];
+}
+
+/** 送信時に述べる投票。選択肢のidはサーバーが採番するのでtextだけを運ぶ。 */
+export interface PollInput {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  options: string[];
+}
+
+/** 投票の上限。サーバーのMinPollOptions/MaxPollOptionsと同値。 */
+export const MIN_POLL_OPTIONS = 2;
+export const MAX_POLL_OPTIONS = 10;
+
+/** 締切を過ぎた投票は結果だけ。押せるものが残っていると嘘になる。 */
+export function isPollClosed(poll: MessagePoll, now: number): boolean {
+  return poll.closesAt !== null && now >= poll.closesAt;
+}
+
+export function pollVoteCount(poll: MessagePoll): number {
+  return poll.options.reduce(
+    (total, option) => total + option.voters.length,
+    0,
+  );
+}
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -152,6 +199,12 @@ export interface Message {
   reactions: ReactionSummary[];
   /** 送信時に紐付いた添付。tombstoneは何も運ばない。 */
   attachments: Attachment[];
+  /**
+   * 問いを立てているメッセージだけが持つ。省略可にしてあるのは、
+   * Messageを組み立てる側（モック・テスト・楽観的描画）に無関係な
+   * nullを書かせないため。
+   */
+  poll?: MessagePoll | null;
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -347,6 +400,8 @@ export type ServerEvent =
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   | { type: "reaction_updated"; message: Message }
+  /** 票の更新。reaction_updatedと同じくmessage全体を運び、seqは進めない。 */
+  | { type: "poll_updated"; message: Message }
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
   | {
       type: "place_created";
@@ -371,6 +426,8 @@ export interface SendMessageInput {
   clientNonce: string;
   /** 先にアップロード済みの添付id。自分がアップロードしたものだけ紐付く。 */
   attachments: string[];
+  /** 投票付きの送信。問いと、それを述べる発言は一つの出来事。 */
+  poll?: PollInput | null;
 }
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
@@ -387,6 +444,7 @@ export interface MessagingCapabilities {
   reactions: boolean;
   notifications: boolean;
   threads: boolean;
+  polls: boolean;
 }
 
 /**
@@ -495,6 +553,11 @@ export interface MessagingBackend {
   ): Promise<void>;
   resolveReplyLater(markerId: string): Promise<void>;
   toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  /**
+   * 投票の回答を丸ごと置き換える。空配列は取り消し——気が変わることと
+   * 取り下げることを別の道具にしない。
+   */
+  votePoll(place: Place, messageId: string, optionIds: string[]): Promise<void>;
   /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
   setNotificationSetting(input: NotificationSettingInput): Promise<void>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */

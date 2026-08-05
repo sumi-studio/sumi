@@ -37,6 +37,8 @@ type Message struct {
 	Mentions    []ParticipantRef
 	Attachments []Attachment
 	Reactions   []ReactionSummary
+	// Poll is the question the message carries, when it asks one.
+	Poll        *Poll
 	ReplyTo     string // empty when not a reply
 	ClientNonce string
 	CreatedAt   time.Time
@@ -57,6 +59,9 @@ type AppendInput struct {
 	ReplyTo       string // optional message_id in the same place
 	ClientNonce   string
 	AttachmentIDs []string
+	// Poll, when set, is committed with the message: a question and the
+	// message that asks it are one durable event, never two.
+	Poll *PollInput
 }
 
 // AppendMessage commits a message to a place, allocating the next place seq in
@@ -75,10 +80,16 @@ func (s *Store) AppendMessage(ctx context.Context, in AppendInput) (Message, boo
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	// A message may be attachments only: sending an image without a caption is
-	// an ordinary thing to do. Empty and attachment-less stays refused.
-	if in.Content == "" && len(in.AttachmentIDs) == 0 {
+	// A message may carry attachments or a poll instead of text: sending an
+	// image without a caption, or a bare question, are ordinary things to do.
+	// Empty with nothing attached stays refused.
+	if in.Content == "" && len(in.AttachmentIDs) == 0 && in.Poll == nil {
 		return Message{}, false, fmt.Errorf("content must not be empty")
+	}
+	if in.Poll != nil {
+		if err := in.Poll.Validate(); err != nil {
+			return Message{}, false, err
+		}
 	}
 	if len(in.Content) > MaxContentBytes {
 		return Message{}, false, fmt.Errorf("content exceeds %d bytes", MaxContentBytes)
@@ -202,6 +213,13 @@ func (s *Store) appendOnce(ctx context.Context, in AppendInput) (Message, bool, 
 		return Message{}, false, err
 	}
 	msg.Attachments = attachments
+	if in.Poll != nil {
+		poll, err := insertPoll(ctx, tx, msg.MessageID, *in.Poll)
+		if err != nil {
+			return Message{}, false, err
+		}
+		msg.Poll = poll
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, fmt.Errorf("commit append: %w", err)
 	}
@@ -258,6 +276,9 @@ func (s *Store) History(ctx context.Context, placeID string, viewer ParticipantR
 	if err := s.attachReactions(ctx, messages); err != nil {
 		return nil, err
 	}
+	if err := s.attachPolls(ctx, messages); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -290,6 +311,9 @@ func (s *Store) MessagesSince(ctx context.Context, placeID string, viewer Partic
 		return nil, err
 	}
 	if err := s.attachReactions(ctx, messages); err != nil {
+		return nil, err
+	}
+	if err := s.attachPolls(ctx, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -371,6 +395,11 @@ func (s *Store) EditMessage(ctx context.Context, placeID, messageID string, auth
 	if err := s.attachReactions(ctx, edited); err != nil {
 		return Message{}, err
 	}
+	// An edit rewrites the text around a question; the question and the votes
+	// cast on it are untouched, so they ride along with the edited copy.
+	if err := s.attachPolls(ctx, edited); err != nil {
+		return Message{}, err
+	}
 	return edited[0], nil
 }
 
@@ -435,6 +464,12 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 		"DELETE FROM message_reactions WHERE message_id = $1", messageID); err != nil {
 		return Message{}, fmt.Errorf("clear reactions: %w", err)
 	}
+	// A vanished question keeps no answers: the poll and every vote go with
+	// the content, leaving only the fact and the seq.
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM message_polls WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear poll: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit delete: %w", err)
 	}
@@ -445,6 +480,7 @@ func (s *Store) DeleteMessage(ctx context.Context, placeID, messageID string, ac
 	// AttachmentForViewer).
 	msg.Attachments = nil
 	msg.Reactions = nil
+	msg.Poll = nil
 	msg.Deleted = true
 	return msg, nil
 }
@@ -582,6 +618,9 @@ func (s *Store) messageByNonce(ctx context.Context, q querier, in AppendInput) (
 		return Message{}, false, err
 	}
 	if err := s.attachReactions(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
+	if err := s.attachPolls(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
 	return messages[0], true, nil

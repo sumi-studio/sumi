@@ -357,6 +357,72 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
+  it("projects poll_updated without moving the replay cursor", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    // 票は古い発言にも付く。cursorが巻き戻ると再接続で取りこぼす。
+    socket?.message({
+      type: "event",
+      event: {
+        type: "poll_updated",
+        place_id: "channel-1",
+        message: {
+          ...messageWire(2, ""),
+          poll: {
+            question: "リリースはいつ？",
+            allow_multi: false,
+            closes_at: null,
+            options: [
+              {
+                option_id: "o-1",
+                text: "今日",
+                voters: [{ kind: "human", human_id: "human-1" }],
+              },
+              { option_id: "o-2", text: "明日", voters: [] },
+            ],
+          },
+        },
+      },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "poll_updated",
+      message: {
+        seq: 2,
+        poll: {
+          question: "リリースはいつ？",
+          allowMulti: false,
+          closesAt: null,
+        },
+      },
+    });
+
+    // 再接続時に送るcursorは票では動かない。動くと、票の付いた古い発言より
+    // 後のメッセージを取りこぼす。
+    vi.useFakeTimers();
+    socket?.close();
+    await vi.advanceTimersByTimeAsync(500);
+    // FakeWebSocketは最新の1本だけを保持する。
+    const reconnected = FakeWebSocket.instances[0];
+    reconnected?.open();
+    expect(JSON.parse(reconnected?.sent[0] ?? "{}")).toEqual({
+      type: "hello",
+      cursors: { "channel-1": 4 },
+    });
+  });
+
   it("creates channels, dms, and group dms and edits topics over REST", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {

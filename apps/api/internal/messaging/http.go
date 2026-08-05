@@ -77,6 +77,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
@@ -261,11 +262,70 @@ type messageWire struct {
 	Attachments []attachmentWire  `json:"attachments"`
 	Urgency     string            `json:"urgency"`
 	Reactions   []reactionWire    `json:"reactions"`
-	ReplyTo     *string           `json:"reply_to"`
-	ClientNonce string            `json:"client_nonce"`
-	CreatedAt   time.Time         `json:"created_at"`
-	EditedAt    *time.Time        `json:"edited_at"`
-	Deleted     bool              `json:"deleted"`
+	// Poll is absent on the wire unless the message asks a question.
+	Poll        *pollWire  `json:"poll,omitempty"`
+	ReplyTo     *string    `json:"reply_to"`
+	ClientNonce string     `json:"client_nonce"`
+	CreatedAt   time.Time  `json:"created_at"`
+	EditedAt    *time.Time `json:"edited_at"`
+	Deleted     bool       `json:"deleted"`
+}
+
+// pollOptionWire is one choice and who currently picks it. Voters travel for
+// the same reason reaction participants do: a shared decision is not a secret
+// ballot, and the counts are derived from the same list the UI highlights.
+type pollOptionWire struct {
+	OptionID string            `json:"option_id"`
+	Text     string            `json:"text"`
+	Voters   []participantWire `json:"voters"`
+}
+
+type pollWire struct {
+	Question   string           `json:"question"`
+	AllowMulti bool             `json:"allow_multi"`
+	ClosesAt   *time.Time       `json:"closes_at"`
+	Options    []pollOptionWire `json:"options"`
+}
+
+func pollToWire(poll *Poll) *pollWire {
+	if poll == nil {
+		return nil
+	}
+	options := make([]pollOptionWire, len(poll.Options))
+	for i, option := range poll.Options {
+		options[i] = pollOptionWire{
+			OptionID: option.OptionID,
+			Text:     option.Text,
+			Voters:   participantsToWire(option.Voters),
+		}
+	}
+	return &pollWire{
+		Question:   poll.Question,
+		AllowMulti: poll.AllowMulti,
+		ClosesAt:   poll.ClosesAt,
+		Options:    options,
+	}
+}
+
+// pollRequestWire is a poll as a sender states it. Option identity is minted
+// server-side, so this shape carries texts only.
+type pollRequestWire struct {
+	Question   string     `json:"question"`
+	AllowMulti bool       `json:"allow_multi"`
+	ClosesAt   *time.Time `json:"closes_at"`
+	Options    []string   `json:"options"`
+}
+
+func (w *pollRequestWire) input() *PollInput {
+	if w == nil {
+		return nil
+	}
+	return &PollInput{
+		Question:   w.Question,
+		AllowMulti: w.AllowMulti,
+		ClosesAt:   w.ClosesAt,
+		Options:    w.Options,
+	}
 }
 
 // reactionWire matches the web model's ReactionSummary.
@@ -296,6 +356,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Attachments: attachmentsToWire(m.Attachments),
 		Urgency:     m.Urgency,
 		Reactions:   reactionsToWire(m.Reactions),
+		Poll:        pollToWire(m.Poll),
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
@@ -1188,6 +1249,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		ReplyTo     string   `json:"reply_to"`
 		ClientNonce string   `json:"client_nonce"`
 		Attachments []string `json:"attachments"`
+		// A poll rides on the ordinary send: the question and the message that
+		// asks it commit together, rather than as two events one of which can
+		// be missing (契約: メッセージが投票を運ぶ).
+		Poll *pollRequestWire `json:"poll"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1198,8 +1263,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
-	// Attachments-only messages are legitimate; empty and attachment-less is not.
-	if (req.Content == "" && len(req.Attachments) == 0) || len(req.Content) > MaxContentBytes {
+	// Attachment-only and poll-only messages are legitimate; empty with
+	// nothing attached is not.
+	if (req.Content == "" && len(req.Attachments) == 0 && req.Poll == nil) ||
+		len(req.Content) > MaxContentBytes {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
@@ -1225,7 +1292,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		msg, created, opErr = s.Store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
-			AttachmentIDs: req.Attachments,
+			AttachmentIDs: req.Attachments, Poll: req.Poll.input(),
 		})
 		return opErr
 	})
@@ -1367,6 +1434,48 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		Message messageWire `json:"message"`
 		Reacted bool        `json:"reacted"`
 	}{Message: wire, Reacted: reacted})
+}
+
+// serveVotePoll restates the viewer's whole choice on one poll. An empty
+// option list withdraws the vote — changing your mind and taking it back are
+// the same act, not two capabilities. The same store call backs the agent
+// tool path (AX: UIだけにある操作を作らない).
+func (s *Server) serveVotePoll(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	placeID := r.PathValue("place_id")
+	var req struct {
+		OptionIDs []string `json:"option_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var msg Message
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		msg, opErr = s.Store.VotePoll(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.OptionIDs)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventPollUpdated, PlaceID: placeID, Message: &wire})
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
 }
 
 // serveSetStatus replaces the viewer's own status. There is no route for
@@ -1955,6 +2064,14 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_threadable")
 	case errors.Is(err, ErrThreadExists):
 		writeError(w, http.StatusConflict, "thread_exists")
+	case errors.Is(err, ErrInvalidPoll):
+		writeError(w, http.StatusBadRequest, "invalid_poll")
+	case errors.Is(err, ErrPollNotFound), errors.Is(err, ErrPollOptionNotFound):
+		writeError(w, http.StatusNotFound, "poll_not_found")
+	case errors.Is(err, ErrPollClosed):
+		writeError(w, http.StatusConflict, "poll_closed")
+	case errors.Is(err, ErrPollSingleChoice):
+		writeError(w, http.StatusBadRequest, "poll_single_choice")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

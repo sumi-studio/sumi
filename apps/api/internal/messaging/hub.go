@@ -45,10 +45,13 @@ type Event struct {
 
 // Durable event types. The wire names match the web model's ServerEvent.
 const (
-	EventMessageCreated     = "message_created"
-	EventMessageEdited      = "message_edited"
-	EventMessageDeleted     = "message_deleted"
-	EventReactionUpdated    = "reaction_updated"
+	EventMessageCreated  = "message_created"
+	EventMessageEdited   = "message_edited"
+	EventMessageDeleted  = "message_deleted"
+	EventReactionUpdated = "reaction_updated"
+	// EventPollUpdated carries the whole message after a vote, like
+	// reaction_updated: the durable truth is the vote rows, this is the fan-out.
+	EventPollUpdated        = "poll_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"
 	EventReplyLaterCreated  = "reply_later_created"

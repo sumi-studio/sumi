@@ -53,3 +53,41 @@ CREATE INDEX places_by_parent ON places (parent_place_id)
 -- 1メッセージから生えるスレッドは1本。返信数チップが指す先が一意になる。
 CREATE UNIQUE INDEX places_one_thread_per_origin ON places (parent_message_id)
     WHERE parent_message_id IS NOT NULL;
+
+-- 2. 投票。メッセージが投票を運ぶ（別の入れ物ではない）ので、投票は
+--    message_id を主キーに持つ1対1の付属物。tombstone化した発言と一緒に
+--    消える（ON DELETE CASCADE ＋ store側のtombstone処理）。
+CREATE TABLE message_polls (
+    message_id  uuidv7      PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+    question    text        NOT NULL CHECK (length(question) BETWEEN 1 AND 500),
+    -- 複数選択可か。falseなら「同一pollに1票」をサーバーが強制する。
+    allow_multi boolean     NOT NULL DEFAULT false,
+    -- 締切。NULL は締切なし。過ぎたら結果だけが見える。
+    closes_at   timestamptz,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE message_poll_options (
+    option_id  uuidv7 PRIMARY KEY,
+    message_id uuidv7 NOT NULL REFERENCES message_polls(message_id) ON DELETE CASCADE,
+    text       text   NOT NULL CHECK (length(text) BETWEEN 1 AND 200),
+    -- 表示順。作成時の並びをそのまま保つ。
+    ord        int    NOT NULL CHECK (ord >= 0),
+    UNIQUE (message_id, ord)
+);
+
+-- 投票者は human と personality_agent の同じ形。誰が入れたかは reactions と
+-- 同じく見える（匿名投票はv0では作らない）。message_id を冗長に持つのは
+-- 「同一pollに1票」をサーバーが1本のDELETEで強制できるようにするため。
+CREATE TABLE message_poll_votes (
+    option_id  uuidv7      NOT NULL REFERENCES message_poll_options(option_id) ON DELETE CASCADE,
+    message_id uuidv7      NOT NULL REFERENCES message_polls(message_id) ON DELETE CASCADE,
+    voter_kind text        NOT NULL
+        CHECK (voter_kind IN ('human', 'personality_agent')),
+    voter_id   uuidv7      NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (option_id, voter_kind, voter_id)
+);
+
+CREATE INDEX message_poll_votes_by_poll ON message_poll_votes (message_id);
+CREATE INDEX message_poll_options_by_poll ON message_poll_options (message_id, ord);

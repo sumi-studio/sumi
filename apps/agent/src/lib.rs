@@ -1,3 +1,7 @@
+// The messaging tool schema is one large `serde_json::json!` literal; keep
+// the macro from hitting the default recursion ceiling as actions grow.
+#![recursion_limit = "256"]
+
 // The binary remains the production composition root. These private module
 // mirrors keep the library's compactor unit tests linked to the durable Store
 // and runtime contracts without exposing a second public lib/bin API.

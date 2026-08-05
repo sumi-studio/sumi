@@ -1,3 +1,7 @@
+DROP TABLE message_poll_votes;
+DROP TABLE message_poll_options;
+DROP TABLE message_polls;
+
 -- 0018 の巻き戻し。thread place は 0008 の CHECK では表現できないので、
 -- 先にスレッドの中身ごと落としてから列と制約を元の形へ戻す（pre-launch:
 -- 守るべき本番データはない）。

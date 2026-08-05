@@ -20,6 +20,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  PollInput,
   ReplyLaterMarker,
   ServerEvent,
   StatusKind,
@@ -121,7 +122,14 @@ interface MessagingState {
   /** 可視なplace全体の本文検索。結果はUI局所状態で持ち、storeには残さない。 */
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   setDraft(key: PlaceKey, draft: string): void;
-  send(content: string, urgency: Urgency, attachments?: Attachment[]): void;
+  send(
+    content: string,
+    urgency: Urgency,
+    attachments?: Attachment[],
+    poll?: PollInput | null,
+  ): void;
+  /** 投票する。空配列は取り消し。押した結果はサーバーのechoで確定する。 */
+  votePoll(message: Message, optionIds: string[]): void;
   /** 送信前にファイルを預ける。返ったAttachmentをsendへ渡すまで誰にも見えない。 */
   uploadAttachment(file: File): Promise<Attachment>;
   /** 送信前の添付を編集する（名前・概要・ネタバレ）。 */
@@ -311,7 +319,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     if (
       event.type === "message_created" ||
       event.type === "message_edited" ||
-      event.type === "reaction_updated"
+      event.type === "reaction_updated" ||
+      event.type === "poll_updated"
     ) {
       const key = placeKey(event.message.place);
       set((state) => {
@@ -544,6 +553,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         attachments: pending.attachments.map(
           (attachment) => attachment.attachmentId,
         ),
+        poll: pending.poll ?? null,
       })
       .then(async (receipt) => {
         let confirmed = (get().messagesByPlace[key] ?? []).some(
@@ -875,19 +885,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }));
     },
 
-    send(content, urgency, attachments = []) {
+    send(content, urgency, attachments = [], poll = null) {
       const state = get();
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       const trimmed = content.trim();
       // 添付だけの送信は普通のこと。本文も添付も無いときだけ送らない。
       if (!key || !place || !state.self) return;
-      if (!trimmed && attachments.length === 0) return;
+      // 問いだけの送信も普通のこと。本文も添付も投票も無いときだけ送らない。
+      if (!trimmed && attachments.length === 0 && !poll) return;
       const pending: PendingMessage = {
         clientNonce: secureRandomUUID(),
         content: trimmed,
         mentions: resolveMentions(trimmed, state.membersByKey, state.selfKey),
         attachments,
+        poll,
         urgency,
         replyTo: state.replyTargetId,
         createdAt: Date.now(),
@@ -1033,6 +1045,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
           message.messageId,
           Date.now() + delayMs,
         )
+        .catch(() => undefined);
+    },
+
+    votePoll(message, optionIds) {
+      void backend
+        .votePoll(message.place, message.messageId, optionIds)
         .catch(() => undefined);
     },
 

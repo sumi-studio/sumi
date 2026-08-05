@@ -50,6 +50,7 @@ import { EmojiPicker } from "./emoji-picker";
 import { MessageAttachments } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { MessageEditor } from "./message-editor";
+import { MessagePoll } from "./message-poll";
 import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
@@ -410,6 +411,7 @@ export const MessageItem = memo(function MessageItem({
             authorName={author?.displayName}
             createdAt={message.createdAt}
           />
+          <MessagePoll message={message} />
           <MessageThreadChip message={message} />
           {allowReactions ? (
             <ReactionChips

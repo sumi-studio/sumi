@@ -8,6 +8,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
   MessageSearchResult,
   MessagingBackend,
   NotificationSetting,
@@ -17,6 +18,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  PollInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -29,12 +31,27 @@ import type {
   WorkspaceSummary,
 } from "./model";
 import {
+  isPollClosed,
   parsePlaceKey,
   participantKey,
   placeId,
   placeKey,
   sameParticipant,
 } from "./model";
+
+/** 述べられた投票を、選択肢idの付いた状態へ起こす（実サーバーの採番役）。 */
+function seedPoll(input: PollInput): MessagePoll {
+  return {
+    question: input.question,
+    allowMulti: input.allowMulti,
+    closesAt: input.closesAt,
+    options: input.options.map((text) => ({
+      optionId: secureRandomUUID(),
+      text,
+      voters: [],
+    })),
+  };
+}
 
 /**
  * インメモリのモックbackend。実API（WS + REST）と同じMessagingBackend境界を
@@ -345,6 +362,7 @@ export class MockMessagingServer implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   /** スレッドはplaceの一種。作成されるまで存在しないのでインスタンス側に持つ。 */
@@ -633,6 +651,7 @@ export class MockMessagingServer implements MessagingBackend {
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
+          poll: input.poll ? seedPoll(input.poll) : null,
           // 自分がアップロードした未紐付けの添付だけがメッセージに載る。
           attachments: input.attachments.flatMap((attachmentId) => {
             const pending = this.uploads.get(attachmentId);
@@ -822,6 +841,31 @@ export class MockMessagingServer implements MessagingBackend {
     this.applyReaction(place, messageId, SELF, emoji);
   }
 
+  /**
+   * 回答の置き換え。空配列は取り消し。単一選択では最後の1つだけが残る——
+   * 実サーバーが「同一投票に1票」を強制するのと同じ結果になる。
+   */
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<void> {
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const message = messages.find((entry) => entry.messageId === messageId);
+    const poll = message?.poll;
+    if (!message || message.deleted || !poll) return;
+    if (isPollClosed(poll, Date.now())) return;
+    const chosen = poll.allowMulti ? optionIds : optionIds.slice(0, 1);
+    poll.options = poll.options.map((option) => ({
+      ...option,
+      voters: [
+        ...option.voters.filter((ref) => !sameParticipant(ref, SELF)),
+        ...(chosen.includes(option.optionId) ? [SELF] : []),
+      ],
+    }));
+    this.emit({ type: "poll_updated", message: { ...message } });
+  }
+
   /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
   private applyReaction(
     place: Place,
@@ -886,6 +930,7 @@ export class MockMessagingServer implements MessagingBackend {
     replyTo: string | null;
     clientNonce?: string;
     attachments?: Attachment[];
+    poll?: MessagePoll | null;
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -900,6 +945,7 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: input.urgency,
       reactions: [],
       attachments: input.attachments ?? [],
+      poll: input.poll ?? null,
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
