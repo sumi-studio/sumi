@@ -1,5 +1,10 @@
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@sumi/ui/components/popover";
 import { Check, ChevronRight, Copy, Pencil, Plus } from "lucide-react";
-import { useEffect, useId, useRef, useState } from "react";
+import { type ReactElement, useEffect, useId, useState } from "react";
 import type { NotificationLevel, PlaceKey } from "../model";
 import { notificationLevelFor, useMessaging } from "../store";
 
@@ -23,11 +28,12 @@ const ITEM_CLASS =
  * 主メニューに置き、通知設定は横に開くサブメニューへ送る——通知は場所の設定では
  * なく受け手の設定で、粒度が違うものを同じ高さに並べると選び間違える。
  *
- * 開閉は自前で持つ（A1のポップオーバー基盤へは統合時に差し替える）。
+ * Base UIのportalへ出すため、サイドバーのスクロール面に切られず隣接ペインへ重なる。
  */
 export function PlaceContextMenu({
   placeKey: key,
   channelId,
+  trigger,
   open,
   onOpenChange,
   onEditChannel,
@@ -37,6 +43,7 @@ export function PlaceContextMenu({
   placeKey: PlaceKey;
   /** channel以外（DM・グループDM）ではnull。channel専用の項目が消える。 */
   channelId: string | null;
+  trigger: ReactElement;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onEditChannel: (channelId: string) => void;
@@ -50,39 +57,12 @@ export function PlaceContextMenu({
   const setPlaceNotificationLevel = useMessaging(
     (state) => state.setPlaceNotificationLevel,
   );
-  const containerRef = useRef<HTMLDivElement>(null);
   const [submenuOpen, setSubmenuOpen] = useState(false);
   const submenuId = useId();
 
   useEffect(() => {
-    if (!open) {
-      setSubmenuOpen(false);
-      return;
-    }
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) {
-        onOpenChange(false);
-      }
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      // Escapeは一段ずつ閉じる。サブメニューを開けた手が、主メニューごと
-      // 消されて最初からやり直しになるのを避ける。
-      setSubmenuOpen((sub) => {
-        if (sub) return false;
-        onOpenChange(false);
-        return false;
-      });
-    };
-    window.addEventListener("mousedown", closeOnOutsideClick);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("mousedown", closeOnOutsideClick);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open, onOpenChange]);
-
-  if (!open) return null;
+    if (!open) setSubmenuOpen(false);
+  }, [open]);
 
   const close = () => {
     setSubmenuOpen(false);
@@ -90,127 +70,132 @@ export function PlaceContextMenu({
   };
 
   return (
-    <div
-      ref={containerRef}
-      role="menu"
-      aria-label="この場所のメニュー"
-      className="absolute top-full right-0 z-30 mt-1 w-52 rounded-lg border border-border bg-background p-1 shadow-md"
-    >
-      {channelId ? (
-        <>
-          <button
-            type="button"
-            role="menuitem"
-            className={ITEM_CLASS}
-            onClick={() => {
-              close();
-              onEditChannel(channelId);
-            }}
-          >
-            <Pencil className="size-3.5 shrink-0 text-muted-foreground" />
-            チャンネルを編集
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className={ITEM_CLASS}
-            onClick={() => {
-              close();
-              onDuplicateChannel(channelId);
-            }}
-          >
-            <Copy className="size-3.5 shrink-0 text-muted-foreground" />
-            複製
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className={ITEM_CLASS}
-            onClick={() => {
-              close();
-              onCreateChannel();
-            }}
-          >
-            <Plus className="size-3.5 shrink-0 text-muted-foreground" />
-            チャンネルを作成
-          </button>
-        </>
-      ) : null}
-      {canConfigureNotifications ? (
-        <>
-          {channelId ? <div className="my-1 h-px bg-border/70" /> : null}
-          {/* 横に開くサブメニュー。ホバーでもクリックでも開く——指す手と
-              押す手のどちらにも同じ場所がある。 */}
-          <div
-            role="none"
-            className="relative"
-            onMouseEnter={() => setSubmenuOpen(true)}
-            onMouseLeave={() => setSubmenuOpen(false)}
-          >
+    <Popover open={open} onOpenChange={onOpenChange}>
+      <PopoverTrigger render={trigger} />
+      <PopoverContent
+        role="menu"
+        aria-label="この場所のメニュー"
+        side="bottom"
+        align="end"
+        sideOffset={4}
+        className="w-52 rounded-lg bg-background p-1"
+      >
+        {channelId ? (
+          <>
             <button
               type="button"
               role="menuitem"
-              aria-haspopup="menu"
-              aria-expanded={submenuOpen}
-              aria-controls={submenuId}
-              onClick={() => setSubmenuOpen((value) => !value)}
-              className={`${ITEM_CLASS} ${submenuOpen ? "bg-accent" : ""}`}
+              className={ITEM_CLASS}
+              onClick={() => {
+                close();
+                onEditChannel(channelId);
+              }}
             >
-              通知設定
-              <span className="ml-auto text-[11px] text-muted-foreground">
-                {NOTIFICATION_LEVEL_LABEL[level]}
-              </span>
-              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+              <Pencil className="size-3.5 shrink-0 text-muted-foreground" />
+              チャンネルを編集
             </button>
-            {submenuOpen ? (
-              <div
-                id={submenuId}
-                role="menu"
-                aria-label="通知設定"
-                className="absolute top-0 left-full z-40 ml-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
+            <button
+              type="button"
+              role="menuitem"
+              className={ITEM_CLASS}
+              onClick={() => {
+                close();
+                onDuplicateChannel(channelId);
+              }}
+            >
+              <Copy className="size-3.5 shrink-0 text-muted-foreground" />
+              複製
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className={ITEM_CLASS}
+              onClick={() => {
+                close();
+                onCreateChannel();
+              }}
+            >
+              <Plus className="size-3.5 shrink-0 text-muted-foreground" />
+              チャンネルを作成
+            </button>
+          </>
+        ) : null}
+        {canConfigureNotifications ? (
+          <>
+            {channelId ? <div className="my-1 h-px bg-border/70" /> : null}
+            {/* 横に開くサブメニュー。ホバーでもクリックでも開く——指す手と
+              押す手のどちらにも同じ場所がある。 */}
+            <div
+              role="none"
+              className="relative"
+              onMouseEnter={() => setSubmenuOpen(true)}
+              onMouseLeave={() => setSubmenuOpen(false)}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                aria-haspopup="menu"
+                aria-expanded={submenuOpen}
+                aria-controls={submenuId}
+                onClick={() => setSubmenuOpen((value) => !value)}
+                className={`${ITEM_CLASS} ${submenuOpen ? "bg-accent" : ""}`}
               >
-                {(
-                  Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]
-                ).map((candidate) => (
-                  <button
-                    key={candidate}
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={level === candidate}
-                    onClick={() => {
-                      setPlaceNotificationLevel(key, candidate);
-                      close();
-                    }}
-                    className={`flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${
-                      level === candidate ? "bg-accent/60" : ""
-                    }`}
-                  >
-                    {/* 選択中は色だけでなく形（✓）でも示す。 */}
-                    <Check
-                      aria-hidden
-                      className={`mt-0.5 size-3.5 shrink-0 ${
-                        level === candidate ? "opacity-100" : "opacity-0"
+                通知設定
+                <span className="ml-auto text-[11px] text-muted-foreground">
+                  {NOTIFICATION_LEVEL_LABEL[level]}
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+              </button>
+              {submenuOpen ? (
+                <div
+                  id={submenuId}
+                  role="menu"
+                  aria-label="通知設定"
+                  className="absolute top-0 left-full z-40 ml-1 w-56 rounded-lg border border-border bg-background p-1 shadow-md"
+                >
+                  {(
+                    Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]
+                  ).map((candidate) => (
+                    <button
+                      key={candidate}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={level === candidate}
+                      onClick={() => {
+                        setPlaceNotificationLevel(key, candidate);
+                        close();
+                      }}
+                      className={`flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${
+                        level === candidate ? "bg-accent/60" : ""
                       }`}
-                    />
-                    <span className="min-w-0">
-                      <span
-                        className={`block text-[13px] ${
-                          level === candidate ? "font-medium" : ""
+                    >
+                      {/* 選択中は色だけでなく形（✓）でも示す。 */}
+                      <Check
+                        aria-hidden
+                        className={`mt-0.5 size-3.5 shrink-0 ${
+                          level === candidate ? "opacity-100" : "opacity-0"
                         }`}
-                      >
-                        {NOTIFICATION_LEVEL_LABEL[candidate]}
+                      />
+                      <span className="min-w-0">
+                        <span
+                          className={`block text-[13px] ${
+                            level === candidate ? "font-medium" : ""
+                          }`}
+                        >
+                          {NOTIFICATION_LEVEL_LABEL[candidate]}
+                        </span>
+                        <span className="block text-[11px] text-muted-foreground">
+                          {NOTIFICATION_LEVEL_HINT[candidate]}
+                        </span>
                       </span>
-                      <span className="block text-[11px] text-muted-foreground">
-                        {NOTIFICATION_LEVEL_HINT[candidate]}
-                      </span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        </>
-      ) : null}
-    </div>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+      </PopoverContent>
+    </Popover>
   );
 }

@@ -217,6 +217,12 @@ describe("チャンネルのコンテキストメニュー", () => {
 
   it("通知設定は横に開くサブメニューに入る", () => {
     const menu = openChannelMenu();
+    const placesScroller = document.querySelector(
+      '[data-slot="sidebar-places"]',
+    );
+    expect(placesScroller).not.toContainElement(
+      screen.getByRole("menu", { name: "この場所のメニュー" }),
+    );
     // 主メニューには通知レベルが直接並ばない。
     expect(screen.queryByText("メンションのみ")).not.toBeInTheDocument();
     const submenuTrigger = menu.getByRole("menuitem", { name: /通知設定/ });

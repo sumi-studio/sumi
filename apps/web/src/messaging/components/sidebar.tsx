@@ -127,35 +127,28 @@ function PlaceRow({
         muted={muted}
       />
       {hasMenu ? (
-        <div className="relative">
-          <button
-            type="button"
-            aria-label="この場所のメニュー"
-            aria-expanded={menuOpen}
-            onMouseDown={(event) => {
-              // トリガー上のmousedownを外側クリック判定に拾わせない（閉→即再開を防ぐ）。
-              event.stopPropagation();
-            }}
-            onClick={(event) => {
-              event.stopPropagation();
-              setMenuOpen(!menuOpen);
-            }}
-            className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
-              menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-            }`}
-          >
-            <MoreVertical className="size-3.5" />
-          </button>
-          <PlaceContextMenu
-            placeKey={key}
-            channelId={channelId}
-            open={menuOpen}
-            onOpenChange={setMenuOpen}
-            onEditChannel={onEditChannel}
-            onDuplicateChannel={onDuplicateChannel}
-            onCreateChannel={onCreateChannel}
-          />
-        </div>
+        <PlaceContextMenu
+          placeKey={key}
+          channelId={channelId}
+          trigger={
+            <button
+              type="button"
+              aria-label="この場所のメニュー"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
+                menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              }`}
+            >
+              <MoreVertical className="size-3.5" />
+            </button>
+          }
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+          onEditChannel={onEditChannel}
+          onDuplicateChannel={onDuplicateChannel}
+          onCreateChannel={onCreateChannel}
+        />
       ) : null}
     </div>
   );
