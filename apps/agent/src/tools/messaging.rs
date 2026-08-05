@@ -32,10 +32,10 @@ const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_MARKER_ID_BYTES: usize = 256;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
-// The server bounds these notes at 200 and 500 characters; four bytes per
-// character covers any UTF-8 within those limits.
-const MAX_STATUS_NOTE_BYTES: usize = 800;
-const MAX_REPLY_LATER_NOTE_BYTES: usize = 2000;
+// The server counts characters, not bytes, so this check must too: a 201
+// character ASCII note is well under any byte budget and still a 400.
+const MAX_STATUS_NOTE_CHARS: usize = 200;
+const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
 
@@ -254,9 +254,11 @@ fn messaging_parameters_schema() -> Value {
             },
             "note": {
                 "type": "string",
+                "maxLength": 500,
                 "description": concat!(
                     "Optional for status and reply_later, omitted for other actions. A short ",
-                    "line others see alongside the state or the promise."
+                    "line others see alongside the state or the promise. At most 200 characters ",
+                    "for status and 500 for reply_later."
                 )
             },
             "expires_in_minutes": {
@@ -538,7 +540,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             expires_in_minutes,
             ..
         } => {
-            validate_optional_note(note, MAX_STATUS_NOTE_BYTES)?;
+            validate_optional_note(note, MAX_STATUS_NOTE_CHARS)?;
             validate_relative_minutes(expires_in_minutes)
         }
         MessagingAction::ReplyLater {
@@ -548,7 +550,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             remind_in_minutes,
         } => {
             validate_visible_selector(message_id, seq)?;
-            validate_optional_note(note, MAX_REPLY_LATER_NOTE_BYTES)?;
+            validate_optional_note(note, MAX_REPLY_LATER_NOTE_CHARS)?;
             validate_relative_minutes(remind_in_minutes)
         }
         MessagingAction::ResolveReplyLater { marker_id } => {
@@ -576,10 +578,10 @@ fn validate_visible_selector(
     Ok(())
 }
 
-fn validate_optional_note(note: &Option<String>, max_bytes: usize) -> Result<(), ToolError> {
+fn validate_optional_note(note: &Option<String>, max_chars: usize) -> Result<(), ToolError> {
     if note
         .as_deref()
-        .is_some_and(|note| note.len() > max_bytes || note.chars().any(char::is_control))
+        .is_some_and(|note| note.chars().count() > max_chars || note.chars().any(char::is_control))
     {
         return Err(ToolError::InvalidArguments);
     }
@@ -1242,6 +1244,60 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.statuses.lock().await.len(), 2);
+    }
+
+    /// The server counts characters. Checking bytes here would both reject
+    /// legal multibyte notes and let a 201 character ASCII note through to a
+    /// server 400, so the two checks are stated in the same unit.
+    #[tokio::test]
+    async fn notes_are_bounded_by_characters_like_the_server() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        for note in ["a".repeat(200), "あ".repeat(200)] {
+            execute(
+                &tool,
+                json!({"action": "status", "status": "busy", "note": note}),
+                "status-note",
+            )
+            .await
+            .unwrap();
+        }
+        let error = execute(
+            &tool,
+            json!({"action": "status", "status": "busy", "note": "a".repeat(201)}),
+            "status-note-too-long",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert_eq!(api.statuses.lock().await.len(), 2);
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        for note in ["a".repeat(500), "あ".repeat(500)] {
+            execute(
+                &tool,
+                json!({"action": "reply_later", "seq": 7, "note": note}),
+                "promise-note",
+            )
+            .await
+            .unwrap();
+        }
+        let error = execute(
+            &tool,
+            json!({"action": "reply_later", "seq": 7, "note": "a".repeat(501)}),
+            "promise-note-too-long",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert_eq!(api.promises.lock().await.len(), 2);
     }
 
     #[tokio::test]

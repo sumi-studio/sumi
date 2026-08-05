@@ -98,24 +98,27 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
     // status_updated は replay されないvolatile eventなので、現在値はここでしか
     // 手に入らない。ReplyLaterのmarkerも同じく開いていないplaceの分まで届く。
-    const statuses: ParticipantStatus[] = asArray(body.statuses).map(
-      parseStatus,
-    );
-    const replyLaterMarkers: ReplyLaterMarker[] = asArray(
-      body.reply_later_markers,
-    ).map(parseReplyLater);
+    const presence = parsePresence(body);
     return {
       self: parseParticipant(body.self),
       workspaces,
       channels,
       dms,
       members,
-      statuses,
+      statuses: presence.statuses,
       readMarkers,
       unreadSummaries,
-      replyLaterMarkers,
+      replyLaterMarkers: presence.replyLaterMarkers,
       employedAgents: [],
     };
+  }
+
+  /**
+   * 再接続後の再同期。cursorが戻せるのはplaceのdurableな並びだけなので、
+   * statusと開いているmarkerはserverの現在値で置き換えるほかない。
+   */
+  async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
+    return parsePresence(asRecord(await this.request("/messaging/bootstrap")));
   }
 
   async fetchMessages(
@@ -219,29 +222,43 @@ export class ApiMessagingBackend implements MessagingBackend {
   }
 
   /** 自分のstatusだけを置き換える。参加者はsessionが決め、bodyには載せない。 */
-  async setStatus(status: StatusKind, note: string): Promise<void> {
-    await this.request("/messaging/status", {
-      method: "PUT",
-      body: { status, note },
-    });
+  async setStatus(
+    status: StatusKind,
+    note: string,
+  ): Promise<ParticipantStatus> {
+    return parseStatus(
+      await this.request("/messaging/status", {
+        method: "PUT",
+        body: { status, note },
+      }),
+    );
   }
 
   async createReplyLater(
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void> {
-    await this.request(
-      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
-      { method: "POST", body: { remind_at: new Date(remindAt).toISOString() } },
+  ): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reply-later`,
+        {
+          method: "POST",
+          body: { remind_at: new Date(remindAt).toISOString() },
+        },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
-  async resolveReplyLater(markerId: string): Promise<void> {
-    await this.request(
-      `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
-      { method: "POST", body: {} },
+  async resolveReplyLater(markerId: string): Promise<ReplyLaterMarker> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/reply-later/${encodeURIComponent(markerId)}/resolve`,
+        { method: "POST", body: {} },
+      ),
     );
+    return parseReplyLater(body.marker);
   }
 
   async toggleReaction(
@@ -538,6 +555,16 @@ function parseReaction(value: unknown): ReactionSummary {
   return {
     emoji: asString(wire.emoji),
     participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
+function parsePresence(body: Record<string, unknown>): {
+  statuses: ParticipantStatus[];
+  replyLaterMarkers: ReplyLaterMarker[];
+} {
+  return {
+    statuses: asArray(body.statuses).map(parseStatus),
+    replyLaterMarkers: asArray(body.reply_later_markers).map(parseReplyLater),
   };
 }
 

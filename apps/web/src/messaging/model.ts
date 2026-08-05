@@ -250,13 +250,26 @@ export interface MessagingBackend {
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;
-  setStatus(status: StatusKind, note: string): Promise<void>;
+  /**
+   * 自己申告のattentionの現在値。status_updatedはvolatileでreplayされず、
+   * reply-laterのeventはplaceのseq catch-upにも載らない。切断中の変化は
+   * cursorからは戻らないので、再接続のたびにここで取り直して置き換える。
+   */
+  fetchPresence(): Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }>;
+  /**
+   * mutationはserverが確定した値を返す。socketが再接続中でも成功ACKだけで
+   * 収束できるよう、呼び出し側はこの戻り値を状態に反映する。
+   */
+  setStatus(status: StatusKind, note: string): Promise<ParticipantStatus>;
   createReplyLater(
     place: Place,
     messageId: string,
     remindAt: number,
-  ): Promise<void>;
-  resolveReplyLater(markerId: string): Promise<void>;
+  ): Promise<ReplyLaterMarker>;
+  resolveReplyLater(markerId: string): Promise<ReplyLaterMarker>;
   toggleReaction(
     place: Place,
     messageId: string,

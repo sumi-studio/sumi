@@ -162,6 +162,10 @@ const reactionProjectionByPlace = new Map<
   PlaceKey,
   ReactionProjectionCoordinator
 >();
+let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 遠い期限でもtimerを一度に張らない上限。起きたら残りをもう一度張り直す。 */
+const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
 
 export const useMessaging = create<MessagingState>((set, get) => {
   if (import.meta.env.DEV) {
@@ -193,6 +197,91 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
       if (!changed) return {};
       return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+    });
+  };
+
+  /**
+   * 期限切れのstatusは「まだ取り込み中に見える」より「何も申告していない」が
+   * 正しい。serverは読み出し時に落とすだけで失効eventを送らないので、
+   * 期限に達した分はこちらで落とす。
+   */
+  const withoutExpired = (
+    statuses: Record<ParticipantKey, ParticipantStatus>,
+    now: number,
+  ): Record<ParticipantKey, ParticipantStatus> => {
+    const live: Record<ParticipantKey, ParticipantStatus> = {};
+    let dropped = false;
+    for (const [key, status] of Object.entries(statuses)) {
+      if (status.expiresAt !== null && status.expiresAt <= now) {
+        dropped = true;
+        continue;
+      }
+      live[key] = status;
+    }
+    return dropped ? live : statuses;
+  };
+
+  const scheduleStatusExpiry = () => {
+    if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+    statusExpiryTimer = null;
+    let nearest: number | null = null;
+    for (const status of Object.values(get().statusByKey)) {
+      if (status.expiresAt === null) continue;
+      if (nearest === null || status.expiresAt < nearest) {
+        nearest = status.expiresAt;
+      }
+    }
+    if (nearest === null) return;
+    const delay = Math.min(
+      Math.max(0, nearest - Date.now()),
+      STATUS_EXPIRY_MAX_DELAY_MS,
+    );
+    statusExpiryTimer = setTimeout(() => {
+      statusExpiryTimer = null;
+      set((state) => ({
+        statusByKey: withoutExpired(state.statusByKey, Date.now()),
+      }));
+      scheduleStatusExpiry();
+    }, delay);
+  };
+
+  const applyStatuses = (statuses: ParticipantStatus[]) => {
+    const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
+    for (const status of statuses) {
+      statusByKey[participantKey(status.participant)] = status;
+    }
+    return withoutExpired(statusByKey, Date.now());
+  };
+
+  /** 一人分の申告を置き換える。WS echoとRESTのACKはどちらが先でも同じ形。 */
+  const applyStatus = (status: ParticipantStatus) => {
+    set((state) => ({
+      statusByKey: withoutExpired(
+        { ...state.statusByKey, [participantKey(status.participant)]: status },
+        Date.now(),
+      ),
+    }));
+    scheduleStatusExpiry();
+  };
+
+  /**
+   * markerの現在値を書き込む。RESTのACKとWS echoは同じmarkerを二度運ぶので、
+   * 順序に関わらず収束するよう「解けた約束は解けたまま」「一度知った自分の
+   * リマインド予定は他人向けwireのnullで消さない」を保つ。
+   */
+  const applyReplyLater = (marker: ReplyLaterMarker) => {
+    set((state) => {
+      const known = state.replyLaterById[marker.markerId];
+      return {
+        replyLaterById: {
+          ...state.replyLaterById,
+          [marker.markerId]: {
+            ...marker,
+            remindAt: marker.remindAt ?? known?.remindAt ?? null,
+            resolved: marker.resolved || (known?.resolved ?? false),
+          },
+        },
+      };
     });
   };
 
@@ -364,6 +453,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
     applyReactionUpdateRaw(event);
   };
 
+  /**
+   * 再接続時の再同期。status_updatedはvolatileでreplayされず、reply-laterの
+   * eventもplaceのseq catch-upには載らない。切断中に他の参加者がstatusを
+   * 変えたりmarkerを作った／解いたりした分は、cursorでは戻らない。
+   */
+  const resyncPresence = async () => {
+    const presence = await backend.fetchPresence();
+    const replyLaterById: Record<string, ReplyLaterMarker> = {};
+    for (const marker of presence.replyLaterMarkers) {
+      replyLaterById[marker.markerId] = marker;
+    }
+    set({ statusByKey: applyStatuses(presence.statuses), replyLaterById });
+    scheduleStatusExpiry();
+  };
+
   const applyEvent = (
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
@@ -487,21 +591,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "status_updated") {
-      set((state) => ({
-        statusByKey: {
-          ...state.statusByKey,
-          [participantKey(event.status.participant)]: event.status,
-        },
-      }));
+      applyStatus(event.status);
       return;
     }
     if (event.type === "reply_later_created") {
-      set((state) => ({
-        replyLaterById: {
-          ...state.replyLaterById,
-          [event.marker.markerId]: event.marker,
-        },
-      }));
+      applyReplyLater(event.marker);
       return;
     }
     if (event.type === "reply_later_resolved") {
@@ -737,10 +831,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
           }
-          const statusByKey: Record<ParticipantKey, ParticipantStatus> = {};
-          for (const status of snapshot.statuses) {
-            statusByKey[participantKey(status.participant)] = status;
-          }
+          const statusByKey = applyStatuses(snapshot.statuses);
           const lastReadByPlace: Record<PlaceKey, number> = {};
           for (const marker of snapshot.readMarkers) {
             lastReadByPlace[placeKey(marker.place)] = marker.lastReadSeq;
@@ -774,9 +865,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
             replyLaterById,
             employedAgents: snapshot.employedAgents,
           });
+          scheduleStatusExpiry();
           backend.subscribe(applyEvent, { sinceByPlace });
           // 最初のconnectedはいま読んだこのbootstrapが正本。以降のconnectedは
-          // 再接続なので、replayされないplace lifecycleを読み直す。
+          // 再接続なので、replayされないplace lifecycleとpresenceを読み直す。
           let connectedOnce = false;
           backend.subscribeConnection((connection) => {
             set({ connection });
@@ -786,6 +878,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
               return;
             }
             void reconcilePlaces().catch(() => undefined);
+            void resyncPresence().catch(() => undefined);
           });
         })
         .catch(() => {
@@ -997,8 +1090,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.markRead(place, seq);
     },
 
+    // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
+    // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
     setStatus(status, note) {
-      void backend.setStatus(status, note).catch(() => undefined);
+      void backend.setStatus(status, note).then(applyStatus, () => undefined);
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
@@ -1008,7 +1103,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           message.messageId,
           Date.now() + delayMs,
         )
-        .catch(() => undefined);
+        .then(applyReplyLater, () => undefined);
     },
 
     toggleReaction(message, emoji) {
@@ -1069,7 +1164,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      void backend.resolveReplyLater(markerId).catch(() => undefined);
+      void backend
+        .resolveReplyLater(markerId)
+        .then(applyReplyLater, () => undefined);
     },
 
     sendTyping() {
@@ -1123,6 +1220,8 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
+  if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+  statusExpiryTimer = null;
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,

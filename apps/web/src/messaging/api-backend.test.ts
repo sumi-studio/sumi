@@ -489,7 +489,12 @@ describe("ApiMessagingBackend", () => {
           );
         }
         if (path.endsWith("/resolve") && init?.method === "POST") {
-          return json({ marker: replyLaterWire("marker-3", "human-1") });
+          return json({
+            marker: {
+              ...replyLaterWire("marker-3", "human-1"),
+              resolved: true,
+            },
+          });
         }
         throw new Error(`unexpected request ${path}`);
       },
@@ -512,10 +517,50 @@ describe("ApiMessagingBackend", () => {
       Date.parse("2026-08-01T11:00:00Z"),
     ]);
 
-    await backend.setStatus("busy", "取り込み中");
+    // 再接続後の再同期は、bootstrapと同じ現在値をもう一度読み直す。
+    await expect(backend.fetchPresence()).resolves.toEqual({
+      statuses: snapshot.statuses,
+      replyLaterMarkers: snapshot.replyLaterMarkers,
+    });
+
+    // mutationはserverが確定した値を返す。呼び出し側はecho待ちにならない。
+    await expect(backend.setStatus("busy", "取り込み中")).resolves.toEqual({
+      participant: { kind: "human", humanId: "human-1" },
+      status: "busy",
+      note: "取り込み中",
+      expiresAt: null,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/status",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ status: "busy", note: "取り込み中" }),
+      }),
+    );
+
     const remindAt = Date.parse("2026-08-01T11:00:00Z");
-    await backend.createReplyLater(channel, "message-1", remindAt);
-    await backend.resolveReplyLater("marker-3");
+    await expect(
+      backend.createReplyLater(channel, "message-1", remindAt),
+    ).resolves.toMatchObject({
+      markerId: "marker-3",
+      remindAt,
+      resolved: false,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/places/channel-1/messages/message-1/reply-later",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ remind_at: "2026-08-01T11:00:00.000Z" }),
+      }),
+    );
+    await expect(backend.resolveReplyLater("marker-3")).resolves.toMatchObject({
+      markerId: "marker-3",
+      resolved: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/reply-later/marker-3/resolve",
+      expect.objectContaining({ method: "POST" }),
+    );
 
     const events: ServerEvent[] = [];
     backend.subscribe((event) => events.push(event));
