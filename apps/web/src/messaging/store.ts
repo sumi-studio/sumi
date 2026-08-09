@@ -169,10 +169,8 @@ type PresenceProjection =
   | { type: "reply_later_resolved"; markerId: string };
 let presenceResyncGeneration = 0;
 let pendingPresenceResync: {
-  backend: MessagingBackend;
   generation: number;
   projections: PresenceProjection[];
-  sessionGeneration: number;
 } | null = null;
 
 /** 遠い期限でもtimerを一度に張らない上限。起きたら残りをもう一度張り直す。 */
@@ -499,16 +497,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
   const resyncPresence = async () => {
     const currentBackend = backend;
     const sessionGeneration = messagingSessionGeneration;
-    const previous = pendingPresenceResync;
     const resync = {
-      backend: currentBackend,
       generation: ++presenceResyncGeneration,
-      projections:
-        previous?.backend === currentBackend &&
-        previous.sessionGeneration === sessionGeneration
-          ? [...previous.projections]
-          : [],
-      sessionGeneration,
+      // このfetchより前のprojectionはsnapshotに含まれる。先行generationの
+      // queueを継ぐと、snapshot内の後続状態を古いprojectionで巻き戻し得る。
+      projections: [] as PresenceProjection[],
     };
     pendingPresenceResync = resync;
     try {

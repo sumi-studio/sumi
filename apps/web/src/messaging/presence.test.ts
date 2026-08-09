@@ -6,6 +6,7 @@ import type {
   ParticipantRef,
   ParticipantStatus,
   Place,
+  ReactionMutationResult,
   ReplyLaterMarker,
   SendReceipt,
   ServerEvent,
@@ -142,7 +143,9 @@ class FakePresenceBackend implements MessagingBackend {
   async resolveReplyLater(): Promise<ReplyLaterMarker> {
     return { ...this.nextMarker, resolved: true };
   }
-  async toggleReaction(): Promise<void> {}
+  async toggleReaction(): Promise<ReactionMutationResult> {
+    throw new Error("unused");
+  }
   sendTyping(): void {}
 
   subscribe(listener: (event: ServerEvent) => void): () => void {
@@ -262,6 +265,62 @@ describe("messaging presence convergence", () => {
       expect(state.replyLaterById["marker-new"]).toBeDefined();
       expect(state.replyLaterById["marker-open"]?.resolved).toBe(true);
     });
+  });
+
+  it("does not replay an earlier generation over a newer presence snapshot", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(OTHER, "available")],
+      replyLaterMarkers: [],
+    };
+    await startMessaging(backend);
+
+    let resolveFirst!: (presence: {
+      statuses: ParticipantStatus[];
+      replyLaterMarkers: ReplyLaterMarker[];
+    }) => void;
+    backend.nextPresenceFetch = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
+
+    // E1 belongs only to resync A's journal.
+    backend.emit({
+      type: "status_updated",
+      status: status(OTHER, "busy", "E1"),
+    });
+
+    let resolveSecond!: (presence: {
+      statuses: ParticipantStatus[];
+      replyLaterMarkers: ReplyLaterMarker[];
+    }) => void;
+    backend.nextPresenceFetch = new Promise((resolve) => {
+      resolveSecond = resolve;
+    });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await vi.waitFor(() => expect(backend.presenceFetches).toBe(2));
+
+    // B's snapshot contains the later E2 state; its echo is deliberately lost.
+    resolveSecond({
+      statuses: [status(OTHER, "away", "E2")],
+      replyLaterMarkers: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useMessaging.getState().statusByKey["human:human-2"]).toEqual(
+      status(OTHER, "away", "E2"),
+    );
+
+    resolveFirst({
+      statuses: [status(OTHER, "available")],
+      replyLaterMarkers: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useMessaging.getState().statusByKey["human:human-2"]).toEqual(
+      status(OTHER, "away", "E2"),
+    );
   });
 
   it("converges from the REST acknowledgement without a socket echo", async () => {
