@@ -163,12 +163,13 @@ export function ComposerAttachments({
                   <button
                     type="button"
                     onClick={() => onToggleSpoiler(entry.localId)}
+                    disabled={entry.status === "uploading"}
                     title={spoiler ? "ネタバレを解除" : "ネタバレとしてマーク"}
                     aria-label={`${entry.filename} の${
                       spoiler ? "ネタバレを解除" : "ネタバレをマーク"
                     }`}
                     aria-pressed={spoiler}
-                    className={`flex size-6 items-center justify-center rounded-md border bg-background/80 shadow-xs transition-colors focus-visible:opacity-100 group-hover:opacity-100 ${
+                    className={`flex size-6 items-center justify-center rounded-md border bg-background/80 shadow-xs transition-colors focus-visible:opacity-100 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 ${
                       spoiler
                         ? "border-ring/60 text-foreground opacity-100"
                         : "border-transparent text-muted-foreground opacity-60 hover:border-border hover:bg-accent hover:text-foreground"
@@ -185,9 +186,10 @@ export function ComposerAttachments({
                   <button
                     type="button"
                     onClick={() => setEditingId(entry.localId)}
+                    disabled={entry.status === "uploading"}
                     title="添付ファイルを編集"
                     aria-label={`${entry.filename} を編集`}
-                    className="flex size-6 items-center justify-center rounded-md border border-transparent bg-background/80 text-muted-foreground opacity-60 shadow-xs transition-colors hover:border-border hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                    className="flex size-6 items-center justify-center rounded-md border border-transparent bg-background/80 text-muted-foreground opacity-60 shadow-xs transition-colors hover:border-border hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30"
                   >
                     <Pencil className="size-3.5" />
                   </button>
@@ -263,6 +265,8 @@ export function useDraftAttachments({
   // 非同期の編集が終わったときの最新の下書き（stale closureを避ける）。
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  // React の再描画より先に同じ添付への二重操作を拒む同期的な占有権。
+  const editsInFlight = useRef(new Set<string>());
 
   useEffect(
     () => () => {
@@ -392,41 +396,46 @@ export function useDraftAttachments({
       const current = itemsRef.current.find(
         (entry) => entry.localId === localId,
       );
-      if (!current) return;
-      let attachment = current.attachment;
-      if (edit.editedFile) {
-        replace(localId, { status: "uploading" }, edit.editedFile);
-        try {
-          attachment = await upload(edit.editedFile);
-        } catch {
-          replace(localId, { status: "failed" });
-          return;
-        }
+      if (
+        !current ||
+        current.status === "uploading" ||
+        editsInFlight.current.has(localId)
+      ) {
+        return;
       }
-      if (!attachment) return;
       const patch = edit.patch;
       const needsPatch =
         patch.filename !== undefined ||
         patch.alt !== undefined ||
         patch.spoiler !== undefined;
-      if (needsPatch) {
+      if (!edit.editedFile && !needsPatch) return;
+      if (!current.attachment && !edit.editedFile) return;
+
+      editsInFlight.current.add(localId);
+      replace(localId, { status: "uploading" }, edit.editedFile);
+      try {
+        let attachment = current.attachment;
+        if (edit.editedFile) {
+          attachment = await upload(edit.editedFile);
+        }
+        if (!attachment) throw new Error("attachment upload returned no row");
         // 宣言だけの更新も送信と競合する。PATCH が終わるまで composer の
         // 送信ゲートを閉じ、束ねた後の添付へ更新が落ちるのを防ぐ。
-        replace(localId, { status: "uploading" });
-        try {
+        if (needsPatch) {
           attachment = await update(attachment.attachmentId, patch);
-        } catch {
-          replace(localId, { status: "failed" });
-          return;
         }
+        replace(localId, {
+          status: "ready",
+          attachment,
+          filename: attachment.filename,
+          size: attachment.size,
+          mime: attachment.mime,
+        });
+      } catch {
+        replace(localId, { status: "failed" });
+      } finally {
+        editsInFlight.current.delete(localId);
       }
-      replace(localId, {
-        status: "ready",
-        attachment,
-        filename: attachment.filename,
-        size: attachment.size,
-        mime: attachment.mime,
-      });
     },
     [replace, upload, update],
   );
