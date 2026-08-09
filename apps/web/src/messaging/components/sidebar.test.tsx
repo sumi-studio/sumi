@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ParticipantRef } from "../model";
 import { useMessaging } from "../store";
@@ -95,5 +101,43 @@ describe("Sidebar", () => {
     expect(
       screen.queryByRole("menu", { name: "ステータス" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("開いた後のステータス更新は入力中のひとことを上書きしない", () => {
+    useMessaging.setState({
+      statusByKey: {
+        "human:h1": {
+          participant: human,
+          status: "available",
+          note: "最初の宣言",
+          expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
+        },
+      },
+    });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByLabelText("アカウントとステータス"));
+    const note = screen.getByLabelText("ステータスのひとこと");
+    expect(note).toHaveValue("最初の宣言");
+    fireEvent.change(note, { target: { value: "入力途中" } });
+
+    act(() => {
+      useMessaging.setState({
+        statusByKey: {
+          "human:h1": {
+            participant: human,
+            status: "away",
+            note: "別クライアントからの更新",
+            expiresAt: null,
+            baseStatus: null,
+            baseNote: "",
+          },
+        },
+      });
+    });
+
+    expect(note).toHaveValue("入力途中");
   });
 });

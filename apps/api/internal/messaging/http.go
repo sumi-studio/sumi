@@ -923,6 +923,10 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.Name == nil && req.Topic == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	if req.Name != nil && (*req.Name == "" || utf8.RuneCountInString(*req.Name) > MaxChannelNameChars) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
@@ -2044,7 +2048,7 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not_a_member")
 	case errors.Is(err, ErrNotAuthor):
 		writeError(w, http.StatusForbidden, "not_author")
-	case errors.Is(err, ErrForbidden):
+	case errors.Is(err, ErrForbidden), errors.Is(err, ErrPushSubscriptionOwned):
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, ErrNotReachable):
 		writeError(w, http.StatusForbidden, "not_reachable")

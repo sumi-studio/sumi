@@ -100,12 +100,12 @@ export function Composer() {
 
   const value = draft;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始をフォーカスのトリガーにする
+  // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始・編集終了をフォーカスのトリガーにする
   useEffect(() => {
     // インライン編集中はキャレットが編集欄にある。奪い返さない。
     if (editingMessageId) return;
     textareaRef.current?.focus();
-  }, [activePlaceKey, replyTargetId]);
+  }, [activePlaceKey, editingMessageId, replyTargetId]);
 
   // autogrow: 内容に合わせて高さを伸ばし、上限でスクロールへ切り替える。
   // biome-ignore lint/correctness/useExhaustiveDependencies: 入力値の変化を高さ再計算のトリガーにする

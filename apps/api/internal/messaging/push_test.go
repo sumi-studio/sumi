@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -112,6 +114,19 @@ func TestPushSubscriptionIsOwnedByTheAuthenticatedHumanOnly(t *testing.T) {
 		t.Fatalf("subscriptions = %+v, want one for humanA only", subscriptions)
 	}
 
+	// endpoint を知っているだけの別人は、異なる鍵で所有者を奪えない。
+	if _, err := w.store.SavePushSubscription(ctx, w.humanB,
+		"https://push.example.test/a", "attacker-p256dh", "attacker-auth"); !errors.Is(err, ErrPushSubscriptionOwned) {
+		t.Fatalf("cross-owner save err = %v, want ErrPushSubscriptionOwned", err)
+	}
+	subscriptions, err = w.store.PushSubscriptionsFor(ctx, []ParticipantRef{w.humanA, w.humanB})
+	if err != nil {
+		t.Fatalf("reload after takeover attempt: %v", err)
+	}
+	if len(subscriptions[w.humanA.Key()]) != 1 || len(subscriptions[w.humanB.Key()]) != 0 {
+		t.Fatalf("takeover changed ownership: %+v", subscriptions)
+	}
+
 	// 他人の endpoint は消せない。消せると「その人の端末を黙らせる手段」になる。
 	if err := w.store.DeletePushSubscription(ctx, w.humanB, "https://push.example.test/a"); err != nil {
 		t.Fatalf("delete someone else's endpoint should be a silent no-op: %v", err)
@@ -213,6 +228,38 @@ func TestPushForgetsAnEndpointThePushServiceDeclaredGone(t *testing.T) {
 	}
 	if len(subscriptions[w.humanB.Key()]) != 0 {
 		t.Fatalf("a 410 endpoint survived: %+v", subscriptions)
+	}
+}
+
+func TestPushLogsUnexpectedServiceStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	w.subscribe(t, ctx, w.humanB, "https://push.example.test/rejected")
+
+	client := &recordingPushClient{status: map[string]int{
+		"https://push.example.test/rejected": http.StatusBadRequest,
+	}}
+	dispatcher := w.dispatcher(t, ctx, client)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "設定を見直してください")
+	decisions, err := w.store.NotificationDecisionsFor(ctx, ch, msg)
+	if err != nil {
+		t.Fatalf("decisions: %v", err)
+	}
+
+	var logs bytes.Buffer
+	previousWriter, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	dispatcher.deliver(ctx, ch, msg, decisions)
+
+	if !strings.Contains(logs.String(), "unexpected response status 400") {
+		t.Fatalf("push log = %q, want rejected status", logs.String())
 	}
 }
 
