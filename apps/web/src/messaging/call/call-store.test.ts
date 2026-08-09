@@ -38,6 +38,7 @@ class FakeTransport implements CallTransport {
   readonly log: string[] = [];
   readonly events: CallTransportEvents;
   connectRejects = false;
+  resumeAudioRejects = false;
 
   constructor(events: CallTransportEvents) {
     this.events = events;
@@ -55,6 +56,10 @@ class FakeTransport implements CallTransport {
   }
   async setScreenShareEnabled(enabled: boolean): Promise<void> {
     this.log.push(`screen:${enabled}`);
+  }
+  async resumeAudio(): Promise<void> {
+    this.log.push("audio:resume");
+    if (this.resumeAudioRejects) throw new Error("still blocked");
   }
   async disconnect(): Promise<void> {
     this.log.push("disconnect");
@@ -308,6 +313,40 @@ describe("自分の通話セッション", () => {
       activePlaceKey: "dm:d1",
       phase: "connected",
     });
+  });
+
+  it("autoplay拒否を表示状態へ上げ、明示resumeの成功時だけ解除する", async () => {
+    await useCall.getState().join("channel:c1");
+    transports[0].events.onAudioPlaybackBlocked(true);
+    expect(useCall.getState().audioPlaybackBlocked).toBe(true);
+
+    transports[0].resumeAudioRejects = true;
+    await expect(useCall.getState().resumeAudio()).rejects.toThrow(
+      "still blocked",
+    );
+    expect(useCall.getState().audioPlaybackBlocked).toBe(true);
+
+    transports[0].resumeAudioRejects = false;
+    await useCall.getState().resumeAudio();
+    expect(transports[0].log).toContain("audio:resume");
+    expect(useCall.getState().audioPlaybackBlocked).toBe(false);
+  });
+
+  it("leave・reset・回線切断でautoplay拒否表示を持ち越さない", async () => {
+    await useCall.getState().join("channel:c1");
+    transports[0].events.onAudioPlaybackBlocked(true);
+    await useCall.getState().leave();
+    expect(useCall.getState().audioPlaybackBlocked).toBe(false);
+
+    await useCall.getState().join("channel:c1");
+    transports[1].events.onAudioPlaybackBlocked(true);
+    useCall.getState().reset();
+    expect(useCall.getState().audioPlaybackBlocked).toBe(false);
+
+    await useCall.getState().join("channel:c1");
+    transports[2].events.onAudioPlaybackBlocked(true);
+    transports[2].events.onDisconnected();
+    expect(useCall.getState().audioPlaybackBlocked).toBe(false);
   });
 
   it("マイク・カメラ・画面共有は手元を先に動かし、失敗したら戻す", async () => {

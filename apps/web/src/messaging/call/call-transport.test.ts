@@ -65,6 +65,7 @@ describe("LiveKit call transport", () => {
       onTracks,
       onSpeaking: vi.fn(),
       onParticipants: vi.fn(),
+      onAudioPlaybackBlocked: vi.fn(),
       onDisconnected: vi.fn(),
     });
     await transport.connect({
@@ -119,11 +120,13 @@ describe("LiveKit call transport", () => {
     expect(onTracks.mock.lastCall?.[0]).toEqual([]);
   });
 
-  it("autoplay拒否後の次のuser gestureでRoom.startAudioを呼ぶ", async () => {
+  it("autoplay拒否を上へ伝え、明示的なresumeでRoom.startAudioを待つ", async () => {
+    const onAudioPlaybackBlocked = vi.fn();
     const transport = createLiveKitTransport({
       onTracks: vi.fn(),
       onSpeaking: vi.fn(),
       onParticipants: vi.fn(),
+      onAudioPlaybackBlocked,
       onDisconnected: vi.fn(),
     });
     await transport.connect({
@@ -135,12 +138,38 @@ describe("LiveKit call transport", () => {
     const room = liveKit.Room.instances[0];
 
     room.emit(liveKit.RoomEvent.AudioPlaybackStatusChanged, false);
+    expect(onAudioPlaybackBlocked).toHaveBeenLastCalledWith(true);
     document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(room.startAudio).toHaveBeenCalledOnce();
+    expect(room.startAudio).not.toHaveBeenCalled();
 
-    room.emit(liveKit.RoomEvent.AudioPlaybackStatusChanged, true);
-    document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await transport.resumeAudio();
     expect(room.startAudio).toHaveBeenCalledOnce();
+    expect(onAudioPlaybackBlocked).toHaveBeenLastCalledWith(false);
+  });
+
+  it("resume失敗を呼び出し元へ返し、blocked状態を解除しない", async () => {
+    const onAudioPlaybackBlocked = vi.fn();
+    const transport = createLiveKitTransport({
+      onTracks: vi.fn(),
+      onSpeaking: vi.fn(),
+      onParticipants: vi.fn(),
+      onAudioPlaybackBlocked,
+      onDisconnected: vi.fn(),
+    });
+    await transport.connect({
+      url: "ws://livekit.test",
+      token: "ticket",
+      room: "c1",
+      identity: "human:alice",
+    });
+    const room = liveKit.Room.instances[0];
+    room.emit(liveKit.RoomEvent.AudioPlaybackStatusChanged, false);
+    room.startAudio.mockRejectedValueOnce(new Error("still blocked"));
+
+    await expect(transport.resumeAudio()).rejects.toThrow("still blocked");
+
+    expect(room.startAudio).toHaveBeenCalledOnce();
+    expect(onAudioPlaybackBlocked).toHaveBeenLastCalledWith(true);
   });
 });
 

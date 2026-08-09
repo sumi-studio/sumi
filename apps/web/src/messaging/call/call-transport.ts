@@ -15,6 +15,8 @@ export interface CallTransportEvents {
   onSpeaking(participants: ParticipantKey[]): void;
   /** 部屋の実際の在室者。サーバーのcall_stateが遅れても画面が追いつく。 */
   onParticipants(participants: ParticipantKey[]): void;
+  /** Browserがremote audioのautoplayを許可していない。 */
+  onAudioPlaybackBlocked(blocked: boolean): void;
   /** 相手都合・回線都合で切れた。自分から切った場合は呼ばれない。 */
   onDisconnected(): void;
 }
@@ -24,6 +26,8 @@ export interface CallTransport {
   setMicrophoneEnabled(enabled: boolean): Promise<void>;
   setCameraEnabled(enabled: boolean): Promise<void>;
   setScreenShareEnabled(enabled: boolean): Promise<void>;
+  /** 本人の明示gestureから、拒否されたremote audio再生を再試行する。 */
+  resumeAudio(): Promise<void>;
   disconnect(): Promise<void>;
 }
 
@@ -40,8 +44,6 @@ class LiveKitCallTransport implements CallTransport {
   private room: Room | null = null;
   private readonly tracks = new Map<string, CallMediaTrack>();
   private readonly audioTracks = new Map<string, () => void>();
-  private audioRecoveryRoom: Room | null = null;
-  private audioRecoveryPending = false;
 
   constructor(events: CallTransportEvents) {
     this.events = events;
@@ -105,18 +107,14 @@ class LiveKitCallTransport implements CallTransport {
     room.on(RoomEvent.ParticipantConnected, emitParticipants);
     room.on(RoomEvent.ParticipantDisconnected, emitParticipants);
     room.on(RoomEvent.AudioPlaybackStatusChanged, (canPlay) => {
-      if (canPlay) {
-        this.stopAudioRecovery();
-      } else {
-        this.startAudioRecovery(room);
-      }
+      this.events.onAudioPlaybackBlocked(!canPlay);
     });
     room.on(RoomEvent.Disconnected, () => {
       if (this.room === room) this.room = null;
       this.clearAudioTracks();
-      this.stopAudioRecovery();
       this.tracks.clear();
       this.emitTracks();
+      this.events.onAudioPlaybackBlocked(false);
       this.events.onDisconnected();
     });
 
@@ -139,11 +137,17 @@ class LiveKitCallTransport implements CallTransport {
     await this.room?.localParticipant.setScreenShareEnabled(enabled);
   }
 
+  async resumeAudio(): Promise<void> {
+    const room = this.room;
+    if (!room) return;
+    await room.startAudio();
+    if (this.room === room) this.events.onAudioPlaybackBlocked(false);
+  }
+
   async disconnect(): Promise<void> {
     const room = this.room;
     this.room = null;
     this.clearAudioTracks();
-    this.stopAudioRecovery();
     this.tracks.clear();
     this.emitTracks();
     await room?.disconnect();
@@ -164,31 +168,6 @@ class LiveKitCallTransport implements CallTransport {
     for (const cleanup of this.audioTracks.values()) cleanup();
     this.audioTracks.clear();
   }
-
-  /** Browserのautoplay拒否後、次の本人操作をLiveKitの再開gestureに使う。 */
-  private startAudioRecovery(room: Room): void {
-    if (this.audioRecoveryRoom === room) return;
-    this.stopAudioRecovery();
-    this.audioRecoveryRoom = room;
-    document.addEventListener("click", this.recoverAudio, true);
-    document.addEventListener("keydown", this.recoverAudio, true);
-  }
-
-  private stopAudioRecovery(): void {
-    this.audioRecoveryRoom = null;
-    this.audioRecoveryPending = false;
-    document.removeEventListener("click", this.recoverAudio, true);
-    document.removeEventListener("keydown", this.recoverAudio, true);
-  }
-
-  private readonly recoverAudio = (): void => {
-    const room = this.audioRecoveryRoom;
-    if (!room || this.audioRecoveryPending) return;
-    this.audioRecoveryPending = true;
-    void room.startAudio().finally(() => {
-      if (this.audioRecoveryRoom === room) this.audioRecoveryPending = false;
-    });
-  };
 }
 
 function trackKey(participantKey: ParticipantKey, screen: boolean): string {

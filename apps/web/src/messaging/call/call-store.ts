@@ -63,6 +63,8 @@ interface CallStoreState {
   failure: "unavailable" | "failed" | null;
   local: CallLocalState;
   tracks: CallMediaTrack[];
+  /** Browserのautoplay制約により、remote audioへ本人gestureが必要。 */
+  audioPlaybackBlocked: boolean;
   speakingUntil: Record<ParticipantKey, number>;
   /** 拒否・応答済みで、もう鳴らさない通話（place単位）。 */
   dismissedPlaces: Record<PlaceKey, boolean>;
@@ -75,6 +77,7 @@ interface CallStoreState {
   toggleMicrophone(): void;
   toggleCamera(): void;
   toggleScreenShare(): void;
+  resumeAudio(): Promise<void>;
   dismissIncoming(key: PlaceKey): void;
   /** セッションが変わったら通話も終える。 */
   reset(): void;
@@ -110,6 +113,9 @@ export const useCall = create<CallStoreState>((set, get) => {
         // 在室者の正本はサーバーのcall_state。ここでは受け取るだけにして、
         // 二つの真実を画面に並べない。
       },
+      onAudioPlaybackBlocked(blocked: boolean) {
+        if (ownsCurrentCall()) set({ audioPlaybackBlocked: blocked });
+      },
       onDisconnected() {
         if (!ownsCurrentCall()) return;
         joinGeneration += 1;
@@ -118,6 +124,7 @@ export const useCall = create<CallStoreState>((set, get) => {
           activePlaceKey: null,
           phase: "idle",
           tracks: [],
+          audioPlaybackBlocked: false,
           local: IDLE_LOCAL,
         });
       },
@@ -131,6 +138,7 @@ export const useCall = create<CallStoreState>((set, get) => {
     failure: null,
     local: IDLE_LOCAL,
     tracks: [],
+    audioPlaybackBlocked: false,
     speakingUntil: {},
     dismissedPlaces: {},
 
@@ -198,6 +206,7 @@ export const useCall = create<CallStoreState>((set, get) => {
         failure: null,
         local: IDLE_LOCAL,
         tracks: [],
+        audioPlaybackBlocked: false,
         dismissedPlaces: { ...get().dismissedPlaces, [key]: true },
       });
       let created: CallTransport | null = null;
@@ -229,6 +238,7 @@ export const useCall = create<CallStoreState>((set, get) => {
                 ? "unavailable"
                 : "failed",
             tracks: [],
+            audioPlaybackBlocked: false,
           });
         }
         await disconnectQuietly(created);
@@ -244,6 +254,7 @@ export const useCall = create<CallStoreState>((set, get) => {
         phase: "idle",
         failure: null,
         tracks: [],
+        audioPlaybackBlocked: false,
         local: IDLE_LOCAL,
       });
       try {
@@ -279,6 +290,16 @@ export const useCall = create<CallStoreState>((set, get) => {
       });
     },
 
+    async resumeAudio() {
+      const current = transport;
+      const generation = joinGeneration;
+      if (!current) return;
+      await current.resumeAudio();
+      if (joinGeneration === generation && transport === current) {
+        set({ audioPlaybackBlocked: false });
+      }
+    },
+
     dismissIncoming(key) {
       set((state) => ({
         dismissedPlaces: { ...state.dismissedPlaces, [key]: true },
@@ -299,6 +320,7 @@ export const useCall = create<CallStoreState>((set, get) => {
         failure: null,
         local: IDLE_LOCAL,
         tracks: [],
+        audioPlaybackBlocked: false,
         speakingUntil: {},
         dismissedPlaces: {},
       });

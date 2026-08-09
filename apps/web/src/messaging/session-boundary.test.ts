@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useCall } from "./call/call-store";
 import { MockMessagingServer } from "./mock-server";
 import type { ConnectionState } from "./model";
 import {
@@ -51,6 +52,11 @@ describe("messaging session boundary", () => {
         ],
       },
     });
+    useCall.setState({
+      activePlaceKey: "channel:private-a",
+      phase: "connected",
+      audioPlaybackBlocked: true,
+    });
 
     bindMessagingSessionIdentity(null);
     bindMessagingSessionIdentity("human-b");
@@ -64,6 +70,11 @@ describe("messaging session boundary", () => {
       messagesByPlace: {},
       activePlaceKey: null,
       connection: "disconnected",
+    });
+    expect(useCall.getState()).toMatchObject({
+      activePlaceKey: null,
+      phase: "idle",
+      audioPlaybackBlocked: false,
     });
   });
 
