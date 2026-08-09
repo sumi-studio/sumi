@@ -333,6 +333,59 @@ describe("notification settings in the store", () => {
     );
   });
 
+  it("does not let queued writes cross a messaging session boundary", async () => {
+    const previousBackend = backend;
+    previousBackend.holdWrites = true;
+    useMessaging.getState().setNotificationDefaultLevel("all");
+    await vi.waitFor(() => expect(previousBackend.inFlight).toBe(1));
+    // This second old-session snapshot is queued behind the held request.
+    useMessaging.getState().setNotificationKeywords(["前アカウント"]);
+
+    bindMessagingSessionIdentity("human-2");
+    const nextBackend = new StubBackend();
+    nextBackend.serverSetting = {
+      owner: SELF,
+      defaults: { level: "mentions" },
+      perPlace: [{ place: CHANNEL, level: "all" }],
+      keywords: ["新アカウント"],
+    };
+    installMessagingBackend(nextBackend);
+    useMessaging.getState().init();
+    await vi.waitFor(() => expect(useMessaging.getState().ready).toBe(true));
+
+    // Bring the new session to generation 2 as well. A generation counter that
+    // was merely reset would let the old queued generation-2 task pass.
+    useMessaging.getState().setNotificationDefaultLevel("all");
+    useMessaging.getState().setNotificationKeywords(["新しい確定値"]);
+    await vi.waitFor(() =>
+      expect(nextBackend.serverSetting.keywords).toEqual(["新しい確定値"]),
+    );
+    expect(nextBackend.settingWrites).toHaveLength(1);
+
+    previousBackend.holdWrites = false;
+    previousBackend.releaseWrites();
+    await vi.waitFor(() =>
+      expect(previousBackend.serverSetting.defaults.level).toBe("all"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(nextBackend.settingWrites).toHaveLength(1);
+    expect(useMessaging.getState().notificationKeywords).toEqual([
+      "新しい確定値",
+    ]);
+
+    // A later failure must roll back to this session's confirmed value, never
+    // to the response returned by the request that crossed the boundary.
+    nextBackend.rejectSettingWrites = true;
+    useMessaging.getState().setNotificationDefaultLevel("mute");
+    await vi.waitFor(() =>
+      expect(useMessaging.getState().notificationDefaultLevel).toBe("all"),
+    );
+    expect(useMessaging.getState().notificationKeywords).toEqual([
+      "新しい確定値",
+    ]);
+  });
+
   it("keeps the sound preference on the device, not in the shared setting", () => {
     useMessaging.getState().setNotificationSoundEnabled(false);
     expect(useMessaging.getState().notificationSoundEnabled).toBe(false);

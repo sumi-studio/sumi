@@ -1001,6 +1001,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     levelByPlace: Record<PlaceKey, NotificationLevel>;
     keywords: string[];
   }) => {
+    const sessionBackend = backend;
     const state = get();
     const previous: NotificationSettingState = {
       notificationDefaultLevel: state.notificationDefaultLevel,
@@ -1014,6 +1015,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       notificationKeywords: next.keywords,
     });
     notificationWriteChain = notificationWriteChain.then(async () => {
+      // bindMessagingSessionIdentity resets the public chain, but a callback
+      // already queued on the old promise still exists. Never let it use the
+      // replacement backend or mutate the replacement session's confirmed
+      // rollback point.
+      if (backend !== sessionBackend) return;
       // 送る番が来るまでにもっと新しい設定になっていたら、この一本は要らない。
       if (generation !== notificationWriteGeneration) return;
       const perPlace: { place: Place; level: NotificationLevel }[] = [];
@@ -1023,17 +1029,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
       try {
         const confirmed = notificationSettingState(
-          await backend.setNotificationSetting({
+          await sessionBackend.setNotificationSetting({
             defaults: { level: next.defaultLevel },
             perPlace,
             keywords: next.keywords,
           }),
         );
+        if (backend !== sessionBackend) return;
         confirmedNotificationSetting = confirmed;
         // 追い越されていれば後続の書き込みが正。確定値は覚えるが手元は触らない。
         if (generation === notificationWriteGeneration) set(confirmed);
       } catch {
-        if (generation !== notificationWriteGeneration) return;
+        if (
+          backend !== sessionBackend ||
+          generation !== notificationWriteGeneration
+        ) {
+          return;
+        }
         set(confirmedNotificationSetting ?? previous);
       }
     });
