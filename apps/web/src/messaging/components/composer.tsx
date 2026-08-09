@@ -7,6 +7,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import { secureRandomUUID } from "../../lib/random-uuid";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { Attachment, MemberProfile, Message, Urgency } from "../model";
@@ -18,6 +19,7 @@ import {
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { formatFileSize } from "./message-attachments";
+import { useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 
 const MAX_HEIGHT_PX = 220;
@@ -227,6 +229,8 @@ export function Composer() {
     );
   }, []);
 
+  // メンション候補は一覧の上に浮くので、この上でのホイールも一覧へ渡す。
+  const mentionPassthroughRef = useWheelPassthrough<HTMLDivElement>();
   const uploading = attachments.some((entry) => entry.status === "uploading");
   const readyAttachments = useMemo(
     () =>
@@ -261,7 +265,7 @@ export function Composer() {
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (event.nativeEvent.isComposing) return;
+      if (isImeComposing(event)) return;
       if (mention && candidates.length > 0) {
         if (event.key === "ArrowDown") {
           event.preventDefault();
@@ -341,7 +345,10 @@ export function Composer() {
   return (
     <div className="relative shrink-0 px-4 pb-4 sm:px-6">
       {mention && candidates.length > 0 ? (
-        <div className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6">
+        <div
+          ref={mentionPassthroughRef}
+          className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6"
+        >
           {candidates.map((member, index) => {
             const key = participantKey(member.participant);
             return (

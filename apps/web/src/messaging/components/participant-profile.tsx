@@ -6,6 +6,7 @@ import {
 import { type ReactNode, useState } from "react";
 import { usePlaceNavigate } from "../place-route";
 import { useMessaging } from "../store";
+import { useWheelPassthrough } from "./overlay";
 import {
   ParticipantAvatar,
   STATUS_DOT,
@@ -144,6 +145,8 @@ export function ParticipantProfilePopover({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // portalで一覧の外へ出るカードの上でも、ホイールは一覧へ渡す。
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
@@ -157,7 +160,12 @@ export function ParticipantProfilePopover({
       >
         {children}
       </PopoverTrigger>
-      <PopoverContent side={side} align={align} className="w-64 p-2">
+      <PopoverContent
+        ref={passthroughRef}
+        side={side}
+        align={align}
+        className="w-64 p-2"
+      >
         <ParticipantProfileCard
           participantKey={key}
           onDone={() => setOpen(false)}

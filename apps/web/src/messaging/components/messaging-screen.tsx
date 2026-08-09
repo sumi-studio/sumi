@@ -1,21 +1,8 @@
-import {
-  Bell,
-  Clock,
-  Hash,
-  Pencil,
-  Users,
-  Volume2,
-  VolumeX,
-  X,
-} from "lucide-react";
+import { Bell, Clock, Hash, Pencil, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isImeComposing } from "../../lib/ime";
 import { AppRail } from "../../shell/app-rail";
-import {
-  type NotificationLevel,
-  type PlaceKey,
-  participantKey,
-  type ReplyLaterMarker,
-} from "../model";
+import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
 import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
@@ -31,7 +18,9 @@ import { ConnectionBanner } from "./connection-banner";
 import { MemberList } from "./member-list";
 import { MessageList, type MessageListHandle } from "./message-list";
 import { MessageSearch } from "./message-search";
-import { NOTIFICATION_LEVEL_LABEL, Sidebar } from "./sidebar";
+import { NotificationSettingsMenu } from "./notification-settings";
+import { useOverlayPanel, useWheelPassthrough } from "./overlay";
+import { Sidebar } from "./sidebar";
 
 interface PendingJump {
   placeKey: PlaceKey;
@@ -53,7 +42,7 @@ function relativeTime(target: number, now: number): string {
  * Escapeで破棄する。権限はサーバーのmembershipモデルに従う（v0: workspaceの
  * activeメンバーなら誰でも編集できる）。
  */
-function ChannelTopic({
+export function ChannelTopic({
   channelId,
   topic,
 }: {
@@ -119,6 +108,8 @@ function ChannelTopic({
         maxLength={200}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
+          // IME変換確定のEnterで保存しない。確定は確定だけの意味。
+          if (isImeComposing(event)) return;
           if (event.key === "Enter") {
             event.preventDefault();
             void submit();
@@ -213,126 +204,16 @@ function NotificationPermissionBanner() {
   );
 }
 
-/** 既定のレベル・keyword・音。placeごとの上書きはサイドバー側にある。 */
-function NotificationSettingsMenu() {
-  const defaultLevel = useMessaging((state) => state.notificationDefaultLevel);
-  const keywords = useMessaging((state) => state.notificationKeywords);
-  const soundEnabled = useMessaging((state) => state.notificationSoundEnabled);
-  const setDefaultLevel = useMessaging(
-    (state) => state.setNotificationDefaultLevel,
-  );
-  const setKeywords = useMessaging((state) => state.setNotificationKeywords);
-  const setSoundEnabled = useMessaging(
-    (state) => state.setNotificationSoundEnabled,
-  );
-  const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState("");
-
-  const addKeyword = () => {
-    const value = draft.trim();
-    if (!value || keywords.includes(value)) {
-      setDraft("");
-      return;
-    }
-    setKeywords([...keywords, value]);
-    setDraft("");
-  };
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        title="通知設定"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-        className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
-          open ? "bg-accent text-foreground" : "text-muted-foreground"
-        }`}
-      >
-        <Bell className="size-4" />
-      </button>
-      {open ? (
-        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-2 shadow-md">
-          <p className="pb-1 font-medium text-[11px] text-muted-foreground">
-            既定の通知
-          </p>
-          {(Object.keys(NOTIFICATION_LEVEL_LABEL) as NotificationLevel[]).map(
-            (level) => (
-              <button
-                key={level}
-                type="button"
-                onClick={() => setDefaultLevel(level)}
-                className={`block w-full rounded-md px-2 py-1 text-left text-[13px] hover:bg-accent ${
-                  defaultLevel === level ? "bg-accent/60 font-medium" : ""
-                }`}
-              >
-                {NOTIFICATION_LEVEL_LABEL[level]}
-              </button>
-            ),
-          )}
-          <p className="pt-3 pb-1 font-medium text-[11px] text-muted-foreground">
-            キーワード — 名前以外で呼ばれたい言葉
-          </p>
-          <div className="flex flex-wrap gap-1 pb-1">
-            {keywords.map((keyword) => (
-              <span
-                key={keyword}
-                className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[12px]"
-              >
-                {keyword}
-                <button
-                  type="button"
-                  aria-label={`${keyword} を外す`}
-                  onClick={() =>
-                    setKeywords(keywords.filter((entry) => entry !== keyword))
-                  }
-                  className="text-muted-foreground hover:text-foreground"
-                >
-                  <X className="size-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-          <input
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              event.preventDefault();
-              addKeyword();
-            }}
-            onBlur={addKeyword}
-            placeholder="追加して Enter"
-            aria-label="通知キーワードを追加"
-            className="w-full rounded-md border border-border bg-transparent px-2 py-1 text-[12.5px] outline-none focus:border-muted-foreground/60"
-          />
-          <button
-            type="button"
-            onClick={() => setSoundEnabled(!soundEnabled)}
-            className="mt-3 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-accent"
-          >
-            {soundEnabled ? (
-              <Volume2 className="size-3.5" />
-            ) : (
-              <VolumeX className="size-3.5 text-muted-foreground" />
-            )}
-            通知音 {soundEnabled ? "オン" : "オフ"}
-            <span className="ml-auto text-[11px] text-muted-foreground">
-              この端末だけ
-            </span>
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const replyLaterById = useMessaging((state) => state.replyLaterById);
   const selfKey = useMessaging((state) => state.selfKey);
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const overlay = useOverlayPanel<HTMLButtonElement>({
+    open,
+    onOpenChange: setOpen,
+  });
 
   // リマインドの予定が入っているのは本人のmarkerだけ。相手の「後で返信します」は
   // messageの側に見えていればよく、こちらのknock対象にはならない。
@@ -360,8 +241,9 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
     <div className="relative">
       <button
         type="button"
-        onClick={() => setOpen((value) => !value)}
         title="後で返信"
+        aria-haspopup="dialog"
+        {...overlay.triggerProps}
         className={`relative flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
           open ? "bg-accent text-foreground" : "text-muted-foreground"
         }`}
@@ -378,7 +260,12 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
         ) : null}
       </button>
       {open ? (
-        <div className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md">
+        <div
+          {...overlay.panelProps}
+          role="dialog"
+          aria-label="後で返信"
+          className="absolute top-full right-0 z-20 mt-1 w-72 rounded-lg border border-border bg-background p-1 shadow-md"
+        >
           <p className="px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
             後で返信 — 忘れないように knock します
           </p>
@@ -445,6 +332,8 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
   const [now, setNow] = useState(() => Date.now());
   const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
+  // 一覧の上に浮いているので、この上でのホイールも一覧へ渡す。
+  const passthroughRef = useWheelPassthrough<HTMLDivElement>();
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -463,7 +352,10 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
   if (!marker) return null;
 
   return (
-    <div className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg">
+    <div
+      ref={passthroughRef}
+      className="fixed right-4 bottom-4 z-30 w-80 rounded-xl border border-border bg-background p-3 shadow-lg"
+    >
       <p className="flex items-center gap-1.5 font-medium text-[13px]">
         <Clock className="size-3.5 text-rose-500" />
         後で返信の時間です

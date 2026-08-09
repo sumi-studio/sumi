@@ -8,6 +8,7 @@ import {
 import { ArrowUpIcon, SquareIcon } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useRef } from "react";
+import { isImeComposing } from "../lib/ime";
 
 const MIN_HEIGHT = 42;
 const MAX_HEIGHT = 186;
@@ -53,11 +54,7 @@ export function ChatPromptInput({
   }, [value]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (
-      event.key === "Enter" &&
-      !event.shiftKey &&
-      !event.nativeEvent.isComposing
-    ) {
+    if (event.key === "Enter" && !event.shiftKey && !isImeComposing(event)) {
       event.preventDefault();
       if (canSend) onSend();
     }

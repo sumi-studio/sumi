@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { isImeComposing } from "../../lib/ime";
 import type {
   ChannelSummary,
   DmSummary,
@@ -17,6 +18,7 @@ import type {
 } from "../model";
 import { participantKey, placeKey } from "../model";
 import { useMessaging } from "../store";
+import { useOverlayPanel } from "./overlay";
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -102,8 +104,6 @@ export function MessageSearch({
   const [open, setOpen] = useState(false);
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<MessageSearchResult[] | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
   const timerRef = useRef<number | null>(null);
   const requestIdRef = useRef(0);
 
@@ -152,31 +152,23 @@ export function MessageSearch({
     setSearching(false);
   }, []);
 
-  // パネルの外をクリック/タップしたら閉じる。
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: PointerEvent) => {
-      if (
-        event.target instanceof Node &&
-        containerRef.current?.contains(event.target)
-      ) {
-        return;
-      }
-      close();
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open, close]);
-
   const trimmed = query.trim();
   const showPanel = open && trimmed !== "";
 
+  // 外側クリック・Escape・排他・ホイール透過は共通のオーバーレイ規律に任せる。
+  const overlay = useOverlayPanel<HTMLInputElement>({
+    open: showPanel,
+    onOpenChange: (next) => {
+      if (!next) close();
+    },
+  });
+
   return (
-    <div ref={containerRef} className="relative">
+    <div className="relative">
       <div className="relative">
         <Search className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5 text-muted-foreground" />
         <input
-          ref={inputRef}
+          ref={overlay.triggerProps.ref}
           value={query}
           placeholder="検索"
           maxLength={100}
@@ -189,7 +181,7 @@ export function MessageSearch({
             if (query.trim()) setOpen(true);
           }}
           onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return;
+            if (isImeComposing(event)) return;
             if (event.key === "Enter") {
               event.preventDefault();
               if (timerRef.current) window.clearTimeout(timerRef.current);
@@ -198,16 +190,20 @@ export function MessageSearch({
               return;
             }
             if (event.key === "Escape") {
+              // 閉じるのはオーバーレイ規律側（フォーカスは検索欄に残す）。
               event.preventDefault();
               close();
-              inputRef.current?.blur();
             }
           }}
-          className="h-7 w-36 rounded-md border border-border bg-background pr-2 pl-7 text-[12px] outline-none transition-[width] duration-150 focus:w-64 focus-visible:border-ring/60 sm:w-44"
+          // フォーカスで幅を変えない。右隣のアイコンが動くと押し損ねる。
+          className="h-7 w-36 rounded-md border border-border bg-background pr-2 pl-7 text-[12px] outline-none focus-visible:border-ring/60 sm:w-44"
         />
       </div>
       {showPanel ? (
-        <div className="absolute top-full right-0 z-20 mt-1 max-h-[60vh] w-96 overflow-y-auto rounded-lg border border-border bg-background p-1 shadow-md">
+        <div
+          {...overlay.panelProps}
+          className="absolute top-full right-0 z-20 mt-1 max-h-[60vh] w-96 overflow-y-auto rounded-lg border border-border bg-background p-1 shadow-md"
+        >
           <p className="flex items-center gap-1.5 px-2 pt-1.5 pb-1 font-medium text-[11px] text-muted-foreground">
             「{trimmed}」の検索結果
             {searching ? (

@@ -388,6 +388,21 @@ export function MessageList({
     ],
   );
 
+  // 「最新へ」は一覧のスクロール領域の内側に置く。外に浮かせると、その真下に
+  // 来たホイールがスクロール領域へ届かず一覧が止まる（BUG-NAV-01）。
+  const jumpToLatest = atEnd ? null : (
+    <button
+      type="button"
+      onClick={() =>
+        virtualizerRef.current?.scrollToEnd({ behavior: "smooth" })
+      }
+      className="absolute right-4 bottom-3 flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-sm transition-colors hover:text-foreground"
+    >
+      <ArrowDown className="size-3.5" />
+      最新へ
+    </button>
+  );
+
   return (
     <div className="relative min-h-0 flex-1">
       <ConversationVirtualizer
@@ -398,24 +413,13 @@ export function MessageList({
         ariaLabel="メッセージ"
         className="scrollbar-ui size-full min-h-0 overscroll-contain"
         contentClassName="pb-4"
+        footerOverlay={jumpToLatest}
         onAtEndChange={(next) => {
           atEndRef.current = next;
           setAtEnd(next);
         }}
         onVisibleMessageIdsChange={advanceRead}
       />
-      {atEnd ? null : (
-        <button
-          type="button"
-          onClick={() =>
-            virtualizerRef.current?.scrollToEnd({ behavior: "smooth" })
-          }
-          className="absolute right-4 bottom-3 flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-sm transition-colors hover:text-foreground"
-        >
-          <ArrowDown className="size-3.5" />
-          最新へ
-        </button>
-      )}
     </div>
   );
 }
