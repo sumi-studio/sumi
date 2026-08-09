@@ -5,11 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 const (
@@ -242,6 +246,262 @@ func TestCallRoutesFailClosedWithoutLiveKit(t *testing.T) {
 	mux.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unconfigured webhook status = %d", response.Code)
+	}
+}
+
+type rejectedCallSessions struct{}
+
+func (rejectedCallSessions) VerifySession(
+	context.Context,
+	string,
+) (agentevents.UserSessionClaims, error) {
+	return agentevents.UserSessionClaims{
+		TenantID: "tenant-1",
+		UserID:   "01900000-0000-7000-8000-0000000000aa",
+	}, nil
+}
+
+func (rejectedCallSessions) AuthorizeSession(
+	context.Context,
+	agentevents.UserSessionClaims,
+	func() error,
+) error {
+	return errors.New("session revoked before admission")
+}
+
+func TestCallTokenDoesNotIssueACredentialWhenSessionAdmissionIsRejected(t *testing.T) {
+	server := NewServer(nil, rejectedCallSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	service := NewCallService(server, testLiveKit())
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/messaging/places/place-1/call/token",
+		nil,
+	)
+	request.Header.Set("Origin", testOrigin)
+	request.AddCookie(&http.Cookie{
+		Name:  agentevents.BrowserSessionCookie,
+		Value: "session",
+	})
+	response := httptest.NewRecorder()
+
+	mux.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("rejected admission status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), `"token"`) {
+		t.Fatalf("rejected admission returned a credential: %s", response.Body.String())
+	}
+}
+
+// callSessionRevocations is the smallest BrowserSessionRevocationStore that
+// preserves the production lease contract needed by this package's HTTP test:
+// admission holds a read lease while logout takes the exclusive write lease.
+type callSessionRevocations struct {
+	mu              sync.RWMutex
+	revoked         map[string]bool
+	revokeAttempted chan struct{}
+	revokeOnce      sync.Once
+}
+
+func newCallSessionRevocations() *callSessionRevocations {
+	return &callSessionRevocations{
+		revoked:         map[string]bool{},
+		revokeAttempted: make(chan struct{}),
+	}
+}
+
+func (s *callSessionRevocations) CheckBrowserSession(
+	_ context.Context,
+	sessionID string,
+	_ time.Time,
+	_ time.Time,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.revoked[sessionID] {
+		return errors.New("browser session revoked")
+	}
+	return nil
+}
+
+func (s *callSessionRevocations) AuthorizeBrowserSession(
+	_ context.Context,
+	sessionID string,
+	_ time.Time,
+	_ time.Time,
+	operation func() error,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.revoked[sessionID] {
+		return errors.New("browser session revoked")
+	}
+	return operation()
+}
+
+func (s *callSessionRevocations) RevokeBrowserSession(
+	_ context.Context,
+	sessionID string,
+	_ time.Time,
+	_ time.Time,
+) error {
+	s.revokeOnce.Do(func() { close(s.revokeAttempted) })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revoked[sessionID] = true
+	return nil
+}
+
+func (s *callSessionRevocations) RotateBrowserSession(
+	_ context.Context,
+	_ string,
+	_ time.Time,
+	_ string,
+	_ time.Time,
+	_ time.Time,
+) error {
+	return nil
+}
+
+func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, place := w.workspaceWithChannel(t, ctx)
+	revocations := newCallSessionRevocations()
+	sessions, err := agentevents.NewHMACUserSessionVerifier(
+		[]byte("call-token-session-secret-at-least-32-bytes"),
+		"",
+		revocations,
+	)
+	if err != nil {
+		t.Fatalf("create browser sessions: %v", err)
+	}
+	signedSession, err := sessions.IssueSession(ctx, agentevents.UserSessionClaims{
+		TenantID:           "tenant-1",
+		UserID:             w.humanA.ID,
+		PersonalityAgentID: w.agent.ID,
+	}, time.Hour)
+	if err != nil {
+		t.Fatalf("issue browser session: %v", err)
+	}
+	server := NewServer(w.store, sessions)
+	server.AllowedOrigins = []string{testOrigin}
+	service := NewCallService(server, testLiveKit())
+	mintEntered := make(chan struct{})
+	releaseMint := make(chan struct{})
+	var mintOnce sync.Once
+	service.Now = func() time.Time {
+		mintOnce.Do(func() { close(mintEntered) })
+		<-releaseMint
+		return time.Unix(1_780_000_000, 0)
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(releaseMint)
+		}
+	}()
+
+	auth := &agentevents.BrowserAuthServer{
+		Sessions:       sessions,
+		AllowedOrigins: []string{testOrigin},
+	}
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+	auth.RegisterRoutes(mux)
+
+	tokenRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/messaging/places/"+place.PlaceID+"/call/token",
+		nil,
+	)
+	tokenRequest.Header.Set("Origin", testOrigin)
+	tokenRequest.AddCookie(&http.Cookie{
+		Name:  agentevents.BrowserSessionCookie,
+		Value: signedSession,
+	})
+	tokenResponse := httptest.NewRecorder()
+	tokenDone := make(chan struct{})
+	go func() {
+		mux.ServeHTTP(tokenResponse, tokenRequest)
+		close(tokenDone)
+	}()
+
+	select {
+	case <-mintEntered:
+	case <-ctx.Done():
+		t.Fatal("token request did not reach credential issuance")
+	}
+
+	csrf := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	logoutRequest.Header.Set("Origin", testOrigin)
+	logoutRequest.Header.Set("X-CSRF-Token", csrf)
+	logoutRequest.AddCookie(&http.Cookie{Name: agentevents.BrowserCSRFCookie, Value: csrf})
+	logoutRequest.AddCookie(&http.Cookie{
+		Name:  agentevents.BrowserSessionCookie,
+		Value: signedSession,
+	})
+	logoutResponse := httptest.NewRecorder()
+	logoutDone := make(chan struct{})
+	go func() {
+		mux.ServeHTTP(logoutResponse, logoutRequest)
+		close(logoutDone)
+	}()
+
+	select {
+	case <-revocations.revokeAttempted:
+	case <-ctx.Done():
+		t.Fatal("logout did not reach durable revocation")
+	}
+	prematureLogout := false
+	select {
+	case <-logoutDone:
+		prematureLogout = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseMint)
+	released = true
+
+	select {
+	case <-tokenDone:
+	case <-ctx.Done():
+		t.Fatal("call token request did not complete")
+	}
+	if tokenResponse.Code != http.StatusOK {
+		t.Fatalf("call token status = %d, body = %s", tokenResponse.Code, tokenResponse.Body.String())
+	}
+	var issued struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &issued); err != nil || issued.Token == "" {
+		t.Fatalf("decode call token: token=%q err=%v body=%s", issued.Token, err, tokenResponse.Body.String())
+	}
+	if _, err := verifyJWT(issued.Token, testLiveKitSecret); err != nil {
+		t.Fatalf("issued LiveKit credential does not verify: %v", err)
+	}
+
+	if !prematureLogout {
+		select {
+		case <-logoutDone:
+		case <-ctx.Done():
+			t.Fatal("logout did not complete after token issuance")
+		}
+	}
+	if logoutResponse.Code != http.StatusNoContent {
+		t.Fatalf("logout status = %d, body = %s", logoutResponse.Code, logoutResponse.Body.String())
+	}
+	if prematureLogout {
+		t.Fatal("logout returned before the in-flight LiveKit credential was issued")
+	}
+	if _, err := sessions.VerifySession(ctx, signedSession); err == nil {
+		t.Fatal("logout left the browser session valid")
 	}
 }
 
