@@ -69,12 +69,15 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
 	mux.HandleFunc("POST /messaging/places/{place_id}/duplicate", s.serveDuplicatePlace)
+	mux.HandleFunc("GET /messaging/places/{place_id}/threads", s.serveThreads)
+	mux.HandleFunc("POST /messaging/places/{place_id}/threads", s.serveCreateThread)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("GET /messaging/search", s.serveSearch)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}/messages/{message_id}", s.serveEdit)
 	mux.HandleFunc("DELETE /messaging/places/{place_id}/messages/{message_id}", s.serveDelete)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reactions", s.serveToggleReaction)
+	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/poll/vote", s.serveVotePoll)
 	mux.HandleFunc("PUT /messaging/places/{place_id}/read-through", s.serveReadThrough)
 	mux.HandleFunc("POST /messaging/attachments", s.serveUploadAttachment)
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
@@ -138,18 +141,81 @@ func participantsToWire(refs []ParticipantRef) []participantWire {
 	return out
 }
 
-// placeWire matches the frozen PlaceRef shape from contracts/agent-events.yaml.
+// placeWire matches the frozen PlaceRef shape from contracts/agent-events.yaml,
+// extended with the thread kind (migration 0018). Consumers that do not know
+// `thread` fail closed on the unknown kind, exactly as they must for any future
+// kind, so the frozen shape is not reinterpreted.
 type placeWire struct {
 	Kind      string `json:"kind"`
 	ChannelID string `json:"channel_id,omitempty"`
 	DMID      string `json:"dm_id,omitempty"`
+	ThreadID  string `json:"thread_id,omitempty"`
 }
 
 func placeToWire(p Place) placeWire {
-	if p.Kind == PlaceChannel {
+	switch p.Kind {
+	case PlaceChannel:
 		return placeWire{Kind: p.Kind, ChannelID: p.PlaceID}
+	case PlaceThread:
+		return placeWire{Kind: p.Kind, ThreadID: p.PlaceID}
+	default:
+		return placeWire{Kind: p.Kind, DMID: p.PlaceID}
 	}
-	return placeWire{Kind: p.Kind, DMID: p.PlaceID}
+}
+
+// placeIDOf reads the identifier out of a client-sent place reference without
+// caring which kind field carried it.
+func (p placeWire) placeID() string {
+	switch {
+	case p.ChannelID != "":
+		return p.ChannelID
+	case p.DMID != "":
+		return p.DMID
+	default:
+		return p.ThreadID
+	}
+}
+
+// threadWire is a thread place plus what a list of threads renders: how much
+// was said, when, and who is in it.
+type threadWire struct {
+	ThreadID        string            `json:"thread_id"`
+	ParentPlace     placeWire         `json:"parent_place"`
+	ParentMessageID *string           `json:"parent_message_id"`
+	WorkspaceID     string            `json:"workspace_id"`
+	Name            string            `json:"name"`
+	MessageCount    int64             `json:"message_count"`
+	LastMessageAt   *time.Time        `json:"last_message_at"`
+	LastMessage     string            `json:"last_message"`
+	Participants    []participantWire `json:"participants"`
+	LatestSeq       int64             `json:"latest_seq"`
+}
+
+func threadToWire(t Thread) threadWire {
+	wire := threadWire{
+		ThreadID:      t.Place.PlaceID,
+		ParentPlace:   placeToWire(Place{PlaceID: t.ParentPlaceID, Kind: PlaceChannel}),
+		WorkspaceID:   t.Place.WorkspaceID,
+		Name:          t.Place.Name,
+		MessageCount:  t.MessageCount,
+		LastMessageAt: t.LastMessageAt,
+		LastMessage:   t.LastMessagePreview,
+		Participants:  participantsToWire(t.Participants),
+		LatestSeq:     t.Place.LastSeq,
+	}
+	if t.ParentMessageID != "" {
+		origin := t.ParentMessageID
+		wire.ParentMessageID = &origin
+	}
+	return wire
+}
+
+func threadsToWire(threads []Thread) []threadWire {
+	out := make([]threadWire, len(threads))
+	for i, thread := range threads {
+		out[i] = threadToWire(thread)
+	}
+	return out
 }
 
 // attachmentWire is the file a message carries. The bytes are fetched from
@@ -196,11 +262,70 @@ type messageWire struct {
 	Attachments []attachmentWire  `json:"attachments"`
 	Urgency     string            `json:"urgency"`
 	Reactions   []reactionWire    `json:"reactions"`
-	ReplyTo     *string           `json:"reply_to"`
-	ClientNonce string            `json:"client_nonce"`
-	CreatedAt   time.Time         `json:"created_at"`
-	EditedAt    *time.Time        `json:"edited_at"`
-	Deleted     bool              `json:"deleted"`
+	// Poll is absent on the wire unless the message asks a question.
+	Poll        *pollWire  `json:"poll,omitempty"`
+	ReplyTo     *string    `json:"reply_to"`
+	ClientNonce string     `json:"client_nonce"`
+	CreatedAt   time.Time  `json:"created_at"`
+	EditedAt    *time.Time `json:"edited_at"`
+	Deleted     bool       `json:"deleted"`
+}
+
+// pollOptionWire is one choice and who currently picks it. Voters travel for
+// the same reason reaction participants do: a shared decision is not a secret
+// ballot, and the counts are derived from the same list the UI highlights.
+type pollOptionWire struct {
+	OptionID string            `json:"option_id"`
+	Text     string            `json:"text"`
+	Voters   []participantWire `json:"voters"`
+}
+
+type pollWire struct {
+	Question   string           `json:"question"`
+	AllowMulti bool             `json:"allow_multi"`
+	ClosesAt   *time.Time       `json:"closes_at"`
+	Options    []pollOptionWire `json:"options"`
+}
+
+func pollToWire(poll *Poll) *pollWire {
+	if poll == nil {
+		return nil
+	}
+	options := make([]pollOptionWire, len(poll.Options))
+	for i, option := range poll.Options {
+		options[i] = pollOptionWire{
+			OptionID: option.OptionID,
+			Text:     option.Text,
+			Voters:   participantsToWire(option.Voters),
+		}
+	}
+	return &pollWire{
+		Question:   poll.Question,
+		AllowMulti: poll.AllowMulti,
+		ClosesAt:   poll.ClosesAt,
+		Options:    options,
+	}
+}
+
+// pollRequestWire is a poll as a sender states it. Option identity is minted
+// server-side, so this shape carries texts only.
+type pollRequestWire struct {
+	Question   string     `json:"question"`
+	AllowMulti bool       `json:"allow_multi"`
+	ClosesAt   *time.Time `json:"closes_at"`
+	Options    []string   `json:"options"`
+}
+
+func (w *pollRequestWire) input() *PollInput {
+	if w == nil {
+		return nil
+	}
+	return &PollInput{
+		Question:   w.Question,
+		AllowMulti: w.AllowMulti,
+		ClosesAt:   w.ClosesAt,
+		Options:    w.Options,
+	}
 }
 
 // reactionWire matches the web model's ReactionSummary.
@@ -231,6 +356,7 @@ func messageToWire(place Place, m Message) messageWire {
 		Attachments: attachmentsToWire(m.Attachments),
 		Urgency:     m.Urgency,
 		Reactions:   reactionsToWire(m.Reactions),
+		Poll:        pollToWire(m.Poll),
 		ClientNonce: m.ClientNonce,
 		CreatedAt:   m.CreatedAt,
 		EditedAt:    m.EditedAt,
@@ -653,6 +779,11 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			channels = append(channels, channelToWire(sum.Place))
 			continue
 		}
+		// A thread's identity travels in `threads` (it needs its parent), and
+		// its members are the parent channel's — already added above.
+		if sum.Place.Kind == PlaceThread {
+			continue
+		}
 		profiles, err := s.Store.ActiveMembers(ctx, sum.Place.PlaceID, viewer)
 		if err != nil {
 			writeStoreError(w, err)
@@ -701,12 +832,21 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	// Threads the viewer has joined. They are places like any other, but the
+	// client needs the parent relation to place them under their channel
+	// instead of listing them beside it.
+	threads, err := s.Store.ThreadsFor(ctx, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, struct {
 		Self                participantWire         `json:"self"`
 		Workspaces          []workspaceWire         `json:"workspaces"`
 		Channels            []channelWire           `json:"channels"`
 		DMs                 []dmWire                `json:"dms"`
+		Threads             []threadWire            `json:"threads"`
 		Members             []memberWire            `json:"members"`
 		Statuses            []statusWire            `json:"statuses"`
 		ReadMarkers         []readMarkerWire        `json:"read_markers"`
@@ -718,6 +858,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		Workspaces:          workspaceWires,
 		Channels:            channels,
 		DMs:                 dms,
+		Threads:             threadsToWire(threads),
 		Members:             members,
 		Statuses:            statusWires,
 		ReadMarkers:         readMarkers,
@@ -931,6 +1072,64 @@ func (s *Server) serveCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, wire)
 }
 
+// serveThreads lists the side conversations under a channel. Every member of
+// the parent sees all of them: a thread keeps a tangent out of the main flow,
+// it does not hide it.
+func (s *Server) serveThreads(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	threads, err := s.Store.ThreadsIn(r.Context(), r.PathValue("place_id"), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Threads []threadWire `json:"threads"`
+	}{Threads: threadsToWire(threads)})
+}
+
+// serveCreateThread opens a thread under a channel, optionally anchored to the
+// message it grew out of. The same store call backs the agent tool path.
+func (s *Server) serveCreateThread(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		// Empty means the thread starts from nothing said yet.
+		ParentMessageID string `json:"parent_message_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" || utf8.RuneCountInString(req.Name) > MaxThreadNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	var thread Thread
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		thread, opErr = s.Store.CreateThread(
+			r.Context(), r.PathValue("place_id"), req.Name, req.ParentMessageID, viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := threadToWire(thread)
+	s.Hub.Publish(r.Context(), Event{
+		Type: EventPlaceCreated, PlaceID: thread.ParentPlaceID, Thread: &wire,
+	})
+	writeJSON(w, http.StatusCreated, wire)
+}
+
 func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	viewer, _, ok := s.viewer(w, r)
 	if !ok {
@@ -1054,6 +1253,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		ReplyTo     string   `json:"reply_to"`
 		ClientNonce string   `json:"client_nonce"`
 		Attachments []string `json:"attachments"`
+		// A poll rides on the ordinary send: the question and the message that
+		// asks it commit together, rather than as two events one of which can
+		// be missing (契約: メッセージが投票を運ぶ).
+		Poll *pollRequestWire `json:"poll"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1064,8 +1267,10 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_urgency")
 		return
 	}
-	// Attachments-only messages are legitimate; empty and attachment-less is not.
-	if (req.Content == "" && len(req.Attachments) == 0) || len(req.Content) > MaxContentBytes {
+	// Attachment-only and poll-only messages are legitimate; empty with
+	// nothing attached is not.
+	if (req.Content == "" && len(req.Attachments) == 0 && req.Poll == nil) ||
+		len(req.Content) > MaxContentBytes {
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
@@ -1091,7 +1296,7 @@ func (s *Server) serveSend(w http.ResponseWriter, r *http.Request) {
 		msg, created, opErr = s.Store.AppendMessage(r.Context(), AppendInput{
 			PlaceID: placeID, Author: viewer, Content: req.Content,
 			Urgency: req.Urgency, ReplyTo: req.ReplyTo, ClientNonce: req.ClientNonce,
-			AttachmentIDs: req.Attachments,
+			AttachmentIDs: req.Attachments, Poll: req.Poll.input(),
 		})
 		return opErr
 	})
@@ -1235,6 +1440,48 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	}{Message: wire, Reacted: reacted})
 }
 
+// serveVotePoll restates the viewer's whole choice on one poll. An empty
+// option list withdraws the vote — changing your mind and taking it back are
+// the same act, not two capabilities. The same store call backs the agent
+// tool path (AX: UIだけにある操作を作らない).
+func (s *Server) serveVotePoll(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	placeID := r.PathValue("place_id")
+	var req struct {
+		OptionIDs []string `json:"option_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	place, err := s.Store.PlaceFor(r.Context(), placeID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var msg Message
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		msg, opErr = s.Store.VotePoll(
+			r.Context(), placeID, r.PathValue("message_id"), viewer, req.OptionIDs)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := messageToWire(place, msg)
+	s.Hub.Publish(r.Context(), Event{Type: EventPollUpdated, PlaceID: placeID, Message: &wire})
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: wire})
+}
+
 // serveSetStatus replaces the viewer's own status. There is no route for
 // setting anyone else's: the participant is the authenticated session, never a
 // request field (自己申告のattention — the platform does not observe or
@@ -1329,10 +1576,7 @@ func (s *Server) serveSetNotificationSetting(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "invalid_level")
 			return
 		}
-		placeID := entry.Place.ChannelID
-		if placeID == "" {
-			placeID = entry.Place.DMID
-		}
+		placeID := entry.Place.placeID()
 		if placeID == "" {
 			writeError(w, http.StatusBadRequest, "invalid_place")
 			return
@@ -1820,6 +2064,18 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_a_channel")
 	case errors.Is(err, ErrInvalidChannelName):
 		writeError(w, http.StatusBadRequest, "invalid_name")
+	case errors.Is(err, ErrNotThreadable):
+		writeError(w, http.StatusBadRequest, "not_threadable")
+	case errors.Is(err, ErrThreadExists):
+		writeError(w, http.StatusConflict, "thread_exists")
+	case errors.Is(err, ErrInvalidPoll):
+		writeError(w, http.StatusBadRequest, "invalid_poll")
+	case errors.Is(err, ErrPollNotFound), errors.Is(err, ErrPollOptionNotFound):
+		writeError(w, http.StatusNotFound, "poll_not_found")
+	case errors.Is(err, ErrPollClosed):
+		writeError(w, http.StatusConflict, "poll_closed")
+	case errors.Is(err, ErrPollSingleChoice):
+		writeError(w, http.StatusBadRequest, "poll_single_choice")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

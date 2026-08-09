@@ -83,6 +83,12 @@ func (s *Store) ToggleReaction(ctx context.Context, placeID, messageID string, a
 	if err := s.attachReactions(ctx, messages); err != nil {
 		return Message{}, false, err
 	}
+	// The reaction event carries the whole message and live consumers replace
+	// their copy with it, so a poll on the message must ride along or reacting
+	// would erase the question.
+	if err := s.attachPolls(ctx, messages); err != nil {
+		return Message{}, false, err
+	}
 	return messages[0], reacted, nil
 }
 

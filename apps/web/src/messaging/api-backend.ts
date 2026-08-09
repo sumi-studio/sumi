@@ -7,6 +7,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
   MessageSearchResult,
   MessagingBackend,
   NotificationLevel,
@@ -17,6 +18,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  PollOption,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -24,13 +26,21 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
 } from "./model";
-import { MAX_SEQ, parsePlaceKey } from "./model";
+import { MAX_SEQ, parsePlaceKey, placeId } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 /** アップロードは最大20MiBを運ぶため、通常のRESTより長い猶予を与える。 */
 const UPLOAD_TIMEOUT_MS = 120_000;
+const INITIAL_RECONNECT_DELAY_MS = 250;
+const MAX_RECONNECT_DELAY_MS = 5_000;
+
+type CatchUpListener = (
+  place: Place,
+  latestSeq: number,
+) => void | Promise<void>;
 
 export class MessagingAPIError extends Error {
   readonly code: string;
@@ -51,16 +61,23 @@ export class ApiMessagingBackend implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
     (state: ConnectionState) => void
   >();
+  private readonly catchUpListeners = new Set<CatchUpListener>();
   private readonly cursors = new Map<string, number>();
   private readonly places = new Map<string, Place>();
+  private catchingUpPlaces = new Set<string>();
+  private bufferedPollUpdates = new Map<string, ServerEvent[]>();
+  private readonly reconciliationRetryDelays = new Map<string, number>();
   private socket: WebSocket | null = null;
+  private socketGeneration = 0;
   private reconnectTimer: number | null = null;
-  private reconnectDelay = 250;
+  private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   private stopped = false;
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
@@ -77,6 +94,9 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
     const dms: DmSummary[] = asArray(body.dms).map((entry) =>
       this.registerDm(entry),
+    );
+    const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
+      this.registerThread(entry),
     );
     const members: MemberProfile[] = asArray(body.members).map((entry) => {
       const value = asRecord(entry);
@@ -119,6 +139,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       workspaces,
       channels,
       dms,
+      threads,
       members,
       statuses,
       readMarkers,
@@ -187,6 +208,30 @@ export class ApiMessagingBackend implements MessagingBackend {
     return this.registerDm(body);
   }
 
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      ),
+    );
+    return asArray(body.threads).map((entry) => this.registerThread(entry));
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    const body = await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(parent))}/threads`,
+      {
+        method: "POST",
+        body: { name, parent_message_id: originMessageId ?? "" },
+      },
+    );
+    return this.registerThread(body);
+  }
+
   async updateChannel(
     channelId: string,
     input: { name?: string; topic?: string },
@@ -228,6 +273,21 @@ export class ApiMessagingBackend implements MessagingBackend {
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
             attachments: input.attachments,
+            // 問いを立てない送信にpollは載せない。ほとんどのメッセージが
+            // 運ぶ必要のないnullを、毎回wireに置かないため。
+            ...(input.poll
+              ? {
+                  poll: {
+                    question: input.poll.question,
+                    allow_multi: input.poll.allowMulti,
+                    closes_at:
+                      input.poll.closesAt === null
+                        ? null
+                        : new Date(input.poll.closesAt).toISOString(),
+                    options: input.poll.options,
+                  },
+                }
+              : {}),
           },
         },
       ),
@@ -351,6 +411,17 @@ export class ApiMessagingBackend implements MessagingBackend {
     );
   }
 
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<void> {
+    await this.request(
+      `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/poll/vote`,
+      { method: "POST", body: { option_ids: optionIds } },
+    );
+  }
+
   /** PUTは全置換。クライアントは常に現在値を持っているので差分は要らない。 */
   async setNotificationSetting(input: NotificationSettingInput): Promise<void> {
     await this.request("/messaging/notification-settings", {
@@ -398,9 +469,20 @@ export class ApiMessagingBackend implements MessagingBackend {
     return () => this.connectionListeners.delete(listener);
   }
 
+  /**
+   * A place boundary after durable replay has finished. Poll votes do not move
+   * the replay cursor, so callers use this boundary to refresh loaded polls
+   * from REST before queued live poll updates become visible.
+   */
+  subscribeCatchUp(listener: CatchUpListener): () => void {
+    this.catchUpListeners.add(listener);
+    return () => this.catchUpListeners.delete(listener);
+  }
+
   dispose(): void {
     this.listeners.clear();
     this.connectionListeners.clear();
+    this.catchUpListeners.clear();
     this.stopSocket();
   }
 
@@ -414,6 +496,12 @@ export class ApiMessagingBackend implements MessagingBackend {
       return;
     }
     this.emitConnection("reconnecting");
+    const generation = ++this.socketGeneration;
+    this.catchingUpPlaces =
+      this.catchUpListeners.size > 0
+        ? new Set(this.cursors.keys())
+        : new Set<string>();
+    this.bufferedPollUpdates.clear();
     const url = new URL("/messaging/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
@@ -430,7 +518,10 @@ export class ApiMessagingBackend implements MessagingBackend {
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
       try {
-        this.handleFrame(asRecord(JSON.parse(event.data) as unknown));
+        this.handleFrame(
+          asRecord(JSON.parse(event.data) as unknown),
+          generation,
+        );
       } catch {
         socket.close(1002, "invalid messaging frame");
       }
@@ -444,19 +535,33 @@ export class ApiMessagingBackend implements MessagingBackend {
       }
       this.emitConnection("reconnecting");
       const delay = this.reconnectDelay;
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5_000);
+      this.reconnectDelay = Math.min(
+        this.reconnectDelay * 2,
+        MAX_RECONNECT_DELAY_MS,
+      );
       this.reconnectTimer = window.setTimeout(() => this.connect(), delay);
     });
   }
 
-  private handleFrame(frame: Record<string, unknown>): void {
+  private handleFrame(
+    frame: Record<string, unknown>,
+    generation: number,
+  ): void {
     const type = asString(frame.type);
     if (type === "hello_ack") {
-      this.reconnectDelay = 250;
+      this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.emitConnection("connected");
       return;
     }
-    if (type === "caught_up" || type === "receipt") return;
+    if (type === "caught_up") {
+      void this.finishCatchUp(
+        asString(frame.place_id),
+        asSeq(frame.latest_seq),
+        generation,
+      );
+      return;
+    }
+    if (type === "receipt") return;
     if (type === "error") throw new Error("messaging socket error");
     if (type !== "event") throw new Error("unknown messaging frame");
     const wire = asRecord(frame.event);
@@ -474,9 +579,12 @@ export class ApiMessagingBackend implements MessagingBackend {
       const message = parseMessage(wire.message);
       this.cursors.set(placeID(message.place), message.seq);
       parsed = { type: eventType, message };
-    } else if (eventType === "reaction_updated") {
-      // A reaction can target a message older than the replay cursor, so it
-      // must never move the cursor (backwards or at all).
+    } else if (
+      eventType === "reaction_updated" ||
+      eventType === "poll_updated"
+    ) {
+      // A reaction or a vote can target a message older than the replay
+      // cursor, so it must never move the cursor (backwards or at all).
       parsed = { type: eventType, message: parseMessage(wire.message) };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
@@ -504,13 +612,19 @@ export class ApiMessagingBackend implements MessagingBackend {
         participant: parseParticipant(wire.actor),
       };
     } else if (eventType === "place_created") {
-      parsed =
-        wire.channel === undefined || wire.channel === null
-          ? { type: "place_created", dm: this.registerDm(wire.dm) }
-          : {
-              type: "place_created",
-              channel: this.registerChannel(wire.channel),
-            };
+      if (wire.channel != null) {
+        parsed = {
+          type: "place_created",
+          channel: this.registerChannel(wire.channel),
+        };
+      } else if (wire.thread != null) {
+        parsed = {
+          type: "place_created",
+          thread: this.registerThread(wire.thread),
+        };
+      } else {
+        parsed = { type: "place_created", dm: this.registerDm(wire.dm) };
+      }
     } else if (eventType === "place_updated") {
       parsed = {
         type: "place_updated",
@@ -522,7 +636,64 @@ export class ApiMessagingBackend implements MessagingBackend {
     } else {
       return;
     }
-    for (const listener of this.listeners) listener(parsed);
+    if (parsed.type === "poll_updated") {
+      const id = placeID(parsed.message.place);
+      if (this.catchingUpPlaces.has(id)) {
+        const buffered = this.bufferedPollUpdates.get(id) ?? [];
+        buffered.push(parsed);
+        this.bufferedPollUpdates.set(id, buffered);
+        return;
+      }
+    }
+    this.emitEvent(parsed);
+  }
+
+  private async finishCatchUp(
+    id: string,
+    latestSeq: number,
+    generation: number,
+  ): Promise<void> {
+    if (
+      generation !== this.socketGeneration ||
+      !this.catchingUpPlaces.has(id)
+    ) {
+      return;
+    }
+    const place = this.places.get(id);
+    let reconciliationFailed = false;
+    if (place) {
+      const results = await Promise.allSettled(
+        [...this.catchUpListeners].map((listener) =>
+          Promise.resolve().then(() => listener(place, latestSeq)),
+        ),
+      );
+      reconciliationFailed = results.some(
+        (result) => result.status === "rejected",
+      );
+    }
+    if (generation !== this.socketGeneration) return;
+    if (reconciliationFailed) {
+      // A failed authoritative refresh must not be treated as caught up. A
+      // fresh socket retries the same place boundary and its REST reconcile.
+      const retryDelay =
+        this.reconciliationRetryDelays.get(id) ?? INITIAL_RECONNECT_DELAY_MS;
+      this.reconnectDelay = Math.max(this.reconnectDelay, retryDelay);
+      this.reconciliationRetryDelays.set(
+        id,
+        Math.min(retryDelay * 2, MAX_RECONNECT_DELAY_MS),
+      );
+      this.socket?.close(1012, "catch-up reconciliation failed");
+      return;
+    }
+    this.reconciliationRetryDelays.delete(id);
+    this.catchingUpPlaces.delete(id);
+    const buffered = this.bufferedPollUpdates.get(id) ?? [];
+    this.bufferedPollUpdates.delete(id);
+    for (const event of buffered) this.emitEvent(event);
+  }
+
+  private emitEvent(event: ServerEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 
   /** Parses a channel wire shape and remembers the place for event routing. */
@@ -544,6 +715,32 @@ export class ApiMessagingBackend implements MessagingBackend {
     return channel;
   }
 
+  /** Parses a thread wire shape and remembers the place for event routing. */
+  private registerThread(value: unknown): ThreadSummary {
+    const wire = asRecord(value);
+    const thread: ThreadSummary = {
+      threadId: asString(wire.thread_id),
+      parentPlace: parsePlace(wire.parent_place),
+      parentMessageId:
+        wire.parent_message_id == null
+          ? null
+          : asString(wire.parent_message_id),
+      name: asString(wire.name),
+      messageCount: asSeq(wire.message_count),
+      lastMessageAt:
+        wire.last_message_at == null ? null : asTimestamp(wire.last_message_at),
+      lastMessage:
+        typeof wire.last_message === "string" ? wire.last_message : "",
+      participants: asArray(wire.participants).map(parseParticipant),
+      latestSeq: asSeq(wire.latest_seq),
+    };
+    this.places.set(thread.threadId, {
+      kind: "thread",
+      threadId: thread.threadId,
+    });
+    return thread;
+  }
+
   /** Parses a dm wire shape and remembers the place for event routing. */
   private registerDm(value: unknown): DmSummary {
     const wire = asRecord(value);
@@ -558,6 +755,10 @@ export class ApiMessagingBackend implements MessagingBackend {
 
   private stopSocket(): void {
     this.stopped = true;
+    this.socketGeneration += 1;
+    this.catchingUpPlaces.clear();
+    this.bufferedPollUpdates.clear();
+    this.reconciliationRetryDelays.clear();
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.socket?.close(1000, "unsubscribed");
@@ -603,13 +804,17 @@ export class ApiMessagingBackend implements MessagingBackend {
 }
 
 function placeID(place: Place): string {
-  return place.kind === "channel" ? place.channelId : place.dmId;
+  return placeId(place);
 }
 
 function placeToWire(place: Place): Record<string, string> {
-  return place.kind === "channel"
-    ? { kind: place.kind, channel_id: place.channelId }
-    : { kind: place.kind, dm_id: place.dmId };
+  if (place.kind === "channel") {
+    return { kind: place.kind, channel_id: place.channelId };
+  }
+  if (place.kind === "thread") {
+    return { kind: place.kind, thread_id: place.threadId };
+  }
+  return { kind: place.kind, dm_id: place.dmId };
 }
 
 function parseNotify(value: unknown): { reason: NotifyReason } | null {
@@ -720,6 +925,9 @@ function parsePlace(value: unknown): Place {
   if (kind === "channel") {
     return { kind, channelId: asString(wire.channel_id) };
   }
+  if (kind === "thread") {
+    return { kind, threadId: asString(wire.thread_id) };
+  }
   if (kind === "dm" || kind === "group_dm") {
     return { kind, dmId: asString(wire.dm_id) };
   }
@@ -744,6 +952,26 @@ function parseAttachment(value: unknown): Attachment {
   };
 }
 
+function parsePollOption(value: unknown): PollOption {
+  const wire = asRecord(value);
+  return {
+    optionId: asString(wire.option_id),
+    text: asString(wire.text),
+    voters: asArray(wire.voters).map(parseParticipant),
+  };
+}
+
+function parsePoll(value: unknown): MessagePoll | null {
+  if (value == null) return null;
+  const wire = asRecord(value);
+  return {
+    question: asString(wire.question),
+    allowMulti: asBoolean(wire.allow_multi),
+    closesAt: wire.closes_at == null ? null : asTimestamp(wire.closes_at),
+    options: asArray(wire.options).map(parsePollOption),
+  };
+}
+
 function parseMessage(value: unknown): Message {
   const wire = asRecord(value);
   return {
@@ -756,6 +984,7 @@ function parseMessage(value: unknown): Message {
     urgency: asUrgency(wire.urgency),
     reactions: asArray(wire.reactions).map(parseReaction),
     attachments: asArray(wire.attachments ?? []).map(parseAttachment),
+    poll: parsePoll(wire.poll ?? null),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,

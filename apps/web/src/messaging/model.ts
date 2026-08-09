@@ -29,18 +29,26 @@ export function sameParticipant(a: ParticipantRef, b: ParticipantRef): boolean {
   return participantKey(a) === participantKey(b);
 }
 
+/**
+ * 会話の起きる場所。threadは新種の入れ物ではなくplaceの一種——seq・冪等送信・
+ * tombstone・既読・通知が既存の仕組みのまま効く（migration 0018）。
+ */
 export type Place =
   | { kind: "channel"; channelId: string }
   | { kind: "dm"; dmId: string }
-  | { kind: "group_dm"; dmId: string };
+  | { kind: "group_dm"; dmId: string }
+  | { kind: "thread"; threadId: string };
 
-/** Stable map key for a place: `channel:<id>` / `dm:<id>` / `group_dm:<id>`. */
+/**
+ * Stable map key for a place:
+ * `channel:<id>` / `dm:<id>` / `group_dm:<id>` / `thread:<id>`.
+ */
 export type PlaceKey = string;
 
 export function placeKey(place: Place): PlaceKey {
-  return place.kind === "channel"
-    ? `channel:${place.channelId}`
-    : `${place.kind}:${place.dmId}`;
+  if (place.kind === "channel") return `channel:${place.channelId}`;
+  if (place.kind === "thread") return `thread:${place.threadId}`;
+  return `${place.kind}:${place.dmId}`;
 }
 
 export function parsePlaceKey(key: PlaceKey): Place | null {
@@ -50,8 +58,16 @@ export function parsePlaceKey(key: PlaceKey): Place | null {
   const id = key.slice(separator + 1);
   if (!id) return null;
   if (kind === "channel") return { kind, channelId: id };
+  if (kind === "thread") return { kind, threadId: id };
   if (kind === "dm" || kind === "group_dm") return { kind, dmId: id };
   return null;
+}
+
+/** placeの識別子。kindごとのフィールド名の違いを呼び出し側に漏らさない。 */
+export function placeId(place: Place): string {
+  if (place.kind === "channel") return place.channelId;
+  if (place.kind === "thread") return place.threadId;
+  return place.dmId;
 }
 
 /**
@@ -123,6 +139,53 @@ export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 /** 1メッセージに添付できる件数の上限。サーバーの上限と同値。 */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
+/**
+ * 投票の選択肢。誰が入れたかはreactionと同じく見える（v0に匿名投票はない）。
+ * 票数はvotersの数から導く——別に数を持つと二つの真実ができる。
+ */
+export interface PollOption {
+  optionId: string;
+  text: string;
+  voters: ParticipantRef[];
+}
+
+/**
+ * メッセージが運ぶ問い。投票は別の入れ物ではなくメッセージの付属物で、
+ * 発言と一緒にcommitされ、発言が消えれば票ごと消える。
+ */
+export interface MessagePoll {
+  question: string;
+  /** 複数選択可。falseなら「同一投票に1票」をサーバーが強制する。 */
+  allowMulti: boolean;
+  /** 締切。nullは締切なし。過ぎたら結果だけが見える。 */
+  closesAt: number | null;
+  options: PollOption[];
+}
+
+/** 送信時に述べる投票。選択肢のidはサーバーが採番するのでtextだけを運ぶ。 */
+export interface PollInput {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  options: string[];
+}
+
+/** 投票の上限。サーバーのMinPollOptions/MaxPollOptionsと同値。 */
+export const MIN_POLL_OPTIONS = 2;
+export const MAX_POLL_OPTIONS = 10;
+
+/** 締切を過ぎた投票は結果だけ。押せるものが残っていると嘘になる。 */
+export function isPollClosed(poll: MessagePoll, now: number): boolean {
+  return poll.closesAt !== null && now >= poll.closesAt;
+}
+
+export function pollVoteCount(poll: MessagePoll): number {
+  return poll.options.reduce(
+    (total, option) => total + option.voters.length,
+    0,
+  );
+}
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -136,6 +199,12 @@ export interface Message {
   reactions: ReactionSummary[];
   /** 送信時に紐付いた添付。tombstoneは何も運ばない。 */
   attachments: Attachment[];
+  /**
+   * 問いを立てているメッセージだけが持つ。省略可にしてあるのは、
+   * Messageを組み立てる側（モック・テスト・楽観的描画）に無関係な
+   * nullを書かせないため。
+   */
+  poll?: MessagePoll | null;
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -167,6 +236,26 @@ export interface DmSummary {
   dmId: string;
   kind: "dm" | "group_dm";
   participants: ParticipantRef[];
+}
+
+/**
+ * チャンネル配下の脇道。閲覧は親チャンネルのメンバー全員、参加者
+ * （= 未読と通知の対象）は書いた人と作成者。サイドバーには並べず、
+ * 親チャンネルのスレッド一覧と起点メッセージのチップから辿る。
+ */
+export interface ThreadSummary {
+  threadId: string;
+  /** 親チャンネル。 */
+  parentPlace: Place;
+  /** 起点メッセージ。nullは「ゼロから作ったスレッド」。 */
+  parentMessageId: string | null;
+  name: string;
+  messageCount: number;
+  lastMessageAt: number | null;
+  /** 一覧に出す最新発言の抜粋。全文はplace側にある。 */
+  lastMessage: string;
+  participants: ParticipantRef[];
+  latestSeq: number;
 }
 
 /**
@@ -311,8 +400,15 @@ export type ServerEvent =
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   | { type: "reaction_updated"; message: Message }
+  /** 票の更新。reaction_updatedと同じくmessage全体を運び、seqは進めない。 */
+  | { type: "poll_updated"; message: Message }
   /** placeの誕生。作成者以外のメンバーのサイドバーへ即時に現れる。 */
-  | { type: "place_created"; channel?: ChannelSummary; dm?: DmSummary }
+  | {
+      type: "place_created";
+      channel?: ChannelSummary;
+      dm?: DmSummary;
+      thread?: ThreadSummary;
+    }
   /** channelのmutable属性（v0: topic）の変更。 */
   | { type: "place_updated"; channel: ChannelSummary }
   /**
@@ -330,6 +426,8 @@ export interface SendMessageInput {
   clientNonce: string;
   /** 先にアップロード済みの添付id。自分がアップロードしたものだけ紐付く。 */
   attachments: string[];
+  /** 投票付きの送信。問いと、それを述べる発言は一つの出来事。 */
+  poll?: PollInput | null;
 }
 
 /** mutationのACK。serverが採番したidentityを返し、楽観的描画と照合する。 */
@@ -345,6 +443,8 @@ export interface MessagingCapabilities {
   replyLater: boolean;
   reactions: boolean;
   notifications: boolean;
+  threads: boolean;
+  polls: boolean;
 }
 
 /**
@@ -360,6 +460,8 @@ export interface MessagingBackend {
     workspaces: WorkspaceSummary[];
     channels: ChannelSummary[];
     dms: DmSummary[];
+    /** 自分が参加しているスレッド。未読を持つスレッドを親を開かずに出せる。 */
+    threads: ThreadSummary[];
     members: MemberProfile[];
     statuses: ParticipantStatus[];
     readMarkers: ReadMarker[];
@@ -392,6 +494,18 @@ export interface MessagingBackend {
   /** 相手との唯一のDMを返す。既存があればそれを返し、無ければ作る（EnsureDM）。 */
   ensureDM(participant: ParticipantRef): Promise<DmSummary>;
   createGroupDM(participants: ParticipantRef[]): Promise<DmSummary>;
+  /** 親チャンネル配下のスレッド一覧。可視性はサーバーが強制する。 */
+  fetchThreads(parent: Place): Promise<ThreadSummary[]>;
+  /**
+   * スレッドを開く。originMessageIdを渡すとそのメッセージが起点になり、
+   * 1メッセージにつきスレッドは1本だけ生える。
+   */
+  createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary>;
+
   /**
    * channelのmutableな身元（名前・トピック）を書き換える。省いた項目は
    * そのまま残る——名前を変えただけでトピックが消えては困る。
@@ -439,6 +553,11 @@ export interface MessagingBackend {
   ): Promise<void>;
   resolveReplyLater(markerId: string): Promise<void>;
   toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  /**
+   * 投票の回答を丸ごと置き換える。空配列は取り消し——気が変わることと
+   * 取り下げることを別の道具にしない。
+   */
+  votePoll(place: Place, messageId: string, optionIds: string[]): Promise<void>;
   /** 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。 */
   setNotificationSetting(input: NotificationSettingInput): Promise<void>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */

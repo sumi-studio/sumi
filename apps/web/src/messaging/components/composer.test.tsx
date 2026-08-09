@@ -171,6 +171,9 @@ describe("Composer ＋メニュー", () => {
     expect(
       screen.getByRole("button", { name: /スレッドを作成/ }),
     ).toBeDisabled();
-    expect(screen.getByRole("button", { name: /投票を作成/ })).toBeDisabled();
+    // 投票は実装済み: 品書きから選べる。
+    expect(
+      screen.getByRole("button", { name: /投票を作成/ }),
+    ).toBeEnabled();
   });
 });

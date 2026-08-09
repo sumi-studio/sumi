@@ -8,6 +8,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
   MessageSearchResult,
   MessagingBackend,
   NotificationSetting,
@@ -17,6 +18,7 @@ import type {
   ParticipantStatus,
   Place,
   PlaceKey,
+  PollInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
@@ -24,15 +26,32 @@ import type {
   SendReceipt,
   ServerEvent,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   WorkspaceSummary,
 } from "./model";
 import {
+  isPollClosed,
   parsePlaceKey,
   participantKey,
+  placeId,
   placeKey,
   sameParticipant,
 } from "./model";
+
+/** 述べられた投票を、選択肢idの付いた状態へ起こす（実サーバーの採番役）。 */
+function seedPoll(input: PollInput): MessagePoll {
+  return {
+    question: input.question,
+    allowMulti: input.allowMulti,
+    closesAt: input.closesAt,
+    options: input.options.map((text) => ({
+      optionId: secureRandomUUID(),
+      text,
+      voters: [],
+    })),
+  };
+}
 
 /**
  * インメモリのモックbackend。実API（WS + REST）と同じMessagingBackend境界を
@@ -342,8 +361,12 @@ export class MockMessagingServer implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
+  /** スレッドはplaceの一種。作成されるまで存在しないのでインスタンス側に持つ。 */
+  private readonly threads = new Map<string, ThreadSummary>();
   private readonly history = buildSeedHistory();
   private readonly readMarkers: Map<string, number>;
   private readonly statuses = new Map<string, ParticipantStatus>();
@@ -407,6 +430,7 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES,
       channels: CHANNELS,
       dms: DMS,
+      threads: [...this.threads.values()],
       members: MEMBERS,
       statuses: [...this.statuses.values()],
       readMarkers,
@@ -433,7 +457,9 @@ export class MockMessagingServer implements MessagingBackend {
     );
     const level = override?.level ?? this.notificationSetting.defaults.level;
     if (level === "mute") return null;
-    if (message.place.kind !== "channel") return { reason: "dm" };
+    if (message.place.kind === "dm" || message.place.kind === "group_dm") {
+      return { reason: "dm" };
+    }
     if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
       return { reason: "mention" };
     }
@@ -539,6 +565,44 @@ export class MockMessagingServer implements MessagingBackend {
     return dm;
   }
 
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    const parentKey = placeKey(parent);
+    return [...this.threads.values()].filter(
+      (thread) => placeKey(thread.parentPlace) === parentKey,
+    );
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+  ): Promise<ThreadSummary> {
+    if (parent.kind !== "channel") throw new Error("not threadable");
+    const taken = [...this.threads.values()].some(
+      (thread) =>
+        originMessageId !== null && thread.parentMessageId === originMessageId,
+    );
+    if (taken) throw new Error("thread exists");
+    const thread: ThreadSummary = {
+      threadId: `th-${secureRandomUUID().slice(0, 8)}`,
+      parentPlace: parent,
+      parentMessageId: originMessageId,
+      name,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    this.threads.set(thread.threadId, thread);
+    this.readMarkers.set(
+      placeKey({ kind: "thread", threadId: thread.threadId }),
+      0,
+    );
+    this.emit({ type: "place_created", thread });
+    return thread;
+  }
+
   async updateChannel(
     channelId: string,
     input: { name?: string; topic?: string },
@@ -587,6 +651,7 @@ export class MockMessagingServer implements MessagingBackend {
           urgency: input.urgency,
           replyTo: input.replyTo,
           clientNonce: input.clientNonce,
+          poll: input.poll ? seedPoll(input.poll) : null,
           // 自分がアップロードした未紐付けの添付だけがメッセージに載る。
           attachments: input.attachments.flatMap((attachmentId) => {
             const pending = this.uploads.get(attachmentId);
@@ -776,6 +841,31 @@ export class MockMessagingServer implements MessagingBackend {
     this.applyReaction(place, messageId, SELF, emoji);
   }
 
+  /**
+   * 回答の置き換え。空配列は取り消し。単一選択では最後の1つだけが残る——
+   * 実サーバーが「同一投票に1票」を強制するのと同じ結果になる。
+   */
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<void> {
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const message = messages.find((entry) => entry.messageId === messageId);
+    const poll = message?.poll;
+    if (!message || message.deleted || !poll) return;
+    if (isPollClosed(poll, Date.now())) return;
+    const chosen = poll.allowMulti ? optionIds : optionIds.slice(0, 1);
+    poll.options = poll.options.map((option) => ({
+      ...option,
+      voters: [
+        ...option.voters.filter((ref) => !sameParticipant(ref, SELF)),
+        ...(chosen.includes(option.optionId) ? [SELF] : []),
+      ],
+    }));
+    this.emit({ type: "poll_updated", message: { ...message } });
+  }
+
   /** リアクションのトグル。人間もagentも同じ道具として通る経路。 */
   private applyReaction(
     place: Place,
@@ -840,6 +930,7 @@ export class MockMessagingServer implements MessagingBackend {
     replyTo: string | null;
     clientNonce?: string;
     attachments?: Attachment[];
+    poll?: MessagePoll | null;
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -854,6 +945,7 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: input.urgency,
       reactions: [],
       attachments: input.attachments ?? [],
+      poll: input.poll ?? null,
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
@@ -862,6 +954,21 @@ export class MockMessagingServer implements MessagingBackend {
     };
     messages.push(message);
     this.history.set(key, messages);
+    // スレッドに書くことが参加すること。一覧の件数・最新行・参加者を更新する。
+    if (input.place.kind === "thread") {
+      const thread = this.threads.get(placeId(input.place));
+      if (thread) {
+        thread.messageCount += 1;
+        thread.lastMessageAt = message.createdAt;
+        thread.lastMessage = message.content;
+        thread.latestSeq = message.seq;
+        if (
+          !thread.participants.some((ref) => sameParticipant(ref, input.author))
+        ) {
+          thread.participants = [...thread.participants, input.author];
+        }
+      }
+    }
     return message;
   }
 

@@ -15,12 +15,14 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-        DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, MessagingApi,
-        MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
-        OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
-        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
-        SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+        CreateMessagingChannelRequest, CreateMessagingPollRequest,
+        CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
+        DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
+        ListMessagingThreadsRequest, MessagingApi, MessagingNotificationPlace,
+        MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingPlaceRequest,
+        PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
+        StartMessagingDMRequest, UpdateMessagingChannelRequest, VoteMessagingPollRequest,
         WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
@@ -43,6 +45,14 @@ const MAX_TOPIC_BYTES: usize = 1000;
 // A group dm the agent opens in one gesture. Far beyond any real conversation,
 // tight enough that a malformed argument cannot fan out.
 const MAX_DM_PARTICIPANTS: usize = 32;
+// The server bounds a thread name at 100 characters; four bytes per character
+// covers any UTF-8 within that limit.
+const MAX_THREAD_NAME_BYTES: usize = 400;
+// The server bounds a poll question at 500 characters and an option at 200.
+const MAX_POLL_QUESTION_BYTES: usize = 2000;
+const MAX_POLL_OPTION_BYTES: usize = 800;
+const MIN_POLL_OPTIONS: usize = 2;
+const MAX_POLL_OPTIONS: usize = 10;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
@@ -194,6 +204,37 @@ enum MessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    /// See the side conversations under the place currently in view.
+    Threads {},
+    /// Open a side conversation under the place currently in view, optionally
+    /// growing it out of a message visible there.
+    CreateThread {
+        name: String,
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+    },
+    /// Ask the open place a question everyone can answer.
+    CreatePoll {
+        question: String,
+        options: Vec<String>,
+        #[serde(default)]
+        allow_multi: bool,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        closes_in_minutes: Option<u32>,
+    },
+    /// Answer a poll visible in the open place.  Restating the whole choice is
+    /// the only way to change it; an empty list withdraws the vote.
+    VotePoll {
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
+        option_ids: Vec<String>,
+    },
 }
 
 /// The three notification levels, identical to the ones a Human chooses in the
@@ -310,7 +351,8 @@ fn messaging_parameters_schema() -> Value {
                     "overview", "open", "write", "react",
                     "status", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
-                    "search", "notification_settings", "attention", "get_call_state"
+                    "search", "notification_settings", "attention", "get_call_state",
+                    "threads", "create_thread", "create_poll", "vote_poll"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -326,7 +368,10 @@ fn messaging_parameters_schema() -> Value {
                     "search finds messages you can already see, anywhere; ",
                     "notification_settings reads or changes what is allowed to interrupt you; ",
                     "attention lists what arrived while you were not looking, and why; ",
-                    "get_call_state reports who is currently in a voice or video call."
+                    "get_call_state reports who is currently in a voice or video call; ",
+                    "threads lists the side conversations under the currently open place; ",
+                    "create_thread opens one and moves this view into it; create_poll asks the ",
+                    "open place a question; vote_poll answers one visible there."
                 )
             },
             "place_id": {
@@ -383,7 +428,11 @@ fn messaging_parameters_schema() -> Value {
             },
             "content": {
                 "type": "string",
-                "description": "Required for write and omitted for other actions. Message text to send to the currently open place."
+                "description": concat!(
+                    "Required for write, optional for create_poll, and omitted for other ",
+                    "actions. For write, the message text sent to the currently open place; ",
+                    "for create_poll, a line of your own text shown above the question."
+                )
             },
             "urgency": {
                 "type": "string",
@@ -397,17 +446,67 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "message_id. Provide exactly one of message_id or seq; the message must be ",
-                    "visible in the currently open place."
+                    "For react, reply_later and create_thread, omitted for other actions. The ",
+                    "target message by message_id. react and reply_later need exactly one of ",
+                    "message_id or seq; create_thread takes at most one and starts a thread from ",
+                    "nothing said when both are omitted. The message must be visible in the ",
+                    "currently open place."
                 )
             },
             "seq": {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "its seq in the currently open place. Provide exactly one of message_id or seq."
+                    "For react, reply_later and create_thread, omitted for other actions. The ",
+                    "target message by its seq in the currently open place; provide at most one ",
+                    "of message_id or seq."
+                )
+            },
+            "name": {
+                "type": "string",
+                "description": concat!(
+                    "Required for create_thread and omitted for other actions. The heading of ",
+                    "the side conversation, as others will see it in the thread list."
+                )
+            },
+            "question": {
+                "type": "string",
+                "description": "Required for create_poll and omitted for other actions. What the poll asks."
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 10,
+                "description": concat!(
+                    "Required for create_poll and omitted for other actions. Two to ten distinct ",
+                    "choices, in the order they should be shown."
+                )
+            },
+            "allow_multi": {
+                "type": "boolean",
+                "description": concat!(
+                    "Optional for create_poll and omitted for other actions. When true a voter ",
+                    "may pick several options; when omitted the poll takes one choice each."
+                )
+            },
+            "closes_in_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10080,
+                "description": concat!(
+                    "Optional for create_poll and omitted for other actions. Minutes until the ",
+                    "poll stops accepting votes; when omitted it stays open."
+                )
+            },
+            "option_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+                "description": concat!(
+                    "Required for vote_poll and omitted for other actions. The option_id values ",
+                    "from the poll as the open place shows it. Restate your whole choice: an ",
+                    "empty list withdraws your vote."
                 )
             },
             "emoji": {
@@ -558,7 +657,8 @@ impl Tool for MessagingTool {
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status, or ",
+                "message visible in it. When a tangent deserves its own room, list or ",
+                "open a thread under the place. Declare your own availability with status, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Use search to find something said elsewhere, attention to see what ",
                 "arrived while you were not looking, notification_settings to ",
@@ -768,6 +868,66 @@ impl Tool for MessagingTool {
                 }
                 response
             }
+            MessagingAction::Threads {} => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before listing threads; the list belongs to the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.threads(ListMessagingThreadsRequest {
+                        place_id: &place_id,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::CreateThread {
+                name,
+                message_id,
+                seq,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before creating a thread; the thread hangs under the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                // An origin, when named, must be on this screen — the same rule
+                // react and reply_later follow (ADR 0011 §3).
+                let origin = if message_id.is_some() || seq.is_some() {
+                    Some(visible_target(
+                        &state,
+                        &message_id,
+                        seq,
+                        "start a thread from it",
+                    )?)
+                } else {
+                    None
+                };
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_thread(CreateMessagingThreadRequest {
+                        place_id: &place_id,
+                        name: &name,
+                        parent_message_id: origin.as_ref().map(|target| target.message_id.as_str()),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // Creating a thread takes you into it, exactly as the human UI
+                // navigates to the new place. The screen starts empty.
+                if let Some(thread_id) = response
+                    .get("thread")
+                    .and_then(|thread| thread.get("thread_id"))
+                    .and_then(Value::as_str)
+                {
+                    state.focused_place_id = Some(thread_id.to_owned());
+                    state.pending_read_through = None;
+                    state.visible_messages.clear();
+                }
+                response
+            }
             MessagingAction::CreateChannel {
                 name,
                 topic,
@@ -852,6 +1012,65 @@ impl Tool for MessagingTool {
                         defaults_level: defaults_level.map(notify_level_text),
                         per_place: places,
                         keywords: words,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::CreatePoll {
+                question,
+                options,
+                allow_multi,
+                content,
+                closes_in_minutes,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before creating a poll; the question is asked of the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                let nonce = client_nonce(ctx.flow_id, ctx.call_id);
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_poll(CreateMessagingPollRequest {
+                        place_id: &place_id,
+                        question: &question,
+                        options: &options,
+                        allow_multi,
+                        content: content.as_deref(),
+                        client_nonce: &nonce,
+                        closes_in_minutes,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // Like any message one sends, the poll lands on one's own
+                // screen and can be answered or reacted to straight away.
+                if let Some(message_id) = response.get("message_id").and_then(Value::as_str) {
+                    state.visible_messages.push(VisibleMessage {
+                        message_id: message_id.to_owned(),
+                        seq: response.get("seq").and_then(Value::as_u64),
+                    });
+                }
+                response
+            }
+            MessagingAction::VotePoll {
+                message_id,
+                seq,
+                option_ids,
+            } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before voting; a poll is answered where it is shown"
+                            .to_owned(),
+                    )
+                })?;
+                let target = visible_target(&state, &message_id, seq, "vote on it")?;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.vote_poll(VoteMessagingPollRequest {
+                        place_id: &place_id,
+                        message_id: &target.message_id,
+                        option_ids: &option_ids,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?
@@ -1078,6 +1297,68 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Threads {} => Ok(()),
+        MessagingAction::CreatePoll {
+            question,
+            options,
+            content,
+            closes_in_minutes,
+            ..
+        } => {
+            validate_bounded_nonempty(question, MAX_POLL_QUESTION_BYTES)?;
+            if !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&options.len()) {
+                return Err(ToolError::InvalidArguments);
+            }
+            for option in options {
+                validate_bounded_nonempty(option, MAX_POLL_OPTION_BYTES)?;
+            }
+            // Two identical choices cannot be told apart by a voter.
+            for (index, option) in options.iter().enumerate() {
+                if options[index + 1..].contains(option) {
+                    return Err(ToolError::InvalidArguments);
+                }
+            }
+            validate_optional_note(content, MAX_CONTENT_BYTES)?;
+            validate_relative_minutes(closes_in_minutes)
+        }
+        MessagingAction::VotePoll {
+            message_id,
+            seq,
+            option_ids,
+        } => {
+            validate_visible_selector(message_id, seq)?;
+            // An empty list is a withdrawal, not a malformed vote.
+            if option_ids.len() > MAX_POLL_OPTIONS {
+                return Err(ToolError::InvalidArguments);
+            }
+            for option_id in option_ids {
+                validate_bounded_nonempty(option_id, MAX_MESSAGE_ID_BYTES)?;
+            }
+            Ok(())
+        }
+        MessagingAction::CreateThread {
+            name,
+            message_id,
+            seq,
+        } => {
+            validate_bounded_nonempty(name, MAX_THREAD_NAME_BYTES)?;
+            // Unlike react, an origin is optional here: a thread may start
+            // from a message or from nothing said yet. Naming both selectors
+            // is still ambiguous.
+            if message_id.is_some() && seq.is_some() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if seq == &Some(0) {
+                return Err(ToolError::InvalidArguments);
+            }
+            if message_id
+                .as_deref()
+                .is_some_and(|id| validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1271,6 +1552,9 @@ mod tests {
         searches: AsyncMutex<Vec<(String, Option<String>, Option<u16>)>>,
         notifications: AsyncMutex<Vec<(Option<String>, usize, Vec<String>)>>,
         attentions: AsyncMutex<Vec<(Option<u64>, Option<u16>)>>,
+        threads: AsyncMutex<Vec<(String, String, Option<String>)>>,
+        polls: AsyncMutex<Vec<(String, String, Vec<String>, bool)>>,
+        votes: AsyncMutex<Vec<(String, String, Vec<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -1452,6 +1736,63 @@ mod tests {
             }))
         }
 
+        async fn threads(&self, request: ListMessagingThreadsRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("threads:{}", request.place_id));
+            Ok(json!({"threads": []}))
+        }
+
+        async fn create_thread(&self, request: CreateMessagingThreadRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_thread:{}", request.place_id));
+            self.threads.lock().await.push((
+                request.place_id.to_owned(),
+                request.name.to_owned(),
+                request.parent_message_id.map(str::to_owned),
+            ));
+            Ok(json!({
+                "thread": {
+                    "thread_id": "th-1",
+                    "name": request.name,
+                    "parent_place": {"kind": "channel", "channel_id": request.place_id},
+                    "parent_message_id": request.parent_message_id,
+                    "message_count": 0,
+                    "participants": []
+                }
+            }))
+        }
+
+        async fn create_poll(&self, request: CreateMessagingPollRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_poll:{}", request.place_id));
+            self.polls.lock().await.push((
+                request.place_id.to_owned(),
+                request.question.to_owned(),
+                request.options.to_vec(),
+                request.allow_multi,
+            ));
+            Ok(json!({"message_id": "m9", "seq": 9}))
+        }
+
+        async fn vote_poll(&self, request: VoteMessagingPollRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("vote_poll:{}", request.message_id));
+            self.votes.lock().await.push((
+                request.place_id.to_owned(),
+                request.message_id.to_owned(),
+                request.option_ids.to_vec(),
+            ));
+            Ok(json!({"message": {"message_id": request.message_id}}))
+        }
+
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
             if self.failures.lock().await.pop_front() == Some("read") {
                 return Err(anyhow!("read failed"));
@@ -1618,7 +1959,11 @@ mod tests {
                 "search",
                 "notification_settings",
                 "attention",
-                "get_call_state"
+                "get_call_state",
+                "threads",
+                "create_thread",
+                "create_poll",
+                "vote_poll"
             ])
         );
         assert_eq!(
@@ -1653,6 +1998,12 @@ mod tests {
             schema["properties"]["participants"]["items"]["properties"]["kind"]["enum"],
             json!(["human", "personality_agent"])
         );
+        assert_eq!(schema["properties"]["question"]["type"], "string");
+        assert_eq!(schema["properties"]["options"]["minItems"], 2);
+        assert_eq!(schema["properties"]["options"]["maxItems"], 10);
+        assert_eq!(schema["properties"]["allow_multi"]["type"], "boolean");
+        assert_eq!(schema["properties"]["option_ids"]["type"], "array");
+        assert_eq!(schema["properties"]["closes_in_minutes"]["minimum"], 1);
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -1662,7 +2013,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            25
+            30
         );
     }
 
@@ -2310,6 +2661,217 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.channels.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn threads_need_an_open_place_and_creation_moves_the_view_into_it() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // A thread hangs under a place, so both actions need one in view.
+        for arguments in [
+            json!({"action": "threads"}),
+            json!({"action": "create_thread", "name": "認証リダイレクトの件"}),
+        ] {
+            let error = execute(&tool, arguments, "no-place").await.unwrap_err();
+            assert!(matches!(error, ToolError::Protocol(_)));
+        }
+        assert!(api.threads.lock().await.is_empty());
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(&tool, json!({"action": "threads"}), "list")
+            .await
+            .unwrap();
+        execute(
+            &tool,
+            json!({"action": "create_thread", "name": "認証リダイレクトの件", "seq": 7}),
+            "create",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.threads.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "認証リダイレクトの件".to_owned(),
+                Some("m7".to_owned())
+            )]
+        );
+
+        // Creating moved the view into the new thread: the next write lands
+        // there, and the parent's screen is no longer what can be acted on.
+        execute(
+            &tool,
+            json!({"action": "write", "content": "続きはこちらで"}),
+            "write",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "th-1");
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn create_thread_rejects_missing_names_and_unseen_or_ambiguous_origins() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        for arguments in [
+            json!({"action": "create_thread"}),
+            json!({"action": "create_thread", "name": ""}),
+            json!({"action": "create_thread", "name": "x", "message_id": "m7", "seq": 7}),
+            json!({"action": "create_thread", "name": "x", "seq": 0}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        // A message off the screen cannot become an origin (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "create_thread", "name": "x", "message_id": "m404"}),
+            "missing",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+        assert!(api.threads.lock().await.is_empty());
+
+        // Without an origin the thread simply starts from nothing said yet.
+        execute(
+            &tool,
+            json!({"action": "create_thread", "name": "来週の段取り"}),
+            "scratch",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.threads.lock().await[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn polls_are_asked_of_the_open_place_and_answered_where_they_are_shown() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // Both acts belong to a place in view.
+        for arguments in [
+            json!({"action": "create_poll", "question": "いつ出す？", "options": ["今日", "明日"]}),
+            json!({"action": "vote_poll", "seq": 7, "option_ids": ["o1"]}),
+        ] {
+            let error = execute(&tool, arguments, "no-place").await.unwrap_err();
+            assert!(matches!(error, ToolError::Protocol(_)));
+        }
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "create_poll", "question": "いつ出す？",
+                   "options": ["今日", "明日"], "allow_multi": true}),
+            "poll",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.polls.lock().await.as_slice(),
+            &[(
+                "general".to_owned(),
+                "いつ出す？".to_owned(),
+                vec!["今日".to_owned(), "明日".to_owned()],
+                true
+            )]
+        );
+
+        // One's own poll lands on one's own screen and can be answered at once.
+        execute(
+            &tool,
+            json!({"action": "vote_poll", "seq": 9, "option_ids": ["o1"]}),
+            "vote",
+        )
+        .await
+        .unwrap();
+        // An empty list is a withdrawal, not a malformed vote.
+        execute(
+            &tool,
+            json!({"action": "vote_poll", "message_id": "m9", "option_ids": []}),
+            "withdraw",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.votes.lock().await.as_slice(),
+            &[
+                ("general".to_owned(), "m9".to_owned(), vec!["o1".to_owned()]),
+                ("general".to_owned(), "m9".to_owned(), vec![]),
+            ]
+        );
+
+        // A poll off the screen cannot be voted on (ADR 0011 §3).
+        let error = execute(
+            &tool,
+            json!({"action": "vote_poll", "message_id": "m404", "option_ids": ["o1"]}),
+            "unseen",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn create_poll_rejects_unaskable_questions() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        for arguments in [
+            // A question with fewer than two choices is an announcement.
+            json!({"action": "create_poll", "question": "?", "options": ["ひとつ"]}),
+            json!({"action": "create_poll", "question": "", "options": ["a", "b"]}),
+            // Two identical choices cannot be told apart by a voter.
+            json!({"action": "create_poll", "question": "?", "options": ["a", "a"]}),
+            json!({"action": "create_poll", "question": "?",
+                   "options": ["a", "b"], "closes_in_minutes": 0}),
+            json!({"action": "create_poll", "question": "?",
+                   "options": ["a", "b"], "closes_in_minutes": 10081}),
+            // Voting still needs exactly one selector.
+            json!({"action": "vote_poll", "option_ids": ["o1"]}),
+            json!({"action": "vote_poll", "message_id": "m7", "seq": 7, "option_ids": ["o1"]}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert!(api.polls.lock().await.is_empty());
+        assert!(api.votes.lock().await.is_empty());
     }
 
     #[tokio::test]

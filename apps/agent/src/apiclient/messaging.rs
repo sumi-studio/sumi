@@ -196,6 +196,52 @@ pub(crate) struct GetMessagingCallStateRequest<'a> {
     pub place_id: Option<&'a str>,
 }
 
+/// The side conversations under one place.  Reading them is the same act a
+/// human performs by opening the thread list of a channel.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListMessagingThreadsRequest<'a> {
+    pub place_id: &'a str,
+}
+
+/// Opening a thread under the place currently in view.  `parent_message_id`
+/// names the message the thread grows from; None starts one from nothing said.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingThreadRequest<'a> {
+    pub place_id: &'a str,
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<&'a str>,
+}
+
+/// Asking a question of the room.  It rides the ordinary send, so the poll and
+/// the message that carries it commit as one event.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingPollRequest<'a> {
+    pub place_id: &'a str,
+    pub question: &'a str,
+    pub options: &'a [String],
+    pub allow_multi: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<&'a str>,
+    pub client_nonce: &'a str,
+    /// Relative for the same reason the status expiry above is: the server's
+    /// clock fixes the deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closes_in_minutes: Option<u32>,
+}
+
+/// Answering one.  The whole choice is restated; an empty list withdraws it.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VoteMessagingPollRequest<'a> {
+    pub place_id: &'a str,
+    pub message_id: &'a str,
+    pub option_ids: &'a [String],
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn overview(&self) -> Result<Value>;
@@ -238,4 +284,12 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<Value>;
 
     async fn call_state(&self, request: GetMessagingCallStateRequest<'_>) -> Result<Value>;
+
+    async fn threads(&self, request: ListMessagingThreadsRequest<'_>) -> Result<Value>;
+
+    async fn create_thread(&self, request: CreateMessagingThreadRequest<'_>) -> Result<Value>;
+
+    async fn create_poll(&self, request: CreateMessagingPollRequest<'_>) -> Result<Value>;
+
+    async fn vote_poll(&self, request: VoteMessagingPollRequest<'_>) -> Result<Value>;
 }

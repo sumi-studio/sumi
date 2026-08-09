@@ -78,6 +78,50 @@ describe("messaging session boundary", () => {
     });
   });
 
+  it("ignores a bootstrap that completes after the session changes", async () => {
+    const serverA = new MockMessagingServer();
+    const serverB = new MockMessagingServer();
+    const baseA = await serverA.bootstrap();
+    const baseB = await serverB.bootstrap();
+    let resolveA: (snapshot: typeof baseA) => void = () => {};
+    const pendingA = new Promise<typeof baseA>((resolve) => {
+      resolveA = resolve;
+    });
+    vi.spyOn(serverA, "bootstrap").mockReturnValue(pendingA);
+    vi.spyOn(serverB, "bootstrap").mockResolvedValue({
+      ...baseB,
+      self: { kind: "human", humanId: "human-b" },
+    });
+    const subscribeB = vi.spyOn(serverB, "subscribe");
+
+    bindMessagingSessionIdentity("human-a");
+    installMessagingBackend(serverA);
+    useMessaging.getState().init();
+
+    bindMessagingSessionIdentity("human-b");
+    installMessagingBackend(serverB);
+    useMessaging.getState().init();
+    await vi.waitFor(() =>
+      expect(useMessaging.getState()).toMatchObject({
+        ready: true,
+        selfKey: "human:human-b",
+      }),
+    );
+
+    resolveA({
+      ...baseA,
+      self: { kind: "human", humanId: "human-a" },
+    });
+    await pendingA;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(useMessaging.getState()).toMatchObject({
+      ready: true,
+      selfKey: "human:human-b",
+    });
+    expect(subscribeB).toHaveBeenCalledTimes(1);
+  });
+
   it("atomically refreshes Human and contextual agent presentation profiles", async () => {
     bindMessagingSessionIdentity("human-a");
     const server = new MockMessagingServer();

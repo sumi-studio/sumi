@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as DirectRouteImport } from './routes/direct'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as TThreadIdRouteImport } from './routes/t.$threadId'
 import { Route as GroupDmIdRouteImport } from './routes/group.$dmId'
 import { Route as DmDmIdRouteImport } from './routes/dm.$dmId'
 import { Route as CChannelIdRouteImport } from './routes/c.$channelId'
@@ -23,6 +24,11 @@ const DirectRoute = DirectRouteImport.update({
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TThreadIdRoute = TThreadIdRouteImport.update({
+  id: '/t/$threadId',
+  path: '/t/$threadId',
   getParentRoute: () => rootRouteImport,
 } as any)
 const GroupDmIdRoute = GroupDmIdRouteImport.update({
@@ -47,6 +53,7 @@ export interface FileRoutesByFullPath {
   '/c/$channelId': typeof CChannelIdRoute
   '/dm/$dmId': typeof DmDmIdRoute
   '/group/$dmId': typeof GroupDmIdRoute
+  '/t/$threadId': typeof TThreadIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -54,6 +61,7 @@ export interface FileRoutesByTo {
   '/c/$channelId': typeof CChannelIdRoute
   '/dm/$dmId': typeof DmDmIdRoute
   '/group/$dmId': typeof GroupDmIdRoute
+  '/t/$threadId': typeof TThreadIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -62,12 +70,25 @@ export interface FileRoutesById {
   '/c/$channelId': typeof CChannelIdRoute
   '/dm/$dmId': typeof DmDmIdRoute
   '/group/$dmId': typeof GroupDmIdRoute
+  '/t/$threadId': typeof TThreadIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/direct' | '/c/$channelId' | '/dm/$dmId' | '/group/$dmId'
+  fullPaths:
+    | '/'
+    | '/direct'
+    | '/c/$channelId'
+    | '/dm/$dmId'
+    | '/group/$dmId'
+    | '/t/$threadId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/direct' | '/c/$channelId' | '/dm/$dmId' | '/group/$dmId'
+  to:
+    | '/'
+    | '/direct'
+    | '/c/$channelId'
+    | '/dm/$dmId'
+    | '/group/$dmId'
+    | '/t/$threadId'
   id:
     | '__root__'
     | '/'
@@ -75,6 +96,7 @@ export interface FileRouteTypes {
     | '/c/$channelId'
     | '/dm/$dmId'
     | '/group/$dmId'
+    | '/t/$threadId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -83,6 +105,7 @@ export interface RootRouteChildren {
   CChannelIdRoute: typeof CChannelIdRoute
   DmDmIdRoute: typeof DmDmIdRoute
   GroupDmIdRoute: typeof GroupDmIdRoute
+  TThreadIdRoute: typeof TThreadIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -99,6 +122,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/t/$threadId': {
+      id: '/t/$threadId'
+      path: '/t/$threadId'
+      fullPath: '/t/$threadId'
+      preLoaderRoute: typeof TThreadIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/group/$dmId': {
@@ -131,6 +161,7 @@ const rootRouteChildren: RootRouteChildren = {
   CChannelIdRoute: CChannelIdRoute,
   DmDmIdRoute: DmDmIdRoute,
   GroupDmIdRoute: GroupDmIdRoute,
+  TThreadIdRoute: TThreadIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -10,6 +10,7 @@ export function placePath(key: PlaceKey): string {
   const place = parsePlaceKey(key);
   if (!place) return "/";
   if (place.kind === "channel") return `/c/${place.channelId}`;
+  if (place.kind === "thread") return `/t/${place.threadId}`;
   if (place.kind === "dm") return `/dm/${place.dmId}`;
   return `/group/${place.dmId}`;
 }
@@ -24,6 +25,11 @@ export function usePlaceNavigate() {
         void navigate({
           to: "/c/$channelId",
           params: { channelId: place.channelId },
+        });
+      } else if (place.kind === "thread") {
+        void navigate({
+          to: "/t/$threadId",
+          params: { threadId: place.threadId },
         });
       } else if (place.kind === "dm") {
         void navigate({ to: "/dm/$dmId", params: { dmId: place.dmId } });

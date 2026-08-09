@@ -28,11 +28,14 @@ const (
 	DefaultGeneralChannelID = "01900000-0000-7000-8000-000000000002"
 )
 
-// Place kinds.
+// Place kinds. thread is a channel-scoped side conversation: an ordinary place
+// so seq, idempotent send, tombstones, read markers and notifications all keep
+// working without a second implementation (migration 0018).
 const (
 	PlaceChannel = "channel"
 	PlaceDM      = "dm"
 	PlaceGroupDM = "group_dm"
+	PlaceThread  = "thread"
 )
 
 // Sentinel errors. The transport layer maps these to status codes; the store
@@ -619,8 +622,12 @@ func (s *Store) placeMembership(ctx context.Context, q querier, placeID string, 
 // canAccess implements the v0 permission rule: channels are readable and
 // postable by every active workspace member; dm/group_dm by their active place
 // members. Reading and posting are the same capability in v0.
+//
+// A thread inherits its parent channel's Workspace, so every member of the
+// parent may read and write in it. place_members on a thread records who
+// joined (unread and notification audience), never who is allowed in.
 func (s *Store) canAccess(ctx context.Context, q querier, place Place, p ParticipantRef) (bool, error) {
-	if place.Kind == PlaceChannel {
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
 		active, _, err := s.workspaceMembership(ctx, q, place.WorkspaceID, p)
 		return active, err
 	}
@@ -670,8 +677,11 @@ func (s *Store) shareActiveWorkspace(ctx context.Context, a, b ParticipantRef) (
 }
 
 // activeMembers lists a place's active members with 戸籍 display names.
+// A thread answers with its parent Workspace's members: everyone who can see
+// the parent can be named in the thread, so mention resolution must not be
+// narrowed to the people who happen to have written in it already.
 func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]MemberProfile, error) {
-	if place.Kind == PlaceChannel {
+	if place.Kind == PlaceChannel || place.Kind == PlaceThread {
 		return s.workspaceMemberProfiles(ctx, q, place.WorkspaceID)
 	}
 	rows, err := q.Query(ctx,
