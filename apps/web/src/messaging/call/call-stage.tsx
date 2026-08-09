@@ -116,11 +116,13 @@ export function CallStage({ placeKey: key }: { placeKey: PlaceKey }) {
   const phase = useCall((state) => state.phase);
   const local = useCall((state) => state.local);
   const tracks = useCall((state) => state.tracks);
+  const audioPlaybackBlocked = useCall((state) => state.audioPlaybackBlocked);
   const speakingUntil = useCall((state) => state.speakingUntil);
   const call = useCall((state) => state.stateByPlace[key]);
   const toggleMicrophone = useCall((state) => state.toggleMicrophone);
   const toggleCamera = useCall((state) => state.toggleCamera);
   const toggleScreenShare = useCall((state) => state.toggleScreenShare);
+  const resumeAudio = useCall((state) => state.resumeAudio);
   const leave = useCall((state) => state.leave);
   const selfKey = useMessaging((state) => state.selfKey);
   const [now, setNow] = useState(() => Date.now());
@@ -146,6 +148,13 @@ export function CallStage({ placeKey: key }: { placeKey: PlaceKey }) {
       .map((track) => [track.participantKey, track]),
   );
   const screens = tracks.filter((track) => track.kind === "screen");
+  const handleResumeAudio = async () => {
+    try {
+      await resumeAudio();
+    } catch {
+      // Browserがまだ許可しない場合はbuttonを残し、次の明示gestureで再試行する。
+    }
+  };
 
   return (
     <section
@@ -156,6 +165,21 @@ export function CallStage({ placeKey: key }: { placeKey: PlaceKey }) {
         <p className="pb-2 text-[12px] text-muted-foreground">
           接続しています…
         </p>
+      ) : null}
+      {audioPlaybackBlocked ? (
+        <div
+          role="alert"
+          className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px]"
+        >
+          <span>通話の音声が停止しています</span>
+          <button
+            type="button"
+            onClick={() => void handleResumeAudio()}
+            className="shrink-0 rounded-md bg-foreground px-2.5 py-1.5 font-medium text-background hover:opacity-90"
+          >
+            音声を再開
+          </button>
+        </div>
       ) : null}
       {screens.length > 0 ? (
         <div className="pb-2">
