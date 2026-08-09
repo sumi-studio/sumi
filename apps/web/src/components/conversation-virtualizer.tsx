@@ -2,6 +2,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type PointerEvent as ReactPointerEvent,
   type Ref,
   useCallback,
   useEffect,
@@ -73,6 +74,8 @@ const SCROLL_KEYS = new Set([
   "End",
   " ",
 ]);
+const INTERACTIVE_SELECTOR =
+  'button, a[href], input, textarea, select, summary, [contenteditable]:not([contenteditable="false"])';
 
 export function ConversationVirtualizer<
   TItem extends ConversationVirtualizerItem,
@@ -293,7 +296,26 @@ export function ConversationVirtualizer<
   const handleViewportKeyDownCapture = (
     event: ReactKeyboardEvent<HTMLElement>,
   ) => {
-    if (SCROLL_KEYS.has(event.key)) interruptProgrammaticScroll();
+    if (!SCROLL_KEYS.has(event.key)) return;
+    if (
+      event.target instanceof Element &&
+      event.target.closest(INTERACTIVE_SELECTOR)
+    ) {
+      return;
+    }
+    interruptProgrammaticScroll();
+  };
+
+  const handleViewportPointerDownCapture = (
+    event: ReactPointerEvent<HTMLElement>,
+  ) => {
+    const viewport = event.currentTarget;
+    if (
+      event.target === viewport &&
+      event.nativeEvent.offsetX >= viewport.clientWidth
+    ) {
+      interruptProgrammaticScroll();
+    }
   };
 
   return (
@@ -315,8 +337,8 @@ export function ConversationVirtualizer<
         aria-busy={busy}
         onScrollCapture={handleViewportScrollCapture}
         onWheelCapture={interruptProgrammaticScroll}
-        onTouchStartCapture={interruptProgrammaticScroll}
-        onPointerDownCapture={interruptProgrammaticScroll}
+        onTouchMoveCapture={interruptProgrammaticScroll}
+        onPointerDownCapture={handleViewportPointerDownCapture}
         onKeyDownCapture={handleViewportKeyDownCapture}
         className={className}
         style={{

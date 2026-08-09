@@ -1,11 +1,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer as createNetServer } from "node:net";
 import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { expect, test } from "@playwright/test";
-
-const webURL = "http://127.0.0.1:4173";
-const harnessURL = `${webURL}/harness/scroll-jump.html`;
 
 interface HarnessSnapshot {
   scrollTop: number;
@@ -19,7 +17,9 @@ interface HarnessSnapshot {
 test("conversation stays anchored to the end while rows land after send", async ({
   page,
 }) => {
-  const vite = startVite();
+  const port = await ephemeralPort();
+  const harnessURL = `http://127.0.0.1:${port}/harness/scroll-jump.html`;
+  const vite = startVite(port);
   try {
     await waitFor(harnessURL);
     await page.goto(harnessURL);
@@ -86,7 +86,9 @@ test("conversation stays anchored to the end while rows land after send", async 
 test("a user wheel gesture wins over streaming follow and is never yanked", async ({
   page,
 }) => {
-  const vite = startVite();
+  const port = await ephemeralPort();
+  const harnessURL = `http://127.0.0.1:${port}/harness/scroll-jump.html`;
+  const vite = startVite(port);
   try {
     await waitFor(harnessURL);
     await page.goto(harnessURL);
@@ -158,7 +160,7 @@ async function snapshot(page: {
   return value;
 }
 
-function startVite() {
+function startVite(port: number) {
   return spawn(
     process.execPath,
     [
@@ -166,7 +168,7 @@ function startVite() {
       "--host",
       "127.0.0.1",
       "--port",
-      "4173",
+      String(port),
       "--strictPort",
     ],
     {
@@ -174,6 +176,22 @@ function startVite() {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+}
+
+async function ephemeralPort(): Promise<number> {
+  const server = createNetServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("ephemeral port reservation did not expose a TCP address");
+  }
+  const port = address.port;
+  const closed = once(server, "close");
+  server.close();
+  await closed;
+  return port;
 }
 
 async function waitFor(url: string) {
