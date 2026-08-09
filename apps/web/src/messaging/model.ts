@@ -65,6 +65,12 @@ export interface ReactionSummary {
   participants: ParticipantRef[];
 }
 
+/** Canonical absolute reaction state returned by a successful mutation. */
+export interface ReactionMutationResult {
+  messageId: string;
+  reactions: ReactionSummary[];
+}
+
 export interface Message {
   messageId: string;
   place: Place;
@@ -234,7 +240,11 @@ export interface MessagingBackend {
     remindAt: number,
   ): Promise<void>;
   resolveReplyLater(markerId: string): Promise<void>;
-  toggleReaction(place: Place, messageId: string, emoji: string): Promise<void>;
+  toggleReaction(
+    place: Place,
+    messageId: string,
+    emoji: string,
+  ): Promise<ReactionMutationResult>;
   /** best-effort。失敗しても会話は壊れないため受領確認しない。 */
   sendTyping(place: Place): void;
   /**

@@ -120,7 +120,7 @@ describe("ApiMessagingBackend", () => {
     });
   });
 
-  it("toggles reactions over REST and projects reaction_updated", async () => {
+  it("returns the canonical REST reaction result and projects WS updates", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
@@ -150,7 +150,7 @@ describe("ApiMessagingBackend", () => {
       sinceByPlace: { "channel:channel-1": 4 },
     });
 
-    await backend.toggleReaction(channel, "message-1", "👍");
+    const canonical = await backend.toggleReaction(channel, "message-1", "👍");
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/places/channel-1/messages/message-1/reactions",
       expect.objectContaining({
@@ -158,22 +158,19 @@ describe("ApiMessagingBackend", () => {
         body: JSON.stringify({ emoji: "👍" }),
       }),
     );
-    // The socket echo can be dropped, so the authoritative POST response is
-    // projected locally rather than discarded.
-    expect(events).toEqual([
-      {
-        type: "reaction_updated",
-        place: channel,
-        messageId: "message-1",
-        reactions: [
-          {
-            emoji: "👍",
-            participants: [{ kind: "human", humanId: "human-1" }],
-          },
-        ],
-      },
-    ]);
-    events.length = 0;
+    expect(canonical).toEqual({
+      messageId: "message-1",
+      reactions: [
+        {
+          emoji: "👍",
+          participants: [{ kind: "human", humanId: "human-1" }],
+        },
+      ],
+    });
+    // REST and WS have different ordering semantics. The store coordinates
+    // the canonical ACK with live events, so the backend must not disguise
+    // the ACK as another live event.
+    expect(events).toEqual([]);
 
     vi.useFakeTimers();
     try {

@@ -4,6 +4,7 @@ import type {
   Message,
   MessagingBackend,
   Place,
+  ReactionMutationResult,
   ServerEvent,
 } from "./model";
 import {
@@ -192,6 +193,324 @@ describe("reaction convergence in the messaging store", () => {
     ).toEqual([{ emoji: "👍", participants: [self] }]);
   });
 
+  it("does not replay an earlier generation over a newer resync snapshot", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [message(1, "message")] },
+    });
+    harness.history = [message(1, "message")];
+    harness.holdFetches = true;
+
+    // Resync A captures the old snapshot. E1 then arrives live and is queued
+    // only for A.
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: "message-1",
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+
+    // Before resync B starts, the server has committed the later E2 state.
+    // Its echo is deliberately absent; B's snapshot is the only E2 evidence.
+    harness.history = [
+      {
+        ...message(1, "message"),
+        reactions: [{ emoji: "🎉", participants: [self] }],
+      },
+    ];
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    // B is queued behind A and therefore has no chance to inherit A's journal.
+    expect(harness.heldFetchCount).toBe(1);
+
+    harness.releaseFetches();
+    await harness.settle();
+    // B starts with a fresh journal only after A has settled.
+    expect(harness.heldFetchCount).toBe(1);
+    harness.releaseFetches();
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual([{ emoji: "🎉", participants: [self] }]);
+  });
+
+  it("replays newer live state after a delayed canonical toggle ACK", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<ReactionMutationResult>();
+    harness.toggleResults.push(acknowledgement.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    expect(harness.toggleReaction).toHaveBeenCalledTimes(1);
+
+    const newer = [
+      { emoji: "👍", participants: [self] },
+      { emoji: "🎉", participants: [other] },
+    ];
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: newer,
+    });
+    acknowledgement.resolve({
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual(newer);
+  });
+
+  it("converges when an older published WS frame is delivered during a toggle", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<ReactionMutationResult>();
+    harness.toggleResults.push(acknowledgement.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    const olderPublished = [{ emoji: "🎉", participants: [other] }];
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: olderPublished,
+    });
+    const ownCommitted = [
+      ...olderPublished,
+      { emoji: "👍", participants: [self] },
+    ];
+    acknowledgement.resolve({
+      messageId: target.messageId,
+      reactions: ownCommitted,
+    });
+    await harness.settle();
+
+    // Without a wire revision, replaying the frame delivered during the
+    // request can temporarily restore O. The server enqueues our own E_A after
+    // O on the same WS before returning the HTTP response, so WS FIFO converges
+    // to E_A; disconnect/overflow instead converges through caught_up resync.
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual(olderPublished);
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: ownCommitted,
+    });
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual(ownCommitted);
+  });
+
+  it("serializes concurrent local toggles", async () => {
+    const harness = new StubBackend();
+    const first = deferred<ReactionMutationResult>();
+    const second = deferred<ReactionMutationResult>();
+    harness.toggleResults.push(first.promise, second.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    expect(harness.toggleReaction).toHaveBeenCalledTimes(1);
+
+    first.resolve({
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    await harness.settle();
+    expect(harness.toggleReaction).toHaveBeenCalledTimes(2);
+
+    second.resolve({ messageId: target.messageId, reactions: [] });
+    await harness.settle();
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual([]);
+  });
+
+  it("orders resync after an in-flight local toggle", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<ReactionMutationResult>();
+    harness.toggleResults.push(acknowledgement.promise);
+    harness.holdFetches = true;
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [
+        { emoji: "👍", participants: [self] },
+        { emoji: "🎉", participants: [other] },
+      ],
+    });
+    harness.history = [
+      {
+        ...target,
+        reactions: [{ emoji: "👀", participants: [other] }],
+      },
+    ];
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    expect(harness.fetches).toEqual([]);
+
+    acknowledgement.resolve({
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(1);
+
+    harness.releaseFetches();
+    await harness.settle();
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual([{ emoji: "👀", participants: [other] }]);
+  });
+
+  it("waits for an active resync before sending a local toggle", async () => {
+    const harness = new StubBackend();
+    harness.holdFetches = true;
+    harness.toggleResults.push({
+      messageId: "message-1",
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    harness.history = [target];
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(1);
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    expect(harness.toggleReaction).not.toHaveBeenCalled();
+
+    harness.releaseFetches();
+    await harness.settle();
+    expect(harness.toggleReaction).toHaveBeenCalledTimes(1);
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual([{ emoji: "👍", participants: [self] }]);
+  });
+
+  it("does not restore reactions on a tombstone from a delayed toggle", async () => {
+    const harness = new StubBackend();
+    const acknowledgement = deferred<ReactionMutationResult>();
+    harness.toggleResults.push(acknowledgement.promise);
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const target = message(1, "message");
+    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+
+    useMessaging.getState().toggleReaction(target, "👍");
+    await harness.settle();
+    harness.emit({
+      type: "message_deleted",
+      message: { ...target, content: "", deleted: true, reactions: [] },
+    });
+    harness.emit({
+      type: "reaction_updated",
+      place,
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    acknowledgement.resolve({
+      messageId: target.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({ deleted: true, reactions: [] });
+  });
+
+  it("discards toggle ACKs and queued mutations from an earlier session", async () => {
+    const oldHarness = new StubBackend();
+    const acknowledgement = deferred<ReactionMutationResult>();
+    oldHarness.toggleResults.push(acknowledgement.promise, {
+      messageId: "message-1",
+      reactions: [],
+    });
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const oldTarget = message(1, "old session");
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [oldTarget] },
+    });
+    useMessaging.getState().toggleReaction(oldTarget, "👍");
+    useMessaging.getState().toggleReaction(oldTarget, "👍");
+    await oldHarness.settle();
+    expect(oldHarness.toggleReaction).toHaveBeenCalledTimes(1);
+
+    bindMessagingSessionIdentity("reaction-test-toggle-new-session");
+    const newHarness = new StubBackend();
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    useMessaging.setState({
+      messagesByPlace: {
+        [placeKey]: [
+          {
+            ...message(1, "new session"),
+            reactions: [{ emoji: "🎉", participants: [other] }],
+          },
+        ],
+      },
+    });
+
+    acknowledgement.resolve({
+      messageId: oldTarget.messageId,
+      reactions: [{ emoji: "👍", participants: [self] }],
+    });
+    await oldHarness.settle();
+
+    expect(oldHarness.toggleReaction).toHaveBeenCalledTimes(1);
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0],
+    ).toMatchObject({
+      content: "new session",
+      reactions: [{ emoji: "🎉", participants: [other] }],
+    });
+  });
+
   it("discards a reaction snapshot from an earlier session", async () => {
     const oldHarness = new StubBackend();
     installMessagingBackend(oldHarness);
@@ -240,6 +559,18 @@ describe("reaction convergence in the messaging store", () => {
 });
 
 const self = { kind: "human", humanId: "human-1" } as const;
+const other = { kind: "human", humanId: "human-2" } as const;
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 function message(
   seq: number,
@@ -270,6 +601,10 @@ class StubBackend implements MessagingBackend {
   } as const;
   history: Message[] = [];
   readonly fetches: { beforeSeq?: number; limit?: number }[] = [];
+  readonly toggleResults: (
+    | ReactionMutationResult
+    | Promise<ReactionMutationResult>
+  )[] = [];
   holdFetches = false;
   private heldFetches: {
     response: Message[];
@@ -346,7 +681,14 @@ class StubBackend implements MessagingBackend {
   setStatus = vi.fn(async () => undefined);
   createReplyLater = vi.fn(async () => undefined);
   resolveReplyLater = vi.fn(async () => undefined);
-  toggleReaction = vi.fn(async () => undefined);
+  toggleReaction = vi.fn(
+    async (
+      _place: Place,
+      messageId: string,
+      _emoji: string,
+    ): Promise<ReactionMutationResult> =>
+      await (this.toggleResults.shift() ?? { messageId, reactions: [] }),
+  );
   sendTyping = vi.fn();
 
   subscribe(listener: (event: ServerEvent) => void): () => void {

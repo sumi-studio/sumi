@@ -7,6 +7,7 @@ import type {
   ParticipantRef,
   Place,
   PlaceKey,
+  ReactionMutationResult,
   ReactionSummary,
   ReadMarker,
   SendMessageInput,
@@ -199,22 +200,18 @@ export class ApiMessagingBackend implements MessagingBackend {
     place: Place,
     messageId: string,
     emoji: string,
-  ): Promise<void> {
+  ): Promise<ReactionMutationResult> {
     const body = asRecord(
       await this.request(
         `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/reactions`,
         { method: "POST", body: { emoji } },
       ),
     );
-    // The socket echo is best-effort (disconnect, hub overflow), but the POST
-    // response is authoritative, so project it locally instead of discarding
-    // it. Reaction state is an absolute set, so the duplicate echo is a no-op.
-    this.emit({
-      type: "reaction_updated",
-      place,
-      messageId,
-      reactions: asArray(asRecord(body.message).reactions).map(parseReaction),
-    });
+    const message = asRecord(body.message);
+    return {
+      messageId: asString(message.message_id),
+      reactions: asArray(message.reactions).map(parseReaction),
+    };
   }
 
   sendTyping(place: Place): void {
