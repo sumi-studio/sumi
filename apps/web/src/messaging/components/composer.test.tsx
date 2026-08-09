@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelSummary, MemberProfile, ParticipantRef } from "../model";
 import { participantKey } from "../model";
@@ -95,6 +101,27 @@ describe("Composer 送信ボタン", () => {
   it("Enterで送信する説明は残す", () => {
     render(<Composer />);
     expect(screen.getByText(/Enterで送信/)).toBeInTheDocument();
+  });
+});
+
+describe("Composer のフォーカス", () => {
+  it("インライン編集の終了時に入力欄へ戻す", () => {
+    render(
+      <>
+        <button type="button">編集中の入力欄</button>
+        <Composer />
+      </>,
+    );
+    const editingInput = screen.getByRole("button", {
+      name: "編集中の入力欄",
+    });
+    editingInput.focus();
+
+    act(() => useMessaging.setState({ editingMessageId: "m1" }));
+    expect(editingInput).toHaveFocus();
+
+    act(() => useMessaging.setState({ editingMessageId: null }));
+    expect(composer()).toHaveFocus();
   });
 });
 
