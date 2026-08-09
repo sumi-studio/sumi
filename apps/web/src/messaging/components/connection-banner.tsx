@@ -12,10 +12,15 @@ export function ConnectionBanner() {
   const connection = useMessaging((state) => state.connection);
   const [flash, setFlash] = useState(false);
   const wasInterrupted = useRef(false);
+  const previousConnection = useRef(connection);
 
   useEffect(() => {
+    const previous = previousConnection.current;
+    previousConnection.current = connection;
     if (connection !== "connected") {
-      wasInterrupted.current = true;
+      if (previous === "connected") {
+        wasInterrupted.current = true;
+      }
       setFlash(false);
       return;
     }
