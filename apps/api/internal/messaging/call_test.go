@@ -368,6 +368,22 @@ func (s *callSessionRevocations) RotateBrowserSession(
 	return nil
 }
 
+// blockingCallResponseWriter pauses the server-side body commit. The lease can
+// only order work through ResponseWriter.Write returning; delivery of those
+// bytes across the network remains the HTTP transport's responsibility.
+type blockingCallResponseWriter struct {
+	http.ResponseWriter
+	writeStarted chan struct{}
+	releaseWrite <-chan struct{}
+	once         sync.Once
+}
+
+func (w *blockingCallResponseWriter) Write(body []byte) (int, error) {
+	w.once.Do(func() { close(w.writeStarted) })
+	<-w.releaseWrite
+	return w.ResponseWriter.Write(body)
+}
+
 func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -393,18 +409,13 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 	server := NewServer(w.store, sessions)
 	server.AllowedOrigins = []string{testOrigin}
 	service := NewCallService(server, testLiveKit())
-	mintEntered := make(chan struct{})
-	releaseMint := make(chan struct{})
-	var mintOnce sync.Once
-	service.Now = func() time.Time {
-		mintOnce.Do(func() { close(mintEntered) })
-		<-releaseMint
-		return time.Unix(1_780_000_000, 0)
-	}
+	service.Now = func() time.Time { return time.Unix(1_780_000_000, 0) }
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
 	released := false
 	defer func() {
 		if !released {
-			close(releaseMint)
+			close(releaseWrite)
 		}
 	}()
 
@@ -426,7 +437,12 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 		Name:  agentevents.BrowserSessionCookie,
 		Value: signedSession,
 	})
-	tokenResponse := httptest.NewRecorder()
+	tokenRecorder := httptest.NewRecorder()
+	tokenResponse := &blockingCallResponseWriter{
+		ResponseWriter: tokenRecorder,
+		writeStarted:   writeStarted,
+		releaseWrite:   releaseWrite,
+	}
 	tokenDone := make(chan struct{})
 	go func() {
 		mux.ServeHTTP(tokenResponse, tokenRequest)
@@ -434,9 +450,9 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 	}()
 
 	select {
-	case <-mintEntered:
+	case <-writeStarted:
 	case <-ctx.Done():
-		t.Fatal("token request did not reach credential issuance")
+		t.Fatal("token request did not reach its server-side response commit")
 	}
 
 	csrf := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
@@ -466,7 +482,7 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 		prematureLogout = true
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(releaseMint)
+	close(releaseWrite)
 	released = true
 
 	select {
@@ -474,14 +490,14 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 	case <-ctx.Done():
 		t.Fatal("call token request did not complete")
 	}
-	if tokenResponse.Code != http.StatusOK {
-		t.Fatalf("call token status = %d, body = %s", tokenResponse.Code, tokenResponse.Body.String())
+	if tokenRecorder.Code != http.StatusOK {
+		t.Fatalf("call token status = %d, body = %s", tokenRecorder.Code, tokenRecorder.Body.String())
 	}
 	var issued struct {
 		Token string `json:"token"`
 	}
-	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &issued); err != nil || issued.Token == "" {
-		t.Fatalf("decode call token: token=%q err=%v body=%s", issued.Token, err, tokenResponse.Body.String())
+	if err := json.Unmarshal(tokenRecorder.Body.Bytes(), &issued); err != nil || issued.Token == "" {
+		t.Fatalf("decode call token: token=%q err=%v body=%s", issued.Token, err, tokenRecorder.Body.String())
 	}
 	if _, err := verifyJWT(issued.Token, testLiveKitSecret); err != nil {
 		t.Fatalf("issued LiveKit credential does not verify: %v", err)
@@ -498,7 +514,7 @@ func TestCallTokenIssuanceHoldsSessionAdmissionUntilTheResponseIsCommitted(t *te
 		t.Fatalf("logout status = %d, body = %s", logoutResponse.Code, logoutResponse.Body.String())
 	}
 	if prematureLogout {
-		t.Fatal("logout returned before the in-flight LiveKit credential was issued")
+		t.Fatal("logout returned before the LiveKit credential response was committed")
 	}
 	if _, err := sessions.VerifySession(ctx, signedSession); err == nil {
 		t.Fatal("logout left the browser session valid")
