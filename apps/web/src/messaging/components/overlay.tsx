@@ -68,9 +68,10 @@ function forwardWheel(
   const target = resolveTarget();
   if (!target) return;
   event.preventDefault();
+  const scale = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
   // scrollBy はテスト環境に無いことがある。scrollTop の代入なら常に効く。
-  target.scrollTop += event.deltaY;
-  target.scrollLeft += event.deltaX;
+  target.scrollTop += event.deltaY * scale;
+  target.scrollLeft += event.deltaX * scale;
 }
 
 /**
@@ -164,7 +165,7 @@ export function useOverlayPanel<T extends HTMLElement = HTMLButtonElement>({
       requestClose(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.isComposing) return;
       requestClose(true);
     };
     document.addEventListener("pointerdown", onPointerDown, true);
