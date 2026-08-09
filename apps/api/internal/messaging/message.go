@@ -533,17 +533,7 @@ func (s *Store) UnreadSummaries(ctx context.Context, viewer ParticipantRef) ([]U
 	if err := viewer.Validate(); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx,
-		`WITH my_places AS (
-		   SELECT p.* FROM places p
-		   JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-		    AND wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
-		   WHERE p.kind = 'channel'
-		   UNION
-		   SELECT p.* FROM places p
-		   JOIN place_members pm ON pm.place_id = p.place_id
-		    AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
-		 )
+	rows, err := s.pool.Query(ctx, participantVisiblePlacesCTE+`
 		 SELECT mp.place_id, mp.kind, mp.workspace_id, mp.name, mp.topic, mp.visibility, mp.last_seq,
 		        mp.voice,
 		        COALESCE(rm.last_read_seq, 0),
