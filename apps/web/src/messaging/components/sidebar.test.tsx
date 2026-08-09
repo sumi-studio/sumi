@@ -109,7 +109,7 @@ describe("Sidebar", () => {
           note: "最初の宣言",
           expiresAt: null,
           baseStatus: null,
-          baseNote: null,
+          baseNote: "",
         },
       },
     });
@@ -129,7 +129,7 @@ describe("Sidebar", () => {
             note: "別クライアントからの更新",
             expiresAt: null,
             baseStatus: null,
-            baseNote: null,
+            baseNote: "",
           },
         },
       });
