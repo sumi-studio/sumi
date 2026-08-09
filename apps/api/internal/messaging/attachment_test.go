@@ -313,3 +313,119 @@ func TestAttachmentUploadLimits(t *testing.T) {
 		t.Fatalf("empty send = %d %v, want 400 invalid_content", resp.StatusCode, body)
 	}
 }
+
+// TestAttachmentDraftSpoilerAndAlt covers the window in which「送る前」の編集
+// is allowed: the uploader's own still-unbound attachment takes a new display
+// name, a description and the spoiler flag, an absent field is left alone, and
+// the moment the attachment becomes part of a message the edit is refused.
+// Both declarations then travel with every delivery of that message.
+func TestAttachmentDraftSpoilerAndAlt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w, ts := newAttachmentServer(t, ctx)
+	_, channel := w.workspaceWithChannel(t, ctx)
+
+	resp, body := upload(t, ts, w.humanA.ID, "shot.png", "image/png", pngBytes)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload = %d %v, want 201", resp.StatusCode, body)
+	}
+	// A fresh upload hides nothing and describes nothing.
+	if body["spoiler"] != false || body["alt"] != "" {
+		t.Fatalf("fresh upload = %v, want spoiler false and empty alt", body)
+	}
+	id := attachmentID(t, body)
+	path := "/messaging/attachments/" + id
+
+	// Nobody else can edit it — and learns nothing about its existence.
+	resp, body = call(t, ts, http.MethodPatch, path, w.humanB.ID,
+		map[string]any{"spoiler": true})
+	if resp.StatusCode != http.StatusNotFound || body["error"] != "attachment_not_found" {
+		t.Fatalf("stranger patch = %d %v, want 404 attachment_not_found", resp.StatusCode, body)
+	}
+
+	// The uploader marks it as a spoiler and describes it.
+	resp, body = call(t, ts, http.MethodPatch, path, w.humanA.ID,
+		map[string]any{"spoiler": true, "alt": "結末の一枚"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch = %d %v, want 200", resp.StatusCode, body)
+	}
+	if body["spoiler"] != true || body["alt"] != "結末の一枚" {
+		t.Fatalf("patched attachment = %v", body)
+	}
+	if body["filename"] != "shot.png" {
+		t.Fatalf("filename changed without being named: %v", body)
+	}
+
+	// An absent field is「触らない」: renaming keeps the spoiler and the alt.
+	resp, body = call(t, ts, http.MethodPatch, path, w.humanA.ID,
+		map[string]any{"filename": "ending.png"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename = %d %v, want 200", resp.StatusCode, body)
+	}
+	if body["filename"] != "ending.png" || body["spoiler"] != true || body["alt"] != "結末の一枚" {
+		t.Fatalf("rename dropped the other fields: %v", body)
+	}
+
+	// Naming nothing at all is not an edit.
+	resp, body = call(t, ts, http.MethodPatch, path, w.humanA.ID, map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("empty patch = %d %v, want 400 invalid_request", resp.StatusCode, body)
+	}
+
+	// Sent: the declarations ride along with the message.
+	resp, body = call(t, ts, http.MethodPost,
+		"/messaging/places/"+channel.PlaceID+"/messages", w.humanA.ID,
+		map[string]any{"content": "見る?", "client_nonce": "n-spoiler", "attachments": []string{id}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("send = %d %v, want 201", resp.StatusCode, body)
+	}
+	message, _ := body["message"].(map[string]any)
+	attachments, _ := message["attachments"].([]any)
+	if len(attachments) != 1 {
+		t.Fatalf("message carries %d attachments, want 1 (%v)", len(attachments), message)
+	}
+	sent, _ := attachments[0].(map[string]any)
+	if sent["spoiler"] != true || sent["alt"] != "結末の一枚" || sent["filename"] != "ending.png" {
+		t.Fatalf("sent attachment wire = %v", sent)
+	}
+
+	// The recipient's own read of the timeline carries them too.
+	resp, body = call(t, ts, http.MethodGet,
+		"/messaging/places/"+channel.PlaceID+"/messages", w.humanB.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history = %d %v, want 200", resp.StatusCode, body)
+	}
+	messages, _ := body["messages"].([]any)
+	if len(messages) == 0 {
+		t.Fatalf("history carries no messages: %v", body)
+	}
+	received, _ := messages[len(messages)-1].(map[string]any)
+	receivedAttachments, _ := received["attachments"].([]any)
+	if len(receivedAttachments) != 1 {
+		t.Fatalf("received message carries %d attachments, want 1", len(receivedAttachments))
+	}
+	seen, _ := receivedAttachments[0].(map[string]any)
+	if seen["spoiler"] != true || seen["alt"] != "結末の一枚" {
+		t.Fatalf("received attachment wire = %v", seen)
+	}
+
+	// After send the edit window is closed. What was seen was seen.
+	resp, body = call(t, ts, http.MethodPatch, path, w.humanA.ID,
+		map[string]any{"spoiler": false})
+	if resp.StatusCode != http.StatusConflict || body["error"] != "attachment_already_sent" {
+		t.Fatalf("patch after send = %d %v, want 409 attachment_already_sent", resp.StatusCode, body)
+	}
+}
+
+func TestSanitizeAttachmentAlt(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"  結末の一枚  ", "結末の一枚"},
+		{"二行の\n説明", "二行の 説明"},
+		{"tab\tここ", "tab ここ"},
+		{"", ""},
+	} {
+		if got := sanitizeAttachmentAlt(tc.in); got != tc.want {
+			t.Fatalf("sanitizeAttachmentAlt(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

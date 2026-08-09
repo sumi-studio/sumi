@@ -192,6 +192,8 @@ describe("ApiMessagingBackend", () => {
       size: 2048,
       // 取得先は境界がこの形に決める。可視性はサーバーが検査する。
       url: "/messaging/attachments/attachment-1",
+      spoiler: false,
+      alt: "",
     });
     const upload = requests[0];
     expect(upload.init?.method).toBe("POST");
@@ -252,8 +254,73 @@ describe("ApiMessagingBackend", () => {
         mime: "image/png",
         size: 2048,
         url: "/messaging/attachments/attachment-1",
+        // 宣言の無い添付は「隠さない・概要なし」に落ちる。
+        spoiler: false,
+        alt: "",
       },
     ]);
+  });
+
+  it("projects the sender's spoiler and description declarations", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === "/messaging/bootstrap") return json(bootstrap);
+        return json({
+          messages: [
+            {
+              ...messageWire(1, "見る?"),
+              attachments: [
+                {
+                  attachment_id: "attachment-1",
+                  filename: "ending.png",
+                  mime: "image/png",
+                  size: 2048,
+                  spoiler: true,
+                  alt: "結末の一枚",
+                },
+              ],
+            },
+          ],
+        });
+      }),
+    );
+    const backend = new ApiMessagingBackend();
+
+    const [message] = await backend.fetchMessages(channel, { limit: 50 });
+
+    expect(message.attachments[0].spoiler).toBe(true);
+    expect(message.attachments[0].alt).toBe("結末の一枚");
+  });
+
+  it("patches only the fields a draft edit names", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        if (String(input) === "/messaging/bootstrap") return json(bootstrap);
+        return json({
+          attachment_id: "attachment-1",
+          filename: "shot.png",
+          mime: "image/png",
+          size: 2048,
+          spoiler: true,
+          alt: "",
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+
+    const updated = await backend.updateAttachment("attachment-1", {
+      spoiler: true,
+    });
+
+    expect(updated.spoiler).toBe(true);
+    const call = fetchMock.mock.calls.at(-1);
+    expect(String(call?.[0])).toBe("/messaging/attachments/attachment-1");
+    const init = call?.[1] as RequestInit;
+    expect(init?.method).toBe("PATCH");
+    // 名前や概要は名指ししていないので載せない（サーバー側の「触らない」）。
+    expect(JSON.parse(String(init.body))).toEqual({ spoiler: true });
   });
 
   it("opens one messaging socket, sends cursors, and projects message_created", async () => {

@@ -1,5 +1,6 @@
 import type {
   Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -258,6 +259,23 @@ export class ApiMessagingBackend implements MessagingBackend {
       throw new MessagingAPIError(code, response.status);
     }
     return parseAttachment(await response.json());
+  }
+
+  /** 送信前の添付の編集。省略した項目はサーバー側でも「触らない」。 */
+  async updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment> {
+    const body: Record<string, unknown> = {};
+    if (patch.filename !== undefined) body.filename = patch.filename;
+    if (patch.alt !== undefined) body.alt = patch.alt;
+    if (patch.spoiler !== undefined) body.spoiler = patch.spoiler;
+    return parseAttachment(
+      await this.request(
+        `/messaging/attachments/${encodeURIComponent(attachmentId)}`,
+        { method: "PATCH", body },
+      ),
+    );
   }
 
   async editMessage(
@@ -714,6 +732,8 @@ function parseAttachment(value: unknown): Attachment {
     mime: asString(wire.mime),
     size: asSeq(wire.size),
     url: `/messaging/attachments/${encodeURIComponent(attachmentId)}`,
+    spoiler: wire.spoiler === true,
+    alt: typeof wire.alt === "string" ? wire.alt : "",
   };
 }
 

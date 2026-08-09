@@ -97,6 +97,9 @@ class StubBackend implements MessagingBackend {
   async uploadAttachment(): ReturnType<MessagingBackend["uploadAttachment"]> {
     throw new Error("not used");
   }
+  async updateAttachment(): ReturnType<MessagingBackend["updateAttachment"]> {
+    throw new Error("not used");
+  }
   async sendMessage() {
     return { messageId: "m", seq: 1 };
   }

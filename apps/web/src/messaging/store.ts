@@ -4,6 +4,7 @@ import { ApiMessagingBackend } from "./api-backend";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
+  AttachmentDraftPatch,
   ChannelSummary,
   ConnectionState,
   DmSummary,
@@ -102,6 +103,11 @@ interface MessagingState {
   send(content: string, urgency: Urgency, attachments?: Attachment[]): void;
   /** 送信前にファイルを預ける。返ったAttachmentをsendへ渡すまで誰にも見えない。 */
   uploadAttachment(file: File): Promise<Attachment>;
+  /** 送信前の添付を編集する（名前・概要・ネタバレ）。 */
+  updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment>;
   retrySend(clientNonce: string): void;
   startEdit(messageId: string): void;
   cancelEdit(): void;
@@ -787,6 +793,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     uploadAttachment(file) {
       return backend.uploadAttachment(file);
+    },
+
+    updateAttachment(attachmentId, patch) {
+      return backend.updateAttachment(attachmentId, patch);
     },
 
     retrySend(clientNonce) {

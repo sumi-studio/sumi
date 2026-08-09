@@ -415,7 +415,13 @@ impl Tool for MessagingTool {
                 "message visible in it. Declare your own availability with status, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Opening never publishes presence: what others see about your ",
-                "attention is only what you declare."
+                "attention is only what you declare. ",
+                "A message may carry attachments; each one reports filename, mime, ",
+                "size, an `alt` description written by the sender, and `spoiler`. ",
+                "A spoilered attachment is one the sender chose to hide until the ",
+                "reader opens it — treat it as hidden content: refer to it by its ",
+                "alt description and do not reveal what it shows unless the reader ",
+                "asks."
             )
             .to_owned(),
             parameters: messaging_parameters_schema(),
@@ -983,7 +989,12 @@ mod tests {
                 "last_read_seq": 3,
                 "members": [],
                 "messages": [
-                    {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": []},
+                    {"message_id": "m6", "seq": 6, "content": "earlier", "reactions": [],
+                     "attachments": [
+                        {"attachment_id": "a6", "filename": "ending.png",
+                         "mime": "image/png", "size": 2048,
+                         "spoiler": true, "alt": "結末の一枚"}
+                     ]},
                     {"message_id": "m7", "seq": 7, "content": "hello",
                      "reactions": [{"emoji": "👍", "participants": []}]}
                 ]
@@ -1833,5 +1844,44 @@ mod tests {
             api.reacts.lock().await.as_slice(),
             &[("general".to_owned(), "m8".to_owned(), "✅".to_owned())]
         );
+    }
+
+    /// AX/UX 同型性: 送り手が添付に付けた「ネタバレ」と概要は、人間の画面と
+    /// 同じくこの view からも見えなければならない。見えなければ agent は
+    /// 隠されているはずの中身を平然と読み上げてしまう。
+    #[tokio::test]
+    async fn open_shows_the_sender_spoiler_and_alt_on_attachments() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        let output = execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+
+        let attachment = output
+            .details
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("attachments"))
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .expect("open response carries the message's attachments");
+        assert_eq!(attachment.get("spoiler"), Some(&Value::Bool(true)));
+        assert_eq!(
+            attachment.get("alt").and_then(Value::as_str),
+            Some("結末の一枚")
+        );
+
+        // モデルが読むテキストにも同じことが載る（details だけではない）。
+        let UserContent::Text { text } = &output.content[0] else {
+            panic!("messaging tool renders text");
+        };
+        assert!(text.contains("\"spoiler\": true"), "rendered: {text}");
+        assert!(text.contains("結末の一枚"), "rendered: {text}");
     }
 }

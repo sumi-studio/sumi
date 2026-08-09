@@ -77,6 +77,20 @@ export interface Attachment {
   /** バイト数。 */
   size: number;
   url: string;
+  /**
+   * 送り手が「中身を先に見せない」と宣言した添付。受け手の画面ではぼかして
+   * 隠し、開示は受け手の操作に任せる。
+   */
+  spoiler: boolean;
+  /** 中身を見なくても何かが分かる概要（代替テキスト）。無ければ空。 */
+  alt: string;
+}
+
+/** 送信前の添付に対する編集。省略した項目は「触らない」。 */
+export interface AttachmentDraftPatch {
+  filename?: string;
+  alt?: string;
+  spoiler?: boolean;
 }
 
 /**
@@ -90,8 +104,13 @@ const INLINE_IMAGE_MIMES = new Set([
   "image/webp",
 ]);
 
+/** MIME単体の判定。送信前の下書き（まだAttachmentでない）でも使う。 */
+export function isImageMime(mime: string): boolean {
+  return INLINE_IMAGE_MIMES.has(mime.toLowerCase());
+}
+
 export function isImageAttachment(attachment: Attachment): boolean {
-  return INLINE_IMAGE_MIMES.has(attachment.mime.toLowerCase());
+  return isImageMime(attachment.mime);
 }
 
 /** 添付できる1ファイルの上限（20MiB）。サーバーのMaxAttachmentBytesと同値。 */
@@ -377,6 +396,14 @@ export interface MessagingBackend {
    * どのメッセージにも属さず、アップロードした本人にしか見えない。
    */
   uploadAttachment(file: File): Promise<Attachment>;
+  /**
+   * 送信前の添付を編集する（名前・概要・ネタバレ）。送ってしまった添付は
+   * 受け手が見たものが正なので、サーバーが編集を拒む。
+   */
+  updateAttachment(
+    attachmentId: string,
+    patch: AttachmentDraftPatch,
+  ): Promise<Attachment>;
   editMessage(place: Place, messageId: string, content: string): Promise<void>;
   deleteMessage(place: Place, messageId: string): Promise<void>;
   markRead(place: Place, lastReadSeq: number): Promise<void>;

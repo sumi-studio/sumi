@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -24,6 +25,10 @@ const MaxAttachmentsPerMessage = 10
 // MaxAttachmentFilenameBytes matches the schema CHECK on filename.
 const MaxAttachmentFilenameBytes = 255
 
+// MaxAttachmentAltRunes matches the schema CHECK on alt: the description is a
+// sentence about the file, not a second message.
+const MaxAttachmentAltRunes = 1000
+
 // Attachment sentinels. ErrAttachmentNotFound doubles as the authorization
 // failure: an attachment the caller may not see, may not bind, or that never
 // existed are all reported identically, so existence never leaks.
@@ -32,6 +37,9 @@ var (
 	ErrAttachmentTooLarge = errors.New("attachment exceeds the size limit")
 	ErrAttachmentEmpty    = errors.New("attachment has no bytes")
 	ErrTooManyAttachments = errors.New("too many attachments for one message")
+	// ErrAttachmentAlreadySent is a draft edit arriving after the attachment
+	// became part of a message. What was sent is what was sent.
+	ErrAttachmentAlreadySent = errors.New("attachment is already part of a message")
 )
 
 // Attachment is one uploaded file. It is minted unbound (MessageID empty) and
@@ -43,7 +51,22 @@ type Attachment struct {
 	Filename     string
 	MIME         string
 	SizeBytes    int64
-	CreatedAt    time.Time
+	// Spoiler hides the content behind a reveal on the receiving side. It is
+	// the sender's declaration about the file, so it travels with the file and
+	// not with the message text.
+	Spoiler bool
+	// Alt describes the content for someone who cannot or should not see it
+	// yet — a screen reader, or a PersonalityAgent reading the timeline.
+	Alt       string
+	CreatedAt time.Time
+}
+
+// AttachmentDraftPatch edits an attachment that has not been sent yet. A nil
+// field is「触らない」; a non-nil one is the new value.
+type AttachmentDraftPatch struct {
+	Filename *string
+	Alt      *string
+	Spoiler  *bool
 }
 
 // NewAttachmentID mints the identity of an upload. The caller writes the bytes
@@ -119,12 +142,14 @@ func (s *Store) AttachmentForViewer(ctx context.Context, attachmentID string, vi
 	)
 	err := s.pool.QueryRow(ctx,
 		`SELECT a.attachment_id, a.message_id, a.uploader_kind, a.uploader_id,
-		        a.filename, a.mime, a.size_bytes, a.created_at, m.place_id, m.deleted_at
+		        a.filename, a.mime, a.size_bytes, a.spoiler, a.alt, a.created_at,
+		        m.place_id, m.deleted_at
 		 FROM message_attachments a
 		 LEFT JOIN messages m ON m.message_id = a.message_id
 		 WHERE a.attachment_id = $1`, attachmentID).
 		Scan(&att.AttachmentID, &messageID, &kind, &att.Uploader.ID,
-			&att.Filename, &att.MIME, &att.SizeBytes, &att.CreatedAt, &placeID, &deletedAt)
+			&att.Filename, &att.MIME, &att.SizeBytes, &att.Spoiler, &att.Alt,
+			&att.CreatedAt, &placeID, &deletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attachment{}, ErrAttachmentNotFound
 	}
@@ -159,6 +184,70 @@ func (s *Store) AttachmentForViewer(ctx context.Context, attachmentID string, vi
 	return att, nil
 }
 
+// UpdateDraftAttachment edits an upload that has not been sent yet: its display
+// name, its description, and whether it arrives hidden behind a spoiler. The
+// window is deliberately narrow — the uploader's own attachment, still unbound
+// — because these are things you decide *before* pressing send. Once the
+// attachment is part of a message, what the recipients saw is what was sent,
+// so the edit is refused rather than silently rewriting history.
+//
+// An attachment belonging to someone else is reported as missing, never as
+// forbidden, matching AttachmentForViewer: existence never leaks.
+func (s *Store) UpdateDraftAttachment(ctx context.Context, attachmentID string, uploader ParticipantRef, patch AttachmentDraftPatch) (Attachment, error) {
+	if err := uploader.Validate(); err != nil {
+		return Attachment{}, err
+	}
+	if !validAttachmentID(attachmentID) {
+		return Attachment{}, ErrAttachmentNotFound
+	}
+	if patch.Filename != nil {
+		name := strings.TrimSpace(*patch.Filename)
+		if name == "" || len(name) > MaxAttachmentFilenameBytes {
+			return Attachment{}, fmt.Errorf("filename must be 1..%d bytes", MaxAttachmentFilenameBytes)
+		}
+		patch.Filename = &name
+	}
+	if patch.Alt != nil && utf8.RuneCountInString(*patch.Alt) > MaxAttachmentAltRunes {
+		return Attachment{}, fmt.Errorf("alt must be at most %d characters", MaxAttachmentAltRunes)
+	}
+	var (
+		att       Attachment
+		messageID *string
+		kind      string
+	)
+	// COALESCE keeps「触らない」honest: a nil field reads back the stored value
+	// in the same statement that writes the others.
+	err := s.pool.QueryRow(ctx,
+		`UPDATE message_attachments
+		    SET filename = COALESCE($4, filename),
+		        alt      = COALESCE($5, alt),
+		        spoiler  = COALESCE($6, spoiler)
+		  WHERE attachment_id = $1 AND uploader_kind = $2 AND uploader_id = $3
+		    AND message_id IS NULL
+		 RETURNING attachment_id, message_id, uploader_kind, uploader_id,
+		           filename, mime, size_bytes, spoiler, alt, created_at`,
+		attachmentID, uploader.Kind, uploader.ID,
+		patch.Filename, patch.Alt, patch.Spoiler).
+		Scan(&att.AttachmentID, &messageID, &kind, &att.Uploader.ID,
+			&att.Filename, &att.MIME, &att.SizeBytes, &att.Spoiler, &att.Alt,
+			&att.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Either it is not ours / does not exist, or it has already been sent.
+		// Tell those apart only for our own already-sent upload: the person
+		// deserves to know why the edit did not land on their own file.
+		existing, loadErr := s.AttachmentForViewer(ctx, attachmentID, uploader)
+		if loadErr == nil && existing.Uploader == uploader && existing.MessageID != "" {
+			return Attachment{}, ErrAttachmentAlreadySent
+		}
+		return Attachment{}, ErrAttachmentNotFound
+	}
+	if err != nil {
+		return Attachment{}, fmt.Errorf("update attachment: %w", err)
+	}
+	att.Uploader.Kind = ParticipantKind(kind)
+	return att, nil
+}
+
 // bindAttachments binds the author's own unbound attachments to a message in
 // the send transaction. A single UPDATE carries the whole rule: the row must
 // exist, must still be unbound, and must have been uploaded by this author.
@@ -181,9 +270,9 @@ func bindAttachments(ctx context.Context, tx pgx.Tx, messageID string, author Pa
 			`UPDATE message_attachments SET message_id = $1
 			 WHERE attachment_id = $2 AND message_id IS NULL
 			   AND uploader_kind = $3 AND uploader_id = $4
-			 RETURNING filename, mime, size_bytes, created_at`,
+			 RETURNING filename, mime, size_bytes, spoiler, alt, created_at`,
 			messageID, id, author.Kind, author.ID).
-			Scan(&att.Filename, &att.MIME, &att.SizeBytes, &att.CreatedAt)
+			Scan(&att.Filename, &att.MIME, &att.SizeBytes, &att.Spoiler, &att.Alt, &att.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAttachmentNotFound
 		}
@@ -216,7 +305,7 @@ func (s *Store) attachAttachments(ctx context.Context, messages []Message) error
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT message_id, attachment_id, uploader_kind, uploader_id,
-		        filename, mime, size_bytes, created_at
+		        filename, mime, size_bytes, spoiler, alt, created_at
 		 FROM message_attachments
 		 WHERE message_id = ANY($1)
 		 ORDER BY message_id, created_at, attachment_id`, ids)
@@ -231,7 +320,8 @@ func (s *Store) attachAttachments(ctx context.Context, messages []Message) error
 			kind      string
 		)
 		if err := rows.Scan(&messageID, &att.AttachmentID, &kind, &att.Uploader.ID,
-			&att.Filename, &att.MIME, &att.SizeBytes, &att.CreatedAt); err != nil {
+			&att.Filename, &att.MIME, &att.SizeBytes, &att.Spoiler, &att.Alt,
+			&att.CreatedAt); err != nil {
 			return fmt.Errorf("scan attachment: %w", err)
 		}
 		att.MessageID = messageID
