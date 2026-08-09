@@ -194,16 +194,12 @@ func (s *Server) localReact(w http.ResponseWriter, r *http.Request, authorizatio
 		writeStoreError(w, err)
 		return
 	}
-	message, reacted, err := s.Store.ToggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
+	message, reacted, err := s.toggleReaction(r.Context(), request.PlaceID, request.MessageID, viewer, request.Emoji)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	wire := messageToWire(place, message)
-	if s.Hub != nil {
-		update := reactionUpdateToWire(message)
-		s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: request.PlaceID, Reaction: &update})
-	}
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`
 		Reacted bool        `json:"reacted"`

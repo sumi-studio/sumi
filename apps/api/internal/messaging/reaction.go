@@ -18,6 +18,25 @@ type ReactionSummary struct {
 	Participants []ParticipantRef
 }
 
+// toggleReaction serializes the observable mutation boundary: database
+// commit, authoritative snapshot assembly, and live publish. ToggleReaction's
+// row lock alone orders commits, but callers used to publish after it returned;
+// two requests could therefore deliver an older absolute snapshot last.
+func (s *Server) toggleReaction(ctx context.Context, placeID, messageID string, actor ParticipantRef, emoji string) (Message, bool, error) {
+	s.reactionMu.Lock()
+	defer s.reactionMu.Unlock()
+
+	message, reacted, err := s.Store.ToggleReaction(ctx, placeID, messageID, actor, emoji)
+	if err != nil {
+		return Message{}, false, err
+	}
+	if s.Hub != nil {
+		update := reactionUpdateToWire(message)
+		s.Hub.Publish(ctx, Event{Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update})
+	}
+	return message, reacted, nil
+}
+
 // ToggleReaction flips actor × message × emoji: absent becomes present,
 // present becomes absent (人間のUIとagentの道具が同じトグルを同じ経路で使う).
 // The message row is locked for the duration, so concurrent toggles serialize

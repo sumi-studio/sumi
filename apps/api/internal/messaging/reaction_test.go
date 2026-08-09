@@ -248,6 +248,59 @@ func TestReactionToggleOverHTTPReachesWSSubscribersAndCatchUp(t *testing.T) {
 	}
 }
 
+func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanA, "concurrent reactions")
+	hub := NewHub(w.store)
+	server := NewServer(w.store, nil)
+	server.Hub = hub
+	sub := hub.subscribe(w.humanA)
+	sub.markVisible(ch.PlaceID, true)
+	t.Cleanup(func() { hub.unsubscribe(sub) })
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, actor := range []ParticipantRef{w.humanA, w.humanB} {
+		actor := actor
+		go func() {
+			<-start
+			_, _, err := server.toggleReaction(ctx, ch.PlaceID, msg.MessageID, actor, "👍")
+			errs <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent toggle: %v", err)
+		}
+	}
+
+	// Whichever actor wins the lock is the one-participant snapshot. The second
+	// commit must publish the complete two-participant snapshot last.
+	for wantParticipants := 1; wantParticipants <= 2; wantParticipants++ {
+		select {
+		case raw := <-sub.send:
+			var frame struct {
+				Event Event `json:"event"`
+			}
+			if err := json.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("decode reaction event: %v", err)
+			}
+			if frame.Event.Reaction == nil || len(frame.Event.Reaction.Reactions) != 1 {
+				t.Fatalf("reaction event = %+v", frame.Event)
+			}
+			if got := len(frame.Event.Reaction.Reactions[0].Participants); got != wantParticipants {
+				t.Fatalf("published participant count = %d, want %d", got, wantParticipants)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for reaction event")
+		}
+	}
+}
+
 func TestLocalReactTogglesForTheAgent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
@@ -30,6 +31,10 @@ type Server struct {
 	// WebSocket subscribers see messages regardless of which transport
 	// committed them. Nil is fine: durable truth lives in the store.
 	Hub *Hub
+	// reactionMu keeps a reaction commit, its authoritative snapshot and the
+	// corresponding live publish in one process-local order. Hub itself is
+	// process-local, so this is the ordering boundary clients can observe.
+	reactionMu sync.Mutex
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -150,11 +155,10 @@ func reactionsToWire(summaries []ReactionSummary) []reactionWire {
 
 // reactionUpdateWire is the reaction_updated payload: the message identity plus
 // its complete reaction set. It deliberately omits content, mentions and
-// edited_at. ToggleReaction releases the message row lock at commit, so an edit
-// can commit and publish while this event is still being assembled; a full
-// message here would arrive late with pre-edit content and roll the edit back
-// on every live client. Reactions are an absolute set, so a late reaction
-// payload only costs a redundant repaint.
+// edited_at. An edit can commit while this event is being assembled; a full
+// message here could then arrive late with pre-edit content and roll the edit
+// back on every live client. Reaction snapshots are absolute, and
+// Server.toggleReaction publishes them in commit order for the local Hub.
 type reactionUpdateWire struct {
 	MessageID string         `json:"message_id"`
 	Reactions []reactionWire `json:"reactions"`
@@ -739,7 +743,7 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 	)
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		msg, reacted, opErr = s.Store.ToggleReaction(
+		msg, reacted, opErr = s.toggleReaction(
 			r.Context(), placeID, r.PathValue("message_id"), viewer, req.Emoji)
 		return opErr
 	})
@@ -750,8 +754,6 @@ func (s *Server) serveToggleReaction(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	update := reactionUpdateToWire(msg)
-	s.Hub.Publish(r.Context(), Event{Type: EventReactionUpdated, PlaceID: placeID, Reaction: &update})
 	writeJSON(w, http.StatusOK, struct {
 		Message messageWire `json:"message"`
 		Reacted bool        `json:"reacted"`

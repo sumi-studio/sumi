@@ -74,6 +74,32 @@ describe("reaction convergence in the messaging store", () => {
     harness.emit({ type: "caught_up", place });
     await harness.settle();
     expect(useMessaging.getState().messagesByPlace[placeKey]).toBe(stable);
+
+    // loadOlderで200件を超えていても、最古のロード済みmessageまで
+    // before_seqで遡り、切断中にreactionを落としたままにしない。
+    const loaded = Array.from({ length: 205 }, (_, index) =>
+      message(index + 1, `message ${index + 1}`),
+    );
+    harness.history = loaded.map((entry) =>
+      entry.seq === 1
+        ? {
+            ...entry,
+            reactions: [{ emoji: "👀", participants: [self] }],
+          }
+        : entry,
+    );
+    harness.fetches.length = 0;
+    useMessaging.setState({ messagesByPlace: { [placeKey]: loaded } });
+    harness.emit({ type: "caught_up", place });
+    await harness.settle();
+
+    expect(harness.fetches).toEqual([
+      { beforeSeq: 206, limit: 200 },
+      { beforeSeq: 6, limit: 5 },
+    ]);
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.reactions,
+    ).toEqual([{ emoji: "👀", participants: [self] }]);
   });
 });
 
@@ -152,7 +178,10 @@ class StubBackend implements MessagingBackend {
     options: { beforeSeq?: number; limit?: number } = {},
   ): Promise<Message[]> {
     this.fetches.push(options);
-    return this.history;
+    const beforeSeq = options.beforeSeq ?? Number.POSITIVE_INFINITY;
+    const limit = options.limit ?? 50;
+    const eligible = this.history.filter((entry) => entry.seq < beforeSeq);
+    return eligible.slice(Math.max(0, eligible.length - limit));
   }
 
   sendMessage = vi.fn();

@@ -27,7 +27,7 @@ import { mergeMessages, upsertMessage } from "./timeline";
 
 const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
-/** 再接続時にreactionを読み直すmessage数の上限（serverの1ページ上限と同じ）。 */
+/** reaction再同期の1ページ上限（serverの上限と同じ）。 */
 const REACTION_RESYNC_LIMIT = 200;
 
 /** reactionの同一判定用。無変化ならmessageの参照を保って再描画を避ける。 */
@@ -144,19 +144,35 @@ export const useMessaging = create<MessagingState>((set, get) => {
   /**
    * ロード済み範囲のreactionを読み直して収束させる。catch-upはcursorより後の
    * messageしかreplayしないので、切断中やHub overflowで落ちたreaction eventは
-   * 二度と届かない。再接続のたびに直近のロード済みwindowを読み直す。
+   * 二度と届かない。再接続のたびにロード済みwindow全体を
+   * serverの上限ごとに遡って読み直す。
    */
   const resyncReactions = async (place: Place) => {
     const key = placeKey(place);
     const loaded = get().messagesByPlace[key];
     if (!loaded || loaded.length === 0) return;
-    const fresh = await backend.fetchMessages(place, {
-      beforeSeq: loaded[loaded.length - 1].seq + 1,
-      limit: Math.min(loaded.length, REACTION_RESYNC_LIMIT),
-    });
-    const reactionsById = new Map(
-      fresh.map((message) => [message.messageId, message.reactions]),
-    );
+    const reactionsById = new Map<string, ReactionSummary[]>();
+    const oldestLoadedSeq = loaded[0].seq;
+    let beforeSeq = loaded[loaded.length - 1].seq + 1;
+    let remaining = loaded.length;
+    while (remaining > 0) {
+      const limit = Math.min(remaining, REACTION_RESYNC_LIMIT);
+      const fresh = await backend.fetchMessages(place, { beforeSeq, limit });
+      if (fresh.length === 0) break;
+      for (const message of fresh) {
+        reactionsById.set(message.messageId, message.reactions);
+      }
+      const nextBeforeSeq = fresh[0].seq;
+      if (
+        nextBeforeSeq <= oldestLoadedSeq ||
+        nextBeforeSeq >= beforeSeq ||
+        fresh.length < limit
+      ) {
+        break;
+      }
+      beforeSeq = nextBeforeSeq;
+      remaining -= fresh.length;
+    }
     set((state) => {
       const current = state.messagesByPlace[key];
       if (!current) return {};
