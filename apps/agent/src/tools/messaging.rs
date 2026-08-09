@@ -15,9 +15,11 @@ use tokio::sync::Mutex;
 
 use crate::{
     apiclient::messaging::{
-        CreateMessagingReplyLaterRequest, MessagingApi, OpenMessagingPlaceRequest,
-        ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, WriteMessagingMessageRequest,
+        CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+        DuplicateMessagingChannelRequest, MessagingApi, MessagingParticipant,
+        OpenMessagingPlaceRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
+        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+        UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -30,6 +32,15 @@ const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_REPLY_ID_BYTES: usize = 256;
 const MAX_MESSAGE_ID_BYTES: usize = 256;
 const MAX_MARKER_ID_BYTES: usize = 256;
+const MAX_PARTICIPANT_ID_BYTES: usize = 256;
+const MAX_WORKSPACE_ID_BYTES: usize = 256;
+// The server bounds a channel name at 200 characters and a topic at 1000
+// bytes; four bytes per character covers any UTF-8 within the name bound.
+const MAX_CHANNEL_NAME_BYTES: usize = 800;
+const MAX_TOPIC_BYTES: usize = 1000;
+// A group dm the agent opens in one gesture. Far beyond any real conversation,
+// tight enough that a malformed argument cannot fan out.
+const MAX_DM_PARTICIPANTS: usize = 32;
 // The server bounds emoji at 32 characters; 128 bytes covers any such UTF-8.
 const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
@@ -70,6 +81,9 @@ enum MessagingAction {
     },
     /// Declare one's own attention state.  Unlike every other action this one
     /// is not about a place: it is about the person, so no view need be open.
+    /// With `expires_in_minutes` the state is temporary and lapses back to
+    /// whatever was declared before it, so「1時間だけ取り込み中」does not have to
+    /// be undone by hand.
     Status {
         status: MessagingStatus,
         #[serde(default)]
@@ -91,6 +105,37 @@ enum MessagingAction {
     /// Mark one's own earlier promise as kept.  Like the human's reply-later
     /// list this is reachable from anywhere, not only from the place.
     ResolveReplyLater { marker_id: String },
+    /// Open a direct conversation with one person (a dm) or several (a group
+    /// dm), exactly like the human sidebar's「ダイレクトメッセージを開始」.
+    /// The new place becomes the one in view, as it does for a human who is
+    /// taken into the conversation they just opened.
+    StartDm {
+        participants: Vec<MessagingParticipant>,
+    },
+    /// Open a channel in the workspace, as the sidebar's「チャンネルを作成」
+    /// does.  The new channel becomes the place in view.
+    CreateChannel {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// Rename a channel, retopic it, or both.  An omitted field is left alone.
+    UpdateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    /// Copy a channel's name and topic into a new, empty channel.  The copy
+    /// carries no messages: it is a fresh place shaped like the original.
+    DuplicateChannel {
+        place_id: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -174,15 +219,19 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id. Write, react and reply_later act on the place most recently opened in ",
-            "this tool view; status and resolve_reply_later need no open place."
+            "marker_id; start_dm requires participants; create_channel requires name and may ",
+            "include topic or workspace_id; update_channel requires place_id plus name, topic or ",
+            "both; duplicate_channel requires place_id and may include name. Write, react and ",
+            "reply_later act on the place most recently opened in this tool view; every other ",
+            "action needs no open place."
         ),
         "properties": {
             "action": {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later"
+                    "status", "reply_later", "resolve_reply_later", "start_dm",
+                    "create_channel", "update_channel", "duplicate_channel"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -190,12 +239,41 @@ fn messaging_parameters_schema() -> Value {
                     "the currently open place; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept."
+                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "start_dm opens a direct conversation with one person, or a group ",
+                    "conversation with several, and puts it in view; create_channel opens a new ",
+                    "channel and puts it in view; update_channel renames or retopics a channel; ",
+                    "duplicate_channel copies a channel's name and topic into a new empty one."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open and omitted for other actions. The place to open."
+                "description": concat!(
+                    "Required for open, update_channel and duplicate_channel; omitted for other ",
+                    "actions. The place to open, edit or copy."
+                )
+            },
+            "name": {
+                "type": "string",
+                "description": concat!(
+                    "Required for create_channel; optional for update_channel and ",
+                    "duplicate_channel; omitted for other actions. The channel's name. For ",
+                    "duplicate_channel, omitting it takes the derived default name for a copy."
+                )
+            },
+            "topic": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for create_channel and update_channel, omitted for other actions. ",
+                    "The one line describing what the channel is for."
+                )
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for create_channel and omitted for other actions. Which workspace ",
+                    "to open the channel in; when omitted, the workspace you are in is used."
+                )
             },
             "before_seq": {
                 "type": "integer",
@@ -249,7 +327,9 @@ fn messaging_parameters_schema() -> Value {
                 "enum": ["available", "busy", "away"],
                 "description": concat!(
                     "Required for status and omitted for other actions. Your own availability, ",
-                    "which you declare; nothing about you is published automatically."
+                    "which you declare; nothing about you is published automatically. These are ",
+                    "the only three states: there is no offline or invisible, because nothing ",
+                    "about your presence is observed in the first place."
                 )
             },
             "note": {
@@ -265,7 +345,9 @@ fn messaging_parameters_schema() -> Value {
                 "maximum": 10080,
                 "description": concat!(
                     "Optional for status and omitted for other actions. Minutes until the status ",
-                    "lapses on its own; when omitted it holds until you replace it."
+                    "lapses on its own, returning you to whatever you had declared before it — ",
+                    "use it for a state that is only true for a while (\"busy for the next ",
+                    "hour\"). When omitted the status holds until you replace it."
                 )
             },
             "remind_in_minutes": {
@@ -284,6 +366,36 @@ fn messaging_parameters_schema() -> Value {
                     "Required for resolve_reply_later and omitted for other actions. The ",
                     "marker_id returned when you made the promise."
                 )
+            },
+            "participants": {
+                "type": "array",
+                "maxItems": 32,
+                "description": concat!(
+                    "Required for start_dm and omitted for other actions. The people to open the ",
+                    "conversation with, each copied from the participant object overview showed ",
+                    "for that member. Do not list yourself. One entry opens the single direct ",
+                    "conversation with that person; several open a group conversation."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["human", "personality_agent"],
+                            "description": "Which kind of participant this is."
+                        },
+                        "human_id": {
+                            "type": "string",
+                            "description": "Required when kind is human, omitted otherwise."
+                        },
+                        "personality_agent_id": {
+                            "type": "string",
+                            "description": "Required when kind is personality_agent, omitted otherwise."
+                        }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }
             }
         },
         "required": ["action"],
@@ -300,7 +412,8 @@ impl Tool for MessagingTool {
                 "Use Sumi's shared messaging app as a person. Start with overview, ",
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
-                "message visible in it. Declare your own availability with status. ",
+                "message visible in it. Declare your own availability with status, or ",
+                "open a new direct or group conversation with start_dm. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare."
             )
@@ -477,6 +590,70 @@ impl Tool for MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::StartDm { participants } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.start_dm(StartMessagingDMRequest {
+                        participants: &participants,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                // A human who starts a conversation lands in it. Focus the new
+                // place so writing needs no second gesture; nothing has been
+                // seen there yet, so the screen starts empty.
+                if let Some(dm_id) = response
+                    .get("dm")
+                    .and_then(|dm| dm.get("dm_id"))
+                    .and_then(Value::as_str)
+                {
+                    state.focused_place_id = Some(dm_id.to_owned());
+                    state.pending_read_through = None;
+                    state.visible_messages.clear();
+                }
+                response
+            }
+            MessagingAction::CreateChannel {
+                name,
+                topic,
+                workspace_id,
+            } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_channel(CreateMessagingChannelRequest {
+                        workspace_id: workspace_id.as_deref(),
+                        name: &name,
+                        topic: topic.as_deref(),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                focus_created_channel(&mut state, &response);
+                response
+            }
+            MessagingAction::UpdateChannel {
+                place_id,
+                name,
+                topic,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.update_channel(UpdateMessagingChannelRequest {
+                    place_id: &place_id,
+                    name: name.as_deref(),
+                    topic: topic.as_deref(),
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::DuplicateChannel { place_id, name } => {
+                let response = tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.duplicate_channel(DuplicateMessagingChannelRequest {
+                        place_id: &place_id,
+                        name: name.as_deref(),
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?;
+                focus_created_channel(&mut state, &response);
+                response
+            }
         };
 
         let rendered = serde_json::to_string_pretty(&response)
@@ -487,6 +664,22 @@ impl Tool for MessagingTool {
             is_error: false,
         })
     }
+}
+
+/// A channel that was just created becomes the place in view, the way a human
+/// lands in the channel they made. Nothing has been seen there, so the screen
+/// starts empty (ADR 0011 §3: 見えていないものは操作できない).
+fn focus_created_channel(state: &mut MessagingViewState, response: &Value) {
+    let Some(channel_id) = response
+        .get("channel")
+        .and_then(|channel| channel.get("channel_id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    state.focused_place_id = Some(channel_id.to_owned());
+    state.pending_read_through = None;
+    state.visible_messages.clear();
 }
 
 fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
@@ -552,7 +745,76 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         MessagingAction::ResolveReplyLater { marker_id } => {
             validate_bounded_nonempty(marker_id, MAX_MARKER_ID_BYTES)
         }
+        MessagingAction::StartDm { participants } => validate_dm_participants(participants),
+        MessagingAction::CreateChannel {
+            name,
+            topic,
+            workspace_id,
+        } => {
+            validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES)?;
+            validate_optional_note(topic, MAX_TOPIC_BYTES)?;
+            if workspace_id.as_deref().is_some_and(|workspace| {
+                validate_bounded_nonempty(workspace, MAX_WORKSPACE_ID_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        MessagingAction::UpdateChannel {
+            place_id,
+            name,
+            topic,
+        } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            // Naming nothing is not an edit; it would be a silent no-op that
+            // reads to the model as a successful rename.
+            if name.is_none() && topic.is_none() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_note(topic, MAX_TOPIC_BYTES)
+        }
+        MessagingAction::DuplicateChannel { place_id, name } => {
+            validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
+            if name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
     }
+}
+
+/// The people a conversation is opened with. Each is named in the shape
+/// overview already showed, and each names exactly one identity: a kind
+/// without its matching id (or with the other kind's id) is not a person.
+fn validate_dm_participants(participants: &[MessagingParticipant]) -> Result<(), ToolError> {
+    if participants.is_empty() || participants.len() > MAX_DM_PARTICIPANTS {
+        return Err(ToolError::InvalidArguments);
+    }
+    let mut seen = Vec::with_capacity(participants.len());
+    for participant in participants {
+        let id = match (
+            participant.kind.as_str(),
+            participant.human_id.as_deref(),
+            participant.personality_agent_id.as_deref(),
+        ) {
+            ("human", Some(id), None) | ("personality_agent", None, Some(id)) => id,
+            _ => return Err(ToolError::InvalidArguments),
+        };
+        validate_bounded_nonempty(id, MAX_PARTICIPANT_ID_BYTES)?;
+        let key = format!("{}:{id}", participant.kind);
+        if seen.contains(&key) {
+            return Err(ToolError::InvalidArguments);
+        }
+        seen.push(key);
+    }
+    Ok(())
 }
 
 /// Exactly one selector: the gesture lands on one visible message. React and
@@ -698,6 +960,8 @@ mod tests {
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
+        started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
+        channels: AsyncMutex<Vec<(String, String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
 
@@ -805,6 +1069,75 @@ mod tests {
             Ok(json!({"marker": {"marker_id": request.marker_id, "resolved": true}}))
         }
 
+        async fn create_channel(
+            &self,
+            request: CreateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("create_channel:{}", request.name));
+            self.channels.lock().await.push((
+                "create".to_owned(),
+                request.name.to_owned(),
+                request.topic.map(str::to_owned),
+            ));
+            Ok(
+                json!({"channel": {"channel_id": "ch-new", "name": request.name,
+                                  "topic": request.topic.unwrap_or("")}}),
+            )
+        }
+
+        async fn update_channel(
+            &self,
+            request: UpdateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("update_channel:{}", request.place_id));
+            self.channels.lock().await.push((
+                format!("update:{}", request.place_id),
+                request.name.unwrap_or("").to_owned(),
+                request.topic.map(str::to_owned),
+            ));
+            Ok(json!({"channel": {"channel_id": request.place_id,
+                                  "name": request.name.unwrap_or("general")}}))
+        }
+
+        async fn duplicate_channel(
+            &self,
+            request: DuplicateMessagingChannelRequest<'_>,
+        ) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("duplicate_channel:{}", request.place_id));
+            self.channels.lock().await.push((
+                format!("duplicate:{}", request.place_id),
+                request.name.unwrap_or("").to_owned(),
+                None,
+            ));
+            Ok(json!({"channel": {"channel_id": "ch-copy", "name": "general のコピー"}}))
+        }
+
+        async fn start_dm(&self, request: StartMessagingDMRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("start_dm".to_owned());
+            self.started_dms
+                .lock()
+                .await
+                .push(request.participants.to_vec());
+            let group = request.participants.len() > 1;
+            Ok(json!({
+                "dm": {
+                    "dm_id": if group { "gdm-1" } else { "dm-1" },
+                    "kind": if group { "group_dm" } else { "dm" },
+                    "participants": []
+                },
+                "created": true
+            }))
+        }
+
         async fn read_through(&self, request: ReadMessagingThroughRequest<'_>) -> Result<Value> {
             if self.failures.lock().await.pop_front() == Some("read") {
                 return Err(anyhow!("read failed"));
@@ -893,7 +1226,11 @@ mod tests {
                 "react",
                 "status",
                 "reply_later",
-                "resolve_reply_later"
+                "resolve_reply_later",
+                "start_dm",
+                "create_channel",
+                "update_channel",
+                "duplicate_channel"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -912,6 +1249,14 @@ mod tests {
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
+        assert_eq!(schema["properties"]["participants"]["type"], "array");
+        for field in ["name", "topic", "workspace_id"] {
+            assert_eq!(schema["properties"][field]["type"], "string");
+        }
+        assert_eq!(
+            schema["properties"]["participants"]["items"]["properties"]["kind"]["enum"],
+            json!(["human", "personality_agent"])
+        );
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -921,7 +1266,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            15
+            19
         );
     }
 
@@ -1324,6 +1669,139 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.resolutions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_dm_opens_the_conversation_and_puts_it_in_view() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // One person: the single direct conversation, and the agent lands in
+        // it — writing needs no separate open, exactly as a human is taken
+        // into the conversation they just started.
+        execute(
+            &tool,
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "human", "human_id": "h-haru"}]}),
+            "dm",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "はじめまして"}),
+            "w1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "dm-1");
+
+        // Several people: a group conversation, which becomes the place in view.
+        execute(
+            &tool,
+            json!({"action": "start_dm", "participants": [
+                {"kind": "human", "human_id": "h-haru"},
+                {"kind": "personality_agent", "personality_agent_id": "a-kuro"}
+            ]}),
+            "gdm",
+        )
+        .await
+        .unwrap();
+        execute(&tool, json!({"action": "write", "content": "3人で"}), "w2")
+            .await
+            .unwrap();
+        assert_eq!(api.writes.lock().await[1].0, "gdm-1");
+        assert_eq!(api.started_dms.lock().await.len(), 2);
+
+        // Nothing has been seen in a place just opened, so there is nothing to
+        // react to there yet.
+        let error = execute(
+            &tool,
+            json!({"action": "react", "seq": 7, "emoji": "👍"}),
+            "react",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
+
+        // A participant must name exactly one identity, and nobody twice.
+        for arguments in [
+            json!({"action": "start_dm", "participants": []}),
+            json!({"action": "start_dm", "participants": [{"kind": "human"}]}),
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "human", "personality_agent_id": "a-kuro"}]}),
+            json!({"action": "start_dm", "participants": [
+                {"kind": "human", "human_id": "h-haru"},
+                {"kind": "human", "human_id": "h-haru"}
+            ]}),
+            json!({"action": "start_dm",
+                   "participants": [{"kind": "app", "human_id": "h-haru"}]}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.started_dms.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_matches_the_human_context_menu() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // Creating a channel lands the agent in it, as a human is taken into
+        // the channel they just made.
+        execute(
+            &tool,
+            json!({"action": "create_channel", "name": "設計", "topic": "図面の相談"}),
+            "create",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "write", "content": "ここで話します"}),
+            "w",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.writes.lock().await[0].0, "ch-new");
+
+        execute(
+            &tool,
+            json!({"action": "update_channel", "place_id": "ch-new", "topic": "図面と素材"}),
+            "update",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "duplicate_channel", "place_id": "ch-new"}),
+            "duplicate",
+        )
+        .await
+        .unwrap();
+        let channels = api.channels.lock().await.clone();
+        assert_eq!(channels[0].0, "create");
+        assert_eq!(channels[0].1, "設計");
+        assert_eq!(channels[1].0, "update:ch-new");
+        assert_eq!(channels[1].2, Some("図面と素材".to_owned()));
+        assert_eq!(channels[2].0, "duplicate:ch-new");
+        // The copy's name is the server's to derive; the tool does not invent
+        // its own so the two sides cannot disagree about what a copy is called.
+        assert_eq!(channels[2].1, "");
+
+        for arguments in [
+            json!({"action": "create_channel"}),
+            json!({"action": "create_channel", "name": ""}),
+            // An edit that names nothing is a silent no-op that reads as success.
+            json!({"action": "update_channel", "place_id": "ch-new"}),
+            json!({"action": "update_channel", "place_id": "ch-new", "name": ""}),
+            json!({"action": "duplicate_channel"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.channels.lock().await.len(), 3);
     }
 
     #[tokio::test]

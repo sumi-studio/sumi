@@ -60,6 +60,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/group-dms", s.serveCreateGroupDM)
 	mux.HandleFunc("GET /messaging/places/{place_id}", s.servePlace)
 	mux.HandleFunc("PATCH /messaging/places/{place_id}", s.serveUpdatePlace)
+	mux.HandleFunc("POST /messaging/places/{place_id}/duplicate", s.serveDuplicatePlace)
 	mux.HandleFunc("GET /messaging/places/{place_id}/messages", s.serveHistory)
 	mux.HandleFunc("GET /messaging/search", s.serveSearch)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages", s.serveSend)
@@ -272,12 +273,19 @@ type readMarkerWire struct {
 	LastReadSeq int64     `json:"last_read_seq"`
 }
 
-// statusWire matches the web model's ParticipantStatus.
+// statusWire matches the web model's ParticipantStatus. A cleared status (a
+// temporary one that lapsed with nothing behind it) travels with an empty
+// status: the participant is no longer saying anything about their attention,
+// which is different from saying they are available.
 type statusWire struct {
 	Participant participantWire `json:"participant"`
 	Status      string          `json:"status"`
 	Note        string          `json:"note"`
 	ExpiresAt   *time.Time      `json:"expires_at"`
+	// What this temporary status lapses back to. Empty means the lapse ends
+	// the declaration instead of restoring an earlier one.
+	BaseStatus string `json:"base_status"`
+	BaseNote   string `json:"base_note"`
 }
 
 func statusToWire(status ParticipantStatus) statusWire {
@@ -286,6 +294,8 @@ func statusToWire(status ParticipantStatus) statusWire {
 		Status:      status.Status,
 		Note:        status.Note,
 		ExpiresAt:   status.ExpiresAt,
+		BaseStatus:  status.BaseStatus,
+		BaseNote:    status.BaseNote,
 	}
 }
 
@@ -443,6 +453,41 @@ func (s *Server) publishStatus(ctx context.Context, status ParticipantStatus) {
 	subject := status.Participant
 	wire := statusToWire(status)
 	s.Hub.Publish(ctx, Event{Type: EventStatusUpdated, Subject: &subject, Status: &wire})
+}
+
+// DefaultStatusExpiryInterval is how often lapsed temporary statuses are swept.
+// Readers already resolve expiry themselves, so this only bounds how late the
+// live announcement is — a minute of lag on「1時間だけ取り込み中」is invisible,
+// and a tighter loop would buy nothing but wakeups.
+const DefaultStatusExpiryInterval = time.Minute
+
+// RunStatusExpiry sweeps lapsed temporary statuses until ctx is done,
+// announcing each participant's restored state over the socket so a screen
+// left open stops showing「取り込み中」after it stopped being true. Expiry is
+// still resolved at read time, so this loop is liveness, not correctness: it
+// can be skipped entirely without any reader seeing a stale declaration.
+func (s *Server) RunStatusExpiry(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultStatusExpiryInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			statuses, err := s.Store.ExpireStatuses(ctx)
+			if err != nil {
+				// Best effort: readers still resolve expiry themselves, and
+				// the next tick retries.
+				continue
+			}
+			for _, status := range statuses {
+				s.publishStatus(ctx, status)
+			}
+		}
+	}
 }
 
 type unreadSummaryWire struct {
@@ -665,7 +710,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Name == "" || len(req.Name) > 200 {
+	if req.Name == "" || utf8.RuneCountInString(req.Name) > MaxChannelNameChars {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
@@ -691,26 +736,36 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, wire)
 }
 
-// serveUpdatePlace edits a channel's mutable fields (v0: topic only).
+// serveUpdatePlace edits a channel's mutable identity: name, topic, or both.
+// An omitted field is left alone, so renaming a channel never clears its topic.
 func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	viewer, claims, ok := s.viewer(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		Topic string `json:"topic"`
+		Name  *string `json:"name"`
+		Topic *string `json:"topic"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if len(req.Topic) > maxTopicBytes {
+	if req.Name == nil && req.Topic == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if req.Name != nil && (*req.Name == "" || utf8.RuneCountInString(*req.Name) > MaxChannelNameChars) {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	if req.Topic != nil && len(*req.Topic) > maxTopicBytes {
 		writeError(w, http.StatusBadRequest, "invalid_topic")
 		return
 	}
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.UpdateChannelTopic(r.Context(), r.PathValue("place_id"), req.Topic, viewer)
+		place, opErr = s.Store.UpdateChannel(r.Context(), r.PathValue("place_id"), req.Name, req.Topic, viewer)
 		return opErr
 	})
 	if !done {
@@ -723,6 +778,42 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	wire := channelToWire(place)
 	s.Hub.Publish(r.Context(), Event{Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire})
 	writeJSON(w, http.StatusOK, wire)
+}
+
+// serveDuplicatePlace creates a new channel beside an existing one. An omitted
+// or empty name takes the server's derived default, so the human menu and the
+// agent tool produce the same copy.
+func (s *Server) serveDuplicatePlace(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > MaxChannelNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_name")
+		return
+	}
+	var place Place
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		place, opErr = s.Store.DuplicateChannel(r.Context(), r.PathValue("place_id"), req.Name, viewer)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, Channel: &wire})
+	writeJSON(w, http.StatusCreated, wire)
 }
 
 func (s *Server) serveEnsureDM(w http.ResponseWriter, r *http.Request) {
@@ -1130,14 +1221,17 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	switch req.Status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(req.Status) {
 		writeError(w, http.StatusBadRequest, "invalid_status")
 		return
 	}
 	if utf8.RuneCountInString(req.Note) > MaxStatusNoteChars {
 		writeError(w, http.StatusBadRequest, "invalid_note")
+		return
+	}
+	// An expiry already in the past would be a status nobody ever holds.
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "invalid_expires_at")
 		return
 	}
 	var status ParticipantStatus
@@ -1622,6 +1716,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
 	case errors.Is(err, ErrNotAChannel):
 		writeError(w, http.StatusBadRequest, "not_a_channel")
+	case errors.Is(err, ErrInvalidChannelName):
+		writeError(w, http.StatusBadRequest, "invalid_name")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

@@ -363,6 +363,8 @@ export class MockMessagingServer implements MessagingBackend {
       status: "busy",
       note: "デプロイ対応中",
       expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
     });
   }
 
@@ -531,15 +533,30 @@ export class MockMessagingServer implements MessagingBackend {
     return dm;
   }
 
-  async updateChannelTopic(
+  async updateChannel(
     channelId: string,
-    topic: string,
+    input: { name?: string; topic?: string },
   ): Promise<ChannelSummary> {
     const channel = CHANNELS.find((entry) => entry.channelId === channelId);
     if (!channel) throw new Error("unknown channel");
-    channel.topic = topic;
+    if (input.name !== undefined) channel.name = input.name;
+    if (input.topic !== undefined) channel.topic = input.topic;
     this.emit({ type: "place_updated", channel });
     return channel;
+  }
+
+  async duplicateChannel(
+    channelId: string,
+    name?: string,
+  ): Promise<ChannelSummary> {
+    const source = CHANNELS.find((entry) => entry.channelId === channelId);
+    if (!source) throw new Error("unknown channel");
+    // 名前の既定は実サーバーと同じ導出（「〜 のコピー」）。中身は運ばない。
+    return this.createChannel(
+      source.workspaceId,
+      name?.trim() || `${source.name} のコピー`,
+      source.topic,
+    );
   }
 
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
@@ -637,15 +654,58 @@ export class MockMessagingServer implements MessagingBackend {
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
   }
 
-  async setStatus(status: StatusKind, note: string): Promise<void> {
+  async setStatus(
+    status: StatusKind,
+    note: string,
+    expiresAt: number | null = null,
+  ): Promise<void> {
+    const key = participantKey(SELF);
+    const current = this.statuses.get(key);
+    // 一時ステータスは「その前に言っていたこと」を覚えて、期限で戻る。
+    // 一時の上に一時を重ねても、下にある恒久の宣言は埋もれない。
+    const base =
+      expiresAt === null
+        ? null
+        : current?.expiresAt !== null && current?.expiresAt !== undefined
+          ? current.baseStatus
+            ? { status: current.baseStatus, note: current.baseNote }
+            : null
+          : current
+            ? { status: current.status, note: current.note }
+            : null;
     const next: ParticipantStatus = {
       participant: SELF,
       status,
       note,
-      expiresAt: null,
+      expiresAt,
+      baseStatus: base?.status ?? null,
+      baseNote: base?.note ?? "",
     };
-    this.statuses.set(participantKey(SELF), next);
+    this.statuses.set(key, next);
     this.emit({ type: "status_updated", status: next });
+    if (expiresAt === null) return;
+    window.setTimeout(
+      () => {
+        // 期限が来ても、途中で置き換えられていたら何もしない。
+        if (this.statuses.get(key) !== next) return;
+        if (next.baseStatus === null) {
+          this.statuses.delete(key);
+          this.emit({ type: "status_cleared", participant: SELF });
+          return;
+        }
+        const restored: ParticipantStatus = {
+          participant: SELF,
+          status: next.baseStatus,
+          note: next.baseNote,
+          expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
+        };
+        this.statuses.set(key, restored);
+        this.emit({ type: "status_updated", status: restored });
+      },
+      Math.max(0, expiresAt - Date.now()),
+    );
   }
 
   async createReplyLater(
@@ -853,6 +913,8 @@ export class MockMessagingServer implements MessagingBackend {
           status: "available",
           note: "",
           expiresAt: null,
+          baseStatus: null,
+          baseNote: "",
         };
         this.statuses.set(participantKey(persona.ref), status);
         this.emit({ type: "status_updated", status });

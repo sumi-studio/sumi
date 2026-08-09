@@ -89,7 +89,12 @@ interface MessagingState {
   createChannel(name: string, topic: string): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
-  updateChannelTopic(channelId: string, topic: string): Promise<void>;
+  updateChannel(
+    channelId: string,
+    input: { name?: string; topic?: string },
+  ): Promise<void>;
+  /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
+  duplicateChannel(channelId: string): Promise<PlaceKey>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
   /** 可視なplace全体の本文検索。結果はUI局所状態で持ち、storeには残さない。 */
   searchMessages(query: string): Promise<MessageSearchResult[]>;
@@ -104,7 +109,7 @@ interface MessagingState {
   deleteMessage(messageId: string): void;
   setReplyTarget(messageId: string | null): void;
   noteReadUpTo(key: PlaceKey, seq: number): void;
-  setStatus(status: StatusKind, note: string): void;
+  setStatus(status: StatusKind, note: string, expiresAt?: number | null): void;
   setPlaceNotificationLevel(key: PlaceKey, level: NotificationLevel): void;
   setNotificationDefaultLevel(level: NotificationLevel): void;
   setNotificationKeywords(keywords: string[]): void;
@@ -368,6 +373,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
           [participantKey(event.status.participant)]: event.status,
         },
       }));
+      return;
+    }
+    if (event.type === "status_cleared") {
+      // 宣言が終わった。「対応可能」に書き換えるのではなく、何も無い状態へ戻す。
+      set((state) => {
+        const key = participantKey(event.participant);
+        if (!(key in state.statusByKey)) return {};
+        const statusByKey = { ...state.statusByKey };
+        delete statusByKey[key];
+        return { statusByKey };
+      });
       return;
     }
     if (event.type === "reply_later_created") {
@@ -689,13 +705,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return placeKey({ kind: dm.kind, dmId: dm.dmId });
     },
 
-    async updateChannelTopic(channelId, topic) {
-      const channel = await backend.updateChannelTopic(channelId, topic);
+    async updateChannel(channelId, input) {
+      const channel = await backend.updateChannel(channelId, input);
       set((state) => ({
         channels: state.channels.map((entry) =>
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+    },
+
+    async duplicateChannel(channelId) {
+      const channel = await backend.duplicateChannel(channelId);
+      set((state) =>
+        state.channels.some((entry) => entry.channelId === channel.channelId)
+          ? {}
+          : { channels: [...state.channels, channel] },
+      );
+      return placeKey({ kind: "channel", channelId: channel.channelId });
     },
 
     async loadPlaceAround(key, seq) {
@@ -841,8 +867,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void backend.markRead(place, seq);
     },
 
-    setStatus(status, note) {
-      void backend.setStatus(status, note).catch(() => undefined);
+    setStatus(status, note, expiresAt = null) {
+      void backend.setStatus(status, note, expiresAt).catch(() => undefined);
     },
 
     setPlaceNotificationLevel(key, level) {

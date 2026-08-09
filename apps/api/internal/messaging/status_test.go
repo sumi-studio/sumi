@@ -54,26 +54,24 @@ func TestStatusIsReplacedInPlaceAndExpiresAtReadTime(t *testing.T) {
 		t.Fatalf("statuses = %d, want exactly one row per participant", n)
 	}
 
-	// An already-expired status is simply not reported: expiry is a read-time
-	// filter, so no sweeper can disagree with what readers see.
+	// An already-expired status is never reported as itself: expiry is resolved
+	// at read time, so no sweeper can disagree with what readers see. Since
+	// 0017 the lapse restores what the participant had said before (here the
+	// away above) instead of erasing them — see
+	// TestTemporaryStatusLapsesBackToWhatWasSaidBefore.
 	past := time.Now().Add(-time.Minute)
 	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
 		t.Fatalf("set expiring status: %v", err)
 	}
-	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanB)
-	if err != nil {
-		t.Fatalf("list statuses after expiry: %v", err)
-	}
-	if _, ok := statusOf(t, statuses, w.humanA); ok {
-		t.Fatalf("expired status must not be reported, got %+v", statuses)
-	}
-	// The owner does not get to see their own expired status either.
-	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanA)
-	if err != nil {
-		t.Fatalf("list own statuses: %v", err)
-	}
-	if _, ok := statusOf(t, statuses, w.humanA); ok {
-		t.Fatalf("expired own status must not be reported, got %+v", statuses)
+	for _, viewer := range []ParticipantRef{w.humanB, w.humanA} {
+		statuses, err = w.store.StatusesVisibleTo(ctx, viewer)
+		if err != nil {
+			t.Fatalf("list statuses after expiry: %v", err)
+		}
+		got, _ := statusOf(t, statuses, w.humanA)
+		if got.Status == StatusBusy || got.Note == "会議中" {
+			t.Fatalf("expired status must not be reported, got %+v", statuses)
+		}
 	}
 
 	// Only the three declared values exist; anything else fails closed.
@@ -234,5 +232,146 @@ func TestLocalStatusSetsTheAgentsOwnAttentionState(t *testing.T) {
 	}, authorization)
 	if status != http.StatusBadRequest {
 		t.Fatalf("unknown agent status: %d, want 400", status)
+	}
+}
+
+// A temporary status lapses back to what the participant had already said —
+// the platform never quietly replaces someone's own words with a default.
+func TestTemporaryStatusLapsesBackToWhatWasSaidBefore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	// A lasting state, then a temporary one on top of it.
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "外出中", nil); err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	soon := time.Now().Add(time.Hour)
+	temporary, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &soon)
+	if err != nil {
+		t.Fatalf("set temporary status: %v", err)
+	}
+	if temporary.BaseStatus != StatusAway || temporary.BaseNote != "外出中" {
+		t.Fatalf("temporary = %+v, want the lasting state remembered", temporary)
+	}
+	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("list statuses: %v", err)
+	}
+	got, _ := statusOf(t, statuses, w.humanA)
+	if got.Status != StatusBusy || got.ExpiresAt == nil || got.BaseStatus != StatusAway {
+		t.Fatalf("visible while it holds = %+v", got)
+	}
+
+	// Once it has lapsed, readers see the earlier state — before any sweep.
+	past := time.Now().Add(-time.Minute)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &past); err != nil {
+		t.Fatalf("set lapsed status: %v", err)
+	}
+	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("list statuses after lapse: %v", err)
+	}
+	got, ok := statusOf(t, statuses, w.humanA)
+	if !ok || got.Status != StatusAway || got.Note != "外出中" || got.ExpiresAt != nil {
+		t.Fatalf("visible after lapse = %+v (found %v), want the earlier state", got, ok)
+	}
+
+	// The sweep makes that same answer durable and reports what changed, so
+	// the socket can announce it. It never disagrees with the read-time answer.
+	expired, err := w.store.ExpireStatuses(ctx)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(expired) != 1 || expired[0].Participant != w.humanA ||
+		expired[0].Status != StatusAway || expired[0].Note != "外出中" {
+		t.Fatalf("expired = %+v", expired)
+	}
+	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("list statuses after sweep: %v", err)
+	}
+	got, _ = statusOf(t, statuses, w.humanA)
+	if got.Status != StatusAway || got.ExpiresAt != nil || got.BaseStatus != "" {
+		t.Fatalf("after sweep = %+v, want a plain lasting status", got)
+	}
+	// A second sweep has nothing to do: the lapse already happened.
+	if again, err := w.store.ExpireStatuses(ctx); err != nil || len(again) != 0 {
+		t.Fatalf("second sweep = %+v, %v", again, err)
+	}
+}
+
+// A temporary status with nothing behind it ends the declaration rather than
+// leaving a stale one: saying nothing is not the same as saying「対応可能」.
+func TestTemporaryStatusWithNoEarlierStateClearsOnLapse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	past := time.Now().Add(-time.Minute)
+	declared, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "集中中", &past)
+	if err != nil {
+		t.Fatalf("set temporary status: %v", err)
+	}
+	if declared.BaseStatus != "" {
+		t.Fatalf("declared = %+v, want no earlier state to return to", declared)
+	}
+	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("list statuses: %v", err)
+	}
+	if _, ok := statusOf(t, statuses, w.humanA); ok {
+		t.Fatalf("statuses = %+v, want the lapsed declaration not reported", statuses)
+	}
+
+	expired, err := w.store.ExpireStatuses(ctx)
+	if err != nil {
+		t.Fatalf("expire statuses: %v", err)
+	}
+	if len(expired) != 1 || expired[0].Status != "" {
+		t.Fatalf("expired = %+v, want one cleared declaration", expired)
+	}
+	statuses, err = w.store.StatusesVisibleTo(ctx, w.humanB)
+	if err != nil {
+		t.Fatalf("list statuses after sweep: %v", err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("statuses after sweep = %+v, want none", statuses)
+	}
+}
+
+// Stacking two temporary statuses keeps the lasting one as the base: the state
+// the participant actually chose to hold cannot be buried by two short ones.
+func TestStackedTemporaryStatusesKeepTheLastingBase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusAway, "外出中", nil); err != nil {
+		t.Fatalf("set lasting status: %v", err)
+	}
+	hour := time.Now().Add(time.Hour)
+	if _, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "会議中", &hour); err != nil {
+		t.Fatalf("set first temporary status: %v", err)
+	}
+	second, err := w.store.SetStatus(ctx, w.humanA, StatusBusy, "別件", &hour)
+	if err != nil {
+		t.Fatalf("set second temporary status: %v", err)
+	}
+	if second.BaseStatus != StatusAway || second.BaseNote != "外出中" {
+		t.Fatalf("second = %+v, want the lasting state still underneath", second)
+	}
+
+	// Declaring a lasting state again forgets the base: the new words are the
+	// whole truth.
+	lasting, err := w.store.SetStatus(ctx, w.humanA, StatusAvailable, "", nil)
+	if err != nil {
+		t.Fatalf("set lasting status again: %v", err)
+	}
+	if lasting.BaseStatus != "" || lasting.ExpiresAt != nil {
+		t.Fatalf("lasting = %+v, want nothing pending behind it", lasting)
 	}
 }

@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -17,6 +18,17 @@ const (
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
+	// LocalStartDMPath opens the same conversation the human sidebar's
+	// 「ダイレクトメッセージを開始」opens: one participant reuses (or mints) the
+	// single dm, several mint a group dm. Both go through the identical store
+	// calls REST uses, so neither side can reach a place the other cannot.
+	LocalStartDMPath = "/local-control/v1/messaging:start-dm"
+	// LocalCreateChannelPath / LocalUpdateChannelPath / LocalDuplicateChannelPath
+	// are the channel lifecycle the human sidebar's context menu offers,
+	// reachable through the same Store calls REST uses.
+	LocalCreateChannelPath    = "/local-control/v1/messaging:create-channel"
+	LocalUpdateChannelPath    = "/local-control/v1/messaging:update-channel"
+	LocalDuplicateChannelPath = "/local-control/v1/messaging:duplicate-channel"
 	// LocalNotificationSettingsPath is both the read and the write of the
 	// agent's own notification setting. The agent owns the identical resource a
 	// Human owns — same contract, different transport (契約ドラフト: 人間はUI、
@@ -47,6 +59,10 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
+		{"POST " + LocalStartDMPath, s.localStartDM},
+		{"POST " + LocalCreateChannelPath, s.localCreateChannel},
+		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
+		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
 	}
 	for _, route := range routes {
@@ -242,9 +258,7 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	switch request.Status {
-	case StatusAvailable, StatusBusy, StatusAway:
-	default:
+	if !ValidStatus(request.Status) {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -415,6 +429,201 @@ func (s *Server) localNotificationSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, struct {
 		Setting notificationSettingWire `json:"setting"`
 	}{notificationSettingToWire(stored)})
+}
+
+// localStartDM opens a direct conversation for the agent through the same
+// store calls POST /messaging/dms and POST /messaging/group-dms use. One other
+// participant means the single dm with them (existing or freshly minted);
+// several mean a group dm. The agent is always one of the participants and is
+// never named in the body — the credential decides who is acting.
+func (s *Server) localStartDM(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		Participants []participantWire `json:"participants"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if len(request.Participants) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	others := make([]ParticipantRef, 0, len(request.Participants))
+	for _, wire := range request.Participants {
+		ref, err := wire.ref()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		others = append(others, ref)
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var (
+		place   Place
+		created = true
+		err     error
+	)
+	if len(others) == 1 {
+		place, created, err = s.Store.EnsureDM(r.Context(), viewer, others[0])
+	} else {
+		place, err = s.Store.CreateGroupDM(r.Context(), viewer, others)
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := dmWire{
+		DMID: place.PlaceID, Kind: place.Kind,
+		Participants: append([]participantWire{participantToWire(viewer)}, request.Participants...),
+	}
+	if created && s.Hub != nil {
+		s.Hub.Publish(r.Context(), Event{Type: EventPlaceCreated, PlaceID: place.PlaceID, DM: &wire})
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, struct {
+		DM      dmWire `json:"dm"`
+		Created bool   `json:"created"`
+	}{wire, created})
+}
+
+// localCreateChannel opens a channel in the workspace, the same act as the
+// sidebar's「チャンネルを作成」. An omitted workspace_id means the one workspace
+// the agent is in — naming it is only required once there is more than one.
+func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string `json:"workspace_id,omitempty"`
+		Name        string `json:"name"`
+		Topic       string `json:"topic,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Name == "" || utf8.RuneCountInString(request.Name) > MaxChannelNameChars ||
+		len(request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	workspaceID, err := s.soleWorkspaceID(r.Context(), viewer, request.WorkspaceID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.CreateChannel(r.Context(), workspaceID, request.Name, request.Topic, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishChannel(r.Context(), EventPlaceCreated, place)
+	writeJSON(w, http.StatusCreated, struct {
+		Channel channelWire `json:"channel"`
+	}{channelToWire(place)})
+}
+
+// localUpdateChannel renames a channel, retopics it, or both. An omitted field
+// is left alone: naming one thing must not silently discard the other.
+func (s *Server) localUpdateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID string  `json:"place_id"`
+		Name    *string `json:"name,omitempty"`
+		Topic   *string `json:"topic,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || (request.Name == nil && request.Topic == nil) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Name != nil &&
+		(*request.Name == "" || utf8.RuneCountInString(*request.Name) > MaxChannelNameChars) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if request.Topic != nil && len(*request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.UpdateChannel(r.Context(), request.PlaceID, request.Name, request.Topic, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishChannel(r.Context(), EventPlaceUpdated, place)
+	writeJSON(w, http.StatusOK, struct {
+		Channel channelWire `json:"channel"`
+	}{channelToWire(place)})
+}
+
+// localDuplicateChannel copies a channel's shape (name and topic) into a new,
+// empty one. An omitted name takes the same derived default the human menu
+// gets, so neither side has its own idea of what a copy is called.
+func (s *Server) localDuplicateChannel(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID string `json:"place_id"`
+		Name    string `json:"name,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || utf8.RuneCountInString(request.Name) > MaxChannelNameChars {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.DuplicateChannel(r.Context(), request.PlaceID, request.Name, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishChannel(r.Context(), EventPlaceCreated, place)
+	writeJSON(w, http.StatusCreated, struct {
+		Channel channelWire `json:"channel"`
+	}{channelToWire(place)})
+}
+
+// soleWorkspaceID resolves the workspace a channel act happens in. An explicit
+// id is used as given; without one the agent's single workspace is implied, and
+// an ambiguous membership is refused rather than guessed.
+func (s *Server) soleWorkspaceID(ctx context.Context, viewer ParticipantRef, requested string) (string, error) {
+	if requested != "" {
+		return requested, nil
+	}
+	workspaces, err := s.Store.WorkspacesFor(ctx, viewer)
+	if err != nil {
+		return "", err
+	}
+	if len(workspaces) != 1 {
+		return "", ErrWorkspaceNotFound
+	}
+	return workspaces[0].WorkspaceID, nil
+}
+
+func (s *Server) publishChannel(ctx context.Context, eventType string, place Place) {
+	if s.Hub == nil {
+		return
+	}
+	wire := channelToWire(place)
+	s.Hub.Publish(ctx, Event{Type: eventType, PlaceID: place.PlaceID, Channel: &wire})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
