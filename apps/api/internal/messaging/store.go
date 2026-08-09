@@ -585,8 +585,12 @@ type querier interface {
 }
 
 func (s *Store) workspaceExists(ctx context.Context, workspaceID string) error {
+	return s.workspaceExistsWith(ctx, s.pool, workspaceID)
+}
+
+func (s *Store) workspaceExistsWith(ctx context.Context, q querier, workspaceID string) error {
 	var exists bool
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		"SELECT EXISTS (SELECT 1 FROM workspaces WHERE workspace_id = $1)", workspaceID).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("check workspace exists: %w", err)
@@ -628,7 +632,7 @@ func (s *Store) workspaceMembership(ctx context.Context, q querier, workspaceID 
 		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
 		workspaceID, p.Kind, p.ID).Scan(&role)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if err := s.workspaceExists(ctx, workspaceID); err != nil {
+		if err := s.workspaceExistsWith(ctx, q, workspaceID); err != nil {
 			return false, "", err
 		}
 		return false, "", nil

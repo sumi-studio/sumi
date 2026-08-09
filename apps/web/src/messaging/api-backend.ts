@@ -39,6 +39,13 @@ import { MAX_SEQ, PERMISSIONS, parsePlaceKey, placeId } from "./model";
 const REQUEST_TIMEOUT_MS = 15_000;
 /** アップロードは最大20MiBを運ぶため、通常のRESTより長い猶予を与える。 */
 const UPLOAD_TIMEOUT_MS = 120_000;
+const INITIAL_RECONNECT_DELAY_MS = 250;
+const MAX_RECONNECT_DELAY_MS = 5_000;
+
+type CatchUpListener = (
+  place: Place,
+  latestSeq: number,
+) => void | Promise<void>;
 
 export class MessagingAPIError extends Error {
   readonly code: string;
@@ -66,11 +73,16 @@ export class ApiMessagingBackend implements MessagingBackend {
   private readonly connectionListeners = new Set<
     (state: ConnectionState) => void
   >();
+  private readonly catchUpListeners = new Set<CatchUpListener>();
   private readonly cursors = new Map<string, number>();
   private readonly places = new Map<string, Place>();
+  private catchingUpPlaces = new Set<string>();
+  private bufferedPollUpdates = new Map<string, ServerEvent[]>();
+  private readonly reconciliationRetryDelays = new Map<string, number>();
   private socket: WebSocket | null = null;
+  private socketGeneration = 0;
   private reconnectTimer: number | null = null;
-  private reconnectDelay = 250;
+  private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   private stopped = false;
 
   async bootstrap(): ReturnType<MessagingBackend["bootstrap"]> {
@@ -538,9 +550,20 @@ export class ApiMessagingBackend implements MessagingBackend {
     return () => this.connectionListeners.delete(listener);
   }
 
+  /**
+   * A place boundary after durable replay has finished. Poll votes do not move
+   * the replay cursor, so callers use this boundary to refresh loaded polls
+   * from REST before queued live poll updates become visible.
+   */
+  subscribeCatchUp(listener: CatchUpListener): () => void {
+    this.catchUpListeners.add(listener);
+    return () => this.catchUpListeners.delete(listener);
+  }
+
   dispose(): void {
     this.listeners.clear();
     this.connectionListeners.clear();
+    this.catchUpListeners.clear();
     this.stopSocket();
   }
 
@@ -554,6 +577,12 @@ export class ApiMessagingBackend implements MessagingBackend {
       return;
     }
     this.emitConnection("reconnecting");
+    const generation = ++this.socketGeneration;
+    this.catchingUpPlaces =
+      this.catchUpListeners.size > 0
+        ? new Set(this.cursors.keys())
+        : new Set<string>();
+    this.bufferedPollUpdates.clear();
     const url = new URL("/messaging/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
@@ -570,7 +599,10 @@ export class ApiMessagingBackend implements MessagingBackend {
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
       try {
-        this.handleFrame(asRecord(JSON.parse(event.data) as unknown));
+        this.handleFrame(
+          asRecord(JSON.parse(event.data) as unknown),
+          generation,
+        );
       } catch {
         socket.close(1002, "invalid messaging frame");
       }
@@ -584,19 +616,33 @@ export class ApiMessagingBackend implements MessagingBackend {
       }
       this.emitConnection("reconnecting");
       const delay = this.reconnectDelay;
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5_000);
+      this.reconnectDelay = Math.min(
+        this.reconnectDelay * 2,
+        MAX_RECONNECT_DELAY_MS,
+      );
       this.reconnectTimer = window.setTimeout(() => this.connect(), delay);
     });
   }
 
-  private handleFrame(frame: Record<string, unknown>): void {
+  private handleFrame(
+    frame: Record<string, unknown>,
+    generation: number,
+  ): void {
     const type = asString(frame.type);
     if (type === "hello_ack") {
-      this.reconnectDelay = 250;
+      this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.emitConnection("connected");
       return;
     }
-    if (type === "caught_up" || type === "receipt") return;
+    if (type === "caught_up") {
+      void this.finishCatchUp(
+        asString(frame.place_id),
+        asSeq(frame.latest_seq),
+        generation,
+      );
+      return;
+    }
+    if (type === "receipt") return;
     if (type === "error") throw new Error("messaging socket error");
     if (type !== "event") throw new Error("unknown messaging frame");
     const wire = asRecord(frame.event);
@@ -674,7 +720,64 @@ export class ApiMessagingBackend implements MessagingBackend {
     } else {
       return;
     }
-    for (const listener of this.listeners) listener(parsed);
+    if (parsed.type === "poll_updated") {
+      const id = placeID(parsed.message.place);
+      if (this.catchingUpPlaces.has(id)) {
+        const buffered = this.bufferedPollUpdates.get(id) ?? [];
+        buffered.push(parsed);
+        this.bufferedPollUpdates.set(id, buffered);
+        return;
+      }
+    }
+    this.emitEvent(parsed);
+  }
+
+  private async finishCatchUp(
+    id: string,
+    latestSeq: number,
+    generation: number,
+  ): Promise<void> {
+    if (
+      generation !== this.socketGeneration ||
+      !this.catchingUpPlaces.has(id)
+    ) {
+      return;
+    }
+    const place = this.places.get(id);
+    let reconciliationFailed = false;
+    if (place) {
+      const results = await Promise.allSettled(
+        [...this.catchUpListeners].map((listener) =>
+          Promise.resolve().then(() => listener(place, latestSeq)),
+        ),
+      );
+      reconciliationFailed = results.some(
+        (result) => result.status === "rejected",
+      );
+    }
+    if (generation !== this.socketGeneration) return;
+    if (reconciliationFailed) {
+      // A failed authoritative refresh must not be treated as caught up. A
+      // fresh socket retries the same place boundary and its REST reconcile.
+      const retryDelay =
+        this.reconciliationRetryDelays.get(id) ?? INITIAL_RECONNECT_DELAY_MS;
+      this.reconnectDelay = Math.max(this.reconnectDelay, retryDelay);
+      this.reconciliationRetryDelays.set(
+        id,
+        Math.min(retryDelay * 2, MAX_RECONNECT_DELAY_MS),
+      );
+      this.socket?.close(1012, "catch-up reconciliation failed");
+      return;
+    }
+    this.reconciliationRetryDelays.delete(id);
+    this.catchingUpPlaces.delete(id);
+    const buffered = this.bufferedPollUpdates.get(id) ?? [];
+    this.bufferedPollUpdates.delete(id);
+    for (const event of buffered) this.emitEvent(event);
+  }
+
+  private emitEvent(event: ServerEvent): void {
+    for (const listener of this.listeners) listener(event);
   }
 
   /** Parses a channel wire shape and remembers the place for event routing. */
@@ -736,6 +839,10 @@ export class ApiMessagingBackend implements MessagingBackend {
 
   private stopSocket(): void {
     this.stopped = true;
+    this.socketGeneration += 1;
+    this.catchingUpPlaces.clear();
+    this.bufferedPollUpdates.clear();
+    this.reconciliationRetryDelays.clear();
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.socket?.close(1000, "unsubscribed");

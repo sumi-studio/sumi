@@ -57,6 +57,7 @@ const bootstrap = {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("ApiMessagingBackend", () => {
@@ -421,6 +422,146 @@ describe("ApiMessagingBackend", () => {
       type: "hello",
       cursors: { "channel-1": 4 },
     });
+  });
+
+  it("holds live poll updates until loaded polls reconcile at caught_up", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    const boundaries: { place: typeof channel; latestSeq: number }[] = [];
+    let finishReconciliation: () => void = () => {};
+    const reconciliation = new Promise<void>((resolve) => {
+      finishReconciliation = resolve;
+    });
+    backend.subscribeCatchUp(async (place, latestSeq) => {
+      boundaries.push({ place: place as typeof channel, latestSeq });
+      await reconciliation;
+    });
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const socket = FakeWebSocket.instances[0];
+    socket?.open();
+
+    const pollUpdate = (humanId: string) => ({
+      type: "event",
+      event: {
+        type: "poll_updated",
+        place_id: "channel-1",
+        message: {
+          ...messageWire(2, ""),
+          poll: {
+            question: "リリースはいつ？",
+            allow_multi: false,
+            closes_at: null,
+            options: [
+              {
+                option_id: "o-1",
+                text: "今日",
+                voters: [{ kind: "human", human_id: humanId }],
+              },
+              { option_id: "o-2", text: "明日", voters: [] },
+            ],
+          },
+        },
+      },
+    });
+
+    // catch-up前後のlive更新を、RESTの正本より先には適用しない。
+    socket?.message(pollUpdate("human-2"));
+    socket?.message({
+      type: "caught_up",
+      place_id: "channel-1",
+      latest_seq: 4,
+    });
+    await vi.waitFor(() =>
+      expect(boundaries).toEqual([{ place: channel, latestSeq: 4 }]),
+    );
+    socket?.message(pollUpdate("human-3"));
+    expect(events).toHaveLength(0);
+
+    finishReconciliation();
+    await vi.waitFor(() => expect(events).toHaveLength(2));
+    expect(
+      events.map((event) =>
+        event.type === "poll_updated"
+          ? event.message.poll?.options[0]?.voters[0]
+          : null,
+      ),
+    ).toEqual([
+      { kind: "human", humanId: "human-2" },
+      { kind: "human", humanId: "human-3" },
+    ]);
+  });
+
+  it("closes the socket to retry when catch-up reconciliation throws", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(bootstrap)),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+    const events: ServerEvent[] = [];
+    let attempts = 0;
+    backend.subscribeCatchUp(() => {
+      attempts += 1;
+      throw new Error("authoritative refresh failed");
+    });
+    backend.subscribe((event) => events.push(event), {
+      sinceByPlace: { "channel:channel-1": 4 },
+    });
+    const failReconciliation = async (socket: FakeWebSocket | undefined) => {
+      socket?.open();
+      socket?.message({ type: "hello_ack" });
+      socket?.message({
+        type: "caught_up",
+        place_id: "channel-1",
+        latest_seq: 4,
+      });
+      await flushPromises();
+      expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
+    };
+
+    const first = FakeWebSocket.instances[0];
+    first?.open();
+    first?.message({ type: "hello_ack" });
+    first?.message({
+      type: "event",
+      event: {
+        type: "poll_updated",
+        place_id: "channel-1",
+        message: messageWire(2, "stale live frame"),
+      },
+    });
+    first?.message({
+      type: "caught_up",
+      place_id: "channel-1",
+      latest_seq: 4,
+    });
+    await flushPromises();
+    expect(first?.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(events).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(250);
+    const second = FakeWebSocket.instances[0];
+    expect(second).not.toBe(first);
+    await failReconciliation(second);
+    expect(attempts).toBe(2);
+
+    // hello_ack must not collapse a repeated reconciliation failure back to
+    // another 250ms retry.
+    await vi.advanceTimersByTimeAsync(250);
+    expect(FakeWebSocket.instances[0]).toBe(second);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(FakeWebSocket.instances[0]).not.toBe(second);
+    backend.dispose();
   });
 
   it("creates channels, dms, and group dms and edits topics over REST", async () => {
@@ -1157,4 +1298,10 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+async function flushPromises(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }

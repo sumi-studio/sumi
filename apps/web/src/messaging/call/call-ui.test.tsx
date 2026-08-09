@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemberProfile, ParticipantRef, Place } from "../model";
 import { participantKey } from "../model";
@@ -64,6 +70,7 @@ beforeEach(() => {
       screenShareEnabled: false,
     },
     tracks: [],
+    audioPlaybackBlocked: false,
     speakingUntil: {},
     dismissedPlaces: {},
   });
@@ -148,6 +155,49 @@ describe("通話画面", () => {
     expect(toggleCamera).toHaveBeenCalled();
     expect(toggleScreenShare).toHaveBeenCalled();
     expect(leave).toHaveBeenCalled();
+  });
+
+  it("autoplayが拒否されたら明示的な音声再開buttonを出し、成功後に畳む", async () => {
+    const resumeAudio = vi.fn(async () => {
+      useCall.setState({ audioPlaybackBlocked: false });
+    });
+    useCall.setState({
+      stateByPlace: { "dm:d1": callWith(DM, [me]) },
+      activePlaceKey: "dm:d1",
+      phase: "connected",
+      audioPlaybackBlocked: true,
+      resumeAudio,
+    });
+    render(<CallStage placeKey="dm:d1" />);
+
+    expect(screen.getByText("通話の音声が停止しています")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "音声を再開" }));
+
+    expect(resumeAudio).toHaveBeenCalledOnce();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "音声を再開" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("音声再開に失敗してもrejectionを外へ漏らさず再試行buttonを残す", async () => {
+    const resumeAudio = vi.fn().mockRejectedValue(new Error("still blocked"));
+    useCall.setState({
+      stateByPlace: { "dm:d1": callWith(DM, [me]) },
+      activePlaceKey: "dm:d1",
+      phase: "connected",
+      audioPlaybackBlocked: true,
+      resumeAudio,
+    });
+    render(<CallStage placeKey="dm:d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "音声を再開" }));
+
+    await waitFor(() => expect(resumeAudio).toHaveBeenCalledOnce());
+    expect(
+      screen.getByRole("button", { name: "音声を再開" }),
+    ).toBeInTheDocument();
   });
 
   it("入っていないplaceには出ない", () => {

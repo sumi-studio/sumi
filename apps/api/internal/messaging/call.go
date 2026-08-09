@@ -290,7 +290,7 @@ func (c *CallService) RegisterRoutes(mux *http.ServeMux) {
 // room. Membership is the store's decision, exactly as it is for reading the
 // place's messages.
 func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
-	viewer, _, ok := c.Server.viewer(w, r)
+	viewer, claims, ok := c.Server.viewer(w, r)
 	if !ok {
 		return
 	}
@@ -298,24 +298,46 @@ func (c *CallService) serveCallToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "calls_unavailable")
 		return
 	}
-	placeID := r.PathValue("place_id")
-	place, err := c.Server.Store.PlaceFor(r.Context(), placeID, viewer)
-	if err != nil {
-		writeStoreError(w, err)
+	tokenFailed := false
+	done, err := c.Server.mutate(w, r, claims, func() error {
+		placeID := r.PathValue("place_id")
+		place, placeErr := c.Server.Store.PlaceFor(r.Context(), placeID, viewer)
+		if placeErr != nil {
+			return placeErr
+		}
+		name := c.displayName(r, place, viewer)
+		token, tokenErr := c.LiveKit.accessToken(
+			place.PlaceID,
+			viewer.Key(),
+			name,
+			c.now(),
+			CallTokenTTL,
+		)
+		if tokenErr != nil {
+			tokenFailed = true
+			return tokenErr
+		}
+		// The response commit is part of credential issuance. Keeping it inside
+		// the lease makes a successful logout a barrier to later token delivery.
+		writeJSON(w, http.StatusOK, struct {
+			URL      string `json:"url"`
+			Token    string `json:"token"`
+			Room     string `json:"room"`
+			Identity string `json:"identity"`
+		}{c.LiveKit.URL, token, place.PlaceID, viewer.Key()})
+		return nil
+	})
+	if !done {
 		return
 	}
-	name := c.displayName(r, place, viewer)
-	token, err := c.LiveKit.accessToken(place.PlaceID, viewer.Key(), name, c.now(), CallTokenTTL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "call_token_failed")
+		if tokenFailed {
+			writeError(w, http.StatusInternalServerError, "call_token_failed")
+		} else {
+			writeStoreError(w, err)
+		}
 		return
 	}
-	writeJSON(w, http.StatusOK, struct {
-		URL      string `json:"url"`
-		Token    string `json:"token"`
-		Room     string `json:"room"`
-		Identity string `json:"identity"`
-	}{c.LiveKit.URL, token, place.PlaceID, viewer.Key()})
 }
 
 // displayName resolves the participant's presentation name for the call tile.

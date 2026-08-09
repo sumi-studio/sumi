@@ -13,10 +13,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 // maxRequestBytes bounds any /messaging request body: the largest legal
@@ -55,6 +57,12 @@ type Server struct {
 	// GET /messaging/calls remains mounted without a configured media transport;
 	// nil keeps only the local-control call-state capability unavailable.
 	Calls *CallService
+
+	// profileMu keeps this process's unversioned profile events in the same
+	// order as their commits. It spans commit through Hub.Publish; database row
+	// locks still provide the cross-process correctness of partial patches.
+	// Server must not be copied after first use.
+	profileMu sync.Mutex
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -1616,11 +1624,15 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	var profile MemberProfile
+	var change profileChange
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		profile, opErr = s.Store.SetProfile(r.Context(), viewer,
-			req.DisplayName, req.Tagline, req.AvatarAttachmentID, req.BannerAttachmentID)
+		change, opErr = s.updateProfile(r.Context(), viewer, profilePatch{
+			DisplayName:        &req.DisplayName,
+			Tagline:            &req.Tagline,
+			AvatarAttachmentID: &req.AvatarAttachmentID,
+			BannerAttachmentID: &req.BannerAttachmentID,
+		})
 		return opErr
 	})
 	if !done {
@@ -1630,8 +1642,46 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishProfile(r.Context(), profile)
-	writeJSON(w, http.StatusOK, memberToWire(profile))
+	writeJSON(w, http.StatusOK, memberToWire(change.Profile))
+}
+
+// updateProfile is the shared commit-and-publish boundary for every process
+// surface that mutates a profile. Profile events carry a full unversioned
+// snapshot, so no later commit may publish before an earlier one.
+func (s *Server) updateProfile(ctx context.Context, actor ParticipantRef, patch profilePatch) (profileChange, error) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	change, err := s.Store.patchProfile(ctx, actor, patch)
+	if err != nil {
+		return profileChange{}, err
+	}
+	s.publishProfileChange(ctx, change)
+	return change, nil
+}
+
+func (s *Server) publishProfileChange(ctx context.Context, change profileChange) {
+	s.publishProfile(ctx, change.Profile)
+	for _, dependent := range change.Dependents {
+		s.publishProfile(ctx, dependent)
+	}
+}
+
+// UpdateHumanDisplayName lets the primary browser settings endpoint use the
+// same profile mutation and event boundary as /messaging/profile. The koseki
+// sentinels preserve that endpoint's existing error contract.
+func (s *Server) UpdateHumanDisplayName(ctx context.Context, humanID, displayName string) (string, error) {
+	change, err := s.updateProfile(ctx, Human(humanID), profilePatch{DisplayName: &displayName})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidDisplayName):
+			return "", koseki.ErrInvalidDisplayName
+		case errors.Is(err, ErrParticipantNotFound):
+			return "", koseki.ErrHumanNotFound
+		default:
+			return "", err
+		}
+	}
+	return change.Profile.DisplayName, nil
 }
 
 // publishProfile tells everyone who can see this participant that the way they
