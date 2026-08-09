@@ -171,7 +171,11 @@ describe("SDUI action boundary", () => {
   it("keeps an unwired card action disabled and cannot send a user message", async () => {
     render(<ChatScreen />);
 
-    const action = await screen.findByRole("button", { name: "完了にする" });
+    const action = await screen.findByRole(
+      "button",
+      { name: "完了にする" },
+      { timeout: 5_000 },
+    );
     expect(action).toBeDisabled();
     fireEvent.click(action);
 

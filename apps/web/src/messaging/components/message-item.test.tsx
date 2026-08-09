@@ -21,7 +21,11 @@ import type {
   ParticipantRef,
 } from "../model";
 import { participantKey } from "../model";
-import { noteEmojiUsed, resetRecentEmojis } from "../recent-emoji";
+import {
+  noteEmojiUsed,
+  recentEmojis,
+  resetRecentEmojis,
+} from "../recent-emoji";
 import { MessageItem } from "./message-item";
 
 vi.mock("@tanstack/react-router", () => ({
@@ -287,6 +291,26 @@ describe("リアクションの選択", () => {
         node.getAttribute("aria-label")?.endsWith("でリアクション"),
       );
     expect(quick[0]).toHaveAccessibleName("完了 でリアクション");
+  });
+
+  it("自分のリアクションを外すときは直近の並びを変えない", () => {
+    noteEmojiUsed("✅");
+    noteEmojiUsed("🔥");
+    const onToggleReaction = vi.fn();
+    renderItem(
+      makeMessage({
+        reactions: [{ emoji: "✅", participants: [human] }],
+      }),
+      { onToggleReaction },
+    );
+
+    fireEvent.click(screen.getByLabelText("完了 でリアクション"));
+
+    expect(recentEmojis()).toEqual(["🔥", "✅"]);
+    expect(onToggleReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "m1" }),
+      "✅",
+    );
   });
 
   it("ピッカーは検索・カテゴリ・最近から選べる", async () => {
