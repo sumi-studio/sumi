@@ -266,6 +266,71 @@ export interface MemberProfile {
   participant: ParticipantRef;
   displayName: string;
   tagline: string;
+  /** プロフィール画像の添付id。未設定は「画像なし」。 */
+  avatarAttachmentId?: string;
+  bannerAttachmentId?: string;
+  /**
+   * 表示用URL。attachmentと同じくbackend境界が決める
+   * （実APIは同一originの `/messaging/attachments/<id>`、モックはobject URL）。
+   */
+  avatarUrl?: string;
+  bannerUrl?: string;
+}
+
+/**
+ * 個人設定からの名乗りの更新。ownerは認証済みsessionが決めるので載せない。
+ * 全置換: クライアントは常に現在値を持っているので差分は要らない。
+ */
+export interface ProfileInput {
+  displayName: string;
+  tagline: string;
+  /** 空文字は「画像を外す」。 */
+  avatarAttachmentId: string;
+  bannerAttachmentId: string;
+}
+
+/**
+ * 権限キー。最小の4つだけを持つ。誰も強制しない権限は、製品が守らない約束に
+ * なるので増やさない。
+ */
+export type Permission =
+  | "manage_channels"
+  | "manage_roles"
+  | "manage_members"
+  | "mention_all";
+
+export const PERMISSIONS: Permission[] = [
+  "manage_channels",
+  "manage_roles",
+  "manage_members",
+  "mention_all",
+];
+
+/** 自分が何をして良いか。未知のキーはfail-closedに「不可」として読む。 */
+export type PermissionSet = Partial<Record<Permission, boolean>>;
+
+/** ワークスペースの権限の束。人間にもagentにも同じ形で付く。 */
+export interface WorkspaceRole {
+  roleId: string;
+  workspaceId: string;
+  name: string;
+  /** 空文字は「色を付けない」。 */
+  color: string;
+  position: number;
+  permissions: PermissionSet;
+}
+
+/** 誰がどのロールを持つか。 */
+export interface RoleAssignment {
+  participant: ParticipantRef;
+  roleIds: string[];
+}
+
+/** ロールの作成・編集の入力。 */
+export interface RoleInput {
+  name: string;
+  color: string;
+  permissions: PermissionSet;
 }
 
 export type StatusKind = "available" | "busy" | "away";
@@ -397,6 +462,8 @@ export type ServerEvent =
    * 名乗ることはしない。
    */
   | { type: "status_cleared"; participant: ParticipantRef }
+  /** 本人が名乗りを変えた。member-list・プロフィール・発言者名に即時に効く。 */
+  | { type: "profile_updated"; member: MemberProfile }
   | { type: "reply_later_created"; marker: ReplyLaterMarker }
   | { type: "reply_later_resolved"; markerId: string }
   | { type: "reaction_updated"; message: Message }
@@ -469,6 +536,10 @@ export interface MessagingBackend {
     replyLaterMarkers: ReplyLaterMarker[];
     /** 自分の通知設定。muteしたplaceを最初の描画から薄くするために要る。 */
     notificationSetting: NotificationSetting;
+    /** いま居るワークスペースのロールと、自分の権限。導線の出し分けに要る。 */
+    roles: WorkspaceRole[];
+    roleAssignments: RoleAssignment[];
+    permissions: PermissionSet;
     /** 自分がEmployerである人格agent。直通（生の直接回線）の対象。 */
     employedAgents: ParticipantRef[];
   }>;
@@ -546,6 +617,30 @@ export interface MessagingBackend {
     note: string,
     expiresAt: number | null,
   ): Promise<void>;
+  /**
+   * 自分の名乗りを丸ごと置き換える。人間はこれを個人設定画面から、agentは
+   * 同じ契約をtool経由で使う（AX: UIだけにある操作を作らない）。
+   */
+  updateProfile(input: ProfileInput): Promise<MemberProfile>;
+  /** ロール・付与状況・自分の権限をまとめて読む。閲覧はメンバーなら誰でも。 */
+  fetchRoles(workspaceId: string): Promise<{
+    roles: WorkspaceRole[];
+    roleAssignments: RoleAssignment[];
+    permissions: PermissionSet;
+  }>;
+  createRole(workspaceId: string, input: RoleInput): Promise<WorkspaceRole>;
+  updateRole(
+    workspaceId: string,
+    roleId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole>;
+  deleteRole(workspaceId: string, roleId: string): Promise<void>;
+  /** メンバーの保持ロールを丸ごと置き換える。空配列は「ロールなし」。 */
+  setMemberRoles(
+    workspaceId: string,
+    participant: ParticipantRef,
+    roleIds: string[],
+  ): Promise<RoleAssignment>;
   createReplyLater(
     place: Place,
     messageId: string,

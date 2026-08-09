@@ -364,6 +364,7 @@ export const MessageItem = memo(function MessageItem({
                 participantKey={authorKey}
                 name={author?.displayName ?? "?"}
                 size={32}
+                src={author?.avatarUrl}
               />
             </ParticipantProfilePopover>
           </span>

@@ -16,20 +16,25 @@ import type {
   NotifyReason,
   ParticipantRef,
   ParticipantStatus,
+  PermissionSet,
   Place,
   PlaceKey,
   PollOption,
+  ProfileInput,
   ReactionSummary,
   ReadMarker,
   ReplyLaterMarker,
+  RoleAssignment,
+  RoleInput,
   SendMessageInput,
   SendReceipt,
   ServerEvent,
   StatusKind,
   ThreadSummary,
   UnreadSummary,
+  WorkspaceRole,
 } from "./model";
-import { MAX_SEQ, parsePlaceKey, placeId } from "./model";
+import { MAX_SEQ, PERMISSIONS, parsePlaceKey, placeId } from "./model";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 /** アップロードは最大20MiBを運ぶため、通常のRESTより長い猶予を与える。 */
@@ -98,14 +103,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     const threads: ThreadSummary[] = asArray(body.threads ?? []).map((entry) =>
       this.registerThread(entry),
     );
-    const members: MemberProfile[] = asArray(body.members).map((entry) => {
-      const value = asRecord(entry);
-      return {
-        participant: parseParticipant(value.participant),
-        displayName: asString(value.display_name),
-        tagline: typeof value.tagline === "string" ? value.tagline : "",
-      };
-    });
+    const members: MemberProfile[] = asArray(body.members).map(parseMember);
     const readMarkers: ReadMarker[] = asArray(body.read_markers).map(
       (entry) => {
         const value = asRecord(entry);
@@ -146,6 +144,11 @@ export class ApiMessagingBackend implements MessagingBackend {
       unreadSummaries,
       replyLaterMarkers,
       notificationSetting: parseNotificationSetting(body.notification_setting),
+      roles: asArray(body.roles ?? []).map(parseRole),
+      roleAssignments: asArray(body.role_assignments ?? []).map(
+        parseAssignment,
+      ),
+      permissions: parsePermissions(body.permissions),
       employedAgents: [],
     };
   }
@@ -382,6 +385,84 @@ export class ApiMessagingBackend implements MessagingBackend {
     });
   }
 
+  /** PUTは全置換。誰の名乗りかはsessionが決め、bodyには載せない。 */
+  async updateProfile(input: ProfileInput): Promise<MemberProfile> {
+    return parseMember(
+      await this.request("/messaging/profile", {
+        method: "PUT",
+        body: {
+          display_name: input.displayName,
+          tagline: input.tagline,
+          avatar_attachment_id: input.avatarAttachmentId,
+          banner_attachment_id: input.bannerAttachmentId,
+        },
+      }),
+    );
+  }
+
+  async fetchRoles(workspaceId: string): Promise<{
+    roles: WorkspaceRole[];
+    roleAssignments: RoleAssignment[];
+    permissions: PermissionSet;
+  }> {
+    const body = asRecord(await this.request(rolesPath(workspaceId)));
+    return {
+      roles: asArray(body.roles).map(parseRole),
+      roleAssignments: asArray(body.role_assignments).map(parseAssignment),
+      permissions: parsePermissions(body.permissions),
+    };
+  }
+
+  async createRole(
+    workspaceId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    return parseRole(
+      await this.request(rolesPath(workspaceId), {
+        method: "POST",
+        body: roleToWire(input),
+      }),
+    );
+  }
+
+  async updateRole(
+    workspaceId: string,
+    roleId: string,
+    input: RoleInput,
+  ): Promise<WorkspaceRole> {
+    return parseRole(
+      await this.request(
+        `${rolesPath(workspaceId)}/${encodeURIComponent(roleId)}`,
+        { method: "PATCH", body: roleToWire(input) },
+      ),
+    );
+  }
+
+  async deleteRole(workspaceId: string, roleId: string): Promise<void> {
+    await this.request(
+      `${rolesPath(workspaceId)}/${encodeURIComponent(roleId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async setMemberRoles(
+    workspaceId: string,
+    participant: ParticipantRef,
+    roleIds: string[],
+  ): Promise<RoleAssignment> {
+    const kind = participant.kind;
+    const id =
+      participant.kind === "human"
+        ? participant.humanId
+        : participant.personalityAgentId;
+    return parseAssignment(
+      await this.request(
+        `/messaging/workspaces/${encodeURIComponent(workspaceId)}/members/${kind}/${encodeURIComponent(id)}/roles`,
+        { method: "PUT", body: { role_ids: roleIds } },
+      ),
+    );
+  }
+
   async createReplyLater(
     place: Place,
     messageId: string,
@@ -598,6 +679,9 @@ export class ApiMessagingBackend implements MessagingBackend {
               participant: parseParticipant(status.participant),
             }
           : { type: eventType, status: parseStatus(status) };
+    } else if (eventType === "profile_updated") {
+      // 名乗りもstatusと同じくparticipantスコープ。seqを進めない。
+      parsed = { type: eventType, member: parseMember(wire.member) };
     } else if (eventType === "reply_later_created") {
       parsed = { type: eventType, marker: parseReplyLater(wire.marker) };
     } else if (eventType === "reply_later_resolved") {
@@ -883,6 +967,78 @@ function parseReaction(value: unknown): ReactionSummary {
   return {
     emoji: asString(wire.emoji),
     participants: asArray(wire.participants).map(parseParticipant),
+  };
+}
+
+/**
+ * メンバーのwire → domain。画像は添付idだけが載るので、URLはこの境界で
+ * 組み立てる（同一originのセッション付きGET。可視性はサーバーが検査する）。
+ */
+function parseMember(value: unknown): MemberProfile {
+  const wire = asRecord(value);
+  const avatarAttachmentId = optionalString(wire.avatar_attachment_id);
+  const bannerAttachmentId = optionalString(wire.banner_attachment_id);
+  return {
+    participant: parseParticipant(wire.participant),
+    displayName: asString(wire.display_name),
+    tagline: optionalString(wire.tagline),
+    avatarAttachmentId,
+    bannerAttachmentId,
+    avatarUrl: attachmentURL(avatarAttachmentId),
+    bannerUrl: attachmentURL(bannerAttachmentId),
+  };
+}
+
+function attachmentURL(attachmentId: string): string | undefined {
+  return attachmentId
+    ? `/messaging/attachments/${encodeURIComponent(attachmentId)}`
+    : undefined;
+}
+
+function optionalString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function rolesPath(workspaceId: string): string {
+  return `/messaging/workspaces/${encodeURIComponent(workspaceId)}/roles`;
+}
+
+function roleToWire(input: RoleInput): Record<string, unknown> {
+  return {
+    name: input.name,
+    color: input.color,
+    permissions: input.permissions,
+  };
+}
+
+/** 未知の権限キーはfail-closedに落とす。真のものだけを保つ。 */
+function parsePermissions(value: unknown): PermissionSet {
+  if (typeof value !== "object" || value === null) return {};
+  const wire = value as Record<string, unknown>;
+  const granted: PermissionSet = {};
+  for (const permission of PERMISSIONS) {
+    if (wire[permission] === true) granted[permission] = true;
+  }
+  return granted;
+}
+
+function parseRole(value: unknown): WorkspaceRole {
+  const wire = asRecord(value);
+  return {
+    roleId: asString(wire.role_id),
+    workspaceId: asString(wire.workspace_id),
+    name: asString(wire.name),
+    color: optionalString(wire.color),
+    position: typeof wire.position === "number" ? wire.position : 0,
+    permissions: parsePermissions(wire.permissions),
+  };
+}
+
+function parseAssignment(value: unknown): RoleAssignment {
+  const wire = asRecord(value);
+  return {
+    participant: parseParticipant(wire.participant),
+    roleIds: asArray(wire.role_ids).map(asString),
   };
 }
 

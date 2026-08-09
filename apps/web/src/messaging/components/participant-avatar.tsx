@@ -31,11 +31,14 @@ export function ParticipantAvatar({
   name,
   size = 32,
   status,
+  src,
 }: {
   participantKey: string;
   name: string;
   size?: number;
   status?: StatusKind;
+  /** 本人が設定した画像。無ければ頭文字にフォールバックする。 */
+  src?: string;
 }) {
   const hue = hueFor(participantKey);
   return (
@@ -50,7 +53,14 @@ export function ParticipantAvatar({
       }}
       aria-hidden
     >
-      {name.slice(0, 1).toUpperCase()}
+      {src ? (
+        // ステータスの点は円の外側に環を持つので、切り抜きは画像だけに掛ける。
+        <span className="absolute inset-0 overflow-hidden rounded-full">
+          <img src={src} alt="" className="size-full object-cover" />
+        </span>
+      ) : (
+        name.slice(0, 1).toUpperCase()
+      )}
       {status ? (
         <span
           className={`absolute right-0 bottom-0 block rounded-full ring-2 ring-background ${STATUS_DOT[status]}`}

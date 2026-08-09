@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -124,7 +125,10 @@ func (s *Store) CreateAttachment(ctx context.Context, attachmentID string, uploa
 // control lane (agent tools, #209) cannot diverge:
 //   - a bound attachment is readable by everyone who can see its message's
 //     place (the same canAccess rule that governs the message itself);
-//   - an unbound attachment is readable by its uploader alone;
+//   - an unbound attachment used as somebody's avatar or header is readable by
+//     everyone who can see that participant (a face on the member list is meant
+//     to be seen);
+//   - any other unbound attachment is readable by its uploader alone;
 //   - a tombstoned message delivers nothing, its uploader included.
 func (s *Store) AttachmentForViewer(ctx context.Context, attachmentID string, viewer ParticipantRef) (Attachment, error) {
 	if err := viewer.Validate(); err != nil {
@@ -158,7 +162,14 @@ func (s *Store) AttachmentForViewer(ctx context.Context, attachmentID string, vi
 	}
 	att.Uploader.Kind = ParticipantKind(kind)
 	if messageID == nil || placeID == nil {
-		if att.Uploader != viewer {
+		if att.Uploader == viewer {
+			return att, nil
+		}
+		profileImage, err := s.attachmentIsProfileImage(ctx, attachmentID, viewer)
+		if err != nil {
+			return Attachment{}, err
+		}
+		if !profileImage {
 			return Attachment{}, ErrAttachmentNotFound
 		}
 		return att, nil
@@ -250,9 +261,14 @@ func (s *Store) UpdateDraftAttachment(ctx context.Context, attachmentID string, 
 
 // bindAttachments binds the author's own unbound attachments to a message in
 // the send transaction. A single UPDATE carries the whole rule: the row must
-// exist, must still be unbound, and must have been uploaded by this author.
-// Anything else — someone else's attachment, an already-sent one, a made-up id
-// — is ErrAttachmentNotFound.
+// exist, must still be unbound, must not already be somebody's profile image,
+// and must have been uploaded by this author. Anything else — someone else's
+// attachment, an already-sent one, an avatar, a made-up id — is
+// ErrAttachmentNotFound.
+//
+// Excluding profile images keeps the two lifetimes apart: an avatar that became
+// a message attachment would vanish from every member list the moment that
+// message was deleted.
 func bindAttachments(ctx context.Context, tx pgx.Tx, messageID string, author ParticipantRef, ids []string) ([]Attachment, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -260,16 +276,46 @@ func bindAttachments(ctx context.Context, tx pgx.Tx, messageID string, author Pa
 	if len(ids) > MaxAttachmentsPerMessage {
 		return nil, ErrTooManyAttachments
 	}
-	out := make([]Attachment, 0, len(ids))
-	for _, id := range ids {
+	// Lock every candidate in a stable order before the first UPDATE. A profile
+	// replacement locks the same row before publishing it in
+	// participant_profiles. The UPDATE below is intentionally a later statement:
+	// under READ COMMITTED it receives a fresh snapshot after any waited-on
+	// profile transaction commits, so NOT EXISTS cannot approve the row from the
+	// stale snapshot with which this bind began.
+	ordered := append([]string(nil), ids...)
+	sort.Strings(ordered)
+	previous := ""
+	for _, id := range ordered {
 		if !validAttachmentID(id) {
 			return nil, ErrAttachmentNotFound
 		}
+		if id == previous {
+			continue
+		}
+		previous = id
+		var lockedID string
+		err := tx.QueryRow(ctx,
+			`SELECT attachment_id FROM message_attachments
+			 WHERE attachment_id = $1 AND message_id IS NULL
+			   AND uploader_kind = $2 AND uploader_id = $3
+			 FOR UPDATE`, id, author.Kind, author.ID).Scan(&lockedID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAttachmentNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lock attachment for binding: %w", err)
+		}
+	}
+	out := make([]Attachment, 0, len(ids))
+	for _, id := range ids {
 		att := Attachment{AttachmentID: id, MessageID: messageID, Uploader: author}
 		err := tx.QueryRow(ctx,
 			`UPDATE message_attachments SET message_id = $1
 			 WHERE attachment_id = $2 AND message_id IS NULL
 			   AND uploader_kind = $3 AND uploader_id = $4
+			   AND NOT EXISTS (
+			     SELECT 1 FROM participant_profiles p
+			     WHERE p.avatar_attachment_id = $2 OR p.banner_attachment_id = $2)
 			 RETURNING filename, mime, size_bytes, spoiler, alt, created_at`,
 			messageID, id, author.Kind, author.ID).
 			Scan(&att.Filename, &att.MIME, &att.SizeBytes, &att.Spoiler, &att.Alt, &att.CreatedAt)

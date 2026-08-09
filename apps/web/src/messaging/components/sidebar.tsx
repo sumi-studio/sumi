@@ -15,9 +15,10 @@ import { VoiceChannelMembers } from "../call/voice-channel-members";
 import type { PlaceKey } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
-import { notificationLevelFor, useMessaging } from "../store";
+import { notificationLevelFor, useMessaging, usePermissions } from "../store";
 import { ParticipantAvatar } from "./participant-avatar";
 import { PlaceContextMenu } from "./place-context-menu";
+import { SettingsOverlay } from "./settings-overlay";
 import { StatusMenu, statusSummary } from "./status-menu";
 
 const INPUT_CLASS =
@@ -126,35 +127,28 @@ function PlaceRow({
         muted={muted}
       />
       {hasMenu ? (
-        <div className="relative">
-          <button
-            type="button"
-            aria-label="この場所のメニュー"
-            aria-expanded={menuOpen}
-            onMouseDown={(event) => {
-              // トリガー上のmousedownを外側クリック判定に拾わせない（閉→即再開を防ぐ）。
-              event.stopPropagation();
-            }}
-            onClick={(event) => {
-              event.stopPropagation();
-              setMenuOpen(!menuOpen);
-            }}
-            className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
-              menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-            }`}
-          >
-            <MoreVertical className="size-3.5" />
-          </button>
-          <PlaceContextMenu
-            placeKey={key}
-            channelId={channelId}
-            open={menuOpen}
-            onOpenChange={setMenuOpen}
-            onEditChannel={onEditChannel}
-            onDuplicateChannel={onDuplicateChannel}
-            onCreateChannel={onCreateChannel}
-          />
-        </div>
+        <PlaceContextMenu
+          placeKey={key}
+          channelId={channelId}
+          trigger={
+            <button
+              type="button"
+              aria-label="この場所のメニュー"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              className={`flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
+                menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              }`}
+            >
+              <MoreVertical className="size-3.5" />
+            </button>
+          }
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+          onEditChannel={onEditChannel}
+          onDuplicateChannel={onDuplicateChannel}
+          onCreateChannel={onCreateChannel}
+        />
       ) : null}
     </div>
   );
@@ -544,6 +538,7 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
                   name={member.displayName}
                   size={22}
                   status={statusByKey[key]?.status}
+                  src={member.avatarUrl}
                 />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[13px]">
@@ -593,6 +588,10 @@ function StartDMDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+/**
+ * 見出しと、その場所を増やす導線。onActionが無いときは「＋」を出さない——
+ * 押せば必ず断られるボタンを見せるくらいなら、無い方が正直。
+ */
 function SectionHeader({
   label,
   actionTitle,
@@ -600,21 +599,23 @@ function SectionHeader({
 }: {
   label: string;
   actionTitle: string;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   return (
     <div className="group flex items-center justify-between px-2 pb-1">
       <p className="font-medium text-[11px] text-muted-foreground/80">
         {label}
       </p>
-      <button
-        type="button"
-        title={actionTitle}
-        onClick={onAction}
-        className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
-      >
-        <Plus className="size-3.5" />
-      </button>
+      {onAction ? (
+        <button
+          type="button"
+          title={actionTitle}
+          onClick={onAction}
+          className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Plus className="size-3.5" />
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -636,6 +637,9 @@ export function Sidebar() {
   const placeNavigate = usePlaceNavigate();
   // ボイスチャンネルは開くことと入ることが同じ動作（ADR 0012）。
   const joinCall = useCall((state) => state.join);
+  // チャンネルを増やすのはワークスペースの管理。DMは自分の会話なので誰でも。
+  const { can } = usePermissions();
+  const canManageChannels = can("manage_channels");
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
@@ -678,7 +682,9 @@ export function Sidebar() {
           <SectionHeader
             label="チャンネル"
             actionTitle="チャンネルを作成"
-            onAction={() => setOpenDialog("channel")}
+            onAction={
+              canManageChannels ? () => setOpenDialog("channel") : undefined
+            }
           />
         </div>
         {channels.map((channel) => {
@@ -741,6 +747,7 @@ export function Sidebar() {
                   name={membersByKey[firstKey]?.displayName ?? "?"}
                   size={18}
                   status={statusByKey[firstKey]?.status}
+                  src={membersByKey[firstKey]?.avatarUrl}
                 />
               }
               unread={unread}
@@ -775,6 +782,7 @@ export function Sidebar() {
             name={selfProfile?.displayName ?? "?"}
             size={26}
             status={selfStatus?.status}
+            src={selfProfile?.avatarUrl}
           />
           <span className="min-w-0 flex-1">
             <span className="block truncate font-medium text-[13px]">
@@ -786,7 +794,7 @@ export function Sidebar() {
           </span>
         </button>
       </div>
-      {openDialog === "channel" ? (
+      {openDialog === "channel" && canManageChannels ? (
         <CreateChannelDialog onClose={() => setOpenDialog(null)} />
       ) : null}
       {openDialog === "dm" ? (
@@ -798,6 +806,7 @@ export function Sidebar() {
           onClose={() => setEditingChannelId(null)}
         />
       ) : null}
+      <SettingsOverlay />
     </aside>
   );
 }

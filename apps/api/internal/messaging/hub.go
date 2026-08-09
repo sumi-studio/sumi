@@ -25,6 +25,8 @@ type Event struct {
 	// Thread rides on place_created scoped to the parent place, so everyone
 	// who can see the parent learns the side conversation exists.
 	Thread *threadWire `json:"thread,omitempty"`
+	// Member rides on participant-scoped profile changes (表示名・tagline・画像).
+	Member *memberWire `json:"member,omitempty"`
 	// Notify rides only on the copy addressed to a recipient the server decided
 	// to interrupt. Its absence is the answer "this is not worth calling you
 	// for", which is why it is per-recipient rather than part of the message.
@@ -54,6 +56,7 @@ const (
 	EventPollUpdated        = "poll_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"
+	EventProfileUpdated     = "profile_updated"
 	EventReplyLaterCreated  = "reply_later_created"
 	EventReplyLaterResolved = "reply_later_resolved"
 	EventPlaceCreated       = "place_created"

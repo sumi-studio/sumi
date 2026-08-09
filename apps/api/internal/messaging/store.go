@@ -134,7 +134,7 @@ func (s *Store) EnsureDefaultWorkspaceMembership(ctx context.Context, participan
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit default workspace admission: %w", err)
 	}
-	return nil
+	return s.EnsureFoundingAdmin(ctx, participant)
 }
 
 func addDefaultMember(ctx context.Context, tx pgx.Tx, participant ParticipantRef) error {
@@ -172,13 +172,19 @@ type Place struct {
 	Voice bool
 }
 
-// MemberProfile is a participant with their scope-resolved display name.
+// MemberProfile is a participant with their scope-resolved display name and
+// the presentation profile they chose for themselves (participant_profiles).
 // IDs are never used as display names (ADR 0008 §1).
 type MemberProfile struct {
 	Participant             ParticipantRef
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
+	// Tagline は本人が名乗る職務の説明。空でよい。
+	Tagline string
+	// 画像は message_attachments の添付id。空は「未設定」。
+	AvatarAttachmentID string
+	BannerAttachmentID string
 }
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
@@ -216,6 +222,24 @@ func (s *Store) CreateWorkspace(ctx context.Context, name string, creator Partic
 		 VALUES ($1, $2, $3, $4)`,
 		workspaceID, creator.Kind, creator.ID, RoleOwner); err != nil {
 		return Workspace{}, fmt.Errorf("insert workspace owner: %w", err)
+	}
+	// Every workspace is born with the same two roles the shared one has, and
+	// its creator holds Admin. A workspace nobody can administer is not a
+	// state the product should be able to reach.
+	adminRoleID := newUUIDv7()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO workspace_roles (role_id, workspace_id, name, position, permissions)
+		 VALUES ($1, $2, 'Admin', 100, $3), ($4, $2, 'Member', 0, '{}'::jsonb)`,
+		adminRoleID, workspaceID, map[string]bool{
+			PermManageChannels: true, PermManageRoles: true,
+			PermManageMembers: true, PermMentionAll: true,
+		}, newUUIDv7()); err != nil {
+		return Workspace{}, fmt.Errorf("seed workspace roles: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO participant_roles (role_id, member_kind, member_id) VALUES ($1, $2, $3)`,
+		adminRoleID, creator.Kind, creator.ID); err != nil {
+		return Workspace{}, fmt.Errorf("grant workspace admin: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Workspace{}, fmt.Errorf("commit create workspace: %w", err)
@@ -269,8 +293,9 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, workspaceID string, m
 	return nil
 }
 
-// CreateChannel creates a public channel in the workspace. v0: any active
-// member may create channels (契約ドラフト: 権限は最小構成).
+// CreateChannel creates a public channel in the workspace. Creating a channel
+// is workspace administration, so it requires manage_channels — the same check
+// on the REST lane and the agent lane (AX 同型).
 // voice marks the channel as a place people are meant to talk in (ADR 0012).
 // It changes nothing else: the channel still carries a timeline, unread counts
 // and notification settings, because a voice channel is still a channel.
@@ -287,6 +312,9 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	}
 	if !active {
 		return Place{}, ErrNotAMember
+	}
+	if err := s.RequirePermission(ctx, workspaceID, creator, PermManageChannels); err != nil {
+		return Place{}, err
 	}
 	placeID := newUUIDv7()
 	_, err = s.pool.Exec(ctx,
@@ -307,9 +335,10 @@ const MaxChannelNameChars = 200
 
 // UpdateChannel edits a channel's mutable identity: its name, its topic, or
 // both. A nil field is left alone, so naming one thing never silently discards
-// the other. v0 permission mirrors CreateChannel: any active workspace member
-// may edit (契約ドラフト: 権限は最小構成). Visibility is checked first so a
-// place the actor cannot see stays unrevealed.
+// the other. Editing a channel needs manage_channels, mirroring CreateChannel.
+// Visibility is checked first so a place the actor cannot see stays
+// unrevealed — a member without the permission is refused, a stranger is told
+// nothing.
 func (s *Store) UpdateChannel(ctx context.Context, placeID string, name, topic *string, actor ParticipantRef) (Place, error) {
 	place, err := s.PlaceFor(ctx, placeID, actor)
 	if err != nil {
@@ -320,6 +349,9 @@ func (s *Store) UpdateChannel(ctx context.Context, placeID string, name, topic *
 	}
 	if name != nil && !validChannelName(*name) {
 		return Place{}, ErrInvalidChannelName
+	}
+	if err := s.RequirePermission(ctx, place.WorkspaceID, actor, PermManageChannels); err != nil {
+		return Place{}, err
 	}
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE places
@@ -553,8 +585,12 @@ type querier interface {
 }
 
 func (s *Store) workspaceExists(ctx context.Context, workspaceID string) error {
+	return s.workspaceExistsWith(ctx, s.pool, workspaceID)
+}
+
+func (s *Store) workspaceExistsWith(ctx context.Context, q querier, workspaceID string) error {
 	var exists bool
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		"SELECT EXISTS (SELECT 1 FROM workspaces WHERE workspace_id = $1)", workspaceID).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("check workspace exists: %w", err)
@@ -596,7 +632,7 @@ func (s *Store) workspaceMembership(ctx context.Context, q querier, workspaceID 
 		 WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3 AND left_at IS NULL`,
 		workspaceID, p.Kind, p.ID).Scan(&role)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if err := s.workspaceExists(ctx, workspaceID); err != nil {
+		if err := s.workspaceExistsWith(ctx, q, workspaceID); err != nil {
 			return false, "", err
 		}
 		return false, "", nil
@@ -688,11 +724,15 @@ func (s *Store) activeMembers(ctx context.Context, q querier, place Place) ([]Me
 		`SELECT pm.member_kind, pm.member_id, '' AS role,
 		        COALESCE(h.display_name, a.display_name, '') AS display_name,
 		        CASE WHEN pm.member_kind='personality_agent'
-		             THEN COALESCE(owner.display_name, '') ELSE '' END
+		             THEN COALESCE(owner.display_name, '') ELSE '' END,
+		        COALESCE(pp.tagline, ''),
+		        pp.avatar_attachment_id, pp.banner_attachment_id
 		 FROM place_members pm
 		 LEFT JOIN humans h ON pm.member_kind = 'human' AND h.human_id = pm.member_id
 		 LEFT JOIN agents a ON pm.member_kind = 'personality_agent' AND a.personality_agent_id = pm.member_id
 		 LEFT JOIN humans owner ON owner.human_id = a.human_id
+		 LEFT JOIN participant_profiles pp ON pp.member_kind = pm.member_kind
+		                                 AND pp.member_id = pm.member_id
 		 WHERE pm.place_id = $1 AND pm.left_at IS NULL
 		 ORDER BY pm.place_member_id`, place.PlaceID)
 	if err != nil {
@@ -706,11 +746,15 @@ func (s *Store) workspaceMemberProfiles(ctx context.Context, q querier, workspac
 		`SELECT wm.member_kind, wm.member_id, wm.role,
 		        COALESCE(h.display_name, a.display_name, '') AS display_name,
 		        CASE WHEN wm.member_kind='personality_agent'
-		             THEN COALESCE(owner.display_name, '') ELSE '' END
+		             THEN COALESCE(owner.display_name, '') ELSE '' END,
+		        COALESCE(pp.tagline, ''),
+		        pp.avatar_attachment_id, pp.banner_attachment_id
 		 FROM workspace_members wm
 		 LEFT JOIN humans h ON wm.member_kind = 'human' AND h.human_id = wm.member_id
 		 LEFT JOIN agents a ON wm.member_kind = 'personality_agent' AND a.personality_agent_id = wm.member_id
 		 LEFT JOIN humans owner ON owner.human_id = a.human_id
+		 LEFT JOIN participant_profiles pp ON pp.member_kind = wm.member_kind
+		                                 AND pp.member_id = wm.member_id
 		 WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
 		 ORDER BY wm.workspace_member_id`, workspaceID)
 	if err != nil {
@@ -725,10 +769,18 @@ func scanMemberProfiles(rows pgx.Rows) ([]MemberProfile, error) {
 	for rows.Next() {
 		var m MemberProfile
 		var kind string
-		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName, &m.SecretaryForDisplayName); err != nil {
+		var avatar, banner *string
+		if err := rows.Scan(&kind, &m.Participant.ID, &m.Role, &m.DisplayName,
+			&m.SecretaryForDisplayName, &m.Tagline, &avatar, &banner); err != nil {
 			return nil, fmt.Errorf("scan member: %w", err)
 		}
 		m.Participant.Kind = ParticipantKind(kind)
+		if avatar != nil {
+			m.AvatarAttachmentID = *avatar
+		}
+		if banner != nil {
+			m.BannerAttachmentID = *banner
+		}
 		members = append(members, m)
 	}
 	if err := rows.Err(); err != nil {

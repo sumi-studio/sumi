@@ -13,10 +13,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 // maxRequestBytes bounds any /messaging request body: the largest legal
@@ -53,6 +55,12 @@ type Server struct {
 	// Calls, when set, is the RTC surface (ADR 0012). Nil means the deployment
 	// configured no media transport, and the call routes are not mounted.
 	Calls *CallService
+
+	// profileMu keeps this process's unversioned profile events in the same
+	// order as their commits. It spans commit through Hub.Publish; database row
+	// locks still provide the cross-process correctness of partial patches.
+	// Server must not be copied after first use.
+	profileMu sync.Mutex
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -83,6 +91,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /messaging/attachments/{attachment_id}", s.serveAttachment)
 	mux.HandleFunc("PATCH /messaging/attachments/{attachment_id}", s.serveUpdateAttachment)
 	mux.HandleFunc("PUT /messaging/status", s.serveSetStatus)
+	mux.HandleFunc("GET /messaging/workspaces/{workspace_id}/roles", s.serveRoles)
+	mux.HandleFunc("POST /messaging/workspaces/{workspace_id}/roles", s.serveCreateRole)
+	mux.HandleFunc("PATCH /messaging/workspaces/{workspace_id}/roles/{role_id}", s.serveUpdateRole)
+	mux.HandleFunc("DELETE /messaging/workspaces/{workspace_id}/roles/{role_id}", s.serveDeleteRole)
+	mux.HandleFunc("PUT /messaging/workspaces/{workspace_id}/members/{kind}/{id}/roles", s.serveSetMemberRoles)
+	mux.HandleFunc("GET /messaging/profile", s.serveProfile)
+	mux.HandleFunc("PUT /messaging/profile", s.serveSetProfile)
 	mux.HandleFunc("GET /messaging/notification-settings", s.serveNotificationSetting)
 	mux.HandleFunc("PUT /messaging/notification-settings", s.serveSetNotificationSetting)
 	mux.HandleFunc("POST /messaging/places/{place_id}/messages/{message_id}/reply-later", s.serveCreateReplyLater)
@@ -131,6 +146,19 @@ func (w participantWire) ref() (ParticipantRef, error) {
 		return p, err
 	}
 	return p, nil
+}
+
+// pathRef resolves a participant addressed by path segments, where the single
+// id segment could be either kind's id. The kind decides which one it is.
+func (w participantWire) pathRef() (ParticipantRef, error) {
+	switch ParticipantKind(w.Kind) {
+	case KindHuman:
+		return participantWire{Kind: w.Kind, HumanID: w.HumanID}.ref()
+	case KindPersonalityAgent:
+		return participantWire{Kind: w.Kind, PersonalityAgentID: w.PersonalityAgentID}.ref()
+	default:
+		return ParticipantRef{}, fmt.Errorf("unknown participant kind %q", w.Kind)
+	}
 }
 
 func participantsToWire(refs []ParticipantRef) []participantWire {
@@ -412,9 +440,25 @@ type dmWire struct {
 	Participants []participantWire `json:"participants"`
 }
 
+// memberWire is one participant as the UI and the agent tool both see them:
+// the 戸籍 name plus whatever the participant said about themselves. Humans and
+// PersonalityAgents use the identical shape — there is no bot field.
 type memberWire struct {
-	Participant participantWire `json:"participant"`
-	DisplayName string          `json:"display_name"`
+	Participant        participantWire `json:"participant"`
+	DisplayName        string          `json:"display_name"`
+	Tagline            string          `json:"tagline"`
+	AvatarAttachmentID string          `json:"avatar_attachment_id,omitempty"`
+	BannerAttachmentID string          `json:"banner_attachment_id,omitempty"`
+}
+
+func memberToWire(p MemberProfile) memberWire {
+	return memberWire{
+		Participant:        participantToWire(p.Participant),
+		DisplayName:        p.ProjectedDisplayName(),
+		Tagline:            p.Tagline,
+		AvatarAttachmentID: p.AvatarAttachmentID,
+		BannerAttachmentID: p.BannerAttachmentID,
+	}
 }
 
 type readMarkerWire struct {
@@ -745,15 +789,17 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			if _, seen := memberSet[key]; seen {
 				continue
 			}
-			memberSet[key] = memberWire{
-				Participant: participantToWire(p.Participant),
-				DisplayName: p.ProjectedDisplayName(),
-			}
+			memberSet[key] = memberToWire(p)
 			memberOrder = append(memberOrder, key)
 		}
 	}
 
 	workspaceWires := make([]workspaceWire, len(workspaces))
+	// ロール・権限は「いま居るワークスペース」の分だけ載せる。サイドバーが
+	// 見せているのも 1 つなので、最初の描画から設定導線を正しく出し分けられる。
+	roleWires := []roleWire{}
+	assignmentWires := []roleAssignmentWire{}
+	permissions := PermissionSet{}
 	for i, ws := range workspaces {
 		workspaceWires[i] = workspaceWire{WorkspaceID: ws.WorkspaceID, Name: ws.Name}
 		profiles, err := s.Store.WorkspaceMemberProfiles(ctx, ws.WorkspaceID, viewer)
@@ -762,6 +808,14 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		addMembers(profiles)
+		if i > 0 {
+			continue
+		}
+		roleWires, assignmentWires, permissions, err = s.workspaceRoles(ctx, ws.WorkspaceID, viewer)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
 	}
 
 	channels := []channelWire{}
@@ -853,6 +907,9 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		UnreadSummaries     []unreadSummaryWire     `json:"unread_summaries"`
 		ReplyLaterMarkers   []replyLaterWire        `json:"reply_later_markers"`
 		NotificationSetting notificationSettingWire `json:"notification_setting"`
+		Roles               []roleWire              `json:"roles"`
+		RoleAssignments     []roleAssignmentWire    `json:"role_assignments"`
+		Permissions         PermissionSet           `json:"permissions"`
 	}{
 		Self:                participantToWire(viewer),
 		Workspaces:          workspaceWires,
@@ -865,6 +922,9 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		UnreadSummaries:     unread,
 		ReplyLaterMarkers:   markerWires,
 		NotificationSetting: notificationSettingToWire(setting),
+		Roles:               roleWires,
+		RoleAssignments:     assignmentWires,
+		Permissions:         permissions,
 	})
 }
 
@@ -1147,7 +1207,7 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+		members[i] = memberToWire(p)
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`
@@ -1528,6 +1588,332 @@ func (s *Server) serveSetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.publishStatus(r.Context(), status)
 	writeJSON(w, http.StatusOK, statusToWire(status))
+}
+
+// serveProfile returns the viewer's own profile. Everyone else's profile
+// arrives with the member list, so there is no route for reading one by id.
+func (s *Server) serveProfile(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	profile, err := s.Store.MemberProfileFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberToWire(profile))
+}
+
+// serveSetProfile replaces the viewer's own profile. PUT is a replacement for
+// the same reason the notification setting is: the client already holds the
+// current value (bootstrap gives it), so a partial merge would only add a way
+// for two tabs to disagree about what was cleared.
+//
+// There is no route for editing anyone else's profile — 名乗りは本人のもの。
+func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		DisplayName string `json:"display_name"`
+		Tagline     string `json:"tagline"`
+		// 空文字は「画像を外す」。省略も同じ意味になる（PUTは全置換）。
+		AvatarAttachmentID string `json:"avatar_attachment_id"`
+		BannerAttachmentID string `json:"banner_attachment_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var change profileChange
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		change, opErr = s.updateProfile(r.Context(), viewer, profilePatch{
+			DisplayName:        &req.DisplayName,
+			Tagline:            &req.Tagline,
+			AvatarAttachmentID: &req.AvatarAttachmentID,
+			BannerAttachmentID: &req.BannerAttachmentID,
+		})
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberToWire(change.Profile))
+}
+
+// updateProfile is the shared commit-and-publish boundary for every process
+// surface that mutates a profile. Profile events carry a full unversioned
+// snapshot, so no later commit may publish before an earlier one.
+func (s *Server) updateProfile(ctx context.Context, actor ParticipantRef, patch profilePatch) (profileChange, error) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	change, err := s.Store.patchProfile(ctx, actor, patch)
+	if err != nil {
+		return profileChange{}, err
+	}
+	s.publishProfileChange(ctx, change)
+	return change, nil
+}
+
+func (s *Server) publishProfileChange(ctx context.Context, change profileChange) {
+	s.publishProfile(ctx, change.Profile)
+	for _, dependent := range change.Dependents {
+		s.publishProfile(ctx, dependent)
+	}
+}
+
+// UpdateHumanDisplayName lets the primary browser settings endpoint use the
+// same profile mutation and event boundary as /messaging/profile. The koseki
+// sentinels preserve that endpoint's existing error contract.
+func (s *Server) UpdateHumanDisplayName(ctx context.Context, humanID, displayName string) (string, error) {
+	change, err := s.updateProfile(ctx, Human(humanID), profilePatch{DisplayName: &displayName})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidDisplayName):
+			return "", koseki.ErrInvalidDisplayName
+		case errors.Is(err, ErrParticipantNotFound):
+			return "", koseki.ErrHumanNotFound
+		default:
+			return "", err
+		}
+	}
+	return change.Profile.DisplayName, nil
+}
+
+// publishProfile tells everyone who can see this participant that the way they
+// present themselves changed. Like status it is participant-scoped and never
+// replayed: bootstrap carries the current value.
+func (s *Server) publishProfile(ctx context.Context, profile MemberProfile) {
+	if s.Hub == nil {
+		return
+	}
+	subject := profile.Participant
+	wire := memberToWire(profile)
+	s.Hub.Publish(ctx, Event{Type: EventProfileUpdated, Subject: &subject, Member: &wire})
+}
+
+// roleWire matches the web model's WorkspaceRole. permissions is an object of
+// booleans rather than a list so an unknown key added later reads as absent
+// instead of shifting positions.
+type roleWire struct {
+	RoleID      string          `json:"role_id"`
+	WorkspaceID string          `json:"workspace_id"`
+	Name        string          `json:"name"`
+	Color       string          `json:"color,omitempty"`
+	Position    int             `json:"position"`
+	Permissions map[string]bool `json:"permissions"`
+}
+
+func roleToWire(role Role) roleWire {
+	permissions := role.Permissions
+	if permissions == nil {
+		permissions = map[string]bool{}
+	}
+	return roleWire{
+		RoleID: role.RoleID, WorkspaceID: role.WorkspaceID, Name: role.Name,
+		Color: role.Color, Position: role.Position, Permissions: permissions,
+	}
+}
+
+func rolesToWire(roles []Role) []roleWire {
+	out := make([]roleWire, len(roles))
+	for i, role := range roles {
+		out[i] = roleToWire(role)
+	}
+	return out
+}
+
+// roleAssignmentWire is one participant and the roles they hold.
+type roleAssignmentWire struct {
+	Participant participantWire `json:"participant"`
+	RoleIDs     []string        `json:"role_ids"`
+}
+
+// assignmentsToWire projects the store's key→ids map in member-list order, so
+// the client never has to parse the participant key string itself.
+func assignmentsToWire(profiles []MemberProfile, assignments map[string][]string) []roleAssignmentWire {
+	out := []roleAssignmentWire{}
+	for _, profile := range profiles {
+		ids := assignments[profile.Participant.Key()]
+		if len(ids) == 0 {
+			continue
+		}
+		out = append(out, roleAssignmentWire{
+			Participant: participantToWire(profile.Participant), RoleIDs: ids,
+		})
+	}
+	return out
+}
+
+// workspaceRoles gathers the role picture of one workspace for a viewer who is
+// a member of it: the roles themselves, who holds what, and what the viewer may
+// do. The last one is what the UI gates its administration entries on.
+func (s *Server) workspaceRoles(ctx context.Context, workspaceID string, viewer ParticipantRef) (
+	[]roleWire, []roleAssignmentWire, PermissionSet, error,
+) {
+	roles, err := s.Store.Roles(ctx, workspaceID, viewer)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	assignments, err := s.Store.RoleAssignments(ctx, workspaceID, viewer)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	profiles, err := s.Store.WorkspaceMemberProfiles(ctx, workspaceID, viewer)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	granted, err := s.Store.PermissionsFor(ctx, workspaceID, viewer)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return rolesToWire(roles), assignmentsToWire(profiles, assignments), granted, nil
+}
+
+// serveRoles reports the workspace's roles, who holds them, and the viewer's
+// own permissions. Reading is open to members: the badges are already visible
+// in the member list, and the viewer must be able to learn what they may do.
+func (s *Server) serveRoles(w http.ResponseWriter, r *http.Request) {
+	viewer, _, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	roles, assignments, granted, err := s.workspaceRoles(
+		r.Context(), r.PathValue("workspace_id"), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Roles       []roleWire           `json:"roles"`
+		Assignments []roleAssignmentWire `json:"role_assignments"`
+		Permissions PermissionSet        `json:"permissions"`
+	}{roles, assignments, granted})
+}
+
+type roleRequest struct {
+	Name        string          `json:"name"`
+	Color       string          `json:"color"`
+	Permissions map[string]bool `json:"permissions"`
+}
+
+func (s *Server) serveCreateRole(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req roleRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	workspaceID := r.PathValue("workspace_id")
+	var role Role
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		role, opErr = s.Store.CreateRole(r.Context(), workspaceID, viewer,
+			req.Name, req.Color, req.Permissions)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, roleToWire(role))
+}
+
+func (s *Server) serveUpdateRole(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	var req roleRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var role Role
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		role, opErr = s.Store.UpdateRole(r.Context(), r.PathValue("workspace_id"),
+			r.PathValue("role_id"), viewer, req.Name, req.Color, req.Permissions)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roleToWire(role))
+}
+
+func (s *Server) serveDeleteRole(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	done, err := s.mutate(w, r, claims, func() error {
+		return s.Store.DeleteRole(r.Context(), r.PathValue("workspace_id"),
+			r.PathValue("role_id"), viewer)
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// serveSetMemberRoles replaces one member's roles. The member travels in the
+// path as kind/id — the same ParticipantRef grammar everywhere else uses, so a
+// PersonalityAgent is addressed exactly like a Human.
+func (s *Server) serveSetMemberRoles(w http.ResponseWriter, r *http.Request) {
+	viewer, claims, ok := s.viewer(w, r)
+	if !ok {
+		return
+	}
+	member, err := participantWire{
+		Kind: r.PathValue("kind"), HumanID: r.PathValue("id"),
+		PersonalityAgentID: r.PathValue("id"),
+	}.pathRef()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	var req struct {
+		RoleIDs []string `json:"role_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var stored []string
+	done, err := s.mutate(w, r, claims, func() error {
+		var opErr error
+		stored, opErr = s.Store.SetParticipantRoles(r.Context(),
+			r.PathValue("workspace_id"), viewer, member, req.RoleIDs)
+		return opErr
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roleAssignmentWire{
+		Participant: participantToWire(member), RoleIDs: stored,
+	})
 }
 
 // serveNotificationSetting returns the viewer's own notification preference.
@@ -2076,6 +2462,20 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "poll_closed")
 	case errors.Is(err, ErrPollSingleChoice):
 		writeError(w, http.StatusBadRequest, "poll_single_choice")
+	case errors.Is(err, ErrInvalidDisplayName):
+		writeError(w, http.StatusBadRequest, "invalid_display_name")
+	case errors.Is(err, ErrInvalidTagline):
+		writeError(w, http.StatusBadRequest, "invalid_tagline")
+	case errors.Is(err, ErrInvalidProfileImage):
+		writeError(w, http.StatusBadRequest, "invalid_profile_image")
+	case errors.Is(err, ErrRoleNotFound):
+		writeError(w, http.StatusNotFound, "role_not_found")
+	case errors.Is(err, ErrInvalidRoleName):
+		writeError(w, http.StatusBadRequest, "invalid_role_name")
+	case errors.Is(err, ErrInvalidRoleColor):
+		writeError(w, http.StatusBadRequest, "invalid_role_color")
+	case errors.Is(err, ErrRoleNameTaken):
+		writeError(w, http.StatusConflict, "role_name_taken")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal")
 	}

@@ -37,12 +37,14 @@ use super::supervisor::{
 };
 use crate::apiclient::messaging::{
     CreateMessagingChannelRequest, CreateMessagingPollRequest, CreateMessagingReplyLaterRequest,
-    CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
+    CreateMessagingRoleRequest, CreateMessagingThreadRequest, DeleteMessagingRoleRequest,
+    DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, ListMessagingRolesRequest,
     ListMessagingThreadsRequest, MessagingApi, MessagingNotificationSettingsRequest,
     OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+    SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest, SetMessagingProfileRequest,
     SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
-    VoteMessagingPollRequest, WriteMessagingMessageRequest,
+    UpdateMessagingRoleRequest, VoteMessagingPollRequest, WriteMessagingMessageRequest,
 };
 use crate::runtime::authority::RuntimeEpochAuthority;
 use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
@@ -522,6 +524,62 @@ impl MessagingApi for LocalControlHttpClient {
         request: SetMessagingStatusRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:status", &request)
+            .await
+    }
+
+    async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:profile", &request)
+            .await
+    }
+
+    async fn roles(&self, request: ListMessagingRolesRequest<'_>) -> Result<serde_json::Value> {
+        // The response carries the whole member list, so it shares the
+        // messaging screen bound rather than the tighter control-plane one.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:roles",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_role(
+        &self,
+        request: CreateMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-create", &request)
+            .await
+    }
+
+    async fn update_role(
+        &self,
+        request: UpdateMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-update", &request)
+            .await
+    }
+
+    async fn delete_role(
+        &self,
+        request: DeleteMessagingRoleRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:role-delete", &request)
+            .await
+    }
+
+    async fn set_member_roles(
+        &self,
+        request: SetMessagingMemberRolesRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:member-roles", &request)
+            .await
+    }
+
+    async fn set_channel_topic(
+        &self,
+        request: SetMessagingChannelTopicRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:channel-topic", &request)
             .await
     }
 

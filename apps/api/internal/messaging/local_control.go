@@ -11,11 +11,28 @@ import (
 )
 
 const (
-	LocalOverviewPath          = "/local-control/v1/messaging:overview"
-	LocalOpenPath              = "/local-control/v1/messaging:open"
-	LocalWritePath             = "/local-control/v1/messaging:write"
-	LocalReactPath             = "/local-control/v1/messaging:react"
-	LocalStatusPath            = "/local-control/v1/messaging:status"
+	LocalOverviewPath = "/local-control/v1/messaging:overview"
+	LocalOpenPath     = "/local-control/v1/messaging:open"
+	LocalWritePath    = "/local-control/v1/messaging:write"
+	LocalReactPath    = "/local-control/v1/messaging:react"
+	LocalStatusPath   = "/local-control/v1/messaging:status"
+	// LocalProfilePath は agent が自分の名乗り（表示名・tagline）を読み書きする口。
+	// 人間が個人設定画面から行うのと同じ Store 経路を通る（AX: UIだけにある操作を
+	// 作らない）。
+	LocalProfilePath = "/local-control/v1/messaging:profile"
+	// LocalRolesPath は agent が「ここでは誰が何をして良いか」を読む口。
+	LocalRolesPath = "/local-control/v1/messaging:roles"
+	// ロールの作成・変更・削除と、参加者への付け替え。human が設定画面で行える
+	// 管理操作は、同じ Store 経路で agent 側にも並ぶ（AX: UIだけにある操作を
+	// 作らない）。境界は道具の有無ではなく権限にある——manage_roles /
+	// manage_members を持たない agent は human と同じ 403 で断られる。
+	LocalRoleCreatePath  = "/local-control/v1/messaging:role-create"
+	LocalRoleUpdatePath  = "/local-control/v1/messaging:role-update"
+	LocalRoleDeletePath  = "/local-control/v1/messaging:role-delete"
+	LocalMemberRolesPath = "/local-control/v1/messaging:member-roles"
+	// トピックを書き換えるのも同じ理由でここに置く（作成・改名・複製は下の
+	// channel lifecycle 群が担う）。manage_channels の判定は Store が一点で行う。
+	LocalChannelTopicPath      = "/local-control/v1/messaging:channel-topic"
 	LocalReplyLaterPath        = "/local-control/v1/messaging:reply-later"
 	LocalReplyLaterResolvePath = "/local-control/v1/messaging:reply-later-resolve"
 	LocalReadThroughPath       = "/local-control/v1/messaging:read-through"
@@ -72,6 +89,13 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
+		{"POST " + LocalProfilePath, s.localProfile},
+		{"POST " + LocalRolesPath, s.localRoles},
+		{"POST " + LocalRoleCreatePath, s.localCreateRole},
+		{"POST " + LocalRoleUpdatePath, s.localUpdateRole},
+		{"POST " + LocalRoleDeletePath, s.localDeleteRole},
+		{"POST " + LocalMemberRolesPath, s.localSetMemberRoles},
+		{"POST " + LocalChannelTopicPath, s.localSetChannelTopic},
 		{"POST " + LocalReplyLaterPath, s.localReplyLater},
 		{"POST " + LocalReplyLaterResolvePath, s.localReplyLaterResolve},
 		{"POST " + LocalReadThroughPath, s.localReadThrough},
@@ -176,7 +200,7 @@ func (s *Server) localOpen(w http.ResponseWriter, r *http.Request, authorization
 	}
 	members := make([]memberWire, len(profiles))
 	for i, profile := range profiles {
-		members[i] = memberWire{Participant: participantToWire(profile.Participant), DisplayName: profile.ProjectedDisplayName()}
+		members[i] = memberToWire(profile)
 	}
 	// A thread is read as belonging to its parent: the agent should see the
 	// same relation a human sees in the thread header, not a stray place.
@@ -400,6 +424,289 @@ func (s *Server) localStatus(w http.ResponseWriter, r *http.Request, authorizati
 	writeJSON(w, http.StatusOK, struct {
 		Status statusWire `json:"status"`
 	}{statusToWire(status)})
+}
+
+// localProfile reads or updates the agent's own名乗り through the identical
+// store path the human settings screen uses. A request with no field set is a
+// read; any field present is a change to that field only, because an agent
+// naming one thing about itself ("taglineを『開発』にして") should not silently
+// discard the rest of its profile the way a full PUT would.
+//
+// 画像はこの口には無い: agent はまだファイルをアップロードする道具を持って
+// いないので、口だけ先に開けても使えない。道具が生えた時に追加する。
+func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		DisplayName *string `json:"display_name,omitempty"`
+		Tagline     *string `json:"tagline,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if request.DisplayName == nil && request.Tagline == nil {
+		s.profileMu.Lock()
+		current, err := s.Store.MemberProfileFor(r.Context(), viewer)
+		s.profileMu.Unlock()
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Profile memberWire `json:"profile"`
+		}{memberToWire(current)})
+		return
+	}
+	change, err := s.updateProfile(r.Context(), viewer, profilePatch{
+		DisplayName: request.DisplayName,
+		Tagline:     request.Tagline,
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Profile memberWire `json:"profile"`
+	}{memberToWire(change.Profile)})
+}
+
+// localWorkspaceScope admits the agent to the shared Workspace and resolves which
+// workspace this role request is about, defaulting to the one it is in. It
+// reports false once it has already answered the request.
+func (s *Server) localWorkspaceScope(
+	w http.ResponseWriter, r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization, named string,
+) (ParticipantRef, string, bool) {
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return viewer, "", false
+	}
+	if named != "" {
+		return viewer, named, true
+	}
+	workspaces, err := s.Store.WorkspacesFor(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return viewer, "", false
+	}
+	if len(workspaces) == 0 {
+		writeStoreError(w, ErrWorkspaceNotFound)
+		return viewer, "", false
+	}
+	return viewer, workspaces[0].WorkspaceID, true
+}
+
+// permissionsFromList reads the agent lane's list-of-names shape. Naming the
+// permissions one holds is what a sentence says; the browser's boolean map
+// would give "false" and "absent" two ways to mean the same thing. Unknown
+// names are dropped by the store, exactly as on the REST lane.
+func permissionsFromList(names []string) map[string]bool {
+	granted := make(map[string]bool, len(names))
+	for _, name := range names {
+		granted[name] = true
+	}
+	return granted
+}
+
+// localRoles reports who may do what in the shared Workspace: the roles, the
+// members holding them, and the agent's own permissions. Reading is open to
+// members — an agent must be able to answer「誰に頼めばいい?」even when it may
+// change nothing itself.
+func (s *Server) localRoles(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string `json:"workspace_id,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer, workspaceID, ok := s.localWorkspaceScope(w, r, authorization, request.WorkspaceID)
+	if !ok {
+		return
+	}
+	roles, assignments, granted, err := s.workspaceRoles(r.Context(), workspaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	profiles, err := s.Store.WorkspaceMemberProfiles(r.Context(), workspaceID, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	members := make([]memberWire, len(profiles))
+	for i, profile := range profiles {
+		members[i] = memberToWire(profile)
+	}
+	writeJSON(w, http.StatusOK, struct {
+		WorkspaceID string               `json:"workspace_id"`
+		Roles       []roleWire           `json:"roles"`
+		Assignments []roleAssignmentWire `json:"role_assignments"`
+		Members     []memberWire         `json:"members"`
+		Permissions PermissionSet        `json:"permissions"`
+	}{workspaceID, roles, assignments, members, granted})
+}
+
+// localCreateRole mints a role from the agent lane. The refusal for an agent
+// without manage_roles comes from the same Store gate the browser meets, so a
+// PersonalityAgent that has been given the role administers exactly as a Human
+// does (roles_test: permission is about the role, not the kind).
+func (s *Server) localCreateRole(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string   `json:"workspace_id,omitempty"`
+		Name        string   `json:"name"`
+		Color       string   `json:"color,omitempty"`
+		Permissions []string `json:"permissions,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	viewer, workspaceID, ok := s.localWorkspaceScope(w, r, authorization, request.WorkspaceID)
+	if !ok {
+		return
+	}
+	role, err := s.Store.CreateRole(r.Context(), workspaceID, viewer,
+		request.Name, request.Color, permissionsFromList(request.Permissions))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		Role roleWire `json:"role"`
+	}{roleToWire(role)})
+}
+
+// localUpdateRole replaces a role's name, colour and permissions. Like the
+// PATCH route it is a whole replacement: the permissions named are the
+// permissions the role ends up with.
+func (s *Server) localUpdateRole(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string   `json:"workspace_id,omitempty"`
+		RoleID      string   `json:"role_id"`
+		Name        string   `json:"name"`
+		Color       string   `json:"color,omitempty"`
+		Permissions []string `json:"permissions,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.RoleID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer, workspaceID, ok := s.localWorkspaceScope(w, r, authorization, request.WorkspaceID)
+	if !ok {
+		return
+	}
+	role, err := s.Store.UpdateRole(r.Context(), workspaceID, request.RoleID, viewer,
+		request.Name, request.Color, permissionsFromList(request.Permissions))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Role roleWire `json:"role"`
+	}{roleToWire(role)})
+}
+
+// localDeleteRole removes a role and every grant of it.
+func (s *Server) localDeleteRole(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string `json:"workspace_id,omitempty"`
+		RoleID      string `json:"role_id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.RoleID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer, workspaceID, ok := s.localWorkspaceScope(w, r, authorization, request.WorkspaceID)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteRole(r.Context(), workspaceID, request.RoleID, viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		RoleID  string `json:"role_id"`
+		Deleted bool   `json:"deleted"`
+	}{request.RoleID, true})
+}
+
+// localSetMemberRoles replaces the roles one participant holds. The member is
+// named in the ParticipantRef grammar every other lane uses, so a
+// PersonalityAgent is addressed exactly like a Human.
+func (s *Server) localSetMemberRoles(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		WorkspaceID string   `json:"workspace_id,omitempty"`
+		MemberKind  string   `json:"member_kind"`
+		MemberID    string   `json:"member_id"`
+		RoleIDs     []string `json:"role_ids"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	member, err := participantWire{
+		Kind: request.MemberKind, HumanID: request.MemberID,
+		PersonalityAgentID: request.MemberID,
+	}.pathRef()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_participant")
+		return
+	}
+	viewer, workspaceID, ok := s.localWorkspaceScope(w, r, authorization, request.WorkspaceID)
+	if !ok {
+		return
+	}
+	stored, err := s.Store.SetParticipantRoles(
+		r.Context(), workspaceID, viewer, member, request.RoleIDs)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roleAssignmentWire{
+		Participant: participantToWire(member), RoleIDs: stored,
+	})
+}
+
+// localSetChannelTopic rewrites a channel's topic. The place is named rather
+// than taken from an open view because the tool layer supplies the place it
+// currently has open, exactly as it does for write.
+func (s *Server) localSetChannelTopic(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		PlaceID string `json:"place_id"`
+		Topic   string `json:"topic"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || len(request.Topic) > maxTopicBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	place, err := s.Store.UpdateChannelTopic(r.Context(), request.PlaceID, request.Topic, viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wire := channelToWire(place)
+	s.Hub.Publish(r.Context(), Event{
+		Type: EventPlaceUpdated, PlaceID: place.PlaceID, Channel: &wire,
+	})
+	writeJSON(w, http.StatusOK, struct {
+		Channel channelWire `json:"channel"`
+	}{wire})
 }
 
 // localReplyLater places the agent's own「後で返信します」marker. The tool

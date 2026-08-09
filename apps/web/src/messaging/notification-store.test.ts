@@ -3,12 +3,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ConnectionState,
+  MemberProfile,
   Message,
   MessagingBackend,
   NotificationSettingInput,
   Place,
   PlaceKey,
+  RoleAssignment,
   ServerEvent,
+  WorkspaceRole,
 } from "./model";
 import {
   bindMessagingSessionIdentity,
@@ -67,6 +70,9 @@ class StubBackend implements MessagingBackend {
         },
       ],
       replyLaterMarkers: [],
+      roles: [],
+      roleAssignments: [],
+      permissions: {},
       notificationSetting: {
         owner: SELF,
         defaults: { level: "mentions" },
@@ -120,6 +126,22 @@ class StubBackend implements MessagingBackend {
   async deleteMessage(): Promise<void> {}
   async markRead(): Promise<void> {}
   async setStatus(): Promise<void> {}
+  async updateProfile(): Promise<MemberProfile> {
+    return { participant: SELF, displayName: "yohaku", tagline: "" };
+  }
+  async fetchRoles() {
+    return { roles: [], roleAssignments: [], permissions: {} };
+  }
+  async createRole(): Promise<WorkspaceRole> {
+    throw new Error("not used");
+  }
+  async updateRole(): Promise<WorkspaceRole> {
+    throw new Error("not used");
+  }
+  async deleteRole(): Promise<void> {}
+  async setMemberRoles(): Promise<RoleAssignment> {
+    return { participant: SELF, roleIds: [] };
+  }
   async createReplyLater(): Promise<void> {}
   async resolveReplyLater(): Promise<void> {}
   async toggleReaction(): Promise<void> {}

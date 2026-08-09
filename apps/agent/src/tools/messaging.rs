@@ -16,13 +16,15 @@ use tokio::sync::Mutex;
 use crate::{
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingPollRequest,
-        CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
-        DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
-        ListMessagingThreadsRequest, MessagingApi, MessagingNotificationPlace,
-        MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingPlaceRequest,
-        PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
-        StartMessagingDMRequest, UpdateMessagingChannelRequest, VoteMessagingPollRequest,
+        CreateMessagingReplyLaterRequest, CreateMessagingRoleRequest, CreateMessagingThreadRequest,
+        DeleteMessagingRoleRequest, DuplicateMessagingChannelRequest, GetMessagingCallStateRequest,
+        ListMessagingRolesRequest, ListMessagingThreadsRequest, MessagingApi,
+        MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
+        OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+        SetMessagingChannelTopicRequest, SetMessagingMemberRolesRequest,
+        SetMessagingProfileRequest, SetMessagingStatusRequest, StartMessagingDMRequest,
+        UpdateMessagingChannelRequest, UpdateMessagingRoleRequest, VoteMessagingPollRequest,
         WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
@@ -58,7 +60,17 @@ const MAX_EMOJI_BYTES: usize = 128;
 // The server bounds these notes at 200 and 500 characters; four bytes per
 // character covers any UTF-8 within those limits.
 const MAX_STATUS_NOTE_BYTES: usize = 800;
+// The server bounds a display name at 80 characters and a tagline at 100;
+// four bytes per character covers any UTF-8 within those limits.
+const MAX_DISPLAY_NAME_BYTES: usize = 320;
+const MAX_TAGLINE_BYTES: usize = 400;
 const MAX_REPLY_LATER_NOTE_BYTES: usize = 2000;
+// The server bounds a role name at 60 characters; four bytes per character
+// covers any UTF-8 within that bound.
+const MAX_ROLE_NAME_BYTES: usize = 240;
+const MAX_ROLE_ID_BYTES: usize = 256;
+// A workspace with more roles than this is not a thing one call should build.
+const MAX_ROLE_IDS: usize = 32;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
 // The server bounds a search phrase at 200 bytes and one poll at 50 candidates.
@@ -70,6 +82,17 @@ const MAX_ATTENTION_LIMIT: u16 = 50;
 const MAX_NOTIFICATION_KEYWORDS: usize = 32;
 const MAX_NOTIFICATION_KEYWORD_BYTES: usize = 64 * 4;
 const MAX_NOTIFICATION_PLACES: usize = 200;
+
+/// The closed set of permissions a role may carry, matching the server's.  A
+/// name outside it is refused here rather than silently dropped later: an
+/// agent that asked for a permission and was quietly given a role without it
+/// would believe something untrue about the workspace.
+const ROLE_PERMISSIONS: [&str; 4] = [
+    "manage_channels",
+    "manage_roles",
+    "manage_members",
+    "mention_all",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -112,6 +135,71 @@ enum MessagingAction {
         #[serde(default)]
         expires_in_minutes: Option<u32>,
     },
+    /// Read or change one's own名乗り — the display name and the one-line
+    /// description others see next to it.  Like status this is about the
+    /// person, not a place, so no view need be open.  Sending no field reads
+    /// the current profile.
+    Profile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        tagline: Option<String>,
+    },
+    /// See who may do what here: the roles, who holds them, and one's own
+    /// permissions.  Open to any member — knowing whom to ask is not itself a
+    /// privilege.
+    Roles {
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
+    /// Administer roles.  These four exist because the human settings screen
+    /// has them: an operation that lived only in the UI would make this
+    /// participant a lesser one.  The boundary is the permission, not the
+    /// tool — without `manage_roles` (or `manage_members` for assign_roles)
+    /// the server refuses exactly as it refuses a Human without it.
+    CreateRole {
+        #[serde(default)]
+        workspace_id: Option<String>,
+        role_name: String,
+        #[serde(default)]
+        role_color: Option<String>,
+        #[serde(default)]
+        permissions: Option<Vec<String>>,
+    },
+    /// Replace a role's name, colour and permissions.  Whole replacement, not
+    /// a patch: the permissions named are the ones the role ends up holding.
+    UpdateRole {
+        #[serde(default)]
+        workspace_id: Option<String>,
+        role_id: String,
+        role_name: String,
+        #[serde(default)]
+        role_color: Option<String>,
+        #[serde(default)]
+        permissions: Option<Vec<String>>,
+    },
+    /// Remove a role, withdrawing it from everyone holding it.
+    DeleteRole {
+        #[serde(default)]
+        workspace_id: Option<String>,
+        role_id: String,
+    },
+    /// Replace the roles one participant holds.  The member is named the way
+    /// every participant is named — there is one member list, not a people
+    /// list and a bot list.  An empty role_ids returns them to plain
+    /// membership.
+    AssignRoles {
+        #[serde(default)]
+        workspace_id: Option<String>,
+        member_kind: MessagingMemberKind,
+        member_id: String,
+        role_ids: Vec<String>,
+    },
+    /// Rewrite the topic of the place currently open in this view — the one
+    /// line at the top of the screen saying what the channel is for.  Like
+    /// write, it acts on what is in view; unlike write, it needs
+    /// `manage_channels`.
+    SetTopic { topic: String },
     /// Promise a later reply to a message visible in the open place.
     ReplyLater {
         #[serde(default)]
@@ -273,6 +361,22 @@ enum MessagingStatus {
     Away,
 }
 
+/// The two kinds of participant.  A PersonalityAgent is addressed exactly like
+/// a Human, which is why role administration needs no second vocabulary.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessagingMemberKind {
+    Human,
+    PersonalityAgent,
+}
+
+fn member_kind_text(kind: MessagingMemberKind) -> &'static str {
+    match kind {
+        MessagingMemberKind::Human => "human",
+        MessagingMemberKind::PersonalityAgent => "personality_agent",
+    }
+}
+
 /// One message currently on this view's screen. Reactions may only target
 /// these (ADR 0011 §3: 見えていないものは操作できない — like a human, the
 /// agent reacts to what the open place shows, never to an unseen permalink).
@@ -334,25 +438,35 @@ fn messaging_parameters_schema() -> Value {
             "or limit; write requires content and may include urgency or reply_to; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
-            "status and may include note or expires_in_minutes; resolve_reply_later requires ",
+            "status and may include note or expires_in_minutes; profile may include display_name ",
+            "or tagline and reads the current profile when neither is given; ",
+            "resolve_reply_later requires ",
             "marker_id; start_dm requires participants; create_channel requires name and may ",
             "include topic or workspace_id; update_channel requires place_id plus name, topic or ",
             "both; duplicate_channel requires place_id and may include name; search requires ",
             "query and may include place_id or limit; notification_settings takes any of ",
             "defaults_level, per_place or keywords and reads the current setting when given ",
             "none of them; attention may include consume_through or limit; get_call_state takes ",
-            "an optional place_id. Write, react and reply_later act on the place most recently ",
-            "opened in this tool view; every other action needs no open place."
+            "an optional place_id; ",
+            "roles takes no required field and may include workspace_id; ",
+            "create_role requires role_name and may include role_color or permissions; ",
+            "update_role requires role_id and role_name and may include role_color or ",
+            "permissions; delete_role requires role_id; assign_roles requires member_kind, ",
+            "member_id and role_ids. Every role action may include workspace_id. ",
+            "set_topic requires topic; ",
+            "write, react, reply_later and set_topic act on the place most recently opened in ",
+            "this tool view; every other action needs no open place."
         ),
         "properties": {
             "action": {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "react",
-                    "status", "reply_later", "resolve_reply_later", "start_dm",
+                    "status", "profile", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
                     "search", "notification_settings", "attention", "get_call_state",
-                    "threads", "create_thread", "create_poll", "vote_poll"
+                    "threads", "create_thread", "create_poll", "vote_poll", "roles",
+                    "create_role", "update_role", "delete_role", "assign_roles", "set_topic"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -360,7 +474,9 @@ fn messaging_parameters_schema() -> Value {
                     "the currently open place; react toggles an emoji reaction on a message ",
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
-                    "own availability; resolve_reply_later marks one of your promises as kept; ",
+                    "own availability; profile reads or changes your own display name and the ",
+                    "one-line description shown next to it; resolve_reply_later marks one of ",
+                    "your promises as kept; ",
                     "start_dm opens a direct conversation with one person, or a group ",
                     "conversation with several, and puts it in view; create_channel opens a new ",
                     "channel and puts it in view; update_channel renames or retopics a channel; ",
@@ -371,7 +487,12 @@ fn messaging_parameters_schema() -> Value {
                     "get_call_state reports who is currently in a voice or video call; ",
                     "threads lists the side conversations under the currently open place; ",
                     "create_thread opens one and moves this view into it; create_poll asks the ",
-                    "open place a question; vote_poll answers one visible there."
+                    "open place a question; vote_poll answers one visible there; roles shows ",
+                    "who may administer ",
+                    "this workspace and what you yourself may do; create_role, update_role and ",
+                    "delete_role change which bundles of permission exist; assign_roles changes ",
+                    "which of them a participant holds; set_topic rewrites what the open channel ",
+                    "says it is for."
                 )
             },
             "place_id": {
@@ -526,6 +647,93 @@ fn messaging_parameters_schema() -> Value {
                     "about your presence is observed in the first place."
                 )
             },
+            "display_name": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. The name others see ",
+                    "for you. Omit it to leave your current name unchanged."
+                )
+            },
+            "tagline": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for profile and omitted for other actions. One line about what ",
+                    "you do, shown next to your name. Omit it to leave it unchanged; send an ",
+                    "empty string to remove it."
+                )
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for the role actions and omitted for other actions. Which ",
+                    "workspace to describe or administer; when omitted your current one is used."
+                )
+            },
+            "role_id": {
+                "type": "string",
+                "description": concat!(
+                    "Required for update_role and delete_role, omitted for other actions. The ",
+                    "role_id shown by the roles action."
+                )
+            },
+            "role_name": {
+                "type": "string",
+                "description": concat!(
+                    "Required for create_role and update_role, omitted for other actions. What ",
+                    "this bundle of permissions is called, up to 60 characters, unique in the ",
+                    "workspace."
+                )
+            },
+            "role_color": {
+                "type": "string",
+                "description": concat!(
+                    "Optional for create_role and update_role, omitted for other actions. The ",
+                    "badge colour as #rrggbb in lowercase; the empty string leaves the role ",
+                    "uncoloured."
+                )
+            },
+            "permissions": {
+                "type": "array",
+                "items": {"type": "string", "enum": ROLE_PERMISSIONS},
+                "description": concat!(
+                    "Optional for create_role and update_role, omitted for other actions. The ",
+                    "permissions this role ends up holding — naming them replaces the previous ",
+                    "set rather than adding to it. Omitting the field leaves the role with none."
+                )
+            },
+            "member_kind": {
+                "type": "string",
+                "enum": ["human", "personality_agent"],
+                "description": concat!(
+                    "Required for assign_roles and omitted for other actions. Which kind of ",
+                    "participant member_id names; people and personality agents are addressed ",
+                    "the same way."
+                )
+            },
+            "member_id": {
+                "type": "string",
+                "description": concat!(
+                    "Required for assign_roles and omitted for other actions. The id of the ",
+                    "participant whose roles are being replaced."
+                )
+            },
+            "role_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": concat!(
+                    "Required for assign_roles and omitted for other actions. Every role that ",
+                    "participant ends up holding; an empty list returns them to plain ",
+                    "membership."
+                )
+            },
+            "topic": {
+                "type": "string",
+                "description": concat!(
+                    "Required for set_topic, optional for create_channel, omitted for other ",
+                    "actions. The one line at the top of the channel saying what it is for; ",
+                    "the empty string clears it."
+                )
+            },
             "note": {
                 "type": "string",
                 "description": concat!(
@@ -658,12 +866,16 @@ impl Tool for MessagingTool {
                 "open a place to see its timeline/members/unread state, then write in ",
                 "that currently open place, or react or promise a later reply to a ",
                 "message visible in it. When a tangent deserves its own room, list or ",
-                "open a thread under the place. Declare your own availability with status, or ",
+                "open a thread under the place. Declare your own availability with status, ",
+                "say who you are — your name and what you do — with profile, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Use search to find something said elsewhere, attention to see what ",
                 "arrived while you were not looking, notification_settings to ",
                 "decide what is allowed to interrupt you, and get_call_state to see ",
                 "who is currently in a call. ",
+                "See who may administer this place with roles, and administer it yourself ",
+                "with create_role, update_role, delete_role and assign_roles once you hold ",
+                "the permission to. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare. ",
                 "A message may carry attachments; each one reports filename, mime, ",
@@ -813,6 +1025,104 @@ impl Tool for MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::Profile {
+                display_name,
+                tagline,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.profile(SetMessagingProfileRequest {
+                    display_name: display_name.as_deref(),
+                    tagline: tagline.as_deref(),
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::Roles { workspace_id } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.roles(ListMessagingRolesRequest {
+                    workspace_id: workspace_id.as_deref(),
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::CreateRole {
+                workspace_id,
+                role_name,
+                role_color,
+                permissions,
+            } => {
+                let permissions = permissions.unwrap_or_default();
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.create_role(CreateMessagingRoleRequest {
+                        workspace_id: workspace_id.as_deref(),
+                        name: &role_name,
+                        color: role_color.as_deref(),
+                        permissions: &permissions,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::UpdateRole {
+                workspace_id,
+                role_id,
+                role_name,
+                role_color,
+                permissions,
+            } => {
+                let permissions = permissions.unwrap_or_default();
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.update_role(UpdateMessagingRoleRequest {
+                        workspace_id: workspace_id.as_deref(),
+                        role_id: &role_id,
+                        name: &role_name,
+                        color: role_color.as_deref(),
+                        permissions: &permissions,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
+            MessagingAction::DeleteRole {
+                workspace_id,
+                role_id,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.delete_role(DeleteMessagingRoleRequest {
+                    workspace_id: workspace_id.as_deref(),
+                    role_id: &role_id,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::AssignRoles {
+                workspace_id,
+                member_kind,
+                member_id,
+                role_ids,
+            } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.set_member_roles(SetMessagingMemberRolesRequest {
+                    workspace_id: workspace_id.as_deref(),
+                    member_kind: member_kind_text(member_kind),
+                    member_id: &member_id,
+                    role_ids: &role_ids,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::SetTopic { topic } => {
+                let place_id = state.focused_place_id.clone().ok_or_else(|| {
+                    ToolError::Protocol(
+                        "open a messaging place before setting its topic; the topic belongs to the place currently in view"
+                            .to_owned(),
+                    )
+                })?;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.set_channel_topic(SetMessagingChannelTopicRequest {
+                        place_id: &place_id,
+                        topic: &topic,
+                    }) => result,
+                }
+                .map_err(|error| ToolError::Rpc(error.to_string()))?
+            }
             MessagingAction::ReplyLater {
                 message_id,
                 seq,
@@ -1171,6 +1481,71 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             validate_optional_note(note, MAX_STATUS_NOTE_BYTES)?;
             validate_relative_minutes(expires_in_minutes)
         }
+        MessagingAction::Profile {
+            display_name,
+            tagline,
+        } => {
+            // A present-but-blank name would ask the server to erase the one
+            // thing every list needs; omitting the field is how one leaves it
+            // alone. A blank tagline is legitimate — it removes the line.
+            if display_name.as_deref().is_some_and(|name| {
+                validate_bounded_nonempty(name, MAX_DISPLAY_NAME_BYTES).is_err()
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            if tagline.as_deref().is_some_and(|tagline| {
+                tagline.len() > MAX_TAGLINE_BYTES || tagline.chars().any(char::is_control)
+            }) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        MessagingAction::Roles { workspace_id } => validate_optional_workspace(workspace_id),
+        MessagingAction::CreateRole {
+            workspace_id,
+            role_name,
+            role_color,
+            permissions,
+        } => {
+            validate_optional_workspace(workspace_id)?;
+            validate_role_shape(role_name, role_color, permissions)
+        }
+        MessagingAction::UpdateRole {
+            workspace_id,
+            role_id,
+            role_name,
+            role_color,
+            permissions,
+        } => {
+            validate_optional_workspace(workspace_id)?;
+            validate_bounded_nonempty(role_id, MAX_ROLE_ID_BYTES)?;
+            validate_role_shape(role_name, role_color, permissions)
+        }
+        MessagingAction::DeleteRole {
+            workspace_id,
+            role_id,
+        } => {
+            validate_optional_workspace(workspace_id)?;
+            validate_bounded_nonempty(role_id, MAX_ROLE_ID_BYTES)
+        }
+        MessagingAction::AssignRoles {
+            workspace_id,
+            member_id,
+            role_ids,
+            ..
+        } => {
+            validate_optional_workspace(workspace_id)?;
+            validate_bounded_nonempty(member_id, MAX_PLACE_ID_BYTES)?;
+            if role_ids.len() > MAX_ROLE_IDS {
+                return Err(ToolError::InvalidArguments);
+            }
+            for role_id in role_ids {
+                validate_bounded_nonempty(role_id, MAX_ROLE_ID_BYTES)?;
+            }
+            Ok(())
+        }
+        // A blank topic is legitimate: it is how the line is removed.
+        MessagingAction::SetTopic { topic } => validate_topic(topic),
         MessagingAction::ReplyLater {
             message_id,
             seq,
@@ -1396,6 +1771,64 @@ fn validate_limit(limit: &Option<u16>, max: u16) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn validate_optional_workspace(workspace_id: &Option<String>) -> Result<(), ToolError> {
+    if workspace_id
+        .as_deref()
+        .is_some_and(|id| validate_bounded_nonempty(id, MAX_PLACE_ID_BYTES).is_err())
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// A topic is one line others read at the top of the screen, so a control
+/// character in it would corrupt the header rather than say anything.
+fn validate_topic(topic: &str) -> Result<(), ToolError> {
+    if topic.len() > MAX_TOPIC_BYTES || topic.chars().any(char::is_control) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// A colour the server will store: the empty string, which is how one asks for
+/// no colour at all, or the lowercase `#rrggbb` its CHECK constraint accepts.
+fn is_storable_role_color(color: &str) -> bool {
+    color.is_empty()
+        || (color.len() == 7
+            && color.starts_with('#')
+            && color[1..]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()))
+}
+
+/// The shape create_role and update_role share. An unknown permission name is
+/// refused here rather than dropped by the server, so an agent never walks away
+/// believing a role carries something it does not.
+fn validate_role_shape(
+    role_name: &str,
+    role_color: &Option<String>,
+    permissions: &Option<Vec<String>>,
+) -> Result<(), ToolError> {
+    validate_bounded_nonempty(role_name, MAX_ROLE_NAME_BYTES)?;
+    if role_name.chars().any(char::is_control) {
+        return Err(ToolError::InvalidArguments);
+    }
+    if role_color
+        .as_deref()
+        .is_some_and(|color| !is_storable_role_color(color))
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    if let Some(permissions) = permissions
+        && permissions
+            .iter()
+            .any(|permission| !ROLE_PERMISSIONS.contains(&permission.as_str()))
+    {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
+}
+
 /// Exactly one selector: the gesture lands on one visible message. React and
 /// reply_later share the rule because they are the same kind of act — a
 /// response to something on screen.
@@ -1545,6 +1978,11 @@ mod tests {
         writes: AsyncMutex<Vec<(String, String, String)>>,
         reacts: AsyncMutex<Vec<(String, String, String)>>,
         statuses: AsyncMutex<Vec<(String, Option<String>, Option<u32>)>>,
+        profiles: AsyncMutex<Vec<(Option<String>, Option<String>)>>,
+        role_reads: AsyncMutex<Vec<Option<String>>>,
+        role_writes: AsyncMutex<Vec<(String, String, Vec<String>)>>,
+        role_grants: AsyncMutex<Vec<(String, String, Vec<String>)>>,
+        topics: AsyncMutex<Vec<(String, String)>>,
         promises: AsyncMutex<Vec<(String, String, Option<String>, Option<u32>)>>,
         resolutions: AsyncMutex<Vec<String>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
@@ -1629,6 +2067,91 @@ mod tests {
                 request.expires_in_minutes,
             ));
             Ok(json!({"status": {"status": request.status, "note": request.note.unwrap_or("")}}))
+        }
+
+        async fn profile(&self, request: SetMessagingProfileRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("profile".to_owned());
+            self.profiles.lock().await.push((
+                request.display_name.map(str::to_owned),
+                request.tagline.map(str::to_owned),
+            ));
+            Ok(json!({"profile": {
+                "display_name": request.display_name.unwrap_or("Sumi"),
+                "tagline": request.tagline.unwrap_or("")
+            }}))
+        }
+
+        async fn roles(&self, request: ListMessagingRolesRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("roles".to_owned());
+            self.role_reads
+                .lock()
+                .await
+                .push(request.workspace_id.map(str::to_owned));
+            Ok(json!({
+                "workspace_id": request.workspace_id.unwrap_or("ws-1"),
+                "roles": [{"role_id": "r1", "name": "Admin",
+                           "permissions": {"manage_channels": true}}],
+                "role_assignments": [],
+                "members": [],
+                "permissions": {}
+            }))
+        }
+
+        async fn create_role(&self, request: CreateMessagingRoleRequest<'_>) -> Result<Value> {
+            self.calls.lock().await.push("create_role".to_owned());
+            self.role_writes.lock().await.push((
+                request.name.to_owned(),
+                request.color.unwrap_or_default().to_owned(),
+                request.permissions.to_vec(),
+            ));
+            Ok(json!({"role": {"role_id": "r-new", "name": request.name}}))
+        }
+
+        async fn update_role(&self, request: UpdateMessagingRoleRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("update_role:{}", request.role_id));
+            self.role_writes.lock().await.push((
+                request.name.to_owned(),
+                request.color.unwrap_or_default().to_owned(),
+                request.permissions.to_vec(),
+            ));
+            Ok(json!({"role": {"role_id": request.role_id, "name": request.name}}))
+        }
+
+        async fn delete_role(&self, request: DeleteMessagingRoleRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("delete_role:{}", request.role_id));
+            Ok(json!({"role_id": request.role_id, "deleted": true}))
+        }
+
+        async fn set_member_roles(
+            &self,
+            request: SetMessagingMemberRolesRequest<'_>,
+        ) -> Result<Value> {
+            self.calls.lock().await.push("assign_roles".to_owned());
+            self.role_grants.lock().await.push((
+                request.member_kind.to_owned(),
+                request.member_id.to_owned(),
+                request.role_ids.to_vec(),
+            ));
+            Ok(json!({"participant": {"kind": request.member_kind},
+                      "role_ids": request.role_ids}))
+        }
+
+        async fn set_channel_topic(
+            &self,
+            request: SetMessagingChannelTopicRequest<'_>,
+        ) -> Result<Value> {
+            self.calls.lock().await.push("set_topic".to_owned());
+            self.topics
+                .lock()
+                .await
+                .push((request.place_id.to_owned(), request.topic.to_owned()));
+            Ok(json!({"channel": {"channel_id": request.place_id, "topic": request.topic}}))
         }
 
         async fn reply_later(
@@ -1950,6 +2473,7 @@ mod tests {
                 "write",
                 "react",
                 "status",
+                "profile",
                 "reply_later",
                 "resolve_reply_later",
                 "start_dm",
@@ -1963,7 +2487,13 @@ mod tests {
                 "threads",
                 "create_thread",
                 "create_poll",
-                "vote_poll"
+                "vote_poll",
+                "roles",
+                "create_role",
+                "update_role",
+                "delete_role",
+                "assign_roles",
+                "set_topic"
             ])
         );
         assert_eq!(
@@ -1989,6 +2519,29 @@ mod tests {
             json!(["available", "busy", "away"])
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
+        assert_eq!(schema["properties"]["display_name"]["type"], "string");
+        assert_eq!(schema["properties"]["tagline"]["type"], "string");
+        assert_eq!(schema["properties"]["workspace_id"]["type"], "string");
+        assert_eq!(schema["properties"]["role_id"]["type"], "string");
+        assert_eq!(schema["properties"]["role_name"]["type"], "string");
+        assert_eq!(schema["properties"]["role_color"]["type"], "string");
+        assert_eq!(schema["properties"]["role_ids"]["type"], "array");
+        assert_eq!(schema["properties"]["member_id"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["member_kind"]["enum"],
+            json!(["human", "personality_agent"])
+        );
+        // The permission vocabulary is closed and mirrors the server's.
+        assert_eq!(
+            schema["properties"]["permissions"]["items"]["enum"],
+            json!([
+                "manage_channels",
+                "manage_roles",
+                "manage_members",
+                "mention_all"
+            ])
+        );
+        assert_eq!(schema["properties"]["topic"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
         assert_eq!(schema["properties"]["participants"]["type"], "array");
         for field in ["name", "topic", "workspace_id"] {
@@ -2013,7 +2566,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            30
+            39
         );
     }
 
@@ -2084,6 +2637,118 @@ mod tests {
                 note: Some(note),
                 expires_in_minutes: Some(45)
             } if note == "取り込み中"
+        ));
+
+        let profile: MessagingAction = serde_json::from_value(json!({
+            "action": "profile",
+            "display_name": "墨",
+            "tagline": "秘書"
+        }))
+        .unwrap();
+        assert!(matches!(
+            profile,
+            MessagingAction::Profile {
+                display_name: Some(display_name),
+                tagline: Some(tagline)
+            } if display_name == "墨" && tagline == "秘書"
+        ));
+
+        let roles: MessagingAction = serde_json::from_value(json!({
+            "action": "roles",
+            "workspace_id": "ws-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            roles,
+            MessagingAction::Roles { workspace_id: Some(workspace_id) } if workspace_id == "ws-1"
+        ));
+
+        let create_role: MessagingAction = serde_json::from_value(json!({
+            "action": "create_role",
+            "role_name": "開発",
+            "role_color": "#3366ff",
+            "permissions": ["manage_channels"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            create_role,
+            MessagingAction::CreateRole {
+                workspace_id: None,
+                role_name,
+                role_color: Some(role_color),
+                permissions: Some(permissions)
+            } if role_name == "開発" && role_color == "#3366ff"
+                && permissions == vec!["manage_channels".to_owned()]
+        ));
+
+        let update_role: MessagingAction = serde_json::from_value(json!({
+            "action": "update_role",
+            "role_id": "role-1",
+            "role_name": "設計"
+        }))
+        .unwrap();
+        assert!(matches!(
+            update_role,
+            MessagingAction::UpdateRole {
+                role_id,
+                role_name,
+                role_color: None,
+                permissions: None,
+                ..
+            } if role_id == "role-1" && role_name == "設計"
+        ));
+
+        let delete_role: MessagingAction = serde_json::from_value(json!({
+            "action": "delete_role",
+            "role_id": "role-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            delete_role,
+            MessagingAction::DeleteRole { role_id, .. } if role_id == "role-1"
+        ));
+
+        let assign_roles: MessagingAction = serde_json::from_value(json!({
+            "action": "assign_roles",
+            "member_kind": "human",
+            "member_id": "human-1",
+            "role_ids": ["role-1"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            assign_roles,
+            MessagingAction::AssignRoles {
+                member_kind: MessagingMemberKind::Human,
+                member_id,
+                role_ids,
+                ..
+            } if member_id == "human-1" && role_ids == vec!["role-1".to_owned()]
+        ));
+
+        let create_channel: MessagingAction = serde_json::from_value(json!({
+            "action": "create_channel",
+            "name": "dev",
+            "topic": "開発の相談"
+        }))
+        .unwrap();
+        assert!(matches!(
+            create_channel,
+            MessagingAction::CreateChannel {
+                workspace_id: None,
+                name,
+                topic: Some(topic),
+                voice: None,
+            } if name == "dev" && topic == "開発の相談"
+        ));
+
+        let set_topic: MessagingAction = serde_json::from_value(json!({
+            "action": "set_topic",
+            "topic": "レビュー予約はこちら"
+        }))
+        .unwrap();
+        assert!(matches!(
+            set_topic,
+            MessagingAction::SetTopic { topic } if topic == "レビュー予約はこちら"
         ));
 
         let reply_later: MessagingAction = serde_json::from_value(json!({
@@ -2229,6 +2894,17 @@ mod tests {
     async fn open_does_not_mark_read_until_the_next_admitted_tool_result() {
         let api = Arc::new(FakeMessagingApi::default());
         let tool = MessagingTool::new(api.clone());
+
+        // The topic is the line at the top of the screen, so there must be a
+        // screen: without an open place the tool refuses rather than guessing.
+        let error = execute(
+            &tool,
+            json!({"action": "set_topic", "topic": "x"}),
+            "no-place",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Protocol(_)));
 
         execute(
             &tool,
@@ -2436,6 +3112,231 @@ mod tests {
             assert!(matches!(error, ToolError::InvalidArguments));
         }
         assert_eq!(api.statuses.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_is_read_and_changed_field_by_field_without_an_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        // 名乗り is about the person, so like status it needs no place in view.
+        execute(&tool, json!({"action": "profile"}), "read")
+            .await
+            .unwrap();
+        assert_eq!(api.profiles.lock().await.as_slice(), &[(None, None)]);
+
+        // Naming one field leaves the other alone: omitted fields stay off the
+        // wire rather than arriving as a null the server must interpret.
+        execute(
+            &tool,
+            json!({"action": "profile", "tagline": "開発"}),
+            "tagline",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.profiles.lock().await[1],
+            (None, Some("開発".to_owned()))
+        );
+
+        // An empty tagline removes the line; an empty name would erase the one
+        // thing every member list needs, so it is refused here.
+        execute(&tool, json!({"action": "profile", "tagline": ""}), "clear")
+            .await
+            .unwrap();
+        assert_eq!(api.profiles.lock().await[2], (None, Some(String::new())));
+
+        for arguments in [
+            json!({"action": "profile", "display_name": ""}),
+            json!({"action": "profile", "display_name": "改\n行"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.profiles.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn roles_are_readable_without_an_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        execute(&tool, json!({"action": "roles"}), "roles")
+            .await
+            .unwrap();
+        assert_eq!(api.role_reads.lock().await.as_slice(), &[None]);
+
+        execute(
+            &tool,
+            json!({"action": "roles", "workspace_id": "ws-2"}),
+            "scoped",
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.role_reads.lock().await[1], Some("ws-2".to_owned()));
+
+        let error = execute(
+            &tool,
+            json!({"action": "roles", "workspace_id": ""}),
+            "invalid",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments));
+        assert_eq!(api.role_reads.lock().await.len(), 2);
+    }
+
+    /// Every administrative gesture the human settings screen offers has an
+    /// action here (AX 同型). The refusal for an agent that may not administer
+    /// comes from the server's permission check, not from a missing tool.
+    #[tokio::test]
+    async fn every_role_administration_the_settings_screen_offers_has_an_action() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        execute(
+            &tool,
+            json!({"action": "create_role", "role_name": "開発",
+                   "role_color": "#3366ff", "permissions": ["manage_channels"]}),
+            "create",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "update_role", "role_id": "r1", "role_name": "設計",
+                   "permissions": []}),
+            "update",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "delete_role", "role_id": "r1"}),
+            "delete",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "assign_roles", "member_kind": "personality_agent",
+                   "member_id": "pa-1", "role_ids": ["r1", "r2"]}),
+            "assign",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.role_writes.lock().await.as_slice(),
+            &[
+                (
+                    "開発".to_owned(),
+                    "#3366ff".to_owned(),
+                    vec!["manage_channels".to_owned()]
+                ),
+                // Naming no permission is how one is removed: the call replaces
+                // the set rather than adding to it.
+                ("設計".to_owned(), String::new(), vec![]),
+            ]
+        );
+        assert_eq!(
+            api.role_grants.lock().await.as_slice(),
+            &[(
+                "personality_agent".to_owned(),
+                "pa-1".to_owned(),
+                vec!["r1".to_owned(), "r2".to_owned()]
+            )]
+        );
+        assert!(
+            api.calls
+                .lock()
+                .await
+                .contains(&"delete_role:r1".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn role_administration_refuses_shapes_the_server_would_reject() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        for arguments in [
+            // A blank name is not a role anybody could point at.
+            json!({"action": "create_role", "role_name": ""}),
+            // Colours are the lowercase #rrggbb the schema stores.
+            json!({"action": "create_role", "role_name": "色", "role_color": "red"}),
+            json!({"action": "create_role", "role_name": "色", "role_color": "#AABBCC"}),
+            // An unknown permission is refused here rather than dropped later,
+            // so nobody walks away believing the role carries it.
+            json!({"action": "create_role", "role_name": "夢", "permissions": ["become_owner"]}),
+            json!({"action": "update_role", "role_id": "", "role_name": "改名"}),
+            json!({"action": "delete_role", "role_id": ""}),
+            json!({"action": "assign_roles", "member_kind": "bot",
+                   "member_id": "b-1", "role_ids": []}),
+            json!({"action": "assign_roles", "member_kind": "human",
+                   "member_id": "", "role_ids": []}),
+            json!({"action": "assign_roles", "member_kind": "human",
+                   "member_id": "h-1", "role_ids": [""]}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert!(api.role_writes.lock().await.is_empty());
+        assert!(api.role_grants.lock().await.is_empty());
+    }
+
+    /// manage_channels は agent にも与えられる権限なので、チャンネルを作る・
+    /// トピックを書き換えるという human の画面の操作もここにある。
+    #[tokio::test]
+    async fn channels_are_created_anywhere_but_the_topic_belongs_to_the_open_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        execute(
+            &tool,
+            json!({"action": "create_channel", "name": "dev", "topic": "開発の相談"}),
+            "create-channel",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.channels.lock().await.as_slice(),
+            &[(
+                "create".to_owned(),
+                "dev".to_owned(),
+                Some("開発の相談".to_owned())
+            )]
+        );
+
+        execute(
+            &tool,
+            json!({"action": "open", "place_id": "general"}),
+            "open",
+        )
+        .await
+        .unwrap();
+        execute(
+            &tool,
+            json!({"action": "set_topic", "topic": "レビュー予約はこちら"}),
+            "set-topic",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.topics.lock().await.as_slice(),
+            &[("general".to_owned(), "レビュー予約はこちら".to_owned())]
+        );
+
+        for arguments in [
+            json!({"action": "create_channel", "name": ""}),
+            json!({"action": "create_channel", "name": "dev\n"}),
+            json!({"action": "set_topic", "topic": "改行\nは入らない"}),
+        ] {
+            let error = execute(&tool, arguments, "invalid").await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments));
+        }
+        assert_eq!(api.channels.lock().await.len(), 1);
+        assert_eq!(api.topics.lock().await.len(), 1);
     }
 
     #[tokio::test]

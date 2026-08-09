@@ -8,6 +8,7 @@ import {
   STATUS_DOT,
   STATUS_LABEL,
 } from "./participant-avatar";
+import { SettingsMenuItem } from "./settings-overlay";
 
 const STATUS_HINT: Record<StatusKind, string> = {
   available: "話しかけて大丈夫です",
@@ -238,6 +239,9 @@ export function StatusMenu({
       <p className="px-2 pt-1 pb-0.5 text-[10px] text-muted-foreground/70">
         ステータスは自己申告。誰かが勝手に晒すことはありません
       </p>
+      <div className="mt-1 border-border/70 border-t pt-1">
+        <SettingsMenuItem onOpened={() => onOpenChange(false)} />
+      </div>
     </div>
   );
 }
