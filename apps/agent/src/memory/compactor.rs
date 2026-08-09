@@ -711,13 +711,18 @@ fn compaction_time_range(input: &CompactionInput) -> (DateTime<Utc>, DateTime<Ut
 
 fn build_user_content(input: &CompactionInput) -> String {
     let mut content = String::new();
+    let summary_layer = match input.prompt {
+        CompactPrompt::L1ToL2 => "l1",
+        CompactPrompt::ConsolidateL2 => "l2",
+        CompactPrompt::L0ToL1 => "l0",
+    };
 
     for summary in &input.summaries {
         let from = summary.from.to_rfc3339_opts(SecondsFormat::Secs, true);
         let to = summary.to.to_rfc3339_opts(SecondsFormat::Secs, true);
         let escaped_summary = escape_framing_text(summary.text.as_str());
         content.push_str(&format!(
-            "<memory layer=\"l1\" from=\"{from}\" to=\"{to}\">{escaped_summary}</memory>\n"
+            "<memory layer=\"{summary_layer}\" from=\"{from}\" to=\"{to}\">{escaped_summary}</memory>\n"
         ));
     }
 
@@ -2882,6 +2887,9 @@ mod tests {
             request["messages"][0]["content"],
             CompactPrompt::ConsolidateL2.as_str()
         );
+        let content = request["messages"][1]["content"].as_str().expect("content");
+        assert!(content.contains("<memory layer=\"l2\""));
+        assert!(!content.contains("<memory layer=\"l1\""));
     }
 
     #[test]
