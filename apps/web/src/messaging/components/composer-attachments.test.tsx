@@ -11,6 +11,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Attachment } from "../model";
 import {
   ComposerAttachments,
   type DraftAttachment,
@@ -177,10 +178,10 @@ describe("useDraftAttachments", () => {
   it("宣言のPATCH中も送信を止め、完了後にreadyへ戻す", async () => {
     const initial = draft().attachment;
     if (!initial) throw new Error("test draft must carry an attachment");
-    let finishUpdate: ((attachment: typeof initial) => void) | undefined;
+    let finishUpdate: ((attachment: Attachment) => void) | undefined;
     const update = vi.fn(
       () =>
-        new Promise<typeof initial>((resolve) => {
+        new Promise<Attachment>((resolve) => {
           finishUpdate = resolve;
         }),
     );
