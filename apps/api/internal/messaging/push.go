@@ -58,9 +58,14 @@ type PushSubscription struct {
 	CreatedAt      time.Time
 }
 
-// ErrInvalidPushSubscription marks a subscription the caller shaped wrongly.
-// It is a request error, so the transport answers 400 instead of 500.
-var ErrInvalidPushSubscription = errors.New("invalid push subscription")
+var (
+	// ErrInvalidPushSubscription marks a subscription the caller shaped wrongly.
+	// It is a request error, so the transport answers 400 instead of 500.
+	ErrInvalidPushSubscription = errors.New("invalid push subscription")
+	// ErrPushSubscriptionOwned keeps an endpoint bearer from being enough to
+	// move another Human's browser subscription to the caller.
+	ErrPushSubscriptionOwned = errors.New("push subscription belongs to another human")
+)
 
 // EnsureVAPIDKeys returns the deployment's VAPID key pair, minting it on first
 // use. 「無ければ作る、あれば絶対に作り直さない」を DB 側の単一行制約に預ける
@@ -97,8 +102,8 @@ func (s *Store) EnsureVAPIDKeys(ctx context.Context) (VAPIDKeys, error) {
 
 // SavePushSubscription registers (or re-registers) one browser endpoint for the
 // owner. 所有者は認証済みの呼び出し元であってリクエストの項目ではない。
-// endpoint は push service が端末に発行する識別子なので、同じ endpoint が
-// 別の人に再利用されたときは新しい所有者が上書きする。
+// endpoint は push service が端末に発行する識別子だが、それだけでは所有権の
+// 証明にしない。同じ鍵素材を持つ同じブラウザだけが別のログインへ引き継げる。
 func (s *Store) SavePushSubscription(
 	ctx context.Context, owner ParticipantRef, endpoint, p256dh, auth string,
 ) (PushSubscription, error) {
@@ -134,9 +139,15 @@ func (s *Store) SavePushSubscription(
 		   SET human_id = EXCLUDED.human_id,
 		       p256dh = EXCLUDED.p256dh,
 		       auth = EXCLUDED.auth
+		   WHERE push_subscriptions.human_id = EXCLUDED.human_id
+		      OR (push_subscriptions.p256dh = EXCLUDED.p256dh
+		          AND push_subscriptions.auth = EXCLUDED.auth)
 		 RETURNING subscription_id, created_at`,
 		subscription.SubscriptionID, owner.ID, endpoint, p256dh, auth).
 		Scan(&subscription.SubscriptionID, &subscription.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PushSubscription{}, ErrPushSubscriptionOwned
+	}
 	if err != nil {
 		return PushSubscription{}, fmt.Errorf("save push subscription: %w", err)
 	}
@@ -380,6 +391,12 @@ func (d *PushDispatcher) send(ctx context.Context, subscription PushSubscription
 	// 送らないよう、その場で忘れる。
 	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusGone {
 		d.store.forgetPushEndpoint(ctx, subscription.Endpoint)
+		return
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		// endpoint は bearer secret なのでログへ出さない。status があれば設定不良・
+		// rate limit・payload rejection の区別には十分である。
+		log.Printf("messaging push: unexpected response status %d", response.StatusCode)
 	}
 }
 
