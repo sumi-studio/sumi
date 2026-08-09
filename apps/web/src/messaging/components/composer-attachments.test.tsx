@@ -138,6 +138,24 @@ describe("ComposerAttachments", () => {
     expect(screen.getByText("ネタバレ")).toBeInTheDocument();
   });
 
+  it("宣言の更新中はネタバレ切替と編集を重ねられない", () => {
+    render(
+      <ComposerAttachments
+        items={[draft({ status: "uploading" })]}
+        onRemove={() => {}}
+        onToggleSpoiler={() => {}}
+        onEdit={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "avatar.jpg のネタバレをマーク" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "avatar.jpg を編集" }),
+    ).toBeDisabled();
+  });
+
   it("編集ボタンから添付ファイルの編集を開く", () => {
     render(
       <ComposerAttachments
@@ -175,7 +193,7 @@ describe("ComposerAttachments", () => {
 });
 
 describe("useDraftAttachments", () => {
-  it("宣言のPATCH中も送信を止め、完了後にreadyへ戻す", async () => {
+  it("重なる宣言編集を一件だけ受け付け、完了まで送信を止める", async () => {
     const initial = draft().attachment;
     if (!initial) throw new Error("test draft must carry an attachment");
     let finishUpdate: ((attachment: Attachment) => void) | undefined;
@@ -196,10 +214,13 @@ describe("useDraftAttachments", () => {
     });
     await waitFor(() => expect(result.current.items[0]?.status).toBe("ready"));
 
+    const localId = result.current.items[0].localId;
     act(() => {
-      result.current.toggleSpoiler(result.current.items[0].localId);
+      result.current.toggleSpoiler(localId);
+      void result.current.applyEdit(localId, { patch: { alt: "後続の編集" } });
     });
     expect(update).toHaveBeenCalledWith("attachment-1", { spoiler: true });
+    expect(update).toHaveBeenCalledTimes(1);
     expect(result.current.uploading).toBe(true);
 
     await act(async () => {
