@@ -971,11 +971,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
             (place) => reconcileLoadedPolls(currentBackend, place),
           );
           currentBackend.subscribe(applyEvent, { sinceByPlace });
-          currentBackend.subscribeConnection((state) =>
-            set({ connection: state }),
-          );
-          // 通話はreplayされないので、今開いている通話は明示的に読み直す。
-          void useCall.getState().hydrate();
+          let previousConnection: ConnectionState | null = null;
+          currentBackend.subscribeConnection((state) => {
+            set({ connection: state });
+            // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
+            // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
+            // snapshotの後へreplayする。
+            if (state === "connected" && previousConnection !== "connected") {
+              void useCall.getState().hydrate();
+            }
+            previousConnection = state;
+          });
         })
         .catch(() => {
           if (
