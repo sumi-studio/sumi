@@ -318,6 +318,14 @@ func TestChannelTopicPatchOverHTTP(t *testing.T) {
 	}
 	channelID := body["channel_id"].(string)
 
+	// 名前もトピックも指定しない PATCH は変更でも成功でもない。通知だけを
+	// 発生させる no-op にせず、local-control と同じ形で拒む。
+	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID,
+		w.humanA.ID, map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_request" {
+		t.Fatalf("empty patch: status %d body %v", resp.StatusCode, body)
+	}
+
 	// Editing a channel is workspace administration: a plain member is refused
 	// (0019: manage_channels と同じ基準を作成・編集の両方に掛ける).
 	resp, body = call(t, ts, http.MethodPatch, "/messaging/places/"+channelID, w.humanB.ID,
