@@ -80,6 +80,10 @@ class FakePresenceBackend implements MessagingBackend {
   } = { statuses: [], replyLaterMarkers: [] };
   nextStatus: ParticipantStatus = status(SELF, "available");
   nextMarker: ReplyLaterMarker = marker("marker-self", SELF, 1);
+  nextPresenceFetch: Promise<{
+    statuses: ParticipantStatus[];
+    replyLaterMarkers: ReplyLaterMarker[];
+  }> | null = null;
   presenceFetches = 0;
   private listener: ((event: ServerEvent) => void) | null = null;
   private connectionListener: ((state: ConnectionState) => void) | null = null;
@@ -112,6 +116,11 @@ class FakePresenceBackend implements MessagingBackend {
 
   async fetchPresence(): ReturnType<MessagingBackend["fetchPresence"]> {
     this.presenceFetches += 1;
+    if (this.nextPresenceFetch) {
+      const pending = this.nextPresenceFetch;
+      this.nextPresenceFetch = null;
+      return pending;
+    }
     return this.presence;
   }
 
@@ -210,6 +219,49 @@ describe("messaging presence convergence", () => {
       expect(state.replyLaterById["marker-open"]).toBeUndefined();
     });
     expect(backend.presenceFetches).toBe(1);
+  });
+
+  it("replays live presence events that arrive during the snapshot fetch", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(OTHER, "available")],
+      replyLaterMarkers: [marker("marker-open", OTHER)],
+    };
+    await startMessaging(backend);
+
+    let resolvePresence!: (presence: {
+      statuses: ParticipantStatus[];
+      replyLaterMarkers: ReplyLaterMarker[];
+    }) => void;
+    backend.nextPresenceFetch = new Promise((resolve) => {
+      resolvePresence = resolve;
+    });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
+
+    // These land after the server captured the snapshot but before its response
+    // reaches us. They must survive the wholesale replacement below.
+    backend.emit({
+      type: "status_updated",
+      status: status(OTHER, "busy", "live update"),
+    });
+    backend.emit({
+      type: "reply_later_created",
+      marker: marker("marker-new", OTHER),
+    });
+    backend.emit({ type: "reply_later_resolved", markerId: "marker-open" });
+
+    resolvePresence({
+      statuses: [status(OTHER, "available")],
+      replyLaterMarkers: [marker("marker-open", OTHER)],
+    });
+    await vi.waitFor(() => {
+      const state = useMessaging.getState();
+      expect(state.statusByKey["human:human-2"]?.status).toBe("busy");
+      expect(state.replyLaterById["marker-new"]).toBeDefined();
+      expect(state.replyLaterById["marker-open"]?.resolved).toBe(true);
+    });
   });
 
   it("converges from the REST acknowledgement without a socket echo", async () => {

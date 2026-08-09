@@ -163,6 +163,17 @@ const reactionProjectionByPlace = new Map<
   ReactionProjectionCoordinator
 >();
 let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+type PresenceServerEvent = Extract<
+  ServerEvent,
+  {
+    type: "status_updated" | "reply_later_created" | "reply_later_resolved";
+  }
+>;
+let presenceResyncGeneration = 0;
+let pendingPresenceResync: {
+  generation: number;
+  events: PresenceServerEvent[];
+} | null = null;
 
 /** 遠い期限でもtimerを一度に張らない上限。起きたら残りをもう一度張り直す。 */
 const STATUS_EXPIRY_MAX_DELAY_MS = 60 * 60_000;
@@ -459,13 +470,35 @@ export const useMessaging = create<MessagingState>((set, get) => {
    * 変えたりmarkerを作った／解いたりした分は、cursorでは戻らない。
    */
   const resyncPresence = async () => {
-    const presence = await backend.fetchPresence();
-    const replyLaterById: Record<string, ReplyLaterMarker> = {};
-    for (const marker of presence.replyLaterMarkers) {
-      replyLaterById[marker.markerId] = marker;
+    const currentBackend = backend;
+    const resync = {
+      generation: ++presenceResyncGeneration,
+      events: [] as PresenceServerEvent[],
+    };
+    pendingPresenceResync = resync;
+    try {
+      const presence = await currentBackend.fetchPresence();
+      if (
+        backend !== currentBackend ||
+        pendingPresenceResync !== resync ||
+        presenceResyncGeneration !== resync.generation
+      ) {
+        return;
+      }
+      const replyLaterById: Record<string, ReplyLaterMarker> = {};
+      for (const marker of presence.replyLaterMarkers) {
+        replyLaterById[marker.markerId] = marker;
+      }
+      // Stop buffering before replaying, otherwise the replay would append to
+      // its own queue forever. Events were already applied live; replaying them
+      // now restores anything the older wholesale snapshot replaced.
+      pendingPresenceResync = null;
+      set({ statusByKey: applyStatuses(presence.statuses), replyLaterById });
+      scheduleStatusExpiry();
+      for (const event of resync.events) applyEvent(event);
+    } finally {
+      if (pendingPresenceResync === resync) pendingPresenceResync = null;
     }
-    set({ statusByKey: applyStatuses(presence.statuses), replyLaterById });
-    scheduleStatusExpiry();
   };
 
   const applyEvent = (
@@ -591,14 +624,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "status_updated") {
+      pendingPresenceResync?.events.push(event);
       applyStatus(event.status);
       return;
     }
     if (event.type === "reply_later_created") {
+      pendingPresenceResync?.events.push(event);
       applyReplyLater(event.marker);
       return;
     }
     if (event.type === "reply_later_resolved") {
+      pendingPresenceResync?.events.push(event);
       set((state) => {
         const marker = state.replyLaterById[event.markerId];
         if (!marker) return {};
@@ -1220,6 +1256,8 @@ export function bindMessagingSessionIdentity(identity: string | null): void {
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
+  presenceResyncGeneration += 1;
+  pendingPresenceResync = null;
   if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
   statusExpiryTimer = null;
   useMessaging.setState({
