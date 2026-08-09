@@ -17,6 +17,7 @@ import type {
   PlaceKey,
   ReactionSummary,
   ReplyLaterMarker,
+  ServerEvent,
   StatusKind,
   Urgency,
   WorkspaceSummary,
@@ -135,6 +136,19 @@ function unreadContribution(
 }
 
 let initialized = false;
+let messagingSessionGeneration = 0;
+let reactionResyncGeneration = 0;
+
+type ReactionUpdatedEvent = Extract<ServerEvent, { type: "reaction_updated" }>;
+
+interface PendingReactionResync {
+  backend: MessagingBackend;
+  events: ReactionUpdatedEvent[];
+  generation: number;
+  sessionGeneration: number;
+}
+
+const pendingReactionResyncByPlace = new Map<PlaceKey, PendingReactionResync>();
 
 export const useMessaging = create<MessagingState>((set, get) => {
   if (import.meta.env.DEV) {
@@ -151,43 +165,123 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const key = placeKey(place);
     const loaded = get().messagesByPlace[key];
     if (!loaded || loaded.length === 0) return;
+    const resyncBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const previous = pendingReactionResyncByPlace.get(key);
+    const pending: PendingReactionResync = {
+      backend: resyncBackend,
+      events:
+        previous?.backend === resyncBackend &&
+        previous.sessionGeneration === sessionGeneration
+          ? [...previous.events]
+          : [],
+      generation: ++reactionResyncGeneration,
+      sessionGeneration,
+    };
+    pendingReactionResyncByPlace.set(key, pending);
+
+    const isCurrent = () =>
+      backend === resyncBackend &&
+      messagingSessionGeneration === sessionGeneration &&
+      pendingReactionResyncByPlace.get(key)?.generation === pending.generation;
+
     const reactionsById = new Map<string, ReactionSummary[]>();
-    const oldestLoadedSeq = loaded[0].seq;
-    let beforeSeq = loaded[loaded.length - 1].seq + 1;
-    let remaining = loaded.length;
-    while (remaining > 0) {
-      const limit = Math.min(remaining, REACTION_RESYNC_LIMIT);
-      const fresh = await backend.fetchMessages(place, { beforeSeq, limit });
-      if (fresh.length === 0) break;
-      for (const message of fresh) {
-        reactionsById.set(message.messageId, message.reactions);
+    const ranges: { oldestSeq: number; newestSeq: number }[] = [];
+    for (const message of [...loaded].sort(
+      (left, right) => left.seq - right.seq,
+    )) {
+      const current = ranges[ranges.length - 1];
+      if (current && message.seq <= current.newestSeq + 1) {
+        current.newestSeq = Math.max(current.newestSeq, message.seq);
+      } else {
+        ranges.push({ oldestSeq: message.seq, newestSeq: message.seq });
       }
-      const nextBeforeSeq = fresh[0].seq;
-      if (
-        nextBeforeSeq <= oldestLoadedSeq ||
-        nextBeforeSeq >= beforeSeq ||
-        fresh.length < limit
-      ) {
-        break;
-      }
-      beforeSeq = nextBeforeSeq;
-      remaining -= fresh.length;
     }
+
+    try {
+      // loadPlaceAroundで離れたwindowが併存し得るため、件数ではなく連続seq範囲
+      // ごとに取得する。gapをページ送りで横断せず、各windowを確実に覆う。
+      for (const range of ranges.reverse()) {
+        let beforeSeq = range.newestSeq + 1;
+        while (beforeSeq > range.oldestSeq) {
+          const limit = Math.min(
+            beforeSeq - range.oldestSeq,
+            REACTION_RESYNC_LIMIT,
+          );
+          const fresh = await resyncBackend.fetchMessages(place, {
+            beforeSeq,
+            limit,
+          });
+          if (!isCurrent()) return;
+          if (fresh.length === 0) break;
+          for (const message of fresh) {
+            reactionsById.set(message.messageId, message.reactions);
+          }
+          const nextBeforeSeq = Math.min(
+            ...fresh.map((message) => message.seq),
+          );
+          if (nextBeforeSeq >= beforeSeq) break;
+          beforeSeq = nextBeforeSeq;
+        }
+      }
+      if (!isCurrent()) return;
+
+      set((state) => {
+        const current = state.messagesByPlace[key];
+        if (!current) return {};
+        let changed = false;
+        const next = current.map((message) => {
+          const reactions = reactionsById.get(message.messageId);
+          if (
+            !reactions ||
+            reactionsFingerprint(reactions) ===
+              reactionsFingerprint(message.reactions)
+          ) {
+            return message;
+          }
+          changed = true;
+          return { ...message, reactions };
+        });
+        if (!changed) return {};
+        return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
+      });
+
+      pendingReactionResyncByPlace.delete(key);
+      for (const event of pending.events) applyReactionUpdate(event, false);
+    } finally {
+      if (
+        pendingReactionResyncByPlace.get(key)?.generation === pending.generation
+      ) {
+        pendingReactionResyncByPlace.delete(key);
+      }
+    }
+  };
+
+  const applyReactionUpdate = (
+    event: ReactionUpdatedEvent,
+    bufferDuringResync = true,
+  ) => {
+    const key = placeKey(event.place);
+    if (bufferDuringResync) {
+      pendingReactionResyncByPlace.get(key)?.events.push(event);
+    }
+    // reactionだけを差し替える。message全体を置き換えると、同時に届いた
+    // 編集をこのeventが巻き戻す。未ロードのmessageは無視でよい（後で読めば
+    // 現在のreactionが付いてくる）。
     set((state) => {
       const current = state.messagesByPlace[key];
       if (!current) return {};
       let changed = false;
       const next = current.map((message) => {
-        const reactions = reactionsById.get(message.messageId);
+        if (message.messageId !== event.messageId) return message;
         if (
-          !reactions ||
-          reactionsFingerprint(reactions) ===
-            reactionsFingerprint(message.reactions)
+          reactionsFingerprint(message.reactions) ===
+          reactionsFingerprint(event.reactions)
         ) {
           return message;
         }
         changed = true;
-        return { ...message, reactions };
+        return { ...message, reactions: event.reactions };
       });
       if (!changed) return {};
       return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
@@ -198,28 +292,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     event: Parameters<Parameters<MessagingBackend["subscribe"]>[0]>[0],
   ) => {
     if (event.type === "reaction_updated") {
-      // reactionだけを差し替える。message全体を置き換えると、同時に届いた
-      // 編集をこのeventが巻き戻す。未ロードのmessageは無視でよい（後で読めば
-      // 現在のreactionが付いてくる）。
-      const key = placeKey(event.place);
-      set((state) => {
-        const current = state.messagesByPlace[key];
-        if (!current) return {};
-        let changed = false;
-        const next = current.map((message) => {
-          if (message.messageId !== event.messageId) return message;
-          if (
-            reactionsFingerprint(message.reactions) ===
-            reactionsFingerprint(event.reactions)
-          ) {
-            return message;
-          }
-          changed = true;
-          return { ...message, reactions: event.reactions };
-        });
-        if (!changed) return {};
-        return { messagesByPlace: { ...state.messagesByPlace, [key]: next } };
-      });
+      applyReactionUpdate(event);
       return;
     }
     if (event.type === "caught_up") {
@@ -793,6 +866,8 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  messagingSessionGeneration += 1;
+  pendingReactionResyncByPlace.clear();
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;
