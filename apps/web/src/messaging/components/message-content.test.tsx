@@ -140,6 +140,81 @@ describe("MessageContent mentions and links", () => {
   });
 });
 
+describe("MessageContent math", () => {
+  it("renders inline math with KaTeX", () => {
+    const { container } = renderContent("式は $E = mc^2$ です");
+    const katex = container.querySelector(".katex");
+    expect(katex).not.toBeNull();
+    expect(container.querySelector("annotation")).toHaveTextContent("E = mc^2");
+    expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container).toHaveTextContent("式は");
+  });
+
+  it("renders fenced block math as display math in a scrollable box", () => {
+    const { container } = renderContent(
+      "解は\n\n$$\n\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\n$$",
+    );
+    const display = container.querySelector(".katex-display");
+    expect(display).not.toBeNull();
+    expect(display?.parentElement?.className).toContain("overflow-x-auto");
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("promotes a line that is entirely $$...$$ to display math", () => {
+    const { container } = renderContent("解は\n$$x^2 + 1$$\nでした");
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+    expect(container).toHaveTextContent("解は");
+    expect(container).toHaveTextContent("でした");
+  });
+
+  it("keeps $$...$$ inline when other text shares the line", () => {
+    const { container } = renderContent("途中に $$x^2$$ を置く");
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+  });
+
+  it("leaves currency amounts alone instead of turning them into math", () => {
+    const { container } = renderContent("ランチは $5 と $10 でした");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent("ランチは $5 と $10 でした");
+  });
+
+  it("leaves currency alone even without spaces around the amounts", () => {
+    const { container } = renderContent("コストは$5、利益は$3です");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent("コストは$5、利益は$3です");
+  });
+
+  it("leaves a dollar sign followed by a space alone", () => {
+    const { container } = renderContent("US$ 100 と US$ 200");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container).toHaveTextContent("US$ 100 と US$ 200");
+  });
+
+  it("still decorates mentions on a line with currency", () => {
+    const { container, getByText } = renderContent("@Haku ランチ $5 と $10");
+    expect(getByText("@Haku")).toHaveAttribute("data-mention", "self");
+    expect(container.querySelector(".katex")).toBeNull();
+  });
+
+  it("does not render math inside code", () => {
+    const { container } = renderContent("```\n$x^2$\n```");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.querySelector("pre")).toHaveTextContent("$x^2$");
+  });
+
+  it("does not render math inside inline code", () => {
+    const { container } = renderContent("`$x^2$` はそのまま");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.querySelector("code")).toHaveTextContent("$x^2$");
+  });
+
+  it("shows a broken formula as an error instead of throwing", () => {
+    const { container } = renderContent("$\\frac{1}$");
+    expect(container).toHaveTextContent("\\frac{1}");
+  });
+});
+
 describe("MessageContent sanitization", () => {
   it("never renders raw HTML from the body (img onerror)", () => {
     const { container } = renderContent(
