@@ -22,6 +22,15 @@ describe("ConnectionBanner", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
+  it("does not report an initial handshake as a reconnection", () => {
+    act(() => useMessaging.setState({ connection: "reconnecting" }));
+    render(<ConnectionBanner />);
+
+    act(() => useMessaging.setState({ connection: "connected" }));
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it("shows a reconnecting banner while the socket is down", () => {
     render(<ConnectionBanner />);
     act(() => useMessaging.setState({ connection: "reconnecting" }));
