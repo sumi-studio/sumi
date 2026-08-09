@@ -302,6 +302,80 @@ describe("messaging presence convergence", () => {
     expect(settled?.remindAt).toBe(1_800_000);
   });
 
+  it("replays a status REST acknowledgement over an older presence snapshot", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(SELF, "available")],
+      replyLaterMarkers: [],
+    };
+    await startMessaging(backend);
+
+    let resolvePresence!: (presence: {
+      statuses: ParticipantStatus[];
+      replyLaterMarkers: ReplyLaterMarker[];
+    }) => void;
+    backend.nextPresenceFetch = new Promise((resolve) => {
+      resolvePresence = resolve;
+    });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
+
+    backend.nextStatus = status(SELF, "busy", "canonical ACK");
+    useMessaging.getState().setStatus("busy", "canonical ACK");
+    await vi.waitFor(() =>
+      expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
+        backend.nextStatus,
+      ),
+    );
+
+    resolvePresence({
+      statuses: [status(SELF, "available")],
+      replyLaterMarkers: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
+      backend.nextStatus,
+    );
+  });
+
+  it("replays reply-later REST acknowledgements over an older snapshot", async () => {
+    const backend = new FakePresenceBackend();
+    await startMessaging(backend);
+
+    let resolvePresence!: (presence: {
+      statuses: ParticipantStatus[];
+      replyLaterMarkers: ReplyLaterMarker[];
+    }) => void;
+    backend.nextPresenceFetch = new Promise((resolve) => {
+      resolvePresence = resolve;
+    });
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+    await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
+
+    backend.nextMarker = marker("marker-during-resync", SELF, 1_800_000);
+    useMessaging.getState().createReplyLater(targetMessage());
+    await vi.waitFor(() =>
+      expect(
+        useMessaging.getState().replyLaterById["marker-during-resync"],
+      ).toEqual(backend.nextMarker),
+    );
+    useMessaging.getState().resolveReplyLater("marker-during-resync");
+    await vi.waitFor(() =>
+      expect(
+        useMessaging.getState().replyLaterById["marker-during-resync"]
+          ?.resolved,
+      ).toBe(true),
+    );
+
+    resolvePresence({ statuses: [], replyLaterMarkers: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      useMessaging.getState().replyLaterById["marker-during-resync"],
+    ).toMatchObject({ resolved: true, remindAt: 1_800_000 });
+  });
+
   it("drops a status once expires_at is reached", async () => {
     const backend = new FakePresenceBackend();
     await startMessaging(backend);

@@ -163,16 +163,16 @@ const reactionProjectionByPlace = new Map<
   ReactionProjectionCoordinator
 >();
 let statusExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-type PresenceServerEvent = Extract<
-  ServerEvent,
-  {
-    type: "status_updated" | "reply_later_created" | "reply_later_resolved";
-  }
->;
+type PresenceProjection =
+  | { type: "status"; status: ParticipantStatus }
+  | { type: "reply_later"; marker: ReplyLaterMarker }
+  | { type: "reply_later_resolved"; markerId: string };
 let presenceResyncGeneration = 0;
 let pendingPresenceResync: {
+  backend: MessagingBackend;
   generation: number;
-  events: PresenceServerEvent[];
+  projections: PresenceProjection[];
+  sessionGeneration: number;
 } | null = null;
 
 /** 遠い期限でもtimerを一度に張らない上限。起きたら残りをもう一度張り直す。 */
@@ -291,6 +291,33 @@ export const useMessaging = create<MessagingState>((set, get) => {
             remindAt: marker.remindAt ?? known?.remindAt ?? null,
             resolved: marker.resolved || (known?.resolved ?? false),
           },
+        },
+      };
+    });
+  };
+
+  const applyPresenceProjection = (
+    projection: PresenceProjection,
+    bufferDuringResync = true,
+  ) => {
+    if (bufferDuringResync) {
+      pendingPresenceResync?.projections.push(projection);
+    }
+    if (projection.type === "status") {
+      applyStatus(projection.status);
+      return;
+    }
+    if (projection.type === "reply_later") {
+      applyReplyLater(projection.marker);
+      return;
+    }
+    set((state) => {
+      const marker = state.replyLaterById[projection.markerId];
+      if (!marker) return {};
+      return {
+        replyLaterById: {
+          ...state.replyLaterById,
+          [projection.markerId]: { ...marker, resolved: true },
         },
       };
     });
@@ -471,9 +498,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
    */
   const resyncPresence = async () => {
     const currentBackend = backend;
+    const sessionGeneration = messagingSessionGeneration;
+    const previous = pendingPresenceResync;
     const resync = {
+      backend: currentBackend,
       generation: ++presenceResyncGeneration,
-      events: [] as PresenceServerEvent[],
+      projections:
+        previous?.backend === currentBackend &&
+        previous.sessionGeneration === sessionGeneration
+          ? [...previous.projections]
+          : [],
+      sessionGeneration,
     };
     pendingPresenceResync = resync;
     try {
@@ -481,7 +516,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (
         backend !== currentBackend ||
         pendingPresenceResync !== resync ||
-        presenceResyncGeneration !== resync.generation
+        presenceResyncGeneration !== resync.generation ||
+        messagingSessionGeneration !== sessionGeneration
       ) {
         return;
       }
@@ -495,7 +531,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
       pendingPresenceResync = null;
       set({ statusByKey: applyStatuses(presence.statuses), replyLaterById });
       scheduleStatusExpiry();
-      for (const event of resync.events) applyEvent(event);
+      for (const projection of resync.projections) {
+        applyPresenceProjection(projection, false);
+      }
     } finally {
       if (pendingPresenceResync === resync) pendingPresenceResync = null;
     }
@@ -624,26 +662,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return;
     }
     if (event.type === "status_updated") {
-      pendingPresenceResync?.events.push(event);
-      applyStatus(event.status);
+      applyPresenceProjection({ type: "status", status: event.status });
       return;
     }
     if (event.type === "reply_later_created") {
-      pendingPresenceResync?.events.push(event);
-      applyReplyLater(event.marker);
+      applyPresenceProjection({ type: "reply_later", marker: event.marker });
       return;
     }
     if (event.type === "reply_later_resolved") {
-      pendingPresenceResync?.events.push(event);
-      set((state) => {
-        const marker = state.replyLaterById[event.markerId];
-        if (!marker) return {};
-        return {
-          replyLaterById: {
-            ...state.replyLaterById,
-            [event.markerId]: { ...marker, resolved: true },
-          },
-        };
+      applyPresenceProjection({
+        type: "reply_later_resolved",
+        markerId: event.markerId,
       });
       return;
     }
@@ -1129,17 +1158,43 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // 成功ACKはserverが確定した値そのものなので、socketが再接続中でも
     // これだけで表示とリマインドは収束する。後着のechoは同じ形を上書きする。
     setStatus(status, note) {
-      void backend.setStatus(status, note).then(applyStatus, () => undefined);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      void currentBackend.setStatus(status, note).then(
+        (canonical) => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration
+          ) {
+            return;
+          }
+          applyPresenceProjection({ type: "status", status: canonical });
+        },
+        () => undefined,
+      );
     },
 
     createReplyLater(message, delayMs = DEFAULT_REPLY_LATER_REMIND_MS) {
-      void backend
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      void currentBackend
         .createReplyLater(
           message.place,
           message.messageId,
           Date.now() + delayMs,
         )
-        .then(applyReplyLater, () => undefined);
+        .then(
+          (canonical) => {
+            if (
+              backend !== currentBackend ||
+              messagingSessionGeneration !== sessionGeneration
+            ) {
+              return;
+            }
+            applyPresenceProjection({ type: "reply_later", marker: canonical });
+          },
+          () => undefined,
+        );
     },
 
     toggleReaction(message, emoji) {
@@ -1200,9 +1255,20 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     resolveReplyLater(markerId) {
-      void backend
-        .resolveReplyLater(markerId)
-        .then(applyReplyLater, () => undefined);
+      const currentBackend = backend;
+      const sessionGeneration = messagingSessionGeneration;
+      void currentBackend.resolveReplyLater(markerId).then(
+        (canonical) => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionGeneration !== sessionGeneration
+          ) {
+            return;
+          }
+          applyPresenceProjection({ type: "reply_later", marker: canonical });
+        },
+        () => undefined,
+      );
     },
 
     sendTyping() {
