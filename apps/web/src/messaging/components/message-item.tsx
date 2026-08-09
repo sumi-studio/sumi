@@ -284,11 +284,18 @@ export const MessageItem = memo(function MessageItem({
   const quickEmojis = useMemo(() => topRecentEmojis(recent), [recent]);
   const chooseEmoji = useCallback(
     (emoji: string) => {
-      noteEmojiUsed(emoji);
+      const mine = message.reactions.some(
+        (reaction) =>
+          reaction.emoji === emoji &&
+          reaction.participants.some(
+            (participant) => participantKey(participant) === selfKey,
+          ),
+      );
+      if (!mine) noteEmojiUsed(emoji);
       onToggleReaction(message, emoji);
       setOpenPanel(null);
     },
-    [message, onToggleReaction],
+    [message, onToggleReaction, selfKey],
   );
 
   return (
@@ -478,7 +485,11 @@ export const MessageItem = memo(function MessageItem({
                 >
                   <SmilePlus className="size-3.5" />
                 </PopoverTrigger>
-                <PopoverContent ref={passthroughRef} side="top" className="p-1.5">
+                <PopoverContent
+                  ref={passthroughRef}
+                  side="top"
+                  className="p-1.5"
+                >
                   <EmojiPicker onSelect={chooseEmoji} />
                 </PopoverContent>
               </Popover>
