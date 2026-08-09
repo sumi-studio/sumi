@@ -77,13 +77,21 @@ export function StatusMenu({
 
   const selfStatus = statusByKey[selfKey];
   const profile = membersByKey[selfKey];
+  const selfStatusRef = useRef(selfStatus);
+  selfStatusRef.current = selfStatus;
 
   useEffect(() => {
     if (!open) {
       setSubmenuFor(null);
       return;
     }
-    setNote(selfStatus?.note ?? "");
+    // パネルを開いた瞬間の値だけを下書きへ写す。開いた後の status_updated は
+    // 表示には反映しても、入力中のひとことを上書きしてはならない。
+    setNote(selfStatusRef.current?.note ?? "");
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
     // 残り時間の表示だけのための更新。開いている間しか動かさない。
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
     const closeOnOutsideClick = (event: MouseEvent) => {
@@ -106,8 +114,7 @@ export function StatusMenu({
       window.removeEventListener("mousedown", closeOnOutsideClick);
       window.removeEventListener("keydown", closeOnEscape);
     };
-    // selfStatusはパネルを開いた時点の値を下書きに写すだけなので依存に入れない。
-  }, [open, onOpenChange, selfStatus?.note]);
+  }, [open, onOpenChange]);
 
   if (!open) return null;
 

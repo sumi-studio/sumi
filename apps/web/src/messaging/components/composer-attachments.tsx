@@ -410,6 +410,9 @@ export function useDraftAttachments({
         patch.alt !== undefined ||
         patch.spoiler !== undefined;
       if (needsPatch) {
+        // 宣言だけの更新も送信と競合する。PATCH が終わるまで composer の
+        // 送信ゲートを閉じ、束ねた後の添付へ更新が落ちるのを防ぐ。
+        replace(localId, { status: "uploading" });
         try {
           attachment = await update(attachment.attachmentId, patch);
         } catch {
