@@ -92,6 +92,15 @@ describe("useOverlayPanel", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it("IME変換中のEscapeでは閉じない", () => {
+    render(<Harness />);
+    fireEvent.click(screen.getByRole("button", { name: "通知" }));
+
+    fireEvent.keyDown(document, { key: "Escape", isComposing: true });
+
+    expect(screen.getByTestId("通知-panel")).toBeInTheDocument();
+  });
+
   it("別のオーバーレイを開くと先に開いていたものが閉じる", () => {
     render(<Harness />);
     fireEvent.click(screen.getByRole("button", { name: "通知" }));
@@ -127,6 +136,23 @@ describe("useOverlayPanel", () => {
 
     expect(wheel.defaultPrevented).toBe(true);
     expect(readScrollTop()).toBe(120);
+  });
+
+  it("行単位のホイール量をピクセルへ換算して一覧へ渡す", () => {
+    render(<Harness />);
+    const readScrollTop = fakeScroller(screen.getByTestId("viewport"));
+    fireEvent.click(screen.getByRole("button", { name: "通知" }));
+
+    const wheel = new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaMode: WheelEvent.DOM_DELTA_LINE,
+      deltaY: 3,
+    });
+    screen.getByTestId("通知-panel").dispatchEvent(wheel);
+
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(readScrollTop()).toBe(48);
   });
 
   it("パネル自身がスクロールできるならホイールを奪わない", () => {
