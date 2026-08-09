@@ -404,6 +404,9 @@ export class ApiMessagingBackend implements MessagingBackend {
       topic: asString(wire.topic),
       visibility: asVisibility(wire.visibility),
     };
+    if (!this.cursors.has(channel.channelId)) {
+      this.cursors.set(channel.channelId, 0);
+    }
     this.places.set(channel.channelId, {
       kind: "channel",
       channelId: channel.channelId,
@@ -419,6 +422,7 @@ export class ApiMessagingBackend implements MessagingBackend {
       kind: asDMKind(wire.kind),
       participants: asArray(wire.participants).map(parseParticipant),
     };
+    if (!this.cursors.has(dm.dmId)) this.cursors.set(dm.dmId, 0);
     this.places.set(dm.dmId, { kind: dm.kind, dmId: dm.dmId });
     return dm;
   }
