@@ -47,10 +47,9 @@ func normalizeHumanDisplayName(raw string) (string, error) {
 	return "", ErrInvalidDisplayName
 }
 
-// NormalizeDisplayName is the registry's rule for a名乗り, exported so other
-// boundaries (messaging の個人設定) apply the identical normalization instead of
-// inventing a second one. Humans and PersonalityAgents share it: a participant
-// is a participant.
+// NormalizeDisplayName exposes the registry's rule for callers that need to
+// validate a名乗り without persisting it. Humans and PersonalityAgents share
+// the rule: a participant is a participant.
 func NormalizeDisplayName(raw string) (string, error) {
 	return normalizeHumanDisplayName(raw)
 }
@@ -79,14 +78,18 @@ func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, raw string)
 	return stored, nil
 }
 
-// UpdateAgentDisplayNameTx updates a PersonalityAgent name inside a caller-owned
-// transaction and reports whether the canonical value changed. Locking the
-// registry row before the update lets a wider participant mutation use it as
-// its serialization point without moving 戸籍 ownership into that caller.
-func (s *Store) UpdateAgentDisplayNameTx(ctx context.Context, tx pgx.Tx, agentID, raw string) (string, bool, error) {
-	name, err := normalizeHumanDisplayName(raw)
-	if err != nil {
-		return "", false, err
+// ResolveAgentDisplayNameTx locks a PersonalityAgent's canonical row inside a
+// caller-owned transaction and optionally updates its name. A nil raw value is
+// a lock-only operation: wider partial-profile mutations can serialize on the
+// same registry row before reading the fields they intend to preserve.
+func (s *Store) ResolveAgentDisplayNameTx(ctx context.Context, tx pgx.Tx, agentID string, raw *string) (string, bool, error) {
+	var name string
+	if raw != nil {
+		var err error
+		name, err = normalizeHumanDisplayName(*raw)
+		if err != nil {
+			return "", false, err
+		}
 	}
 	var previous string
 	if err := tx.QueryRow(ctx,
@@ -96,6 +99,9 @@ func (s *Store) UpdateAgentDisplayNameTx(ctx context.Context, tx pgx.Tx, agentID
 			return "", false, ErrAgentNotFound
 		}
 		return "", false, fmt.Errorf("lock PersonalityAgent display name: %w", err)
+	}
+	if raw == nil {
+		return previous, false, nil
 	}
 	var stored string
 	if err := tx.QueryRow(ctx,
@@ -150,13 +156,17 @@ func (s *Store) UpdateHumanDisplayName(ctx context.Context, humanID, raw string)
 	return stored, nil
 }
 
-// UpdateHumanDisplayNameTx is the transaction-aware form used when a profile
-// replacement must commit the canonical name and its messaging presentation as
-// one participant mutation. The Human row is the participant-level lock.
-func (s *Store) UpdateHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID, raw string) (string, bool, error) {
-	name, err := normalizeHumanDisplayName(raw)
-	if err != nil {
-		return "", false, err
+// ResolveHumanDisplayNameTx locks a Human's canonical row inside a caller-owned
+// transaction and optionally updates its name. The Human row is the
+// participant-level serialization point for both full and partial profiles.
+func (s *Store) ResolveHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID string, raw *string) (string, bool, error) {
+	var name string
+	if raw != nil {
+		var err error
+		name, err = normalizeHumanDisplayName(*raw)
+		if err != nil {
+			return "", false, err
+		}
 	}
 	var previous string
 	if err := tx.QueryRow(ctx,
@@ -166,6 +176,9 @@ func (s *Store) UpdateHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID
 			return "", false, ErrHumanNotFound
 		}
 		return "", false, fmt.Errorf("lock Human display name: %w", err)
+	}
+	if raw == nil {
+		return previous, false, nil
 	}
 	var stored string
 	if err := tx.QueryRow(ctx, `UPDATE humans

@@ -47,16 +47,39 @@ type profileChange struct {
 	Dependents []MemberProfile
 }
 
+// profilePatch is an internal mutation shape. Nil preserves a field; a
+// non-nil empty image id clears that image. REST PUT builds a patch with every
+// field present, while the local-control and auth surfaces name only the fields
+// their callers actually changed.
+type profilePatch struct {
+	DisplayName        *string
+	Tagline            *string
+	AvatarAttachmentID *string
+	BannerAttachmentID *string
+}
+
 func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayName, tagline, avatarID, bannerID string) (profileChange, error) {
+	return s.patchProfile(ctx, actor, profilePatch{
+		DisplayName:        &displayName,
+		Tagline:            &tagline,
+		AvatarAttachmentID: &avatarID,
+		BannerAttachmentID: &bannerID,
+	})
+}
+
+func (s *Store) patchProfile(ctx context.Context, actor ParticipantRef, patch profilePatch) (profileChange, error) {
 	if err := actor.Validate(); err != nil {
 		return profileChange{}, err
 	}
-	if utf8.RuneCountInString(tagline) > MaxTaglineChars {
+	if patch.Tagline != nil && utf8.RuneCountInString(*patch.Tagline) > MaxTaglineChars {
 		return profileChange{}, ErrInvalidTagline
 	}
-	normalizedName, err := koseki.NormalizeDisplayName(displayName)
-	if err != nil {
-		return profileChange{}, ErrInvalidDisplayName
+	if patch.DisplayName != nil {
+		normalizedName, err := koseki.NormalizeDisplayName(*patch.DisplayName)
+		if err != nil {
+			return profileChange{}, ErrInvalidDisplayName
+		}
+		patch.DisplayName = &normalizedName
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -65,14 +88,14 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Updating the canonical row first acquires the participant-level row lock.
-	// Concurrent whole-profile replacements for one participant therefore run in
+	// Resolving the canonical row first acquires the participant-level row lock.
+	// Concurrent full and partial mutations for one participant therefore run in
 	// a serial order, while unrelated participants remain independent.
 	registry := koseki.New(s.pool)
 	nameChanged := false
 	switch actor.Kind {
 	case KindHuman:
-		if _, nameChanged, err = registry.UpdateHumanDisplayNameTx(ctx, tx, actor.ID, normalizedName); err != nil {
+		if _, nameChanged, err = registry.ResolveHumanDisplayNameTx(ctx, tx, actor.ID, patch.DisplayName); err != nil {
 			if errors.Is(err, koseki.ErrInvalidDisplayName) {
 				return profileChange{}, ErrInvalidDisplayName
 			}
@@ -82,7 +105,7 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 			return profileChange{}, fmt.Errorf("update display name: %w", err)
 		}
 	case KindPersonalityAgent:
-		if _, nameChanged, err = registry.UpdateAgentDisplayNameTx(ctx, tx, actor.ID, normalizedName); err != nil {
+		if _, nameChanged, err = registry.ResolveAgentDisplayNameTx(ctx, tx, actor.ID, patch.DisplayName); err != nil {
 			if errors.Is(err, koseki.ErrInvalidDisplayName) {
 				return profileChange{}, ErrInvalidDisplayName
 			}
@@ -95,10 +118,23 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 		return profileChange{}, fmt.Errorf("unknown participant kind %q", actor.Kind)
 	}
 
-	// Lock every chosen attachment row until the profile row commits. Message
-	// binding locks the same rows in the same stable order, so overlapping avatar,
-	// banner and message selections cannot deadlock or both win.
-	imageIDs := []string{avatarID, bannerID}
+	// The canonical row above is the participant lock. Read the values a partial
+	// patch preserves only after acquiring it, so a concurrent patch cannot merge
+	// an old field back over a newer commit.
+	current, err := s.memberProfileFor(ctx, tx, actor)
+	if err != nil {
+		return profileChange{}, err
+	}
+
+	// Lock every newly chosen attachment row until the profile row commits.
+	// Preserved images are already bound to this profile; only explicitly
+	// supplied ids need to compete with message binding.
+	imageIDs := make([]string, 0, 2)
+	for _, imageID := range []*string{patch.AvatarAttachmentID, patch.BannerAttachmentID} {
+		if imageID != nil && *imageID != "" {
+			imageIDs = append(imageIDs, *imageID)
+		}
+	}
 	sort.Strings(imageIDs)
 	images := make(map[string]*string, len(imageIDs))
 	for _, imageID := range imageIDs {
@@ -111,10 +147,21 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 		}
 		images[imageID] = image
 	}
-	avatar := images[avatarID]
-	banner := images[bannerID]
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO participant_profiles
+	avatar := nullableProfileImage(current.AvatarAttachmentID)
+	if patch.AvatarAttachmentID != nil {
+		avatar = images[*patch.AvatarAttachmentID]
+	}
+	banner := nullableProfileImage(current.BannerAttachmentID)
+	if patch.BannerAttachmentID != nil {
+		banner = images[*patch.BannerAttachmentID]
+	}
+	tagline := current.Tagline
+	if patch.Tagline != nil {
+		tagline = *patch.Tagline
+	}
+	if patch.Tagline != nil || patch.AvatarAttachmentID != nil || patch.BannerAttachmentID != nil {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO participant_profiles
 		   (member_kind, member_id, tagline, avatar_attachment_id, banner_attachment_id)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (member_kind, member_id) DO UPDATE
@@ -122,8 +169,9 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 		       avatar_attachment_id = EXCLUDED.avatar_attachment_id,
 		       banner_attachment_id = EXCLUDED.banner_attachment_id,
 		       updated_at = now()`,
-		actor.Kind, actor.ID, tagline, avatar, banner); err != nil {
-		return profileChange{}, fmt.Errorf("upsert participant profile: %w", err)
+			actor.Kind, actor.ID, tagline, avatar, banner); err != nil {
+			return profileChange{}, fmt.Errorf("upsert participant profile: %w", err)
+		}
 	}
 
 	change := profileChange{}
@@ -141,6 +189,13 @@ func (s *Store) setProfile(ctx context.Context, actor ParticipantRef, displayNam
 		return profileChange{}, fmt.Errorf("commit set profile: %w", err)
 	}
 	return change, nil
+}
+
+func nullableProfileImage(attachmentID string) *string {
+	if attachmentID == "" {
+		return nil
+	}
+	return &attachmentID
 }
 
 // profileImage validates one profile image reference. An empty id clears the

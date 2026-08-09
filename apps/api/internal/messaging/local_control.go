@@ -447,37 +447,30 @@ func (s *Server) localProfile(w http.ResponseWriter, r *http.Request, authorizat
 		writeStoreError(w, err)
 		return
 	}
-	current, err := s.Store.MemberProfileFor(r.Context(), viewer)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
 	if request.DisplayName == nil && request.Tagline == nil {
+		s.profileMu.Lock()
+		current, err := s.Store.MemberProfileFor(r.Context(), viewer)
+		s.profileMu.Unlock()
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, struct {
 			Profile memberWire `json:"profile"`
 		}{memberToWire(current)})
 		return
 	}
-	// The stored canonical name, not the composed "Sumi（たっけ）" projection:
-	// re-submitting the projection would smuggle the qualifier into the registry.
-	displayName := current.DisplayName
-	if request.DisplayName != nil {
-		displayName = *request.DisplayName
-	}
-	tagline := current.Tagline
-	if request.Tagline != nil {
-		tagline = *request.Tagline
-	}
-	stored, err := s.Store.SetProfile(r.Context(), viewer, displayName, tagline,
-		current.AvatarAttachmentID, current.BannerAttachmentID)
+	change, err := s.updateProfile(r.Context(), viewer, profilePatch{
+		DisplayName: request.DisplayName,
+		Tagline:     request.Tagline,
+	})
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishProfile(r.Context(), stored)
 	writeJSON(w, http.StatusOK, struct {
 		Profile memberWire `json:"profile"`
-	}{memberToWire(stored)})
+	}{memberToWire(change.Profile)})
 }
 
 // localWorkspaceScope admits the agent to the shared Workspace and resolves which
