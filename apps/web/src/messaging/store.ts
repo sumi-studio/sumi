@@ -28,7 +28,7 @@ import type {
   Urgency,
   WorkspaceSummary,
 } from "./model";
-import { parsePlaceKey, participantKey, placeKey } from "./model";
+import { MAX_SEQ, parsePlaceKey, participantKey, placeKey } from "./model";
 import {
   isNotificationSoundEnabled,
   isTabActive,
@@ -47,6 +47,12 @@ const TYPING_TTL_MS = 4_500;
 const DEFAULT_REPLY_LATER_REMIND_MS = 30 * 60_000;
 
 let backend: MessagingBackend = new ApiMessagingBackend();
+
+type CatchUpAwareMessagingBackend = MessagingBackend & {
+  subscribeCatchUp?: (
+    listener: (place: Place, latestSeq: number) => void | Promise<void>,
+  ) => () => void;
+};
 
 /** Tests and explicit development harnesses may replace the transport before init. */
 export function installMessagingBackend(override: MessagingBackend): void {
@@ -282,6 +288,82 @@ export const useMessaging = create<MessagingState>((set, get) => {
     });
   };
 
+  const threadProjectionVersions = new Map<string, number>();
+  const appliedThreadDeletions = new Set<string>();
+
+  const advanceThreadProjection = (message: Message): number | null => {
+    if (message.place.kind !== "thread") return null;
+    const threadId = message.place.threadId;
+    const version = (threadProjectionVersions.get(threadId) ?? 0) + 1;
+    threadProjectionVersions.set(threadId, version);
+    return version;
+  };
+
+  const refreshThreadSummary = async (message: Message, version: number) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const thread = get().threadsById[threadId];
+    if (!thread) return;
+    const currentBackend = backend;
+    const parentKey = placeKey(thread.parentPlace);
+    try {
+      const summaries = await currentBackend.fetchThreads(thread.parentPlace);
+      if (
+        backend !== currentBackend ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      const refreshed = summaries.find((entry) => entry.threadId === threadId);
+      if (!refreshed) return;
+      set((state) => ({
+        threadsById: { ...state.threadsById, [threadId]: refreshed },
+      }));
+    } catch {
+      if (
+        backend !== currentBackend ||
+        threadProjectionVersions.get(threadId) !== version
+      ) {
+        return;
+      }
+      // A later visit may retry the authoritative list instead of treating a
+      // failed refresh as a permanently loaded projection.
+      set((state) => ({
+        threadsLoadedForPlace: {
+          ...state.threadsLoadedForPlace,
+          [parentKey]: false,
+        },
+      }));
+    }
+  };
+
+  const applyThreadDeletionSummary = (message: Message) => {
+    if (message.place.kind !== "thread") return;
+    const threadId = message.place.threadId;
+    const deletionKey = `${threadId}:${message.messageId}`;
+    const applyDeletion = !appliedThreadDeletions.has(deletionKey);
+    appliedThreadDeletions.add(deletionKey);
+    if (applyDeletion) {
+      set((state) => {
+        const thread = state.threadsById[threadId];
+        if (!thread) return {};
+        return {
+          threadsById: {
+            ...state.threadsById,
+            [threadId]: {
+              ...thread,
+              messageCount: Math.max(0, thread.messageCount - 1),
+            },
+          },
+        };
+      });
+    }
+    const version = advanceThreadProjection(message);
+    if (version !== null) {
+      void refreshThreadSummary(message, version);
+    }
+  };
+
   /**
    * スレッドに新しい発言が着いたときの一覧側の追従。件数と最新行は一覧を
    * 開き直さなくても正しくあってほしいので、eventから直接更新する。
@@ -327,17 +409,26 @@ export const useMessaging = create<MessagingState>((set, get) => {
         const existing = (state.messagesByPlace[key] ?? []).find(
           (message) => message.messageId === event.message.messageId,
         );
+        const projected =
+          event.type === "poll_updated" && existing
+            ? {
+                ...existing,
+                // A delayed poll frame is a delta for the poll projection. It
+                // must not revert a later edit or revive a tombstone.
+                poll: existing.deleted ? null : (event.message.poll ?? null),
+              }
+            : event.message;
         const messages = upsertMessage(
           state.messagesByPlace[key] ?? [],
-          event.message,
+          projected,
         );
-        const nonce = event.message.clientNonce;
+        const nonce = projected.clientNonce;
         const pending = nonce
           ? (state.pendingByPlace[key] ?? []).filter(
               (entry) => entry.clientNonce !== nonce,
             )
           : (state.pendingByPlace[key] ?? []);
-        const authorKey = participantKey(event.message.author);
+        const authorKey = participantKey(projected.author);
         const typing = { ...(state.typingByPlace[key] ?? {}) };
         delete typing[authorKey];
         const lastRead =
@@ -348,7 +439,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           ? unreadContribution(existing, lastRead, state.selfKey)
           : { unread: 0, mentions: 0 };
         const nextContribution = unreadContribution(
-          event.message,
+          projected,
           lastRead,
           state.selfKey,
         );
@@ -378,8 +469,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
         };
       });
       if (event.type === "message_created") {
+        advanceThreadProjection(event.message);
         noteThreadActivity(event.message);
         presentNotification(event);
+      } else if (event.type === "message_edited") {
+        const version = advanceThreadProjection(event.message);
+        if (version !== null) {
+          void refreshThreadSummary(event.message, version);
+        }
       }
       return;
     }
@@ -419,6 +516,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           },
         };
       });
+      applyThreadDeletionSummary(event.message);
       return;
     }
     if (event.type === "typing") {
@@ -521,21 +619,143 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   const PAGE_SIZE = 50;
+  const placeLoads = new Map<PlaceKey, Promise<void>>();
+  const pollReconciliationVersions = new Map<PlaceKey, number>();
+
+  const reconcileLoadedPolls = async (
+    currentBackend: MessagingBackend,
+    place: Place,
+  ) => {
+    const key = placeKey(place);
+    const reconciliationVersion =
+      (pollReconciliationVersions.get(key) ?? 0) + 1;
+    pollReconciliationVersions.set(key, reconciliationVersion);
+    const isCurrentReconciliation = () =>
+      backend === currentBackend &&
+      pollReconciliationVersions.get(key) === reconciliationVersion;
+    const inFlightLoad = placeLoads.get(key);
+    if (inFlightLoad) await inFlightLoad;
+    if (!isCurrentReconciliation()) return;
+    const targets = (get().messagesByPlace[key] ?? [])
+      .filter((message) => !message.deleted && message.poll)
+      .map((message) => ({ messageId: message.messageId, seq: message.seq }));
+    if (targets.length === 0) return;
+
+    const snapshots = await Promise.all(
+      targets.map(async (target) => {
+        const options =
+          target.seq === MAX_SEQ
+            ? { limit: 1 }
+            : { beforeSeq: target.seq + 1, limit: 1 };
+        const messages = await currentBackend.fetchMessages(place, options);
+        return (
+          messages.find(
+            (message) =>
+              message.messageId === target.messageId &&
+              message.seq === target.seq,
+          ) ?? null
+        );
+      }),
+    );
+    // A session switch owns a different store. Never let the old person's
+    // catch-up response cross that boundary. A newer socket generation can
+    // also reconcile through the same backend instance, so identity alone is
+    // not enough to reject its predecessor's delayed REST response.
+    if (!isCurrentReconciliation()) return;
+    const discoveredThreadDeletions: Message[] = [];
+    set((state) => {
+      let messages = state.messagesByPlace[key] ?? [];
+      let unreadCount = state.unreadCountByPlace[key] ?? 0;
+      let mentionCount = state.mentionCountByPlace[key] ?? 0;
+      let changed = false;
+      for (const snapshot of snapshots) {
+        if (!snapshot) continue;
+        const current = messages.find(
+          (message) => message.messageId === snapshot.messageId,
+        );
+        if (!current) continue;
+        if (
+          !current.deleted &&
+          snapshot.deleted &&
+          snapshot.place.kind === "thread"
+        ) {
+          discoveredThreadDeletions.push(snapshot);
+        }
+        const projected = snapshot.deleted
+          ? { ...current, ...snapshot, poll: null }
+          : current.deleted
+            ? { ...current, poll: null }
+            : { ...current, poll: snapshot.poll ?? null };
+        const lastRead = state.lastReadByPlace[key] ?? 0;
+        const previousContribution = unreadContribution(
+          current,
+          lastRead,
+          state.selfKey,
+        );
+        const nextContribution = unreadContribution(
+          projected,
+          lastRead,
+          state.selfKey,
+        );
+        unreadCount = Math.max(
+          0,
+          unreadCount - previousContribution.unread + nextContribution.unread,
+        );
+        mentionCount = Math.max(
+          0,
+          mentionCount -
+            previousContribution.mentions +
+            nextContribution.mentions,
+        );
+        messages = upsertMessage(messages, projected);
+        changed = true;
+      }
+      return changed
+        ? {
+            messagesByPlace: { ...state.messagesByPlace, [key]: messages },
+            unreadCountByPlace: {
+              ...state.unreadCountByPlace,
+              [key]: unreadCount,
+            },
+            mentionCountByPlace: {
+              ...state.mentionCountByPlace,
+              [key]: mentionCount,
+            },
+          }
+        : {};
+    });
+    for (const deletion of discoveredThreadDeletions) {
+      applyThreadDeletionSummary(deletion);
+    }
+  };
 
   const loadPlace = async (place: Place) => {
     const key = placeKey(place);
     if (get().messagesByPlace[key]) return;
-    const messages = await backend.fetchMessages(place, { limit: PAGE_SIZE });
-    set((state) => ({
-      messagesByPlace: {
-        ...state.messagesByPlace,
-        [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
-      },
-      hasMoreByPlace: {
-        ...state.hasMoreByPlace,
-        [key]: messages.length >= PAGE_SIZE,
-      },
-    }));
+    const existingLoad = placeLoads.get(key);
+    if (existingLoad) return existingLoad;
+    const currentBackend = backend;
+    const load = currentBackend
+      .fetchMessages(place, { limit: PAGE_SIZE })
+      .then((messages) => {
+        if (backend !== currentBackend) return;
+        set((state) => ({
+          messagesByPlace: {
+            ...state.messagesByPlace,
+            [key]: mergeMessages(state.messagesByPlace[key] ?? [], messages),
+          },
+          hasMoreByPlace: {
+            ...state.hasMoreByPlace,
+            [key]: messages.length >= PAGE_SIZE,
+          },
+        }));
+      });
+    placeLoads.set(key, load);
+    try {
+      await load;
+    } finally {
+      if (placeLoads.get(key) === load) placeLoads.delete(key);
+    }
   };
 
   // 送信・再送の共通経路。ACK(receipt)はecho eventで照合されるため、
@@ -677,9 +897,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
     init() {
       if (initialized) return;
       initialized = true;
-      void backend
+      threadProjectionVersions.clear();
+      appliedThreadDeletions.clear();
+      placeLoads.clear();
+      pollReconciliationVersions.clear();
+      const currentBackend = backend;
+      const currentSessionIdentity = messagingSessionIdentity;
+      void currentBackend
         .bootstrap()
         .then((snapshot) => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionIdentity !== currentSessionIdentity
+          ) {
+            return;
+          }
           const membersByKey: Record<ParticipantKey, MemberProfile> = {};
           for (const member of snapshot.members) {
             membersByKey[participantKey(member.participant)] = member;
@@ -716,7 +948,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           }
           set({
             ready: true,
-            capabilities: backend.capabilities,
+            capabilities: currentBackend.capabilities,
             self: snapshot.self,
             selfKey: participantKey(snapshot.self),
             workspaces: snapshot.workspaces,
@@ -735,12 +967,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
             notificationKeywords: snapshot.notificationSetting.keywords,
             employedAgents: snapshot.employedAgents,
           });
-          backend.subscribe(applyEvent, { sinceByPlace });
-          backend.subscribeConnection((state) => set({ connection: state }));
+          (currentBackend as CatchUpAwareMessagingBackend).subscribeCatchUp?.(
+            (place) => reconcileLoadedPolls(currentBackend, place),
+          );
+          currentBackend.subscribe(applyEvent, { sinceByPlace });
+          currentBackend.subscribeConnection((state) =>
+            set({ connection: state }),
+          );
           // 通話はreplayされないので、今開いている通話は明示的に読み直す。
           void useCall.getState().hydrate();
         })
         .catch(() => {
+          if (
+            backend !== currentBackend ||
+            messagingSessionIdentity !== currentSessionIdentity
+          ) {
+            return;
+          }
           initialized = false;
           set({ connection: "disconnected" });
         });
@@ -809,15 +1052,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const parent = parsePlaceKey(parentKey);
       if (parent?.kind !== "channel") return;
       if (get().threadsLoadedForPlace[parentKey]) return;
-      const threads = await backend.fetchThreads(parent);
+      const currentBackend = backend;
+      const versionsAtStart = new Map(threadProjectionVersions);
+      const threads = await currentBackend.fetchThreads(parent);
+      if (backend !== currentBackend) return;
       set((state) => {
         const threadsById = { ...state.threadsById };
-        for (const thread of threads) threadsById[thread.threadId] = thread;
+        let skippedStaleThread = false;
+        for (const thread of threads) {
+          if (
+            (threadProjectionVersions.get(thread.threadId) ?? 0) !==
+            (versionsAtStart.get(thread.threadId) ?? 0)
+          ) {
+            skippedStaleThread = true;
+            continue;
+          }
+          threadsById[thread.threadId] = thread;
+        }
         return {
           threadsById,
           threadsLoadedForPlace: {
             ...state.threadsLoadedForPlace,
-            [parentKey]: true,
+            [parentKey]: !skippedStaleThread,
           },
         };
       });
