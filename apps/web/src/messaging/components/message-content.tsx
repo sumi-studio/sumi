@@ -1,5 +1,5 @@
 import "katex/dist/katex.min.css";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, TriangleAlert } from "lucide-react";
 import {
   Children,
   isValidElement,
@@ -15,6 +15,7 @@ import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { copyText } from "../../lib/clipboard";
 import { displayMentionPattern } from "../mention";
 import type { MemberProfile, ParticipantKey } from "../model";
 import { participantKey } from "../model";
@@ -372,7 +373,7 @@ function nodeToText(children: ReactNode): string {
 }
 
 function CodeBlock({ children }: { children?: ReactNode }) {
-  const [copied, setCopied] = useState(false);
+  const [copyResult, setCopyResult] = useState<"done" | "failed" | null>(null);
   const codeElement = Children.toArray(children).find((child) =>
     isValidElement<{ className?: string; children?: ReactNode }>(child),
   ) as
@@ -382,10 +383,11 @@ function CodeBlock({ children }: { children?: ReactNode }) {
     codeElement?.props.className?.match(/language-([\w+-]+)/)?.[1] ?? "";
   const code = nodeToText(children).replace(/\n$/, "");
 
+  // コピーは失敗しうる（非セキュアorigin・権限拒否）。成否を見てから示す。
   const copy = () => {
-    void navigator.clipboard?.writeText(code).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
+    void copyText(code).then((ok) => {
+      setCopyResult(ok ? "done" : "failed");
+      window.setTimeout(() => setCopyResult(null), ok ? 900 : 1_800);
     });
   };
 
@@ -400,12 +402,21 @@ function CodeBlock({ children }: { children?: ReactNode }) {
           onClick={copy}
           title="コードをコピー"
           aria-label="コードをコピー"
-          className="flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/code:opacity-100"
+          className={`flex items-center gap-1 rounded px-1 py-0.5 text-[10px] transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/code:opacity-100 ${
+            copyResult
+              ? "opacity-100"
+              : "text-muted-foreground opacity-0 group-hover/code:opacity-100"
+          } ${copyResult === "failed" ? "text-rose-500" : copyResult === "done" ? "text-emerald-600 dark:text-emerald-400" : ""}`}
         >
-          {copied ? (
+          {copyResult === "done" ? (
             <>
               <Check className="size-3" />
               コピーしました
+            </>
+          ) : copyResult === "failed" ? (
+            <>
+              <TriangleAlert className="size-3" />
+              コピーできません
             </>
           ) : (
             <>

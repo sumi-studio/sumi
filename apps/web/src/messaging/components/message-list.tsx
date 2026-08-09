@@ -12,6 +12,7 @@ import {
   ConversationVirtualizer,
   type ConversationVirtualizerHandle,
 } from "../../components/conversation-virtualizer";
+import { copyText } from "../../lib/clipboard";
 import { type Message, participantKey } from "../model";
 import { placePath } from "../place-route";
 import { useMessaging } from "../store";
@@ -71,6 +72,8 @@ export function MessageList({
   const noteReadUpTo = useMessaging((state) => state.noteReadUpTo);
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
   const startEdit = useMessaging((state) => state.startEdit);
+  const submitEdit = useMessaging((state) => state.submitEdit);
+  const cancelEdit = useMessaging((state) => state.cancelEdit);
   const deleteMessage = useMessaging((state) => state.deleteMessage);
   const createReplyLater = useMessaging((state) => state.createReplyLater);
   const retrySend = useMessaging((state) => state.retrySend);
@@ -265,11 +268,12 @@ export function MessageList({
     return () => window.removeEventListener("focus", onFocus);
   }, [advanceRead]);
 
+  // コピーは成否を返す。呼び出し側（操作チップ）が完了表示を出すため。
   const copyLink = useCallback(
     (message: Message) => {
-      if (!activePlaceKey) return;
+      if (!activePlaceKey) return Promise.resolve(false);
       const url = `${window.location.origin}${placePath(activePlaceKey)}?m=${message.seq}`;
-      void navigator.clipboard.writeText(url);
+      return copyText(url);
     },
     [activePlaceKey],
   );
@@ -363,6 +367,9 @@ export function MessageList({
             onEdit={(message) => startEdit(message.messageId)}
             onDelete={deleteMessage2}
             onJumpTo={flashMessage}
+            editing={editingMessageId === row.message.messageId}
+            onSubmitEdit={submitEdit}
+            onCancelEdit={cancelEdit}
           />
         </div>
       );
@@ -370,6 +377,8 @@ export function MessageList({
     [
       highlightedId,
       editingMessageId,
+      submitEdit,
+      cancelEdit,
       selfKey,
       membersByKey,
       messagesById,
