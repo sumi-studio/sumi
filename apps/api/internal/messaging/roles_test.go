@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
@@ -829,5 +830,98 @@ func TestConcurrentFoundingAdminBootstrapGrantsExactlyOneHuman(t *testing.T) {
 	}
 	if admins != 1 {
 		t.Fatalf("concurrent founding admins = %d, want exactly 1", admins)
+	}
+}
+
+func TestRoleTransactionsDoNotReenterASaturatedPoolForMissingMembership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	w.admitAll(t, ctx)
+	registry := koseki.New(w.store.pool)
+	outsiderID, err := registry.MintHuman(ctx)
+	if err != nil {
+		t.Fatalf("mint nonmember: %v", err)
+	}
+	outsider := Human(outsiderID)
+
+	tests := []struct {
+		name      string
+		want      error
+		operation func(context.Context, *Store) error
+	}{
+		{
+			name: "nonmember actor",
+			want: ErrForbidden,
+			operation: func(ctx context.Context, store *Store) error {
+				_, err := store.CreateRole(ctx, DefaultWorkspaceID, outsider, "not allowed", "", nil)
+				return err
+			},
+		},
+		{
+			name: "nonmember target",
+			want: ErrNotAMember,
+			operation: func(ctx context.Context, store *Store) error {
+				_, err := store.SetParticipantRoles(ctx, DefaultWorkspaceID, w.humanA, outsider, nil)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := pgxpool.ParseConfig(w.store.pool.Config().ConnString())
+			if err != nil {
+				t.Fatalf("parse saturated pool config: %v", err)
+			}
+			config.MaxConns = 2
+			pool, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				t.Fatalf("create saturated pool: %v", err)
+			}
+			defer pool.Close()
+			store := New(pool)
+
+			blocker, err := w.store.pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin membership blocker: %v", err)
+			}
+			defer func() { _ = blocker.Rollback(ctx) }()
+			if _, err := blocker.Exec(ctx, "LOCK TABLE workspace_members IN ACCESS EXCLUSIVE MODE"); err != nil {
+				t.Fatalf("lock memberships: %v", err)
+			}
+
+			opCtx, opCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer opCancel()
+			results := make(chan error, 2)
+			start := make(chan struct{})
+			for range 2 {
+				go func() {
+					<-start
+					results <- test.operation(opCtx, store)
+				}()
+			}
+			close(start)
+
+			acquireDeadline := time.NewTimer(time.Second)
+			defer acquireDeadline.Stop()
+			acquirePoll := time.NewTicker(5 * time.Millisecond)
+			defer acquirePoll.Stop()
+			for pool.Stat().AcquiredConns() != 2 {
+				select {
+				case <-acquirePoll.C:
+				case <-acquireDeadline.C:
+					t.Fatalf("role requests acquired %d/2 pool connections", pool.Stat().AcquiredConns())
+				}
+			}
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatalf("release membership blocker: %v", err)
+			}
+
+			for range 2 {
+				if err := <-results; !errors.Is(err, test.want) {
+					t.Fatalf("saturated role request: error = %v, want %v", err, test.want)
+				}
+			}
+		})
 	}
 }
