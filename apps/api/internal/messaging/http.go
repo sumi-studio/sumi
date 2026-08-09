@@ -1614,10 +1614,10 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	var profile MemberProfile
+	var change profileChange
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		profile, opErr = s.Store.SetProfile(r.Context(), viewer,
+		change, opErr = s.Store.setProfile(r.Context(), viewer,
 			req.DisplayName, req.Tagline, req.AvatarAttachmentID, req.BannerAttachmentID)
 		return opErr
 	})
@@ -1628,8 +1628,11 @@ func (s *Server) serveSetProfile(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	s.publishProfile(r.Context(), profile)
-	writeJSON(w, http.StatusOK, memberToWire(profile))
+	s.publishProfile(r.Context(), change.Profile)
+	for _, dependent := range change.Dependents {
+		s.publishProfile(r.Context(), dependent)
+	}
+	writeJSON(w, http.StatusOK, memberToWire(change.Profile))
 }
 
 // publishProfile tells everyone who can see this participant that the way they

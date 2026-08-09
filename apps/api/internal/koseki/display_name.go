@@ -79,6 +79,33 @@ func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, raw string)
 	return stored, nil
 }
 
+// UpdateAgentDisplayNameTx updates a PersonalityAgent name inside a caller-owned
+// transaction and reports whether the canonical value changed. Locking the
+// registry row before the update lets a wider participant mutation use it as
+// its serialization point without moving 戸籍 ownership into that caller.
+func (s *Store) UpdateAgentDisplayNameTx(ctx context.Context, tx pgx.Tx, agentID, raw string) (string, bool, error) {
+	name, err := normalizeHumanDisplayName(raw)
+	if err != nil {
+		return "", false, err
+	}
+	var previous string
+	if err := tx.QueryRow(ctx,
+		`SELECT display_name FROM agents WHERE personality_agent_id=$1 FOR UPDATE`, agentID,
+	).Scan(&previous); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrAgentNotFound
+		}
+		return "", false, fmt.Errorf("lock PersonalityAgent display name: %w", err)
+	}
+	var stored string
+	if err := tx.QueryRow(ctx,
+		`UPDATE agents SET display_name=$2 WHERE personality_agent_id=$1
+		 RETURNING display_name`, agentID, name).Scan(&stored); err != nil {
+		return "", false, fmt.Errorf("update PersonalityAgent display name: %w", err)
+	}
+	return stored, stored != previous, nil
+}
+
 // initialHumanDisplayName treats a malformed verified provider label as absent
 // so profile metadata can never prevent authentication.
 func initialHumanDisplayName(raw string) string {
@@ -121,6 +148,32 @@ func (s *Store) UpdateHumanDisplayName(ctx context.Context, humanID, raw string)
 		return "", fmt.Errorf("update Human display name: %w", err)
 	}
 	return stored, nil
+}
+
+// UpdateHumanDisplayNameTx is the transaction-aware form used when a profile
+// replacement must commit the canonical name and its messaging presentation as
+// one participant mutation. The Human row is the participant-level lock.
+func (s *Store) UpdateHumanDisplayNameTx(ctx context.Context, tx pgx.Tx, humanID, raw string) (string, bool, error) {
+	name, err := normalizeHumanDisplayName(raw)
+	if err != nil {
+		return "", false, err
+	}
+	var previous string
+	if err := tx.QueryRow(ctx,
+		`SELECT display_name FROM humans WHERE human_id=$1 FOR UPDATE`, humanID,
+	).Scan(&previous); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrHumanNotFound
+		}
+		return "", false, fmt.Errorf("lock Human display name: %w", err)
+	}
+	var stored string
+	if err := tx.QueryRow(ctx, `UPDATE humans
+		SET display_name=$2, display_name_customized=true, display_name_initialized=true
+		WHERE human_id=$1 RETURNING display_name`, humanID, name).Scan(&stored); err != nil {
+		return "", false, fmt.Errorf("update Human display name: %w", err)
+	}
+	return stored, stored != previous, nil
 }
 
 // SeedHumanDisplayName upgrades only the historical creation sentinel and only

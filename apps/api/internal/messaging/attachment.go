@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -275,11 +276,38 @@ func bindAttachments(ctx context.Context, tx pgx.Tx, messageID string, author Pa
 	if len(ids) > MaxAttachmentsPerMessage {
 		return nil, ErrTooManyAttachments
 	}
-	out := make([]Attachment, 0, len(ids))
-	for _, id := range ids {
+	// Lock every candidate in a stable order before the first UPDATE. A profile
+	// replacement locks the same row before publishing it in
+	// participant_profiles. The UPDATE below is intentionally a later statement:
+	// under READ COMMITTED it receives a fresh snapshot after any waited-on
+	// profile transaction commits, so NOT EXISTS cannot approve the row from the
+	// stale snapshot with which this bind began.
+	ordered := append([]string(nil), ids...)
+	sort.Strings(ordered)
+	previous := ""
+	for _, id := range ordered {
 		if !validAttachmentID(id) {
 			return nil, ErrAttachmentNotFound
 		}
+		if id == previous {
+			continue
+		}
+		previous = id
+		var lockedID string
+		err := tx.QueryRow(ctx,
+			`SELECT attachment_id FROM message_attachments
+			 WHERE attachment_id = $1 AND message_id IS NULL
+			   AND uploader_kind = $2 AND uploader_id = $3
+			 FOR UPDATE`, id, author.Kind, author.ID).Scan(&lockedID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAttachmentNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lock attachment for binding: %w", err)
+		}
+	}
+	out := make([]Attachment, 0, len(ids))
+	for _, id := range ids {
 		att := Attachment{AttachmentID: id, MessageID: messageID, Uploader: author}
 		err := tx.QueryRow(ctx,
 			`UPDATE message_attachments SET message_id = $1
