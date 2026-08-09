@@ -27,6 +27,9 @@ type Event struct {
 	// for", which is why it is per-recipient rather than part of the message.
 	Notify   *notifyWire `json:"notify,omitempty"`
 	MarkerID string      `json:"marker_id,omitempty"`
+	// Call is one place's live call membership (ADR 0012). Volatile like
+	// typing: never replayed, re-read from GET /messaging/calls on reconnect.
+	Call *callStateWire `json:"call,omitempty"`
 
 	// Delivery controls; never serialized. Subject scopes a place-less event to
 	// subscribers who can see that participant. OnlyFor/ExceptFor split one
@@ -49,6 +52,7 @@ const (
 	EventReplyLaterResolved = "reply_later_resolved"
 	EventPlaceCreated       = "place_created"
 	EventPlaceUpdated       = "place_updated"
+	EventCallState          = "call_state"
 )
 
 // subscriber is one live WebSocket connection's delivery state. visible is a

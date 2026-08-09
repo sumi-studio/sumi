@@ -50,6 +50,9 @@ type Server struct {
 	// failing closed (503): a subscription nothing can send to is worse than
 	// an honest "この deployment に push はまだ無い".
 	Push *PushDispatcher
+	// Calls, when set, is the RTC surface (ADR 0012). Nil means the deployment
+	// configured no media transport, and the call routes are not mounted.
+	Calls *CallService
 }
 
 // NewServer returns a messaging REST server backed by the store.
@@ -262,6 +265,8 @@ type channelWire struct {
 	Name        string `json:"name"`
 	Topic       string `json:"topic"`
 	Visibility  string `json:"visibility"`
+	// Voice marks a channel people are meant to talk in (ADR 0012).
+	Voice bool `json:"voice"`
 }
 
 func channelToWire(p Place) channelWire {
@@ -271,6 +276,7 @@ func channelToWire(p Place) channelWire {
 		Name:        p.Name,
 		Topic:       p.Topic,
 		Visibility:  p.Visibility,
+		Voice:       p.Voice,
 	}
 }
 
@@ -730,6 +736,8 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID string `json:"workspace_id"`
 		Name        string `json:"name"`
 		Topic       string `json:"topic"`
+		// 省略はテキストチャンネル。既定を「話す場所」にしない。
+		Voice bool `json:"voice"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -745,7 +753,7 @@ func (s *Server) serveCreateChannel(w http.ResponseWriter, r *http.Request) {
 	var place Place
 	done, err := s.mutate(w, r, claims, func() error {
 		var opErr error
-		place, opErr = s.Store.CreateChannel(r.Context(), req.WorkspaceID, req.Name, req.Topic, viewer)
+		place, opErr = s.Store.CreateChannel(r.Context(), req.WorkspaceID, req.Name, req.Topic, viewer, req.Voice)
 		return opErr
 	})
 	if !done {

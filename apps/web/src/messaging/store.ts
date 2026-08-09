@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend } from "./api-backend";
+import { useCall } from "./call/call-store";
 import { hasDisplayMention } from "./mention";
 import type {
   Attachment,
@@ -87,7 +88,11 @@ interface MessagingState {
 
   init(): void;
   selectPlace(key: PlaceKey): void;
-  createChannel(name: string, topic: string): Promise<PlaceKey>;
+  createChannel(
+    name: string,
+    topic: string,
+    voice?: boolean,
+  ): Promise<PlaceKey>;
   /** 1人ならDM（既存があれば再利用）、複数人ならグループDMを開く。 */
   startDM(participants: ParticipantRef[]): Promise<PlaceKey>;
   updateChannel(
@@ -440,6 +445,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
           entry.channelId === channel.channelId ? channel : entry,
         ),
       }));
+      return;
+    }
+    // 通話の在室（ADR 0012）はメッセージングのstateではなくcall storeが持つ。
+    if (event.type === "call_state") {
+      useCall.getState().applyCallState(event.call);
     }
   };
 
@@ -651,7 +661,17 @@ export const useMessaging = create<MessagingState>((set, get) => {
             employedAgents: snapshot.employedAgents,
           });
           backend.subscribe(applyEvent, { sinceByPlace });
-          backend.subscribeConnection((state) => set({ connection: state }));
+          let previousConnection: ConnectionState | null = null;
+          backend.subscribeConnection((state) => {
+            set({ connection: state });
+            // call_stateはreplayされない。初回接続と再接続のどちらでも、WSが
+            // live配送可能になった時点の全量を読み、取得中のeventはcall storeで
+            // snapshotの後へreplayする。
+            if (state === "connected" && previousConnection !== "connected") {
+              void useCall.getState().hydrate();
+            }
+            previousConnection = state;
+          });
         })
         .catch(() => {
           initialized = false;
@@ -684,10 +704,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
       void loadPlace(place);
     },
 
-    async createChannel(name, topic) {
+    async createChannel(name, topic, voice = false) {
       const workspaceId = get().workspaces[0]?.workspaceId;
       if (!workspaceId) throw new Error("workspace is not ready");
-      const channel = await backend.createChannel(workspaceId, name, topic);
+      const channel = await backend.createChannel(
+        workspaceId,
+        name,
+        topic,
+        voice,
+      );
       set((state) =>
         state.channels.some((entry) => entry.channelId === channel.channelId)
           ? {}
@@ -1011,6 +1036,8 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
   messagingSessionIdentity = identity;
+  // 人が入れ替わるなら通話も終わる。前の人の部屋に残らない。
+  useCall.getState().reset();
   backend.dispose();
   backend = new ApiMessagingBackend();
   initialized = false;

@@ -162,6 +162,11 @@ type Place struct {
 	Topic       string
 	Visibility  string
 	LastSeq     int64
+	// Voice marks a channel as a place people are meant to talk in (ADR 0012).
+	// It is an attribute of a channel, not a separate kind: the timeline,
+	// unread counts and notification settings stay identical, because a voice
+	// channel still carries text.
+	Voice bool
 }
 
 // MemberProfile is a participant with their scope-resolved display name.
@@ -263,7 +268,10 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, workspaceID string, m
 
 // CreateChannel creates a public channel in the workspace. v0: any active
 // member may create channels (契約ドラフト: 権限は最小構成).
-func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic string, creator ParticipantRef) (Place, error) {
+// voice marks the channel as a place people are meant to talk in (ADR 0012).
+// It changes nothing else: the channel still carries a timeline, unread counts
+// and notification settings, because a voice channel is still a channel.
+func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic string, creator ParticipantRef, voice bool) (Place, error) {
 	if err := creator.Validate(); err != nil {
 		return Place{}, err
 	}
@@ -279,15 +287,15 @@ func (s *Store) CreateChannel(ctx context.Context, workspaceID, name, topic stri
 	}
 	placeID := newUUIDv7()
 	_, err = s.pool.Exec(ctx,
-		`INSERT INTO places (place_id, kind, workspace_id, name, topic)
-		 VALUES ($1, 'channel', $2, $3, $4)`,
-		placeID, workspaceID, name, topic)
+		`INSERT INTO places (place_id, kind, workspace_id, name, topic, voice)
+		 VALUES ($1, 'channel', $2, $3, $4, $5)`,
+		placeID, workspaceID, name, topic, voice)
 	if err != nil {
 		return Place{}, fmt.Errorf("insert channel: %w", err)
 	}
 	return Place{
 		PlaceID: placeID, Kind: PlaceChannel, WorkspaceID: workspaceID,
-		Name: name, Topic: topic, Visibility: "public",
+		Name: name, Topic: topic, Visibility: "public", Voice: voice,
 	}, nil
 }
 
@@ -349,7 +357,9 @@ func (s *Store) DuplicateChannel(ctx context.Context, placeID, name string, acto
 	if !validChannelName(name) {
 		return Place{}, ErrInvalidChannelName
 	}
-	return s.CreateChannel(ctx, source.WorkspaceID, name, source.Topic, actor)
+	// 複製は形（名前・トピック・ボイスかどうか）を写す。ボイスの複製が
+	// テキストになったら、それは同じ形の場所ではない。
+	return s.CreateChannel(ctx, source.WorkspaceID, name, source.Topic, actor, source.Voice)
 }
 
 // duplicateChannelName names the copy, keeping the result inside the schema's
@@ -510,6 +520,15 @@ func (s *Store) PlaceFor(ctx context.Context, placeID string, viewer Participant
 	return place, nil
 }
 
+// PlaceByID loads a place without a viewer. It exists for server-to-server
+// paths that must name a place before any recipient is known — the LiveKit
+// call webhook, which learns only a room name and needs the place shape to
+// publish. It performs no visibility check, so it must never answer a request
+// that carries a participant: the Hub still decides who is told (call.go).
+func (s *Store) PlaceByID(ctx context.Context, placeID string) (Place, error) {
+	return s.loadPlace(ctx, s.pool, placeID)
+}
+
 // ActiveMembers returns the active members of a place with display names
 // resolved from the 戸籍 (workspace nicknames land later). The viewer must be
 // able to see the place.
@@ -615,10 +634,10 @@ func (s *Store) loadPlace(ctx context.Context, q querier, placeID string) (Place
 		name        *string
 	)
 	err := q.QueryRow(ctx,
-		`SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq
+		`SELECT place_id, kind, workspace_id, name, topic, visibility, last_seq, voice
 		 FROM places WHERE place_id = $1`, placeID).
 		Scan(&place.PlaceID, &place.Kind, &workspaceID, &name,
-			&place.Topic, &place.Visibility, &place.LastSeq)
+			&place.Topic, &place.Visibility, &place.LastSeq, &place.Voice)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Place{}, ErrPlaceNotFound
 	}

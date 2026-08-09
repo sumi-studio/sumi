@@ -16,11 +16,12 @@ use tokio::sync::Mutex;
 use crate::{
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-        DuplicateMessagingChannelRequest, MessagingApi, MessagingNotificationPlace,
-        MessagingNotificationSettingsRequest, MessagingParticipant, OpenMessagingPlaceRequest,
-        PollMessagingAttentionRequest, ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
-        StartMessagingDMRequest, UpdateMessagingChannelRequest, WriteMessagingMessageRequest,
+        DuplicateMessagingChannelRequest, GetMessagingCallStateRequest, MessagingApi,
+        MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
+        OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+        ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
+        SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
+        WriteMessagingMessageRequest,
     },
     provider::types::{ToolDefinition, UserContent},
     tools::{Tool, ToolCtx, ToolError, ToolOutput, ToolRisk},
@@ -130,6 +131,9 @@ enum MessagingAction {
         topic: Option<String>,
         #[serde(default)]
         workspace_id: Option<String>,
+        /// A voice channel is a place people are meant to talk in (ADR 0012).
+        #[serde(default)]
+        voice: Option<bool>,
     },
     /// Rename a channel, retopic it, or both.  An omitted field is left alone.
     UpdateChannel {
@@ -181,6 +185,14 @@ enum MessagingAction {
         consume_through: Option<u64>,
         #[serde(default)]
         limit: Option<u16>,
+    },
+    /// See who is currently in a call (ADR 0012).  Like status this is about
+    /// people rather than a screen, so no place need be open; naming one
+    /// narrows the answer.  There is no action for joining a call: the ADR
+    /// records the agent's own participation as an open question.
+    GetCallState {
+        #[serde(default)]
+        place_id: Option<String>,
     },
 }
 
@@ -287,9 +299,9 @@ fn messaging_parameters_schema() -> Value {
             "both; duplicate_channel requires place_id and may include name; search requires ",
             "query and may include place_id or limit; notification_settings takes any of ",
             "defaults_level, per_place or keywords and reads the current setting when given ",
-            "none of them; attention may include consume_through or limit. Write, react and ",
-            "reply_later act on the place most recently opened in this tool view; every other ",
-            "action needs no open place."
+            "none of them; attention may include consume_through or limit; get_call_state takes ",
+            "an optional place_id. Write, react and reply_later act on the place most recently ",
+            "opened in this tool view; every other action needs no open place."
         ),
         "properties": {
             "action": {
@@ -298,7 +310,7 @@ fn messaging_parameters_schema() -> Value {
                     "overview", "open", "write", "react",
                     "status", "reply_later", "resolve_reply_later", "start_dm",
                     "create_channel", "update_channel", "duplicate_channel",
-                    "search", "notification_settings", "attention"
+                    "search", "notification_settings", "attention", "get_call_state"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -313,15 +325,17 @@ fn messaging_parameters_schema() -> Value {
                     "duplicate_channel copies a channel's name and topic into a new empty one; ",
                     "search finds messages you can already see, anywhere; ",
                     "notification_settings reads or changes what is allowed to interrupt you; ",
-                    "attention lists what arrived while you were not looking, and why."
+                    "attention lists what arrived while you were not looking, and why; ",
+                    "get_call_state reports who is currently in a voice or video call."
                 )
             },
             "place_id": {
                 "type": "string",
                 "description": concat!(
                     "Required for open, update_channel and duplicate_channel; optional for ",
-                    "search; omitted for other actions. The place to open, edit or copy, or the ",
-                    "one place a search is restricted to."
+                    "search and get_call_state; omitted for other actions. The place to open, ",
+                    "edit or copy, the one place a search is restricted to, or the single place ",
+                    "whose call to report."
                 )
             },
             "name": {
@@ -344,6 +358,13 @@ fn messaging_parameters_schema() -> Value {
                 "description": concat!(
                     "Optional for create_channel and omitted for other actions. Which workspace ",
                     "to open the channel in; when omitted, the workspace you are in is used."
+                )
+            },
+            "voice": {
+                "type": "boolean",
+                "description": concat!(
+                    "Optional for create_channel and omitted for other actions. True opens a ",
+                    "voice channel — a place people are meant to talk in (ADR 0012)."
                 )
             },
             "before_seq": {
@@ -540,8 +561,9 @@ impl Tool for MessagingTool {
                 "message visible in it. Declare your own availability with status, or ",
                 "open a new direct or group conversation with start_dm. ",
                 "Use search to find something said elsewhere, attention to see what ",
-                "arrived while you were not looking, and notification_settings to ",
-                "decide what is allowed to interrupt you. ",
+                "arrived while you were not looking, notification_settings to ",
+                "decide what is allowed to interrupt you, and get_call_state to see ",
+                "who is currently in a call. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare. ",
                 "A message may carry attachments; each one reports filename, mime, ",
@@ -750,6 +772,7 @@ impl Tool for MessagingTool {
                 name,
                 topic,
                 workspace_id,
+                voice,
             } => {
                 let response = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
@@ -757,6 +780,7 @@ impl Tool for MessagingTool {
                         workspace_id: workspace_id.as_deref(),
                         name: &name,
                         topic: topic.as_deref(),
+                        voice,
                     }) => result,
                 }
                 .map_err(|error| ToolError::Rpc(error.to_string()))?;
@@ -840,6 +864,13 @@ impl Tool for MessagingTool {
                 result = self.api.attention(PollMessagingAttentionRequest {
                     consume_through,
                     limit,
+                }) => result,
+            }
+            .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            MessagingAction::GetCallState { place_id } => tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.call_state(GetMessagingCallStateRequest {
+                    place_id: place_id.as_deref(),
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
@@ -939,6 +970,7 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             name,
             topic,
             workspace_id,
+            ..
         } => {
             validate_bounded_nonempty(name, MAX_CHANNEL_NAME_BYTES)?;
             validate_optional_note(topic, MAX_TOPIC_BYTES)?;
@@ -1036,6 +1068,15 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
                 return Err(ToolError::InvalidArguments);
             }
             validate_limit(limit, MAX_ATTENTION_LIMIT)
+        }
+        MessagingAction::GetCallState { place_id } => {
+            if place_id
+                .as_deref()
+                .is_some_and(|id| validate_bounded_nonempty(id, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
         }
     }
 }
@@ -1480,6 +1521,21 @@ mod tests {
                 "latest_seq": 1
             }))
         }
+
+        async fn call_state(&self, request: GetMessagingCallStateRequest<'_>) -> Result<Value> {
+            self.calls
+                .lock()
+                .await
+                .push(format!("call_state:{}", request.place_id.unwrap_or("*")));
+            Ok(json!({"calls": [{
+                "place": {"kind": "channel", "channel_id": request.place_id.unwrap_or("general")},
+                "active": true,
+                "participants": [
+                    {"participant": {"kind": "human", "human_id": "h1"},
+                     "screen_share": false}
+                ]
+            }]}))
+        }
     }
 
     async fn execute(
@@ -1561,7 +1617,8 @@ mod tests {
                 "duplicate_channel",
                 "search",
                 "notification_settings",
-                "attention"
+                "attention",
+                "get_call_state"
             ])
         );
         assert_eq!(
@@ -1605,7 +1662,7 @@ mod tests {
                 .as_object()
                 .expect("properties must be an object")
                 .len(),
-            24
+            25
         );
     }
 
@@ -1763,6 +1820,58 @@ mod tests {
                 limit: None
             }
         ));
+
+        let all_calls: MessagingAction =
+            serde_json::from_value(json!({"action": "get_call_state"})).unwrap();
+        assert!(matches!(
+            all_calls,
+            MessagingAction::GetCallState { place_id: None }
+        ));
+        let one_call: MessagingAction =
+            serde_json::from_value(json!({"action": "get_call_state", "place_id": "general"}))
+                .unwrap();
+        assert!(matches!(
+            one_call,
+            MessagingAction::GetCallState { place_id: Some(place_id) } if place_id == "general"
+        ));
+    }
+
+    /// Reading who is in a call is about people, not about a screen — like
+    /// status it needs no open place (ADR 0012).
+    #[tokio::test]
+    async fn call_state_is_readable_without_opening_a_place() {
+        let api = Arc::new(FakeMessagingApi::default());
+        let tool = MessagingTool::new(api.clone());
+
+        let output = execute(&tool, json!({"action": "get_call_state"}), "calls")
+            .await
+            .unwrap();
+        assert!(output.details["calls"][0]["active"].as_bool().unwrap());
+        assert_eq!(
+            api.calls.lock().await.as_slice(),
+            ["overview", "call_state:*"]
+        );
+
+        execute(
+            &tool,
+            json!({"action": "get_call_state", "place_id": "general"}),
+            "one-call",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("call_state:general")
+        );
+
+        for invalid in [
+            json!({"action": "get_call_state", "place_id": ""}),
+            json!({"action": "get_call_state", "place_id": "a\nb"}),
+        ] {
+            execute(&tool, invalid, "invalid")
+                .await
+                .expect_err("malformed place_id must be rejected before the call");
+        }
     }
 
     #[tokio::test]

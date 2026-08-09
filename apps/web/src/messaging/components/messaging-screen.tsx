@@ -1,6 +1,11 @@
-import { Bell, Clock, Hash, Users, X } from "lucide-react";
+import { Bell, Clock, Hash, Users, Volume2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppRail } from "../../shell/app-rail";
+import { CallBanner } from "../call/call-banner";
+import { CallStage } from "../call/call-stage";
+import { CallStartButtons } from "../call/call-start-buttons";
+import { IncomingCallModal } from "../call/incoming-call";
+import { VoiceChannelPanel } from "../call/voice-channel-panel";
 import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
 import {
   dismissPermissionPrompt,
@@ -327,6 +332,14 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
   const display = usePlaceDisplay(activePlaceKey);
+  // 開いているchannelが「話す場所」か（ADR 0012）。booleanなので購読は安定する。
+  const activeIsVoiceChannel = useMessaging((state) =>
+    activePlaceKey?.startsWith("channel:")
+      ? (state.channels.find(
+          (channel) => `channel:${channel.channelId}` === activePlaceKey,
+        )?.voice ?? false)
+      : false,
+  );
   const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
   const mentionCountByPlace = useMessaging(
     (state) => state.mentionCountByPlace,
@@ -445,7 +458,11 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
           {display?.kind === "channel" ? (
-            <Hash className="size-4 shrink-0 text-muted-foreground" />
+            activeIsVoiceChannel ? (
+              <Volume2 className="size-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <Hash className="size-4 shrink-0 text-muted-foreground" />
+            )
           ) : null}
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? ""}
@@ -461,6 +478,10 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             </>
           ) : null}
           <span className="ml-auto flex items-center gap-1">
+            {/* 通話 (ADR 0012)。DM・グループDMのヘッダーから始める。 */}
+            {activePlaceKey && display && display.kind !== "channel" ? (
+              <CallStartButtons placeKey={activePlaceKey} />
+            ) : null}
             <MessageSearch onJump={requestJump} />
             {canNotify ? <NotificationSettingsMenu /> : null}
             {canReplyLater ? <ReplyLaterMenu onJump={requestJump} /> : null}
@@ -481,6 +502,16 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
         <ConnectionBanner />
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
+            {/* 通話領域はテキストの上に積む。通話中もそのまま会話が続く。 */}
+            {activePlaceKey ? (
+              <>
+                {activeIsVoiceChannel ? (
+                  <VoiceChannelPanel placeKey={activePlaceKey} />
+                ) : null}
+                <CallBanner placeKey={activePlaceKey} />
+                <CallStage placeKey={activePlaceKey} />
+              </>
+            ) : null}
             <MessageList handleRef={listRef} />
             <TypingIndicator />
             <Composer />
@@ -489,6 +520,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
         </div>
       </div>
       {canReplyLater ? <ReplyLaterKnock onJump={requestJump} /> : null}
+      <IncomingCallModal />
     </div>
   );
 }

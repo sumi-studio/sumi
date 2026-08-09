@@ -38,6 +38,7 @@ const channel: ChannelSummary = {
   name: "general",
   topic: "",
   visibility: "public",
+  voice: false,
 };
 
 function composer() {

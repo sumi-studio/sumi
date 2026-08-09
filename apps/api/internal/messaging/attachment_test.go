@@ -120,7 +120,7 @@ func TestAttachmentUploadBindAndVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create private workspace: %v", err)
 	}
-	privateChannel, err := w.store.CreateChannel(ctx, private.WorkspaceID, "solo", "", w.humanA)
+	privateChannel, err := w.store.CreateChannel(ctx, private.WorkspaceID, "solo", "", w.humanA, false)
 	if err != nil {
 		t.Fatalf("create private channel: %v", err)
 	}

@@ -5,10 +5,13 @@ import {
   MoreVertical,
   Plus,
   Search,
+  Volume2,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
+import { useCall } from "../call/call-store";
+import { VoiceChannelMembers } from "../call/voice-channel-members";
 import type { PlaceKey } from "../model";
 import { participantKey } from "../model";
 import { usePlaceNavigate } from "../place-route";
@@ -58,6 +61,7 @@ function PlaceRow({
   onEditChannel,
   onDuplicateChannel,
   onCreateChannel,
+  onOpen,
 }: {
   placeKey: PlaceKey;
   /** channel以外（DM・グループDM）ではnull。 */
@@ -69,6 +73,8 @@ function PlaceRow({
   onEditChannel: (channelId: string) => void;
   onDuplicateChannel: (channelId: string) => void;
   onCreateChannel: () => void;
+  /** 開くときの追加の作用（ボイスチャンネルはそのまま通話へ入る）。 */
+  onOpen?: () => void;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const canConfigureNotifications = useMessaging(
@@ -94,7 +100,10 @@ function PlaceRow({
     >
       <button
         type="button"
-        onClick={() => placeNavigate(key)}
+        onClick={() => {
+          placeNavigate(key);
+          onOpen?.();
+        }}
         onContextMenu={(event) => {
           if (!hasMenu) return;
           event.preventDefault();
@@ -197,6 +206,8 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
   const placeNavigate = usePlaceNavigate();
   const [name, setName] = useState("");
   const [topic, setTopic] = useState("");
+  // 既定はテキスト。「話す場所」は選んで作るもの。
+  const [voice, setVoice] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -212,7 +223,7 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setFailed(false);
     try {
-      const key = await createChannel(trimmed, topic.trim());
+      const key = await createChannel(trimmed, topic.trim(), voice);
       placeNavigate(key);
       onClose();
     } catch {
@@ -260,6 +271,32 @@ function CreateChannelDialog({ onClose }: { onClose: () => void }) {
             className={INPUT_CLASS}
           />
         </label>
+        <button
+          type="button"
+          disabled={busy}
+          aria-pressed={voice}
+          onClick={() => setVoice((value) => !value)}
+          className="flex w-full items-start gap-2 rounded-md px-1 py-1 text-left hover:bg-accent/60 disabled:opacity-50"
+        >
+          <span
+            className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded border ${
+              voice
+                ? "border-primary bg-primary text-primary-foreground"
+                : "border-border"
+            }`}
+          >
+            {voice ? <Check className="size-3" /> : null}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-1.5 text-[13px]">
+              <Volume2 className="size-3.5 shrink-0 opacity-70" />
+              ボイスチャンネル
+            </span>
+            <span className="block text-[11px] text-muted-foreground">
+              入ると通話になります。文字での会話もそのまま続けられます
+            </span>
+          </span>
+        </button>
         {failed ? (
           <p className="text-[11px] text-rose-500">
             チャンネルを作成できませんでした
@@ -597,6 +634,8 @@ export function Sidebar() {
   const canSetStatus = useMessaging((state) => state.capabilities.status);
   const duplicateChannel = useMessaging((state) => state.duplicateChannel);
   const placeNavigate = usePlaceNavigate();
+  // ボイスチャンネルは開くことと入ることが同じ動作（ADR 0012）。
+  const joinCall = useCall((state) => state.join);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<"channel" | "dm" | null>(null);
   const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
@@ -647,16 +686,27 @@ export function Sidebar() {
           const unread = unreadCountByPlace[key] ?? 0;
           const mentions = mentionCountByPlace[key] ?? 0;
           return (
-            <PlaceRow
-              key={key}
-              placeKey={key}
-              channelId={channel.channelId}
-              label={channel.name}
-              icon={<Hash className="size-3.5 shrink-0 opacity-60" />}
-              unread={unread}
-              mentions={mentions}
-              {...menuActions}
-            />
+            // ボイスチャンネルはスピーカーで見分け、通話中の人を名前の下へ
+            // ぶら下げる（ADR 0012）。行そのものは他のchannelと同じ。
+            <div key={key}>
+              <PlaceRow
+                placeKey={key}
+                channelId={channel.channelId}
+                label={channel.name}
+                icon={
+                  channel.voice ? (
+                    <Volume2 className="size-3.5 shrink-0 opacity-60" />
+                  ) : (
+                    <Hash className="size-3.5 shrink-0 opacity-60" />
+                  )
+                }
+                unread={unread}
+                mentions={mentions}
+                onOpen={channel.voice ? () => void joinCall(key) : undefined}
+                {...menuActions}
+              />
+              {channel.voice ? <VoiceChannelMembers placeKey={key} /> : null}
+            </div>
           );
         })}
         <div className="pt-4">

@@ -74,6 +74,15 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalSearchPath, s.localSearch},
 		{"POST " + LocalAttentionPath, s.localAttention},
 	}
+	// 通話状態の読み取り (ADR 0012)。Calls が nil の deployment では口自体を
+	// 生やさない — 無い能力を「常に空」として見せると、通話が無いのか SFU が
+	// 未設定なのかを agent が区別できない。
+	if s.Calls != nil {
+		routes = append(routes, struct {
+			pattern string
+			handler agentevents.LocalAuthorizedHandler
+		}{"POST " + LocalCallStatePath, s.Calls.localCallState})
+	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
 			return err
@@ -509,6 +518,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		WorkspaceID string `json:"workspace_id,omitempty"`
 		Name        string `json:"name"`
 		Topic       string `json:"topic,omitempty"`
+		Voice       bool   `json:"voice,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -528,7 +538,7 @@ func (s *Server) localCreateChannel(w http.ResponseWriter, r *http.Request, auth
 		writeStoreError(w, err)
 		return
 	}
-	place, err := s.Store.CreateChannel(r.Context(), workspaceID, request.Name, request.Topic, viewer)
+	place, err := s.Store.CreateChannel(r.Context(), workspaceID, request.Name, request.Topic, viewer, request.Voice)
 	if err != nil {
 		writeStoreError(w, err)
 		return

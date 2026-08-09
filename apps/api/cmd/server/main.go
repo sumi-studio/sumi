@@ -383,6 +383,19 @@ func newApplicationFromEnv() (*application, error) {
 			messagingStore.UsePush(dispatcher)
 			log.Print("messaging web push ready")
 		}
+		// 通話 (ADR 0012)。key/secret が無い deployment では call service を
+		// 作らず、通話の口を生やさない。テキストは通話に依存しない。
+		livekit := messaging.LiveKitConfig{
+			URL:       strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_URL")),
+			APIKey:    strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_KEY")),
+			APISecret: strings.TrimSpace(os.Getenv("SUMI_LIVEKIT_API_SECRET")),
+		}
+		if livekit.APIKey != "" && livekit.APISecret != "" {
+			calls := messaging.NewCallService(messagingServer, livekit)
+			messagingServer.Calls = calls
+			calls.RegisterRoutes(mux)
+			log.Printf("messaging calls ready (livekit url=%s)", livekit.URL)
+		}
 		messagingServer.RegisterRoutes(mux)
 		messagingWS = messaging.NewWSServer(messagingStore, messagingSessions, messagingHub)
 		messagingWS.AllowedOrigins = browserOrigins

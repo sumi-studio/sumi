@@ -120,7 +120,7 @@ func TestNotificationDecisionsFollowPriorityAndMuteSuppresses(t *testing.T) {
 		}
 	}
 	// The mute is scoped to that one place: a second channel still calls them.
-	other, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "random", "", w.humanA)
+	other, err := w.store.CreateChannel(ctx, ws.WorkspaceID, "random", "", w.humanA, false)
 	if err != nil {
 		t.Fatalf("create second channel: %v", err)
 	}

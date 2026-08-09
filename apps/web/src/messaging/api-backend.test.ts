@@ -410,6 +410,7 @@ describe("ApiMessagingBackend", () => {
       name: "dev",
       topic: "開発の相談",
       visibility: "public",
+      voice: false,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/messaging/channels",
@@ -419,6 +420,7 @@ describe("ApiMessagingBackend", () => {
           workspace_id: "workspace-1",
           name: "dev",
           topic: "開発の相談",
+          voice: false,
         }),
       }),
     );
@@ -446,6 +448,38 @@ describe("ApiMessagingBackend", () => {
     await expect(
       backend.updateChannel("channel-2", { topic: "新しいトピック" }),
     ).resolves.toMatchObject({ topic: "新しいトピック" });
+  });
+
+  // ボイスチャンネル (ADR 0012) はchannelの一属性なので、同じ口を通る。
+  it("creates a voice channel through the same channel endpoint", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          return json(channelSummaryWire("", true), 201);
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend();
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel("workspace-1", "dev", "", true),
+    ).resolves.toMatchObject({ voice: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/messaging/channels",
+      expect.objectContaining({
+        body: JSON.stringify({
+          workspace_id: "workspace-1",
+          name: "dev",
+          topic: "",
+          voice: true,
+        }),
+      }),
+    );
   });
 
   it("projects place_created and place_updated from the socket", async () => {
@@ -903,13 +937,14 @@ function replyLaterWire(markerId: string, humanId: string, remindAt?: string) {
   };
 }
 
-function channelSummaryWire(topic: string) {
+function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
     workspace_id: "workspace-1",
     name: "dev",
     topic,
     visibility: "public",
+    voice,
   };
 }
 
