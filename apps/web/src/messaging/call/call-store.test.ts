@@ -63,6 +63,16 @@ class FakeTransport implements CallTransport {
 
 let transports: FakeTransport[] = [];
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   transports = [];
   installCallTransportFactory((events) => {
@@ -117,6 +127,71 @@ describe("サーバーが配る通話状態", () => {
   it("人格agentも人間と同じ参加者として並ぶ", () => {
     useCall.getState().applyCallState(callState(DM, [KURO]));
     expect(callParticipantsFor(useCall.getState(), "dm:d1")).toEqual([KURO]);
+  });
+
+  it("snapshotを全量として扱い、offline中に始まり終わった通話も揃える", async () => {
+    let calls = [wireCallState(DM, [BOB])];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ calls }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+
+    await useCall.getState().hydrate();
+    expect(callParticipantsFor(useCall.getState(), "dm:d1")).toEqual([BOB]);
+
+    calls = [];
+    await useCall.getState().hydrate();
+
+    expect(useCall.getState().stateByPlace).toEqual({});
+  });
+
+  it("snapshot取得中に届いたlive eventをsnapshotの後へreplayする", async () => {
+    const response = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response.promise),
+    );
+    const hydration = useCall.getState().hydrate();
+
+    useCall.getState().applyCallState(callState(DM, [BOB, ALICE]));
+    response.resolve(
+      new Response(JSON.stringify({ calls: [wireCallState(DM, [BOB])] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await hydration;
+
+    expect(callParticipantsFor(useCall.getState(), "dm:d1")).toEqual([
+      BOB,
+      ALICE,
+    ]);
+  });
+
+  it("reset後に解決した前sessionのsnapshotを無視する", async () => {
+    const response = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response.promise),
+    );
+    const hydration = useCall.getState().hydrate();
+
+    useCall.getState().reset();
+    response.resolve(
+      new Response(JSON.stringify({ calls: [wireCallState(DM, [BOB])] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await hydration;
+
+    expect(useCall.getState().stateByPlace).toEqual({});
   });
 });
 
@@ -176,6 +251,63 @@ describe("自分の通話セッション", () => {
     expect(transports[0].log).toContain("disconnect");
     expect(useCall.getState().activePlaceKey).toBe("dm:d1");
     expect(transports).toHaveLength(2);
+  });
+
+  it("ticket待機中のresetで古いjoinを無効にする", async () => {
+    const response = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response.promise),
+    );
+    const joining = useCall.getState().join("channel:c1");
+
+    useCall.getState().reset();
+    response.resolve(
+      new Response(
+        JSON.stringify({
+          url: "ws://livekit.test",
+          token: "old-session-token",
+          room: "c1",
+          identity: "human:alice",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await joining;
+
+    expect(transports).toHaveLength(0);
+    expect(useCall.getState()).toMatchObject({
+      activePlaceKey: null,
+      phase: "idle",
+    });
+  });
+
+  it("接続途中で失敗したtransportも切断する", async () => {
+    installCallTransportFactory((events) => {
+      const created = new FakeTransport(events);
+      created.connectRejects = true;
+      transports.push(created);
+      return created;
+    });
+
+    await useCall.getState().join("channel:c1");
+
+    expect(transports[0].log).toEqual(["disconnect"]);
+    expect(useCall.getState().phase).toBe("failed");
+  });
+
+  it("古いtransportのlate callbackで新しい通話を畳まない", async () => {
+    await useCall.getState().join("channel:c1");
+    const old = transports[0];
+    await useCall.getState().leave();
+    await useCall.getState().join("dm:d1");
+
+    old.events.onDisconnected();
+
+    expect(useCall.getState()).toMatchObject({
+      activePlaceKey: "dm:d1",
+      phase: "connected",
+    });
   });
 
   it("マイク・カメラ・画面共有は手元を先に動かし、失敗したら戻す", async () => {
@@ -240,3 +372,25 @@ describe("自分の通話セッション", () => {
     expect(useCall.getState().speakingUntil["human:bob"]).toBeDefined();
   });
 });
+
+function wireCallState(place: Place, participants: ParticipantRef[]) {
+  return {
+    place:
+      place.kind === "channel"
+        ? { kind: place.kind, channel_id: place.channelId }
+        : { kind: place.kind, dm_id: place.dmId },
+    active: participants.length > 0,
+    started_at: "2026-08-09T00:00:00.000Z",
+    participants: participants.map((participant) => ({
+      participant:
+        participant.kind === "human"
+          ? { kind: participant.kind, human_id: participant.humanId }
+          : {
+              kind: participant.kind,
+              personality_agent_id: participant.personalityAgentId,
+            },
+      joined_at: "2026-08-09T00:00:00.000Z",
+      screen_share: false,
+    })),
+  };
+}

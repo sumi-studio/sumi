@@ -39,6 +39,9 @@ class LiveKitCallTransport implements CallTransport {
   private readonly events: CallTransportEvents;
   private room: Room | null = null;
   private readonly tracks = new Map<string, CallMediaTrack>();
+  private readonly audioTracks = new Map<string, () => void>();
+  private audioRecoveryRoom: Room | null = null;
+  private audioRecoveryPending = false;
 
   constructor(events: CallTransportEvents) {
     this.events = events;
@@ -49,7 +52,21 @@ class LiveKitCallTransport implements CallTransport {
     const room = new Room({ adaptiveStream: true, dynacast: true });
     this.room = room;
 
-    room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (track.kind === "audio") {
+        const element = document.createElement("audio");
+        element.autoplay = true;
+        element.hidden = true;
+        track.attach(element);
+        document.body.append(element);
+        const key = publication.trackSid;
+        this.removeAudioTrack(key);
+        this.audioTracks.set(key, () => {
+          track.detach(element);
+          element.remove();
+        });
+        return;
+      }
       if (track.kind !== "video") return;
       const screen = track.source === Track.Source.ScreenShare;
       this.tracks.set(trackKey(participant.identity, screen), {
@@ -64,7 +81,12 @@ class LiveKitCallTransport implements CallTransport {
       });
       this.emitTracks();
     });
-    room.on(RoomEvent.TrackUnsubscribed, (track, _publication, participant) => {
+    room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+      if (track.kind === "audio") {
+        this.removeAudioTrack(publication.trackSid);
+        return;
+      }
+      if (track.kind !== "video") return;
       const screen = track.source === Track.Source.ScreenShare;
       this.tracks.delete(trackKey(participant.identity, screen));
       this.emitTracks();
@@ -82,7 +104,17 @@ class LiveKitCallTransport implements CallTransport {
     };
     room.on(RoomEvent.ParticipantConnected, emitParticipants);
     room.on(RoomEvent.ParticipantDisconnected, emitParticipants);
+    room.on(RoomEvent.AudioPlaybackStatusChanged, (canPlay) => {
+      if (canPlay) {
+        this.stopAudioRecovery();
+      } else {
+        this.startAudioRecovery(room);
+      }
+    });
     room.on(RoomEvent.Disconnected, () => {
+      if (this.room === room) this.room = null;
+      this.clearAudioTracks();
+      this.stopAudioRecovery();
       this.tracks.clear();
       this.emitTracks();
       this.events.onDisconnected();
@@ -110,6 +142,8 @@ class LiveKitCallTransport implements CallTransport {
   async disconnect(): Promise<void> {
     const room = this.room;
     this.room = null;
+    this.clearAudioTracks();
+    this.stopAudioRecovery();
     this.tracks.clear();
     this.emitTracks();
     await room?.disconnect();
@@ -118,6 +152,43 @@ class LiveKitCallTransport implements CallTransport {
   private emitTracks(): void {
     this.events.onTracks([...this.tracks.values()]);
   }
+
+  private removeAudioTrack(key: string): void {
+    const cleanup = this.audioTracks.get(key);
+    if (!cleanup) return;
+    this.audioTracks.delete(key);
+    cleanup();
+  }
+
+  private clearAudioTracks(): void {
+    for (const cleanup of this.audioTracks.values()) cleanup();
+    this.audioTracks.clear();
+  }
+
+  /** Browserのautoplay拒否後、次の本人操作をLiveKitの再開gestureに使う。 */
+  private startAudioRecovery(room: Room): void {
+    if (this.audioRecoveryRoom === room) return;
+    this.stopAudioRecovery();
+    this.audioRecoveryRoom = room;
+    document.addEventListener("click", this.recoverAudio, true);
+    document.addEventListener("keydown", this.recoverAudio, true);
+  }
+
+  private stopAudioRecovery(): void {
+    this.audioRecoveryRoom = null;
+    this.audioRecoveryPending = false;
+    document.removeEventListener("click", this.recoverAudio, true);
+    document.removeEventListener("keydown", this.recoverAudio, true);
+  }
+
+  private readonly recoverAudio = (): void => {
+    const room = this.audioRecoveryRoom;
+    if (!room || this.audioRecoveryPending) return;
+    this.audioRecoveryPending = true;
+    void room.startAudio().finally(() => {
+      if (this.audioRecoveryRoom === room) this.audioRecoveryPending = false;
+    });
+  };
 }
 
 function trackKey(participantKey: ParticipantKey, screen: boolean): string {
