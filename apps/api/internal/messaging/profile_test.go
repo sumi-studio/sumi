@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,229 @@ import (
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
+
+type profileResult struct {
+	profile MemberProfile
+	err     error
+}
+
+type profileEndpointResult struct {
+	status  int
+	profile memberWire
+	body    string
+	err     error
+}
+
+func invokeRESTProfile(ctx context.Context, server *Server, humanID, displayName, tagline string) profileEndpointResult {
+	body, err := json.Marshal(map[string]string{
+		"display_name": displayName, "tagline": tagline,
+		"avatar_attachment_id": "", "banner_attachment_id": "",
+	})
+	if err != nil {
+		return profileEndpointResult{err: err}
+	}
+	request := httptest.NewRequest(http.MethodPut, "/messaging/profile", bytes.NewReader(body)).WithContext(ctx)
+	request.Header.Set("Origin", testOrigin)
+	request.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: humanID})
+	response := httptest.NewRecorder()
+	server.serveSetProfile(response, request)
+	result := profileEndpointResult{status: response.Code, body: response.Body.String()}
+	if response.Code == http.StatusOK {
+		result.err = json.Unmarshal(response.Body.Bytes(), &result.profile)
+	}
+	return result
+}
+
+func invokeLocalProfile(ctx context.Context, server *Server, authorization agentevents.LocalRuntimeAuthorization, payload string) profileEndpointResult {
+	request := httptest.NewRequest(http.MethodPost, LocalProfilePath, strings.NewReader(payload)).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.localProfile(response, request, authorization)
+	result := profileEndpointResult{status: response.Code, body: response.Body.String()}
+	if response.Code == http.StatusOK {
+		var decoded struct {
+			Profile memberWire `json:"profile"`
+		}
+		result.err = json.Unmarshal(response.Body.Bytes(), &decoded)
+		result.profile = decoded.Profile
+	}
+	return result
+}
+
+// holdProfileTestGate owns one transaction-scoped advisory lock until the
+// returned function is called. Tests use a database trigger that waits on the
+// same key to stop a profile write at an exact statement boundary.
+func holdProfileTestGate(t *testing.T, ctx context.Context, w world, key int32) func() {
+	t.Helper()
+	conn, err := w.store.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire advisory gate connection: %v", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		conn.Release()
+		t.Fatalf("begin advisory gate transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
+		_ = tx.Rollback(ctx)
+		conn.Release()
+		t.Fatalf("hold advisory gate: %v", err)
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			_ = tx.Rollback(context.Background())
+		}
+		conn.Release()
+	})
+	return func() {
+		t.Helper()
+		if released {
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("release advisory gate: %v", err)
+		}
+		released = true
+	}
+}
+
+func waitForProfileTestGate(t *testing.T, ctx context.Context, w world, key int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		err := w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted
+			  AND classid = 0 AND objid = $1
+		)`, key).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("inspect advisory gate: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("profile write did not reach the advisory gate")
+}
+
+// holdProfileVisibilityGate stops participant visibility checks after the
+// profile transaction commits but before Hub.Publish can enqueue its event.
+func holdProfileVisibilityGate(t *testing.T, ctx context.Context, w world) (int, func()) {
+	t.Helper()
+	conn, err := w.store.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire visibility gate connection: %v", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		conn.Release()
+		t.Fatalf("begin visibility gate transaction: %v", err)
+	}
+	var pid int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		_ = tx.Rollback(ctx)
+		conn.Release()
+		t.Fatalf("read visibility gate pid: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE place_members IN ACCESS EXCLUSIVE MODE`); err != nil {
+		_ = tx.Rollback(ctx)
+		conn.Release()
+		t.Fatalf("hold visibility gate: %v", err)
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			_ = tx.Rollback(context.Background())
+		}
+		conn.Release()
+	})
+	return pid, func() {
+		t.Helper()
+		if released {
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("release visibility gate: %v", err)
+		}
+		released = true
+	}
+}
+
+func waitForProfileVisibilityGate(t *testing.T, ctx context.Context, w world, gatePID int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked bool
+		err := w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity a
+			WHERE a.datname = current_database()
+			  AND $1::integer = ANY(pg_blocking_pids(a.pid))
+		)`, gatePID).Scan(&blocked)
+		if err != nil {
+			t.Fatalf("inspect visibility gate: %v", err)
+		}
+		if blocked {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("profile publish did not reach the visibility gate")
+}
+
+func waitForProfileDatabaseWaiters(t *testing.T, ctx context.Context, w world, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var blocked int
+		err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&blocked)
+		if err != nil {
+			t.Fatalf("inspect profile database waiters: %v", err)
+		}
+		if blocked >= want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func makeProfilesVisibleOnlyByDM(t *testing.T, ctx context.Context, w world) {
+	t.Helper()
+	workspace, _ := w.workspaceWithChannel(t, ctx)
+	if _, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB); err != nil {
+		t.Fatalf("create profile visibility DM: %v", err)
+	}
+	for _, participant := range []ParticipantRef{w.humanA, w.humanB} {
+		if err := w.store.RemoveWorkspaceMember(ctx, workspace.WorkspaceID, participant); err != nil {
+			t.Fatalf("leave setup workspace as %s: %v", participant.Key(), err)
+		}
+	}
+}
+
+func receiveProfileEvent(t *testing.T, subscriber *subscriber) memberWire {
+	t.Helper()
+	select {
+	case raw := <-subscriber.send:
+		var frame struct {
+			Type  string `json:"type"`
+			Event Event  `json:"event"`
+		}
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			t.Fatalf("decode profile event: %v", err)
+		}
+		if frame.Type != "event" || frame.Event.Type != EventProfileUpdated || frame.Event.Member == nil {
+			t.Fatalf("unexpected profile frame: %s", raw)
+		}
+		return *frame.Event.Member
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for profile event")
+		return memberWire{}
+	}
+}
 
 func TestProfileIsSelfDeclaredAndReachesEveryMemberList(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -73,6 +297,489 @@ func TestProfileRejectsUnusableNamesAndTaglines(t *testing.T) {
 	}
 	if profile.DisplayName != "Yohaku" {
 		t.Fatalf("display name after rejected updates = %q", profile.DisplayName)
+	}
+}
+
+func TestSetProfileRollsBackDisplayNameWhenTheProfileWriteFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION reject_test_profile_write() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.tagline = 'reject-after-name' THEN
+				RAISE EXCEPTION 'injected participant_profiles failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER reject_test_profile_write
+		BEFORE INSERT OR UPDATE ON participant_profiles
+		FOR EACH ROW EXECUTE FUNCTION reject_test_profile_write()`); err != nil {
+		t.Fatalf("install profile failure trigger: %v", err)
+	}
+
+	if _, err := w.store.SetProfile(ctx, w.humanA, "Changed", "reject-after-name", "", ""); err == nil {
+		t.Fatal("SetProfile succeeded despite the injected profile write failure")
+	}
+	profile, err := w.store.MemberProfileFor(ctx, w.humanA)
+	if err != nil {
+		t.Fatalf("read profile after rollback: %v", err)
+	}
+	if profile.DisplayName != "Yohaku" || profile.Tagline != "" {
+		t.Fatalf("profile after failed replacement = %#v, want the original profile", profile)
+	}
+}
+
+func TestSetProfileSerializesConcurrentWholeProfileReplacements(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	const gateKey int32 = 22901
+
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_first_test_profile() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.tagline = 'tag-a' THEN
+				PERFORM pg_advisory_xact_lock(22901);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_first_test_profile
+		BEFORE INSERT OR UPDATE ON participant_profiles
+		FOR EACH ROW EXECUTE FUNCTION gate_first_test_profile()`); err != nil {
+		t.Fatalf("install profile gate trigger: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	first := make(chan profileResult, 1)
+	go func() {
+		profile, err := w.store.SetProfile(ctx, w.humanA, "Name A", "tag-a", "", "")
+		first <- profileResult{profile: profile, err: err}
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	second := make(chan profileResult, 1)
+	go func() {
+		profile, err := w.store.SetProfile(ctx, w.humanA, "Name B", "tag-b", "", "")
+		second <- profileResult{profile: profile, err: err}
+	}()
+
+	// Wait until B either completes (the old split-autocommit behavior) or is
+	// blocked behind A's participant row lock (the serialized transaction).
+	var secondBeforeRelease *profileResult
+	deadline := time.Now().Add(5 * time.Second)
+	for secondBeforeRelease == nil && time.Now().Before(deadline) {
+		select {
+		case result := <-second:
+			secondBeforeRelease = &result
+		default:
+			var waitingOnRow bool
+			err := w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_locks l
+				JOIN pg_stat_activity a ON a.pid = l.pid
+				WHERE a.datname = current_database() AND NOT l.granted
+				  AND l.locktype IN ('transactionid', 'tuple')
+			)`).Scan(&waitingOnRow)
+			if err != nil {
+				t.Fatalf("inspect participant row waiter: %v", err)
+			}
+			if waitingOnRow {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if secondBeforeRelease == nil {
+			var waitingOnRow bool
+			_ = w.store.pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+				WHERE a.datname = current_database() AND NOT l.granted
+				  AND l.locktype IN ('transactionid', 'tuple')
+			)`).Scan(&waitingOnRow)
+			if waitingOnRow {
+				break
+			}
+		}
+	}
+	release()
+
+	firstResult := <-first
+	secondResult := profileResult{}
+	if secondBeforeRelease != nil {
+		secondResult = *secondBeforeRelease
+	} else {
+		secondResult = <-second
+	}
+	if firstResult.err != nil || secondResult.err != nil {
+		t.Fatalf("concurrent replacements: first error %v, second error %v", firstResult.err, secondResult.err)
+	}
+	if firstResult.profile.DisplayName != "Name A" || firstResult.profile.Tagline != "tag-a" {
+		t.Fatalf("first response mixed concurrent replacements: %#v", firstResult.profile)
+	}
+	if secondResult.profile.DisplayName != "Name B" || secondResult.profile.Tagline != "tag-b" {
+		t.Fatalf("second response mixed concurrent replacements: %#v", secondResult.profile)
+	}
+	stored, err := w.store.MemberProfileFor(ctx, w.humanA)
+	if err != nil {
+		t.Fatalf("read final profile: %v", err)
+	}
+	if stored.DisplayName != "Name B" || stored.Tagline != "tag-b" {
+		t.Fatalf("final profile = %#v, want the later whole replacement", stored)
+	}
+}
+
+func TestProfileImageAndMessageBindingChooseOneWinner(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+		t.Fatalf("admit Human: %v", err)
+	}
+	attachmentID := NewAttachmentID()
+	if _, err := w.store.CreateAttachment(ctx, attachmentID, w.humanA, "face.png", "image/png", 64); err != nil {
+		t.Fatalf("create test attachment: %v", err)
+	}
+	const gateKey int32 = 22902
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_test_profile_name() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.display_name = 'Racing name' THEN
+				PERFORM pg_advisory_xact_lock(22902);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_test_profile_name
+		BEFORE UPDATE ON humans
+		FOR EACH ROW EXECUTE FUNCTION gate_test_profile_name()`); err != nil {
+		t.Fatalf("install name gate trigger: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	profileDone := make(chan profileResult, 1)
+	go func() {
+		profile, err := w.store.SetProfile(ctx, w.humanA, "Racing name", "", attachmentID, "")
+		profileDone <- profileResult{profile: profile, err: err}
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	if _, created, err := w.store.AppendMessage(ctx, AppendInput{
+		PlaceID: DefaultGeneralChannelID, Author: w.humanA, Content: "the same image",
+		ClientNonce: "profile-image-race", AttachmentIDs: []string{attachmentID},
+	}); err != nil || !created {
+		t.Fatalf("bind the competing message attachment: created=%v error=%v", created, err)
+	}
+	release()
+	result := <-profileDone
+	if !errors.Is(result.err, ErrInvalidProfileImage) {
+		t.Fatalf("losing profile replacement error = %v, want ErrInvalidProfileImage", result.err)
+	}
+	profile, err := w.store.MemberProfileFor(ctx, w.humanA)
+	if err != nil {
+		t.Fatalf("read profile after attachment race: %v", err)
+	}
+	if profile.DisplayName != "Yohaku" || profile.AvatarAttachmentID != "" {
+		t.Fatalf("losing profile replacement partially committed: %#v", profile)
+	}
+}
+
+func TestCommittedProfileImageFencesAWaitingMessageBinding(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	if err := w.store.EnsureDefaultWorkspaceMembership(ctx, w.humanA); err != nil {
+		t.Fatalf("admit Human: %v", err)
+	}
+	attachmentID := NewAttachmentID()
+	if _, err := w.store.CreateAttachment(ctx, attachmentID, w.humanA, "face.png", "image/png", 64); err != nil {
+		t.Fatalf("create test attachment: %v", err)
+	}
+	const gateKey int32 = 22903
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_test_profile_row() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.tagline = 'profile-wins' THEN
+				PERFORM pg_advisory_xact_lock(22903);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_test_profile_row
+		BEFORE INSERT OR UPDATE ON participant_profiles
+		FOR EACH ROW EXECUTE FUNCTION gate_test_profile_row()`); err != nil {
+		t.Fatalf("install profile row gate trigger: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	profileDone := make(chan profileResult, 1)
+	go func() {
+		profile, err := w.store.SetProfile(ctx, w.humanA, "Profile winner", "profile-wins", attachmentID, "")
+		profileDone <- profileResult{profile: profile, err: err}
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	type messageResult struct {
+		created bool
+		err     error
+	}
+	messageDone := make(chan messageResult, 1)
+	go func() {
+		_, created, err := w.store.AppendMessage(ctx, AppendInput{
+			PlaceID: DefaultGeneralChannelID, Author: w.humanA, Content: "the same image",
+			ClientNonce: "profile-image-loses", AttachmentIDs: []string{attachmentID},
+		})
+		messageDone <- messageResult{created: created, err: err}
+	}()
+
+	select {
+	case result := <-messageDone:
+		t.Fatalf("message binding completed before the profile transaction: created=%v error=%v", result.created, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	profileResult := <-profileDone
+	if profileResult.err != nil || profileResult.profile.AvatarAttachmentID != attachmentID {
+		t.Fatalf("winning profile replacement = %#v error %v", profileResult.profile, profileResult.err)
+	}
+	receivedMessage := <-messageDone
+	if !errors.Is(receivedMessage.err, ErrAttachmentNotFound) || receivedMessage.created {
+		t.Fatalf("waiting message binding: created=%v error=%v, want ErrAttachmentNotFound", receivedMessage.created, receivedMessage.err)
+	}
+}
+
+func TestHumanRenamePublishesItsDependentAgentProjection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	for _, participant := range []ParticipantRef{w.humanA, w.humanB} {
+		if err := w.store.EnsureDefaultWorkspaceMembership(ctx, participant); err != nil {
+			t.Fatalf("admit %s: %v", participant.Key(), err)
+		}
+	}
+	hub := NewHub(w.store)
+	subscriber := hub.subscribe(w.humanB)
+	defer hub.unsubscribe(subscriber)
+	server := NewServer(w.store, stubSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	server.Hub = hub
+
+	request := httptest.NewRequest(http.MethodPut, "/messaging/profile", strings.NewReader(`{
+		"display_name":"New owner","tagline":"design",
+		"avatar_attachment_id":"","banner_attachment_id":""
+	}`)).WithContext(ctx)
+	request.Header.Set("Origin", testOrigin)
+	request.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: w.humanA.ID})
+	response := httptest.NewRecorder()
+	server.serveSetProfile(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("rename Human: status %d body %s", response.Code, response.Body.String())
+	}
+
+	seen := map[string]string{}
+	for len(seen) < 2 {
+		select {
+		case raw := <-subscriber.send:
+			var frame struct {
+				Type  string `json:"type"`
+				Event Event  `json:"event"`
+			}
+			if err := json.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("decode profile event: %v", err)
+			}
+			if frame.Type != "event" || frame.Event.Type != EventProfileUpdated || frame.Event.Member == nil {
+				t.Fatalf("unexpected profile frame: %s", raw)
+			}
+			participant, err := frame.Event.Member.Participant.ref()
+			if err != nil {
+				t.Fatalf("profile event participant: %v", err)
+			}
+			seen[participant.Key()] = frame.Event.Member.DisplayName
+		case <-time.After(time.Second):
+			t.Fatalf("profile events = %#v, want Human and dependent PersonalityAgent", seen)
+		}
+	}
+	if seen[w.humanA.Key()] != "New owner" || seen[w.agent.Key()] != "Kuro（New owner）" {
+		t.Fatalf("profile events = %#v", seen)
+	}
+}
+
+func TestConcurrentDisjointLocalProfilePatchesPreserveBothFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	nameServer := NewServer(w.store, nil)
+	taglineServer := NewServer(w.store, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	const gateKey int32 = 22904
+	if _, err := w.store.pool.Exec(ctx, `
+		CREATE FUNCTION gate_local_profile_name() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.display_name = 'Agent Name' THEN
+				PERFORM pg_advisory_xact_lock(22904);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER gate_local_profile_name
+		BEFORE UPDATE ON agents
+		FOR EACH ROW EXECUTE FUNCTION gate_local_profile_name()`); err != nil {
+		t.Fatalf("install local profile gate trigger: %v", err)
+	}
+	release := holdProfileTestGate(t, ctx, w, gateKey)
+
+	nameResult := make(chan profileEndpointResult, 1)
+	go func() {
+		nameResult <- invokeLocalProfile(ctx, nameServer, authorization, `{"display_name":"Agent Name"}`)
+	}()
+	waitForProfileTestGate(t, ctx, w, gateKey)
+
+	taglineResult := make(chan profileEndpointResult, 1)
+	go func() {
+		taglineResult <- invokeLocalProfile(ctx, taglineServer, authorization, `{"tagline":"Agent Tagline"}`)
+	}()
+	// The requests deliberately use different Server instances. Both may enter
+	// PostgreSQL, but the second must wait on the canonical agent row before it
+	// reads any field it intends to preserve.
+	_ = waitForProfileDatabaseWaiters(t, ctx, w, 2, 250*time.Millisecond)
+	release()
+
+	for name, result := range map[string]profileEndpointResult{
+		"name": <-nameResult, "tagline": <-taglineResult,
+	} {
+		if result.status != http.StatusOK || result.err != nil {
+			t.Fatalf("%s patch: status=%d body=%s error=%v", name, result.status, result.body, result.err)
+		}
+	}
+	stored, err := w.store.MemberProfileFor(ctx, w.agent)
+	if err != nil {
+		t.Fatalf("read patched agent profile: %v", err)
+	}
+	if stored.DisplayName != "Agent Name" || stored.Tagline != "Agent Tagline" {
+		t.Fatalf("disjoint patches lost a field: %#v", stored)
+	}
+}
+
+func TestRESTProfileEventsFollowCommittedReplacementOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	makeProfilesVisibleOnlyByDM(t, ctx, w)
+	hub := NewHub(w.store)
+	subscriber := hub.subscribe(w.humanB)
+	defer hub.unsubscribe(subscriber)
+	server := NewServer(w.store, stubSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	server.Hub = hub
+	gatePID, release := holdProfileVisibilityGate(t, ctx, w)
+
+	firstResult := make(chan profileEndpointResult, 1)
+	go func() {
+		firstResult <- invokeRESTProfile(ctx, server, w.humanA.ID, "Name A", "tag-a")
+	}()
+	waitForProfileVisibilityGate(t, ctx, w, gatePID)
+	// A is already inside visibleTo. This lets B bypass that database gate only,
+	// making a commit-B/publish-B/publish-A inversion deterministic without a
+	// production test hook.
+	subscriber.markVisible("participant|"+w.humanA.Key(), true)
+
+	secondResult := make(chan profileEndpointResult, 1)
+	go func() {
+		secondResult <- invokeRESTProfile(ctx, server, w.humanA.ID, "Name B", "tag-b")
+	}()
+	var secondBeforeRelease *profileEndpointResult
+	select {
+	case result := <-secondResult:
+		// The unfixed handler commits and publishes B while A is still gated.
+		secondBeforeRelease = &result
+	case <-time.After(250 * time.Millisecond):
+	}
+	release()
+
+	first := <-firstResult
+	var second profileEndpointResult
+	if secondBeforeRelease != nil {
+		second = *secondBeforeRelease
+	} else {
+		second = <-secondResult
+	}
+	for name, result := range map[string]profileEndpointResult{"first": first, "second": second} {
+		if result.status != http.StatusOK || result.err != nil {
+			t.Fatalf("%s replacement: status=%d body=%s error=%v", name, result.status, result.body, result.err)
+		}
+	}
+	events := []memberWire{receiveProfileEvent(t, subscriber), receiveProfileEvent(t, subscriber)}
+	if events[0].DisplayName != "Name A" || events[1].DisplayName != "Name B" {
+		t.Fatalf("profile event order = %q then %q, want committed A then B", events[0].DisplayName, events[1].DisplayName)
+	}
+}
+
+func TestHumanRenameAndOwnedAgentEditEndWithAuthoritativeAgentEvent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	makeProfilesVisibleOnlyByDM(t, ctx, w)
+	hub := NewHub(w.store)
+	subscriber := hub.subscribe(w.humanB)
+	defer hub.unsubscribe(subscriber)
+	server := NewServer(w.store, stubSessions{})
+	server.AllowedOrigins = []string{testOrigin}
+	server.Hub = hub
+	gatePID, release := holdProfileVisibilityGate(t, ctx, w)
+
+	humanResult := make(chan profileEndpointResult, 1)
+	go func() {
+		humanResult <- invokeRESTProfile(ctx, server, w.humanA.ID, "New owner", "owner")
+	}()
+	waitForProfileVisibilityGate(t, ctx, w, gatePID)
+	subscriber.markVisible("participant|"+w.agent.Key(), true)
+
+	agentResult := make(chan profileEndpointResult, 1)
+	go func() {
+		authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+		agentResult <- invokeLocalProfile(ctx, server, authorization, `{"display_name":"New Agent"}`)
+	}()
+	var agentBeforeRelease *profileEndpointResult
+	select {
+	case result := <-agentResult:
+		// Without the shared boundary, the agent commits while the owner event is
+		// gated and the owner's older dependent snapshot is published last.
+		agentBeforeRelease = &result
+	case <-time.After(250 * time.Millisecond):
+	}
+	release()
+
+	human := <-humanResult
+	var agent profileEndpointResult
+	if agentBeforeRelease != nil {
+		agent = *agentBeforeRelease
+	} else {
+		agent = <-agentResult
+	}
+	for name, result := range map[string]profileEndpointResult{"human": human, "agent": agent} {
+		if result.status != http.StatusOK || result.err != nil {
+			t.Fatalf("%s update: status=%d body=%s error=%v", name, result.status, result.body, result.err)
+		}
+	}
+	var agentEvents []string
+	for range 3 {
+		event := receiveProfileEvent(t, subscriber)
+		participant, err := event.Participant.ref()
+		if err != nil {
+			t.Fatalf("profile event participant: %v", err)
+		}
+		if participant == w.agent {
+			agentEvents = append(agentEvents, event.DisplayName)
+		}
+	}
+	if len(agentEvents) != 2 || agentEvents[len(agentEvents)-1] != "New Agent（New owner）" {
+		t.Fatalf("agent profile events = %#v, final event must be authoritative", agentEvents)
 	}
 }
 

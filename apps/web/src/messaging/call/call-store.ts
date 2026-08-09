@@ -31,6 +31,12 @@ const SPEAKING_TTL_MS = 1_200;
 
 let transportFactory: CallTransportFactory = createLiveKitTransport;
 let transport: CallTransport | null = null;
+let joinGeneration = 0;
+let snapshotGeneration = 0;
+let reconciliation: {
+  generation: number;
+  liveEvents: CallState[];
+} | null = null;
 
 /** テストと開発ハーネスはメディア層を差し替えられる。 */
 export function installCallTransportFactory(
@@ -57,6 +63,8 @@ interface CallStoreState {
   failure: "unavailable" | "failed" | null;
   local: CallLocalState;
   tracks: CallMediaTrack[];
+  /** Browserのautoplay制約により、remote audioへ本人gestureが必要。 */
+  audioPlaybackBlocked: boolean;
   speakingUntil: Record<ParticipantKey, number>;
   /** 拒否・応答済みで、もう鳴らさない通話（place単位）。 */
   dismissedPlaces: Record<PlaceKey, boolean>;
@@ -69,6 +77,7 @@ interface CallStoreState {
   toggleMicrophone(): void;
   toggleCamera(): void;
   toggleScreenShare(): void;
+  resumeAudio(): Promise<void>;
   dismissIncoming(key: PlaceKey): void;
   /** セッションが変わったら通話も終える。 */
   reset(): void;
@@ -81,31 +90,45 @@ const IDLE_LOCAL: CallLocalState = {
 };
 
 export const useCall = create<CallStoreState>((set, get) => {
-  const events = {
-    onTracks(tracks: CallMediaTrack[]) {
-      set({ tracks });
-    },
-    onSpeaking(participants: ParticipantKey[]) {
-      const until = Date.now() + SPEAKING_TTL_MS;
-      set((state) => {
-        const speakingUntil = { ...state.speakingUntil };
-        for (const key of participants) speakingUntil[key] = until;
-        return { speakingUntil };
-      });
-    },
-    onParticipants(_participants: ParticipantKey[]) {
-      // 在室者の正本はサーバーのcall_state。ここでは受け取るだけにして、
-      // 二つの真実を画面に並べない。
-    },
-    onDisconnected() {
-      transport = null;
-      set({
-        activePlaceKey: null,
-        phase: "idle",
-        tracks: [],
-        local: IDLE_LOCAL,
-      });
-    },
+  const eventsFor = (
+    generation: number,
+    ownedTransport: () => CallTransport | null,
+  ) => {
+    const ownsCurrentCall = () =>
+      joinGeneration === generation && transport === ownedTransport();
+    return {
+      onTracks(tracks: CallMediaTrack[]) {
+        if (ownsCurrentCall()) set({ tracks });
+      },
+      onSpeaking(participants: ParticipantKey[]) {
+        if (!ownsCurrentCall()) return;
+        const until = Date.now() + SPEAKING_TTL_MS;
+        set((state) => {
+          const speakingUntil = { ...state.speakingUntil };
+          for (const key of participants) speakingUntil[key] = until;
+          return { speakingUntil };
+        });
+      },
+      onParticipants(_participants: ParticipantKey[]) {
+        // 在室者の正本はサーバーのcall_state。ここでは受け取るだけにして、
+        // 二つの真実を画面に並べない。
+      },
+      onAudioPlaybackBlocked(blocked: boolean) {
+        if (ownsCurrentCall()) set({ audioPlaybackBlocked: blocked });
+      },
+      onDisconnected() {
+        if (!ownsCurrentCall()) return;
+        joinGeneration += 1;
+        transport = null;
+        set({
+          activePlaceKey: null,
+          phase: "idle",
+          tracks: [],
+          audioPlaybackBlocked: false,
+          local: IDLE_LOCAL,
+        });
+      },
+    };
   };
 
   return {
@@ -115,38 +138,57 @@ export const useCall = create<CallStoreState>((set, get) => {
     failure: null,
     local: IDLE_LOCAL,
     tracks: [],
+    audioPlaybackBlocked: false,
     speakingUntil: {},
     dismissedPlaces: {},
 
     async hydrate() {
+      const generation = ++snapshotGeneration;
+      const pending = { generation, liveEvents: [] };
+      reconciliation = pending;
       try {
         const states = await fetchCallStates();
+        if (snapshotGeneration !== generation || reconciliation !== pending) {
+          return;
+        }
         set((current) => {
-          const stateByPlace = { ...current.stateByPlace };
+          let stateByPlace: Record<PlaceKey, CallState> = {};
+          let dismissedPlaces: Record<PlaceKey, boolean> = {};
           for (const state of states) {
-            stateByPlace[placeKey(state.place)] = state;
+            const key = placeKey(state.place);
+            if (
+              current.dismissedPlaces[key] &&
+              current.stateByPlace[key]?.startedAt === state.startedAt
+            ) {
+              dismissedPlaces[key] = true;
+            }
+            ({ stateByPlace, dismissedPlaces } = reduceCallState(
+              stateByPlace,
+              dismissedPlaces,
+              state,
+            ));
           }
-          return { stateByPlace };
+          for (const event of pending.liveEvents) {
+            ({ stateByPlace, dismissedPlaces } = reduceCallState(
+              stateByPlace,
+              dismissedPlaces,
+              event,
+            ));
+          }
+          return { stateByPlace, dismissedPlaces };
         });
       } catch {
         // 通話が使えないことはメッセージングの失敗ではない。
+      } finally {
+        if (reconciliation === pending) reconciliation = null;
       }
     },
 
     applyCallState(state) {
-      const key = placeKey(state.place);
-      set((current) => {
-        const stateByPlace = { ...current.stateByPlace };
-        if (!state.active && state.participants.length === 0) {
-          delete stateByPlace[key];
-        } else {
-          stateByPlace[key] = state;
-        }
-        // 通話が終わったplaceの「拒否済み」は忘れる。次に呼ばれたら鳴る。
-        const dismissedPlaces = { ...current.dismissedPlaces };
-        if (!stateByPlace[key]) delete dismissedPlaces[key];
-        return { stateByPlace, dismissedPlaces };
-      });
+      reconciliation?.liveEvents.push(state);
+      set((current) =>
+        reduceCallState(current.stateByPlace, current.dismissedPlaces, state),
+      );
     },
 
     async join(key) {
@@ -157,35 +199,54 @@ export const useCall = create<CallStoreState>((set, get) => {
       }
       const place = parsePlaceKeyStrict(key);
       if (!place) return;
+      const generation = ++joinGeneration;
       set({
         activePlaceKey: key,
         phase: "connecting",
         failure: null,
         local: IDLE_LOCAL,
         tracks: [],
+        audioPlaybackBlocked: false,
         dismissedPlaces: { ...get().dismissedPlaces, [key]: true },
       });
+      let created: CallTransport | null = null;
       try {
         const ticket = await fetchCallTicket(place);
-        const created = transportFactory(events);
+        if (joinGeneration !== generation) return;
+        const events = eventsFor(generation, () => created);
+        created = transportFactory(events);
+        if (joinGeneration !== generation) {
+          await disconnectQuietly(created);
+          return;
+        }
         transport = created;
         await created.connect(ticket);
+        if (joinGeneration !== generation || transport !== created) {
+          await disconnectQuietly(created);
+          return;
+        }
         set({ phase: "connected" });
       } catch (error) {
-        transport = null;
-        set({
-          activePlaceKey: null,
-          phase: "failed",
-          failure:
-            error instanceof CallAPIError && error.unavailable
-              ? "unavailable"
-              : "failed",
-          tracks: [],
-        });
+        if (joinGeneration === generation) {
+          joinGeneration += 1;
+          if (transport === created) transport = null;
+          set({
+            activePlaceKey: null,
+            phase: "failed",
+            failure:
+              error instanceof CallAPIError && error.unavailable
+                ? "unavailable"
+                : "failed",
+            tracks: [],
+            audioPlaybackBlocked: false,
+          });
+        }
+        await disconnectQuietly(created);
       }
     },
 
     async leave() {
+      joinGeneration += 1;
       const current = transport;
       transport = null;
       set({
@@ -193,6 +254,7 @@ export const useCall = create<CallStoreState>((set, get) => {
         phase: "idle",
         failure: null,
         tracks: [],
+        audioPlaybackBlocked: false,
         local: IDLE_LOCAL,
       });
       try {
@@ -228,6 +290,16 @@ export const useCall = create<CallStoreState>((set, get) => {
       });
     },
 
+    async resumeAudio() {
+      const current = transport;
+      const generation = joinGeneration;
+      if (!current) return;
+      await current.resumeAudio();
+      if (joinGeneration === generation && transport === current) {
+        set({ audioPlaybackBlocked: false });
+      }
+    },
+
     dismissIncoming(key) {
       set((state) => ({
         dismissedPlaces: { ...state.dismissedPlaces, [key]: true },
@@ -235,6 +307,9 @@ export const useCall = create<CallStoreState>((set, get) => {
     },
 
     reset() {
+      joinGeneration += 1;
+      snapshotGeneration += 1;
+      reconciliation = null;
       const current = transport;
       transport = null;
       void current?.disconnect().catch(() => undefined);
@@ -245,12 +320,44 @@ export const useCall = create<CallStoreState>((set, get) => {
         failure: null,
         local: IDLE_LOCAL,
         tracks: [],
+        audioPlaybackBlocked: false,
         speakingUntil: {},
         dismissedPlaces: {},
       });
     },
   };
 });
+
+function reduceCallState(
+  currentStates: Record<PlaceKey, CallState>,
+  currentDismissed: Record<PlaceKey, boolean>,
+  state: CallState,
+): Pick<CallStoreState, "stateByPlace" | "dismissedPlaces"> {
+  const key = placeKey(state.place);
+  const stateByPlace = { ...currentStates };
+  const dismissedPlaces = { ...currentDismissed };
+  const previous = stateByPlace[key];
+  if (!state.active && state.participants.length === 0) {
+    delete stateByPlace[key];
+    delete dismissedPlaces[key];
+  } else {
+    stateByPlace[key] = state;
+    // 終了eventを取り逃して同じplaceで次の通話が始まっていても、前回の拒否を
+    // 引き継がない。startedAtは一つの通話を識別するserver-owned generation。
+    if (previous && previous.startedAt !== state.startedAt) {
+      delete dismissedPlaces[key];
+    }
+  }
+  return { stateByPlace, dismissedPlaces };
+}
+
+async function disconnectQuietly(current: CallTransport | null): Promise<void> {
+  try {
+    await current?.disconnect();
+  } catch {
+    // 部分接続を畳むbest effort。storeの所有権は既に外している。
+  }
+}
 
 function parsePlaceKeyStrict(key: PlaceKey): Place | null {
   const separator = key.indexOf(":");

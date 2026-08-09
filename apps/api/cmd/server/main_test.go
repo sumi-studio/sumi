@@ -24,6 +24,7 @@ import (
 	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/gorilla/websocket"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 )
 
 var testTokenSecret = []byte("test-secret-32bytes-long-string!!")
@@ -923,6 +924,76 @@ func setCompleteLocalControlEnv(t *testing.T) {
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
+}
+
+func TestRegisterMessagingCallRoutesSeparatesPublicStateFromLocalControlCapability(t *testing.T) {
+	localMux := func(t *testing.T, server *messaging.Server) *http.ServeMux {
+		t.Helper()
+		store, err := agentevents.OpenCommandStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		gateway, err := agentevents.OpenDurableGateway(t.TempDir(), store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		control, err := agentevents.NewLocalControlServer(gateway, testTokenSecret, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := server.RegisterLocalControlRoutes(control); err != nil {
+			t.Fatal(err)
+		}
+		mux := http.NewServeMux()
+		if err := control.RegisterRoutes(mux); err != nil {
+			t.Fatal(err)
+		}
+		return mux
+	}
+
+	for _, test := range []struct {
+		name              string
+		livekit           messaging.LiveKitConfig
+		wantLocalCallPath bool
+	}{
+		{name: "unconfigured"},
+		{
+			name: "configured",
+			livekit: messaging.LiveKitConfig{
+				URL:       "wss://livekit.example",
+				APIKey:    "key",
+				APISecret: "secret",
+			},
+			wantLocalCallPath: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := messaging.NewServer(nil, nil)
+			publicMux := http.NewServeMux()
+			configured := registerMessagingCallRoutes(publicMux, server, test.livekit)
+			if configured != test.wantLocalCallPath {
+				t.Fatalf("configured = %v, want %v", configured, test.wantLocalCallPath)
+			}
+
+			_, publicPattern := publicMux.Handler(
+				httptest.NewRequest(http.MethodGet, "/messaging/calls", nil),
+			)
+			if publicPattern != "GET /messaging/calls" {
+				t.Fatalf("public call-state route pattern = %q, want mounted GET route", publicPattern)
+			}
+
+			_, localPattern := localMux(t, server).Handler(
+				httptest.NewRequest(http.MethodPost, messaging.LocalCallStatePath, nil),
+			)
+			if test.wantLocalCallPath && localPattern != "POST "+messaging.LocalCallStatePath {
+				t.Fatalf("configured local-control call-state route pattern = %q, want mounted POST route", localPattern)
+			}
+			if !test.wantLocalCallPath && localPattern != "" {
+				t.Fatalf("unconfigured local-control call-state route pattern = %q, want absent", localPattern)
+			}
+		})
+	}
 }
 
 func trustedSocketParent(t *testing.T) string {

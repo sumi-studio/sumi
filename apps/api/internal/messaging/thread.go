@@ -19,6 +19,42 @@ const MaxThreadNameChars = 100
 // summary. The full text stays in the place; the list only needs a glance.
 const ThreadPreviewChars = 120
 
+// A place_members row records that someone joined a thread, but it does not
+// grant access: the parent workspace's active membership remains the authority
+// boundary. Keep that join in one fragment so every projection agrees.
+const activeThreadWorkspaceMemberJoinSQL = `
+		 JOIN workspace_members twm
+		   ON twm.workspace_id = t.workspace_id
+		  AND twm.member_kind = pm.member_kind AND twm.member_id = pm.member_id
+		  AND twm.left_at IS NULL`
+
+const activeJoinedThreadMemberExistsSQL = `EXISTS (
+		 SELECT 1 FROM place_members pm` + activeThreadWorkspaceMemberJoinSQL + `
+		 WHERE pm.place_id = t.place_id AND pm.left_at IS NULL
+		   AND pm.member_kind = $1 AND pm.member_id = $2)`
+
+// participantVisiblePlacesCTE is the shared global-list visibility basis for
+// unread, search, and reply-later. Channels inherit active workspace
+// membership; DMs inherit active place membership; threads require both an
+// active joined row and active membership in their parent workspace.
+const participantVisiblePlacesCTE = `WITH my_places AS (
+		 SELECT p.* FROM places p
+		 JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
+		  AND wm.member_kind = $1 AND wm.member_id = $2 AND wm.left_at IS NULL
+		 WHERE p.kind = 'channel'
+		 UNION
+		 SELECT p.* FROM places p
+		 JOIN place_members pm ON pm.place_id = p.place_id
+		  AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL
+		 WHERE p.kind IN ('dm', 'group_dm')
+		 UNION
+		 SELECT t.* FROM places t
+		 JOIN place_members pm ON pm.place_id = t.place_id
+		  AND pm.member_kind = $1 AND pm.member_id = $2 AND pm.left_at IS NULL` +
+	activeThreadWorkspaceMemberJoinSQL + `
+		 WHERE t.kind = 'thread'
+		)`
+
 var (
 	// ErrNotThreadable is returned when a thread is asked for somewhere a side
 	// conversation has no parent to belong to (v0: channels only).
@@ -167,10 +203,7 @@ func (s *Store) ThreadsFor(ctx context.Context, viewer ParticipantRef) ([]Thread
 	if err := viewer.Validate(); err != nil {
 		return nil, err
 	}
-	return s.threadsWhere(ctx,
-		`EXISTS (SELECT 1 FROM place_members pm
-		          WHERE pm.place_id = t.place_id AND pm.left_at IS NULL
-		            AND pm.member_kind = $1 AND pm.member_id = $2)`,
+	return s.threadsWhere(ctx, activeJoinedThreadMemberExistsSQL,
 		viewer.Kind, viewer.ID)
 }
 
@@ -264,9 +297,12 @@ func (s *Store) threadsWhere(ctx context.Context, condition string, args ...any)
 // threadParticipants loads the joined participants of many threads at once.
 func (s *Store) threadParticipants(ctx context.Context, placeIDs []string) (map[string][]ParticipantRef, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT place_id, member_kind, member_id FROM place_members
-		 WHERE place_id = ANY($1) AND left_at IS NULL
-		 ORDER BY place_id, place_member_id`, placeIDs)
+		`SELECT pm.place_id, pm.member_kind, pm.member_id
+		 FROM place_members pm
+		 JOIN places t ON t.place_id = pm.place_id AND t.kind = 'thread'`+
+			activeThreadWorkspaceMemberJoinSQL+`
+		 WHERE pm.place_id = ANY($1) AND pm.left_at IS NULL
+		 ORDER BY pm.place_id, pm.place_member_id`, placeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("query thread participants: %w", err)
 	}
@@ -291,8 +327,12 @@ func (s *Store) threadParticipants(ctx context.Context, placeIDs []string) (map[
 // a side conversation is what asks to be called about it.
 func (s *Store) threadMembers(ctx context.Context, q querier, placeID string) ([]ParticipantRef, error) {
 	rows, err := q.Query(ctx,
-		`SELECT member_kind, member_id FROM place_members
-		 WHERE place_id = $1 AND left_at IS NULL ORDER BY place_member_id`, placeID)
+		`SELECT pm.member_kind, pm.member_id
+		 FROM place_members pm
+		 JOIN places t ON t.place_id = pm.place_id AND t.kind = 'thread'`+
+			activeThreadWorkspaceMemberJoinSQL+`
+		 WHERE pm.place_id = $1 AND pm.left_at IS NULL
+		 ORDER BY pm.place_member_id`, placeID)
 	if err != nil {
 		return nil, fmt.Errorf("query thread members: %w", err)
 	}

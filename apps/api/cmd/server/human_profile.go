@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,13 +18,17 @@ const maxHumanProfileRequestBytes = 4 * 1024
 // comes only from the signed browser session; clients cannot nominate another
 // Human whose profile should be changed.
 type humanProfileServer struct {
-	store          *koseki.Store
+	updater        humanDisplayNameUpdater
 	sessions       agentevents.UserSessionAuthorizer
 	allowedOrigins []string
 }
 
-func newHumanProfileServer(store *koseki.Store, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
-	return &humanProfileServer{store: store, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
+type humanDisplayNameUpdater interface {
+	UpdateHumanDisplayName(context.Context, string, string) (string, error)
+}
+
+func newHumanProfileServer(updater humanDisplayNameUpdater, sessions agentevents.UserSessionAuthorizer, allowedOrigins []string) *humanProfileServer {
+	return &humanProfileServer{updater: updater, sessions: sessions, allowedOrigins: append([]string(nil), allowedOrigins...)}
 }
 
 func (s *humanProfileServer) RegisterRoutes(mux *http.ServeMux) {
@@ -45,7 +50,7 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	cookies := r.CookiesNamed(agentevents.BrowserSessionCookie)
-	if len(cookies) != 1 || s.sessions == nil || s.store == nil {
+	if len(cookies) != 1 || s.sessions == nil || s.updater == nil {
 		writeHumanProfileError(w, http.StatusUnauthorized, "authentication_required")
 		return
 	}
@@ -72,7 +77,7 @@ func (s *humanProfileServer) serveUpdate(w http.ResponseWriter, r *http.Request)
 	err = s.sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
 		var updateErr error
-		displayName, updateErr = s.store.UpdateHumanDisplayName(r.Context(), claims.UserID, request.DisplayName)
+		displayName, updateErr = s.updater.UpdateHumanDisplayName(r.Context(), claims.UserID, request.DisplayName)
 		return updateErr
 	})
 	if !called {

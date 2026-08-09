@@ -105,10 +105,14 @@ func validateRoleColor(color string) error {
 // A participant who is not an active member of the workspace has no
 // permissions, whatever roles happen to point at them.
 func (s *Store) PermissionsFor(ctx context.Context, workspaceID string, participant ParticipantRef) (PermissionSet, error) {
+	return s.permissionsFor(ctx, s.pool, workspaceID, participant)
+}
+
+func (s *Store) permissionsFor(ctx context.Context, q querier, workspaceID string, participant ParticipantRef) (PermissionSet, error) {
 	if err := participant.Validate(); err != nil {
 		return nil, err
 	}
-	active, memberRole, err := s.workspaceMembership(ctx, s.pool, workspaceID, participant)
+	active, memberRole, err := s.workspaceMembership(ctx, q, workspaceID, participant)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +125,7 @@ func (s *Store) PermissionsFor(ctx context.Context, workspaceID string, particip
 			granted[key] = true
 		}
 	}
-	rows, err := s.pool.Query(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT wr.permissions FROM participant_roles pr
 		 JOIN workspace_roles wr ON wr.role_id = pr.role_id
 		 WHERE wr.workspace_id = $1 AND pr.member_kind = $2 AND pr.member_id = $3`,
@@ -153,7 +157,11 @@ func (s *Store) PermissionsFor(ctx context.Context, workspaceID string, particip
 // refusal, not a pretend-missing resource, because the actor can already see
 // the workspace.
 func (s *Store) RequirePermission(ctx context.Context, workspaceID string, actor ParticipantRef, permission string) error {
-	granted, err := s.PermissionsFor(ctx, workspaceID, actor)
+	return s.requirePermission(ctx, s.pool, workspaceID, actor, permission)
+}
+
+func (s *Store) requirePermission(ctx context.Context, q querier, workspaceID string, actor ParticipantRef, permission string) error {
+	granted, err := s.permissionsFor(ctx, q, workspaceID, actor)
 	if err != nil {
 		return err
 	}
@@ -161,6 +169,115 @@ func (s *Store) RequirePermission(ctx context.Context, workspaceID string, actor
 		return ErrForbidden
 	}
 	return nil
+}
+
+// beginRoleMutation serializes every role definition, assignment, and
+// bootstrap decision for one workspace. The workspace row is the durable lock
+// target all of those paths already share; no role hierarchy or auxiliary lock
+// table is needed.
+func (s *Store) beginRoleMutation(ctx context.Context, workspaceID string) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var lockedID string
+	err = tx.QueryRow(ctx,
+		"SELECT workspace_id FROM workspaces WHERE workspace_id = $1 FOR UPDATE",
+		workspaceID).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_ = tx.Rollback(ctx)
+		return nil, ErrWorkspaceNotFound
+	}
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, fmt.Errorf("lock workspace roles: %w", err)
+	}
+	return tx, nil
+}
+
+func permissionsWithin(actor PermissionSet, target map[string]bool) bool {
+	for permission := range normalizePermissions(target) {
+		if !actor.Can(permission) {
+			return false
+		}
+	}
+	return true
+}
+
+func isFullDefaultAdminPermissions(permissions map[string]bool) bool {
+	normalized := normalizePermissions(permissions)
+	for _, permission := range knownPermissions {
+		if !normalized[permission] {
+			return false
+		}
+	}
+	return true
+}
+
+func rolePermissions(ctx context.Context, q querier, workspaceID, roleID string) (map[string]bool, error) {
+	var permissions map[string]bool
+	err := q.QueryRow(ctx,
+		`SELECT permissions FROM workspace_roles
+		 WHERE role_id = $1 AND workspace_id = $2`,
+		roleID, workspaceID).Scan(&permissions)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRoleNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load role permissions: %w", err)
+	}
+	return normalizePermissions(permissions), nil
+}
+
+func participantRolePermissions(ctx context.Context, q querier, workspaceID string, participant ParticipantRef) (map[string]map[string]bool, error) {
+	rows, err := q.Query(ctx,
+		`SELECT wr.role_id, wr.permissions
+		 FROM participant_roles pr
+		 JOIN workspace_roles wr ON wr.role_id = pr.role_id
+		 WHERE wr.workspace_id = $1 AND pr.member_kind = $2 AND pr.member_id = $3`,
+		workspaceID, participant.Kind, participant.ID)
+	if err != nil {
+		return nil, fmt.Errorf("query participant roles: %w", err)
+	}
+	defer rows.Close()
+	roles := map[string]map[string]bool{}
+	for rows.Next() {
+		var roleID string
+		var permissions map[string]bool
+		if err := rows.Scan(&roleID, &permissions); err != nil {
+			return nil, fmt.Errorf("scan participant role: %w", err)
+		}
+		roles[roleID] = normalizePermissions(permissions)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate participant roles: %w", err)
+	}
+	return roles, nil
+}
+
+func workspaceHasAdministrator(ctx context.Context, q querier, workspaceID string) (bool, error) {
+	var administered bool
+	err := q.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1
+		   FROM workspace_members wm
+		   WHERE wm.workspace_id = $1 AND wm.left_at IS NULL
+		     AND (
+		       wm.role IN ('owner', 'admin')
+		       OR EXISTS (
+		         SELECT 1
+		         FROM participant_roles pr
+		         JOIN workspace_roles wr ON wr.role_id = pr.role_id
+		         WHERE wr.workspace_id = wm.workspace_id
+		           AND pr.member_kind = wm.member_kind AND pr.member_id = wm.member_id
+		           AND COALESCE((wr.permissions ->> 'manage_roles')::boolean, false)
+		       )
+		     )
+		 )`, workspaceID).Scan(&administered)
+	if err != nil {
+		return false, fmt.Errorf("check workspace administration: %w", err)
+	}
+	return administered, nil
 }
 
 // PlacePermissionsFor resolves permissions against the workspace that owns a
@@ -260,8 +377,17 @@ func (s *Store) RoleAssignments(ctx context.Context, workspaceID string, viewer 
 
 // CreateRole mints a role. Requires manage_roles.
 func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor ParticipantRef, name, color string, permissions map[string]bool) (Role, error) {
-	if err := s.RequirePermission(ctx, workspaceID, actor, PermManageRoles); err != nil {
+	tx, err := s.beginRoleMutation(ctx, workspaceID)
+	if err != nil {
+		return Role{}, fmt.Errorf("begin create role: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	actorPermissions, err := s.permissionsFor(ctx, tx, workspaceID, actor)
+	if err != nil {
 		return Role{}, err
+	}
+	if !actorPermissions.Can(PermManageRoles) {
+		return Role{}, ErrForbidden
 	}
 	if err := validateRoleName(name); err != nil {
 		return Role{}, err
@@ -276,7 +402,10 @@ func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor Partic
 		Color:       color,
 		Permissions: normalizePermissions(permissions),
 	}
-	if _, err := s.pool.Exec(ctx,
+	if !permissionsWithin(actorPermissions, role.Permissions) {
+		return Role{}, ErrForbidden
+	}
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO workspace_roles (role_id, workspace_id, name, color, position, permissions)
 		 VALUES ($1, $2, $3, $4, 0, $5)`,
 		role.RoleID, workspaceID, role.Name, nullableColor(color), role.Permissions); err != nil {
@@ -285,14 +414,26 @@ func (s *Store) CreateRole(ctx context.Context, workspaceID string, actor Partic
 		}
 		return Role{}, fmt.Errorf("insert role: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return Role{}, fmt.Errorf("commit create role: %w", err)
+	}
 	return role, nil
 }
 
 // UpdateRole replaces a role's name, colour and permissions. Requires
 // manage_roles.
 func (s *Store) UpdateRole(ctx context.Context, workspaceID, roleID string, actor ParticipantRef, name, color string, permissions map[string]bool) (Role, error) {
-	if err := s.RequirePermission(ctx, workspaceID, actor, PermManageRoles); err != nil {
+	tx, err := s.beginRoleMutation(ctx, workspaceID)
+	if err != nil {
+		return Role{}, fmt.Errorf("begin update role: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	actorPermissions, err := s.permissionsFor(ctx, tx, workspaceID, actor)
+	if err != nil {
 		return Role{}, err
+	}
+	if !actorPermissions.Can(PermManageRoles) {
+		return Role{}, ErrForbidden
 	}
 	if err := validateRoleName(name); err != nil {
 		return Role{}, err
@@ -307,7 +448,19 @@ func (s *Store) UpdateRole(ctx context.Context, workspaceID, roleID string, acto
 		Color:       color,
 		Permissions: normalizePermissions(permissions),
 	}
-	err := s.pool.QueryRow(ctx,
+	previousPermissions, err := rolePermissions(ctx, tx, workspaceID, roleID)
+	if err != nil {
+		return Role{}, err
+	}
+	if !permissionsWithin(actorPermissions, previousPermissions) ||
+		!permissionsWithin(actorPermissions, role.Permissions) {
+		return Role{}, ErrForbidden
+	}
+	if workspaceID == DefaultWorkspaceID && roleID == DefaultAdminRoleID &&
+		!isFullDefaultAdminPermissions(role.Permissions) {
+		return Role{}, ErrForbidden
+	}
+	err = tx.QueryRow(ctx,
 		`UPDATE workspace_roles SET name = $3, color = $4, permissions = $5
 		 WHERE role_id = $1 AND workspace_id = $2
 		 RETURNING position`,
@@ -321,16 +474,45 @@ func (s *Store) UpdateRole(ctx context.Context, workspaceID, roleID string, acto
 		}
 		return Role{}, fmt.Errorf("update role: %w", err)
 	}
+	administered, err := workspaceHasAdministrator(ctx, tx, workspaceID)
+	if err != nil {
+		return Role{}, err
+	}
+	if !administered {
+		return Role{}, ErrForbidden
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Role{}, fmt.Errorf("commit update role: %w", err)
+	}
 	return role, nil
 }
 
 // DeleteRole removes a role and every grant of it (ON DELETE CASCADE).
 // Requires manage_roles.
 func (s *Store) DeleteRole(ctx context.Context, workspaceID, roleID string, actor ParticipantRef) error {
-	if err := s.RequirePermission(ctx, workspaceID, actor, PermManageRoles); err != nil {
+	tx, err := s.beginRoleMutation(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("begin delete role: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	actorPermissions, err := s.permissionsFor(ctx, tx, workspaceID, actor)
+	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
+	if !actorPermissions.Can(PermManageRoles) {
+		return ErrForbidden
+	}
+	targetPermissions, err := rolePermissions(ctx, tx, workspaceID, roleID)
+	if err != nil {
+		return err
+	}
+	if !permissionsWithin(actorPermissions, targetPermissions) {
+		return ErrForbidden
+	}
+	if workspaceID == DefaultWorkspaceID && roleID == DefaultAdminRoleID {
+		return ErrForbidden
+	}
+	tag, err := tx.Exec(ctx,
 		"DELETE FROM workspace_roles WHERE role_id = $1 AND workspace_id = $2",
 		roleID, workspaceID)
 	if err != nil {
@@ -339,6 +521,16 @@ func (s *Store) DeleteRole(ctx context.Context, workspaceID, roleID string, acto
 	if tag.RowsAffected() == 0 {
 		return ErrRoleNotFound
 	}
+	administered, err := workspaceHasAdministrator(ctx, tx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !administered {
+		return ErrForbidden
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete role: %w", err)
+	}
 	return nil
 }
 
@@ -346,24 +538,55 @@ func (s *Store) DeleteRole(ctx context.Context, workspaceID, roleID string, acto
 // manage_members. Passing an empty list removes every role, which is how a
 // participant is returned to plain membership.
 func (s *Store) SetParticipantRoles(ctx context.Context, workspaceID string, actor, member ParticipantRef, roleIDs []string) ([]string, error) {
-	if err := s.RequirePermission(ctx, workspaceID, actor, PermManageMembers); err != nil {
+	tx, err := s.beginRoleMutation(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("begin set participant roles: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	actorPermissions, err := s.permissionsFor(ctx, tx, workspaceID, actor)
+	if err != nil {
 		return nil, err
+	}
+	if !actorPermissions.Can(PermManageMembers) {
+		return nil, ErrForbidden
 	}
 	if err := member.Validate(); err != nil {
 		return nil, err
 	}
-	active, _, err := s.workspaceMembership(ctx, s.pool, workspaceID, member)
+	active, _, err := s.workspaceMembership(ctx, tx, workspaceID, member)
 	if err != nil {
 		return nil, err
 	}
 	if !active {
 		return nil, ErrNotAMember
 	}
-	tx, err := s.pool.Begin(ctx)
+	currentRoles, err := participantRolePermissions(ctx, tx, workspaceID, member)
 	if err != nil {
-		return nil, fmt.Errorf("begin set participant roles: %w", err)
+		return nil, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	requestedRoles := make(map[string]map[string]bool, len(roleIDs))
+	for _, roleID := range roleIDs {
+		if _, alreadyLoaded := requestedRoles[roleID]; alreadyLoaded {
+			continue
+		}
+		permissions, err := rolePermissions(ctx, tx, workspaceID, roleID)
+		if err != nil {
+			return nil, err
+		}
+		requestedRoles[roleID] = permissions
+	}
+	for roleID, permissions := range currentRoles {
+		if _, unchanged := requestedRoles[roleID]; !unchanged &&
+			!permissionsWithin(actorPermissions, permissions) {
+			return nil, ErrForbidden
+		}
+	}
+	for roleID, permissions := range requestedRoles {
+		if _, unchanged := currentRoles[roleID]; !unchanged &&
+			!permissionsWithin(actorPermissions, permissions) {
+			return nil, ErrForbidden
+		}
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM participant_roles pr
 		 USING workspace_roles wr
@@ -374,30 +597,22 @@ func (s *Store) SetParticipantRoles(ctx context.Context, workspaceID string, act
 	}
 	stored := make([]string, 0, len(roleIDs))
 	for _, roleID := range roleIDs {
-		// The role must belong to this workspace: a role id from elsewhere is
-		// not found rather than silently granted.
-		tag, err := tx.Exec(ctx,
+		_, err := tx.Exec(ctx,
 			`INSERT INTO participant_roles (role_id, member_kind, member_id)
-			 SELECT $1::uuidv7, $2::text, $3::uuidv7 FROM workspace_roles
-			 WHERE role_id = $1::uuidv7 AND workspace_id = $4
+			 VALUES ($1::uuidv7, $2::text, $3::uuidv7)
 			 ON CONFLICT DO NOTHING`,
-			roleID, member.Kind, member.ID, workspaceID)
+			roleID, member.Kind, member.ID)
 		if err != nil {
 			return nil, fmt.Errorf("grant participant role: %w", err)
 		}
-		if tag.RowsAffected() == 0 {
-			var exists bool
-			if err := tx.QueryRow(ctx,
-				`SELECT EXISTS (SELECT 1 FROM workspace_roles
-				  WHERE role_id = $1 AND workspace_id = $2)`,
-				roleID, workspaceID).Scan(&exists); err != nil {
-				return nil, fmt.Errorf("check role workspace: %w", err)
-			}
-			if !exists {
-				return nil, ErrRoleNotFound
-			}
-		}
 		stored = append(stored, roleID)
+	}
+	administered, err := workspaceHasAdministrator(ctx, tx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !administered {
+		return nil, ErrForbidden
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit set participant roles: %w", err)
@@ -417,31 +632,56 @@ func (s *Store) EnsureFoundingAdmin(ctx context.Context, participant Participant
 	if participant.Kind != KindHuman {
 		return nil
 	}
-	var administered bool
-	if err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-		   SELECT 1 FROM participant_roles pr
-		   JOIN workspace_roles wr ON wr.role_id = pr.role_id
-		   JOIN workspace_members wm
-		     ON wm.workspace_id = wr.workspace_id
-		    AND wm.member_kind = pr.member_kind
-		    AND wm.member_id = pr.member_id
-		    AND wm.left_at IS NULL
-		   WHERE wr.workspace_id = $1
-		     AND COALESCE((wr.permissions ->> 'manage_roles')::boolean, false))`,
-		DefaultWorkspaceID).Scan(&administered); err != nil {
-		return fmt.Errorf("check workspace administration: %w", err)
+	tx, err := s.beginRoleMutation(ctx, DefaultWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("begin founding admin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	active, _, err := s.workspaceMembership(ctx, tx, DefaultWorkspaceID, participant)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return ErrNotAMember
+	}
+	administered, err := workspaceHasAdministrator(ctx, tx, DefaultWorkspaceID)
+	if err != nil {
+		return err
 	}
 	if administered {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit founding admin check: %w", err)
+		}
 		return nil
 	}
-	if _, err := s.pool.Exec(ctx,
+	adminPermissions, err := rolePermissions(ctx, tx, DefaultWorkspaceID, DefaultAdminRoleID)
+	if err != nil {
+		return fmt.Errorf("load founding Admin role: %w", err)
+	}
+	if !isFullDefaultAdminPermissions(adminPermissions) {
+		return fmt.Errorf("founding Admin role is not recoverable: %w", ErrForbidden)
+	}
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO participant_roles (role_id, member_kind, member_id)
 		 SELECT $1::uuidv7, $2::text, $3::uuidv7 FROM workspace_roles
-		 WHERE role_id = $1::uuidv7
+		 WHERE role_id = $1::uuidv7 AND workspace_id = $4
 		 ON CONFLICT DO NOTHING`,
-		DefaultAdminRoleID, participant.Kind, participant.ID); err != nil {
+		DefaultAdminRoleID, participant.Kind, participant.ID, DefaultWorkspaceID)
+	if err != nil {
 		return fmt.Errorf("grant founding admin: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("grant founding admin affected no rows")
+	}
+	administered, err = workspaceHasAdministrator(ctx, tx, DefaultWorkspaceID)
+	if err != nil {
+		return err
+	}
+	if !administered {
+		return errors.New("founding admin grant left workspace unadministered")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit founding admin: %w", err)
 	}
 	return nil
 }
