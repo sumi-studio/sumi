@@ -1,17 +1,8 @@
-import { Check, Copy, Image as ImageIcon } from "lucide-react";
 import {
-  Children,
-  isValidElement,
-  memo,
-  type ReactNode,
-  useMemo,
-  useState,
-} from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
-import remarkBreaks from "remark-breaks";
-import remarkCjkFriendly from "remark-cjk-friendly";
-import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough";
-import remarkGfm from "remark-gfm";
+  CompactMessageResponse,
+  type CompactMessageTrailer,
+} from "@sumi/ui/ai-elements/compact-message-response";
+import { memo, useMemo } from "react";
 import { displayMentionPattern } from "../mention";
 import type { MemberProfile, ParticipantKey } from "../model";
 import { participantKey } from "../model";
@@ -23,10 +14,9 @@ import { participantKey } from "../model";
  * 会話はコード片だらけなので、コードブロック・インラインコード・リスト・
  * 引用・強調をDiscord相当の控えめな組版で描く。
  *
- * 安全性: rehype-rawを入れないため本文由来の生HTMLは描画されない
- * （react-markdownのデフォルトで生HTMLはテキスト扱い）。リンクは
- * rel="noreferrer noopener" target="_blank"。![alt](url)は<img>にせず
- * リンクとして描く（自動取得しない。後述のImageLink参照）。
+ * parser・標準Markdown plugin・安全性ポリシーは@sumi/uiの共有rendererが
+ * 所有する。本文由来の生HTMLは描画せず、リンクはopenerを渡さず、
+ * ![alt](url)は<img>にせず明示的に開くリンクとして描く。
  *
  * mention装飾はremarkプラグインとしてAST上のtextノードを分割する。
  * code / inlineCode は値がtextノードにならないため、コードの内側は
@@ -121,237 +111,12 @@ function remarkMentions(targets: MentionTarget[]) {
   };
 }
 
-/** hastノードの最小型（rehypeプラグイン用）。 */
-interface HastNode {
-  type: string;
-  tagName?: string;
-  properties?: Record<string, unknown>;
-  value?: string;
-  children?: HastNode[];
-}
-
-export interface ContentTrailer {
-  text: string;
-  title?: string;
-}
-
-/**
- * 「(編集済み)」のような後置ラベルを最終段落の内側へ差し込む。
- * Markdown化で本文がブロック要素になっても、Discord同様に本文末尾へ
- * インラインで続けるための道具。最後がコードブロック等ならルート末尾に置く。
- */
-function rehypeTrailer(trailer: ContentTrailer) {
-  const span: HastNode = {
-    type: "element",
-    tagName: "span",
-    properties: {
-      className: "ml-1 text-[10px] text-muted-foreground",
-      title: trailer.title,
-      "data-trailer": "",
-    },
-    children: [{ type: "text", value: trailer.text }],
-  };
-  return () => (tree: HastNode) => {
-    const children = tree.children ?? [];
-    const last = [...children]
-      .reverse()
-      .find((child) => child.type === "element");
-    if (last?.tagName === "p" && last.children) {
-      last.children.push(span);
-    } else {
-      children.push(span);
-      tree.children = children;
-    }
-  };
-}
-
-function nodeToText(children: ReactNode): string {
-  let out = "";
-  for (const child of Children.toArray(children)) {
-    if (typeof child === "string" || typeof child === "number") {
-      out += String(child);
-    } else if (isValidElement<{ children?: ReactNode }>(child)) {
-      out += nodeToText(child.props.children);
-    }
-  }
-  return out;
-}
-
-function CodeBlock({ children }: { children?: ReactNode }) {
-  const [copied, setCopied] = useState(false);
-  const codeElement = Children.toArray(children).find((child) =>
-    isValidElement<{ className?: string; children?: ReactNode }>(child),
-  ) as
-    | React.ReactElement<{ className?: string; children?: ReactNode }>
-    | undefined;
-  const language =
-    codeElement?.props.className?.match(/language-([\w+-]+)/)?.[1] ?? "";
-  const code = nodeToText(children).replace(/\n$/, "");
-
-  const copy = () => {
-    void navigator.clipboard?.writeText(code).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    });
-  };
-
-  return (
-    <div className="group/code my-1 max-w-full overflow-hidden rounded-lg border border-border bg-muted/40">
-      <div className="flex items-center justify-between border-border/60 border-b px-3 py-1">
-        <span className="text-[10px] text-muted-foreground uppercase tracking-wide">
-          {language || "code"}
-        </span>
-        <button
-          type="button"
-          onClick={copy}
-          title="コードをコピー"
-          aria-label="コードをコピー"
-          className="flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/code:opacity-100"
-        >
-          {copied ? (
-            <>
-              <Check className="size-3" />
-              コピーしました
-            </>
-          ) : (
-            <>
-              <Copy className="size-3" />
-              コピー
-            </>
-          )}
-        </button>
-      </div>
-      <pre className="overflow-x-auto whitespace-pre px-3 py-2 font-mono text-[12.5px] leading-5">
-        {codeElement?.props.children ?? children}
-      </pre>
-    </div>
-  );
-}
-
-const LINK_CLASS =
-  "break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary";
-
-/**
- * ![alt](url) を <img> にせず、開くかどうかを読み手が決めるリンクにする。
- *
- * <img>で描くと、メッセージを表示しただけで作者の指定したURLへ閲覧者の
- * ブラウザからGETが飛び、IPと閲覧時刻が作者へ渡る。承認済みの
- * proxy／attachment経路（#201）ができるまでは自動取得しない。
- * hrefはreact-markdownのurlTransformを通っており、javascript:などは空になる。
- */
-function ImageLink({
-  src,
-  alt,
-  title,
-}: {
-  src?: string | Blob;
-  alt?: string;
-  title?: string;
-}) {
-  const href = typeof src === "string" && src !== "" ? src : undefined;
-  const label = alt?.trim() || href || "画像";
-  if (!href) {
-    return (
-      <span className="inline-flex items-baseline gap-1 text-muted-foreground">
-        <ImageIcon className="size-3 self-center" aria-hidden="true" />
-        {label}
-      </span>
-    );
-  }
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer noopener"
-      title={title ?? href}
-      data-image-link=""
-      className={`inline-flex items-baseline gap-1 ${LINK_CLASS}`}
-    >
-      <ImageIcon className="size-3 self-center" aria-hidden="true" />
-      {label}
-    </a>
-  );
-}
-
-/**
- * チャット向けの控えめな組版。見出しはDiscord同様に本文よりわずかに
- * 大きい程度へ抑える。段落間は狭く、リストはインデントのみ。
- */
-const markdownComponents: Components = {
-  img: ({ src, alt, title }) => <ImageLink src={src} alt={alt} title={title} />,
-  pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-  code: ({ children }) => (
-    <code className="rounded bg-muted px-1 py-px font-mono text-[12.5px]">
-      {children}
-    </code>
-  ),
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer noopener"
-      className={LINK_CLASS}
-    >
-      {children}
-    </a>
-  ),
-  p: ({ children }) => <p className="my-0 [p+&]:mt-2">{children}</p>,
-  blockquote: ({ children }) => (
-    <blockquote className="my-1 border-border border-l-2 pl-3 text-muted-foreground">
-      {children}
-    </blockquote>
-  ),
-  ul: ({ children }) => (
-    <ul className="my-0.5 list-disc pl-5 marker:text-muted-foreground">
-      {children}
-    </ul>
-  ),
-  ol: ({ children }) => (
-    <ol className="my-0.5 list-decimal pl-5 marker:text-muted-foreground">
-      {children}
-    </ol>
-  ),
-  li: ({ children }) => <li className="my-0">{children}</li>,
-  h1: ({ children }) => (
-    <p className="my-0.5 font-semibold text-[15px] [p+&]:mt-2">{children}</p>
-  ),
-  h2: ({ children }) => (
-    <p className="my-0.5 font-semibold text-[14px] [p+&]:mt-2">{children}</p>
-  ),
-  h3: ({ children }) => (
-    <p className="my-0.5 font-semibold [p+&]:mt-2">{children}</p>
-  ),
-  h4: ({ children }) => (
-    <p className="my-0.5 font-semibold [p+&]:mt-2">{children}</p>
-  ),
-  h5: ({ children }) => (
-    <p className="my-0.5 font-semibold [p+&]:mt-2">{children}</p>
-  ),
-  h6: ({ children }) => (
-    <p className="my-0.5 font-semibold [p+&]:mt-2">{children}</p>
-  ),
-  hr: () => <hr className="my-2 border-border" />,
-  table: ({ children }) => (
-    <div className="my-1 max-w-full overflow-x-auto">
-      <table className="border-collapse text-[12.5px]">{children}</table>
-    </div>
-  ),
-  th: ({ children }) => (
-    <th className="border border-border px-2 py-0.5 text-left font-semibold">
-      {children}
-    </th>
-  ),
-  td: ({ children }) => (
-    <td className="border border-border px-2 py-0.5">{children}</td>
-  ),
-};
-
 export interface MessageContentProps {
   content: string;
   members: Record<ParticipantKey, MemberProfile>;
   selfKey: ParticipantKey;
   /** 本文末尾へインラインで続ける後置ラベル（例:「(編集済み)」）。 */
-  trailer?: ContentTrailer;
+  trailer?: CompactMessageTrailer;
 }
 
 export const MessageContent = memo(function MessageContent({
@@ -365,27 +130,15 @@ export const MessageContent = memo(function MessageContent({
       displayName: member.displayName,
       isSelf: participantKey(member.participant) === selfKey,
     }));
-    return [
-      remarkGfm,
-      remarkCjkFriendly,
-      remarkCjkFriendlyGfmStrikethrough,
-      remarkBreaks,
-      remarkMentions(targets),
-    ];
+    return [remarkMentions(targets)];
   }, [members, selfKey]);
 
-  const rehypePlugins = useMemo(
-    () => (trailer ? [rehypeTrailer(trailer)] : []),
-    [trailer],
-  );
-
   return (
-    <ReactMarkdown
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={rehypePlugins}
-      components={markdownComponents}
+    <CompactMessageResponse
+      extraRemarkPlugins={remarkPlugins}
+      trailer={trailer}
     >
       {content}
-    </ReactMarkdown>
+    </CompactMessageResponse>
   );
 });
