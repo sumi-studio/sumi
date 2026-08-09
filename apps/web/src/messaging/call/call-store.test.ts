@@ -412,7 +412,10 @@ describe("自分の通話セッション", () => {
   });
 });
 
-function wireCallState(place: Place, participants: ParticipantRef[]) {
+function wireCallState(
+  place: Exclude<Place, { kind: "thread" }>,
+  participants: ParticipantRef[],
+) {
   return {
     place:
       place.kind === "channel"
