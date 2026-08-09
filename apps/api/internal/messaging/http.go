@@ -759,6 +759,10 @@ func (s *Server) serveUpdatePlace(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.Name == nil && req.Topic == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	if req.Name != nil && (*req.Name == "" || utf8.RuneCountInString(*req.Name) > MaxChannelNameChars) {
 		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
