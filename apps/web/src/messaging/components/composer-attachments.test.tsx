@@ -1,12 +1,21 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerAttachments,
   type DraftAttachment,
   fileExtension,
+  useDraftAttachments,
 } from "./composer-attachments";
 
 function draft(overrides: Partial<DraftAttachment> = {}): DraftAttachment {
@@ -142,6 +151,7 @@ describe("ComposerAttachments", () => {
     const modal = screen.getByRole("dialog", { name: "添付ファイルを編集" });
     expect(modal).toBeInTheDocument();
     expect(screen.getByLabelText(/スポイラーとしてマーク/)).toBeInTheDocument();
+    expect(screen.getByLabelText("概要")).toHaveAttribute("maxLength", "1000");
   });
 
   it("大きすぎる添付は失敗として見せる", () => {
@@ -160,6 +170,42 @@ describe("ComposerAttachments", () => {
       <ComposerAttachments items={[]} onRemove={() => {}} />,
     );
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("useDraftAttachments", () => {
+  it("宣言のPATCH中も送信を止め、完了後にreadyへ戻す", async () => {
+    const initial = draft().attachment;
+    if (!initial) throw new Error("test draft must carry an attachment");
+    let finishUpdate: ((attachment: typeof initial) => void) | undefined;
+    const update = vi.fn(
+      () =>
+        new Promise<typeof initial>((resolve) => {
+          finishUpdate = resolve;
+        }),
+    );
+    const { result } = renderHook(() =>
+      useDraftAttachments({ upload: async () => initial, update }),
+    );
+
+    act(() => {
+      result.current.addFiles([
+        new File(["draft"], "avatar.jpg", { type: "text/plain" }),
+      ]);
+    });
+    await waitFor(() => expect(result.current.items[0]?.status).toBe("ready"));
+
+    act(() => {
+      result.current.toggleSpoiler(result.current.items[0].localId);
+    });
+    expect(update).toHaveBeenCalledWith("attachment-1", { spoiler: true });
+    expect(result.current.uploading).toBe(true);
+
+    await act(async () => {
+      finishUpdate?.({ ...initial, spoiler: true });
+    });
+    expect(result.current.uploading).toBe(false);
+    expect(result.current.items[0].attachment?.spoiler).toBe(true);
   });
 });
 

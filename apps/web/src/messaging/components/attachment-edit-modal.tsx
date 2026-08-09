@@ -336,6 +336,7 @@ export function AttachmentEditModal({
             <textarea
               value={nextAlt}
               onChange={(event) => setNextAlt(event.target.value)}
+              maxLength={1000}
               rows={2}
               placeholder="中身を見なくても何か分かる説明"
               className="w-full resize-none rounded-md border border-border bg-background px-2.5 py-1.5 text-[13px] outline-none placeholder:text-muted-foreground/70 focus:border-ring/60"
