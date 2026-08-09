@@ -37,8 +37,9 @@ use super::supervisor::{
 };
 use crate::apiclient::messaging::{
     CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-    DuplicateMessagingChannelRequest, MessagingApi, OpenMessagingPlaceRequest,
-    ReactMessagingReactionRequest, ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest,
+    DuplicateMessagingChannelRequest, MessagingApi, MessagingNotificationSettingsRequest,
+    OpenMessagingPlaceRequest, PollMessagingAttentionRequest, ReactMessagingReactionRequest,
+    ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
     SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
     WriteMessagingMessageRequest,
 };
@@ -573,6 +574,33 @@ impl MessagingApi for LocalControlHttpClient {
         request: DuplicateMessagingChannelRequest<'_>,
     ) -> Result<serde_json::Value> {
         self.post_json("/local-control/v1/messaging:duplicate-channel", &request)
+            .await
+    }
+
+    async fn search(&self, request: SearchMessagingRequest<'_>) -> Result<serde_json::Value> {
+        // Up to 50 hits, each carrying a snippet — a result list, not a
+        // timeline, but still wider than the control-plane bound.
+        self.post_json_bounded(
+            "/local-control/v1/messaging:search",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn notification_settings(
+        &self,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json(
+            "/local-control/v1/messaging:notification-settings",
+            &request,
+        )
+        .await
+    }
+
+    async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<serde_json::Value> {
+        self.post_json("/local-control/v1/messaging:attention", &request)
             .await
     }
 }

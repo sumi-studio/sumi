@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -35,6 +36,12 @@ const (
 	// agentはtool). The messaging tool that calls it lands with #209; the口 is
 	// here so the capability is not UI-only in the meantime.
 	LocalNotificationSettingsPath = "/local-control/v1/messaging:notification-settings"
+	// LocalSearchPath is the agent's copy of the human search box. 探すことが
+	// UI にしか無いと、agent は「見えているものしか思い出せない」人になる。
+	LocalSearchPath = "/local-control/v1/messaging:search"
+	// LocalAttentionPath hands the agent its own unconsumed AttentionCandidates
+	// and, in the same call, lets it ack what it has taken in.
+	LocalAttentionPath = "/local-control/v1/messaging:attention"
 )
 
 // maxRelativeMinutes bounds every relative duration the agent lane accepts.
@@ -64,6 +71,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalUpdateChannelPath, s.localUpdateChannel},
 		{"POST " + LocalDuplicateChannelPath, s.localDuplicateChannel},
 		{"POST " + LocalNotificationSettingsPath, s.localNotificationSettings},
+		{"POST " + LocalSearchPath, s.localSearch},
+		{"POST " + LocalAttentionPath, s.localAttention},
 	}
 	for _, route := range routes {
 		if err := control.RegisterAuthorizedRoute(route.pattern, route.handler); err != nil {
@@ -624,6 +633,128 @@ func (s *Server) publishChannel(ctx context.Context, eventType string, place Pla
 	}
 	wire := channelToWire(place)
 	s.Hub.Publish(ctx, Event{Type: eventType, PlaceID: place.PlaceID, Channel: &wire})
+}
+
+// localSearch is the agent's copy of the human search box, through the
+// identical store path (SearchMessages)。可視性は store が決めるので、agent が
+// 見られない place の発言は結果に現れず、見られない place を名指しした検索は
+// 「無い」と答える——人間の UI と同じ答え方である。
+func (s *Server) localSearch(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		Query   string `json:"query"`
+		PlaceID string `json:"place_id,omitempty"`
+		Limit   int    `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	query := strings.TrimSpace(request.Query)
+	if query == "" || len(query) > MaxSearchQueryBytes || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	results, err := s.Store.SearchMessages(r.Context(), viewer, query,
+		SearchOptions{PlaceID: request.PlaceID, Limit: request.Limit})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]searchResultWire, len(results))
+	for i, result := range results {
+		wires[i] = searchResultWire{
+			MessageID: result.Message.MessageID,
+			Place:     placeToWire(result.Place),
+			Seq:       result.Message.Seq,
+			Author:    participantToWire(result.Message.Author),
+			Snippet:   result.Snippet,
+			CreatedAt: result.Message.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Results []searchResultWire `json:"results"`
+	}{wires})
+}
+
+// attentionCandidateWire is one queued「呼ばれた」. actor / message_id / 本文は
+// 載せない：候補は message ref であって本文の注入ではない（凍結契約 v1）。
+// 続きは place を open して読む——人間が通知から place を開くのと同じ動きで、
+// そこで read cursor も正しく進む。
+type attentionCandidateWire struct {
+	CandidateID  string    `json:"candidate_id"`
+	CandidateSeq int64     `json:"candidate_seq"`
+	Place        placeWire `json:"place"`
+	MessageSeq   int64     `json:"message_seq"`
+	Reason       string    `json:"reason"`
+	ArrivalTime  time.Time `json:"arrival_time"`
+}
+
+// localAttention hands the agent its own unconsumed AttentionCandidates and, in
+// the same call, acks what a previous call already took in.
+//
+// **暫定配線である（ADR 0010 覚醒トリガ / issue #173）。** 本設計では候補の
+// 到着そのものが本人を起こす。ここには自動覚醒が無く、起きている本人が自分で
+// 取りに来る形にしてある。それでも「runtime が止まっていた間に呼ばれたこと」は
+// shared 側に積まれているので、次に動いたときに必ず見つかる。
+//
+// consume_through は先に適用する：本人が「ここまで取り込んだ」と言ってから
+// 「次は何か」を聞く順である。
+func (s *Server) localAttention(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
+	var request struct {
+		ConsumeThrough int64 `json:"consume_through,omitempty"`
+		Limit          int   `json:"limit,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.ConsumeThrough < 0 || request.Limit < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	viewer := localViewer(authorization)
+	if err := s.Store.EnsureDefaultWorkspaceMembership(r.Context(), viewer); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	var consumed int64
+	if request.ConsumeThrough > 0 {
+		count, err := s.Store.ConsumeAttentionCandidates(r.Context(), viewer, request.ConsumeThrough)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		consumed = count
+	}
+	candidates, err := s.Store.PendingAttentionCandidates(r.Context(), viewer, request.Limit)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	latestSeq, err := s.Store.LatestAttentionSeq(r.Context(), viewer)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	wires := make([]attentionCandidateWire, len(candidates))
+	for i, candidate := range candidates {
+		wires[i] = attentionCandidateWire{
+			CandidateID:  candidate.CandidateID,
+			CandidateSeq: candidate.CandidateSeq,
+			Place:        placeToWire(Place{PlaceID: candidate.PlaceID, Kind: candidate.PlaceKind}),
+			MessageSeq:   candidate.MessageSeq,
+			Reason:       candidate.Reason,
+			ArrivalTime:  candidate.CreatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Candidates []attentionCandidateWire `json:"candidates"`
+		Consumed   int64                    `json:"consumed"`
+		LatestSeq  int64                    `json:"latest_seq"`
+	}{wires, consumed, latestSeq})
 }
 
 func (s *Server) localReadThrough(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {

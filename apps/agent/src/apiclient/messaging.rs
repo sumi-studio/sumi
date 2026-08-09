@@ -134,6 +134,55 @@ pub(crate) struct DuplicateMessagingChannelRequest<'a> {
     pub name: Option<&'a str>,
 }
 
+/// Searching the messages one can already see.  Visibility is the server's to
+/// decide, exactly as it is for the human search box: the query never widens
+/// what this person may read.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchMessagingRequest<'a> {
+    pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+/// One place-scoped override of one's own default notification level.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationPlace<'a> {
+    pub place_id: &'a str,
+    pub level: &'a str,
+}
+
+/// Reading or changing one's own notification setting.  Every field is
+/// optional, and a request with none of them is a read: naming one preference
+/// must not silently discard the rest, the way a full replacement would.
+/// Whose setting it is comes from the transport's credential — nobody
+/// configures anyone else's attention.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationSettingsRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults_level: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_place: Option<Vec<MessagingNotificationPlace<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<&'a str>>,
+}
+
+/// Taking in one's own AttentionCandidates.  `consume_through` acknowledges
+/// everything up to that candidate_seq before the remaining ones are listed:
+/// one says what one has taken in, then asks what is left.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PollMessagingAttentionRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consume_through: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: Send + Sync + 'static {
     async fn overview(&self) -> Result<Value>;
@@ -165,4 +214,13 @@ pub(crate) trait MessagingApi: Send + Sync + 'static {
         &self,
         request: DuplicateMessagingChannelRequest<'_>,
     ) -> Result<Value>;
+
+    async fn search(&self, request: SearchMessagingRequest<'_>) -> Result<Value>;
+
+    async fn notification_settings(
+        &self,
+        request: MessagingNotificationSettingsRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn attention(&self, request: PollMessagingAttentionRequest) -> Result<Value>;
 }
